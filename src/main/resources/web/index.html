@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CodeSearch — Code Graph Browser</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header id="header">
+    <div class="header-left">
+      <span class="logo">⬡ CodeSearch</span>
+      <button id="btn-modules" class="btn-view active" title="Show module dependency graph">Module Graph</button>
+      <button id="btn-hide-external" class="btn-view" title="Toggle external dependencies">Hide external</button>
+    </div>
+    <div class="header-center">
+      <div class="search-wrap">
+        <input id="search-input" type="text" placeholder="Filter nodes… (Enter to search code)" autocomplete="off">
+        <button id="search-btn" class="btn-search" title="Search code (Enter)">⌕</button>
+      </div>
+    </div>
+    <div class="header-right">
+      <select id="pkg-filter" title="Filter call graph by package">
+        <option value="">All packages</option>
+      </select>
+      <span id="status-bar">Loading…</span>
+    </div>
+  </header>
+
+  <div id="layout">
+    <aside id="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-title">Projects</div>
+        <div id="project-list"><div class="loading">Loading…</div></div>
+      </div>
+      <div class="sidebar-section" id="legend-section">
+        <div class="sidebar-title">Legend</div>
+        <div id="legend">
+          <div class="legend-item"><span class="dot" style="background:#42a5f5"></span>Method</div>
+          <div class="legend-item"><span class="dot" style="background:#66bb6a"></span>Constructor</div>
+          <div class="legend-item"><span class="dot" style="background:#ab47bc"></span>Class</div>
+          <div class="legend-item"><span class="dot" style="background:#26c6da"></span>Document / Chunk</div>
+          <div class="legend-item"><span class="dot" style="background:#26a69a"></span>Indexed module</div>
+          <div class="legend-item"><span class="dot" style="background:#78909c"></span>External module</div>
+        </div>
+      </div>
+    </aside>
+
+    <div id="graph-container">
+      <div id="breadcrumb" class="breadcrumb" style="display:none"></div>
+      <svg id="graph-canvas"></svg>
+      <div id="empty-hint" class="empty-hint" style="display:none">
+        <div class="empty-icon">⬡</div>
+        <div>No data to display.</div>
+        <div class="empty-sub">Index a project first: <code>codesearch index &lt;path&gt;</code></div>
+      </div>
+    </div>
+
+    <aside id="detail-panel">
+      <div class="detail-topbar">
+        <span class="detail-title">Detail</span>
+        <button id="detail-close" title="Close">✕</button>
+      </div>
+      <div id="detail-content"></div>
+    </aside>
+  </div>
+
+  <div id="tooltip" class="tooltip" style="display:none"></div>
+</body>
+</html>

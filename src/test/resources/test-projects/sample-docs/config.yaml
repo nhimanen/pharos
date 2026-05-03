@@ -1,0 +1,5 @@
+indexDir: ~/.codesearch/index
+embeddingModel: hf://jinaai/jina-embeddings-v2-base-code
+vectorDimensions: 768
+maxResults: 20
+graphBoostWeight: 0.3

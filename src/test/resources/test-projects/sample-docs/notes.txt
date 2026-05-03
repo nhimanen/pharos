@@ -1,0 +1,16 @@
+Development Notes
+
+These are informal notes about the project architecture.
+
+The indexing pipeline has four stages: parse, graph, embed, index.
+Parsing converts source files to structured model objects.
+
+The call graph is built from resolved call references only.
+Unresolved calls (external libraries, Python dynamic dispatch) are stored
+in metadata for potential cross-project linking.
+
+Vector embeddings are optional. Without them only BM25 search works.
+With embeddings, hybrid search uses Reciprocal Rank Fusion to combine results.
+
+Performance notes: The Java parser is the slowest step due to symbol resolution.
+Python parsing via subprocess adds overhead but avoids JVM-side dependencies.

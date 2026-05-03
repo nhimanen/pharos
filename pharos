@@ -1,0 +1,4 @@
+#!/bin/bash
+# Wrapper script for pharos
+# Install: cp pharos /usr/local/bin/pharos && chmod +x /usr/local/bin/pharos
+exec java --add-modules=jdk.incubator.vector -jar "$(dirname "$0")/target/pharos-1.0.0-SNAPSHOT.jar" "$@"
