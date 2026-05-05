@@ -10,13 +10,16 @@ import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.graph.ModuleNode;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchRequest;
+import com.pharos.search.SearchResponse;
 import com.pharos.search.SearchResult;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -38,6 +41,30 @@ public class McpToolRegistry {
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /** Cache: graphml path -> (lastModified, CallGraph). Avoids re-parsing large graph files per call. */
+    private final ConcurrentHashMap<Path, long[]> graphMtimeCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Path, CallGraph> graphCache = new ConcurrentHashMap<>();
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(McpToolRegistry.class);
+
+    /** Eagerly load all project call graphs into cache in a background thread. */
+    public void warmUp() {
+        Thread t = new Thread(() -> {
+            for (ProjectMeta meta : registry.listAll()) {
+                Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
+                try {
+                    long start = System.currentTimeMillis();
+                    loadGraphCached(graphFile);
+                    log.info("Warmed up graph for '{}' in {}ms", meta.getName(), System.currentTimeMillis() - start);
+                } catch (Exception e) {
+                    log.warn("Failed to warm up graph for '{}': {}", meta.getName(), e.getMessage());
+                }
+            }
+        }, "pharos-graph-warmup");
+        t.setDaemon(true);
+        t.start();
+    }
 
     public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry) {
         this(searchEngine, registry, new ModuleGraphBuilder(registry),
@@ -152,7 +179,11 @@ public class McpToolRegistry {
 
         SearchRequest req = new SearchRequest(
                 query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType);
-        List<SearchResult> results = searchEngine.search(req, expand);
+        SearchResponse response = searchEngine.searchWithTrace(req, expand);
+        List<SearchResult> results = response.results();
+        if (log.isDebugEnabled()) {
+            log.debug("search_code trace [{}]:\n{}", query, response.trace().format());
+        }
 
         if (results.isEmpty()) return "No results found for: " + query;
 
@@ -212,11 +243,10 @@ public class McpToolRegistry {
 
         // Load merged graph from all projects
         CallGraph merged = new CallGraph();
-        CallGraphSerializer serializer = new CallGraphSerializer();
         for (ProjectMeta meta : registry.listAll()) {
             Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
             try {
-                CallGraph g = serializer.load(graphFile);
+                CallGraph g = loadGraphCached(graphFile);
                 g.allMethods().forEach(merged::addMethod);
                 g.getInternalGraph().edgeSet().forEach(edge -> {
                     merged.addCall(g.getInternalGraph().getEdgeSource(edge),
@@ -401,13 +431,24 @@ public class McpToolRegistry {
         return visited;
     }
 
+    private CallGraph loadGraphCached(Path graphFile) throws Exception {
+        long mtime = Files.exists(graphFile) ? Files.getLastModifiedTime(graphFile).toMillis() : 0;
+        long[] cached = graphMtimeCache.get(graphFile);
+        if (cached != null && cached[0] == mtime) {
+            return graphCache.get(graphFile);
+        }
+        CallGraph graph = new CallGraphSerializer().load(graphFile);
+        graphMtimeCache.put(graphFile, new long[]{mtime});
+        graphCache.put(graphFile, graph);
+        return graph;
+    }
+
     private Set<String> getFromGraph(String fqn, boolean callers) {
-        CallGraphSerializer serializer = new CallGraphSerializer();
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
             Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
             try {
-                CallGraph graph = serializer.load(graphFile);
+                CallGraph graph = loadGraphCached(graphFile);
                 result.addAll(callers ? graph.getCallers(fqn) : graph.getCallees(fqn));
             } catch (Exception ignored) {}
         }

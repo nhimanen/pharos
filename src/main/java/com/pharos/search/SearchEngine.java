@@ -104,7 +104,7 @@ public class SearchEngine {
                     List<SearchResult> vecResults = vectorStrategy.search(reader, req);
                     trace.record("vector search (incl. embed)", tVec);
                     long tRrf = System.currentTimeMillis();
-                    primary = hybridStrategy.fuse(kwResults, vecResults, req.limit());
+                    primary = hybridStrategy.fuse(kwResults, vecResults, req.limit(), req.query());
                     trace.record("rrf fusion", tRrf);
                 }
             }

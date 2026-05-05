@@ -1,5 +1,6 @@
 package com.pharos.search;
 
+import com.pharos.config.IndexConfig;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.analysis.Analyzer;
@@ -14,6 +15,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -64,13 +67,60 @@ public class KeywordSearchStrategy {
         FIELD_BOOSTS.put(DocumentMapper.F_CALLER_CONTEXT, 1.5f);
     }
 
-    private final Analyzer analyzer;
+    /**
+     * Path to the synonym file — watched for changes between searches.
+     * Stored so the hot-reload check doesn't need to rebuild the path each time.
+     */
+    private final Path synonymFile;
+
+    private Analyzer analyzer;
+    /** Last-modified timestamp of synonyms.txt at the time the analyzer was built. */
+    private long synonymFileLastModified = -1;
 
     public KeywordSearchStrategy() {
-        this.analyzer = LuceneIndexer.buildAnalyzer();
+        this(IndexConfig.DEFAULT_BASE.resolve("synonyms.txt"));
+    }
+
+    /** Package-private constructor for tests that need a custom synonym file path. */
+    KeywordSearchStrategy(Path synonymFile) {
+        this.synonymFile = synonymFile;
+        reloadAnalyzer();
+    }
+
+    /**
+     * Rebuilds the query analyzer from the current synonyms.txt.
+     * Called at construction and whenever the file's last-modified time advances.
+     */
+    private void reloadAnalyzer() {
+        this.analyzer = LuceneIndexer.buildQueryAnalyzer(synonymFile.getParent());
+        try {
+            this.synonymFileLastModified = Files.exists(synonymFile)
+                    ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
+        } catch (IOException e) {
+            this.synonymFileLastModified = -1;
+        }
+    }
+
+    /**
+     * Checks whether synonyms.txt has been modified since the analyzer was last built,
+     * and rebuilds the analyzer in-place if so. Called at the start of every search —
+     * the file-stat is a single syscall and is negligible compared to Lucene I/O.
+     */
+    private void reloadIfChanged() {
+        try {
+            long current = Files.exists(synonymFile)
+                    ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
+            if (current != synonymFileLastModified) {
+                log.info("synonyms.txt changed — reloading query analyzer");
+                reloadAnalyzer();
+            }
+        } catch (IOException e) {
+            log.warn("Could not stat synonyms.txt: {}", e.getMessage());
+        }
     }
 
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
+        reloadIfChanged();
         IndexSearcher searcher = new IndexSearcher(reader);
         searcher.setSimilarity(new org.apache.lucene.search.similarities.BM25Similarity());
 
@@ -105,7 +155,7 @@ public class KeywordSearchStrategy {
         return toResults(searcher, hits, "keyword");
     }
 
-    static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits, String type) throws IOException {
+    public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits, String type) throws IOException {
         if (hits.scoreDocs.length == 0) return List.of();
 
         StoredFields storedFields = searcher.storedFields();
@@ -121,13 +171,14 @@ public class KeywordSearchStrategy {
             rawHits.add(new RawHit(doc, sd.score));
         }
 
-        // Second pass: apply log-normalized in-degree boost and re-sort
+        // Second pass: apply log-normalized in-degree boost + source-path penalty, then re-sort
         final int maxDeg = maxInDegree;
         return rawHits.stream()
                 .map(hit -> {
                     int inDeg = getInt(hit.doc(), DocumentMapper.F_IN_DEGREE);
                     float normBoost = (float) (Math.log1p(inDeg) / Math.log1p(maxDeg));
-                    float boostedScore = hit.rawScore() * (1.0f + GRAPH_BOOST_WEIGHT * normBoost);
+                    float penalty = sourcePathPenalty(hit.doc().get(DocumentMapper.F_FILE_PATH));
+                    float boostedScore = hit.rawScore() * (1.0f + GRAPH_BOOST_WEIGHT * normBoost) * penalty;
                     return docToResult(hit.doc(), boostedScore, type);
                 })
                 .sorted(Comparator.comparingDouble(SearchResult::score).reversed())
@@ -156,6 +207,28 @@ public class KeywordSearchStrategy {
                 searchType,
                 docType
         );
+    }
+
+    /**
+     * Penalizes test, benchmark, and non-source files so production classes
+     * rank above ancillary code that matches the same tokens.
+     *
+     * Multipliers (applied after BM25 + graph boost):
+     *   /src/test/   → 0.50   (unit/integration tests)
+     *   /benchmark/  → 0.30   (JMH benchmarks — heavy false-positive source)
+     *   /jmh/        → 0.30
+     *   .md / .txt   → 0.20   (documentation files)
+     *   otherwise    → 1.00
+     */
+    static float sourcePathPenalty(String filePath) {
+        if (filePath == null) return 1.0f;
+        String p = filePath.replace('\\', '/');
+        if (p.contains("/benchmark/")) return 0.30f;
+        if (p.contains("/jmh/"))        return 0.30f;
+        if (p.contains("/src/test/"))   return 0.50f;
+        if (p.contains("/.github/"))    return 0.10f;
+        if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".sh") || p.endsWith(".yml")) return 0.10f;
+        return 1.0f;
     }
 
     private static int getInt(Document doc, String field) {

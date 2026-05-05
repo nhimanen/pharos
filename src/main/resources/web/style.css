@@ -113,11 +113,32 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 
 .loading { color: var(--text-xdim); padding: 12px; font-style: italic; }
 
+/* ── Language filter chips ───────────────────────────────── */
+.lang-chips {
+  display: flex; flex-wrap: wrap; gap: 5px;
+  padding: 4px 12px 8px;
+}
+.lang-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; cursor: pointer;
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text-dim); transition: all .12s;
+  user-select: none;
+}
+.lang-chip:hover { border-color: var(--accent); color: var(--text); }
+.lang-chip.active { background: rgba(56,139,253,0.18); border-color: var(--accent); color: var(--accent); }
+.lang-count {
+  font-size: 10px; color: var(--text-xdim);
+  background: var(--bg); border-radius: 6px;
+  padding: 0 4px;
+}
+
 /* ── Graph container ─────────────────────────────────────── */
 #graph-container {
   flex: 1; position: relative; overflow: hidden; background: var(--bg);
 }
-#graph-canvas { width: 100%; height: 100%; display: block; }
+#graph-canvas { width: 100%; height: 100%; display: block; position: absolute; inset: 0; }
 
 .empty-hint {
   position: absolute; top: 50%; left: 50%;
@@ -127,6 +148,68 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 .empty-icon { font-size: 48px; margin-bottom: 12px; opacity: .3; }
 .empty-sub  { margin-top: 6px; font-size: 11px; }
 .empty-sub code { background: var(--bg2); padding: 2px 6px; border-radius: 4px; font-family: var(--mono); }
+
+/* ── Graph toolbar ───────────────────────────────────────── */
+#graph-toolbar {
+  position: absolute; top: 8px; right: 12px; z-index: 6;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  background: rgba(22,27,34,0.92);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  backdrop-filter: blur(6px);
+  font-size: 11px;
+  max-width: calc(100% - 24px);
+}
+
+.gtb-group {
+  display: flex; align-items: center; gap: 5px;
+  padding: 0 6px; border-right: 1px solid var(--border);
+}
+.gtb-group:last-child { border-right: none; padding-right: 0; }
+
+.gtb-label {
+  color: var(--text-xdim); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+}
+
+.gtb-sublabel {
+  color: var(--text-dim); font-size: 11px; white-space: nowrap;
+}
+
+.gtb-val {
+  color: var(--accent); font-family: var(--mono); font-size: 10px;
+  max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.gtb-opts {
+  display: flex; align-items: center; gap: 4px;
+}
+
+#focus-mode-select {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); padding: 2px 5px; font-size: 11px; outline: none; cursor: pointer;
+}
+#focus-mode-select:hover { border-color: var(--accent); }
+
+#ego-hops-slider {
+  accent-color: var(--accent);
+}
+
+#topn-input, #caller-depth-input {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); padding: 2px 5px; font-size: 11px; outline: none;
+}
+#topn-input:focus, #caller-depth-input:focus { border-color: var(--accent); }
+
+.btn-tool {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim); padding: 3px 8px; border-radius: var(--radius);
+  cursor: pointer; font-size: 11px; transition: all .12s; white-space: nowrap;
+}
+.btn-tool:hover  { border-color: var(--accent); color: var(--text); }
+.btn-tool.active { background: rgba(56,139,253,0.18); border-color: var(--accent); color: var(--accent); }
+.btn-zoom { font-size: 15px; padding: 2px 9px; line-height: 1; }
 
 /* ── Detail panel ────────────────────────────────────────── */
 #detail-panel {
@@ -203,9 +286,38 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 .related-list li { padding: 4px 0; border-bottom: 1px solid var(--border); }
 .related-list li:last-child { border-bottom: none; }
 .related-label { color: var(--text); font-size: 11px; display: block; word-break: break-word; }
+.related-label--link {
+  color: var(--accent); cursor: pointer; text-decoration: underline;
+  text-decoration-color: rgba(56,139,253,0.35); text-underline-offset: 2px;
+}
+.related-label--link:hover { text-decoration-color: var(--accent); }
 .related-file  { color: var(--text-xdim); font-family: var(--mono); font-size: 10px; }
 .related-more  { color: var(--text-xdim); font-style: italic; font-size: 11px; padding: 4px 0; }
 .related-empty { color: var(--text-xdim); font-style: italic; font-size: 11px; padding: 4px 0; }
+
+/* ── Context menu ────────────────────────────────────────── */
+#ctx-menu {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 0;
+  min-width: 190px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.5);
+  font-size: 12px;
+}
+.ctx-item {
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: background .1s, color .1s;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: var(--bg3); color: var(--text); }
+.ctx-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 3px 0;
+}
 
 /* ── Tooltip ─────────────────────────────────────────────── */
 .tooltip {
@@ -227,16 +339,13 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   background: rgba(13,17,23,0.88); padding: 4px 12px;
   border-radius: var(--radius); border: 1px solid var(--border);
   pointer-events: auto;
+  max-width: 50%;
 }
-.breadcrumb-link {
-  color: var(--accent); cursor: pointer; transition: color .1s;
-}
+.breadcrumb-link { color: var(--accent); cursor: pointer; transition: color .1s; }
 .breadcrumb-link:hover { color: #fff; }
 .breadcrumb-sep { color: var(--text-xdim); }
 .breadcrumb-current { color: var(--text); font-weight: 500; }
-.breadcrumb-hint {
-  margin-left: 8px; color: var(--text-xdim); font-size: 10px; font-style: italic;
-}
+.breadcrumb-hint { margin-left: 8px; color: var(--text-xdim); font-size: 10px; font-style: italic; }
 
 /* ── D3 graph elements ───────────────────────────────────── */
 .node { cursor: pointer; }
@@ -244,3 +353,9 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 .node:hover circle { filter: brightness(1.3); }
 .node text { pointer-events: none; user-select: none; }
 line.link { transition: stroke-opacity .1s; }
+
+/* Hull polygons drawn by D3 on SVG */
+.hull-layer path {
+  pointer-events: none;
+  stroke-linejoin: round;
+}

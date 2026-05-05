@@ -27,8 +27,8 @@
         <logback.version>1.5.8</logback.version>
         <junit.version>5.11.0</junit.version>
         <assertj.version>3.26.3</assertj.version>
-        <!-- Exclude slow/integration tests by default; override with -DexcludedGroups= to run all -->
-        <excludedGroups>perf,integration</excludedGroups>
+        <!-- Exclude slow/integration/quality tests by default; override with -DexcludedGroups= to run all -->
+        <excludedGroups>perf,integration,quality</excludedGroups>
     </properties>
 
     <dependencyManagement>
@@ -186,7 +186,9 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.3.1</version>
                 <configuration>
-                    <!-- Vector API graduated in Java 21+, no add-modules needed -->
+                    <!-- JavaParser reflects on JDK classes including jdk.incubator.vector
+                         when parsing corpora (e.g. Lucene) that use the Vector API. -->
+                    <argLine>--add-modules jdk.incubator.vector</argLine>
                     <excludedGroups>${excludedGroups}</excludedGroups>
                 </configuration>
             </plugin>

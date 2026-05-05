@@ -14,6 +14,13 @@ import io.javalin.json.JavalinJackson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.pharos.indexer.DocumentMapper;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.TopDocs;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -90,6 +97,14 @@ public class WebServer {
             ProjectMeta meta = registry.find(name).orElse(null);
             if (meta == null) { ctx.status(404).result("Project not found: " + name); return; }
             ctx.json(buildCallGraphData(meta, limit, pkg, className));
+        });
+
+        // API: language breakdown for a project
+        app.get("/api/languages/{project}", ctx -> {
+            String name = ctx.pathParam("project");
+            ProjectMeta meta = registry.find(name).orElse(null);
+            if (meta == null) { ctx.status(404).result("Project not found: " + name); return; }
+            ctx.json(buildLanguageBreakdown(meta));
         });
 
         // API: search
@@ -211,6 +226,11 @@ public class WebServer {
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {
         CallGraph graph = loadCallGraphCached(meta);
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
+        Map<String, String> fqnToFile = buildFqnToFilePath(meta);
+        // Map class FQN → filePath (use first method's path as representative)
+        Map<String, String> classToFile = new HashMap<>();
+        for (Map.Entry<String, String> e : fqnToFile.entrySet())
+            classToFile.putIfAbsent(extractFullClass(e.getKey()), e.getValue());
 
         Set<String> allMethods = new HashSet<>(graph.allMethods());
 
@@ -256,6 +276,8 @@ public class WebServer {
             n.put("methodCount", methodCount.getOrDefault(cls, 0));
             n.put("inDegree", classInDegree.getOrDefault(cls, 0));
             n.put("external", external);
+            String fp = classToFile.get(cls);
+            if (fp != null) n.put("filePath", fp);
             return n;
         }).collect(Collectors.toList());
 
@@ -270,6 +292,7 @@ public class WebServer {
     private Map<String, Object> buildCallGraphData(ProjectMeta meta, int limit, String pkg, String className) throws Exception {
         CallGraph graph = loadCallGraphCached(meta);
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
+        Map<String, String> fqnToFile = buildFqnToFilePath(meta);
 
         Set<String> methods = new HashSet<>(graph.allMethods());
         boolean classView = className != null && !className.isBlank();
@@ -306,6 +329,8 @@ public class WebServer {
             n.put("kind", inferKind(fqn));
             n.put("inDegree", inDegree.getOrDefault(fqn, 0));
             n.put("external", !knownPkgs.contains(p));
+            String fp = fqnToFile.get(fqn);
+            if (fp != null) n.put("filePath", fp);
             nodeMap.put(fqn, n);
         }
 
@@ -328,6 +353,8 @@ public class WebServer {
                             ext.put("kind", inferKind(target));
                             ext.put("inDegree", 0);
                             ext.put("external", !knownPkgs.contains(p));
+                            String tfp = fqnToFile.get(target);
+                            if (tfp != null) ext.put("filePath", tfp);
                             nodeMap.put(target, ext);
                         }
                     } else {
@@ -348,6 +375,56 @@ public class WebServer {
         result.put("total", filtered.size());
         result.put("truncated", filtered.size() > limit);
         return result;
+    }
+
+    // ── Language breakdown ─────────────────────────────────────────────────────
+
+    /** Returns a sorted map of file-extension → doc count for the given project. */
+    private Map<String, Integer> buildLanguageBreakdown(ProjectMeta meta) throws IOException {
+        if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
+        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexSearcher searcher = new IndexSearcher(reader);
+        TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
+        StoredFields sf = searcher.storedFields();
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (var sd : all.scoreDocs) {
+            String fp = sf.document(sd.doc).get(DocumentMapper.F_FILE_PATH);
+            if (fp == null || fp.isBlank()) continue;
+            String ext = extension(fp);
+            counts.merge(ext, 1, Integer::sum);
+        }
+        // Return sorted by count descending
+        return counts.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey, Map.Entry::getValue,
+                        (a, b) -> a, LinkedHashMap::new));
+    }
+
+    /** Builds a FQN → filePath map by scanning the Lucene index for a project. */
+    private Map<String, String> buildFqnToFilePath(ProjectMeta meta) throws IOException {
+        if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
+        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexSearcher searcher = new IndexSearcher(reader);
+        TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
+        StoredFields sf = searcher.storedFields();
+        Map<String, String> map = new HashMap<>();
+        for (var sd : all.scoreDocs) {
+            var doc = sf.document(sd.doc);
+            String id = doc.get(DocumentMapper.F_ID);       // "projectName:fqn"
+            String fp = doc.get(DocumentMapper.F_FILE_PATH);
+            if (id == null || fp == null) continue;
+            int colon = id.indexOf(':');
+            String fqn = colon >= 0 ? id.substring(colon + 1) : id;
+            map.put(fqn, fp);
+        }
+        return map;
+    }
+
+    private static String extension(String filePath) {
+        int dot = filePath.lastIndexOf('.');
+        if (dot < 0 || dot == filePath.length() - 1) return "other";
+        return filePath.substring(dot + 1).toLowerCase();
     }
 
     // ── DTO mappers ────────────────────────────────────────────────────────────

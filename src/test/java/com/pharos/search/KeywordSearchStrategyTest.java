@@ -13,13 +13,19 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.*;
 
 class KeywordSearchStrategyTest {
+
+    @TempDir
+    Path tempDir;
 
     private ByteBuffersDirectory dir;
     private DirectoryReader reader;
@@ -180,6 +186,117 @@ class KeywordSearchStrategyTest {
         assertThat(r.score()).isPositive();
         assertThat(r.searchType()).isEqualTo("keyword");
         assertThat(r.docType()).isEqualTo("method");
+    }
+
+    // --- sourcePathPenalty ---
+
+    @Test
+    void sourcePathPenalty_productionSource_returnsOne() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/src/main/java/com/example/Foo.java"))
+                .isEqualTo(1.0f);
+    }
+
+    @Test
+    void sourcePathPenalty_testSource_returnsHalf() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/src/test/java/com/example/FooTest.java"))
+                .isEqualTo(0.50f);
+    }
+
+    @Test
+    void sourcePathPenalty_benchmark_returnsLow() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/src/benchmark/java/com/example/Bench.java"))
+                .isEqualTo(0.30f);
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/jmh/java/com/example/Bench.java"))
+                .isEqualTo(0.30f);
+    }
+
+    @Test
+    void sourcePathPenalty_githubWorkflow_returnsVeryLow() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/.github/workflows/ci.yml"))
+                .isEqualTo(0.10f);
+    }
+
+    @Test
+    void sourcePathPenalty_docFiles_returnsVeryLow() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/docs/README.md")).isEqualTo(0.10f);
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/scripts/build.sh")).isEqualTo(0.10f);
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("/config/app.yml")).isEqualTo(0.10f);
+    }
+
+    @Test
+    void sourcePathPenalty_null_returnsOne() {
+        assertThat(KeywordSearchStrategy.sourcePathPenalty(null)).isEqualTo(1.0f);
+    }
+
+    @Test
+    void sourcePathPenalty_windowsPath_normalizedCorrectly() {
+        // Backslash paths (Windows) must be treated the same as forward slashes
+        assertThat(KeywordSearchStrategy.sourcePathPenalty("C:\\project\\src\\test\\FooTest.java"))
+                .isEqualTo(0.50f);
+    }
+
+    // --- synonym hot-reload ---
+
+    @Test
+    void search_worksWithNoSynonymFile() throws IOException {
+        // Synonym file absent — strategy must still construct and search normally
+        Path absentFile = tempDir.resolve("missing-synonyms.txt");
+        KeywordSearchStrategy s = new KeywordSearchStrategy(absentFile);
+
+        writeMethod("proj", "Calc", "add", "public int add(int a, int b)", "return a + b;", null, 0);
+        openReader();
+
+        List<SearchResult> results = s.search(reader, SearchRequest.keyword("add", "proj", 10));
+        assertThat(results).isNotEmpty();
+    }
+
+    @Test
+    void search_picksUpSynonymAfterFileCreated() throws Exception {
+        Path synonymFile = tempDir.resolve("synonyms.txt");
+        // Start with no synonym file
+        KeywordSearchStrategy s = new KeywordSearchStrategy(synonymFile);
+
+        writeMethod("proj", "Calc", "sum", "public int sum(int a, int b)", "return a + b;", null, 0);
+        openReader();
+
+        // First search: no synonyms → "addition" does not match "sum"
+        List<SearchResult> before = s.search(reader, SearchRequest.keyword("addition", "proj", 10));
+        assertThat(before).isEmpty();
+
+        // Write a synonym rule and ensure mtime advances
+        Files.writeString(synonymFile, "addition => sum\n");
+        // Force mtime change if filesystem resolution is coarse
+        synonymFile.toFile().setLastModified(System.currentTimeMillis() + 1000);
+
+        // Next search triggers reloadIfChanged → new analyzer active
+        List<SearchResult> after = s.search(reader, SearchRequest.keyword("addition", "proj", 10));
+        assertThat(after).isNotEmpty();
+        assertThat(after.get(0).methodName()).isEqualTo("sum");
+    }
+
+    @Test
+    void search_reloadsWhenSynonymFileModified() throws Exception {
+        Path synonymFile = tempDir.resolve("synonyms.txt");
+        Files.writeString(synonymFile, "arithmetic => add\n");
+
+        KeywordSearchStrategy s = new KeywordSearchStrategy(synonymFile);
+
+        writeMethod("proj", "Calc", "add", "public int add(int a, int b)", "return a + b;", null, 0);
+        writeMethod("proj", "Calc", "multiply", "public int multiply(int a, int b)", "return a * b;", null, 0);
+        openReader();
+
+        // "arithmetic" maps to "add" — multiply should not appear at top
+        List<SearchResult> first = s.search(reader, SearchRequest.keyword("arithmetic", "proj", 10));
+        assertThat(first).isNotEmpty();
+        assertThat(first.get(0).methodName()).isEqualTo("add");
+
+        // Update synonym file: now "arithmetic" maps to "multiply"
+        Files.writeString(synonymFile, "arithmetic => multiply\n");
+        synonymFile.toFile().setLastModified(System.currentTimeMillis() + 2000);
+
+        List<SearchResult> second = s.search(reader, SearchRequest.keyword("arithmetic", "proj", 10));
+        assertThat(second).isNotEmpty();
+        assertThat(second.get(0).methodName()).isEqualTo("multiply");
     }
 
     // --- helpers ---

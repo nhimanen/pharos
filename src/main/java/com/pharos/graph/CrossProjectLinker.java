@@ -38,41 +38,51 @@ public class CrossProjectLinker {
      * all mutually-linked projects and resolving cross-project call edges.
      */
     public CallGraph buildCrossProjectGraph(String project1, String project2) throws IOException {
-        ProjectMeta meta1 = registry.find(project1)
-                .orElseThrow(() -> new IllegalArgumentException("Project not found: " + project1));
-        ProjectMeta meta2 = registry.find(project2)
-                .orElseThrow(() -> new IllegalArgumentException("Project not found: " + project2));
+        return buildCrossProjectGraph(List.of(project1, project2));
+    }
 
-        // Load individual graphs
-        Path graphPath1 = Path.of(meta1.getIndexPath()).resolve("graph.graphml");
-        Path graphPath2 = Path.of(meta2.getIndexPath()).resolve("graph.graphml");
+    /**
+     * Build a merged cross-project call graph across all given projects.
+     * Resolves unresolved refs in each project against all other projects.
+     * All projects must already be registered and indexed.
+     *
+     * @param projectNames names of projects to link (must be ≥ 2)
+     */
+    public CallGraph buildCrossProjectGraph(List<String> projectNames) throws IOException {
+        if (projectNames.size() < 2) {
+            throw new IllegalArgumentException("Need at least 2 projects to link");
+        }
 
+        List<ProjectMeta> metas = new ArrayList<>();
         CallGraph merged = new CallGraph();
-        mergeInto(merged, serializer.load(graphPath1));
-        mergeInto(merged, serializer.load(graphPath2));
 
-        // Resolve cross-project edges: unresolved refs in project1 that match packages in project2
+        for (String name : projectNames) {
+            ProjectMeta meta = registry.find(name)
+                    .orElseThrow(() -> new IllegalArgumentException("Project not found: " + name));
+            metas.add(meta);
+            Path graphPath = Path.of(meta.getIndexPath()).resolve("graph.graphml");
+            if (Files.exists(graphPath)) {
+                mergeInto(merged, serializer.load(graphPath));
+            }
+        }
+
+        // Resolve unresolved refs in each project against every other project
         int resolved = 0;
-        for (ProjectMeta.UnresolvedRef ref : meta1.getUnresolvedRefs()) {
-            String candidate = findInProject(ref.calleeMethodName, meta2);
-            if (candidate != null) {
-                merged.addCall(ref.callerFqn, candidate);
-                resolved++;
-                log.debug("Cross-project link: {} → {}", ref.callerFqn, candidate);
+        for (int i = 0; i < metas.size(); i++) {
+            for (int j = 0; j < metas.size(); j++) {
+                if (i == j) continue;
+                for (ProjectMeta.UnresolvedRef ref : metas.get(i).getUnresolvedRefs()) {
+                    String candidate = findInProject(ref.calleeMethodName, metas.get(j));
+                    if (candidate != null) {
+                        merged.addCall(ref.callerFqn, candidate);
+                        resolved++;
+                        log.debug("Cross-project link: {} → {}", ref.callerFqn, candidate);
+                    }
+                }
             }
         }
 
-        // Also resolve refs in project2 calling project1
-        for (ProjectMeta.UnresolvedRef ref : meta2.getUnresolvedRefs()) {
-            String candidate = findInProject(ref.calleeMethodName, meta1);
-            if (candidate != null) {
-                merged.addCall(ref.callerFqn, candidate);
-                resolved++;
-            }
-        }
-
-        log.info("Cross-project linking: {} new edges between '{}' and '{}'",
-                resolved, project1, project2);
+        log.info("Cross-project linking: {} new edges across {} projects", resolved, projectNames.size());
 
         // Persist the merged graph
         Path crossGraphPath = IndexConfig.DEFAULT_BASE.resolve("cross-project-graph.graphml");

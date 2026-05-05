@@ -1,5 +1,6 @@
 package com.pharos.indexer;
 
+import com.pharos.analysis.ConceptMiner;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -193,6 +194,8 @@ public class ProjectIndexManager {
         progress.onProgress("Done", meta.getFileCount(), meta.getFileCount());
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
+
+        expandSynonyms(projectName);
         return meta;
     }
 
@@ -312,6 +315,8 @@ public class ProjectIndexManager {
 
         progress.onProgress("Done", dirtyFiles.size(), dirtyFiles.size());
         log.info("Incremental index complete for '{}': {} files updated", projectName, dirtyFiles.size());
+
+        expandSynonyms(projectName);
         return meta;
     }
 
@@ -521,6 +526,31 @@ public class ProjectIndexManager {
         meta.setUnresolvedRefs(unresolvedRefs);
 
         return meta;
+    }
+
+    /**
+     * Mines discriminative TF-IDF terms from the freshly indexed project and
+     * appends new synonym rules to {@code ~/.pharos/synonyms.txt}.
+     *
+     * <p>Runs after every full or incremental index.  Errors are logged but
+     * never propagate — synonym expansion is best-effort and must not break
+     * the primary indexing pipeline.
+     */
+    private void expandSynonyms(String projectName) {
+        Path synonymFile = IndexConfig.DEFAULT_BASE.resolve("synonyms.txt");
+        try {
+            org.apache.lucene.index.IndexReader reader =
+                    luceneIndexer.openMultiReader(List.of(projectName));
+            ConceptMiner miner = new ConceptMiner(10, 2, 30, 0.05);
+            int added = miner.appendNewSynonyms(reader, synonymFile, projectName);
+            if (added > 0) {
+                log.info("Synonym expansion: appended {} new rules to {}", added, synonymFile);
+            } else {
+                log.debug("Synonym expansion: no new rules for '{}'", projectName);
+            }
+        } catch (Exception e) {
+            log.warn("Synonym expansion failed for '{}' (non-fatal): {}", projectName, e.getMessage());
+        }
     }
 
     /**

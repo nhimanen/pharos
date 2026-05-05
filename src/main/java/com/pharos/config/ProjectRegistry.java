@@ -67,6 +67,20 @@ public class ProjectRegistry {
         save(registry);
     }
 
+    /** Remove {@code name} from the linkedProjects list of every other project. */
+    public synchronized void unlinkAll(String name) {
+        Map<String, ProjectMeta> registry = loadAll();
+        boolean changed = false;
+        for (ProjectMeta meta : registry.values()) {
+            if (meta.getLinkedProjects().remove(name)) {
+                changed = true;
+            }
+        }
+        if (changed) {
+            save(registry);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, ProjectMeta> loadAll() {
         if (!Files.exists(registryFile)) {

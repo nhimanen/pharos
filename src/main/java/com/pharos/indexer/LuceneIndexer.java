@@ -1,10 +1,16 @@
 package com.pharos.indexer;
 
+import com.pharos.analysis.SynonymProvider;
 import com.pharos.config.IndexConfig;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.core.KeywordAnalyzer;
+import org.apache.lucene.analysis.core.LowerCaseFilter;
 import org.apache.lucene.analysis.miscellaneous.PerFieldAnalyzerWrapper;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.analysis.synonym.SynonymGraphFilter;
+import org.apache.lucene.analysis.synonym.SynonymMap;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.store.FSDirectory;
@@ -16,6 +22,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.ParseException;
 import java.util.*;
 import java.util.Comparator;
 
@@ -138,9 +145,12 @@ public class LuceneIndexer implements Closeable {
     }
 
     /**
-     * Builds the per-field analyzer:
+     * Builds the per-field analyzer used at <b>index time</b>:
      * - StandardAnalyzer for full-text fields (body, javadoc, signature, methodName, className)
      * - KeywordAnalyzer (default) for exact-match fields (id, project, filePath, etc.)
+     *
+     * <p>No synonyms are applied at index time — synonyms are query-only (see
+     * {@link #buildQueryAnalyzer}) so the synonym file can be updated without re-indexing.
      */
     public static Analyzer buildAnalyzer() {
         Map<String, Analyzer> fieldAnalyzers = new HashMap<>();
@@ -152,6 +162,62 @@ public class LuceneIndexer implements Closeable {
         fieldAnalyzers.put(DocumentMapper.F_CLASS_NAME, std);
         fieldAnalyzers.put(DocumentMapper.F_QUALIFIED_CLASS, std);
         fieldAnalyzers.put(DocumentMapper.F_ANNOTATIONS, std);
+        return new PerFieldAnalyzerWrapper(new KeywordAnalyzer(), fieldAnalyzers);
+    }
+
+    /**
+     * Builds the per-field analyzer used at <b>query time</b>.
+     *
+     * <p>Identical to {@link #buildAnalyzer} for exact-match fields.
+     * For full-text fields, wraps the standard tokenizer with a
+     * {@link SynonymGraphFilter} loaded from {@code ~/.pharos/synonyms.txt}
+     * when that file exists — enabling query-time vocabulary bridging without
+     * re-indexing.
+     *
+     * <p>If the synonym file is absent or fails to parse, falls back to
+     * {@link #buildAnalyzer} transparently.
+     *
+     * @param configBase the Pharos config directory (typically {@code ~/.pharos})
+     */
+    public static Analyzer buildQueryAnalyzer(Path configBase) {
+        Path synonymFile = configBase.resolve("synonyms.txt");
+        SynonymProvider provider = new SynonymProvider(synonymFile);
+        if (!provider.isAvailable()) {
+            return buildAnalyzer();
+        }
+
+        SynonymMap synonymMap;
+        try {
+            synonymMap = provider.load(true);
+        } catch (IOException | ParseException e) {
+            log.warn("Failed to load synonyms from {} — falling back to standard analyzer: {}",
+                    synonymFile, e.getMessage());
+            return buildAnalyzer();
+        }
+
+        // Build a synonym-aware analyzer for each full-text field.
+        // We construct it inline with an anonymous Analyzer subclass so that
+        // each field gets its own TokenStreamComponents (Lucene requires this).
+        final SynonymMap finalMap = synonymMap;
+        Analyzer synonymAnalyzer = new Analyzer() {
+            @Override
+            protected TokenStreamComponents createComponents(String fieldName) {
+                StandardTokenizer tokenizer = new StandardTokenizer();
+                TokenStream stream = new LowerCaseFilter(tokenizer);
+                stream = new SynonymGraphFilter(stream, finalMap, true);
+                return new TokenStreamComponents(tokenizer, stream);
+            }
+        };
+
+        Map<String, Analyzer> fieldAnalyzers = new HashMap<>();
+        for (String field : List.of(
+                DocumentMapper.F_BODY, DocumentMapper.F_JAVADOC, DocumentMapper.F_SIGNATURE,
+                DocumentMapper.F_METHOD_NAME, DocumentMapper.F_CLASS_NAME,
+                DocumentMapper.F_QUALIFIED_CLASS, DocumentMapper.F_ANNOTATIONS,
+                DocumentMapper.F_CALLER_CONTEXT)) {
+            fieldAnalyzers.put(field, synonymAnalyzer);
+        }
+        log.info("Query analyzer loaded with synonym expansion from {}", synonymFile);
         return new PerFieldAnalyzerWrapper(new KeywordAnalyzer(), fieldAnalyzers);
     }
 

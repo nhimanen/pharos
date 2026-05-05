@@ -83,9 +83,31 @@ public class McpServer {
         };
     }
 
+    private static final String INSTRUCTIONS = """
+            Pharos is a Java code search and navigation tool. Use it instead of grep or file reads when the current project is indexed.
+
+            Start with `list_projects` to check if the current project is indexed.
+
+            Tool selection guide:
+            - Finding code by concept or description → `search_code` with type=hybrid (default)
+            - Finding code by exact method or class name → `search_code` with type=keyword (BM25)
+            - Getting a full method implementation → `get_method` with the FQN from search results
+            - Understanding what a method calls / depends on → `get_callees`
+            - Understanding who calls a method (impact of a change) → `get_callers`
+            - Tracing an execution path between two methods → `find_call_path`
+            - Understanding module dependencies in a multi-module Maven project → `get_module_deps` or `find_module_path`
+            - Identifying a module's public API surface → `get_module_boundary`
+
+            FQN format: `com.example.MyClass#methodName(ParamType1,ParamType2)`
+            Use FQNs from `search_code` results directly in `get_method`, `get_callers`, `get_callees`.
+
+            For broad questions, start with `search_code` then drill down with graph tools.
+            """;
+
     private String handleInitialize(JsonNode id, JsonNode params) {
         ObjectNode result = mapper.createObjectNode();
         result.put("protocolVersion", PROTOCOL_VERSION);
+        result.put("instructions", INSTRUCTIONS);
         ObjectNode info = result.putObject("serverInfo");
         info.put("name", SERVER_NAME);
         info.put("version", SERVER_VERSION);
@@ -104,16 +126,22 @@ public class McpServer {
         String toolName = params.path("name").asText();
         JsonNode arguments = params.path("arguments");
 
+        long start = System.currentTimeMillis();
         try {
             String toolResult = toolRegistry.call(toolName, arguments);
+            long ms = System.currentTimeMillis() - start;
+            log.info("tool={} args={} status=ok latency_ms={} result_chars={}",
+                    toolName, arguments, ms, toolResult.length());
             ObjectNode result = mapper.createObjectNode();
             var content = result.putArray("content");
             var textContent = content.addObject();
             textContent.put("type", "text");
-                       textContent.put("text", toolResult);
+            textContent.put("text", toolResult);
             return successResponse(id, result);
         } catch (Exception e) {
-            log.warn("Tool call error for {}: {}", toolName, e.getMessage());
+            long ms = System.currentTimeMillis() - start;
+            log.warn("tool={} args={} status=error latency_ms={} error={}",
+                    toolName, arguments, ms, e.getMessage());
             return errorResponse(id, -32603, "Tool error: " + e.getMessage());
         }
     }

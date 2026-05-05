@@ -81,7 +81,7 @@ public class JavaCodeParser implements CodeParser {
         }
         ParserConfiguration cfg = new ParserConfiguration()
                 .setSymbolResolver(new JavaSymbolSolver(solver))
-                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_21)
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.RAW)
                 .setAttributeComments(true);
         return new JavaParser(cfg);
     }

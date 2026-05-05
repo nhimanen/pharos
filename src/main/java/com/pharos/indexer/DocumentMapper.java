@@ -140,9 +140,17 @@ public class DocumentMapper {
         // Also store for retrieval in stats/display
         doc.add(new StoredField(F_IN_DEGREE, inDegree));
         // Caller names as searchable text (e.g. "index indexFull buildAndSaveGraph")
+        // Lucene terms are capped at 32766 bytes — truncate to avoid IndexWriter errors
+        // on highly-connected methods (e.g. IndexWriter with hundreds of callers).
         if (callerNames != null && !callerNames.isEmpty()) {
-            doc.add(new TextField(F_CALLER_CONTEXT,
-                    String.join(" ", callerNames), Field.Store.YES));
+            String callerContext = String.join(" ", callerNames);
+            if (callerContext.length() > 32_000) {
+                callerContext = callerContext.substring(0, 32_000);
+                // trim to last complete word
+                int lastSpace = callerContext.lastIndexOf(' ');
+                if (lastSpace > 0) callerContext = callerContext.substring(0, lastSpace);
+            }
+            doc.add(new TextField(F_CALLER_CONTEXT, callerContext, Field.Store.YES));
         }
 
         // --- Vector embedding (only when available) ---

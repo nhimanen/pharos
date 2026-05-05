@@ -82,27 +82,18 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
         // to trigger deallocation of the parent TranslatorContext manager.
         // All intermediate tensors are created inside a child NDManager and released immediately
         // when the try block exits, rather than waiting for GC to trigger deallocation.
-        try (NDManager child = ctx.getNDManager().newSubManager()) {
-            NDArray maskFloat = mask.toType(DataType.FLOAT32, false);
-            maskFloat.attach(child);
-            NDArray maskExpanded = maskFloat
-                    .reshape(1, mask.getShape().get(1), 1)
-                    .broadcast(hidden.getShape());
-            maskExpanded.attach(child);
-
-            NDArray product = hidden.mul(maskExpanded);
-            product.attach(child);
-            NDArray sumEmbeddings = product.sum(new int[]{1});
-            sumEmbeddings.attach(child);
-            NDArray sumMask = maskExpanded.sum(new int[]{1}).clip(1e-9f, Float.MAX_VALUE);
-            sumMask.attach(child);
-
-            NDArray mean = sumEmbeddings.div(sumMask);
-            mean.attach(child);
-
-            // toFloatArray() copies to a Java primitive array — safe to return after child closes
-            return mean.squeeze(0).toFloatArray();
-        }
+        // Perform mean pooling — all intermediate NDArrays are owned by ctx.getNDManager()
+        // and released when the TranslatorContext closes. Manual .attach() re-parenting is
+        // avoided because OrtNDArray.attach() requires an OrtNDManager, not a sub-manager
+        // from a different engine backend (e.g. RsNDManager), which causes a ClassCastException.
+        NDArray maskFloat    = mask.toType(DataType.FLOAT32, false);
+        NDArray maskExpanded = maskFloat
+                .reshape(1, mask.getShape().get(1), 1)
+                .broadcast(hidden.getShape());
+        NDArray sumEmbeddings = hidden.mul(maskExpanded).sum(new int[]{1});
+        NDArray sumMask       = maskExpanded.sum(new int[]{1}).clip(1e-9f, Float.MAX_VALUE);
+        // toFloatArray() copies to a Java primitive array — safe to return after context closes
+        return sumEmbeddings.div(sumMask).squeeze(0).toFloatArray();
     }
 
     @Override

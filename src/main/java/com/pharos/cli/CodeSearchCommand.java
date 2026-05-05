@@ -23,6 +23,7 @@ import picocli.CommandLine.*;
                 ModulePathCommand.class,
                 McpServerCommand.class,
                 WebCommand.class,
+                RemoveIndexCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,

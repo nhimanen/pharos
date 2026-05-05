@@ -5,6 +5,7 @@ import com.pharos.web.WebServer;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
+import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.indexer.LuceneIndexer;
@@ -43,11 +44,12 @@ public class Main {
                 config, luceneIndexer, registry, embedder, moduleGraphBuilder, parsers);
         SearchEngine searchEngine = new SearchEngine(luceneIndexer, embedder, registry);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);
+        CrossProjectLinker crossProjectLinker = new CrossProjectLinker(config, registry);
 
         // Build picocli CommandLine with injected dependencies via factory
         CommandLine cmd = new CommandLine(new CodeSearchCommand(),
                 new DependencyFactory(config, registry, luceneIndexer, indexManager, searchEngine,
-                        moduleGraphBuilder, boundaryAnalyzer));
+                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker));
 
         int exitCode = cmd.execute(args);
         System.exit(exitCode);
@@ -66,11 +68,13 @@ public class Main {
         private final SearchEngine searchEngine;
         private final ModuleGraphBuilder moduleGraphBuilder;
         private final ModuleBoundaryAnalyzer boundaryAnalyzer;
+        private final CrossProjectLinker crossProjectLinker;
 
         DependencyFactory(IndexConfig config, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer, ProjectIndexManager indexManager,
                           SearchEngine searchEngine, ModuleGraphBuilder moduleGraphBuilder,
-                          ModuleBoundaryAnalyzer boundaryAnalyzer) {
+                          ModuleBoundaryAnalyzer boundaryAnalyzer,
+                          CrossProjectLinker crossProjectLinker) {
             this.config = config;
             this.registry = registry;
             this.luceneIndexer = luceneIndexer;
@@ -78,13 +82,14 @@ public class Main {
             this.searchEngine = searchEngine;
             this.moduleGraphBuilder = moduleGraphBuilder;
             this.boundaryAnalyzer = boundaryAnalyzer;
+            this.crossProjectLinker = crossProjectLinker;
         }
 
         @Override
         @SuppressWarnings("unchecked")
         public <K> K create(Class<K> cls) throws Exception {
             if (cls == IndexCommand.class)
-                return (K) new IndexCommand(indexManager);
+                return (K) new IndexCommand(indexManager, crossProjectLinker, registry);
             if (cls == SearchCommand.class)
                 return (K) new SearchCommand(searchEngine);
             if (cls == CallersCommand.class)
@@ -111,6 +116,8 @@ public class Main {
             if (cls == WebCommand.class)
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
                         moduleGraphBuilder, luceneIndexer));
+            if (cls == RemoveIndexCommand.class)
+                return (K) new RemoveIndexCommand(registry, luceneIndexer, moduleGraphBuilder);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

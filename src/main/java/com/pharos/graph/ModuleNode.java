@@ -56,6 +56,15 @@ public final class ModuleNode {
         this.projectName = Objects.requireNonNull(projectName);
     }
 
+    /**
+     * Downgrade this node from INDEXED to EXTERNAL when the project index is removed.
+     * Preserves module coordinates and edges so other projects' dependency info remains intact.
+     */
+    public void downgrade() {
+        this.status      = Status.EXTERNAL;
+        this.projectName = null;
+    }
+
     // --- Identity: moduleKey only ---
 
     @Override

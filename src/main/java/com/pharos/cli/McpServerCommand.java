@@ -35,6 +35,7 @@ public class McpServerCommand implements Callable<Integer> {
     public Integer call() {
         McpToolRegistry toolRegistry = new McpToolRegistry(
                 searchEngine, registry, moduleGraphBuilder, boundaryAnalyzer);
+        toolRegistry.warmUp();
         McpServer server = new McpServer(toolRegistry);
         server.start();
         return 0;

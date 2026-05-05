@@ -95,6 +95,41 @@ class ModuleNodeTest {
     }
 
     @Test
+    void downgrade_demotesIndexedToExternal() {
+        ModuleNode node = ModuleNode.indexed("com.example", "my-lib", "1.0", "my-project");
+
+        node.downgrade();
+
+        assertThat(node.getStatus()).isEqualTo(ModuleNode.Status.EXTERNAL);
+        assertThat(node.getProjectName()).isNull();
+        assertThat(node.isIndexed()).isFalse();
+    }
+
+    @Test
+    void downgrade_preservesCoordinatesAndVersion() {
+        ModuleNode node = ModuleNode.indexed("com.example", "my-lib", "2.5", "my-project");
+
+        node.downgrade();
+
+        assertThat(node.getGroupId()).isEqualTo("com.example");
+        assertThat(node.getArtifactId()).isEqualTo("my-lib");
+        assertThat(node.getVersion()).isEqualTo("2.5");
+        assertThat(node.getModuleKey()).isEqualTo("com.example:my-lib");
+    }
+
+    @Test
+    void upgradeAfterDowngrade_restoresIndexedStatus() {
+        ModuleNode node = ModuleNode.indexed("com.example", "my-lib", "1.0", "project-a");
+        node.downgrade();
+
+        node.upgrade("1.1", "project-b");
+
+        assertThat(node.getStatus()).isEqualTo(ModuleNode.Status.INDEXED);
+        assertThat(node.getProjectName()).isEqualTo("project-b");
+        assertThat(node.getVersion()).isEqualTo("1.1");
+    }
+
+    @Test
     void nullVersion_defaultsToUnknown() {
         ModuleNode node = ModuleNode.external("com.example", "lib", null);
 

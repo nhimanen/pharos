@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CodeSearch — Code Graph Browser</title>
+  <title>Pharos — Code Graph Browser</title>
   <link rel="stylesheet" href="/style.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" defer></script>
   <script src="/app.js" defer></script>
@@ -11,7 +11,7 @@
 <body>
   <header id="header">
     <div class="header-left">
-      <span class="logo">⬡ CodeSearch</span>
+      <span class="logo">🏛 Pharos</span>
       <button id="btn-modules" class="btn-view active" title="Show module dependency graph">Module Graph</button>
       <button id="btn-hide-external" class="btn-view" title="Toggle external dependencies">Hide external</button>
     </div>
@@ -35,6 +35,8 @@
         <div class="sidebar-title">Projects</div>
         <div id="project-list"><div class="loading">Loading…</div></div>
       </div>
+      <div class="sidebar-section" id="test-filter" style="display:none"></div>
+      <div class="sidebar-section" id="lang-filter" style="display:none"></div>
       <div class="sidebar-section" id="legend-section">
         <div class="sidebar-title">Legend</div>
         <div id="legend">
@@ -50,7 +52,67 @@
 
     <div id="graph-container">
       <div id="breadcrumb" class="breadcrumb" style="display:none"></div>
+
+      <!-- Graph toolbar (floating, top-right) -->
+      <div id="graph-toolbar">
+        <div class="gtb-group">
+          <span class="gtb-label">Focus</span>
+          <select id="focus-mode-select" title="Node reduction / focus mode">
+            <option value="none">— None —</option>
+            <option value="ego">Ego Graph</option>
+            <option value="expand">Lazy Expand</option>
+            <option value="topn">Top-N Centrality</option>
+            <option value="collapse-leaves">Collapse Leaves</option>
+          </select>
+          <div id="ego-opts" class="gtb-opts" style="display:none">
+            <span class="gtb-sublabel">Hops&nbsp;<span id="ego-hops-display">2</span></span>
+            <input type="range" id="ego-hops-slider" min="1" max="4" value="2" step="1" style="width:64px">
+          </div>
+          <div id="topn-opts" class="gtb-opts" style="display:none">
+            <span class="gtb-sublabel">Top</span>
+            <input type="number" id="topn-input" min="5" max="500" value="50" style="width:52px">
+            <span class="gtb-sublabel">nodes</span>
+          </div>
+          <div id="expand-opts" class="gtb-opts" style="display:none">
+            <button id="btn-expand-reset" class="btn-tool" title="Reset expand tree">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="gtb-group">
+          <span class="gtb-label">Caller Depth</span>
+          <span id="caller-depth-label" class="gtb-val" title="Active root node">—</span>
+          <input type="number" id="caller-depth-input" min="1" max="10" value="2" style="width:40px" title="Number of hops">
+          <button id="btn-caller-depth-clear" class="btn-tool" style="display:none" title="Clear caller-depth filter">✕</button>
+        </div>
+
+        <div class="gtb-group">
+          <span class="gtb-label">Layout</span>
+          <button id="btn-clusters"  class="btn-tool" title="Group nodes into package hulls">Cluster Pkgs</button>
+          <button id="btn-overview"  class="btn-tool" title="Toggle overview panel">Overview</button>
+        </div>
+
+        <div class="gtb-group">
+          <button id="btn-search-focus" class="btn-tool" title="Hide non-matching nodes (vs dimming)">Search→Focus</button>
+          <button id="btn-zoom-in"      class="btn-tool btn-zoom" title="Zoom in (+)">+</button>
+          <button id="btn-zoom-out"     class="btn-tool btn-zoom" title="Zoom out (−)">−</button>
+          <button id="btn-reset-view"   class="btn-tool" title="Reset zoom / pan">⊙ Reset</button>
+        </div>
+      </div>
+
+      <!-- Renderers -->
       <svg id="graph-canvas"></svg>
+      <canvas id="gl-canvas"
+        style="display:none; position:absolute; inset:0; width:100%; height:100%; z-index:1;"></canvas>
+
+      <!-- Overview panel (bottom-left) -->
+      <div id="overview-panel"
+        style="display:none; position:absolute; bottom:12px; left:12px;
+               width:220px; height:180px; border-radius:6px; overflow:hidden;
+               border:1px solid #30363d; z-index:5; cursor:pointer;
+               box-shadow:0 2px 8px rgba(0,0,0,.5);">
+        <canvas id="overview-canvas" style="display:block;"></canvas>
+      </div>
+
       <div id="empty-hint" class="empty-hint" style="display:none">
         <div class="empty-icon">⬡</div>
         <div>No data to display.</div>
@@ -65,6 +127,15 @@
       </div>
       <div id="detail-content"></div>
     </aside>
+  </div>
+
+  <!-- Right-click context menu -->
+  <div id="ctx-menu" style="display:none; position:fixed; z-index:9999;">
+    <div class="ctx-item" data-ctx="pin">📌 Pin node</div>
+    <div class="ctx-sep"></div>
+    <div class="ctx-item" data-ctx="ego">⊙ Ego graph from here</div>
+    <div class="ctx-item" data-ctx="expand-root">⊕ Expand from here</div>
+    <div class="ctx-item" data-ctx="caller-root">↔ Set as caller-depth root</div>
   </div>
 
   <div id="tooltip" class="tooltip" style="display:none"></div>

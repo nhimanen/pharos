@@ -188,18 +188,18 @@ class AgentSearchQualityTest {
         IndexConfig config = IndexConfig.load();
         ProjectRegistry registry = new ProjectRegistry(config);
 
-        var mypalMeta = registry.find("mypal")
+        var luceneMeta = registry.find("lucene")
                 .orElseThrow(() -> new IllegalStateException(
-                        "Mypal project not indexed.\n" +
-                        "Run: pharos index /home/nhimanen/projects/mypal --project mypal"));
+                        "Lucene project not indexed.\n" +
+                        "Run: pharos index /home/nhimanen/projects/lucene --project lucene"));
 
         org.junit.jupiter.api.Assumptions.assumeTrue(
-                mypalMeta.getMethodCount() > 0,
-                "Mypal project has 0 methods — still indexing. Re-run after indexing completes.");
+                luceneMeta.getMethodCount() > 0,
+                "Lucene project has 0 methods — still indexing. Re-run after indexing completes.");
 
-        luceneRoot = Path.of(mypalMeta.getRootPath());
+        luceneRoot = Path.of(luceneMeta.getRootPath());
         assertThat(luceneRoot).exists()
-                .withFailMessage("Mypal source root not found at %s", luceneRoot);
+                .withFailMessage("Lucene source root not found at %s", luceneRoot);
 
         luceneIndexer = new LuceneIndexer(config);
         searchEngine  = new SearchEngine(luceneIndexer, EmbeddingProvider.create(config), registry);
@@ -218,7 +218,7 @@ class AgentSearchQualityTest {
     @Order(1)
     void keyword_findsExpectedClasses(QueryScenario scenario) throws Exception {
         List<SearchResult> results = searchEngine.search(
-                SearchRequest.keyword(scenario.nlQuery(), "mypal", 20));
+                SearchRequest.keyword(scenario.nlQuery(), "lucene", 20));
 
         System.out.printf("%n── keyword · %s ──%n", scenario.id());
         System.out.printf("   Query: \"%s\"%n", scenario.nlQuery());
@@ -243,10 +243,10 @@ class AgentSearchQualityTest {
     @Order(2)
     void hybrid_notWorseThanKeyword(QueryScenario scenario) throws Exception {
         List<SearchResult> kwResults = searchEngine.search(
-                SearchRequest.keyword(scenario.nlQuery(), "mypal", 20));
+                SearchRequest.keyword(scenario.nlQuery(), "lucene", 20));
         List<SearchResult> hybridResults = searchEngine.search(new SearchRequest(
                 scenario.nlQuery(), SearchRequest.SearchType.HYBRID,
-                "mypal", null, 20, "text", null));
+                "lucene", null, 20, "text", null));
 
         long kwHits     = countHits(kwResults,     scenario.expectedClasses());
         long hybridHits = countHits(hybridResults, scenario.expectedClasses());
@@ -324,7 +324,7 @@ class AgentSearchQualityTest {
             List<SearchResult> kwRes = searchEngine.search(
                     SearchRequest.keyword(s.nlQuery(), "lucene", 20));
             List<SearchResult> hybridRes = searchEngine.search(new SearchRequest(
-                    s.nlQuery(), SearchRequest.SearchType.HYBRID, "mypal", null, 20, "text", null));
+                    s.nlQuery(), SearchRequest.SearchType.HYBRID, "lucene", null, 20, "text", null));
 
             long kwHits     = countHits(kwRes, s.expectedClasses());
             long hybridHits = countHits(hybridRes, s.expectedClasses());
@@ -429,7 +429,6 @@ class AgentSearchQualityTest {
                 "claude",
                 "--mcp-config", mcpConfig.toString(),
                 "--output-format", "text",
-                "--no-conversation",
                 "-p", prompt);
         pb.environment().put("HOME", System.getProperty("user.home"));
         pb.environment().remove("CLAUDE_SESSION_ID");
@@ -471,7 +470,7 @@ class AgentSearchQualityTest {
         Path target = Path.of(System.getProperty("user.dir"), "target");
         try (var stream = Files.list(target)) {
             return stream
-                    .filter(p -> p.getFileName().toString().matches("code-search-.*\\.jar")
+                    .filter(p -> p.getFileName().toString().matches("pharos-.*\\.jar")
                             && !p.getFileName().toString().contains("original"))
                     .findFirst()
                     .orElseThrow(() -> new IllegalStateException(

@@ -12,12 +12,27 @@ const COLORS = {
   indexed:     '#26a69a',
   external:    '#78909c',
   selected:    '#ff7043',
-  highlight:   '#ffd54f'
+  highlight:   '#ffd54f',
 };
+
+const CANVAS_THRESHOLD = 300;
+
+const PKG_HULL_FILL = [
+  'rgba(56,139,253,0.07)',  'rgba(63,185,80,0.07)',
+  'rgba(171,71,188,0.07)',  'rgba(38,198,218,0.07)',
+  'rgba(255,213,79,0.07)',  'rgba(255,112,67,0.07)',
+  'rgba(120,144,156,0.07)', 'rgba(38,166,154,0.07)',
+];
+const PKG_HULL_STROKE = [
+  'rgba(56,139,253,0.28)',  'rgba(63,185,80,0.28)',
+  'rgba(171,71,188,0.28)',  'rgba(38,198,218,0.28)',
+  'rgba(255,213,79,0.28)',  'rgba(255,112,67,0.28)',
+  'rgba(120,144,156,0.28)', 'rgba(38,166,154,0.28)',
+];
 
 // ── State ────────────────────────────────────────────────────
 const S = {
-  view:            'modules', // 'modules' | 'classes' | 'call'
+  view:            'modules',
   selectedProject: null,
   selectedClass:   null,
   selectedNode:    null,
@@ -25,33 +40,76 @@ const S = {
   graphData:       null,
   searchQuery:     '',
   hideExternal:    false,
+  // Focus modes
+  focusMode:       'none',   // 'none'|'ego'|'expand'|'topn'|'collapse-leaves'
+  egoHops:         2,
+  egoCenter:       null,     // node id
+  topN:            50,
+  expandRoot:      null,     // node id
+  expandedNodes:   new Set(),
+  // Caller-depth filter
+  callerDepth:     2,
+  callerDepthRoot: null,
+  // Visual
+  pinnedNodes:     new Set(),
+  showClusters:    false,
+  showOverview:    false,
+  searchToFocus:   false,
+  // Language filter
+  langFilter:      null,    // e.g. 'java', 'py', null = all
+  langCounts:      {},      // { java: 120, py: 5, ... }
+  // Test/production filter
+  testFilter:      'all',   // 'all' | 'prod' | 'test'
+  // Renderer
+  useCanvas:       false,
+  zoomTransform:   d3.zoomIdentity,
+  // Context menu target
+  ctxMenuNode:     null,
 };
 
 // ── D3 refs ──────────────────────────────────────────────────
-let svgSel, gSel, simulation;
+let svgSel, gSel, simulation, zoomBehavior;
+let canvasEl, canvasCtx;
+let overviewEl, overviewCtx;
+let hullLayer;
+let svgLinkSel, svgNodeSel;
+let currentNodes = [], currentEdges = [], currentMode = 'modules';
+let minimapState = { scale: 1, ox: 0, oy: 0 };
+
+// Canvas interaction state
+let canvasDragNode = null, canvasDragActive = false, canvasHoverNode = null;
 
 // ── Boot ─────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initGraph();
   initControls();
+  initContextMenu();
   await refreshProjects();
   await loadModuleGraph();
 });
 
-// ── Graph canvas setup ───────────────────────────────────────
+// ── Graph canvas setup ────────────────────────────────────────
 function initGraph() {
   const container = document.getElementById('graph-container');
-  svgSel = d3.select('#graph-canvas');
+  svgSel    = d3.select('#graph-canvas');
+  canvasEl  = document.getElementById('gl-canvas');
+  canvasCtx = canvasEl.getContext('2d');
+  overviewEl  = document.getElementById('overview-canvas');
+  overviewCtx = overviewEl.getContext('2d');
 
   function resize() {
     const r = container.getBoundingClientRect();
     svgSel.attr('width', r.width).attr('height', r.height);
-    if (simulation) simulation.force('center', d3.forceCenter(r.width / 2, r.height / 2)).alpha(0.1).restart();
+    canvasEl.width  = r.width;
+    canvasEl.height = r.height;
+    if (simulation)
+      simulation.force('center', d3.forceCenter(r.width / 2, r.height / 2)).alpha(0.1).restart();
+    if (S.showOverview) drawOverview();
   }
   new ResizeObserver(resize).observe(container);
   resize();
 
-  // Arrow marker
+  // SVG arrow marker
   const defs = svgSel.append('defs');
   defs.append('marker')
     .attr('id', 'arrow')
@@ -61,16 +119,131 @@ function initGraph() {
     .attr('orient', 'auto')
     .append('path').attr('d', 'M0,-4L9,0L0,4').attr('fill', '#555');
 
-  gSel = svgSel.append('g');
+  hullLayer = svgSel.append('g').attr('class', 'hull-layer');
+  gSel      = svgSel.append('g');
 
-  svgSel.call(d3.zoom().scaleExtent([0.04, 10])
-    .on('zoom', e => gSel.attr('transform', e.transform)));
+  // Zoom – applied to SVG by default; switches to canvas when in canvas mode
+  zoomBehavior = d3.zoom()
+    .scaleExtent([0.04, 10])
+    .filter(ev => {
+      if (S.useCanvas && ev.type === 'mousedown' && canvasDragActive) return false;
+      return !ev.ctrlKey && !ev.button;
+    })
+    .on('zoom', e => {
+      S.zoomTransform = e.transform;
+      if (S.useCanvas) {
+        drawCanvasFrame();
+      } else {
+        gSel.attr('transform', e.transform);
+        hullLayer.attr('transform', e.transform);
+      }
+      if (S.showOverview) drawOverview();
+    });
 
-  svgSel.on('click', () => {
-    S.selectedNode = null;
-    closeDetail();
-    clearHighlight();
+  svgSel.call(zoomBehavior);
+  svgSel.on('click', ev => {
+    if (ev.target === svgSel.node()) {
+      S.selectedNode = null;
+      closeDetail();
+      clearHighlight();
+      hideCtxMenu();
+    }
   });
+
+  // Canvas events
+  canvasEl.addEventListener('mousedown',   onCanvasMouseDown, { passive: false });
+  canvasEl.addEventListener('mousemove',   onCanvasMouseMove);
+  canvasEl.addEventListener('mouseup',     onCanvasMouseUp);
+  canvasEl.addEventListener('click',       onCanvasClick);
+  canvasEl.addEventListener('dblclick',    onCanvasDbClick);
+  canvasEl.addEventListener('contextmenu', onCanvasContextMenu);
+  document.addEventListener('mouseup', () => {
+    if (canvasDragNode) {
+      if (!S.pinnedNodes.has(canvasDragNode.id)) { canvasDragNode.fx = null; canvasDragNode.fy = null; }
+      if (simulation) simulation.alphaTarget(0);
+    }
+    canvasDragNode  = null;
+    canvasDragActive = false;
+  });
+
+  overviewEl.addEventListener('click', ev => panToMinimapClick(ev, overviewEl));
+}
+
+function panToMinimapClick(ev, canvasElem) {
+  if (!currentNodes.length) return;
+  const r  = canvasElem.getBoundingClientRect();
+  const gx = (ev.clientX - r.left - minimapState.ox) / minimapState.scale;
+  const gy = (ev.clientY - r.top  - minimapState.oy) / minimapState.scale;
+  const cr = document.getElementById('graph-container').getBoundingClientRect();
+  const t  = S.zoomTransform;
+  const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
+  target.call(zoomBehavior.transform,
+    d3.zoomIdentity.translate(cr.width / 2 - gx * t.k, cr.height / 2 - gy * t.k).scale(t.k));
+}
+
+// ── Canvas event handlers ─────────────────────────────────────
+function canvasGraphCoords(clientX, clientY) {
+  const r = canvasEl.getBoundingClientRect(), t = S.zoomTransform;
+  return { x: (clientX - r.left - t.x) / t.k, y: (clientY - r.top - t.y) / t.k };
+}
+
+function canvasHitTest(clientX, clientY) {
+  const { x, y } = canvasGraphCoords(clientX, clientY);
+  for (let i = currentNodes.length - 1; i >= 0; i--) {
+    const n = currentNodes[i];
+    if (n.x != null && Math.hypot(x - n.x, y - n.y) <= nodeR(n, currentMode) + 4) return n;
+  }
+  return null;
+}
+
+function onCanvasMouseDown(ev) {
+  const n = canvasHitTest(ev.clientX, ev.clientY);
+  if (n) {
+    canvasDragActive = true;
+    canvasDragNode   = n;
+    if (simulation) simulation.alphaTarget(0.3).restart();
+    n.fx = n.x; n.fy = n.y;
+    ev.stopPropagation();
+  }
+}
+
+function onCanvasMouseMove(ev) {
+  if (canvasDragNode) {
+    const { x, y } = canvasGraphCoords(ev.clientX, ev.clientY);
+    canvasDragNode.fx = x;
+    canvasDragNode.fy = y;
+    return;
+  }
+  const n = canvasHitTest(ev.clientX, ev.clientY);
+  if (n !== canvasHoverNode) {
+    canvasHoverNode = n;
+    if (n) showTooltip(ev, n); else hideTooltip();
+  } else if (n) {
+    const tip = document.getElementById('tooltip');
+    tip.style.left = (ev.pageX + 14) + 'px';
+    tip.style.top  = (ev.pageY - 12) + 'px';
+  }
+}
+
+function onCanvasMouseUp() { canvasDragActive = false; }
+
+function onCanvasClick(ev) {
+  if (Math.abs(ev.movementX) + Math.abs(ev.movementY) > 4) return;
+  const n = canvasHitTest(ev.clientX, ev.clientY);
+  hideCtxMenu();
+  if (n) { ev.stopPropagation(); selectNode(n); }
+  else   { S.selectedNode = null; closeDetail(); clearHighlight(); }
+}
+
+function onCanvasDbClick(ev) {
+  const n = canvasHitTest(ev.clientX, ev.clientY);
+  if (n) { ev.stopPropagation(); drillDown(n); }
+}
+
+function onCanvasContextMenu(ev) {
+  ev.preventDefault();
+  const n = canvasHitTest(ev.clientX, ev.clientY);
+  if (n) showCtxMenu(ev.clientX, ev.clientY, n);
 }
 
 // ── Controls ─────────────────────────────────────────────────
@@ -88,20 +261,15 @@ function initControls() {
     S.searchQuery = e.target.value.toLowerCase();
     applyLocalFilter();
   });
-  searchInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter') doSearch();
-  });
+  searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
   document.getElementById('search-btn').addEventListener('click', doSearch);
 
   document.getElementById('pkg-filter').addEventListener('change', e => {
-    if (S.view === 'call' && S.selectedProject) {
+    if (S.view === 'call' && S.selectedProject)
       loadCallGraph(S.selectedProject, e.target.value, S.selectedClass);
-    }
   });
 
   document.getElementById('detail-close').addEventListener('click', closeDetail);
-
-  // Detail panel event delegation
   document.getElementById('detail-content').addEventListener('click', e => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -110,10 +278,183 @@ function initControls() {
     if (action === 'callees')     loadRelated(fqn, 'callees');
     if (action === 'drill-proj')  loadClassGraph(project);
     if (action === 'drill-class') loadMethodGraph(S.selectedProject, cls);
+    if (action === 'focus-node')  focusNode(fqn);
+  });
+
+  // Focus mode
+  document.getElementById('focus-mode-select').addEventListener('change', e => {
+    S.focusMode = e.target.value;
+    if (S.focusMode !== 'ego')    S.egoCenter = null;
+    if (S.focusMode !== 'expand') { S.expandRoot = null; S.expandedNodes.clear(); }
+    syncFocusOpts();
+    if (S.graphData) rerender();
+  });
+
+  const egoSlider = document.getElementById('ego-hops-slider');
+  egoSlider.addEventListener('input', () => {
+    S.egoHops = +egoSlider.value;
+    document.getElementById('ego-hops-display').textContent = S.egoHops;
+    if (S.egoCenter && S.graphData) rerender();
+  });
+
+  document.getElementById('topn-input').addEventListener('input', e => {
+    S.topN = Math.max(5, +e.target.value || 50);
+    if (S.graphData) rerender();
+  });
+
+  document.getElementById('btn-expand-reset').addEventListener('click', () => {
+    S.expandRoot = null;
+    S.expandedNodes.clear();
+    if (S.graphData) rerender();
+  });
+
+  // Caller-depth
+  document.getElementById('caller-depth-input').addEventListener('input', e => {
+    S.callerDepth = Math.max(1, +e.target.value || 2);
+    if (S.callerDepthRoot && S.graphData) rerender();
+  });
+  document.getElementById('btn-caller-depth-clear').addEventListener('click', () => {
+    S.callerDepthRoot = null;
+    syncCallerDepthUI();
+    if (S.graphData) rerender();
+  });
+
+  // Layout toggles
+  document.getElementById('btn-clusters').addEventListener('click', () => {
+    S.showClusters = !S.showClusters;
+    document.getElementById('btn-clusters').classList.toggle('active', S.showClusters);
+    if (currentNodes.length) {
+      if (S.useCanvas) drawCanvasFrame();
+      else if (S.showClusters) updateHulls(currentNodes);
+      else hullLayer.selectAll('*').remove();
+    }
+  });
+
+  document.getElementById('btn-overview').addEventListener('click', () => {
+    S.showOverview = !S.showOverview;
+    document.getElementById('btn-overview').classList.toggle('active', S.showOverview);
+    document.getElementById('overview-panel').style.display = S.showOverview ? 'block' : 'none';
+    if (S.showOverview && currentNodes.length) drawOverview();
+  });
+
+  document.getElementById('btn-search-focus').addEventListener('click', () => {
+    S.searchToFocus = !S.searchToFocus;
+    document.getElementById('btn-search-focus').classList.toggle('active', S.searchToFocus);
+    applyLocalFilter();
+  });
+
+  document.getElementById('btn-zoom-in').addEventListener('click',  () => zoomBy(1.4));
+  document.getElementById('btn-zoom-out').addEventListener('click', () => zoomBy(1 / 1.4));
+  document.getElementById('btn-reset-view').addEventListener('click', resetZoom);
+}
+
+function syncFocusOpts() {
+  document.getElementById('ego-opts').style.display    = S.focusMode === 'ego'    ? 'flex' : 'none';
+  document.getElementById('topn-opts').style.display   = S.focusMode === 'topn'   ? 'flex' : 'none';
+  document.getElementById('expand-opts').style.display = S.focusMode === 'expand' ? 'flex' : 'none';
+}
+
+function syncCallerDepthUI() {
+  const lbl = document.getElementById('caller-depth-label');
+  if (lbl) lbl.textContent = S.callerDepthRoot ? shortId(S.callerDepthRoot) : '—';
+  const clr = document.getElementById('btn-caller-depth-clear');
+  if (clr) clr.style.display = S.callerDepthRoot ? 'inline-block' : 'none';
+}
+
+function zoomBy(factor) {
+  const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
+  target.transition().duration(250).call(zoomBehavior.scaleBy, factor);
+}
+
+function resetZoom() {
+  const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
+  target.transition().duration(350).call(zoomBehavior.transform, d3.zoomIdentity);
+}
+
+// ── Context menu ─────────────────────────────────────────────
+function initContextMenu() {
+  const menu = document.getElementById('ctx-menu');
+  document.addEventListener('click', hideCtxMenu);
+  menu.addEventListener('click', e => {
+    e.stopPropagation();
+    const item = e.target.closest('[data-ctx]');
+    if (!item || !S.ctxMenuNode) return;
+    handleCtxAction(item.dataset.ctx, S.ctxMenuNode);
+    hideCtxMenu();
+  });
+  // SVG right-click: use event delegation on the g container
+  gSel.on('contextmenu.ctx', ev => {
+    ev.preventDefault();
+    const nodeG = ev.target.closest('.node');
+    if (!nodeG) return;
+    const d = d3.select(nodeG).datum();
+    if (d) showCtxMenu(ev.clientX, ev.clientY, d);
   });
 }
 
-// ── Data loading ─────────────────────────────────────────────
+function showCtxMenu(x, y, node) {
+  S.ctxMenuNode = node;
+  const menu    = document.getElementById('ctx-menu');
+  const isPinned = S.pinnedNodes.has(node.id);
+  menu.querySelector('[data-ctx="pin"]').textContent = isPinned ? '📌 Unpin node' : '📌 Pin node';
+  menu.style.display = 'block';
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const mw = menu.offsetWidth || 190, mh = menu.offsetHeight || 110;
+  menu.style.left = Math.min(x, vw - mw - 8) + 'px';
+  menu.style.top  = Math.min(y, vh - mh - 8) + 'px';
+}
+
+function hideCtxMenu() { document.getElementById('ctx-menu').style.display = 'none'; }
+
+function handleCtxAction(action, node) {
+  switch (action) {
+    case 'pin':
+      togglePin(node);
+      break;
+    case 'ego':
+      document.getElementById('focus-mode-select').value = 'ego';
+      S.focusMode = 'ego';
+      S.egoCenter = node.id;
+      syncFocusOpts();
+      if (S.graphData) rerender();
+      break;
+    case 'caller-root':
+      S.callerDepthRoot = node.id;
+      syncCallerDepthUI();
+      if (S.graphData) rerender();
+      break;
+    case 'expand-root':
+      document.getElementById('focus-mode-select').value = 'expand';
+      S.focusMode   = 'expand';
+      S.expandRoot  = node.id;
+      S.expandedNodes.clear();
+      S.expandedNodes.add(node.id);
+      syncFocusOpts();
+      if (S.graphData) rerender();
+      break;
+  }
+}
+
+// ── Pinning ───────────────────────────────────────────────────
+function togglePin(node) {
+  const live = currentNodes.find(n => n.id === node.id) || node;
+  if (S.pinnedNodes.has(live.id)) {
+    S.pinnedNodes.delete(live.id);
+    live.fx = null; live.fy = null;
+  } else {
+    S.pinnedNodes.add(live.id);
+    live.fx = live.x; live.fy = live.y;
+  }
+  if (!S.useCanvas) {
+    svgNodeSel && svgNodeSel.select('circle')
+      .filter(d => d.id === live.id)
+      .attr('stroke',           S.pinnedNodes.has(live.id) ? '#ffd54f' : '#0d1117')
+      .attr('stroke-width',     S.pinnedNodes.has(live.id) ? 2.5 : 1.5)
+      .attr('stroke-dasharray', S.pinnedNodes.has(live.id) ? '4,2' : null);
+  }
+}
+
+// ── Data loading ──────────────────────────────────────────────
 async function refreshProjects() {
   const res = await fetch('/api/projects');
   S.projects = await res.json();
@@ -121,32 +462,29 @@ async function refreshProjects() {
 }
 
 async function loadModuleGraph() {
-  S.view = 'modules';
-  S.selectedProject = null;
-  S.selectedClass = null;
+  S.view = 'modules'; S.selectedProject = null; S.selectedClass = null;
+  S.langFilter = null; S.langCounts = {}; S.testFilter = 'all';
   setActiveBtn('btn-modules');
   document.getElementById('pkg-filter').innerHTML = '<option value="">All packages</option>';
   document.getElementById('pkg-filter').style.display = 'none';
   renderBreadcrumb();
-
   const res = await fetch('/api/graph/modules');
   S.graphData = await res.json();
   rerender();
   const vis = S.hideExternal ? S.graphData.nodes.filter(n => n.status !== 'external') : S.graphData.nodes;
   setStatus(`${vis.length} modules · ${S.graphData.edges.length} dependencies`);
   renderProjectList();
+  renderTestFilter();
+  renderLangFilter();
 }
 
 async function loadClassGraph(projectName) {
-  S.view = 'classes';
-  S.selectedProject = projectName;
-  S.selectedClass = null;
+  S.view = 'classes'; S.selectedProject = projectName; S.selectedClass = null;
+  S.langFilter = null; S.testFilter = 'all';
   setActiveBtn(null);
   document.getElementById('pkg-filter').style.display = 'none';
-  closeDetail();
-  renderBreadcrumb();
-  renderProjectList();
-
+  closeDetail(); renderBreadcrumb(); renderProjectList();
+  fetchLanguages(projectName);
   setStatus('Loading class graph…');
   const res = await fetch(`/api/graph/classes/${encodeURIComponent(projectName)}`);
   S.graphData = await res.json();
@@ -156,13 +494,10 @@ async function loadClassGraph(projectName) {
 }
 
 async function loadMethodGraph(projectName, className) {
-  S.view = 'call';
-  S.selectedProject = projectName;
-  S.selectedClass = className;
-  setActiveBtn(null);
-  closeDetail();
-  renderBreadcrumb();
-
+  S.view = 'call'; S.selectedProject = projectName; S.selectedClass = className;
+  S.langFilter = null; S.testFilter = 'all';
+  setActiveBtn(null); closeDetail(); renderBreadcrumb();
+  fetchLanguages(projectName);
   setStatus('Loading method graph…');
   const res = await fetch(
     `/api/graph/call/${encodeURIComponent(projectName)}?class=${encodeURIComponent(className)}&limit=500`
@@ -171,27 +506,32 @@ async function loadMethodGraph(projectName, className) {
   rerender();
   document.getElementById('pkg-filter').style.display = 'none';
   const vis = S.hideExternal ? S.graphData.nodes.filter(n => !n.external) : S.graphData.nodes;
-  const simple = className.split('.').pop();
-  setStatus(`${vis.length} methods · ${S.graphData.edges.length} calls in ${simple}`);
+  setStatus(`${vis.length} methods · ${S.graphData.edges.length} calls in ${className.split('.').pop()}`);
 }
 
-// kept for pkg-filter reloads
 async function loadCallGraph(project, pkg, className) {
-  S.view = 'call';
-  S.selectedProject = project;
-  const pkgParam  = pkg       ? `&package=${encodeURIComponent(pkg)}`       : '';
-  const clsParam  = className ? `&class=${encodeURIComponent(className)}`   : '';
+  S.view = 'call'; S.selectedProject = project;
+  const pkgParam = pkg       ? `&package=${encodeURIComponent(pkg)}`     : '';
+  const clsParam = className ? `&class=${encodeURIComponent(className)}` : '';
   const res = await fetch(`/api/graph/call/${encodeURIComponent(project)}?limit=150${pkgParam}${clsParam}`);
   S.graphData = await res.json();
-
   renderGraph(S.graphData.nodes, S.graphData.edges, 'call');
   populatePkgFilter(S.graphData.nodes);
-
   const extra = S.graphData.truncated ? ` (top 150 of ${S.graphData.total})` : '';
   setStatus(`${S.graphData.nodes.length} methods · ${S.graphData.edges.length} calls${extra}`);
 }
 
-// entry from sidebar project list click
+async function fetchLanguages(projectName) {
+  S.langCounts = {};
+  renderLangFilter();
+  renderTestFilter();
+  try {
+    const res = await fetch(`/api/languages/${encodeURIComponent(projectName)}`);
+    S.langCounts = await res.json();
+  } catch (_) { S.langCounts = {}; }
+  renderLangFilter();
+}
+
 async function browseProject(name) {
   S.selectedProject = name;
   renderProjectList();
@@ -202,76 +542,265 @@ async function browseProject(name) {
 function renderBreadcrumb() {
   const el = document.getElementById('breadcrumb');
   if (!el) return;
-
-  if (S.view === 'modules') {
-    el.style.display = 'none';
-    return;
-  }
+  if (S.view === 'modules') { el.style.display = 'none'; return; }
   el.style.display = 'flex';
 
   const parts = [];
   parts.push({ label: 'Projects', action: loadModuleGraph });
   if (S.selectedProject) {
-    if (S.view === 'classes') {
-      parts.push({ label: S.selectedProject, action: null });
-    } else {
-      parts.push({ label: S.selectedProject, action: () => loadClassGraph(S.selectedProject) });
-    }
+    if (S.view === 'classes') parts.push({ label: S.selectedProject, action: null });
+    else parts.push({ label: S.selectedProject, action: () => loadClassGraph(S.selectedProject) });
   }
-  if (S.selectedClass) {
-    parts.push({ label: S.selectedClass.split('.').pop(), action: null });
-  }
+  if (S.selectedClass) parts.push({ label: S.selectedClass.split('.').pop(), action: null });
 
-  const hintText = S.view === 'classes'
-    ? '<span class="breadcrumb-hint">double-click class → methods</span>'
-    : '';
+  const hint = S.view === 'classes'
+    ? '<span class="breadcrumb-hint">double-click class → methods</span>' : '';
 
   el.innerHTML = parts.map((p, i) => {
     const sep = i > 0 ? '<span class="breadcrumb-sep"> › </span>' : '';
-    if (p.action) {
-      return `${sep}<span class="breadcrumb-link" data-idx="${i}">${esc(p.label)}</span>`;
-    }
-    return `${sep}<span class="breadcrumb-current">${esc(p.label)}</span>`;
-  }).join('') + hintText;
+    return p.action
+      ? `${sep}<span class="breadcrumb-link" data-idx="${i}">${esc(p.label)}</span>`
+      : `${sep}<span class="breadcrumb-current">${esc(p.label)}</span>`;
+  }).join('') + hint;
 
-  el.querySelectorAll('.breadcrumb-link').forEach(span => {
-    const idx = parseInt(span.dataset.idx);
-    span.addEventListener('click', parts[idx].action);
-  });
+  el.querySelectorAll('.breadcrumb-link').forEach(span =>
+    span.addEventListener('click', parts[+span.dataset.idx].action));
 }
 
-// ── Re-render with current filter state ──────────────────────
+// ── Re-render pipeline ────────────────────────────────────────
 function rerender() {
   if (!S.graphData) return;
   let nodes = S.graphData.nodes;
   let edges = S.graphData.edges;
+
+  // 1. Hide external
   if (S.hideExternal) {
-    // For modules: hide status==='external'; for classes/methods: hide external===true
-    const isExt = d => S.view === 'modules' ? d.status === 'external' : d.external === true;
-    const visibleIds = new Set(nodes.filter(n => !isExt(n)).map(n => n.id));
+    const isExt  = d => S.view === 'modules' ? d.status === 'external' : d.external === true;
+    const vis    = new Set(nodes.filter(n => !isExt(n)).map(n => n.id));
     nodes = nodes.filter(n => !isExt(n));
-    edges = edges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
+    edges = edges.filter(e => vis.has(eid(e.source)) && vis.has(eid(e.target)));
   }
+
+  // 2. Language filter
+  if (S.langFilter && S.view !== 'modules') {
+    const keep = new Set(nodes
+      .filter(n => n.filePath && extension(n.filePath) === S.langFilter)
+      .map(n => n.id));
+    nodes = nodes.filter(n => keep.has(n.id));
+    edges = edges.filter(e => keep.has(eid(e.source)) && keep.has(eid(e.target)));
+  }
+
+  // 3. Test/production filter
+  if (S.testFilter !== 'all' && S.view !== 'modules') {
+    const keep = new Set(nodes
+      .filter(n => isTestNode(n) === (S.testFilter === 'test'))
+      .map(n => n.id));
+    nodes = nodes.filter(n => keep.has(n.id));
+    edges = edges.filter(e => keep.has(eid(e.source)) && keep.has(eid(e.target)));
+  }
+
+  // 4. Focus mode
+  ({ nodes, edges } = applyFocusMode(nodes, edges));
+
+  // 5. Caller-depth
+  if (S.callerDepthRoot) {
+    ({ nodes, edges } = callerDepthFilter(nodes, edges, S.callerDepthRoot, S.callerDepth));
+  }
+
+  // 6. Re-apply hide-external after focus modes (traversals can reach external nodes)
+  if (S.hideExternal && S.view !== 'modules') {
+    const vis = new Set(nodes.filter(n => !n.external).map(n => n.id));
+    nodes = nodes.filter(n => !n.external);
+    edges = edges.filter(e => vis.has(eid(e.source)) && vis.has(eid(e.target)));
+  }
+
   renderGraph(nodes, edges, S.view);
 }
 
-// ── Rendering ────────────────────────────────────────────────
+// ── Focus modes ───────────────────────────────────────────────
+function applyFocusMode(nodes, edges) {
+  switch (S.focusMode) {
+    case 'ego':
+      return S.egoCenter ? egoGraph(nodes, edges, S.egoCenter, S.egoHops) : { nodes, edges };
+    case 'expand':
+      return expandGraph(nodes, edges);
+    case 'topn':
+      return topNCentrality(nodes, edges, S.topN);
+    case 'collapse-leaves':
+      return collapseLeaves(nodes, edges);
+    default:
+      return { nodes, edges };
+  }
+}
+
+function egoGraph(nodes, edges, centerId, hops) {
+  const adj     = buildBiAdj(edges);
+  const visited = new Set([centerId]);
+  let frontier  = [centerId];
+  for (let h = 0; h < hops; h++) {
+    const next = [];
+    for (const n of frontier)
+      for (const nb of (adj.get(n) || []))
+        if (!visited.has(nb)) { visited.add(nb); next.push(nb); }
+    frontier = next;
+  }
+  return filterByIds(nodes, edges, visited);
+}
+
+function expandGraph(nodes, edges) {
+  // Auto-seed on first invocation
+  if (!S.expandRoot && S.expandedNodes.size === 0) {
+    const sorted = [...nodes].sort((a, b) => (b.inDegree || 0) - (a.inDegree || 0));
+    if (!sorted.length) return { nodes, edges };
+    S.expandRoot = sorted[0].id;
+    S.expandedNodes.add(S.expandRoot);
+  }
+  const adj     = buildBiAdj(edges);
+  const visible = new Set(S.expandedNodes);
+  for (const nid of S.expandedNodes)
+    for (const nb of (adj.get(nid) || [])) visible.add(nb);
+  return filterByIds(nodes, edges, visible);
+}
+
+function topNCentrality(nodes, edges, n) {
+  const top = [...nodes].sort((a, b) => (b.inDegree || 0) - (a.inDegree || 0)).slice(0, n);
+  return filterByIds(nodes, edges, new Set(top.map(x => x.id)));
+}
+
+function collapseLeaves(nodes, edges) {
+  const inDeg = new Map(), outDeg = new Map();
+  for (const n of nodes) { inDeg.set(n.id, 0); outDeg.set(n.id, 0); }
+  for (const e of edges) {
+    const s = eid(e.source), t = eid(e.target);
+    outDeg.set(s, (outDeg.get(s) || 0) + 1);
+    inDeg.set(t,  (inDeg.get(t)  || 0) + 1);
+  }
+  const keep = new Set(nodes
+    .filter(n => !(inDeg.get(n.id) === 0 && outDeg.get(n.id) === 1))
+    .map(n => n.id));
+  return filterByIds(nodes, edges, keep);
+}
+
+function callerDepthFilter(nodes, edges, rootId, depth) {
+  const fwdAdj = new Map(), revAdj = new Map();
+  for (const e of edges) {
+    const s = eid(e.source), t = eid(e.target);
+    if (!fwdAdj.has(s)) fwdAdj.set(s, []);
+    if (!revAdj.has(t)) revAdj.set(t, []);
+    fwdAdj.get(s).push(t);
+    revAdj.get(t).push(s);
+  }
+  const visible = new Set([rootId]);
+  let fwd = [rootId], bwd = [rootId];
+  for (let i = 0; i < depth; i++) {
+    const nf = [], nb = [];
+    for (const n of fwd) for (const t of (fwdAdj.get(n) || []))
+      if (!visible.has(t)) { visible.add(t); nf.push(t); }
+    for (const n of bwd) for (const s of (revAdj.get(n) || []))
+      if (!visible.has(s)) { visible.add(s); nb.push(s); }
+    fwd = nf; bwd = nb;
+  }
+  return filterByIds(nodes, edges, visible);
+}
+
+// ── Graph helpers ─────────────────────────────────────────────
+function buildBiAdj(edges) {
+  const adj = new Map();
+  for (const e of edges) {
+    const s = eid(e.source), t = eid(e.target);
+    if (!adj.has(s)) adj.set(s, []);
+    if (!adj.has(t)) adj.set(t, []);
+    adj.get(s).push(t);
+    adj.get(t).push(s);
+  }
+  return adj;
+}
+
+function filterByIds(nodes, edges, ids) {
+  return {
+    nodes: nodes.filter(n => ids.has(n.id)),
+    edges: edges.filter(e => ids.has(eid(e.source)) && ids.has(eid(e.target))),
+  };
+}
+
+function eid(x) { return typeof x === 'string' ? x : (x?.id ?? String(x)); }
+
+// ── Rendering dispatcher ──────────────────────────────────────
 function renderGraph(nodes, edges, mode) {
   if (simulation) { simulation.stop(); simulation = null; }
   gSel.selectAll('*').remove();
+  hullLayer.selectAll('*').remove();
+  svgLinkSel = null; svgNodeSel = null;
 
   const emptyHint = document.getElementById('empty-hint');
   emptyHint.style.display = nodes.length ? 'none' : 'block';
-  if (!nodes.length) return;
+  if (!nodes.length) {
+    if (S.useCanvas) canvasCtx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    return;
+  }
 
-  const rect = svgSel.node().getBoundingClientRect();
+  // Decide renderer
+  const needCanvas = nodes.length >= CANVAS_THRESHOLD;
+  if (needCanvas !== S.useCanvas) {
+    S.useCanvas = needCanvas;
+    svgSel.style('display',   needCanvas ? 'none'  : null);
+    canvasEl.style.display =  needCanvas ? 'block' : 'none';
+    hullLayer.attr('display', needCanvas ? 'none'  : null);
+    if (needCanvas) {
+      svgSel.on('.zoom', null);
+      d3.select(canvasEl).call(zoomBehavior);
+    } else {
+      d3.select(canvasEl).on('.zoom', null);
+      svgSel.call(zoomBehavior);
+    }
+    S.zoomTransform = d3.zoomIdentity;
+  }
 
-  // Clone arrays for D3 mutation
-  const ns = nodes.map(d => ({ ...d }));
+  const rect = document.getElementById('graph-container').getBoundingClientRect();
+  if (S.useCanvas) { canvasEl.width = rect.width; canvasEl.height = rect.height; }
+
+  currentMode = mode;
+
+  // Clone with position preservation
+  const prevById = new Map(currentNodes.map(n => [n.id, n]));
+  const ns = nodes.map(d => {
+    const p   = prevById.get(d.id);
+    const out = { ...d };
+    if (p && p.x != null) { out.x = p.x; out.y = p.y; }
+    if (S.pinnedNodes.has(d.id) && p) { out.fx = p.fx ?? p.x; out.fy = p.fy ?? p.y; }
+    return out;
+  });
   const es = edges.map(e => ({ ...e }));
+  currentNodes = ns;
+  currentEdges = es;
 
-  // Links
-  const link = gSel.append('g')
+  if (!S.useCanvas) renderSVGGraph(ns, es, mode);
+
+  // Force simulation
+  const linkDist = mode === 'modules' ? 120 : mode === 'classes' ? 100 : 70;
+  const charge   = mode === 'modules' ? -400 : mode === 'classes' ? -300 : -180;
+
+  simulation = d3.forceSimulation(ns)
+    .force('link',    d3.forceLink(es).id(d => d.id).distance(linkDist).strength(0.4))
+    .force('charge',  d3.forceManyBody().strength(charge))
+    .force('center',  d3.forceCenter(rect.width / 2, rect.height / 2))
+    .force('collide', d3.forceCollide().radius(d => nodeR(d, mode) + 4))
+    .on('tick', () => {
+      if (S.useCanvas) {
+        drawCanvasFrame();
+      } else {
+        tickSVG();
+        if (S.showClusters) updateHulls(ns);
+      }
+      if (S.showOverview) drawOverview();
+    });
+
+  if (S.searchQuery) applyLocalFilter();
+}
+
+// ── SVG rendering ─────────────────────────────────────────────
+function renderSVGGraph(ns, es, mode) {
+  svgLinkSel = gSel.append('g')
     .selectAll('line').data(es).join('line')
     .attr('class', 'link')
     .attr('stroke', '#2d333b')
@@ -279,51 +808,293 @@ function renderGraph(nodes, edges, mode) {
     .attr('stroke-opacity', 0.8)
     .attr('marker-end', 'url(#arrow)');
 
-  // Node groups
-  const node = gSel.append('g')
+  svgNodeSel = gSel.append('g')
     .selectAll('g').data(ns).join('g')
     .attr('class', 'node')
     .call(d3.drag()
       .on('start', (ev, d) => { if (!ev.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag',  (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
-      .on('end',   (ev, d) => { if (!ev.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }))
-    .on('click',   (ev, d) => { ev.stopPropagation(); selectNode(d); })
-    .on('dblclick', (ev, d) => { ev.stopPropagation(); drillDown(d); })
-    .on('mouseover', showTooltip)
-    .on('mouseout',  hideTooltip);
+      .on('end',   (ev, d) => {
+        if (!ev.active) simulation.alphaTarget(0);
+        if (!S.pinnedNodes.has(d.id)) { d.fx = null; d.fy = null; }
+      }))
+    .on('click',       (ev, d) => { ev.stopPropagation(); selectNode(d); })
+    .on('dblclick',    (ev, d) => { ev.stopPropagation(); drillDown(d); })
+    .on('mouseover',   showTooltip)
+    .on('mouseout',    hideTooltip)
+    .on('contextmenu', (ev, d) => { ev.preventDefault(); ev.stopPropagation(); showCtxMenu(ev.clientX, ev.clientY, d); });
 
-  node.append('circle')
+  svgNodeSel.append('circle')
     .attr('r', d => nodeR(d, mode))
     .attr('fill', d => nodeC(d, mode))
-    .attr('stroke', '#0d1117')
-    .attr('stroke-width', 1.5);
+    .attr('stroke', d => S.pinnedNodes.has(d.id) ? '#ffd54f' : '#0d1117')
+    .attr('stroke-width', d => S.pinnedNodes.has(d.id) ? 2.5 : 1.5)
+    .attr('stroke-dasharray', d => S.pinnedNodes.has(d.id) ? '4,2' : null);
 
-  node.append('text')
+  svgNodeSel.append('text')
     .attr('dy', d => nodeR(d, mode) + 11)
     .attr('text-anchor', 'middle')
     .attr('fill', '#6e7681')
     .attr('font-size', '10px')
     .text(d => trunc(d.label || shortId(d.id), 18));
 
-  // Force simulation
-  const linkDist = mode === 'modules' ? 120 : mode === 'classes' ? 100 : 70;
-  const charge   = mode === 'modules' ? -400 : mode === 'classes' ? -300 : -180;
-
-  simulation = d3.forceSimulation(ns)
-    .force('link', d3.forceLink(es).id(d => d.id).distance(linkDist).strength(0.4))
-    .force('charge', d3.forceManyBody().strength(charge))
-    .force('center', d3.forceCenter(rect.width / 2, rect.height / 2))
-    .force('collide', d3.forceCollide().radius(d => nodeR(d, mode) + 4))
-    .on('tick', () => {
-      link
-        .attr('x1', d => d.source.x)
-        .attr('y1', d => d.source.y)
-        .attr('x2', d => tgtX(d, mode))
-        .attr('y2', d => tgtY(d, mode));
-      node.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
-    });
+  // Expand mode: highlight expanded nodes
+  if (S.focusMode === 'expand') {
+    svgNodeSel.select('circle')
+      .attr('stroke', d => S.expandedNodes.has(d.id) ? '#ffd54f' : '#0d1117')
+      .attr('stroke-width', d => S.expandedNodes.has(d.id) ? 2.5 : 1.5);
+  }
 }
 
+function tickSVG() {
+  if (!svgLinkSel || !svgNodeSel) return;
+  svgLinkSel
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => tgtX(d, currentMode))
+    .attr('y2', d => tgtY(d, currentMode));
+  svgNodeSel.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+}
+
+// ── Canvas rendering ──────────────────────────────────────────
+function drawCanvasFrame() {
+  const ns  = currentNodes, es = currentEdges, mode = currentMode;
+  const t   = S.zoomTransform;
+  const ctx = canvasCtx;
+  const w   = canvasEl.width, h = canvasEl.height;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.scale(t.k, t.k);
+
+  const lw = Math.max(0.5, 1 / t.k);
+
+  // Cluster hulls
+  if (S.showClusters) drawCanvasHulls(ns, ctx, t.k);
+
+  // Edges
+  ctx.strokeStyle = 'rgba(45,51,59,0.8)';
+  ctx.lineWidth   = lw;
+  for (const e of es) {
+    if (!e.source || e.source.x == null || !e.target || e.target.x == null) continue;
+    const dx   = e.target.x - e.source.x, dy = e.target.y - e.source.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const r    = nodeR(e.target, mode);
+    const ex   = e.target.x - (dx / dist) * (r + 8 / t.k);
+    const ey   = e.target.y - (dy / dist) * (r + 8 / t.k);
+
+    ctx.beginPath();
+    ctx.moveTo(e.source.x, e.source.y);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+
+    // Arrow head
+    const angle = Math.atan2(dy, dx);
+    ctx.save();
+    ctx.translate(ex, ey);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-9 / t.k, -4 / t.k);
+    ctx.lineTo(-9 / t.k,  4 / t.k);
+    ctx.closePath();
+    ctx.fillStyle = '#555';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Nodes
+  for (const n of ns) {
+    if (n.x == null) continue;
+    const r          = nodeR(n, mode);
+    const isSelected = S.selectedNode && S.selectedNode.id === n.id;
+    const isPinned   = S.pinnedNodes.has(n.id);
+    const isExpanded = S.expandedNodes.has(n.id);
+    const opacity    = n._opacity != null ? n._opacity : 1;
+
+    ctx.globalAlpha = opacity;
+
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = n._highlight ? COLORS.highlight : nodeC(n, mode);
+    ctx.fill();
+
+    ctx.strokeStyle  = isSelected ? COLORS.selected
+      : (isPinned || isExpanded) ? '#ffd54f' : '#0d1117';
+    ctx.lineWidth    = isSelected ? 3 / t.k : isPinned ? 2.5 / t.k : 1.5 / t.k;
+    if (isPinned) ctx.setLineDash([4 / t.k, 2 / t.k]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.globalAlpha = opacity * 0.85;
+    ctx.fillStyle   = '#6e7681';
+    ctx.font        = `${10 / t.k}px system-ui, -apple-system, sans-serif`;
+    ctx.textAlign   = 'center';
+    ctx.fillText(trunc(n.label || shortId(n.id), 18), n.x, n.y + r + 11 / t.k);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+// ── Cluster hulls ─────────────────────────────────────────────
+function groupByPackage(ns) {
+  const groups = new Map();
+  for (const n of ns) {
+    const pkg = n.packageName
+      || (n.id.includes('.') ? n.id.split('.').slice(0, -1).join('.') : '__default__');
+    if (!groups.has(pkg)) groups.set(pkg, []);
+    groups.get(pkg).push(n);
+  }
+  return groups;
+}
+
+function updateHulls(ns) {
+  hullLayer.selectAll('*').remove();
+  if (!S.showClusters) return;
+  let ci = 0;
+  for (const [, gnodes] of groupByPackage(ns)) {
+    if (gnodes.length < 3) continue;
+    const hull = d3.polygonHull(gnodes.map(n => [n.x ?? 0, n.y ?? 0]));
+    if (!hull) { ci++; continue; }
+    const cen  = d3.polygonCentroid(hull);
+    const exp  = hull.map(([x, y]) => {
+      const dx = x - cen[0], dy = y - cen[1], d = Math.hypot(dx, dy) || 1;
+      return [x + (dx / d) * 24, y + (dy / d) * 24];
+    });
+    const c = ci % PKG_HULL_FILL.length;
+    hullLayer.append('path')
+      .attr('d', 'M' + exp.join('L') + 'Z')
+      .attr('fill', PKG_HULL_FILL[c])
+      .attr('stroke', PKG_HULL_STROKE[c])
+      .attr('stroke-width', 1)
+      .attr('stroke-linejoin', 'round');
+    ci++;
+  }
+}
+
+function drawCanvasHulls(ns, ctx, scale) {
+  let ci = 0;
+  for (const [, gnodes] of groupByPackage(ns)) {
+    const valid = gnodes.filter(n => n.x != null);
+    if (valid.length < 3) { ci++; continue; }
+    const hull = d3.polygonHull(valid.map(n => [n.x, n.y]));
+    if (!hull) { ci++; continue; }
+    const cen = d3.polygonCentroid(hull);
+    const exp = hull.map(([x, y]) => {
+      const dx = x - cen[0], dy = y - cen[1], d = Math.hypot(dx, dy) || 1;
+      return [x + (dx / d) * 24, y + (dy / d) * 24];
+    });
+    const c = ci % PKG_HULL_FILL.length;
+    ctx.beginPath();
+    ctx.moveTo(exp[0][0], exp[0][1]);
+    for (let i = 1; i < exp.length; i++) ctx.lineTo(exp[i][0], exp[i][1]);
+    ctx.closePath();
+    ctx.fillStyle   = PKG_HULL_FILL[c];
+    ctx.fill();
+    ctx.strokeStyle = PKG_HULL_STROKE[c];
+    ctx.lineWidth   = 1 / scale;
+    ctx.stroke();
+    ci++;
+  }
+}
+
+// ── Mini-view renderer (shared by minimap & overview) ─────────
+function drawMiniView(cfg) {
+  if (!cfg.ctx || !cfg.show) return;
+  const w = cfg.width, h = cfg.height;
+  cfg.ctx.clearRect(0, 0, w, h);
+  cfg.ctx.fillStyle = cfg.bg;
+  cfg.ctx.fillRect(0, 0, w, h);
+
+  const ns = currentNodes.filter(n => n.x != null);
+  if (!ns.length) return;
+
+  // Bounding box
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of ns) {
+    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+    minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+  }
+  const gw = Math.max(maxX - minX, 1), gh = Math.max(maxY - minY, 1);
+  const pad = cfg.pad || 16;
+  const topPad = cfg.topPad ?? pad;
+  const scale = Math.min((w - pad) / gw, (h - topPad - pad) / gh);
+  const ox = (w - gw * scale) / 2 - minX * scale;
+  const oy = topPad + (h - topPad - pad - gh * scale) / 2 - minY * scale;
+  minimapState = { scale, ox, oy };
+
+  // Edges (optional)
+  if (cfg.drawEdges) {
+    cfg.ctx.strokeStyle = cfg.edgeColor || 'rgba(45,51,59,0.4)';
+    cfg.ctx.lineWidth   = cfg.edgeWidth || 0.5;
+    for (const e of currentEdges) {
+      if (!e.source || e.source.x == null || !e.target || e.target.x == null) continue;
+      cfg.ctx.beginPath();
+      cfg.ctx.moveTo(e.source.x * scale + ox, e.source.y * scale + oy);
+      cfg.ctx.lineTo(e.target.x * scale + ox, e.target.y * scale + oy);
+      cfg.ctx.stroke();
+    }
+  }
+
+  // Nodes
+  const rMult = cfg.radiusMult || 0.6;
+  for (const n of ns) {
+    cfg.ctx.beginPath();
+    cfg.ctx.arc(n.x * scale + ox, n.y * scale + oy,
+      Math.max(cfg.minR || 1.5, nodeR(n, currentMode) * scale * rMult), 0, Math.PI * 2);
+    cfg.ctx.fillStyle = nodeC(n, currentMode);
+    cfg.ctx.fill();
+  }
+
+  // Viewport rect
+  if (cfg.showViewport !== false) {
+    const t  = S.zoomTransform;
+    const cr = document.getElementById('graph-container').getBoundingClientRect();
+    const x0 = -t.x / t.k, y0 = -t.y / t.k;
+    const x1 = x0 + cr.width / t.k, y1 = y0 + cr.height / t.k;
+    const rx = x0 * scale + ox, ry = y0 * scale + oy,
+          rw = (x1 - x0) * scale, rh = (y1 - y0) * scale;
+    if (cfg.vpFill) { cfg.ctx.fillStyle = cfg.vpFill; cfg.ctx.fillRect(rx, ry, rw, rh); }
+    cfg.ctx.fillStyle  = cfg.vpStroke || '#388bfd';
+    cfg.ctx.strokeStyle = cfg.vpStroke || '#388bfd';
+    cfg.ctx.lineWidth   = cfg.vpStrokeWidth ?? 1;
+    cfg.ctx.strokeRect(rx, ry, rw, rh);
+  }
+
+  // Border
+  if (cfg.border) {
+    cfg.ctx.strokeStyle = cfg.border;
+    cfg.ctx.lineWidth   = cfg.borderWidth ?? 1;
+    cfg.ctx.strokeRect(0, 0, w, h);
+  }
+
+  // Title (optional)
+  if (cfg.title) {
+    cfg.ctx.fillStyle  = cfg.titleColor || '#6e7681';
+    cfg.ctx.font       = cfg.titleFont || '10px system-ui';
+    cfg.ctx.textAlign  = 'left';
+    cfg.ctx.fillText(cfg.title, 8, 12);
+  }
+}
+
+function drawOverview() {
+  const panel = document.getElementById('overview-panel');
+  drawMiniView({
+    ctx: overviewCtx, show: S.showOverview,
+    width: panel.clientWidth  || 220,
+    height: panel.clientHeight || 180,
+    bg: '#161b22', topPad: 16,
+    drawEdges: true, edgeColor: 'rgba(45,51,59,0.4)', edgeWidth: 0.5,
+    radiusMult: 0.8, minR: 2,
+    showViewport: true,
+    vpFill: 'rgba(56,139,253,0.06)', vpStroke: 'rgba(56,139,253,0.7)',
+    title: 'Overview  (click to pan)',
+  });
+}
+
+// ── Node helpers ──────────────────────────────────────────────
 function nodeR(d, mode) {
   if (mode === 'modules') return d.status === 'indexed' ? 16 : 9;
   if (mode === 'classes') return Math.max(8, Math.min(30, 8 + Math.log((d.methodCount || 0) + 1) * 4));
@@ -338,55 +1109,71 @@ function nodeC(d, mode) {
 }
 
 function tgtX(d, mode) {
-  const r = nodeR(d.target, mode);
-  const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
-  const dist = Math.hypot(dx, dy) || 1;
-  return d.target.x - (dx / dist) * (r + 8);
+  const r = nodeR(d.target, mode), dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
+  return d.target.x - (dx / (Math.hypot(dx, dy) || 1)) * (r + 8);
 }
 function tgtY(d, mode) {
-  const r = nodeR(d.target, mode);
-  const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
-  const dist = Math.hypot(dx, dy) || 1;
-  return d.target.y - (dy / dist) * (r + 8);
+  const r = nodeR(d.target, mode), dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
+  return d.target.y - (dy / (Math.hypot(dx, dy) || 1)) * (r + 8);
 }
 
 // ── Drill-down ────────────────────────────────────────────────
 function drillDown(d) {
-  if (S.view === 'modules' && d.status === 'indexed' && d.projectName) {
+  if (S.view === 'modules' && d.status === 'indexed' && d.projectName)
     loadClassGraph(d.projectName);
-  } else if (S.view === 'classes') {
+  else if (S.view === 'classes')
     loadMethodGraph(S.selectedProject, d.id);
-  }
 }
 
 // ── Node selection ────────────────────────────────────────────
 function selectNode(d) {
   S.selectedNode = d;
-  gSel.selectAll('.node circle')
-    .attr('stroke', n => n.id === d.id ? COLORS.selected : '#0d1117')
-    .attr('stroke-width', n => n.id === d.id ? 3 : 1.5);
+
+  if (!S.useCanvas) {
+    gSel.selectAll('.node circle')
+      .attr('stroke',       n => n.id === d.id ? COLORS.selected
+        : S.pinnedNodes.has(n.id) ? '#ffd54f' : '#0d1117')
+      .attr('stroke-width', n => n.id === d.id ? 3
+        : S.pinnedNodes.has(n.id) ? 2.5 : 1.5);
+  }
+
+  // Ego mode: set center and re-filter
+  if (S.focusMode === 'ego') {
+    S.egoCenter = d.id;
+    rerender();
+    return;
+  }
+
+  // Expand mode: expand clicked node
+  if (S.focusMode === 'expand' && !S.expandedNodes.has(d.id)) {
+    S.expandedNodes.add(d.id);
+    rerender();
+    return;
+  }
+
   showDetail(d);
 }
 
 function clearHighlight() {
-  gSel.selectAll('.node circle')
-    .attr('stroke', '#0d1117').attr('stroke-width', 1.5)
-    .attr('fill', d => nodeC(d, S.view)).attr('opacity', 1);
-  gSel.selectAll('.node text').attr('opacity', 1);
+  if (!S.useCanvas) {
+    gSel.selectAll('.node circle')
+      .attr('stroke',           d => S.pinnedNodes.has(d.id) ? '#ffd54f' : '#0d1117')
+      .attr('stroke-width',     d => S.pinnedNodes.has(d.id) ? 2.5 : 1.5)
+      .attr('stroke-dasharray', d => S.pinnedNodes.has(d.id) ? '4,2' : null)
+      .attr('fill',    d => nodeC(d, S.view))
+      .attr('opacity', 1);
+    gSel.selectAll('.node text').attr('opacity', 1);
+  } else {
+    for (const n of currentNodes) { n._opacity = 1; n._highlight = false; }
+    drawCanvasFrame();
+  }
 }
 
 // ── Detail panel ──────────────────────────────────────────────
 async function showDetail(d) {
   document.getElementById('detail-panel').classList.add('open');
-
-  if (S.view === 'modules') {
-    renderModuleDetail(d);
-    return;
-  }
-  if (S.view === 'classes') {
-    renderClassDetail(d);
-    return;
-  }
+  if (S.view === 'modules') { renderModuleDetail(d); return; }
+  if (S.view === 'classes') { renderClassDetail(d);  return; }
 
   document.getElementById('detail-content').innerHTML = '<div class="loading">Loading…</div>';
   try {
@@ -398,10 +1185,8 @@ async function showDetail(d) {
 }
 
 function renderMethodDetail(m, d) {
-  const fqn = extractFqn(d.id);
-  const kind = m.docType || d.kind || 'method';
-  const el = document.getElementById('detail-content');
-  el.innerHTML = `
+  const fqn = extractFqn(d.id), kind = m.docType || d.kind || 'method';
+  document.getElementById('detail-content').innerHTML = `
     <div class="d-header">
       <span class="badge badge-${esc(kind)}">${esc(kind)}</span>
       <span class="badge badge-project">${esc(m.project)}</span>
@@ -416,8 +1201,7 @@ function renderMethodDetail(m, d) {
       <button data-action="callers" data-fqn="${esc(fqn)}">Callers</button>
       <button data-action="callees" data-fqn="${esc(fqn)}">Callees</button>
     </div>
-    <div id="related-area"></div>
-  `;
+    <div id="related-area"></div>`;
 }
 
 function renderFqnDetail(d) {
@@ -430,16 +1214,14 @@ function renderFqnDetail(d) {
       <button data-action="callers" data-fqn="${esc(fqn)}">Callers</button>
       <button data-action="callees" data-fqn="${esc(fqn)}">Callees</button>
     </div>
-    <div id="related-area"></div>
-  `;
+    <div id="related-area"></div>`;
 }
 
 function renderClassDetail(d) {
-  const proj = S.selectedProject;
   document.getElementById('detail-content').innerHTML = `
     <div class="d-header">
       <span class="badge badge-class">class</span>
-      <span class="badge badge-project">${esc(proj)}</span>
+      <span class="badge badge-project">${esc(S.selectedProject)}</span>
     </div>
     <div class="d-name">${esc(d.label || d.id.split('.').pop())}</div>
     <div class="d-class">${esc(d.id)}</div>
@@ -449,8 +1231,7 @@ function renderClassDetail(d) {
     </div>
     <div class="d-actions">
       <button data-action="drill-class" data-cls="${esc(d.id)}">Methods →</button>
-    </div>
-  `;
+    </div>`;
 }
 
 function renderModuleDetail(d) {
@@ -470,8 +1251,7 @@ function renderModuleDetail(d) {
     ${d.status === 'indexed' && d.projectName ? `
     <div class="d-actions">
       <button data-action="drill-proj" data-project="${esc(d.projectName)}">Classes →</button>
-    </div>` : ''}
-  `;
+    </div>` : ''}`;
 }
 
 async function loadRelated(fqn, type) {
@@ -480,28 +1260,46 @@ async function loadRelated(fqn, type) {
   el.innerHTML = '<div class="loading">Loading…</div>';
   try {
     const res = await fetch(`/api/${type}?fqn=${encodeURIComponent(fqn)}`);
-    const items = await res.json();
-    renderRelatedList(el, type === 'callers' ? 'Callers' : 'Callees', items);
-  } catch (_) {
-    el.innerHTML = '<div class="related-empty">Error loading</div>';
-  }
+    renderRelatedList(el, type === 'callers' ? 'Callers' : 'Callees', await res.json());
+  } catch (_) { el.innerHTML = '<div class="related-empty">Error loading</div>'; }
 }
 
 function renderRelatedList(el, title, items) {
-  if (!items.length) {
-    el.innerHTML = `<div class="related-empty">No ${title.toLowerCase()}</div>`;
-    return;
-  }
-  const rows = items.slice(0, 25).map(r => `
+  if (!items.length) { el.innerHTML = `<div class="related-empty">No ${title.toLowerCase()}</div>`; return; }
+  const rows = items.slice(0, 25).map(r => {
+    const inGraph = !!currentNodes.find(n => n.id === r.id || extractFqn(n.id) === r.id);
+    const cls = inGraph ? 'related-label related-label--link' : 'related-label';
+    const action = inGraph ? `data-action="focus-node" data-fqn="${esc(r.id)}"` : '';
+    const hint = inGraph ? ' title="Click to focus in graph"' : `title="${esc(r.id)}"`;
+    return `
     <li>
-      <span class="related-label" title="${esc(r.id)}">${esc(r.label)}</span>
+      <span class="${cls}" ${action}${hint}>${esc(r.label)}</span>
       <span class="related-file">${esc(shortPath(r.filePath))}:${r.startLine}</span>
-    </li>`).join('');
-  const more = items.length > 25
-    ? `<li class="related-more">…and ${items.length - 25} more</li>` : '';
+    </li>`;
+  }).join('');
+  const more = items.length > 25 ? `<li class="related-more">…and ${items.length - 25} more</li>` : '';
   el.innerHTML = `
     <div class="related-header">${title} (${items.length})</div>
     <ul class="related-list">${rows}${more}</ul>`;
+}
+
+function focusNode(fqnOrId) {
+  // Match by exact id or by the FQN embedded in id (after ':')
+  const node = currentNodes.find(n => n.id === fqnOrId || extractFqn(n.id) === fqnOrId);
+  if (!node || node.x == null) return;
+
+  // Pan the graph so the node is centred
+  const cr = document.getElementById('graph-container').getBoundingClientRect();
+  const t  = S.zoomTransform;
+  const newTransform = d3.zoomIdentity
+    .translate(cr.width / 2 - node.x * t.k, cr.height / 2 - node.y * t.k)
+    .scale(t.k);
+
+  const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
+  target.transition().duration(500).call(zoomBehavior.transform, newTransform);
+
+  // Select the node (shows detail, highlights circle)
+  selectNode(node);
 }
 
 function closeDetail() {
@@ -513,33 +1311,100 @@ function closeDetail() {
 // ── Project list ──────────────────────────────────────────────
 function renderProjectList() {
   const el = document.getElementById('project-list');
-  if (!S.projects.length) {
-    el.innerHTML = '<div class="loading">No projects indexed</div>';
-    return;
-  }
+  if (!S.projects.length) { el.innerHTML = '<div class="loading">No projects indexed</div>'; return; }
   el.innerHTML = S.projects.map(p => `
     <div class="project-item${S.selectedProject === p.name ? ' active' : ''}"
          data-project="${esc(p.name)}">
       <div class="project-name">${esc(p.name)}</div>
       <div class="project-stats">${p.methodCount.toLocaleString()} methods · ${p.classCount.toLocaleString()} classes</div>
     </div>`).join('');
+  el.querySelectorAll('.project-item').forEach(item =>
+    item.addEventListener('click', () => browseProject(item.dataset.project)));
+}
 
-  el.querySelectorAll('.project-item').forEach(item => {
-    item.addEventListener('click', () => browseProject(item.dataset.project));
+// ── Test/production filter ────────────────────────────────────
+function renderTestFilter() {
+  const el = document.getElementById('test-filter');
+  if (!el) return;
+  if (S.view === 'modules' || !S.selectedProject) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const opts = [
+    { value: 'all',  label: 'All code' },
+    { value: 'prod', label: 'Production' },
+    { value: 'test', label: 'Tests only' },
+  ];
+  el.innerHTML = `<div class="sidebar-title">Code type</div>` +
+    `<div class="lang-chips">` +
+    opts.map(o =>
+      `<span class="lang-chip${S.testFilter === o.value ? ' active' : ''}" data-val="${o.value}">${o.label}</span>`
+    ).join('') +
+    `</div>`;
+  el.querySelectorAll('.lang-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      S.testFilter = chip.dataset.val;
+      renderTestFilter();
+      if (S.graphData) rerender();
+    });
+  });
+}
+
+// ── Language filter ───────────────────────────────────────────
+const LANG_LABELS = {
+  java: 'Java', kt: 'Kotlin', py: 'Python', js: 'JS', ts: 'TS',
+  scala: 'Scala', groovy: 'Groovy', xml: 'XML', json: 'JSON',
+  yaml: 'YAML', yml: 'YAML', md: 'Markdown', sql: 'SQL', other: 'Other',
+};
+
+function renderLangFilter() {
+  const el = document.getElementById('lang-filter');
+  if (!el) return;
+  const entries = Object.entries(S.langCounts);
+  if (entries.length <= 1) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  el.innerHTML = `<div class="sidebar-title">Language</div>` +
+    `<div class="lang-chips">` +
+    `<span class="lang-chip${S.langFilter === null ? ' active' : ''}" data-lang="">All</span>` +
+    entries.map(([ext, count]) => {
+      const label = LANG_LABELS[ext] || ext.toUpperCase();
+      const active = S.langFilter === ext ? ' active' : '';
+      return `<span class="lang-chip${active}" data-lang="${esc(ext)}">${esc(label)}<span class="lang-count">${count}</span></span>`;
+    }).join('') +
+    `</div>`;
+  el.querySelectorAll('.lang-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      S.langFilter = chip.dataset.lang || null;
+      renderLangFilter();
+      if (S.graphData) rerender();
+    });
   });
 }
 
 // ── Search & filter ───────────────────────────────────────────
 function applyLocalFilter() {
-  const q = S.searchQuery;
-  gSel.selectAll('.node').each(function(d) {
-    const match = !q
-      || (d.id    || '').toLowerCase().includes(q)
-      || (d.label || '').toLowerCase().includes(q)
-      || (d.className || '').toLowerCase().includes(q);
-    d3.select(this).select('circle').attr('opacity', !q || match ? 1 : 0.12);
-    d3.select(this).select('text').attr('opacity',   !q || match ? 1 : 0.08);
-  });
+  const q    = S.searchQuery;
+  const hide = S.searchToFocus;
+
+  if (S.useCanvas) {
+    for (const n of currentNodes) {
+      const match = !q
+        || (n.id        || '').toLowerCase().includes(q)
+        || (n.label     || '').toLowerCase().includes(q)
+        || (n.className || '').toLowerCase().includes(q);
+      n._opacity   = !q || match ? 1 : (hide ? 0 : 0.08);
+      n._highlight = false;
+    }
+    drawCanvasFrame();
+  } else {
+    gSel.selectAll('.node').each(function(d) {
+      const match = !q
+        || (d.id        || '').toLowerCase().includes(q)
+        || (d.label     || '').toLowerCase().includes(q)
+        || (d.className || '').toLowerCase().includes(q);
+      const op = !q || match ? 1 : (hide ? 0 : 0.12);
+      d3.select(this).select('circle').attr('opacity', op);
+      d3.select(this).select('text').attr('opacity',   !q || match ? 1 : (hide ? 0 : 0.08));
+    });
+  }
 }
 
 async function doSearch() {
@@ -548,17 +1413,28 @@ async function doSearch() {
 
   const proj = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
   const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}&limit=30`);
-  const hits = await res.json();
+  const hits  = await res.json();
   if (!hits.length) return;
 
   const hitIds = new Set(hits.map(r => r.id));
-  gSel.selectAll('.node').each(function(d) {
-    const match = hitIds.has(d.id);
-    d3.select(this).select('circle')
-      .attr('fill',    match ? COLORS.highlight : nodeC(d, S.view))
-      .attr('opacity', match ? 1 : 0.15);
-    d3.select(this).select('text').attr('opacity', match ? 1 : 0.1);
-  });
+  const hide   = S.searchToFocus;
+
+  if (S.useCanvas) {
+    for (const n of currentNodes) {
+      const match  = hitIds.has(n.id);
+      n._highlight = match;
+      n._opacity   = match ? 1 : (hide ? 0 : 0.15);
+    }
+    drawCanvasFrame();
+  } else {
+    gSel.selectAll('.node').each(function(d) {
+      const match = hitIds.has(d.id);
+      d3.select(this).select('circle')
+        .attr('fill',    match ? COLORS.highlight : nodeC(d, S.view))
+        .attr('opacity', match ? 1 : (hide ? 0 : 0.15));
+      d3.select(this).select('text').attr('opacity', match ? 1 : (hide ? 0 : 0.1));
+    });
+  }
   setStatus(`${hits.length} search hits highlighted`);
 }
 
@@ -575,30 +1451,55 @@ function populatePkgFilter(nodes) {
 function showTooltip(event, d) {
   const tip = document.getElementById('tooltip');
   tip.style.display = 'block';
-  tip.style.left = (event.pageX + 14) + 'px';
-  tip.style.top  = (event.pageY - 12) + 'px';
+  tip.style.left    = (event.pageX + 14) + 'px';
+  tip.style.top     = (event.pageY - 12) + 'px';
   const drillHint = (S.view === 'modules' && d.status === 'indexed') || S.view === 'classes'
     ? '<small style="color:#ffd54f">double-click to drill down</small>' : '';
-  tip.innerHTML = `<b>${esc(d.label || shortId(d.id))}</b><small>${esc(d.id)}</small>${drillHint}`;
+  const pinHint = S.pinnedNodes.has(d.id)
+    ? '<small style="color:#ffd54f"> · pinned</small>' : '';
+  tip.innerHTML = `<b>${esc(d.label || shortId(d.id))}</b><small>${esc(d.id)}</small>${drillHint}${pinHint}`;
 }
-function hideTooltip() {
-  document.getElementById('tooltip').style.display = 'none';
-}
+function hideTooltip() { document.getElementById('tooltip').style.display = 'none'; }
 
 // ── Utilities ─────────────────────────────────────────────────
-function setStatus(txt)    { document.getElementById('status-bar').textContent = txt; }
-function setActiveBtn(id)  {
+function setStatus(txt)   { document.getElementById('status-bar').textContent = txt; }
+function setActiveBtn(id) {
   document.querySelectorAll('.btn-view').forEach(b => b.classList.remove('active'));
-  if (id) {
-    const el = document.getElementById(id);
-    if (el) el.classList.add('active');
-  }
+  if (id) { const el = document.getElementById(id); if (el) el.classList.add('active'); }
 }
-function trunc(s, n)   { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
-function shortId(id)   { return id ? id.split(/[.#]/).pop() : id; }
-function shortPath(p)  { return p ? p.replace(/^.*?\/src\//, 'src/') : (p || ''); }
-function extractFqn(id){ const c = id.indexOf(':'); return c >= 0 ? id.substring(c + 1) : id; }
+function trunc(s, n)    { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
+function shortId(id)    { return id ? id.split(/[.#]/).pop() : id; }
+function shortPath(p)   { return p ? p.replace(/^.*?\/src\//, 'src/') : (p || ''); }
+function extractFqn(id) { const c = id.indexOf(':'); return c >= 0 ? id.substring(c + 1) : id; }
+// Returns true if the node looks like a test class/method.
+// Checks file path segments (/src/test/, /test-framework/, /testFixtures/, etc.)
+// and class name heuristics (starts or ends with Test/Tests/Spec/IT).
+function isTestNode(n) {
+  if (n.filePath) {
+    const p = n.filePath.replace(/\\/g, '/');
+    if (/\/src\/test\//.test(p))        return true;
+    if (/\/src\/testFixtures\//.test(p)) return true;
+    if (/\/test-framework\//.test(p))   return true;
+    if (/\/test\/java\//.test(p))       return true;
+    if (/\/it\/java\//.test(p))         return true;  // integration tests
+  }
+  const cls = n.className || (n.id ? n.id.split('#')[0].split('.').pop() : '');
+  if (/^Test[A-Z]/.test(cls))           return true;
+  if (/Tests?$/.test(cls))              return true;
+  if (/IT$/.test(cls))                  return true;  // integration test
+  if (/Spec$/.test(cls))                return true;
+  return false;
+}
+
+function extension(fp) {
+  if (!fp) return 'other';
+  const dot = fp.lastIndexOf('.');
+  return dot >= 0 && dot < fp.length - 1 ? fp.slice(dot + 1).toLowerCase() : 'other';
+}
+
 function esc(s) {
   if (s == null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
