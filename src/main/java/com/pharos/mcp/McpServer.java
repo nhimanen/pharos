@@ -8,7 +8,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
 
 /**
  * MCP (Model Context Protocol) server over stdio JSON-RPC 2.0.

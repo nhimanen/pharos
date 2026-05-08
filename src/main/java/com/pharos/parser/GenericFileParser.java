@@ -11,7 +11,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * Parser for non-code files: Markdown, plain text, config files, etc.
@@ -260,11 +259,11 @@ public class GenericFileParser implements CodeParser {
         StringBuilder sb = new StringBuilder();
         for (int i = 1; i < level; i++) {
             if (stack[i] != null) {
-                if (sb.length() > 0) sb.append(" > ");
+                if (!sb.isEmpty()) sb.append(" > ");
                 sb.append(stack[i]);
             }
         }
-        if (sb.length() > 0) sb.append(" > ");
+        if (!sb.isEmpty()) sb.append(" > ");
         sb.append(current);
         return sb.toString();
     }
@@ -401,7 +400,7 @@ public class GenericFileParser implements CodeParser {
                 String simpleName = filePart.isBlank()
                         ? (anchor != null ? anchor : target)
                         : stem(Paths.get(filePart).getFileName().toString());
-                refs.add(CallReference.unresolved(callerFqn, simpleName, i + 1));
+                refs.add(CallReference.unresolved(callerFqn, simpleName, null, 0, i + 1));
             }
         }
         return refs;

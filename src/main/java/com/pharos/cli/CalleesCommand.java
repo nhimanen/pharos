@@ -28,12 +28,10 @@ public class CalleesCommand implements Callable<Integer> {
 
     private final SearchEngine searchEngine;
     private final ProjectRegistry registry;
-    private final IndexConfig config;
 
     public CalleesCommand(SearchEngine searchEngine, ProjectRegistry registry, IndexConfig config) {
         this.searchEngine = searchEngine;
         this.registry = registry;
-        this.config = config;
     }
 
     @Override

@@ -39,6 +39,15 @@ public class JavaCodeParser implements CodeParser {
     private final List<Path> jarPaths;
     private final int parseThreads;
 
+    /**
+     * Cache of (sourceRoot → [java21Parser, rawParser]) pairs, keyed by source root path.
+     * Avoids creating a new CombinedTypeSolver + JavaParserTypeSolver on every parseFile() call
+     * during incremental indexing where the same source root is used for all dirty files.
+     * The pair is stored as a two-element array: index 0 = JAVA_21, index 1 = RAW.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Path, JavaParser[]> parserCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     public JavaCodeParser() {
         this(List.of(), List.of(), 1);
     }
@@ -59,6 +68,24 @@ public class JavaCodeParser implements CodeParser {
      * safe to use from a dedicated thread without sharing state with other threads.
      */
     private JavaParser createParser(Path sourceRoot) {
+        return createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21);
+    }
+
+    /**
+     * Creates a parser with the given language level.
+     *
+     * Two-pass strategy used by {@link #doParse}:
+     * <ol>
+     *   <li>JAVA_21 — recognises {@code yield} as a keyword (Java 14+), handles all modern
+     *       switch expression syntax. Fails on files that use {@code _} as an identifier
+     *       because JavaParser treats {@code _} as reserved since JAVA_9.</li>
+     *   <li>RAW — no reserved keywords beyond the Java 1.0 set, so {@code _} is a valid
+     *       identifier. Does NOT treat {@code yield} as a keyword, but the token is still
+     *       parseable as an identifier so these files degrade gracefully (body extraction
+     *       still works even if switch-expression semantics aren't fully modelled).</li>
+     * </ol>
+     */
+    private JavaParser createParser(Path sourceRoot, ParserConfiguration.LanguageLevel level) {
         CombinedTypeSolver solver = new CombinedTypeSolver();
         // JDK types — false = don't try to resolve user classes via reflection
         solver.add(new ReflectionTypeSolver(false));
@@ -81,7 +108,7 @@ public class JavaCodeParser implements CodeParser {
         }
         ParserConfiguration cfg = new ParserConfiguration()
                 .setSymbolResolver(new JavaSymbolSolver(solver))
-                .setLanguageLevel(ParserConfiguration.LanguageLevel.RAW)
+                .setLanguageLevel(level)
                 .setAttributeComments(true);
         return new JavaParser(cfg);
     }
@@ -89,10 +116,14 @@ public class JavaCodeParser implements CodeParser {
 
     @Override
     public ParsedFile parseFile(Path file, String projectName) throws IOException {
-        // Single-file incremental path — create a fresh parser instance (not shared)
         Path sourceRoot = findSourceRoot(file);
-        JavaParser parser = createParser(sourceRoot);
-        return doParse(parser, file, projectName);
+        // Reuse cached parsers for this source root — avoids rebuilding CombinedTypeSolver
+        // (which re-loads JDK reflection + JavaParserTypeSolver caches) on every dirty file.
+        JavaParser[] pair = parserCache.computeIfAbsent(sourceRoot, root -> new JavaParser[]{
+                createParser(root, ParserConfiguration.LanguageLevel.JAVA_21),
+                createParser(root, ParserConfiguration.LanguageLevel.RAW)
+        });
+        return doParseWithFallback(pair[0], pair[1], file, projectName);
     }
 
     @Override
@@ -121,22 +152,26 @@ public class JavaCodeParser implements CodeParser {
         AtomicInteger errorCount = new AtomicInteger(0);
 
         if (parseThreads <= 1) {
-            // Single-threaded path — one parser for all files
-            JavaParser parser = createParser(sourceRoot);
+            // Single-threaded path — create parsers once and reuse across all files
+            JavaParser java21Parser = createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21);
+            JavaParser rawParser    = createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW);
             for (Path file : javaFiles) {
                 try {
-                    parsedFiles.add(doParse(parser, file, projectName));
+                    parsedFiles.add(doParseWithFallback(java21Parser, rawParser, file, projectName));
                     fileCount.incrementAndGet();
-                } catch (Exception e) {
-                    log.debug("Parse error in {}: {}", file, e.getMessage());
+                } catch (Throwable e) {
+                    log.warn("Parse error in {}: {}", file, e.getMessage());
                     errorCount.incrementAndGet();
                 }
             }
         } else {
-            // Multi-threaded path — each thread gets its own JavaParser via ThreadLocal.
+            // Multi-threaded path — each thread gets its own parsers via ThreadLocal.
             // JavaParserTypeSolver has internal mutable caches, so per-thread instances
             // are required to avoid data races.
-            ThreadLocal<JavaParser> threadParser = ThreadLocal.withInitial(() -> createParser(sourceRoot));
+            ThreadLocal<JavaParser> threadParserJava21 = ThreadLocal.withInitial(
+                    () -> createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21));
+            ThreadLocal<JavaParser> threadParserRaw = ThreadLocal.withInitial(
+                    () -> createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW));
 
             ExecutorService pool = Executors.newFixedThreadPool(parseThreads,
                     r -> { Thread t = new Thread(r, "java-parser"); t.setDaemon(true); return t; });
@@ -145,7 +180,8 @@ public class JavaCodeParser implements CodeParser {
                 for (Path file : javaFiles) {
                     futures.add(pool.submit(() -> {
                         try {
-                            ParsedFile pf = doParse(threadParser.get(), file, projectName);
+                            ParsedFile pf = doParseWithFallback(
+                                    threadParserJava21.get(), threadParserRaw.get(), file, projectName);
                             fileCount.incrementAndGet();
                             return pf;
                         } catch (Exception e) {
@@ -176,6 +212,37 @@ public class JavaCodeParser implements CodeParser {
         return new ParsedProject(projectName, projectRoot.toString(), parsedFiles);
     }
 
+    /**
+     * Two-pass parse: try JAVA_21 first (supports {@code yield} in switch expressions),
+     * fall back to RAW if it fails (RAW allows {@code _} as an identifier, which JAVA_21
+     * rejects because JavaParser reserves {@code _} since JAVA_9).
+     */
+    private ParsedFile doParseWithFallback(Path sourceRoot, Path file, String projectName)
+            throws IOException {
+        JavaParser java21 = createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21);
+        JavaParser raw    = createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW);
+        return doParseWithFallback(java21, raw, file, projectName);
+    }
+
+    private ParsedFile doParseWithFallback(JavaParser java21Parser, JavaParser rawParser,
+                                            Path file, String projectName) throws IOException {
+        ParseResult<CompilationUnit> result = java21Parser.parse(file);
+        if (result.isSuccessful() && result.getResult().isPresent()) {
+            return buildParsedFile(result.getResult().get(), file, projectName);
+        }
+        // JAVA_21 failed — retry with RAW (handles _ as identifier and other pre-14 patterns)
+        log.debug("JAVA_21 parse failed for {}, retrying with RAW: {}", file,
+                result.getProblems().stream().map(Object::toString)
+                        .collect(java.util.stream.Collectors.joining("; ")));
+        ParseResult<CompilationUnit> rawResult = rawParser.parse(file);
+        if (!rawResult.isSuccessful() || rawResult.getResult().isEmpty()) {
+            throw new IOException("Parse failed for " + file + ": " +
+                    rawResult.getProblems().stream().map(Object::toString)
+                            .collect(java.util.stream.Collectors.joining("; ")));
+        }
+        return buildParsedFile(rawResult.getResult().get(), file, projectName);
+    }
+
     private ParsedFile doParse(JavaParser parser, Path file, String projectName) throws IOException {
         ParseResult<CompilationUnit> result = parser.parse(file);
         if (!result.isSuccessful() || result.getResult().isEmpty()) {
@@ -183,8 +250,10 @@ public class JavaCodeParser implements CodeParser {
                     result.getProblems().stream().map(Object::toString)
                             .collect(java.util.stream.Collectors.joining("; ")));
         }
-        CompilationUnit cu = result.getResult().get();
+        return buildParsedFile(result.getResult().get(), file, projectName);
+    }
 
+    private ParsedFile buildParsedFile(CompilationUnit cu, Path file, String projectName) {
         String packageName = cu.getPackageDeclaration()
                 .map(p -> p.getNameAsString())
                 .orElse("");
@@ -270,6 +339,78 @@ public class JavaCodeParser implements CodeParser {
             current = current.getParent();
         }
         return parent;
+    }
+
+    /**
+     * Parse a pre-collected list of Java files, reusing the same parser instances across
+     * the entire batch.  This avoids recreating {@link CombinedTypeSolver} (which re-loads
+     * JDK reflection caches) for every file when called from the shared-manifest path.
+     */
+    @Override
+    public ParsedProject parseFiles(List<Path> files, Path projectRoot,
+                                     String projectName) throws IOException {
+        if (files.isEmpty()) {
+            return new ParsedProject(projectName, projectRoot.toString(), List.of());
+        }
+        Path sourceRoot = detectSourceRoot(projectRoot);
+        List<ParsedFile> results = new CopyOnWriteArrayList<>();
+        AtomicInteger errorCount = new AtomicInteger(0);
+        AtomicInteger fileCount = new AtomicInteger(0);
+
+        if (parseThreads <= 1) {
+            JavaParser java21Parser = createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21);
+            JavaParser rawParser    = createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW);
+            for (Path file : files) {
+                try {
+                    results.add(doParseWithFallback(java21Parser, rawParser, file, projectName));
+                    fileCount.incrementAndGet();
+                } catch (Throwable e) {
+                    log.warn("Parse error in {}: {}", file, e.getMessage());
+                    errorCount.incrementAndGet();
+                }
+            }
+        } else {
+            ThreadLocal<JavaParser> threadParserJava21 = ThreadLocal.withInitial(
+                    () -> createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21));
+            ThreadLocal<JavaParser> threadParserRaw = ThreadLocal.withInitial(
+                    () -> createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW));
+            ExecutorService pool = Executors.newFixedThreadPool(parseThreads,
+                    r -> { Thread t = new Thread(r, "java-parser"); t.setDaemon(true); return t; });
+            try {
+                List<Future<ParsedFile>> futures = new ArrayList<>(files.size());
+                for (Path file : files) {
+                    futures.add(pool.submit(() -> {
+                        try {
+                            ParsedFile pf = doParseWithFallback(
+                                    threadParserJava21.get(), threadParserRaw.get(), file, projectName);
+                            fileCount.incrementAndGet();
+                            return pf;
+                        } catch (Exception e) {
+                            log.debug("Parse error in {}: {}", file, e.getMessage());
+                            errorCount.incrementAndGet();
+                            return null;
+                        }
+                    }));
+                }
+                for (Future<ParsedFile> f : futures) {
+                    try {
+                        ParsedFile pf = f.get();
+                        if (pf != null) results.add(pf);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Parsing interrupted", e);
+                    } catch (ExecutionException e) {
+                        log.debug("Unexpected parse failure: {}", e.getCause().getMessage());
+                        errorCount.incrementAndGet();
+                    }
+                }
+            } finally {
+                pool.shutdown();
+            }
+        }
+        log.info("parseFiles: {} files ({} errors) in project '{}'",
+                fileCount.get(), errorCount.get(), projectName);
+        return new ParsedProject(projectName, projectRoot.toString(), results);
     }
 
     @Override

@@ -27,12 +27,10 @@ public class ModuleBoundaryAnalyzer {
 
     private final ProjectRegistry registry;
     private final CallGraphSerializer serializer;
-    private final SearchEngine searchEngine;
 
     public ModuleBoundaryAnalyzer(ProjectRegistry registry, SearchEngine searchEngine) {
         this.registry     = registry;
         this.serializer   = new CallGraphSerializer();
-        this.searchEngine = searchEngine;
     }
 
     // ---------------------------------------------------------------------------

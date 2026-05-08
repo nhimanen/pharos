@@ -11,6 +11,7 @@ import org.junit.jupiter.api.*;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -779,7 +780,7 @@ class LuceneSearchQualityTest {
 
             // Collect the classes we care about: expected + rank-1 of kw + rank-1 of hy
             java.util.Set<String> classesToInspect = new java.util.LinkedHashSet<>();
-            qc.highRelevance().forEach(classesToInspect::add);
+            classesToInspect.addAll(qc.highRelevance());
             if (!kw.isEmpty()) classesToInspect.add(kw.get(0).className());
             if (!hy.isEmpty()) classesToInspect.add(hy.get(0).className());
 
@@ -810,7 +811,7 @@ class LuceneSearchQualityTest {
                     if (inDegStr != null) totalInDegree += Integer.parseInt(inDegStr);
                     String ctx = doc.get(com.pharos.indexer.DocumentMapper.F_CALLER_CONTEXT);
                     if (ctx != null && !ctx.isBlank()) {
-                        for (String caller : ctx.split("\\s+")) callers.add(caller);
+                        callers.addAll(Arrays.asList(ctx.split("\\s+")));
                     }
                 }
                 String callerSnippet = callers.stream().limit(8).collect(java.util.stream.Collectors.joining(" "));

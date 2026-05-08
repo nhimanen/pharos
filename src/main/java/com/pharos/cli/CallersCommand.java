@@ -33,12 +33,10 @@ public class CallersCommand implements Callable<Integer> {
 
     private final SearchEngine searchEngine;
     private final ProjectRegistry registry;
-    private final IndexConfig config;
 
     public CallersCommand(SearchEngine searchEngine, ProjectRegistry registry, IndexConfig config) {
         this.searchEngine = searchEngine;
         this.registry = registry;
-        this.config = config;
     }
 
     @Override

@@ -15,15 +15,19 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 |---|---|
 | Find code by concept or description | `pharos search "<query>"` |
 | Find code by exact method or class name | `pharos search "<name>" --type keyword` |
+| Restrict search to methods or classes | `pharos search "<query>" --doc-type method\|class` |
+| Restrict search to one project | `pharos search "<query>" --project <name>` |
+| Control result count | `pharos search "<query>" --limit 20` |
 | Get full method implementation | `pharos method "<fqn>"` |
-| What does a method call / depend on | `pharos callees "<fqn>"` |
-| Who calls a method (change impact) | `pharos callers "<fqn>"` |
+| What does a method call / depend on | `pharos callees "<fqn>" [--limit N]` |
+| Who calls a method (change impact) | `pharos callers "<fqn>" [--limit N]` |
 | Trace execution between two methods | `pharos path "<from_fqn>" "<to_fqn>"` |
-| List indexed projects | `pharos projects` |
-| List Maven modules | `pharos modules` |
-| Module dependency tree | `pharos deps <module> [--transitive]` |
+| List indexed projects | `pharos projects [--limit N]` |
+| List Maven modules | `pharos modules [--filter indexed\|external] [--limit N]` |
+| Module dependency tree | `pharos deps <module> [--transitive] [--limit N]` |
 | Dependency path between modules | `pharos mod-path <from> <to>` |
-| Module public API surface | `pharos boundary <project>` |
+| Module public API surface | `pharos boundary <project> [--limit N]` |
+| Daemon lifecycle | `pharos daemon status\|start\|stop\|restart\|logs` |
 
 ## FQN Format
 
@@ -57,5 +61,10 @@ pharos search "methodName" --type keyword --doc-type method
 pharos mod-path com.example:module-a com.example:module-b
 pharos boundary my-project
 ```
+
+## Limits
+
+All listing commands accept `--limit N` (default 0 = no limit). `search` defaults to `--limit 10`.
+Use `--limit 0` to remove the cap, or a positive number to cap output.
 
 Run `pharos <command> --help` for full options on any command.

@@ -25,10 +25,6 @@ public class PathCommand implements Callable<Integer> {
     @Parameters(index = "1", description = "Target method FQN")
     private String toFqn;
 
-    @Option(names = {"--cross-project"},
-            description = "Include cross-project call edges (requires linked projects)")
-    private boolean crossProject = false;
-
     private final ProjectRegistry registry;
     private final IndexConfig config;
 
@@ -60,6 +56,7 @@ public class PathCommand implements Callable<Integer> {
     }
 
     private CallGraph buildGraph() throws Exception {
+        boolean crossProject = false;
         if (crossProject) {
             CrossProjectLinker linker = new CrossProjectLinker(config, registry);
             return linker.loadCrossProjectGraph();

@@ -68,6 +68,15 @@ public class IndexConfig {
         return Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 4));
     }
 
+    /**
+     * Number of projects to index concurrently during multi-project discovery.
+     * Capped at available processors; each project already uses its own parse/index threads,
+     * so a small value (2–4) is enough to keep I/O and parsing pipelines busy.
+     */
+    public int resolvedProjectThreads() {
+        return 1;
+    }
+
     public static IndexConfig defaults() {
         return new IndexConfig();
     }

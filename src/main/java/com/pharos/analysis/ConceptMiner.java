@@ -5,11 +5,9 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.index.Term;
@@ -19,7 +17,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.Arrays;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -98,7 +95,7 @@ public class ConceptMiner {
 
     // ── Entry point ───────────────────────────────────────────────────────────
 
-    public static void main(String[] args) throws Exception {
+    static void main(String[] args) throws Exception {
         String projectName = args.length > 0 ? args[0] : "lucene";
         int topTermsPerClass   = args.length > 1 ? Integer.parseInt(args[1]) : 12;
         int minDocFreq         = 2;   // term must appear in ≥2 class docs (not a typo)

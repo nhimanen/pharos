@@ -17,7 +17,8 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Embedding provider using Deep Java Library (DJL) with ONNX Runtime backend.
@@ -59,6 +60,13 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             ThreadLocal.withInitial(this::newPredictor);
 
     /**
+     * Batch predictor: runs multiple texts through the model in a single forward pass.
+     * Only created for HF models (custom translator); null for zoo models.
+     */
+    private final ThreadLocal<Predictor<List<String>, float[][]>> threadBatchPredictor =
+            ThreadLocal.withInitial(this::newBatchPredictor);
+
+    /**
      * Per-thread embed call counter used for periodic predictor reset.
      * int[] so the value can be mutated inside the ThreadLocal lambda.
      */
@@ -92,6 +100,19 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
         SentenceTransformerTranslator translator =
                 new SentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens);
         return hfModel.newPredictor(translator);
+    }
+
+    /**
+     * Creates a fresh batch predictor (HF models only).
+     * Zoo models don't expose a parameterless newPredictor for custom translators,
+     * so we return null and fall back to sequential in {@link #embedBatch}.
+     */
+    @SuppressWarnings("unchecked")
+    private Predictor<List<String>, float[][]> newBatchPredictor() {
+        if (hfModel == null) return null;
+        BatchSentenceTransformerTranslator translator =
+                new BatchSentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens);
+        return (Predictor<List<String>, float[][]>) hfModel.newPredictor(translator);
     }
 
     /**
@@ -204,6 +225,35 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
                     Thread.currentThread().getName(), count[0]);
             threadPredictor.get().close();
             threadPredictor.set(newPredictor());
+        }
+    }
+
+    /**
+     * Embed a batch of texts in a single ONNX forward pass (HF models only).
+     * Sequences are padded to the longest item in the batch; the ONNX model receives
+     * a single [batch, seq_len] tensor instead of N separate [1, seq_len] tensors.
+     *
+     * <p>Falls back to the sequential default for zoo models or on error.
+     */
+    @Override
+    public float[][] embedBatch(List<String> texts) {
+        if (texts == null || texts.isEmpty()) return new float[0][];
+
+        Predictor<List<String>, float[][]> batchPred = threadBatchPredictor.get();
+        if (batchPred == null) {
+            // Zoo model path — sequential fallback
+            return EmbeddingProvider.super.embedBatch(texts);
+        }
+
+        List<String> sanitised = texts.stream()
+                .map(t -> (t == null || t.isBlank()) ? ""
+                        : t.length() > MAX_INPUT_LENGTH ? t.substring(0, MAX_INPUT_LENGTH) : t)
+                .collect(Collectors.toList());
+        try {
+            return batchPred.predict(sanitised);
+        } catch (TranslateException e) {
+            log.debug("Batch embedding failed, falling back to sequential: {}", e.getMessage());
+            return EmbeddingProvider.super.embedBatch(texts);
         }
     }
 

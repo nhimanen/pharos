@@ -93,6 +93,9 @@ public class MavenPomReader {
     private PomInfo parse(Document doc) {
         Element root = doc.getDocumentElement();
 
+        // Collect <properties> for substitution — must happen before reading coordinates
+        java.util.Map<String, String> properties = readProperties(root);
+
         // Own coordinates — groupId/version may be absent and inherited from <parent>
         String groupId    = directChild(root, "groupId");
         String artifactId = directChild(root, "artifactId");
@@ -104,12 +107,22 @@ public class MavenPomReader {
             Element parent = (Element) parentNodes.item(0);
             if (groupId == null)  groupId  = directChild(parent, "groupId");
             if (version == null)  version  = directChild(parent, "version");
+            // Seed properties from parent coordinates so ${project.groupId} etc. resolve
+            String parentGroupId = directChild(parent, "groupId");
+            String parentVersion = directChild(parent, "version");
+            if (parentGroupId != null) properties.putIfAbsent("project.parent.groupId", parentGroupId);
+            if (parentVersion != null) properties.putIfAbsent("project.parent.version", parentVersion);
         }
 
+        // Seed well-known Maven built-in properties
+        if (groupId != null)    properties.putIfAbsent("project.groupId", groupId);
+        if (artifactId != null) properties.putIfAbsent("project.artifactId", artifactId);
+        if (version != null)    properties.putIfAbsent("project.version", version);
+
         MavenCoordinates coords = new MavenCoordinates(
-                groupId    != null ? groupId    : "unknown",
-                artifactId != null ? artifactId : "unknown",
-                version    != null ? version    : "unknown"
+                resolve(groupId    != null ? groupId    : "unknown", properties),
+                resolve(artifactId != null ? artifactId : "unknown", properties),
+                resolve(version    != null ? version    : "unknown", properties)
         );
 
         // Dependencies — skip anything inside <dependencyManagement>
@@ -124,9 +137,10 @@ public class MavenPomReader {
             if (dg == null || da == null) continue;
 
             deps.add(new MavenDependency(
-                    dg, da,
-                    directChild(dep, "version"),   // null = managed by BOM
-                    directChild(dep, "scope")      // null = compile
+                    resolve(dg, properties),
+                    resolve(da, properties),
+                    resolve(directChild(dep, "version"), properties),   // null = managed by BOM
+                    directChild(dep, "scope")                           // null = compile
             ));
         }
 
@@ -139,6 +153,65 @@ public class MavenPomReader {
         }
 
         return new PomInfo(coords, deps, submodules);
+    }
+
+    /**
+     * Reads all entries from the {@code <properties>} element, if present.
+     * Returns a mutable map so callers can seed additional built-in properties.
+     */
+    private static java.util.Map<String, String> readProperties(Element root) {
+        java.util.Map<String, String> props = new java.util.LinkedHashMap<>();
+        NodeList propBlocks = root.getElementsByTagName("properties");
+        for (int i = 0; i < propBlocks.getLength(); i++) {
+            org.w3c.dom.Node node = propBlocks.item(i);
+            if (!(node instanceof Element propsEl)) continue;
+            // Only top-level <properties> (direct child of root)
+            if (node.getParentNode() != root) continue;
+            org.w3c.dom.NodeList children = propsEl.getChildNodes();
+            for (int j = 0; j < children.getLength(); j++) {
+                org.w3c.dom.Node child = children.item(j);
+                if (child instanceof Element propEl) {
+                    String text = propEl.getTextContent().trim();
+                    if (!text.isEmpty()) {
+                        props.put(propEl.getTagName(), text);
+                    }
+                }
+            }
+        }
+        return props;
+    }
+
+    /**
+     * Substitutes {@code ${key}} placeholders in {@code value} using {@code properties}.
+     * Performs up to 5 passes to handle chained references (e.g. {@code ${a}} where
+     * {@code a=${b}}). Returns the original string unchanged if null or no placeholders.
+     */
+    private static String resolve(String value, java.util.Map<String, String> properties) {
+        if (value == null || !value.contains("${")) return value;
+        String result = value;
+        for (int pass = 0; pass < 5; pass++) {
+            String expanded = expandOnce(result, properties);
+            if (expanded.equals(result)) break;
+            result = expanded;
+        }
+        return result;
+    }
+
+    private static String expandOnce(String value, java.util.Map<String, String> properties) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < value.length()) {
+            int start = value.indexOf("${", i);
+            if (start < 0) { sb.append(value, i, value.length()); break; }
+            sb.append(value, i, start);
+            int end = value.indexOf('}', start + 2);
+            if (end < 0) { sb.append(value, start, value.length()); break; }
+            String key = value.substring(start + 2, end);
+            String replacement = properties.get(key);
+            sb.append(replacement != null ? replacement : value.substring(start, end + 1));
+            i = end + 1;
+        }
+        return sb.toString();
     }
 
     /**

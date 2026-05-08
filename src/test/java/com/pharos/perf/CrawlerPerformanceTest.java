@@ -393,7 +393,6 @@ class CrawlerPerformanceTest {
 
         final EmbeddingProvider embedder;
         private final IndexConfig config;
-        private final LuceneIndexer luceneIndexer;
         private final ProjectIndexManager indexManager;
         private final TestRegistry registry;
 
@@ -407,7 +406,7 @@ class CrawlerPerformanceTest {
 
             registry     = new TestRegistry();
             embedder     = EmbeddingProvider.create(config);
-            luceneIndexer = new LuceneIndexer(config);
+            LuceneIndexer luceneIndexer = new LuceneIndexer(config);
 
             // No-op module graph builder: Lucene source uses Gradle (no pom.xml),
             // so incorporate() would be skipped anyway, but this also avoids any

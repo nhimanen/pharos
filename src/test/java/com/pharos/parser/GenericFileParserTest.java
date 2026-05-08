@@ -77,8 +77,8 @@ class GenericFileParserTest {
 
         // README.md Installation section links to docs/getting-started.md
         long linkCount = project.allMethods().stream()
-                .flatMap(m -> m.calledMethods().stream())
-                .count();
+                .mapToLong(m -> m.calledMethods().size())
+                .sum();
         assertThat(linkCount).isGreaterThan(0);
     }
 

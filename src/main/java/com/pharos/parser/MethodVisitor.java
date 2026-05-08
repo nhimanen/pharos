@@ -5,7 +5,6 @@ import com.github.javaparser.ast.comments.JavadocComment;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
-import com.github.javaparser.resolution.UnsolvedSymbolException;
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 import com.pharos.parser.model.CallReference;
 import com.pharos.parser.model.ParsedClass;
@@ -180,13 +179,64 @@ public class MethodVisitor extends VoidVisitorAdapter<List<ParsedMethod>> {
                 String qualifiedClass = pkg.isEmpty() ? className : pkg + "." + className;
                 String calleeFqn = qualifiedClass + "#"
                         + resolved.getName() + "(" + params + ")";
-                calls.add(CallReference.resolved(callerFqn, calleeFqn, line));
-            } catch (RuntimeException e) {
-                // Expected for external library calls or calls on unresolved types
-                calls.add(CallReference.unresolved(callerFqn, call.getNameAsString(), line));
+                calls.add(CallReference.resolved(callerFqn, calleeFqn, numParams, line));
+            } catch (Throwable e) {
+                // Expected for external library calls, unresolved types, or recursive var
+                // type inference (StackOverflowError from JavaParser's symbol solver)
+                String receiverTypeName = call.getScope()
+                        .map(scope -> extractReceiverType(body, scope))
+                        .orElse(null);
+                int paramCount = call.getArguments().size();
+                calls.add(CallReference.unresolved(callerFqn, call.getNameAsString(),
+                        receiverTypeName, paramCount, line));
             }
         });
         return calls;
+    }
+
+    /**
+     * Attempts to determine the simple type name of a call receiver using AST-only analysis
+     * (no symbol resolution). Looks up variable/parameter declarations in the enclosing scope.
+     *
+     * Examples: {@code writer.addDocument(d)} → scope is NameExpr "writer" → looks for
+     * {@code IndexWriter writer} in body/params → returns "IndexWriter".
+     */
+    private String extractReceiverType(BlockStmt body, Expression scope) {
+        if (!(scope instanceof NameExpr nameExpr)) return null;
+        String varName = nameExpr.getNameAsString();
+
+        // Check local variable declarations in method body
+        for (VariableDeclarator vd : body.findAll(VariableDeclarator.class)) {
+            if (vd.getNameAsString().equals(varName)) {
+                return stripGenerics(vd.getType().asString());
+            }
+        }
+
+        // Check method/constructor parameters
+        var enclosingMethod = body.findAncestor(com.github.javaparser.ast.body.MethodDeclaration.class);
+        if (enclosingMethod.isPresent()) {
+            for (var param : enclosingMethod.get().getParameters()) {
+                if (param.getNameAsString().equals(varName)) {
+                    return stripGenerics(param.getType().asString());
+                }
+            }
+        }
+        var enclosingCtor = body.findAncestor(com.github.javaparser.ast.body.ConstructorDeclaration.class);
+        if (enclosingCtor.isPresent()) {
+            for (var param : enclosingCtor.get().getParameters()) {
+                if (param.getNameAsString().equals(varName)) {
+                    return stripGenerics(param.getType().asString());
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /** Strips generic type arguments: {@code "List<String>"} → {@code "List"}. */
+    private String stripGenerics(String typeName) {
+        int lt = typeName.indexOf('<');
+        return lt > 0 ? typeName.substring(0, lt).trim() : typeName.trim();
     }
 
     private String buildSignature(MethodDeclaration n, String access,
@@ -236,14 +286,14 @@ public class MethodVisitor extends VoidVisitorAdapter<List<ParsedMethod>> {
     private String simplifyType(String fullType) {
         if (fullType == null) return "?";
         // Handle array types
-        String suffix = "";
+        StringBuilder suffix = new StringBuilder();
         while (fullType.endsWith("[]")) {
-            suffix += "[]";
+            suffix.append("[]");
             fullType = fullType.substring(0, fullType.length() - 2);
         }
         // Varargs
         if (fullType.endsWith("...")) {
-            suffix += "...";
+            suffix.append("...");
             fullType = fullType.substring(0, fullType.length() - 3);
         }
         // Handle generics: simplify each type argument

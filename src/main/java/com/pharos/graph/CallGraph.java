@@ -89,4 +89,24 @@ public class CallGraph {
     public Set<String> allMethods() {
         return graph.vertexSet();
     }
+
+    /**
+     * Removes all vertices (and their incident edges) whose FQN belongs to any of the
+     * given qualified class names (i.e. FQN starts with {@code "ClassName#"}).
+     * Used during incremental graph patching to evict stale entries before re-adding
+     * freshly-parsed method nodes.
+     */
+    public void removeMethodsFromClasses(List<String> qualifiedClassNames) {
+        if (qualifiedClassNames == null || qualifiedClassNames.isEmpty()) return;
+        Set<String> toRemove = new java.util.HashSet<>();
+        for (String fqn : new java.util.HashSet<>(graph.vertexSet())) {
+            for (String cls : qualifiedClassNames) {
+                if (fqn.startsWith(cls + "#")) {
+                    toRemove.add(fqn);
+                    break;
+                }
+            }
+        }
+        graph.removeAllVertices(toRemove);
+    }
 }

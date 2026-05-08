@@ -17,10 +17,6 @@ public class WebCommand implements Callable<Integer> {
             defaultValue = "7070")
     private int port;
 
-    @Option(names = {"--no-open"},
-            description = "Do not attempt to open the browser automatically")
-    private boolean noOpen = false;
-
     private final WebServer webServer;
 
     public WebCommand(WebServer webServer) {
@@ -31,6 +27,7 @@ public class WebCommand implements Callable<Integer> {
     public Integer call() {
         try {
             webServer.start(port);
+            boolean noOpen = false;
             if (!noOpen) {
                 tryOpenBrowser("http://localhost:" + port);
             }

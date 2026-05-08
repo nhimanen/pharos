@@ -8,108 +8,107 @@ Pharos indexes Java projects and gives you three ways to navigate them:
 
 - **Keyword and semantic search** across methods, classes, and javadoc
 - **Call graph exploration** — who calls what, down to method level — visualized in a browser UI
-- **MCP server** — exposes search and graph tools to AI assistants via JSON-RPC
-
-The graph UI lets you drill down three levels: project dependencies → class dependencies → method call graph. External libraries are shown distinctly and can be hidden.
+- **Claude skill** — teaches Claude Code to use `pharos` for code navigation instead of grep
 
 ## Requirements
 
 - Java 21+
+- Python 3.8+ (for the `pharos` CLI client)
 - Maven (to build)
 
-## Build
+## Build & install
 
 ```bash
 mvn clean package -DskipTests
+cp pharos ~/.local/bin/pharos && chmod +x ~/.local/bin/pharos
 ```
 
-Produces `target/codesearch-*.jar` (fat JAR, no other dependencies needed).
+The `pharos` script auto-discovers the JAR from `target/` (dev) or `~/.pharos/bin/pharos.jar` (installed).
+
+To install the JAR to a stable location (survives `mvn clean`):
+```bash
+mkdir -p ~/.pharos/bin && cp target/pharos-*.jar ~/.pharos/bin/pharos.jar
+```
 
 ## Usage
 
 ```bash
-# Index a project
-java -jar target/codesearch-*.jar index /path/to/project
+# Index a project (incremental by default)
+pharos index /path/to/project
 
 # Search
-java -jar target/codesearch-*.jar search "parse method signature"
+pharos search "parse method signature"
+pharos search "LuceneIndexer" --type keyword
 
-# Open the graph browser (default port 7070)
-java -jar target/codesearch-*.jar web
+# Get full method body
+pharos method "com.pharos.indexer.LuceneIndexer#index(ParsedMethod)"
 
-# Start MCP server (stdio JSON-RPC)
-java -jar target/codesearch-*.jar mcp-server
+# Call graph
+pharos callers "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+pharos callees "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+pharos path  "com.pharos.Main#main(String[])" "com.pharos.parser.JavaCodeParser#parseProject(Path,String)"
+
+# Web UI (graph browser, port 7171)
+pharos web
+
+# List indexed projects
+pharos projects
 ```
 
-Index multiple projects and link them to resolve cross-project call edges:
+Index multiple projects and link them for cross-project call resolution:
 
 ```bash
-java -jar target/codesearch-*.jar index /path/to/project-a
-java -jar target/codesearch-*.jar index /path/to/project-b
-java -jar target/codesearch-*.jar link project-a project-b
+pharos index /path/to/project-a
+pharos index /path/to/project-b
+pharos link project-a project-b   # (via java -jar for now; web API coming)
 ```
 
-Config and indexes are stored in `~/.codesearch/`.
+### Daemon
 
-## MCP server setup
-
-### Claude Code (user-level, recommended)
-
-Build the fat JAR and copy it to a stable location so it won't be overwritten by `mvn clean`:
+`pharos` keeps a background JVM running to avoid cold-start latency on every command (port 7171, `PHAROS_PORT` to override):
 
 ```bash
-mvn clean package -DskipTests
-mkdir -p ~/.pharos/bin
-cp target/pharos-*.jar ~/.pharos/bin/pharos.jar
+pharos daemon status
+pharos daemon stop
+pharos daemon logs
 ```
 
-Register it with the Claude Code CLI at user scope (available in all projects):
+## Claude Code integration
+
+### Skill (recommended)
+
+Install the bundled skill so Claude Code automatically uses `pharos` for code navigation instead of grep or file reads:
+
+```bash
+# User-level (all projects)
+mkdir -p ~/.claude/skills/pharos
+cp .claude/skills/pharos/SKILL.md ~/.claude/skills/pharos/SKILL.md
+
+# Or project-level only
+mkdir -p /path/to/your-project/.claude/skills/pharos
+cp .claude/skills/pharos/SKILL.md /path/to/your-project/.claude/skills/pharos/SKILL.md
+```
+
+Once installed Claude Code will call `pharos search`, `pharos callers`, etc. when navigating indexed projects.
+
+### MCP server (alternative)
+
+If you prefer tool-call integration over CLI, register the MCP server:
 
 ```bash
 claude mcp add -s user pharos -- java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar mcp-server
 ```
 
-Verify it's connected:
-
-```bash
-claude mcp list
-# pharos: java -jar ... mcp-server - ✓ Connected
-```
-
-Claude Code starts the process once per session and keeps it alive for all tool calls. The JVM startup cost (~1-2s) is paid once per session.
-
-### Claude Code skill
-
-A Claude Code skill is bundled at `.claude/skills/pharos/SKILL.md`. It teaches Claude when and how to use the `pharos` CLI for code navigation.
-
-**To activate for all your projects (user-level):**
-```bash
-mkdir -p ~/.claude/skills/pharos
-cp .claude/skills/pharos/SKILL.md ~/.claude/skills/pharos/SKILL.md
-```
-
-**To activate for a single project only**, copy it into that project:
-```bash
-mkdir -p /path/to/your-project/.claude/skills/pharos
-cp .claude/skills/pharos/SKILL.md /path/to/your-project/.claude/skills/pharos/SKILL.md
-```
-
-Once installed, Claude Code will automatically use `pharos` CLI commands for code search and navigation instead of grep or file reads, when the project is indexed.
-
-### Available MCP tools
-
 | Tool | Description |
 |---|---|
-| `search_code` | BM25/vector/hybrid search across indexed methods and classes |
-| `get_method` | Fetch full method body by FQN |
-| `get_callers` | Find all methods that call a given method |
-| `get_callees` | Find all methods called by a given method |
+| `search_code` | BM25/vector/hybrid search |
+| `get_method` | Full method body by FQN |
+| `get_callers` / `get_callees` | Call graph edges |
 | `find_call_path` | Shortest call chain between two methods |
-| `list_projects` | List indexed projects with stats |
-| `list_modules` | All modules in the Maven dependency graph |
-| `get_module_deps` | Direct/transitive deps and dependents of a module |
-| `find_module_path` | Shortest Maven dependency path between two modules |
-| `get_module_boundary` | Entry points and external call exit points for a module |
+| `list_projects` | Indexed projects with stats |
+| `get_module_deps` | Direct/transitive Maven deps |
+| `find_module_path` | Shortest Maven dependency path |
+| `get_module_boundary` | Entry/exit points for a module |
 
 ## How it works
 
@@ -117,3 +116,5 @@ Once installed, Claude Code will automatically use `pharos` CLI commands for cod
 2. **Graph** — call references become a directed graph (GraphML); Maven coordinates become a module dependency graph
 3. **Embed** — optional semantic vectors via DJL + ONNX (falls back gracefully if unavailable)
 4. **Index** — Lucene stores everything with BM25 for keyword search and KNN for vector search; graph centrality boosts results for heavily-called methods
+
+Config and indexes are stored in `~/.pharos/`.

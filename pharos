@@ -1,4 +1,772 @@
-#!/bin/bash
-# Wrapper script for pharos
-# Install: cp pharos /usr/local/bin/pharos && chmod +x /usr/local/bin/pharos
-exec java --add-modules=jdk.incubator.vector -jar "$(dirname "$0")/target/pharos-1.0.0-SNAPSHOT.jar" "$@"
+#!/usr/bin/env python3
+"""
+pharos - Python CLI client for the Pharos code search tool.
+
+Uses a persistent background daemon (pharos web server) to avoid JVM cold-start
+on every command. The daemon is started automatically on first use and reused
+for subsequent calls.
+
+Install:
+  cp pharos ~/.local/bin/pharos && chmod +x ~/.local/bin/pharos
+
+JAR resolution order:
+  1. <script-dir>/target/pharos-*.jar   (development / repo checkout)
+  2. ~/.pharos/bin/pharos.jar            (installed)
+
+Daemon port: 7171  (override with PHAROS_PORT env var)
+"""
+
+import argparse
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# ── JAR resolution ────────────────────────────────────────────────────────────
+
+def _resolve_jar() -> Path:
+    """Find the pharos JAR: prefer local target/ build, fall back to installed."""
+    script_dir = Path(__file__).resolve().parent
+    candidates = sorted(glob.glob(str(script_dir / "target" / "pharos-*.jar")), reverse=True)
+    if candidates:
+        return Path(candidates[0])
+    return Path.home() / ".pharos" / "bin" / "pharos.jar"
+
+JAR = _resolve_jar()
+PHAROS_DIR = Path.home() / ".pharos"
+DAEMON_PORT = int(os.environ.get("PHAROS_PORT", "7171"))
+DAEMON_PID_FILE = PHAROS_DIR / "daemon.pid"
+DAEMON_LOG_FILE = PHAROS_DIR / "daemon.log"
+BASE_URL = f"http://localhost:{DAEMON_PORT}"
+
+# ── Daemon management ─────────────────────────────────────────────────────────
+
+def _is_daemon_running() -> bool:
+    """Return True if the daemon is responding on its health endpoint."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _start_daemon():
+    """Start the pharos web server as a background daemon."""
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\n"
+            f"Run: mvn clean package -DskipTests")
+
+    PHAROS_DIR.mkdir(parents=True, exist_ok=True)
+    log_fh = open(DAEMON_LOG_FILE, "a")
+    proc = subprocess.Popen(
+        ["java", "--enable-native-access=ALL-UNNAMED", "-jar", str(JAR),
+         "web", "--port", str(DAEMON_PORT), "--no-open"],
+        stdout=log_fh,
+        stderr=log_fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    DAEMON_PID_FILE.write_text(str(proc.pid))
+
+    # Wait up to 30s for the server to become ready
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if _is_daemon_running():
+            return
+        time.sleep(0.3)
+
+    die(f"pharos daemon failed to start within 30s.\n"
+        f"Check logs: {DAEMON_LOG_FILE}")
+
+
+def ensure_daemon():
+    """Ensure the daemon is running, starting it if necessary."""
+    if _is_daemon_running():
+        return
+    print("Starting pharos daemon...", file=sys.stderr, flush=True)
+    _start_daemon()
+
+
+def _api_get(path: str, params: dict = None) -> object:
+    """Make a GET request to the daemon API. Returns parsed JSON."""
+    url = f"{BASE_URL}{path}"
+    if params:
+        filtered = {k: v for k, v in params.items() if v is not None}
+        if filtered:
+            url += "?" + urllib.parse.urlencode(filtered)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        die(f"API error {e.code}: {body}")
+    except urllib.error.URLError as e:
+        die(f"Cannot reach pharos daemon: {e.reason}\n"
+            f"Try restarting with: pharos daemon restart")
+
+
+def die(msg: str):
+    print(f"pharos: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Output formatters ─────────────────────────────────────────────────────────
+
+def fmt_search(results: list) -> str:
+    if not results:
+        return "No results found."
+    lines = []
+    for r in results:
+        doc_type = r.get("docType", "method")
+        label = r.get("label", r.get("id", "?"))
+        project = r.get("project", "")
+        sig = r.get("signature", "")
+        javadoc = r.get("javadoc", "")
+        fp = r.get("filePath", "")
+        start = r.get("startLine", "")
+        end = r.get("endLine", "")
+        score = r.get("score", 0)
+
+        lines.append(f"[{doc_type}] **{label}** [{project}]  score={score:.3f}")
+        if sig:
+            lines.append(f"  {sig}")
+        if javadoc:
+            first_line = javadoc.strip().split("\n")[0][:120]
+            lines.append(f"  {first_line}")
+        if fp:
+            loc = f"{fp}:{start}-{end}" if start else fp
+            lines.append(f"  {loc}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def fmt_method(r: dict) -> str:
+    if not r:
+        return "Method not found."
+    label = r.get("label", r.get("id", "?"))
+    project = r.get("project", "")
+    body = r.get("body", "")
+    fp = r.get("filePath", "")
+    start = r.get("startLine", "")
+    end = r.get("endLine", "")
+    javadoc = r.get("javadoc", "")
+
+    lines = [f"**{label}** [{project}]"]
+    if javadoc:
+        lines.append(f"\n{javadoc.strip()}")
+    lines.append(f"\n```java\n{body}\n```")
+    if fp:
+        lines.append(f"\n`{fp}:{start}-{end}`")
+    return "\n".join(lines)
+
+
+def _truncate(items: list, limit: int) -> tuple:
+    """Return (visible_items, truncated_count). limit=0 means no cap."""
+    if limit > 0 and len(items) > limit:
+        return items[:limit], len(items) - limit
+    return items, 0
+
+
+def fmt_refs(results: list, label: str, limit: int = 0) -> str:
+    if not results:
+        return f"No {label} found."
+    visible, hidden = _truncate(results, limit)
+    lines = []
+    for r in visible:
+        rid = r.get("id", r.get("label", "?"))
+        project = r.get("project", "")
+        fp = r.get("filePath", "")
+        start = r.get("startLine", "")
+        loc = f" at {fp}:{start}" if fp else ""
+        lines.append(f"- `{rid}` [{project}]{loc}")
+    if hidden:
+        lines.append(f"- *... and {hidden} more (use --limit to see more)*")
+    return "\n".join(lines)
+
+
+def fmt_path(data: dict) -> str:
+    path = data.get("path", [])
+    hops = data.get("hops", 0)
+    if not path:
+        return "No call path found."
+    lines = [f"Call path ({hops} hop{'s' if hops != 1 else ''}):"]
+    for i, node in enumerate(path):
+        prefix = "START" if i == 0 else ("END" if i == len(path) - 1 else "→")
+        lines.append(f"  {prefix} `{node}`")
+    return "\n".join(lines)
+
+
+def fmt_projects(projects: list, limit: int = 0) -> str:
+    if not projects:
+        return "No projects indexed yet. Run `pharos index <path>` first."
+    visible, hidden = _truncate(projects, limit)
+    lines = ["Indexed projects:"]
+    for p in visible:
+        name = p.get("name", "?")
+        methods = p.get("methodCount", 0)
+        classes = p.get("classCount", 0)
+        last = p.get("lastIndexed", "")
+        lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last})")
+    if hidden:
+        lines.append(f"- *... and {hidden} more*")
+    return "\n".join(lines)
+
+
+def fmt_modules(data: dict, limit: int = 0) -> str:
+    modules = data.get("modules", [])
+    total = data.get("total", 0)
+    edges = data.get("edges", 0)
+    indexed = sum(1 for m in modules if m.get("indexed"))
+    external = total - indexed
+    visible, hidden = _truncate(modules, limit)
+    lines = [f"Module graph: **{total}** nodes ({indexed} indexed, {external} external), **{edges}** edges\n"]
+    for m in visible:
+        key = m.get("moduleKey", "?")
+        status = f"✓ indexed [{m.get('projectName')}]" if m.get("indexed") else "⊘ external"
+        deps = m.get("depCount", 0)
+        used = m.get("usedByCount", 0)
+        ver = m.get("version", "")
+        lines.append(f"- `{key}` {status} — deps: {deps}, used-by: {used}, version: {ver}")
+    if hidden:
+        lines.append(f"- *... and {hidden} more (use --limit to see more)*")
+    return "\n".join(lines)
+
+
+def fmt_deps(data: dict, limit: int = 0) -> str:
+    key = data.get("moduleKey", "?")
+    indexed = data.get("indexed", False)
+    project = data.get("projectName", "")
+    version = data.get("version", "")
+    transitive = data.get("transitive", False)
+    deps = data.get("dependencies", [])
+    dependents = data.get("dependents", [])
+    status = f"indexed/{project}" if indexed else "external"
+    t_label = "transitive, " if transitive else ""
+
+    lines = [f"**{key}** [{status}] version: {version}\n"]
+    vis_deps, hid_deps = _truncate(deps, limit)
+    lines.append(f"**Dependencies ({t_label}{len(deps)}):**")
+    for d in vis_deps:
+        lines.append(f"- → `{d['moduleKey']}` [{'indexed' if d.get('indexed') else 'external'}]")
+    if hid_deps:
+        lines.append(f"- *... and {hid_deps} more*")
+    vis_dep, hid_dep = _truncate(dependents, limit)
+    lines.append(f"\n**Used by ({t_label}{len(dependents)}):**")
+    for d in vis_dep:
+        lines.append(f"- ← `{d['moduleKey']}` [{'indexed' if d.get('indexed') else 'external'}]")
+    if hid_dep:
+        lines.append(f"- *... and {hid_dep} more*")
+    return "\n".join(lines)
+
+
+def fmt_mod_path(data: dict) -> str:
+    path = data.get("path", [])
+    hops = data.get("hops", 0)
+    if not path:
+        return "No dependency path found."
+    lines = [f"Dependency path ({hops} hop{'s' if hops != 1 else ''}):"]
+    for i, n in enumerate(path):
+        marker = "**START**" if i == 0 else ("**END**" if i == len(path) - 1 else "→")
+        status = f"indexed/{n.get('projectName')}" if n.get("indexed") else "external"
+        lines.append(f"  {marker} `{n['moduleKey']}` [{status}]")
+    return "\n".join(lines)
+
+
+def fmt_boundary(data: dict, limit: int = 0) -> str:
+    project = data.get("project", "?")
+    entry = data.get("entryPoints", [])
+    exits = data.get("exitPoints", [])
+    lines = [f"**Module boundary for `{project}`**\n"]
+    vis_entry, hid_entry = _truncate(entry, limit)
+    lines.append(f"**Entry points** (methods called by other linked modules): {len(entry)}")
+    if not entry:
+        lines.append("- *(none — no linked projects have been indexed yet)*")
+    else:
+        for fqn in vis_entry:
+            lines.append(f"- `{fqn}`")
+        if hid_entry:
+            lines.append(f"- *... and {hid_entry} more*")
+    vis_exits, hid_exits = _truncate(exits, limit)
+    lines.append(f"\n**Exit points** (unresolved external calls): {len(exits)}")
+    if not exits:
+        lines.append("- *(none recorded)*")
+    else:
+        for ep in vis_exits:
+            lines.append(f"- `{ep['callerFqn']}` → `{ep['calleeSimpleName']}` (line {ep['line']})")
+        if hid_exits:
+            lines.append(f"- *... and {hid_exits} more*")
+    return "\n".join(lines)
+
+
+# ── Command implementations ───────────────────────────────────────────────────
+
+def cmd_search(args):
+    ensure_daemon()
+    params = {
+        "q": args.query,
+        "type": args.type,
+        "limit": args.limit,
+    }
+    if args.project:
+        params["project"] = args.project
+    if args.doc_type != "all":
+        params["docType"] = args.doc_type
+    if args.expand:
+        params["expand"] = "true"
+    results = _api_get("/api/search", params)
+    print(fmt_search(results))
+
+
+def cmd_method(args):
+    ensure_daemon()
+    data = _api_get("/api/method", {"fqn": args.fqn})
+    print(fmt_method(data))
+
+
+def cmd_callers(args):
+    ensure_daemon()
+    results = _api_get("/api/callers", {"fqn": args.fqn})
+    print(fmt_refs(results, "callers", args.limit))
+
+
+def cmd_callees(args):
+    ensure_daemon()
+    results = _api_get("/api/callees", {"fqn": args.fqn})
+    print(fmt_refs(results, "callees", args.limit))
+
+
+def cmd_path(args):
+    ensure_daemon()
+    data = _api_get("/api/path", {"from": args.from_fqn, "to": args.to_fqn})
+    print(fmt_path(data))
+
+
+def cmd_projects(args):
+    ensure_daemon()
+    projects = _api_get("/api/projects")
+    print(fmt_projects(projects, args.limit))
+
+
+def cmd_modules(args):
+    ensure_daemon()
+    data = _api_get("/api/modules", {"filter": args.filter})
+    print(fmt_modules(data, args.limit))
+
+
+def cmd_deps(args):
+    ensure_daemon()
+    data = _api_get("/api/deps", {"module": args.module, "transitive": str(args.transitive).lower()})
+    print(fmt_deps(data, args.limit))
+
+
+def cmd_mod_path(args):
+    ensure_daemon()
+    data = _api_get("/api/mod-path", {"from": args.from_module, "to": args.to_module})
+    print(fmt_mod_path(data))
+
+
+def cmd_boundary(args):
+    ensure_daemon()
+    data = _api_get("/api/boundary", {"project": args.project})
+    print(fmt_boundary(data, args.limit))
+
+
+def cmd_index(args):
+    """Run indexing by spawning the JAR directly (daemon is search-only, no write lock)."""
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+
+    cmd = ["java", "--enable-native-access=ALL-UNNAMED", "-jar", str(JAR), "index", str(args.path)]
+    if args.project:
+        cmd += ["--project", args.project]
+    if args.full:
+        cmd.append("--full")
+    if args.force:
+        cmd.append("--force")
+    if args.no_embed:
+        cmd.append("--no-embed")
+    if args.single:
+        cmd.append("--single")
+    if args.depth != 3:
+        cmd += ["--depth", str(args.depth)]
+    if args.project_threads != 1:
+        cmd += ["--project-threads", str(args.project_threads)]
+
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
+def cmd_web(args):
+    """Ensure the daemon is running and open the web UI in a browser."""
+    ensure_daemon()
+    url = f"http://localhost:{DAEMON_PORT}"
+    print(f"Web UI available at {url}")
+    if not args.no_open:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+
+def cmd_daemon(args):
+    """Manage the background daemon."""
+    action = args.action
+    if action == "status":
+        if _is_daemon_running():
+            pid = DAEMON_PID_FILE.read_text().strip() if DAEMON_PID_FILE.exists() else "?"
+            print(f"pharos daemon is running (pid={pid}, port={DAEMON_PORT})")
+        else:
+            print("pharos daemon is not running.")
+    elif action == "start":
+        if _is_daemon_running():
+            print(f"pharos daemon is already running on port {DAEMON_PORT}.")
+        else:
+            print("Starting pharos daemon...", flush=True)
+            _start_daemon()
+            print(f"pharos daemon started on port {DAEMON_PORT}.")
+    elif action == "stop":
+        if DAEMON_PID_FILE.exists():
+            try:
+                pid = int(DAEMON_PID_FILE.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                DAEMON_PID_FILE.unlink(missing_ok=True)
+                print(f"pharos daemon (pid={pid}) stopped.")
+            except (ProcessLookupError, ValueError):
+                DAEMON_PID_FILE.unlink(missing_ok=True)
+                print("pharos daemon was not running.")
+        else:
+            print("pharos daemon is not running.")
+    elif action == "restart":
+        if DAEMON_PID_FILE.exists():
+            try:
+                pid = int(DAEMON_PID_FILE.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(1)
+            except (ProcessLookupError, ValueError):
+                pass
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+        print("Starting pharos daemon...", flush=True)
+        _start_daemon()
+        print(f"pharos daemon started on port {DAEMON_PORT}.")
+    elif action == "logs":
+        if DAEMON_LOG_FILE.exists():
+            lines = DAEMON_LOG_FILE.read_text().splitlines()
+            print("\n".join(lines[-50:]))
+        else:
+            print("No daemon log found.")
+
+
+# ── Top-level help ────────────────────────────────────────────────────────────
+
+OVERVIEW = """\
+pharos - Java code search and navigation
+
+USAGE
+  pharos <command> [options] [args]
+  pharos <command> --help
+
+COMMANDS
+  web         Open the web UI in a browser (starts daemon if needed)
+  index       Index a project's source code (runs outside the daemon)
+  search      Search for methods and classes by keyword or concept
+  method      Retrieve full method body by fully qualified name
+  callers     Find all methods that call a given method
+  callees     Find all methods called by a given method
+  path        Find the shortest call chain between two methods
+  projects    List all indexed projects
+  modules     List all modules in the dependency graph
+  deps        Show dependencies of a module
+  mod-path    Find dependency path between two modules
+  boundary    Show entry/exit points of a module
+  daemon      Manage the background daemon (start|stop|restart|status|logs)
+
+DAEMON
+  pharos uses a persistent background JVM to avoid cold-start latency.
+  It starts automatically on first use. Control it with:
+    pharos daemon status
+    pharos daemon stop
+    pharos daemon logs
+  Port: {port}  (override with PHAROS_PORT env var)
+
+TIPS
+  Use type=keyword when searching for exact method or class names.
+  Use type=hybrid (default) for natural language / concept queries.
+  FQN format: com.example.MyClass#methodName(ParamType1,ParamType2)
+
+Run 'pharos <command> --help' for detailed usage of each command.
+""".format(port=DAEMON_PORT)
+
+
+# ── Argument parser ───────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pharos",
+        description="Java code search and navigation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run 'pharos <command> --help' for detailed usage of each command.",
+        add_help=True,
+    )
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    # web
+    p_web = sub.add_parser(
+        "web",
+        help="Open the web UI in a browser (starts daemon if needed)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_web.add_argument("--no-open", dest="no_open", action="store_true",
+                       help="Print the URL but do not open a browser")
+    p_web.set_defaults(func=cmd_web)
+
+    # index
+    p_index = sub.add_parser(
+        "index",
+        help="Index a project's source code",
+        description="""\
+Index a project (or workspace of projects) so it can be searched.
+Spawns a fresh JVM process — the running daemon is not affected.
+
+EXAMPLES
+  pharos index /path/to/myproject
+  pharos index /path/to/workspace          # discovers sub-projects automatically
+  pharos index /path/to/myproject --full   # force full re-index
+  pharos index /path/to/myproject --force  # delete index then re-index
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_index.add_argument("path", help="Path to a project root or workspace")
+    p_index.add_argument("--project", "-p", metavar="NAME",
+                         help="Project name (default: directory name)")
+    p_index.add_argument("--full", action="store_true",
+                         help="Force a full re-index even if previously indexed")
+    p_index.add_argument("--force", action="store_true",
+                         help="Delete existing index before re-indexing")
+    p_index.add_argument("--no-embed", dest="no_embed", action="store_true",
+                         help="Skip vector embedding generation")
+    p_index.add_argument("--single", action="store_true",
+                         help="Treat path as a single project even if sub-projects are detected")
+    p_index.add_argument("--depth", type=int, default=3, metavar="N",
+                         help="Max directory depth to search for sub-projects (default: 3)")
+    p_index.add_argument("--project-threads", dest="project_threads", type=int, default=1, metavar="N",
+                         help="Projects to index concurrently (default: 1)")
+    p_index.set_defaults(func=cmd_index)
+
+    # search
+    p_search = sub.add_parser(
+        "search",
+        help="Search for methods and classes",
+        description="""\
+Search for methods and classes across indexed Java projects.
+
+EXAMPLES
+  pharos search "parse method signature"
+  pharos search "LuceneIndexer" --type keyword
+  pharos search "authentication" --project myapp --limit 20
+  pharos search "token stream" --doc-type method --expand
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_search.add_argument("query", help="Search query (natural language or keyword)")
+    p_search.add_argument(
+        "--type", choices=["hybrid", "keyword", "vector"], default="hybrid",
+        help="Search strategy: hybrid (default), keyword (BM25, best for exact names), vector (semantic)"
+    )
+    p_search.add_argument("--project", metavar="NAME", help="Restrict to a specific indexed project")
+    p_search.add_argument("--limit", type=int, default=10, metavar="N", help="Max results (default: 10)")
+    p_search.add_argument(
+        "--doc-type", dest="doc_type", choices=["all", "method", "class"], default="all",
+        help="Filter by document type (default: all)"
+    )
+    p_search.add_argument("--expand", action="store_true",
+                          help="Append callee methods of top-3 hits as related results")
+    p_search.set_defaults(func=cmd_search)
+
+    # method
+    p_method = sub.add_parser(
+        "method",
+        help="Get full method body by FQN",
+        description="""\
+Retrieve the full source body and metadata of a method by its fully qualified name.
+
+FQN FORMAT
+  com.example.MyClass#methodName(ParamType1,ParamType2)
+
+EXAMPLES
+  pharos method "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_method.add_argument("fqn", help="Fully qualified method name")
+    p_method.set_defaults(func=cmd_method)
+
+    # callers
+    p_callers = sub.add_parser(
+        "callers",
+        help="Find all methods that call a given method",
+        description="""\
+Find all methods in the indexed call graph that call the specified method.
+
+EXAMPLES
+  pharos callers "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+  pharos callers "com.pharos.search.SearchEngine#search(SearchRequest,boolean)" --limit 10
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_callers.add_argument("fqn", help="Fully qualified method name")
+    p_callers.add_argument("--limit", type=int, default=0, metavar="N",
+                           help="Max results to show (default: 0 = no limit)")
+    p_callers.set_defaults(func=cmd_callers)
+
+    # callees
+    p_callees = sub.add_parser(
+        "callees",
+        help="Find all methods called by a given method",
+        description="""\
+Find all methods that the specified method calls (its outgoing call edges).
+
+EXAMPLES
+  pharos callees "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+  pharos callees "com.pharos.search.SearchEngine#search(SearchRequest,boolean)" --limit 10
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_callees.add_argument("fqn", help="Fully qualified method name")
+    p_callees.add_argument("--limit", type=int, default=0, metavar="N",
+                           help="Max results to show (default: 0 = no limit)")
+    p_callees.set_defaults(func=cmd_callees)
+
+    # path
+    p_path = sub.add_parser(
+        "path",
+        help="Find shortest call chain between two methods",
+        description="""\
+Find the shortest call chain (Dijkstra) between two methods across all indexed projects.
+
+EXAMPLES
+  pharos path "com.pharos.Main#main(String[])" "com.pharos.parser.JavaCodeParser#parseProject(Path,String)"
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_path.add_argument("from_fqn", help="Source method FQN")
+    p_path.add_argument("to_fqn", help="Target method FQN")
+    p_path.set_defaults(func=cmd_path)
+
+    # projects
+    p_projects = sub.add_parser(
+        "projects",
+        help="List all indexed projects",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_projects.add_argument("--limit", type=int, default=0, metavar="N",
+                            help="Max results to show (default: 0 = no limit)")
+    p_projects.set_defaults(func=cmd_projects)
+
+    # modules
+    p_modules = sub.add_parser(
+        "modules",
+        help="List all modules in the dependency graph",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_modules.add_argument(
+        "--filter", choices=["all", "indexed", "external"], default="all",
+        help="Filter by status: all (default), indexed, external"
+    )
+    p_modules.add_argument("--limit", type=int, default=0, metavar="N",
+                           help="Max results to show (default: 0 = no limit)")
+    p_modules.set_defaults(func=cmd_modules)
+
+    # deps
+    p_deps = sub.add_parser(
+        "deps",
+        help="Show dependencies of a module",
+        description="""\
+Show direct (or transitive) Maven dependencies and dependents of a module.
+
+EXAMPLES
+  pharos deps com.pharos:pharos
+  pharos deps pharos --transitive
+  pharos deps pharos --transitive --limit 20
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_deps.add_argument("module", help="Module key (groupId:artifactId) or project name")
+    p_deps.add_argument("--transitive", action="store_true", help="Include transitive dependencies")
+    p_deps.add_argument("--limit", type=int, default=0, metavar="N",
+                        help="Max deps/dependents to show per section (default: 0 = no limit)")
+    p_deps.set_defaults(func=cmd_deps)
+
+    # mod-path
+    p_modpath = sub.add_parser(
+        "mod-path",
+        help="Find dependency path between two modules",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_modpath.add_argument("from_module", help="Source module key or project name")
+    p_modpath.add_argument("to_module", help="Target module key or project name")
+    p_modpath.set_defaults(func=cmd_mod_path)
+
+    # boundary
+    p_boundary = sub.add_parser(
+        "boundary",
+        help="Show entry/exit points of a module",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_boundary.add_argument("project", help="Project name of an indexed module")
+    p_boundary.add_argument("--limit", type=int, default=0, metavar="N",
+                            help="Max entry/exit points to show (default: 0 = no limit)")
+    p_boundary.set_defaults(func=cmd_boundary)
+
+    # daemon
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Manage the background pharos daemon",
+        description="""\
+Manage the background pharos web server daemon that enables fast CLI operations.
+
+EXAMPLES
+  pharos daemon status    # Check if running
+  pharos daemon start     # Start if not running
+  pharos daemon stop      # Stop the daemon
+  pharos daemon restart   # Restart
+  pharos daemon logs      # Show last 50 lines of daemon log
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_daemon.add_argument(
+        "action",
+        choices=["start", "stop", "restart", "status", "logs"],
+        help="Action to perform",
+    )
+    p_daemon.set_defaults(func=cmd_daemon)
+
+    return parser
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) == 1:
+        print(OVERVIEW)
+        sys.exit(0)
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(1)
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

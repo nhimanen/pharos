@@ -20,6 +20,24 @@ public interface EmbeddingProvider {
      */
     float[] embed(String text);
 
+    /**
+     * Embed multiple texts in one call, returning one vector per input.
+     *
+     * <p>Implementations that support batched ONNX inference should override this to
+     * amortize the JNI/model-session overhead across the batch.  The default falls back
+     * to individual {@link #embed} calls.
+     *
+     * @param texts list of input texts (null/blank entries yield a null result slot)
+     * @return array of float vectors, same length as {@code texts}; individual slots may be null
+     */
+    default float[][] embedBatch(java.util.List<String> texts) {
+        float[][] results = new float[texts.size()][];
+        for (int i = 0; i < texts.size(); i++) {
+            results[i] = embed(texts.get(i));
+        }
+        return results;
+    }
+
     /** Dimensionality of the embedding vectors. */
     int dimensions();
 

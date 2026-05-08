@@ -13,7 +13,9 @@ import com.pharos.indexer.ProjectIndexManager;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.GenericFileParser;
 import com.pharos.parser.JavaCodeParser;
+import com.pharos.parser.LanguageProfile;
 import com.pharos.parser.PythonCodeParser;
+import com.pharos.parser.RegexCodeParser;
 import com.pharos.search.SearchEngine;
 import picocli.CommandLine;
 
@@ -27,7 +29,7 @@ import java.util.List;
  */
 public class Main {
 
-    public static void main(String[] args) {
+    static void main(String[] args) {
         IndexConfig config = IndexConfig.load();
 
         // Core components
@@ -36,10 +38,16 @@ public class Main {
         LuceneIndexer luceneIndexer = new LuceneIndexer(config);
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
-        List<CodeParser> parsers = List.of(
-                new JavaCodeParser(List.of(), List.of(), parseThreads),
-                new PythonCodeParser(),
-                new GenericFileParser(parseThreads));
+        // Tier-2 regex-based parsers — no external runtime needed
+        List<CodeParser> regexParsers = LanguageProfile.ALL.stream()
+                .<CodeParser>map(RegexCodeParser::new)
+                .toList();
+
+        List<CodeParser> parsers = new java.util.ArrayList<>();
+        parsers.add(new JavaCodeParser(List.of(), List.of(), parseThreads));
+        parsers.add(new PythonCodeParser());
+        parsers.addAll(regexParsers);
+        parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
                 config, luceneIndexer, registry, embedder, moduleGraphBuilder, parsers);
         SearchEngine searchEngine = new SearchEngine(luceneIndexer, embedder, registry);
@@ -89,7 +97,7 @@ public class Main {
         @SuppressWarnings("unchecked")
         public <K> K create(Class<K> cls) throws Exception {
             if (cls == IndexCommand.class)
-                return (K) new IndexCommand(indexManager, crossProjectLinker, registry);
+                return (K) new IndexCommand(indexManager, crossProjectLinker, registry, config);
             if (cls == SearchCommand.class)
                 return (K) new SearchCommand(searchEngine);
             if (cls == CallersCommand.class)
@@ -115,7 +123,7 @@ public class Main {
                 return (K) new ModulePathCommand(moduleGraphBuilder);
             if (cls == WebCommand.class)
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
-                        moduleGraphBuilder, luceneIndexer));
+                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer));
             if (cls == RemoveIndexCommand.class)
                 return (K) new RemoveIndexCommand(registry, luceneIndexer, moduleGraphBuilder);
             // Fall back to default picocli factory for all other classes

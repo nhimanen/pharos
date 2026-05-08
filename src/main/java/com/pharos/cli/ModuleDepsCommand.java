@@ -19,10 +19,6 @@ public class ModuleDepsCommand implements Callable<Integer> {
             description = "Module key (groupId:artifactId) or project name")
     private String moduleRef;
 
-    @Option(names = {"--transitive"},
-            description = "Show all transitive (reachable) deps and dependents via BFS")
-    private boolean transitive = false;
-
     private final ModuleGraphBuilder builder;
 
     public ModuleDepsCommand(ModuleGraphBuilder builder) {
@@ -45,6 +41,7 @@ public class ModuleDepsCommand implements Callable<Integer> {
                     node.isIndexed() ? "indexed/" + node.getProjectName() : "external",
                     node.getVersion());
 
+            boolean transitive = false;
             Set<ModuleNode> deps = transitive
                     ? bfsReach(graph, node, true)
                     : graph.getDependencies(node);

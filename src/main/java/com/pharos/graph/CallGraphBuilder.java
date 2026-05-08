@@ -1,5 +1,6 @@
 package com.pharos.graph;
 
+import com.pharos.parser.model.ParsedFile;
 import com.pharos.parser.model.ParsedMethod;
 import com.pharos.parser.model.ParsedProject;
 import com.pharos.parser.model.CallReference;
@@ -14,18 +15,32 @@ public class CallGraphBuilder {
      * All methods are added as nodes; resolved call references become edges.
      */
     public void build(CallGraph graph, ParsedProject project) {
-        // Add all methods as nodes first
         for (ParsedMethod method : project.allMethods()) {
             graph.addMethod(method.fqn());
         }
-
-        // Add CALLS edges for all resolved call references
         for (ParsedMethod method : project.allMethods()) {
             for (CallReference call : method.calledMethods()) {
                 if (call.resolved()) {
                     graph.addCall(method.fqn(), call.calleeFqn());
                 }
-                // Unresolved calls are stored in meta.json for cross-project linking
+            }
+        }
+    }
+
+    /**
+     * Adds nodes and edges for a single parsed file into an existing graph.
+     * Used during incremental indexing to splice fresh call-graph data without
+     * re-parsing the entire project.
+     */
+    public void buildFile(CallGraph graph, ParsedFile file) {
+        for (ParsedMethod method : file.methods()) {
+            graph.addMethod(method.fqn());
+        }
+        for (ParsedMethod method : file.methods()) {
+            for (CallReference call : method.calledMethods()) {
+                if (call.resolved()) {
+                    graph.addCall(method.fqn(), call.calleeFqn());
+                }
             }
         }
     }

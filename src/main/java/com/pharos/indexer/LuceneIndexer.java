@@ -13,7 +13,6 @@ import org.apache.lucene.analysis.synonym.SynonymGraphFilter;
 import org.apache.lucene.analysis.synonym.SynonymMap;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
-import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,7 +23,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.ParseException;
 import java.util.*;
-import java.util.Comparator;
 
 /**
  * Manages Lucene index directories — opening writers and readers per project,
@@ -49,7 +47,7 @@ public class LuceneIndexer implements Closeable {
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
-        iwc.setRAMBufferSizeMB(64);
+        iwc.setRAMBufferSizeMB(128);
         return new IndexWriter(dir, iwc);
     }
 
@@ -61,7 +59,7 @@ public class LuceneIndexer implements Closeable {
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
-        iwc.setRAMBufferSizeMB(64);
+        iwc.setRAMBufferSizeMB(128);
         return new IndexWriter(dir, iwc);
     }
 

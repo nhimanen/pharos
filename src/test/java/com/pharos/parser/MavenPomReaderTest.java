@@ -5,7 +5,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -215,6 +214,199 @@ class MavenPomReaderTest {
         assertThat(info.dependencies()).anyMatch(d -> "commons-lang3".equals(d.artifactId()));
         assertThat(info.dependencies()).anyMatch(d ->
                 "junit-jupiter".equals(d.artifactId()) && "test".equals(d.scope()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Limitation 4: Maven property substitution
+    // -----------------------------------------------------------------------
+
+    @Test
+    void read_resolvesVersionProperty() throws Exception {
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.example</groupId>" +
+                "  <artifactId>app</artifactId>" +
+                "  <version>1.0</version>" +
+                "  <properties>" +
+                "    <core.version>3.2.1</core.version>" +
+                "  </properties>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>com.example</groupId>" +
+                "      <artifactId>core-lib</artifactId>" +
+                "      <version>${core.version}</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.dependencies()).hasSize(1);
+        assertThat(info.dependencies().get(0).version()).isEqualTo("3.2.1");
+    }
+
+    @Test
+    void read_resolvesGroupIdPropertyInDependency() throws Exception {
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.app</groupId>" +
+                "  <artifactId>service</artifactId>" +
+                "  <version>1.0</version>" +
+                "  <properties>" +
+                "    <platform.groupId>com.platform</platform.groupId>" +
+                "  </properties>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>${platform.groupId}</groupId>" +
+                "      <artifactId>platform-core</artifactId>" +
+                "      <version>2.0</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.dependencies()).hasSize(1);
+        assertThat(info.dependencies().get(0).groupId()).isEqualTo("com.platform");
+        assertThat(info.dependencies().get(0).moduleKey()).isEqualTo("com.platform:platform-core");
+    }
+
+    @Test
+    void read_resolvesArtifactIdPropertyInDependency() throws Exception {
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.app</groupId>" +
+                "  <artifactId>service</artifactId>" +
+                "  <version>1.0</version>" +
+                "  <properties>" +
+                "    <shared.artifactId>shared-kernel</shared.artifactId>" +
+                "  </properties>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>com.shared</groupId>" +
+                "      <artifactId>${shared.artifactId}</artifactId>" +
+                "      <version>1.0</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.dependencies().get(0).artifactId()).isEqualTo("shared-kernel");
+    }
+
+    @Test
+    void read_resolvesProjectBuiltinProperty_projectGroupId() throws Exception {
+        // ${project.groupId} in a dependency groupId should resolve to the project's own groupId
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.mycompany</groupId>" +
+                "  <artifactId>parent</artifactId>" +
+                "  <version>1.0</version>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>${project.groupId}</groupId>" +
+                "      <artifactId>sibling-module</artifactId>" +
+                "      <version>1.0</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.dependencies().get(0).groupId()).isEqualTo("com.mycompany");
+    }
+
+    @Test
+    void read_resolvesOwnCoordinateProperty() throws Exception {
+        // ${my.group} used in the project's own groupId coordinate
+        Path pom = writePom(
+                "<project>" +
+                "  <properties>" +
+                "    <my.group>com.resolved</my.group>" +
+                "  </properties>" +
+                "  <groupId>${my.group}</groupId>" +
+                "  <artifactId>tool</artifactId>" +
+                "  <version>1.0</version>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.coordinates().groupId()).isEqualTo("com.resolved");
+        assertThat(info.coordinates().moduleKey()).isEqualTo("com.resolved:tool");
+    }
+
+    @Test
+    void read_resolvesChainedProperties() throws Exception {
+        // ${a} → ${b} → "final.value" — requires multiple expansion passes
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version>" +
+                "  <properties>" +
+                "    <b>3.0.0</b>" +
+                "    <a>${b}</a>" +
+                "  </properties>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>com.lib</groupId>" +
+                "      <artifactId>core</artifactId>" +
+                "      <version>${a}</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        assertThat(info.dependencies().get(0).version()).isEqualTo("3.0.0");
+    }
+
+    @Test
+    void read_leavesUnresolvablePropertyAsLiteral() throws Exception {
+        // ${undefined.prop} has no matching <properties> entry — kept as-is (no crash)
+        Path pom = writePom(
+                "<project>" +
+                "  <groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>${undefined.prop}</groupId>" +
+                "      <artifactId>some-lib</artifactId>" +
+                "      <version>1.0</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        // Unresolvable placeholder kept verbatim — not null, not empty, no exception
+        assertThat(info.dependencies().get(0).groupId()).isEqualTo("${undefined.prop}");
+    }
+
+    @Test
+    void read_resolvesParentGroupIdViaBuiltin() throws Exception {
+        // Child inherits groupId from parent; ${project.parent.groupId} resolves to parent groupId
+        Path pom = writePom(
+                "<project>" +
+                "  <parent>" +
+                "    <groupId>com.parentco</groupId>" +
+                "    <artifactId>parent-pom</artifactId>" +
+                "    <version>2.0</version>" +
+                "  </parent>" +
+                "  <artifactId>child-module</artifactId>" +
+                "  <dependencies>" +
+                "    <dependency>" +
+                "      <groupId>${project.parent.groupId}</groupId>" +
+                "      <artifactId>sibling</artifactId>" +
+                "      <version>2.0</version>" +
+                "    </dependency>" +
+                "  </dependencies>" +
+                "</project>");
+
+        MavenPomReader.PomInfo info = reader.read(pom).orElseThrow();
+
+        // groupId inherited from parent
+        assertThat(info.coordinates().groupId()).isEqualTo("com.parentco");
+        // dependency groupId resolved via ${project.parent.groupId}
+        assertThat(info.dependencies().get(0).groupId()).isEqualTo("com.parentco");
     }
 
     // --- helper ---

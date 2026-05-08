@@ -40,6 +40,7 @@ public class WebServer {
     private final ProjectRegistry registry;
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final LuceneIndexer luceneIndexer;
+    private final ModuleBoundaryAnalyzer boundaryAnalyzer;
     private final ObjectMapper mapper;
 
     // CallGraph cache: project name → (file lastModified, loaded graph)
@@ -47,11 +48,13 @@ public class WebServer {
     private final Map<String, CallGraph> callGraphCache = new HashMap<>();
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
-                     ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer) {
+                     ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
+                     ModuleBoundaryAnalyzer boundaryAnalyzer) {
         this.searchEngine = searchEngine;
         this.registry = registry;
         this.moduleGraphBuilder = moduleGraphBuilder;
         this.luceneIndexer = luceneIndexer;
+        this.boundaryAnalyzer = boundaryAnalyzer;
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
@@ -159,6 +162,133 @@ public class WebServer {
                 ctx.status(503).result(e.getMessage());
             }
         });
+
+        // API: call path between two methods (merges all project graphs)
+        app.get("/api/path", ctx -> {
+            String from = ctx.queryParam("from");
+            String to = ctx.queryParam("to");
+            if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
+            CallGraph merged = new CallGraph();
+            for (ProjectMeta meta : registry.listAll()) {
+                try {
+                    CallGraph g = loadCallGraphCached(meta);
+                    g.allMethods().forEach(merged::addMethod);
+                    g.getInternalGraph().edgeSet().forEach(edge ->
+                            merged.addCall(g.getInternalGraph().getEdgeSource(edge),
+                                    g.getInternalGraph().getEdgeTarget(edge)));
+                } catch (Exception ignored) {}
+            }
+            List<String> path = merged.findPath(from, to);
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("path", path);
+            res.put("hops", path.isEmpty() ? 0 : path.size() - 1);
+            ctx.json(res);
+        });
+
+        // API: list modules
+        app.get("/api/modules", ctx -> {
+            String filter = ctx.queryParamAsClass("filter", String.class).getOrDefault("all");
+            ModuleGraph graph = moduleGraphBuilder.load();
+            List<Map<String, Object>> nodes = graph.allNodes().stream()
+                    .filter(n -> switch (filter) {
+                        case "indexed"  -> n.isIndexed();
+                        case "external" -> !n.isIndexed();
+                        default         -> true;
+                    })
+                    .sorted(Comparator.comparing(ModuleNode::getModuleKey))
+                    .map(n -> {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("moduleKey", n.getModuleKey());
+                        m.put("groupId", n.getGroupId());
+                        m.put("artifactId", n.getArtifactId());
+                        m.put("version", n.getVersion());
+                        m.put("indexed", n.isIndexed());
+                        m.put("projectName", n.getProjectName());
+                        m.put("depCount", graph.getDependencies(n).size());
+                        m.put("usedByCount", graph.getDependents(n).size());
+                        return m;
+                    })
+                    .collect(Collectors.toList());
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("total", graph.nodeCount());
+            res.put("edges", graph.edgeCount());
+            res.put("modules", nodes);
+            ctx.json(res);
+        });
+
+        // API: module dependencies
+        app.get("/api/deps", ctx -> {
+            String moduleRef = ctx.queryParam("module");
+            boolean transitive = Boolean.parseBoolean(ctx.queryParamAsClass("transitive", String.class).getOrDefault("false"));
+            if (moduleRef == null) { ctx.status(400).result("module required"); return; }
+            ModuleGraph graph = moduleGraphBuilder.load();
+            ModuleNode node = resolveModule(graph, moduleRef);
+            if (node == null) { ctx.status(404).result("Module not found: " + moduleRef); return; }
+            Set<ModuleNode> deps = transitive ? bfsModules(graph, node, true) : graph.getDependencies(node);
+            Set<ModuleNode> dependents = transitive ? bfsModules(graph, node, false) : graph.getDependents(node);
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("moduleKey", node.getModuleKey());
+            res.put("indexed", node.isIndexed());
+            res.put("projectName", node.getProjectName());
+            res.put("version", node.getVersion());
+            res.put("transitive", transitive);
+            res.put("dependencies", deps.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
+                    .map(d -> Map.of("moduleKey", d.getModuleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
+            res.put("dependents", dependents.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
+                    .map(d -> Map.of("moduleKey", d.getModuleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
+            ctx.json(res);
+        });
+
+        // API: module dependency path
+        app.get("/api/mod-path", ctx -> {
+            String fromRef = ctx.queryParam("from");
+            String toRef = ctx.queryParam("to");
+            if (fromRef == null || toRef == null) { ctx.status(400).result("from and to required"); return; }
+            ModuleGraph graph = moduleGraphBuilder.load();
+            ModuleNode fromNode = resolveModule(graph, fromRef);
+            ModuleNode toNode   = resolveModule(graph, toRef);
+            if (fromNode == null) { ctx.status(404).result("Module not found: " + fromRef); return; }
+            if (toNode   == null) { ctx.status(404).result("Module not found: " + toRef); return; }
+            List<Map<String, Object>> pathNodes = graph.findPath(fromNode.getModuleKey(), toNode.getModuleKey())
+                    .stream().map(n -> {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("moduleKey", n.getModuleKey());
+                        m.put("indexed", n.isIndexed());
+                        m.put("projectName", n.getProjectName());
+                        return m;
+                    }).collect(Collectors.toList());
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("path", pathNodes);
+            res.put("hops", pathNodes.isEmpty() ? 0 : pathNodes.size() - 1);
+            ctx.json(res);
+        });
+
+        // API: module boundary (entry/exit points)
+        app.get("/api/boundary", ctx -> {
+            String project = ctx.queryParam("project");
+            if (project == null) { ctx.status(400).result("project required"); return; }
+            try {
+                ModuleBoundaryAnalyzer.BoundaryResult result = boundaryAnalyzer.analyze(project);
+                List<Map<String, Object>> exits = result.exitPoints().stream()
+                        .map(ep -> {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("callerFqn", ep.callerFqn());
+                            m.put("calleeSimpleName", ep.calleeSimpleName());
+                            m.put("line", ep.line());
+                            return m;
+                        }).collect(Collectors.toList());
+                Map<String, Object> res = new LinkedHashMap<>();
+                res.put("project", project);
+                res.put("entryPoints", result.entryPoints());
+                res.put("exitPoints", exits);
+                ctx.json(res);
+            } catch (Exception e) {
+                ctx.status(500).result("Error analyzing boundary: " + e.getMessage());
+            }
+        });
+
+        // Health check (used by daemon client to detect readiness)
+        app.get("/health", ctx -> ctx.json(Map.of("status", "ok")));
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
@@ -478,6 +608,29 @@ public class WebServer {
         m.put("startLine", r.startLine());
         m.put("docType", r.docType());
         return m;
+    }
+
+    // ── Module helpers ─────────────────────────────────────────────────────────
+
+    private static ModuleNode resolveModule(ModuleGraph graph, String ref) {
+        ModuleNode n = graph.findByKey(ref);
+        if (n != null) return n;
+        return graph.findByProjectName(ref).orElse(null);
+    }
+
+    private static Set<ModuleNode> bfsModules(ModuleGraph graph, ModuleNode start, boolean outbound) {
+        Set<ModuleNode> visited = new LinkedHashSet<>();
+        Deque<ModuleNode> queue = new ArrayDeque<>();
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            ModuleNode cur = queue.pop();
+            Set<ModuleNode> next = outbound ? graph.getDependencies(cur) : graph.getDependents(cur);
+            for (ModuleNode n : next) {
+                if (visited.add(n)) queue.add(n);
+            }
+        }
+        visited.remove(start);
+        return visited;
     }
 
     // ── FQN helpers ────────────────────────────────────────────────────────────

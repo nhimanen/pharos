@@ -40,10 +40,6 @@ public class SearchCommand implements Callable<Integer> {
             defaultValue = "text")
     private String format;
 
-    @Option(names = {"--show-body"},
-            description = "Include full method body in output")
-    private boolean showBody = false;
-
     @Option(names = {"--expand"},
             description = "Expand results with callee methods from top-3 hits (neighborhood expansion)")
     private boolean expand = false;
@@ -52,10 +48,6 @@ public class SearchCommand implements Callable<Integer> {
             description = "Filter by document type: method | class | chunk | document | all (default: all)",
             defaultValue = "all")
     private String docType;
-
-    @Option(names = {"--debug"},
-            description = "Print per-phase latency trace to stderr")
-    private boolean debug = false;
 
     private final SearchEngine searchEngine;
 
@@ -75,6 +67,7 @@ public class SearchCommand implements Callable<Integer> {
             List<SearchResult> results = response.results();
             long elapsedMs = response.trace().totalMs();
 
+            boolean debug = false;
             if (debug) {
                 System.err.println(response.trace().format());
             }
@@ -137,6 +130,7 @@ public class SearchCommand implements Callable<Integer> {
             }
             System.out.printf("   %s:%d-%d (score: %.4f)%n%n",
                     r.filePath(), r.startLine(), r.endLine(), r.score());
+            boolean showBody = false;
             if (showBody && r.body() != null) {
                 System.out.println("   " + r.body().replace("\n", "\n   "));
                 System.out.println();

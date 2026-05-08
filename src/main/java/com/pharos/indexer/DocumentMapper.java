@@ -4,7 +4,6 @@ import com.pharos.parser.model.CallReference;
 import com.pharos.parser.model.ParsedClass;
 import com.pharos.parser.model.ParsedMethod;
 import org.apache.lucene.document.*;
-import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 
 import java.util.List;

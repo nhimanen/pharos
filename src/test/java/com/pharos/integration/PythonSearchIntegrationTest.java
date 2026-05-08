@@ -37,9 +37,7 @@ class PythonSearchIntegrationTest {
 
     private static ParsedProject parsedProject;
 
-    private ByteBuffersDirectory directory;
     private DirectoryReader reader;
-    private IndexSearcher searcher;
 
     @BeforeAll
     static void requirePython3AndParse() throws Exception {
@@ -51,7 +49,7 @@ class PythonSearchIntegrationTest {
 
     @BeforeEach
     void buildIndex() throws Exception {
-        directory = new ByteBuffersDirectory();
+        ByteBuffersDirectory directory = new ByteBuffersDirectory();
 
         Map<String, List<ParsedMethod>> byClass = parsedProject.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
@@ -72,7 +70,7 @@ class PythonSearchIntegrationTest {
         }
 
         reader = DirectoryReader.open(directory);
-        searcher = new IndexSearcher(reader);
+        IndexSearcher searcher = new IndexSearcher(reader);
     }
 
     // -----------------------------------------------------------------------

@@ -10,6 +10,7 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Tracks file modification state for incremental indexing.
@@ -23,17 +24,25 @@ public class FileStateTracker {
 
     private final Path stateFile;
     private final ObjectMapper mapper = new ObjectMapper();
-    private Map<String, FileState> state;
+    /** Thread-safe map for concurrent access during parallel indexing */
+    private final ConcurrentHashMap<String, FileState> state;
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class FileState {
         public long lastModifiedMs;
         public String sha256;
+        /** Qualified class names declared in this file — used to patch the call graph incrementally. */
+        public List<String> classNames;
 
         public FileState() {}
         public FileState(long lastModifiedMs, String sha256) {
             this.lastModifiedMs = lastModifiedMs;
             this.sha256 = sha256;
+        }
+        public FileState(long lastModifiedMs, String sha256, List<String> classNames) {
+            this.lastModifiedMs = lastModifiedMs;
+            this.sha256 = sha256;
+            this.classNames = classNames;
         }
     }
 
@@ -63,14 +72,26 @@ public class FileStateTracker {
 
     /** Records the current state of a file. */
     public void track(Path file) {
+        track(file, null);
+    }
+
+    /** Records the current state of a file, along with its declared class names (for graph patching). */
+    public void track(Path file, List<String> classNames) {
         try {
             String key = file.toAbsolutePath().toString();
             long mtime = Files.getLastModifiedTime(file).toMillis();
             String hash = sha256(file);
-            state.put(key, new FileState(mtime, hash));
+            state.put(key, new FileState(mtime, hash, classNames));
         } catch (IOException e) {
             log.debug("Cannot track file {}: {}", file, e.getMessage());
         }
+    }
+
+    /** Returns the class names tracked for a file, or empty list if unknown. */
+    public List<String> getTrackedClassNames(Path file) {
+        FileState s = state.get(file.toAbsolutePath().toString());
+        if (s == null || s.classNames == null) return List.of();
+        return s.classNames;
     }
 
     /** Removes a file from tracking (file was deleted). */
@@ -108,15 +129,15 @@ public class FileStateTracker {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, FileState> load() {
-        if (!Files.exists(stateFile)) return new HashMap<>();
+    private ConcurrentHashMap<String, FileState> load() {
+        if (!Files.exists(stateFile)) return new ConcurrentHashMap<>();
         try {
             Map<String, FileState> loaded = mapper.readValue(stateFile.toFile(),
                     mapper.getTypeFactory().constructMapType(HashMap.class, String.class, FileState.class));
-            return loaded != null ? loaded : new HashMap<>();
+            return loaded != null ? new ConcurrentHashMap<>(loaded) : new ConcurrentHashMap<>();
         } catch (IOException e) {
             log.warn("Could not read file state {}: {}", stateFile, e.getMessage());
-            return new HashMap<>();
+            return new ConcurrentHashMap<>();
         }
     }
 

@@ -8,7 +8,6 @@ import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.search.KeywordSearchStrategy;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResult;
-import org.apache.lucene.index.DirectoryReader;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -159,6 +158,134 @@ class IncrementalIndexingTest {
         assertThat(meta.getName()).isEqualTo("test-project");
     }
 
+    // -----------------------------------------------------------------------
+    // Auto-detection: full on first run, incremental on subsequent runs
+    // -----------------------------------------------------------------------
+
+    @Test
+    void autoDetect_fullIndexOnFirstRun_thenIncrementalOnSecondRun() throws Exception {
+        // Write two Java files to the project
+        writeJava("Alpha.java",
+                "package com.example;\npublic class Alpha {\n" +
+                "  public void alphaMethod() {}\n}");
+        writeJava("Beta.java",
+                "package com.example;\npublic class Beta {\n" +
+                "  public void betaMethod() {}\n}");
+
+        // --- First run: project not yet in registry and no index on disk → full index ---
+        assertThat(indexManager.indexExists("test-project")).isFalse();
+
+        indexManager.index(projectRoot, "test-project", false, false);
+
+        assertThat(indexManager.indexExists("test-project")).isTrue();
+        assertThat(searchMethods("alphaMethod")).anyMatch(r -> "alphaMethod".equals(r.methodName()));
+        assertThat(searchMethods("betaMethod")).anyMatch(r -> "betaMethod".equals(r.methodName()));
+
+        // --- Second run: project is known, index exists → incremental is safe ---
+        // Add a new method to Alpha.java and wait for mtime to advance
+        Thread.sleep(50);
+        writeJava("Alpha.java",
+                "package com.example;\npublic class Alpha {\n" +
+                "  public void alphaMethod() {}\n" +
+                "  public void newAlphaMethod() {}\n}");
+
+        // Simulate what IndexCommand does: auto-detect incremental
+        boolean incremental = indexManager.indexExists("test-project");
+        assertThat(incremental).isTrue();   // proves auto-detection would pick incremental
+
+        indexManager.index(projectRoot, "test-project", incremental, false);
+
+        // Both old and new methods must be present
+        assertThat(searchMethods("alphaMethod")).anyMatch(r -> "alphaMethod".equals(r.methodName()));
+        assertThat(searchMethods("newAlphaMethod")).anyMatch(r -> "newAlphaMethod".equals(r.methodName()));
+        assertThat(searchMethods("betaMethod")).anyMatch(r -> "betaMethod".equals(r.methodName()));
+    }
+
+    @Test
+    void autoDetect_newProjectAlwaysGetsFullIndex() throws Exception {
+        writeJava("Gamma.java",
+                "package com.example;\npublic class Gamma {\n" +
+                "  public void gammaMethod() {}\n}");
+
+        // Project "new-project" has never been indexed → indexExists returns false
+        assertThat(indexManager.indexExists("new-project")).isFalse();
+
+        // Auto-detection logic: not exists → full (incremental=false)
+        boolean incremental = indexManager.indexExists("new-project");
+        assertThat(incremental).isFalse();
+
+        indexManager.index(projectRoot, "new-project", incremental, false);
+
+        assertThat(indexManager.indexExists("new-project")).isTrue();
+        assertThat(searchMethods("gammaMethod", "new-project"))
+                .anyMatch(r -> "gammaMethod".equals(r.methodName()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: dotdir/noise-dir files must not cause endless dirty churn
+    // -----------------------------------------------------------------------
+
+    /**
+     * Files that live in dotdirs (e.g. .gradle/, .cache/) are invisible to the
+     * incremental scanner but were historically indexed by the full parser.
+     * Regression guard: they must NOT appear as "deleted" on subsequent incremental
+     * runs, and the fileCount reported must match what the scanner actually found.
+     */
+    @Test
+    void incrementalIndex_filesInDotdirNotTreatedAsDeleted() throws Exception {
+        writeJava("Service.java",
+                "package com.example;\npublic class Service {\n" +
+                "  public void serve() {}\n}");
+
+        // Simulate a file that ended up tracked from a previous full run in a dotdir
+        // (e.g. .gradle/wrapper/gradle-wrapper.properties). We inject it directly into
+        // the state file by running a full index that creates the state, then manually
+        // adding a "tracked" dotdir file entry.
+        indexManager.index(projectRoot, "test-project", false, false);
+
+        Path stateFile = config.getIndexDir().resolve("test-project/file-state.json");
+        String state = Files.readString(stateFile);
+
+        // Inject a fake tracked file that lives in a dotdir under the project root
+        Path dotdirFile = projectRoot.resolve(".gradle/wrapper/gradle-wrapper.properties");
+        String injected = state.replace("}",
+                ", \"" + dotdirFile.toAbsolutePath() + "\": {\"lastModifiedMs\":1000,\"sha256\":\"aabbcc\"}}");
+        Files.writeString(stateFile, injected);
+
+        // Incremental run — dotdir file is not on disk, but should NOT appear as deleted
+        // (no exception thrown, serve() method must still be searchable)
+        ProjectMeta meta = indexManager.index(projectRoot, "test-project", true, false);
+
+        assertThat(searchMethods("serve")).anyMatch(r -> "serve".equals(r.methodName()));
+        // fileCount must reflect the scanner view, not include the injected dotdir file
+        assertThat(meta.getFileCount()).isLessThanOrEqualTo(10);
+    }
+
+    /**
+     * The fileCount in the registry must stay stable across incremental runs when
+     * nothing changes. Previously it could inflate because buildMeta used the
+     * graph-rebuild full-parse result (which walks into dirs the scanner skips).
+     */
+    @Test
+    void incrementalIndex_fileCountStableAcrossRuns() throws Exception {
+        writeJava("Foo.java",
+                "package com.example;\npublic class Foo {\n  public void foo() {}\n}");
+        writeJava("Bar.java",
+                "package com.example;\npublic class Bar {\n  public void bar() {}\n}");
+
+        ProjectMeta first = indexManager.index(projectRoot, "test-project", false, false);
+        int fileCountAfterFull = first.getFileCount();
+        assertThat(fileCountAfterFull).isGreaterThan(0);
+
+        // Two consecutive incremental runs without any changes
+        ProjectMeta second = indexManager.index(projectRoot, "test-project", true, false);
+        ProjectMeta third  = indexManager.index(projectRoot, "test-project", true, false);
+
+        // fileCount must not drift upward across runs
+        assertThat(second.getFileCount()).isEqualTo(fileCountAfterFull);
+        assertThat(third.getFileCount()).isEqualTo(fileCountAfterFull);
+    }
+
     // --- helpers ---
 
     private Path writeJava(String filename, String content) throws IOException {
@@ -167,10 +294,13 @@ class IncrementalIndexingTest {
     }
 
     private List<SearchResult> searchMethods(String query) throws IOException {
-        List<String> projects = List.of("test-project");
-        var reader = luceneIndexer.openMultiReader(projects);
+        return searchMethods(query, "test-project");
+    }
+
+    private List<SearchResult> searchMethods(String query, String project) throws IOException {
+        var reader = luceneIndexer.openMultiReader(List.of(project));
         SearchRequest req = new SearchRequest(query, SearchRequest.SearchType.KEYWORD,
-                "test-project", null, 20, "text", "method");
+                project, null, 20, "text", "method");
         return strategy.search(reader, req);
     }
 

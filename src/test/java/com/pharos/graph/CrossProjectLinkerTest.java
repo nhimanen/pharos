@@ -119,6 +119,206 @@ class CrossProjectLinkerTest {
                 .contains("com.example.A#callsB()");
     }
 
+    // -----------------------------------------------------------------------
+    // Limitation 1 & 5: scored candidate selection
+    // -----------------------------------------------------------------------
+
+    @Test
+    void receiverTypeName_prefersMatchingClass_overArbitraryFirstMatch() throws IOException {
+        // Two classes in proj-b both have a method called "write()"
+        // The unresolved ref carries receiverTypeName="FileWriter" → should pick FileWriter#write
+        Path indexA = tempDir.resolve("scored-a");
+        Path indexB = tempDir.resolve("scored-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.Sender#send()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.lib.BufferedWriter#write(String)");
+        graphB.addMethod("com.lib.FileWriter#write(String)");   // correct target
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("scored-a", indexA);
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.Sender#send()", "write", "FileWriter", 1, null, 1);
+        metaA.getUnresolvedRefs().add(ref);
+        registry.register(metaA);
+        registry.register(projectMeta("scored-b", indexB));
+
+        CallGraph merged = linker.buildCrossProjectGraph("scored-a", "scored-b");
+
+        assertThat(merged.getCallees("com.app.Sender#send()"))
+                .contains("com.lib.FileWriter#write(String)")
+                .doesNotContain("com.lib.BufferedWriter#write(String)");
+    }
+
+    @Test
+    void paramCount_breaksNameTie_whenNoReceiverTypeKnown() throws IOException {
+        // Two overloads of process() — one with 1 param, one with 2
+        // ref has paramCount=2, no receiverTypeName → param count breaks the tie
+        Path indexA = tempDir.resolve("param-a");
+        Path indexB = tempDir.resolve("param-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.Client#run()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.lib.Processor#process(String)");           // wrong arity
+        graphB.addMethod("com.lib.Processor#process(String,int)");       // correct arity
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("param-a", indexA);
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.Client#run()", "process", null, 2, null, 1);
+        metaA.getUnresolvedRefs().add(ref);
+        registry.register(metaA);
+        registry.register(projectMeta("param-b", indexB));
+
+        CallGraph merged = linker.buildCrossProjectGraph("param-a", "param-b");
+
+        assertThat(merged.getCallees("com.app.Client#run()"))
+                .contains("com.lib.Processor#process(String,int)")
+                .doesNotContain("com.lib.Processor#process(String)");
+    }
+
+    @Test
+    void packageHint_hardFiltersToCorrectPackage() throws IOException {
+        // Same method name "connect()" exists in two packages; packageHint narrows to the right one
+        Path indexA = tempDir.resolve("pkg-a");
+        Path indexB = tempDir.resolve("pkg-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.Main#start()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.db.jdbc.Connection#connect()");    // correct package
+        graphB.addMethod("com.net.http.Connection#connect()");   // wrong package
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("pkg-a", indexA);
+        // packageHint inferred from "import com.db.jdbc.Connection"
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.Main#start()", "connect", "Connection", 0, "com.db.jdbc", 1);
+        metaA.getUnresolvedRefs().add(ref);
+        registry.register(metaA);
+        registry.register(projectMeta("pkg-b", indexB));
+
+        CallGraph merged = linker.buildCrossProjectGraph("pkg-a", "pkg-b");
+
+        assertThat(merged.getCallees("com.app.Main#start()"))
+                .contains("com.db.jdbc.Connection#connect()")
+                .doesNotContain("com.net.http.Connection#connect()");
+    }
+
+    @Test
+    void packageHint_fallsBackToAllCandidates_whenNoMatchInHintedPackage() throws IOException {
+        // packageHint points to a package not present in proj-b → fall back to full list
+        Path indexA = tempDir.resolve("fallback-a");
+        Path indexB = tempDir.resolve("fallback-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.Worker#doWork()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.lib.Engine#execute()");
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("fallback-a", indexA);
+        // packageHint points to nonexistent package — should fall back and still resolve
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.Worker#doWork()", "execute", null, 0, "com.nonexistent.pkg", 1);
+        metaA.getUnresolvedRefs().add(ref);
+        registry.register(metaA);
+        registry.register(projectMeta("fallback-b", indexB));
+
+        CallGraph merged = linker.buildCrossProjectGraph("fallback-a", "fallback-b");
+
+        // Falls back to name-only match — still resolves
+        assertThat(merged.getCallees("com.app.Worker#doWork()"))
+                .contains("com.lib.Engine#execute()");
+    }
+
+    @Test
+    void receiverType_outweighs_paramCount_in_scoring() throws IOException {
+        // Three candidates for "save(X)":
+        //   com.lib.WrongStore#save(String)   — param count match (+1), wrong class
+        //   com.lib.DataStore#save(String,int) — class match (+2), wrong arity
+        //   → DataStore wins (score 2 > score 1)
+        Path indexA = tempDir.resolve("score-weight-a");
+        Path indexB = tempDir.resolve("score-weight-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.Service#run()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.lib.WrongStore#save(String)");      // param match only (+1)
+        graphB.addMethod("com.lib.DataStore#save(String,int)");   // class match only (+2)
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("score-weight-a", indexA);
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.Service#run()", "save", "DataStore", 1, null, 1);
+        metaA.getUnresolvedRefs().add(ref);
+        registry.register(metaA);
+        registry.register(projectMeta("score-weight-b", indexB));
+
+        CallGraph merged = linker.buildCrossProjectGraph("score-weight-a", "score-weight-b");
+
+        assertThat(merged.getCallees("com.app.Service#run()"))
+                .contains("com.lib.DataStore#save(String,int)")
+                .doesNotContain("com.lib.WrongStore#save(String)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Limitation 2: stale-link refresh — graph reflects re-index
+    // -----------------------------------------------------------------------
+
+    @Test
+    void rebuildCrossProjectGraph_picksUpNewGraphAfterReindex() throws IOException {
+        // Simulate re-index: proj-a's graph.graphml is updated with a new method,
+        // then buildCrossProjectGraph is called again — it must reflect the new state.
+        Path indexA = tempDir.resolve("refresh-a");
+        Path indexB = tempDir.resolve("refresh-b");
+
+        CallGraph graphA = new CallGraph();
+        graphA.addMethod("com.app.A#oldMethod()");
+        serializer.save(graphA, indexA.resolve("graph.graphml"));
+
+        CallGraph graphB = new CallGraph();
+        graphB.addMethod("com.lib.B#helper()");
+        serializer.save(graphB, indexB.resolve("graph.graphml"));
+
+        ProjectMeta metaA = projectMeta("refresh-a", indexA);
+        registry.register(metaA);
+        registry.register(projectMeta("refresh-b", indexB));
+
+        // Initial build
+        CallGraph merged1 = linker.buildCrossProjectGraph("refresh-a", "refresh-b");
+        assertThat(merged1.contains("com.app.A#oldMethod()")).isTrue();
+        assertThat(merged1.contains("com.app.A#newMethod()")).isFalse();
+
+        // Simulate re-index: overwrite proj-a's graph with a new one
+        CallGraph updatedGraphA = new CallGraph();
+        updatedGraphA.addMethod("com.app.A#newMethod()");
+        ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
+                "com.app.A#newMethod()", "helper", null, 0, null, 1);
+        metaA.setUnresolvedRefs(List.of(ref));
+        registry.register(metaA);   // update registry with new unresolved refs
+        serializer.save(updatedGraphA, indexA.resolve("graph.graphml"));
+
+        // Rebuild — should reflect the fresh graph
+        CallGraph merged2 = linker.buildCrossProjectGraph("refresh-a", "refresh-b");
+        assertThat(merged2.contains("com.app.A#newMethod()")).isTrue();
+        assertThat(merged2.contains("com.app.A#oldMethod()")).isFalse();
+        assertThat(merged2.getCallees("com.app.A#newMethod()"))
+                .contains("com.lib.B#helper()");
+    }
+
     @Test
     void buildCrossProjectGraph_throwsForUnknownProject() {
         assertThatIllegalArgumentException()
