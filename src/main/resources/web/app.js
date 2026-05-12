@@ -535,7 +535,10 @@ async function loadMethodGraph(projectName, className) {
 }
 
 async function loadCallGraph(project, pkg, className) {
+  const projectChanged = S.selectedProject !== project;
   S.view = 'call'; S.selectedProject = project;
+  renderBreadcrumb(); renderProjectList();
+  if (projectChanged) initFileTree(project);
   const pkgParam = pkg       ? `&package=${encodeURIComponent(pkg)}`     : '';
   const clsParam = className ? `&class=${encodeURIComponent(className)}` : '';
   const res = await fetch(`/api/graph/call/${encodeURIComponent(project)}?limit=150${pkgParam}${clsParam}`);
@@ -1604,8 +1607,21 @@ async function doSearch() {
   if (!q) { applyLocalFilter(); closeSearchResults(); return; }
 
   const proj = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
-  const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}&limit=30`);
-  const hits  = await res.json();
+  let hits;
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}&limit=30`);
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(`Search failed (${res.status}): ${msg}`);
+    }
+    hits = await res.json();
+  } catch (err) {
+    srPanel.innerHTML = `<div class="sr-none">Search error: ${esc(err.message)}</div>`;
+    srPanel.classList.add('open');
+    setStatus('Search error');
+    console.error('doSearch error:', err);
+    return;
+  }
 
   // Highlight matching nodes in the current graph
   const hitIds = new Set(hits.map(r => r.id));
@@ -1633,14 +1649,14 @@ async function doSearch() {
   } else {
     srPanel.innerHTML = hits.map((r, i) => {
       const method  = r.label || r.id || '';
-      const cls     = r.qualifiedClassName || '';
+      const cls     = r.className || '';
       const sig     = r.signature || '';
       const snip    = (r.javadoc || r.body || '').replace(/\s+/g, ' ').slice(0, 100);
       const project = r.project || '';
       return `<div class="sr-item" data-idx="${i}" data-fqn="${esc(extractFqn(r.id))}"
                    data-project="${esc(project)}" data-class="${esc(cls)}" title="${esc(sig)}">
         <div class="sr-method">${highlightTerms(method, q)}<span class="sr-project">${esc(project)}</span></div>
-        <div class="sr-class">${esc(cls)}</div>
+        ${cls  ? `<div class="sr-class">${esc(cls)}</div>` : ''}
         ${sig  ? `<div class="sr-sig">${highlightTerms(sig, q)}</div>` : ''}
         ${snip ? `<div class="sr-snip">${highlightTerms(snip, q)}</div>` : ''}
       </div>`;

@@ -118,8 +118,13 @@ public class WebServer {
             if (project != null && project.isBlank()) project = null;
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
                     project, null, limit, "text", docType);
-            ctx.json(searchEngine.search(req).stream()
-                    .map(this::resultToMap).collect(Collectors.toList()));
+            try {
+                ctx.json(searchEngine.search(req).stream()
+                        .map(this::resultToMap).collect(Collectors.toList()));
+            } catch (Exception e) {
+                log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
+                ctx.status(500).json(Map.of("error", e.getMessage()));
+            }
         });
 
         // API: single method by FQN
