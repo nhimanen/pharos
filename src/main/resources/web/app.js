@@ -1407,18 +1407,40 @@ function applyLocalFilter() {
   }
 }
 
+// ── Search results dropdown ───────────────────────────────
+const srPanel = document.getElementById('search-results');
+
+function closeSearchResults() { srPanel.classList.remove('open'); srPanel.innerHTML = ''; }
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('.search-wrap')) closeSearchResults();
+});
+
+document.getElementById('search-input').addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeSearchResults(); e.target.blur(); }
+});
+
+/** Highlight query terms in text (simple token matching). */
+function highlightTerms(text, query) {
+  if (!text) return '';
+  const tokens = query.trim().split(/\s+/).filter(t => t.length > 1)
+    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!tokens.length) return esc(text);
+  const re = new RegExp(`(${tokens.join('|')})`, 'gi');
+  return esc(text).replace(re, '<span class="sr-hit">$1</span>');
+}
+
 async function doSearch() {
   const q = document.getElementById('search-input').value.trim();
-  if (!q) { applyLocalFilter(); return; }
+  if (!q) { applyLocalFilter(); closeSearchResults(); return; }
 
   const proj = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
   const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}&limit=30`);
   const hits  = await res.json();
-  if (!hits.length) return;
 
+  // Highlight matching nodes in the current graph
   const hitIds = new Set(hits.map(r => r.id));
   const hide   = S.searchToFocus;
-
   if (S.useCanvas) {
     for (const n of currentNodes) {
       const match  = hitIds.has(n.id);
@@ -1435,8 +1457,51 @@ async function doSearch() {
       d3.select(this).select('text').attr('opacity', match ? 1 : (hide ? 0 : 0.1));
     });
   }
-  setStatus(`${hits.length} search hits highlighted`);
+
+  // Render results dropdown
+  if (!hits.length) {
+    srPanel.innerHTML = '<div class="sr-none">No results found</div>';
+  } else {
+    srPanel.innerHTML = hits.map((r, i) => {
+      const method  = r.label || r.id || '';
+      const cls     = r.qualifiedClassName || '';
+      const sig     = r.signature || '';
+      const snip    = (r.javadoc || r.body || '').replace(/\s+/g, ' ').slice(0, 100);
+      const project = r.project || '';
+      return `<div class="sr-item" data-idx="${i}" data-fqn="${esc(extractFqn(r.id))}"
+                   data-project="${esc(project)}" data-class="${esc(cls)}" title="${esc(sig)}">
+        <div class="sr-method">${highlightTerms(method, q)}<span class="sr-project">${esc(project)}</span></div>
+        <div class="sr-class">${esc(cls)}</div>
+        ${sig  ? `<div class="sr-sig">${highlightTerms(sig, q)}</div>` : ''}
+        ${snip ? `<div class="sr-snip">${highlightTerms(snip, q)}</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+  srPanel.classList.add('open');
+  setStatus(`${hits.length} search hits`);
 }
+
+// Click on a search result → load call graph for that project and focus the node
+srPanel.addEventListener('click', async e => {
+  const item = e.target.closest('.sr-item');
+  if (!item) return;
+  closeSearchResults();
+
+  const fqn     = item.dataset.fqn;
+  const project = item.dataset.project;
+  const cls     = item.dataset.class;
+
+  if (!fqn || !project) return;
+
+  // Switch to call graph view for that project if needed
+  if (S.view !== 'call' || S.selectedProject !== project) {
+    await loadCallGraph(project, null, cls || null);
+    // Give the simulation a moment to settle, then try to focus
+    setTimeout(() => focusNode(fqn), 600);
+  } else {
+    focusNode(fqn);
+  }
+});
 
 // ── Package filter dropdown ───────────────────────────────────
 function populatePkgFilter(nodes) {

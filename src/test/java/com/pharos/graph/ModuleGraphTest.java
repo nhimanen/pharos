@@ -1,135 +1,146 @@
 package com.pharos.graph;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
-import java.util.List;
+import java.nio.file.Path;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.*;
 
 class ModuleGraphTest {
 
+    @TempDir
+    Path tempDir;
+
     private ModuleGraph graph;
+
 
     @BeforeEach
     void setUp() {
-        graph = new ModuleGraph();
+        graph = ModuleGraph.open(tempDir.resolve("test-module.arcadedb"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        graph.close();
     }
 
     // --- addOrUpdate ---
 
     @Test
-    void addOrUpdate_addsNewNode_returnsIt() {
-        ModuleNode node = ModuleNode.external("com.example", "lib-a", "1.0");
+    void addOrUpdate_addsNewNode() {
+        graph.addOrUpdate("com.example:lib-a", "com.example", "lib-a", "1.0", "EXTERNAL", null);
 
-        ModuleNode canonical = graph.addOrUpdate(node);
-
-        assertThat(canonical).isSameAs(node);
-        assertThat(graph.nodeCount()).isEqualTo(1);
+        assertThat(graph.moduleCount()).isEqualTo(1);
+        assertThat(graph.findByKey("com.example:lib-a")).isPresent();
     }
 
     @Test
     void addOrUpdate_deduplicatesByModuleKey() {
-        ModuleNode a = ModuleNode.external("com.example", "lib", "1.0");
-        ModuleNode b = ModuleNode.external("com.example", "lib", "2.0");
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "EXTERNAL", null);
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "2.0", "EXTERNAL", null);
 
-        ModuleNode c1 = graph.addOrUpdate(a);
-        ModuleNode c2 = graph.addOrUpdate(b);
-
-        assertThat(c1).isSameAs(c2);
-        assertThat(graph.nodeCount()).isEqualTo(1);
+        assertThat(graph.moduleCount()).isEqualTo(1);
     }
 
     @Test
     void addOrUpdate_upgradesExternalToIndexedWhenNewNodeIsIndexed() {
-        ModuleNode external = ModuleNode.external("com.example", "lib", "1.0");
-        graph.addOrUpdate(external);
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "EXTERNAL", null);
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.1", "INDEXED", "my-project");
 
-        ModuleNode indexed = ModuleNode.indexed("com.example", "lib", "1.1", "my-project");
-        ModuleNode canonical = graph.addOrUpdate(indexed);
-
-        assertThat(canonical.isIndexed()).isTrue();
-        assertThat(canonical.getProjectName()).isEqualTo("my-project");
-        assertThat(canonical.getVersion()).isEqualTo("1.1");
-        assertThat(graph.nodeCount()).isEqualTo(1);
+        ModuleNodeData data = graph.findByKey("com.example:lib").orElseThrow();
+        assertThat(data.isIndexed()).isTrue();
+        assertThat(data.projectName()).isEqualTo("my-project");
+        assertThat(data.version()).isEqualTo("1.1");
+        assertThat(graph.moduleCount()).isEqualTo(1);
     }
 
     @Test
     void addOrUpdate_doesNotDowngradeIndexedToExternal() {
-        graph.addOrUpdate(ModuleNode.indexed("com.example", "lib", "1.0", "project"));
-        ModuleNode canonical = graph.addOrUpdate(ModuleNode.external("com.example", "lib", "2.0"));
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "INDEXED", "project");
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "2.0", "EXTERNAL", null);
 
-        assertThat(canonical.isIndexed()).isTrue();
-        assertThat(graph.nodeCount()).isEqualTo(1);
+        ModuleNodeData data = graph.findByKey("com.example:lib").orElseThrow();
+        assertThat(data.isIndexed()).isTrue();
+        assertThat(graph.moduleCount()).isEqualTo(1);
     }
 
     // --- addDependency ---
 
     @Test
     void addDependency_addsEdgeAndUpdatesTraversals() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("com.example", "app", "1.0"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("com.example", "lib", "1.0"));
+        graph.addOrUpdate("g:app", "g", "app", "1.0", "EXTERNAL", null);
+        graph.addOrUpdate("g:lib", "g", "lib", "1.0", "EXTERNAL", null);
 
-        graph.addDependency(a, b, ModuleDep.compile("1.0"));
+        graph.addDependency("g:app", "g:lib", "compile", "1.0");
 
-        assertThat(graph.edgeCount()).isEqualTo(1);
-        assertThat(graph.getDependencies(a)).containsExactly(b);
-        assertThat(graph.getDependents(b)).containsExactly(a);
+        assertThat(graph.dependencyCount()).isEqualTo(1);
+        assertThat(graph.dependencies("g:app"))
+                .extracting(ModuleNodeData::moduleKey)
+                .containsExactly("g:lib");
+        assertThat(graph.dependents("g:lib"))
+                .extracting(ModuleNodeData::moduleKey)
+                .containsExactly("g:app");
     }
 
     @Test
     void addDependency_deduplicatesByScopeForSamePair() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "app", "1"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("g", "lib", "1"));
+        graph.addOrUpdate("g:app", "g", "app", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:lib", "g", "lib", "1", "EXTERNAL", null);
 
-        graph.addDependency(a, b, ModuleDep.compile("1.0"));
-        graph.addDependency(a, b, ModuleDep.compile("1.0")); // duplicate
+        graph.addDependency("g:app", "g:lib", "compile", "1.0");
+        graph.addDependency("g:app", "g:lib", "compile", "1.0"); // duplicate
 
-        assertThat(graph.edgeCount()).isEqualTo(1);
+        assertThat(graph.dependencyCount()).isEqualTo(1);
     }
 
     @Test
     void addDependency_allowsDifferentScopesForSamePair() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "app", "1"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("g", "lib", "1"));
+        graph.addOrUpdate("g:app", "g", "app", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:lib", "g", "lib", "1", "EXTERNAL", null);
 
-        graph.addDependency(a, b, ModuleDep.compile("1.0"));
-        graph.addDependency(a, b, ModuleDep.test("1.0"));
+        graph.addDependency("g:app", "g:lib", "compile", "1.0");
+        graph.addDependency("g:app", "g:lib", "test", "1.0");
 
-        assertThat(graph.edgeCount()).isEqualTo(2);
+        assertThat(graph.dependencyCount()).isEqualTo(2);
     }
 
     @Test
-    void addDependency_ignoresAbsentVertices() {
-        ModuleNode notInGraph = ModuleNode.external("g", "ghost", "1");
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
+    void addDependency_ignoresAbsentTargetVertex() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
 
-        // Should not throw; edge silently ignored
-        assertThatCode(() -> graph.addDependency(a, notInGraph, ModuleDep.compile(null)))
+        // "g:ghost" doesn't exist — edge silently ignored
+        assertThatCode(() -> graph.addDependency("g:a", "g:ghost", "compile", null))
                 .doesNotThrowAnyException();
-        assertThat(graph.edgeCount()).isEqualTo(0);
+        assertThat(graph.dependencyCount()).isEqualTo(0);
     }
 
     // --- findByKey / findByProjectName ---
 
     @Test
     void findByKey_returnsCorrectNode() {
-        ModuleNode node = graph.addOrUpdate(ModuleNode.external("com.example", "lib", "1.0"));
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "EXTERNAL", null);
 
-        assertThat(graph.findByKey("com.example:lib")).isSameAs(node);
+        assertThat(graph.findByKey("com.example:lib"))
+                .map(ModuleNodeData::moduleKey)
+                .hasValue("com.example:lib");
     }
 
     @Test
-    void findByKey_returnsNullForAbsent() {
-        assertThat(graph.findByKey("com.example:nonexistent")).isNull();
+    void findByKey_returnsEmptyForAbsent() {
+        assertThat(graph.findByKey("com.example:nonexistent")).isEmpty();
     }
 
     @Test
     void findByProjectName_findsIndexedNode() {
-        ModuleNode indexed = graph.addOrUpdate(
-                ModuleNode.indexed("com.example", "lib", "1.0", "my-project"));
+        graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "INDEXED", "my-project");
 
-        assertThat(graph.findByProjectName("my-project")).contains(indexed);
+        assertThat(graph.findByProjectName("my-project"))
+                .map(ModuleNodeData::moduleKey)
+                .hasValue("com.example:lib");
     }
 
     @Test
@@ -137,95 +148,96 @@ class ModuleGraphTest {
         assertThat(graph.findByProjectName("no-such-project")).isEmpty();
     }
 
-    // --- findPath ---
+    // --- shortestPath (was findPath) ---
 
     @Test
-    void findPath_returnsDirectDependencyPath() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("g", "b", "1"));
-        graph.addDependency(a, b, ModuleDep.compile(null));
+    void shortestPath_returnsDirectDependencyPath() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:b", "g", "b", "1", "EXTERNAL", null);
+        graph.addDependency("g:a", "g:b", "compile", null);
 
-        List<ModuleNode> path = graph.findPath("g:a", "g:b");
-
-        assertThat(path).containsExactly(a, b);
+        assertThat(graph.shortestPath("g:a", "g:b"))
+                .extracting(ModuleNodeData::moduleKey)
+                .containsExactly("g:a", "g:b");
     }
 
     @Test
-    void findPath_returnsTransitivePath() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("g", "b", "1"));
-        ModuleNode c = graph.addOrUpdate(ModuleNode.external("g", "c", "1"));
-        graph.addDependency(a, b, ModuleDep.compile(null));
-        graph.addDependency(b, c, ModuleDep.compile(null));
+    void shortestPath_returnsTransitivePath() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:b", "g", "b", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:c", "g", "c", "1", "EXTERNAL", null);
+        graph.addDependency("g:a", "g:b", "compile", null);
+        graph.addDependency("g:b", "g:c", "compile", null);
 
-        List<ModuleNode> path = graph.findPath("g:a", "g:c");
-
-        assertThat(path).containsExactly(a, b, c);
+        assertThat(graph.shortestPath("g:a", "g:c"))
+                .extracting(ModuleNodeData::moduleKey)
+                .containsExactly("g:a", "g:b", "g:c");
     }
 
     @Test
-    void findPath_returnsEmptyWhenNoPath() {
-        graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
-        graph.addOrUpdate(ModuleNode.external("g", "b", "1"));
+    void shortestPath_returnsEmptyWhenNoPath() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:b", "g", "b", "1", "EXTERNAL", null);
         // no edges
 
-        assertThat(graph.findPath("g:a", "g:b")).isEmpty();
+        assertThat(graph.shortestPath("g:a", "g:b")).isEmpty();
     }
 
     @Test
-    void findPath_returnsEmptyWhenNodeMissing() {
-        graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
+    void shortestPath_returnsEmptyWhenNodeMissing() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
 
-        assertThat(graph.findPath("g:a", "g:nonexistent")).isEmpty();
+        assertThat(graph.shortestPath("g:a", "g:nonexistent")).isEmpty();
     }
 
-    // --- getDependencies / getDependents ---
+    // --- dependencies / dependents ---
 
     @Test
-    void getDependencies_returnsEmptySetForNodeWithNoDeps() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
+    void dependencies_returnsEmptySetForNodeWithNoDeps() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
 
-        assertThat(graph.getDependencies(a)).isEmpty();
-    }
-
-    @Test
-    void getDependencies_returnsEmptySetForAbsentNode() {
-        ModuleNode absent = ModuleNode.external("g", "ghost", "1");
-
-        assertThat(graph.getDependencies(absent)).isEmpty();
+        assertThat(graph.dependencies("g:a")).isEmpty();
     }
 
     @Test
-    void getDependents_returnsEmptySetForAbsentNode() {
-        ModuleNode absent = ModuleNode.external("g", "ghost", "1");
-
-        assertThat(graph.getDependents(absent)).isEmpty();
+    void dependencies_returnsEmptySetForAbsentNode() {
+        assertThat(graph.dependencies("g:ghost")).isEmpty();
     }
 
     @Test
-    void getDependencies_returnsMultipleTargets() {
-        ModuleNode app = graph.addOrUpdate(ModuleNode.external("g", "app", "1"));
-        ModuleNode lib1 = graph.addOrUpdate(ModuleNode.external("g", "lib1", "1"));
-        ModuleNode lib2 = graph.addOrUpdate(ModuleNode.external("g", "lib2", "1"));
-        graph.addDependency(app, lib1, ModuleDep.compile(null));
-        graph.addDependency(app, lib2, ModuleDep.compile(null));
-
-        assertThat(graph.getDependencies(app)).containsExactlyInAnyOrder(lib1, lib2);
+    void dependents_returnsEmptySetForAbsentNode() {
+        assertThat(graph.dependents("g:ghost")).isEmpty();
     }
 
-    // --- allNodes / nodeCount / edgeCount ---
+    @Test
+    void dependencies_returnsMultipleTargets() {
+        graph.addOrUpdate("g:app",  "g", "app",  "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:lib1", "g", "lib1", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:lib2", "g", "lib2", "1", "EXTERNAL", null);
+        graph.addDependency("g:app", "g:lib1", "compile", null);
+        graph.addDependency("g:app", "g:lib2", "compile", null);
+
+        assertThat(graph.dependencies("g:app"))
+                .extracting(ModuleNodeData::moduleKey)
+                .containsExactlyInAnyOrder("g:lib1", "g:lib2");
+    }
+
+    // --- allModules / moduleCount / dependencyCount ---
 
     @Test
-    void allNodes_includesAllAddedNodes() {
-        ModuleNode a = graph.addOrUpdate(ModuleNode.external("g", "a", "1"));
-        ModuleNode b = graph.addOrUpdate(ModuleNode.external("g", "b", "1"));
+    void allModules_includesAllAddedNodes() {
+        graph.addOrUpdate("g:a", "g", "a", "1", "EXTERNAL", null);
+        graph.addOrUpdate("g:b", "g", "b", "1", "EXTERNAL", null);
 
-        assertThat(graph.allNodes()).containsExactlyInAnyOrder(a, b);
+        assertThat(graph.allModules()
+                .map(ModuleNodeData::moduleKey)
+                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("g:a", "g:b");
     }
 
     @Test
     void emptyGraph_hasZeroNodesAndEdges() {
-        assertThat(graph.nodeCount()).isEqualTo(0);
-        assertThat(graph.edgeCount()).isEqualTo(0);
+        assertThat(graph.moduleCount()).isEqualTo(0);
+        assertThat(graph.dependencyCount()).isEqualTo(0);
     }
 }

@@ -4,7 +4,6 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchResult;
 import picocli.CommandLine.*;
@@ -67,17 +66,15 @@ public class CallersCommand implements Callable<Integer> {
     }
 
     private Set<String> getCallersFromGraph(String targetFqn) {
-        CallGraphSerializer serializer = new CallGraphSerializer();
         List<ProjectMeta> projects = project != null
                 ? registry.find(project).map(List::of).orElse(List.of())
                 : registry.listAll();
 
         Set<String> allCallers = new LinkedHashSet<>();
         for (ProjectMeta meta : projects) {
-            Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-            try {
-                CallGraph graph = serializer.load(graphFile);
-                allCallers.addAll(graph.getCallers(targetFqn));
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            try (CallGraph graph = CallGraph.open(dbDir)) {
+                allCallers.addAll(graph.callers(targetFqn));
             } catch (Exception e) {
                 // Graph not available for this project
             }

@@ -6,6 +6,7 @@ import com.pharos.search.SearchEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -26,11 +27,9 @@ public class ModuleBoundaryAnalyzer {
     private static final Logger log = LoggerFactory.getLogger(ModuleBoundaryAnalyzer.class);
 
     private final ProjectRegistry registry;
-    private final CallGraphSerializer serializer;
 
     public ModuleBoundaryAnalyzer(ProjectRegistry registry, SearchEngine searchEngine) {
-        this.registry     = registry;
-        this.serializer   = new CallGraphSerializer();
+        this.registry = registry;
     }
 
     // ---------------------------------------------------------------------------
@@ -40,7 +39,8 @@ public class ModuleBoundaryAnalyzer {
     public record BoundaryResult(
             String projectName,
             List<String> entryPoints,    // FQNs in this module called by other linked modules
-            List<ExitPoint> exitPoints   // unresolved calls leaving this module
+            List<ExitPoint> exitPoints,  // unresolved calls leaving this module (may be capped)
+            int totalExitPoints          // total count before any cap
     ) {}
 
     public record ExitPoint(
@@ -60,44 +60,58 @@ public class ModuleBoundaryAnalyzer {
      * Exit points come from the stored unresolvedRefs in ProjectMeta.
      */
     public BoundaryResult analyze(String projectName) throws Exception {
+        return analyze(projectName, Integer.MAX_VALUE);
+    }
+
+    /**
+     * @param exitPointLimit max exit points to include in the result (pass {@code Integer.MAX_VALUE} for all)
+     */
+    public BoundaryResult analyze(String projectName, int exitPointLimit) throws Exception {
         ProjectMeta meta = registry.find(projectName)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Project not found: " + projectName));
 
         // Load this project's method set
-        Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-        CallGraph projectGraph = serializer.load(graphFile);
-        Set<String> ownMethods = new HashSet<>(projectGraph.allMethods());
+        Path ownDbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+        Set<String> ownMethods;
+        try (CallGraph ownGraph = CallGraph.open(ownDbDir)) {
+            ownMethods = ownGraph.allFqns().collect(Collectors.toSet());
+        } catch (Exception e) {
+            log.debug("Could not load call graph for '{}': {}", projectName, e.getMessage());
+            ownMethods = Set.of();
+        }
 
-        // Entry points: scan linked projects for callers of our methods
+        // Entry points: single O(E) scan per linked project via calledTargets()
+        // instead of O(M) per-method callers() queries.
         Set<String> entryPointSet = new LinkedHashSet<>();
-        for (String linkedName : meta.getLinkedProjects()) {
-            ProjectMeta linkedMeta = registry.find(linkedName).orElse(null);
-            if (linkedMeta == null) continue;
-            Path linkedGraphFile = Path.of(linkedMeta.getIndexPath()).resolve("graph.graphml");
-            try {
-                CallGraph linkedGraph = serializer.load(linkedGraphFile);
-                for (String ownMethod : ownMethods) {
-                    Set<String> callers = linkedGraph.getCallers(ownMethod);
-                    if (!callers.isEmpty()) {
-                        entryPointSet.add(ownMethod);
-                    }
+        if (!ownMethods.isEmpty()) {
+            for (String linkedName : meta.getLinkedProjects()) {
+                ProjectMeta linkedMeta = registry.find(linkedName).orElse(null);
+                if (linkedMeta == null) continue;
+                Path linkedDb = Path.of(linkedMeta.getIndexPath()).resolve("callgraph.arcadedb");
+                if (!Files.isDirectory(linkedDb)) continue;
+                try (CallGraph linkedGraph = CallGraph.open(linkedDb)) {
+                    entryPointSet.addAll(linkedGraph.calledTargets(ownMethods));
+                } catch (Exception e) {
+                    log.debug("Could not load call graph for linked project '{}': {}",
+                            linkedName, e.getMessage());
                 }
-            } catch (Exception e) {
-                log.debug("Could not load call graph for linked project '{}': {}",
-                        linkedName, e.getMessage());
             }
         }
 
-        // Exit points: unresolved refs recorded during indexing
-        List<ExitPoint> exitPoints = meta.getUnresolvedRefs().stream()
+        // Exit points: unresolved refs recorded during indexing (apply cap)
+        List<ProjectMeta.UnresolvedRef> allRefs = meta.getUnresolvedRefs();
+        int total = allRefs.size();
+        List<ExitPoint> exitPoints = allRefs.stream()
+                .limit(exitPointLimit)
                 .map(r -> new ExitPoint(r.callerFqn, r.calleeMethodName, r.line))
                 .collect(Collectors.toList());
 
         return new BoundaryResult(
                 projectName,
                 entryPointSet.stream().sorted().collect(Collectors.toList()),
-                exitPoints
+                exitPoints,
+                total
         );
     }
 }

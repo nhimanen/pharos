@@ -37,9 +37,8 @@ public class LinkCommand implements Callable<Integer> {
             // Build cross-project call graph
             System.out.println("Building cross-project call graph...");
             CrossProjectLinker linker = new CrossProjectLinker(config, registry);
-            var crossGraph = linker.buildCrossProjectGraph(project1, project2);
-            System.out.printf("Cross-project graph: %d nodes, %d edges%n",
-                    crossGraph.nodeCount(), crossGraph.edgeCount());
+            linker.buildCrossProjectGraph(project1, project2);
+            System.out.println("Cross-project graph built.");
             return 0;
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());

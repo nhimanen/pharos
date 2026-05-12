@@ -5,7 +5,6 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
-import com.pharos.graph.ModuleNode;
 import com.pharos.indexer.LuceneIndexer;
 import picocli.CommandLine.*;
 
@@ -50,22 +49,20 @@ public class RemoveIndexCommand implements Callable<Integer> {
         }
 
         // 1. Downgrade module-graph node from INDEXED → EXTERNAL (preserves dep edges)
-        try {
-            ModuleGraph moduleGraph = moduleGraphBuilder.load();
-            moduleGraph.findByProjectName(projectName).ifPresent(ModuleNode::downgrade);
-            moduleGraphBuilder.save(moduleGraph);
-        } catch (IOException e) {
+        try (ModuleGraph moduleGraph = moduleGraphBuilder.open()) {
+            moduleGraph.findByProjectName(projectName)
+                    .ifPresent(node -> moduleGraph.downgradeToExternal(node.moduleKey()));
+        } catch (Exception e) {
             System.err.println("Warning: could not update module graph: " + e.getMessage());
         }
 
-        // 2. Delete cross-project graph (stale after removal; rebuilt on next link)
-        Path crossProjectGraph = IndexConfig.DEFAULT_BASE.resolve("cross-project-graph.graphml");
-        Files.deleteIfExists(crossProjectGraph);
+        // 2. Delete cross-project stamp so the next link rebuilds the cross graph
+        Files.deleteIfExists(IndexConfig.DEFAULT_BASE.resolve("cross-project.stamp"));
 
         // 3. Close and delete Lucene index
         luceneIndexer.deleteIndex(projectName);
 
-        // 4. Delete the entire project index directory (graph.graphml, file-state.json, etc.)
+        // 4. Delete the entire project index directory (callgraph.arcadedb/, file-state.json, etc.)
         Path projectDir = luceneIndexer.getProjectIndexDir(projectName);
         if (Files.exists(projectDir)) {
             try (var stream = Files.walk(projectDir)) {

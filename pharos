@@ -279,10 +279,114 @@ def fmt_mod_path(data: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_skeleton(classes: list, limit: int = 0) -> str:
+    """Render skeleton as a filesystem tree grouped by source path."""
+    if not classes:
+        return "No public/protected classes found."
+
+    # Deduplicate: same qualifiedClassName can appear twice from multi-segment indexes.
+    seen_classes: dict[str, dict] = {}
+    for cls in classes:
+        key = cls.get("qualifiedClassName") or cls.get("className", "?")
+        if key not in seen_classes:
+            seen_classes[key] = cls
+        else:
+            # Merge method lists (deduplicate by signature text)
+            existing = seen_classes[key]
+            existing_sigs = set(existing.get("methods", []))
+            for m in cls.get("methods", []):
+                if m not in existing_sigs:
+                    existing.setdefault("methods", []).append(m)
+                    existing_sigs.add(m)
+    deduped = list(seen_classes.values())
+
+    visible, hidden = _truncate(deduped, limit)
+
+    # Build tree: map path segments → list of (file_leaf, methods, display_name)
+    # We derive a short path from filePath (strip up to src/main/java, src/main/python, etc.)
+    # or fall back to the package path from qualifiedClassName.
+    def short_path(cls: dict) -> list[str]:
+        fp = cls.get("filePath", "")
+        if fp:
+            fp = fp.replace("\\", "/")
+            # Strip everything up to a known source root marker
+            for marker in ("/src/main/java/", "/src/main/python/", "/src/main/",
+                           "/main/java/", "/main/", "/src/"):
+                idx = fp.find(marker)
+                if idx >= 0:
+                    fp = fp[idx + len(marker):]
+                    break
+            else:
+                # Just use the last N components
+                parts = fp.split("/")
+                fp = "/".join(parts[-4:]) if len(parts) >= 4 else fp
+            return fp.split("/")
+        # Fallback: derive from qualified class name
+        qname = cls.get("qualifiedClassName", "?")
+        parts = qname.replace(".", "/").split("/")
+        # Last part is the class — append .java
+        parts[-1] = parts[-1].split("$")[0] + ".java"
+        return parts
+
+    # Build a nested dict tree: {segment: subtree | None}
+    # Leaves: segment is a filename, value is list of method sigs
+    tree: dict = {}
+    for cls in visible:
+        parts = short_path(cls)
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        leaf = parts[-1]
+        # Store methods under a special key; merge if leaf already seen
+        existing = node.get(leaf)
+        methods = cls.get("methods", [])
+        if existing is None:
+            node[leaf] = {"__methods__": list(methods)}
+        elif isinstance(existing, dict):
+            seen_m = set(existing.get("__methods__", []))
+            for m in methods:
+                if m not in seen_m:
+                    existing["__methods__"].append(m)
+                    seen_m.add(m)
+
+    def render_tree(node: dict, prefix: str = "") -> list[str]:
+        out = []
+        keys = sorted(node.keys())
+        for i, key in enumerate(keys):
+            is_last = (i == len(keys) - 1)
+            connector = "└── " if is_last else "├── "
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            val = node[key]
+            if isinstance(val, dict):
+                methods = val.pop("__methods__", [])
+                if val:
+                    # Directory with children
+                    out.append(f"{prefix}{connector}{key}/")
+                    out.extend(render_tree(val, child_prefix))
+                else:
+                    # File leaf
+                    out.append(f"{prefix}{connector}{key}")
+                    for j, m in enumerate(methods):
+                        # Strip annotation prefixes for readability
+                        sig = m.strip()
+                        for ann in ("@Override ", "@Override\n"):
+                            sig = sig.replace(ann, "")
+                        # Collapse long generics
+                        m_last = "└── " if j == len(methods) - 1 else "├── "
+                        out.append(f"{child_prefix}{m_last}{sig}")
+        return out
+
+    lines = render_tree(tree)
+    if hidden:
+        lines.append(f"\n... and {hidden} more classes (use --limit N to see more)")
+    return "\n".join(lines)
+
+
 def fmt_boundary(data: dict, limit: int = 0) -> str:
     project = data.get("project", "?")
     entry = data.get("entryPoints", [])
     exits = data.get("exitPoints", [])
+    total_exits = data.get("totalExitPoints", len(exits))
     lines = [f"**Module boundary for `{project}`**\n"]
     vis_entry, hid_entry = _truncate(entry, limit)
     lines.append(f"**Entry points** (methods called by other linked modules): {len(entry)}")
@@ -293,15 +397,17 @@ def fmt_boundary(data: dict, limit: int = 0) -> str:
             lines.append(f"- `{fqn}`")
         if hid_entry:
             lines.append(f"- *... and {hid_entry} more*")
-    vis_exits, hid_exits = _truncate(exits, limit)
-    lines.append(f"\n**Exit points** (unresolved external calls): {len(exits)}")
+    shown = len(exits)
+    exit_label = f"{total_exits}" if total_exits == shown else f"{shown} of {total_exits}"
+    lines.append(f"\n**Exit points** (unresolved external calls): {exit_label}")
     if not exits:
         lines.append("- *(none recorded)*")
     else:
+        vis_exits, hid_exits = _truncate(exits, limit)
         for ep in vis_exits:
             lines.append(f"- `{ep['callerFqn']}` → `{ep['calleeSimpleName']}` (line {ep['line']})")
         if hid_exits:
-            lines.append(f"- *... and {hid_exits} more*")
+            lines.append(f"- *... and {hid_exits} more (use --limit to see more)*")
     return "\n".join(lines)
 
 
@@ -374,8 +480,24 @@ def cmd_mod_path(args):
 
 def cmd_boundary(args):
     ensure_daemon()
-    data = _api_get("/api/boundary", {"project": args.project})
+    params = {"project": args.project}
+    if args.limit:
+        params["limit"] = args.limit
+    data = _api_get("/api/boundary", params)
     print(fmt_boundary(data, args.limit))
+
+
+def cmd_skeleton(args):
+    ensure_daemon()
+    params = {"project": args.project}
+    if args.method_limit:
+        params["limit"] = args.method_limit
+    if getattr(args, "path", None):
+        params["path"] = args.path
+    if getattr(args, "depth", None) is not None and args.depth >= 0:
+        params["depth"] = args.depth
+    classes = _api_get("/api/skeleton", params)
+    print(fmt_skeleton(classes, args.limit))
 
 
 def cmd_index(args):
@@ -383,7 +505,10 @@ def cmd_index(args):
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
-    cmd = ["java", "--enable-native-access=ALL-UNNAMED", "-jar", str(JAR), "index", str(args.path)]
+    jvm_flags = ["--enable-native-access=ALL-UNNAMED"]
+    if args.vector_incubator:
+        jvm_flags.append("--add-modules jdk.incubator.vector")
+    cmd = ["java"] + jvm_flags + ["-jar", str(JAR), "index", str(args.path)]
     if args.project:
         cmd += ["--project", args.project]
     if args.full:
@@ -486,6 +611,7 @@ COMMANDS
   deps        Show dependencies of a module
   mod-path    Find dependency path between two modules
   boundary    Show entry/exit points of a module
+  skeleton    Show public/protected class and method signatures of a project
   daemon      Manage the background daemon (start|stop|restart|status|logs)
 
 DAEMON
@@ -558,6 +684,8 @@ EXAMPLES
                          help="Max directory depth to search for sub-projects (default: 3)")
     p_index.add_argument("--project-threads", dest="project_threads", type=int, default=1, metavar="N",
                          help="Projects to index concurrently (default: 1)")
+    p_index.add_argument("--vector-incubator", dest="vector_incubator", action="store_true",
+                         help="Enable JVM Vector API (--add-modules jdk.incubator.vector) for faster SIMD embedding")
     p_index.set_defaults(func=cmd_index)
 
     # search
@@ -724,6 +852,34 @@ EXAMPLES
     p_boundary.add_argument("--limit", type=int, default=0, metavar="N",
                             help="Max entry/exit points to show (default: 0 = no limit)")
     p_boundary.set_defaults(func=cmd_boundary)
+
+    # skeleton
+    p_skeleton = sub.add_parser(
+        "skeleton",
+        help="Show public/protected class and method signatures of a project",
+        description="""\
+Print a structural outline of a project: public and protected classes with their
+method signatures. Useful for AI context injection or a quick architectural overview.
+
+EXAMPLES
+  pharos skeleton myproject
+  pharos skeleton myproject --limit 20                    # cap at 20 classes shown
+  pharos skeleton myproject --path src/main/java/com/foo  # only classes under that path
+  pharos skeleton myproject --path src/main/java/com/foo --depth 1  # direct children only
+  pharos skeleton myproject --method-limit 200            # cap at 200 total methods fetched
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_skeleton.add_argument("project", help="Project name to summarise")
+    p_skeleton.add_argument("--limit", type=int, default=0, metavar="N",
+                            help="Max classes to display (default: 0 = no limit)")
+    p_skeleton.add_argument("--method-limit", dest="method_limit", type=int, default=None, metavar="N",
+                            help="Max total methods fetched from the server (default: 500)")
+    p_skeleton.add_argument("--path", metavar="PATH",
+                            help="Only show classes whose source file is under this path")
+    p_skeleton.add_argument("--depth", type=int, default=-1, metavar="N",
+                            help="Max directory levels below --path to include (-1 = unlimited)")
+    p_skeleton.set_defaults(func=cmd_skeleton)
 
     # daemon
     p_daemon = sub.add_parser(

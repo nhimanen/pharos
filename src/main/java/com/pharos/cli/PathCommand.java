@@ -4,10 +4,10 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.graph.CrossProjectLinker;
 import picocli.CommandLine.*;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -36,8 +36,7 @@ public class PathCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         try {
-            CallGraph graph = buildGraph();
-            List<String> path = graph.findPath(fromFqn, toFqn);
+            List<String> path = findPath();
 
             if (path.isEmpty()) {
                 System.out.printf("No call path found from:%n  %s%nto:%n  %s%n", fromFqn, toFqn);
@@ -55,27 +54,24 @@ public class PathCommand implements Callable<Integer> {
         }
     }
 
-    private CallGraph buildGraph() throws Exception {
-        boolean crossProject = false;
-        if (crossProject) {
-            CrossProjectLinker linker = new CrossProjectLinker(config, registry);
-            return linker.loadCrossProjectGraph();
-        }
-
-        // Build merged graph from all project graphs
-        CallGraph merged = new CallGraph();
-        CallGraphSerializer serializer = new CallGraphSerializer();
+    private List<String> findPath() throws Exception {
+        // Search each per-project graph individually
         for (ProjectMeta meta : registry.listAll()) {
-            Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-            CallGraph projectGraph = serializer.load(graphFile);
-            // Merge all edges
-            projectGraph.allMethods().forEach(merged::addMethod);
-            projectGraph.getInternalGraph().edgeSet().forEach(edge -> {
-                String src = projectGraph.getInternalGraph().getEdgeSource(edge);
-                String tgt = projectGraph.getInternalGraph().getEdgeTarget(edge);
-                merged.addCall(src, tgt);
-            });
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            if (!Files.isDirectory(dbDir)) continue;
+            try (CallGraph graph = CallGraph.open(dbDir)) {
+                List<String> path = graph.shortestPath(fromFqn, toFqn);
+                if (!path.isEmpty()) return path;
+            } catch (Exception e) {
+                // Graph not available for this project
+            }
         }
-        return merged;
+        // Fall back to cross-project graph
+        CrossProjectLinker linker = new CrossProjectLinker(config, registry);
+        try (CallGraph cross = linker.loadCrossProjectGraph()) {
+            return cross.shortestPath(fromFqn, toFqn);
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 }

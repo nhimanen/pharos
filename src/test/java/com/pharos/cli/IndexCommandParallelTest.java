@@ -5,7 +5,6 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.NoOpEmbeddingProvider;
 import com.pharos.graph.CallGraph;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.indexer.LuceneIndexer;
@@ -34,6 +33,7 @@ class IndexCommandParallelTest {
     Path tempDir;
 
     private Path workspace;
+    private IndexConfig config;
     private LuceneIndexer luceneIndexer;
     private ProjectIndexManager indexManager;
     private TestRegistry registry;
@@ -41,12 +41,13 @@ class IndexCommandParallelTest {
     private IndexCommand indexCommand;
     private KeywordSearchStrategy strategy;
 
+
     @BeforeEach
     void setUp() throws IOException {
         workspace = tempDir.resolve("workspace");
         Files.createDirectories(workspace);
 
-        IndexConfig config = IndexConfig.defaults();
+        config = IndexConfig.defaults();
         config.setIndexDir(tempDir.resolve("indexes"));
 
         registry = new TestRegistry();
@@ -204,14 +205,14 @@ class IndexCommandParallelTest {
         invokeMultiple(projects);
 
         // Cross-project graph must include methods from both projects
-        CallGraphSerializer serializer = new CallGraphSerializer();
-        Path crossGraph = IndexConfig.DEFAULT_BASE.resolve("cross-project-graph.graphml");
-        if (Files.exists(crossGraph)) {
-            CallGraph graph = serializer.load(crossGraph);
-            // Both project graphs were merged — node count > 0
-            assertThat(graph.nodeCount()).isGreaterThan(0);
+        Path crossDbDir = config.getIndexDir().getParent().resolve("cross-project.arcadedb");
+        if (Files.isDirectory(crossDbDir)) {
+            try (CallGraph graph = crossProjectLinker.loadCrossProjectGraph()) {
+                // Both project graphs were merged — method count > 0
+                assertThat(graph.methodCount()).isGreaterThan(0);
+            }
         }
-        // If file doesn't exist (empty graphs), that's also valid — just verify no exception
+        // If directory doesn't exist (empty graphs), that's also valid — just verify no exception
     }
 
     @Test
@@ -236,12 +237,16 @@ class IndexCommandParallelTest {
                         "HandlerService", 0, null, 1));
         registry.register(callerMeta);
 
-        CallGraph crossGraph = crossProjectLinker.buildCrossProjectGraph(
-                List.of("caller-proj", "handler-proj"));
+        // Delete the freshness stamp so the explicit rebuild below is not skipped.
+        Files.deleteIfExists(config.getIndexDir().getParent().resolve("cross-project.stamp"));
+
+        crossProjectLinker.buildCrossProjectGraph(List.of("caller-proj", "handler-proj"));
 
         // The cross-project edge must exist
-        assertThat(crossGraph.getCallees("com.example.CallerService#callSomething()"))
-                .anyMatch(callee -> callee.contains("handleRequest"));
+        try (CallGraph crossGraph = crossProjectLinker.loadCrossProjectGraph()) {
+            assertThat(crossGraph.callees("com.example.CallerService#callSomething()"))
+                    .anyMatch(callee -> callee.contains("handleRequest"));
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -197,17 +197,17 @@ class KeywordSearchStrategyTest {
     }
 
     @Test
-    void sourcePathPenalty_testSource_returnsHalf() {
+    void sourcePathPenalty_testSource_returnsLow() {
         assertThat(KeywordSearchStrategy.sourcePathPenalty("/src/test/java/com/example/FooTest.java"))
-                .isEqualTo(0.50f);
+                .isEqualTo(0.30f);
     }
 
     @Test
     void sourcePathPenalty_benchmark_returnsLow() {
         assertThat(KeywordSearchStrategy.sourcePathPenalty("/src/benchmark/java/com/example/Bench.java"))
-                .isEqualTo(0.30f);
+                .isEqualTo(0.25f);
         assertThat(KeywordSearchStrategy.sourcePathPenalty("/jmh/java/com/example/Bench.java"))
-                .isEqualTo(0.30f);
+                .isEqualTo(0.25f);
     }
 
     @Test
@@ -232,7 +232,7 @@ class KeywordSearchStrategyTest {
     void sourcePathPenalty_windowsPath_normalizedCorrectly() {
         // Backslash paths (Windows) must be treated the same as forward slashes
         assertThat(KeywordSearchStrategy.sourcePathPenalty("C:\\project\\src\\test\\FooTest.java"))
-                .isEqualTo(0.50f);
+                .isEqualTo(0.30f);
     }
 
     // --- synonym hot-reload ---

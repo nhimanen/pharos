@@ -3,11 +3,10 @@ package com.pharos.mcp;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
-import com.pharos.graph.ModuleNode;
+import com.pharos.graph.ModuleNodeData;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResponse;
@@ -18,7 +17,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -41,29 +39,10 @@ public class McpToolRegistry {
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    /** Cache: graphml path -> (lastModified, CallGraph). Avoids re-parsing large graph files per call. */
-    private final ConcurrentHashMap<Path, long[]> graphMtimeCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Path, CallGraph> graphCache = new ConcurrentHashMap<>();
-
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(McpToolRegistry.class);
 
-    /** Eagerly load all project call graphs into cache in a background thread. */
-    public void warmUp() {
-        Thread t = new Thread(() -> {
-            for (ProjectMeta meta : registry.listAll()) {
-                Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-                try {
-                    long start = System.currentTimeMillis();
-                    loadGraphCached(graphFile);
-                    log.info("Warmed up graph for '{}' in {}ms", meta.getName(), System.currentTimeMillis() - start);
-                } catch (Exception e) {
-                    log.warn("Failed to warm up graph for '{}': {}", meta.getName(), e.getMessage());
-                }
-            }
-        }, "pharos-graph-warmup");
-        t.setDaemon(true);
-        t.start();
-    }
+    /** No-op: ArcadeDB graphs are memory-mapped on disk — no warmup needed. */
+    public void warmUp() {}
 
     public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry) {
         this(searchEngine, registry, new ModuleGraphBuilder(registry),
@@ -240,25 +219,19 @@ public class McpToolRegistry {
         String from = args.path("from_fqn").asText();
         String to = args.path("to_fqn").asText();
 
-        // Load merged graph from all projects
-        CallGraph merged = new CallGraph();
+        // Search each per-project graph for the path
         for (ProjectMeta meta : registry.listAll()) {
-            Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-            try {
-                CallGraph g = loadGraphCached(graphFile);
-                g.allMethods().forEach(merged::addMethod);
-                g.getInternalGraph().edgeSet().forEach(edge -> {
-                    merged.addCall(g.getInternalGraph().getEdgeSource(edge),
-                            g.getInternalGraph().getEdgeTarget(edge));
-                });
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            if (!Files.isDirectory(dbDir)) continue;
+            try (CallGraph g = CallGraph.open(dbDir)) {
+                List<String> path = g.shortestPath(from, to);
+                if (!path.isEmpty()) {
+                    return "Call path (" + (path.size() - 1) + " hops):\n" +
+                            path.stream().map(n -> "→ `" + n + "`").collect(Collectors.joining("\n"));
+                }
             } catch (Exception ignored) {}
         }
-
-        List<String> path = merged.findPath(from, to);
-        if (path.isEmpty()) return "No call path found from `" + from + "` to `" + to + "`";
-
-        return "Call path (" + (path.size() - 1) + " hops):\n" +
-                path.stream().map(n -> "→ `" + n + "`").collect(Collectors.joining("\n"));
+        return "No call path found from `" + from + "` to `" + to + "`";
     }
 
     private String callListProjects() {
@@ -281,99 +254,103 @@ public class McpToolRegistry {
 
     private String callListModules(JsonNode args) throws Exception {
         String filter = args.path("status_filter").asText("all");
-        ModuleGraph graph = moduleGraphBuilder.load();
-        if (graph.nodeCount() == 0) {
-            return "No modules registered yet. Run `pharos index` on a Maven project first.";
+        try (ModuleGraph graph = moduleGraphBuilder.open()) {
+            long total = graph.moduleCount();
+            if (total == 0) {
+                return "No modules registered yet. Run `pharos index` on a Maven project first.";
+            }
+
+            List<ModuleNodeData> allNodes = graph.allModules().collect(Collectors.toList());
+            long indexed  = allNodes.stream().filter(ModuleNodeData::isIndexed).count();
+            long external = total - indexed;
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("Module graph: **%d** nodes (%d indexed, %d external), **%d** edges\n\n",
+                    total, indexed, external, graph.dependencyCount()));
+
+            allNodes.stream()
+                    .filter(n -> switch (filter) {
+                        case "indexed"  -> n.isIndexed();
+                        case "external" -> !n.isIndexed();
+                        default         -> true;
+                    })
+                    .sorted(Comparator.comparing(ModuleNodeData::moduleKey))
+                    .forEach(n -> {
+                        int deps   = graph.dependencies(n.moduleKey()).size();
+                        int usedBy = graph.dependents(n.moduleKey()).size();
+                        String status = n.isIndexed()
+                                ? "✓ indexed [" + n.projectName() + "]"
+                                : "⊘ external";
+                        sb.append(String.format("- `%s` %s — deps: %d, used-by: %d, version: %s\n",
+                                n.moduleKey(), status, deps, usedBy, n.version()));
+                    });
+            return sb.toString();
         }
-
-        StringBuilder sb = new StringBuilder();
-        long indexed  = graph.allNodes().stream().filter(ModuleNode::isIndexed).count();
-        long external = graph.nodeCount() - indexed;
-        sb.append(String.format("Module graph: **%d** nodes (%d indexed, %d external), **%d** edges\n\n",
-                graph.nodeCount(), indexed, external, graph.edgeCount()));
-
-        graph.allNodes().stream()
-                .filter(n -> switch (filter) {
-                    case "indexed"  -> n.isIndexed();
-                    case "external" -> !n.isIndexed();
-                    default         -> true;
-                })
-                .sorted((a, b) -> a.getModuleKey().compareTo(b.getModuleKey()))
-                .forEach(n -> {
-                    int deps   = graph.getDependencies(n).size();
-                    int usedBy = graph.getDependents(n).size();
-                    String status = n.isIndexed()
-                            ? "✓ indexed [" + n.getProjectName() + "]"
-                            : "⊘ external";
-                    sb.append(String.format("- `%s` %s — deps: %d, used-by: %d, version: %s\n",
-                            n.getModuleKey(), status, deps, usedBy, n.getVersion()));
-                });
-        return sb.toString();
     }
 
     private String callGetModuleDeps(JsonNode args) throws Exception {
         String moduleRef  = args.path("module").asText();
         boolean transitive = args.path("transitive").asBoolean(false);
 
-        ModuleGraph graph = moduleGraphBuilder.load();
-        ModuleNode node = resolveModule(graph, moduleRef);
-        if (node == null) {
-            return "Module not found: `" + moduleRef + "`. Use `list_modules` to see available modules.";
+        try (ModuleGraph graph = moduleGraphBuilder.open()) {
+            ModuleNodeData node = resolveModule(graph, moduleRef);
+            if (node == null) {
+                return "Module not found: `" + moduleRef + "`. Use `list_modules` to see available modules.";
+            }
+
+            Set<ModuleNodeData> deps = transitive
+                    ? bfsModules(graph, node, true)
+                    : graph.dependencies(node.moduleKey());
+            Set<ModuleNodeData> dependents = transitive
+                    ? bfsModules(graph, node, false)
+                    : graph.dependents(node.moduleKey());
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("**%s** [%s] version: %s\n\n",
+                    node.moduleKey(),
+                    node.isIndexed() ? "indexed/" + node.projectName() : "external",
+                    node.version()));
+
+            sb.append(String.format("**Dependencies (%s%d):**\n",
+                    transitive ? "transitive, " : "", deps.size()));
+            deps.stream().sorted(Comparator.comparing(ModuleNodeData::moduleKey))
+                    .forEach(d -> sb.append(String.format("- → `%s` [%s]\n",
+                            d.moduleKey(), d.isIndexed() ? "indexed" : "external")));
+
+            sb.append(String.format("\n**Used by (%s%d):**\n",
+                    transitive ? "transitive, " : "", dependents.size()));
+            dependents.stream().sorted(Comparator.comparing(ModuleNodeData::moduleKey))
+                    .forEach(d -> sb.append(String.format("- ← `%s` [%s]\n",
+                            d.moduleKey(), d.isIndexed() ? "indexed" : "external")));
+            return sb.toString();
         }
-
-        java.util.Set<ModuleNode> deps = transitive
-                ? bfsModules(graph, node, true)
-                : graph.getDependencies(node);
-        java.util.Set<ModuleNode> dependents = transitive
-                ? bfsModules(graph, node, false)
-                : graph.getDependents(node);
-
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("**%s** [%s] version: %s\n\n",
-                node.getModuleKey(),
-                node.isIndexed() ? "indexed/" + node.getProjectName() : "external",
-                node.getVersion()));
-
-        sb.append(String.format("**Dependencies (%s%d):**\n",
-                transitive ? "transitive, " : "", deps.size()));
-        deps.stream().sorted((a,b) -> a.getModuleKey().compareTo(b.getModuleKey()))
-                .forEach(d -> sb.append(String.format("- → `%s` [%s]\n",
-                        d.getModuleKey(), d.isIndexed() ? "indexed" : "external")));
-
-        sb.append(String.format("\n**Used by (%s%d):**\n",
-                transitive ? "transitive, " : "", dependents.size()));
-        dependents.stream().sorted((a,b) -> a.getModuleKey().compareTo(b.getModuleKey()))
-                .forEach(d -> sb.append(String.format("- ← `%s` [%s]\n",
-                        d.getModuleKey(), d.isIndexed() ? "indexed" : "external")));
-        return sb.toString();
     }
 
     private String callFindModulePath(JsonNode args) throws Exception {
         String fromRef = args.path("from_module").asText();
         String toRef   = args.path("to_module").asText();
 
-        ModuleGraph graph = moduleGraphBuilder.load();
-        ModuleNode fromNode = resolveModule(graph, fromRef);
-        ModuleNode toNode   = resolveModule(graph, toRef);
-        if (fromNode == null) return "Module not found: `" + fromRef + "`";
-        if (toNode   == null) return "Module not found: `" + toRef + "`";
+        try (ModuleGraph graph = moduleGraphBuilder.open()) {
+            ModuleNodeData fromNode = resolveModule(graph, fromRef);
+            ModuleNodeData toNode   = resolveModule(graph, toRef);
+            if (fromNode == null) return "Module not found: `" + fromRef + "`";
+            if (toNode   == null) return "Module not found: `" + toRef + "`";
 
-        java.util.List<ModuleNode> path =
-                graph.findPath(fromNode.getModuleKey(), toNode.getModuleKey());
-        if (path.isEmpty()) {
-            return "No dependency path from `" + fromRef + "` to `" + toRef + "`";
-        }
+            List<ModuleNodeData> path = graph.shortestPath(fromNode.moduleKey(), toNode.moduleKey());
+            if (path.isEmpty()) {
+                return "No dependency path from `" + fromRef + "` to `" + toRef + "`";
+            }
 
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("Dependency path (%d hop%s):\n\n",
-                path.size() - 1, path.size() - 1 == 1 ? "" : "s"));
-        for (int i = 0; i < path.size(); i++) {
-            ModuleNode n = path.get(i);
-            String marker = i == 0 ? "**START**" : i == path.size()-1 ? "**END**" : "→";
-            sb.append(String.format("%s `%s` [%s]\n", marker, n.getModuleKey(),
-                    n.isIndexed() ? "indexed/" + n.getProjectName() : "external"));
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("Dependency path (%d hop%s):\n\n",
+                    path.size() - 1, path.size() - 1 == 1 ? "" : "s"));
+            for (int i = 0; i < path.size(); i++) {
+                ModuleNodeData n = path.get(i);
+                String marker = i == 0 ? "**START**" : i == path.size()-1 ? "**END**" : "→";
+                sb.append(String.format("%s `%s` [%s]\n", marker, n.moduleKey(),
+                        n.isIndexed() ? "indexed/" + n.projectName() : "external"));
+            }
+            return sb.toString();
         }
-        return sb.toString();
     }
 
     private String callGetModuleBoundary(JsonNode args) throws Exception {
@@ -407,22 +384,22 @@ public class McpToolRegistry {
         return sb.toString();
     }
 
-    private static ModuleNode resolveModule(ModuleGraph graph, String ref) {
-        ModuleNode n = graph.findByKey(ref);
-        if (n != null) return n;
+    private static ModuleNodeData resolveModule(ModuleGraph graph, String ref) {
+        Optional<ModuleNodeData> n = graph.findByKey(ref);
+        if (n.isPresent()) return n.get();
         return graph.findByProjectName(ref).orElse(null);
     }
 
-    private static java.util.Set<ModuleNode> bfsModules(ModuleGraph graph,
-                                                          ModuleNode start, boolean outbound) {
-        java.util.Set<ModuleNode> visited = new java.util.LinkedHashSet<>();
-        java.util.Deque<ModuleNode> queue = new java.util.ArrayDeque<>();
+    private static Set<ModuleNodeData> bfsModules(ModuleGraph graph,
+                                                    ModuleNodeData start, boolean outbound) {
+        Set<ModuleNodeData> visited = new LinkedHashSet<>();
+        Deque<ModuleNodeData> queue = new ArrayDeque<>();
         queue.add(start);
         while (!queue.isEmpty()) {
-            ModuleNode cur = queue.pop();
-            java.util.Set<ModuleNode> next = outbound
-                    ? graph.getDependencies(cur) : graph.getDependents(cur);
-            for (ModuleNode n : next) {
+            ModuleNodeData cur = queue.pop();
+            Set<ModuleNodeData> next = outbound
+                    ? graph.dependencies(cur.moduleKey()) : graph.dependents(cur.moduleKey());
+            for (ModuleNodeData n : next) {
                 if (visited.add(n)) queue.add(n);
             }
         }
@@ -430,25 +407,13 @@ public class McpToolRegistry {
         return visited;
     }
 
-    private CallGraph loadGraphCached(Path graphFile) throws Exception {
-        long mtime = Files.exists(graphFile) ? Files.getLastModifiedTime(graphFile).toMillis() : 0;
-        long[] cached = graphMtimeCache.get(graphFile);
-        if (cached != null && cached[0] == mtime) {
-            return graphCache.get(graphFile);
-        }
-        CallGraph graph = new CallGraphSerializer().load(graphFile);
-        graphMtimeCache.put(graphFile, new long[]{mtime});
-        graphCache.put(graphFile, graph);
-        return graph;
-    }
-
     private Set<String> getFromGraph(String fqn, boolean callers) {
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
-            Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-            try {
-                CallGraph graph = loadGraphCached(graphFile);
-                result.addAll(callers ? graph.getCallers(fqn) : graph.getCallees(fqn));
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            if (!Files.isDirectory(dbDir)) continue;
+            try (CallGraph graph = CallGraph.open(dbDir)) {
+                result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (Exception ignored) {}
         }
         return result;

@@ -43,10 +43,6 @@ public class WebServer {
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
     private final ObjectMapper mapper;
 
-    // CallGraph cache: project name → (file lastModified, loaded graph)
-    private final Map<String, long[]> callGraphMtime = new HashMap<>();
-    private final Map<String, CallGraph> callGraphCache = new HashMap<>();
-
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
                      ModuleBoundaryAnalyzer boundaryAnalyzer) {
@@ -163,22 +159,18 @@ public class WebServer {
             }
         });
 
-        // API: call path between two methods (merges all project graphs)
+        // API: call path between two methods (searches each project graph)
         app.get("/api/path", ctx -> {
             String from = ctx.queryParam("from");
             String to = ctx.queryParam("to");
             if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
-            CallGraph merged = new CallGraph();
+            List<String> path = List.of();
             for (ProjectMeta meta : registry.listAll()) {
-                try {
-                    CallGraph g = loadCallGraphCached(meta);
-                    g.allMethods().forEach(merged::addMethod);
-                    g.getInternalGraph().edgeSet().forEach(edge ->
-                            merged.addCall(g.getInternalGraph().getEdgeSource(edge),
-                                    g.getInternalGraph().getEdgeTarget(edge)));
+                try (CallGraph g = loadCallGraphCached(meta)) {
+                    List<String> candidate = g.shortestPath(from, to);
+                    if (!candidate.isEmpty()) { path = candidate; break; }
                 } catch (Exception ignored) {}
             }
-            List<String> path = merged.findPath(from, to);
             Map<String, Object> res = new LinkedHashMap<>();
             res.put("path", path);
             res.put("hops", path.isEmpty() ? 0 : path.size() - 1);
@@ -188,32 +180,33 @@ public class WebServer {
         // API: list modules
         app.get("/api/modules", ctx -> {
             String filter = ctx.queryParamAsClass("filter", String.class).getOrDefault("all");
-            ModuleGraph graph = moduleGraphBuilder.load();
-            List<Map<String, Object>> nodes = graph.allNodes().stream()
-                    .filter(n -> switch (filter) {
-                        case "indexed"  -> n.isIndexed();
-                        case "external" -> !n.isIndexed();
-                        default         -> true;
-                    })
-                    .sorted(Comparator.comparing(ModuleNode::getModuleKey))
-                    .map(n -> {
-                        Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("moduleKey", n.getModuleKey());
-                        m.put("groupId", n.getGroupId());
-                        m.put("artifactId", n.getArtifactId());
-                        m.put("version", n.getVersion());
-                        m.put("indexed", n.isIndexed());
-                        m.put("projectName", n.getProjectName());
-                        m.put("depCount", graph.getDependencies(n).size());
-                        m.put("usedByCount", graph.getDependents(n).size());
-                        return m;
-                    })
-                    .collect(Collectors.toList());
-            Map<String, Object> res = new LinkedHashMap<>();
-            res.put("total", graph.nodeCount());
-            res.put("edges", graph.edgeCount());
-            res.put("modules", nodes);
-            ctx.json(res);
+            try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
+                List<Map<String, Object>> nodes = graph.allModules()
+                        .filter(n -> switch (filter) {
+                            case "indexed"  -> n.isIndexed();
+                            case "external" -> !n.isIndexed();
+                            default         -> true;
+                        })
+                        .sorted(Comparator.comparing(com.pharos.graph.ModuleNodeData::moduleKey))
+                        .map(n -> {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("moduleKey", n.moduleKey());
+                            m.put("groupId", n.groupId());
+                            m.put("artifactId", n.artifactId());
+                            m.put("version", n.version());
+                            m.put("indexed", n.isIndexed());
+                            m.put("projectName", n.projectName());
+                            m.put("depCount", graph.dependencies(n.moduleKey()).size());
+                            m.put("usedByCount", graph.dependents(n.moduleKey()).size());
+                            return m;
+                        })
+                        .collect(Collectors.toList());
+                Map<String, Object> res = new LinkedHashMap<>();
+                res.put("total", graph.moduleCount());
+                res.put("edges", graph.dependencyCount());
+                res.put("modules", nodes);
+                ctx.json(res);
+            }
         });
 
         // API: module dependencies
@@ -221,22 +214,23 @@ public class WebServer {
             String moduleRef = ctx.queryParam("module");
             boolean transitive = Boolean.parseBoolean(ctx.queryParamAsClass("transitive", String.class).getOrDefault("false"));
             if (moduleRef == null) { ctx.status(400).result("module required"); return; }
-            ModuleGraph graph = moduleGraphBuilder.load();
-            ModuleNode node = resolveModule(graph, moduleRef);
-            if (node == null) { ctx.status(404).result("Module not found: " + moduleRef); return; }
-            Set<ModuleNode> deps = transitive ? bfsModules(graph, node, true) : graph.getDependencies(node);
-            Set<ModuleNode> dependents = transitive ? bfsModules(graph, node, false) : graph.getDependents(node);
-            Map<String, Object> res = new LinkedHashMap<>();
-            res.put("moduleKey", node.getModuleKey());
-            res.put("indexed", node.isIndexed());
-            res.put("projectName", node.getProjectName());
-            res.put("version", node.getVersion());
-            res.put("transitive", transitive);
-            res.put("dependencies", deps.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
-                    .map(d -> Map.of("moduleKey", d.getModuleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
-            res.put("dependents", dependents.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
-                    .map(d -> Map.of("moduleKey", d.getModuleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
-            ctx.json(res);
+            try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
+                com.pharos.graph.ModuleNodeData node = resolveModule(graph, moduleRef);
+                if (node == null) { ctx.status(404).result("Module not found: " + moduleRef); return; }
+                Set<com.pharos.graph.ModuleNodeData> deps = transitive ? bfsModules(graph, node, true) : graph.dependencies(node.moduleKey());
+                Set<com.pharos.graph.ModuleNodeData> dependents = transitive ? bfsModules(graph, node, false) : graph.dependents(node.moduleKey());
+                Map<String, Object> res = new LinkedHashMap<>();
+                res.put("moduleKey", node.moduleKey());
+                res.put("indexed", node.isIndexed());
+                res.put("projectName", node.projectName());
+                res.put("version", node.version());
+                res.put("transitive", transitive);
+                res.put("dependencies", deps.stream().sorted(Comparator.comparing(com.pharos.graph.ModuleNodeData::moduleKey))
+                        .map(d -> Map.of("moduleKey", d.moduleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
+                res.put("dependents", dependents.stream().sorted(Comparator.comparing(com.pharos.graph.ModuleNodeData::moduleKey))
+                        .map(d -> Map.of("moduleKey", d.moduleKey(), "indexed", d.isIndexed())).collect(Collectors.toList()));
+                ctx.json(res);
+            }
         });
 
         // API: module dependency path
@@ -244,31 +238,34 @@ public class WebServer {
             String fromRef = ctx.queryParam("from");
             String toRef = ctx.queryParam("to");
             if (fromRef == null || toRef == null) { ctx.status(400).result("from and to required"); return; }
-            ModuleGraph graph = moduleGraphBuilder.load();
-            ModuleNode fromNode = resolveModule(graph, fromRef);
-            ModuleNode toNode   = resolveModule(graph, toRef);
-            if (fromNode == null) { ctx.status(404).result("Module not found: " + fromRef); return; }
-            if (toNode   == null) { ctx.status(404).result("Module not found: " + toRef); return; }
-            List<Map<String, Object>> pathNodes = graph.findPath(fromNode.getModuleKey(), toNode.getModuleKey())
-                    .stream().map(n -> {
-                        Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("moduleKey", n.getModuleKey());
-                        m.put("indexed", n.isIndexed());
-                        m.put("projectName", n.getProjectName());
-                        return m;
-                    }).collect(Collectors.toList());
-            Map<String, Object> res = new LinkedHashMap<>();
-            res.put("path", pathNodes);
-            res.put("hops", pathNodes.isEmpty() ? 0 : pathNodes.size() - 1);
-            ctx.json(res);
+            try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
+                com.pharos.graph.ModuleNodeData fromNode = resolveModule(graph, fromRef);
+                com.pharos.graph.ModuleNodeData toNode   = resolveModule(graph, toRef);
+                if (fromNode == null) { ctx.status(404).result("Module not found: " + fromRef); return; }
+                if (toNode   == null) { ctx.status(404).result("Module not found: " + toRef); return; }
+                List<Map<String, Object>> pathNodes = graph.shortestPath(fromNode.moduleKey(), toNode.moduleKey())
+                        .stream().map(n -> {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("moduleKey", n.moduleKey());
+                            m.put("indexed", n.isIndexed());
+                            m.put("projectName", n.projectName());
+                            return m;
+                        }).collect(Collectors.toList());
+                Map<String, Object> res = new LinkedHashMap<>();
+                res.put("path", pathNodes);
+                res.put("hops", pathNodes.isEmpty() ? 0 : pathNodes.size() - 1);
+                ctx.json(res);
+            }
         });
 
         // API: module boundary (entry/exit points)
         app.get("/api/boundary", ctx -> {
             String project = ctx.queryParam("project");
             if (project == null) { ctx.status(400).result("project required"); return; }
+            int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(200);
             try {
-                ModuleBoundaryAnalyzer.BoundaryResult result = boundaryAnalyzer.analyze(project);
+                ModuleBoundaryAnalyzer.BoundaryResult result =
+                        boundaryAnalyzer.analyze(project, limit);
                 List<Map<String, Object>> exits = result.exitPoints().stream()
                         .map(ep -> {
                             Map<String, Object> m = new LinkedHashMap<>();
@@ -281,9 +278,28 @@ public class WebServer {
                 res.put("project", project);
                 res.put("entryPoints", result.entryPoints());
                 res.put("exitPoints", exits);
+                res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());
+            }
+        });
+
+        // API: project skeleton (public/protected classes and method signatures)
+        app.get("/api/skeleton", ctx -> {
+            String project = ctx.queryParam("project");
+            if (project == null || project.isBlank()) { ctx.status(400).result("project required"); return; }
+            int methodLimit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(500);
+            String pathFilter = ctx.queryParam("path");   // optional: restrict to files under this path
+            int depth = ctx.queryParamAsClass("depth", Integer.class).getOrDefault(-1); // -1 = unlimited
+            if (!luceneIndexer.indexExists(project)) {
+                ctx.status(404).result("No index found for project: " + project); return;
+            }
+            try {
+                ctx.json(buildSkeletonData(project, methodLimit, pathFilter, depth));
+            } catch (IOException e) {
+                log.warn("skeleton failed for '{}': {}", project, e.getMessage());
+                ctx.status(500).result("Error building skeleton: " + e.getMessage());
             }
         });
 
@@ -298,63 +314,52 @@ public class WebServer {
     // ── Graph data builders ────────────────────────────────────────────────────
 
     private Map<String, Object> buildModuleGraphData() throws Exception {
-        ModuleGraph graph = moduleGraphBuilder.load();
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        List<Map<String, Object>> edges = new ArrayList<>();
+        try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
+            List<Map<String, Object>> nodes = new ArrayList<>();
+            List<Map<String, Object>> edges = new ArrayList<>();
+            List<com.pharos.graph.ModuleNodeData> allNodes = graph.allModules().collect(Collectors.toList());
 
-        for (ModuleNode n : graph.allNodes()) {
-            Map<String, Object> node = new LinkedHashMap<>();
-            node.put("id", n.getModuleKey());
-            node.put("label", n.getArtifactId() != null ? n.getArtifactId() : n.getModuleKey());
-            node.put("status", n.isIndexed() ? "indexed" : "external");
-            node.put("projectName", n.getProjectName());
-            node.put("version", n.getVersion());
-            node.put("groupId", n.getGroupId());
-            node.put("depCount", graph.getDependencies(n).size());
-            node.put("usedByCount", graph.getDependents(n).size());
-            nodes.add(node);
-        }
+            for (com.pharos.graph.ModuleNodeData n : allNodes) {
+                Map<String, Object> node = new LinkedHashMap<>();
+                node.put("id", n.moduleKey());
+                node.put("label", n.artifactId() != null ? n.artifactId() : n.moduleKey());
+                node.put("status", n.isIndexed() ? "indexed" : "external");
+                node.put("projectName", n.projectName());
+                node.put("version", n.version());
+                node.put("groupId", n.groupId());
+                node.put("depCount", graph.dependencies(n.moduleKey()).size());
+                node.put("usedByCount", graph.dependents(n.moduleKey()).size());
+                nodes.add(node);
+            }
 
-        Set<String> seen = new HashSet<>();
-        for (ModuleNode source : graph.allNodes()) {
-            for (ModuleNode target : graph.getDependencies(source)) {
-                String key = source.getModuleKey() + "->" + target.getModuleKey();
-                if (seen.add(key)) {
-                    Map<String, Object> edge = new LinkedHashMap<>();
-                    edge.put("source", source.getModuleKey());
-                    edge.put("target", target.getModuleKey());
-                    edges.add(edge);
+            Set<String> seen = new HashSet<>();
+            for (com.pharos.graph.ModuleNodeData source : allNodes) {
+                for (com.pharos.graph.ModuleNodeData target : graph.dependencies(source.moduleKey())) {
+                    String key = source.moduleKey() + "->" + target.moduleKey();
+                    if (seen.add(key)) {
+                        Map<String, Object> edge = new LinkedHashMap<>();
+                        edge.put("source", source.moduleKey());
+                        edge.put("target", target.moduleKey());
+                        edges.add(edge);
+                    }
                 }
             }
-        }
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("nodes", nodes);
-        result.put("edges", edges);
-        return result;
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("nodes", nodes);
+            result.put("edges", edges);
+            return result;
+        }
     }
 
-    /** Load CallGraph for a project, using an in-memory cache invalidated by file mtime. */
-    private synchronized CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
-        Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-        long mtime = Files.exists(graphFile) ? Files.getLastModifiedTime(graphFile).toMillis() : 0L;
-        long[] cached = callGraphMtime.get(meta.getName());
-        if (cached != null && cached[0] == mtime) {
-            return callGraphCache.get(meta.getName());
-        }
-        log.info("Loading call graph for '{}' ({} bytes)…", meta.getName(),
-                Files.exists(graphFile) ? Files.size(graphFile) : 0);
-        long t0 = System.currentTimeMillis();
-        CallGraph graph = new CallGraphSerializer().load(graphFile);
-        log.info("Loaded call graph for '{}': {} nodes, {} edges in {}ms",
-                meta.getName(), graph.nodeCount(), graph.edgeCount(), System.currentTimeMillis() - t0);
-        callGraphCache.put(meta.getName(), graph);
-        callGraphMtime.put(meta.getName(), new long[]{mtime});
-        return graph;
+    /** Open the ArcadeDB call graph for the given project. Caller must close. */
+    private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
+        Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+        return CallGraph.open(dbDir);
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {
-        CallGraph graph = loadCallGraphCached(meta);
+        try (CallGraph graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
         // Map class FQN → filePath (use first method's path as representative)
@@ -362,7 +367,7 @@ public class WebServer {
         for (Map.Entry<String, String> e : fqnToFile.entrySet())
             classToFile.putIfAbsent(extractFullClass(e.getKey()), e.getValue());
 
-        Set<String> allMethods = new HashSet<>(graph.allMethods());
+        Set<String> allMethods = graph.allFqns().collect(Collectors.toSet());
 
         // Count methods per class
         Map<String, Integer> methodCount = new HashMap<>();
@@ -379,7 +384,7 @@ public class WebServer {
 
         for (String srcMethod : allMethods) {
             String srcClass = extractFullClass(srcMethod);
-            for (String tgtMethod : graph.getCallees(srcMethod)) {
+            for (String tgtMethod : graph.callees(srcMethod)) {
                 String tgtClass = extractFullClass(tgtMethod);
                 if (!srcClass.equals(tgtClass)) {
                     allClasses.add(tgtClass);
@@ -417,14 +422,15 @@ public class WebServer {
         result.put("edges", edges);
         result.put("total", allClasses.size());
         return result;
+        } // end try-with-resources CallGraph
     }
 
     private Map<String, Object> buildCallGraphData(ProjectMeta meta, int limit, String pkg, String className) throws Exception {
-        CallGraph graph = loadCallGraphCached(meta);
+        try (CallGraph graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
 
-        Set<String> methods = new HashSet<>(graph.allMethods());
+        Set<String> methods = graph.allFqns().collect(Collectors.toSet());
         boolean classView = className != null && !className.isBlank();
         if (classView) {
             methods = methods.stream()
@@ -437,7 +443,7 @@ public class WebServer {
         final Set<String> filtered = methods;
         Map<String, Integer> inDegree = new HashMap<>();
         for (String m : filtered) {
-            inDegree.put(m, (int) graph.getCallers(m).stream().filter(filtered::contains).count());
+            inDegree.put(m, (int) graph.callers(m).stream().filter(filtered::contains).count());
         }
 
         List<String> top = filtered.stream()
@@ -467,7 +473,7 @@ public class WebServer {
         List<Map<String, Object>> edges = new ArrayList<>();
         Set<String> seenEdges = new HashSet<>();
         for (String source : topSet) {
-            for (String target : graph.getCallees(source)) {
+            for (String target : graph.callees(source)) {
                 String key = source + "->" + target;
                 if (!seenEdges.add(key)) continue;
                 if (!topSet.contains(target)) {
@@ -505,6 +511,7 @@ public class WebServer {
         result.put("total", filtered.size());
         result.put("truncated", filtered.size() > limit);
         return result;
+        } // end try-with-resources CallGraph
     }
 
     // ── Language breakdown ─────────────────────────────────────────────────────
@@ -529,6 +536,83 @@ public class WebServer {
                 .collect(Collectors.toMap(
                         Map.Entry::getKey, Map.Entry::getValue,
                         (a, b) -> a, LinkedHashMap::new));
+    }
+
+    /**
+     * Builds a structural skeleton of a project: public/protected classes and their method signatures.
+     * Returns a list of {className, qualifiedClassName, filePath, methods:[signature,...]} sorted by class name.
+     * Capped at {@code methodLimit} total methods.
+     *
+     * @param pathFilter  if non-null, only include files whose path starts with this prefix
+     * @param depth       if >= 0, only include files within this many directory levels below pathFilter
+     */
+    private List<Map<String, Object>> buildSkeletonData(String projectName, int methodLimit,
+                                                         String pathFilter, int depth) throws IOException {
+        // Normalise the path filter so we can do prefix matching
+        final String normPath = (pathFilter != null && !pathFilter.isBlank())
+                ? pathFilter.replace('\\', '/').replaceAll("/$", "")
+                : null;
+        final int depthLimit = depth; // -1 = unlimited
+
+        IndexReader reader = luceneIndexer.openReader(projectName);
+        IndexSearcher searcher = new IndexSearcher(reader);
+        TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
+        StoredFields sf = searcher.storedFields();
+
+        // qualifiedClassName → ordered list of method signatures
+        Map<String, List<String>> classToMethods = new LinkedHashMap<>();
+        // qualifiedClassName → simple className (for display)
+        Map<String, String> classSimpleName = new LinkedHashMap<>();
+        // qualifiedClassName → filePath
+        Map<String, String> classFilePath = new LinkedHashMap<>();
+
+        int totalMethods = 0;
+        for (var sd : all.scoreDocs) {
+            if (totalMethods >= methodLimit) break;
+            var doc = sf.document(sd.doc);
+            String docType = doc.get(DocumentMapper.F_DOC_TYPE);
+            if (!"method".equals(docType)) continue;
+
+            String access = doc.get(DocumentMapper.F_ACCESS);
+            if (access == null || access.isBlank()) continue;
+            if (!"public".equals(access) && !"protected".equals(access)) continue;
+
+            String filePath = doc.get(DocumentMapper.F_FILE_PATH);
+            if (normPath != null) {
+                String normFile = filePath != null ? filePath.replace('\\', '/') : "";
+                if (!normFile.startsWith(normPath)) continue;
+                if (depthLimit >= 0) {
+                    // Count extra path separators beyond the prefix
+                    String remainder = normFile.substring(normPath.length());
+                    if (remainder.startsWith("/")) remainder = remainder.substring(1);
+                    long extra = remainder.isEmpty() ? 0 : remainder.chars().filter(c -> c == '/').count() + 1;
+                    if (extra > depthLimit) continue;
+                }
+            }
+
+            String qualClass = doc.get(DocumentMapper.F_QUALIFIED_CLASS);
+            if (qualClass == null || qualClass.isBlank()) continue;
+            String sig = doc.get(DocumentMapper.F_SIGNATURE);
+            if (sig == null || sig.isBlank()) continue;
+            String simpleName = doc.get(DocumentMapper.F_CLASS_NAME);
+
+            classToMethods.computeIfAbsent(qualClass, k -> new ArrayList<>()).add(sig);
+            classSimpleName.putIfAbsent(qualClass, simpleName != null ? simpleName : extractSimpleClass(qualClass));
+            classFilePath.putIfAbsent(qualClass, filePath != null ? filePath : "");
+            totalMethods++;
+        }
+
+        return classToMethods.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(e -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("className", classSimpleName.getOrDefault(e.getKey(), extractSimpleClass(e.getKey())));
+                    m.put("qualifiedClassName", e.getKey());
+                    m.put("filePath", classFilePath.getOrDefault(e.getKey(), ""));
+                    m.put("methods", e.getValue());
+                    return m;
+                })
+                .collect(Collectors.toList());
     }
 
     /** Builds a FQN → filePath map by scanning the Lucene index for a project. */
@@ -612,20 +696,23 @@ public class WebServer {
 
     // ── Module helpers ─────────────────────────────────────────────────────────
 
-    private static ModuleNode resolveModule(ModuleGraph graph, String ref) {
-        ModuleNode n = graph.findByKey(ref);
-        if (n != null) return n;
+    private static com.pharos.graph.ModuleNodeData resolveModule(com.pharos.graph.ModuleGraph graph, String ref) {
+        Optional<com.pharos.graph.ModuleNodeData> n = graph.findByKey(ref);
+        if (n.isPresent()) return n.get();
         return graph.findByProjectName(ref).orElse(null);
     }
 
-    private static Set<ModuleNode> bfsModules(ModuleGraph graph, ModuleNode start, boolean outbound) {
-        Set<ModuleNode> visited = new LinkedHashSet<>();
-        Deque<ModuleNode> queue = new ArrayDeque<>();
+    private static Set<com.pharos.graph.ModuleNodeData> bfsModules(com.pharos.graph.ModuleGraph graph,
+                                                                     com.pharos.graph.ModuleNodeData start,
+                                                                     boolean outbound) {
+        Set<com.pharos.graph.ModuleNodeData> visited = new LinkedHashSet<>();
+        Deque<com.pharos.graph.ModuleNodeData> queue = new ArrayDeque<>();
         queue.add(start);
         while (!queue.isEmpty()) {
-            ModuleNode cur = queue.pop();
-            Set<ModuleNode> next = outbound ? graph.getDependencies(cur) : graph.getDependents(cur);
-            for (ModuleNode n : next) {
+            com.pharos.graph.ModuleNodeData cur = queue.pop();
+            Set<com.pharos.graph.ModuleNodeData> next = outbound
+                    ? graph.dependencies(cur.moduleKey()) : graph.dependents(cur.moduleKey());
+            for (com.pharos.graph.ModuleNodeData n : next) {
                 if (visited.add(n)) queue.add(n);
             }
         }

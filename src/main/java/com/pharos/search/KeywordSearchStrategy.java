@@ -11,6 +11,9 @@ import org.apache.lucene.queryparser.classic.MultiFieldQueryParser;
 import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.*;
+import org.apache.lucene.search.similarities.BM25Similarity;
+import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
+import org.apache.lucene.search.similarities.Similarity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,12 +30,21 @@ import java.util.stream.Collectors;
 /**
  * BM25 keyword search using MultiFieldQueryParser with field-level boosting.
  *
- * Field boost hierarchy:
- * - methodName: 3x  (direct method name match is most relevant)
+ * Field boost hierarchy (query-time multipliers):
+ * - methodName: 4x  (direct method name match is the strongest signal)
  * - javadoc: 2x     (documentation describes intent)
- * - signature: 2x   (type information is highly relevant)
- * - className: 1.5x (class context)
- * - body: 1x        (implementation details)
+ * - className: 2x   (class name is nearly as specific as method name for class searches)
+ * - signature: 1.5x (type information adds context)
+ * - body: 0.5x      (implementation details; long field, mostly noise)
+ * - annotations: 1x
+ * - callerContext: 1x (callers are ambient context, not the target)
+ *
+ * Per-field BM25 parameters (via PerFieldSimilarityWrapper):
+ * - methodName, className: k1=0.5, b=0.0  — short identifier fields; no length norm,
+ *   low TF saturation (one occurrence is enough)
+ * - javadoc, signature, callerContext: k1=1.0, b=0.5  — medium-length text
+ * - body, annotations: k1=1.2, b=0.9  — long fields; aggressive length norm so long
+ *   implementations don't beat short, focused methods
  */
 public class KeywordSearchStrategy {
 
@@ -41,10 +53,35 @@ public class KeywordSearchStrategy {
     /**
      * Weight applied to the graph-derived boost on top of BM25 score.
      * Final score = bm25 * (1 + GRAPH_BOOST_WEIGHT * log(1+inDeg)/log(1+maxInDeg))
-     * At 0.3, a method called by 100 others (log boost ≈ 1.0) gets ~30% score lift
-     * over a method never called. Keeps relevance dominant while surfacing hub methods.
+     * At 0.3, a method called by 100 others gets ~30% score lift over a method never
+     * called. Keeps relevance dominant while surfacing hub methods.
      */
     private static final float GRAPH_BOOST_WEIGHT = 0.3f;
+
+    /**
+     * Per-field BM25 similarities. Different k1/b values reflect how each field
+     * behaves as a retrieval signal for code:
+     * - identifier fields (methodName, className): short, uniform length → b=0, low k1
+     * - text fields (javadoc, signature): moderate length → standard params
+     * - body: long, highly variable → aggressive length normalization (high b)
+     */
+    private static final Similarity PER_FIELD_SIMILARITY = new PerFieldSimilarityWrapper() {
+        private final BM25Similarity idSim   = new BM25Similarity(0.5f, 0.0f);
+        private final BM25Similarity textSim = new BM25Similarity(1.0f, 0.5f);
+        private final BM25Similarity bodySim = new BM25Similarity(1.2f, 0.9f);
+
+        @Override
+        public Similarity get(String field) {
+            return switch (field) {
+                case DocumentMapper.F_METHOD_NAME,
+                     DocumentMapper.F_CLASS_NAME   -> idSim;
+                case DocumentMapper.F_JAVADOC,
+                     DocumentMapper.F_SIGNATURE,
+                     DocumentMapper.F_CALLER_CONTEXT -> textSim;
+                default                            -> bodySim;
+            };
+        }
+    };
 
     private static final String[] SEARCH_FIELDS = {
             DocumentMapper.F_METHOD_NAME,
@@ -58,13 +95,13 @@ public class KeywordSearchStrategy {
 
     private static final Map<String, Float> FIELD_BOOSTS = new HashMap<>();
     static {
-        FIELD_BOOSTS.put(DocumentMapper.F_METHOD_NAME, 3.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_JAVADOC, 2.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_SIGNATURE, 2.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_CLASS_NAME, 1.5f);
-        FIELD_BOOSTS.put(DocumentMapper.F_BODY, 1.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_ANNOTATIONS, 1.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_CALLER_CONTEXT, 1.5f);
+        FIELD_BOOSTS.put(DocumentMapper.F_METHOD_NAME,    4.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_JAVADOC,        2.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_CLASS_NAME,     2.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_SIGNATURE,      1.5f);
+        FIELD_BOOSTS.put(DocumentMapper.F_BODY,           0.5f);
+        FIELD_BOOSTS.put(DocumentMapper.F_ANNOTATIONS,    1.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_CALLER_CONTEXT, 1.0f);
     }
 
     /**
@@ -122,7 +159,7 @@ public class KeywordSearchStrategy {
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
         reloadIfChanged();
         IndexSearcher searcher = new IndexSearcher(reader);
-        searcher.setSimilarity(new org.apache.lucene.search.similarities.BM25Similarity());
+        searcher.setSimilarity(PER_FIELD_SIMILARITY);
 
         Query query;
         try {
@@ -223,9 +260,10 @@ public class KeywordSearchStrategy {
     static float sourcePathPenalty(String filePath) {
         if (filePath == null) return 1.0f;
         String p = filePath.replace('\\', '/');
-        if (p.contains("/benchmark/")) return 0.30f;
-        if (p.contains("/jmh/"))        return 0.30f;
-        if (p.contains("/src/test/"))   return 0.50f;
+        if (p.contains("/benchmark/")) return 0.25f;
+        if (p.contains("/jmh/"))        return 0.25f;
+        if (p.contains("/src/test/"))   return 0.30f; // stronger — tests are rarely the target
+        if (p.contains("/test/"))       return 0.30f;
         if (p.contains("/.github/"))    return 0.10f;
         if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".sh") || p.endsWith(".yml")) return 0.10f;
         return 1.0f;

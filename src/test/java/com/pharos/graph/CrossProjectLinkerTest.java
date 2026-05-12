@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -24,13 +25,15 @@ class CrossProjectLinkerTest {
 
     private TestRegistry registry;
     private CrossProjectLinker linker;
-    private CallGraphSerializer serializer;
+    private IndexConfig config;
+
 
     @BeforeEach
     void setUp() {
-        registry   = new TestRegistry();
-        linker     = new CrossProjectLinker(IndexConfig.defaults(), registry);
-        serializer = new CallGraphSerializer();
+        registry = new TestRegistry();
+        config   = IndexConfig.defaults();
+        config.setIndexDir(tempDir.resolve("indexes"));
+        linker   = new CrossProjectLinker(config, registry);
     }
 
     @Test
@@ -38,23 +41,18 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("proj-a");
         Path indexB = tempDir.resolve("proj-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#doWork()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#doWork()");
+        createGraph(indexB, "com.example.B#handle()");
 
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.example.B#handle()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        registry.register(projectMeta("proj-a", indexA));
+        registry.register(projectMeta("proj-b", indexB));
 
-        ProjectMeta metaA = projectMeta("proj-a", indexA);
-        ProjectMeta metaB = projectMeta("proj-b", indexB);
-        registry.register(metaA);
-        registry.register(metaB);
+        linker.buildCrossProjectGraph("proj-a", "proj-b");
 
-        CallGraph merged = linker.buildCrossProjectGraph("proj-a", "proj-b");
-
-        assertThat(merged.contains("com.example.A#doWork()")).isTrue();
-        assertThat(merged.contains("com.example.B#handle()")).isTrue();
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(fqnExists(merged, "com.example.A#doWork()")).isTrue();
+            assertThat(fqnExists(merged, "com.example.B#handle()")).isTrue();
+        }
     }
 
     @Test
@@ -63,14 +61,10 @@ class CrossProjectLinkerTest {
         Path indexB = tempDir.resolve("proj-b");
 
         // proj-a calls "handle" but didn't resolve it during indexing
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#caller()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#caller()");
 
         // proj-b has handle()
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.example.B#handle()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexB, "com.example.B#handle()");
 
         ProjectMeta metaA = projectMeta("proj-a", indexA);
         metaA.getUnresolvedRefs().add(
@@ -79,11 +73,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(metaB);
 
-        CallGraph merged = linker.buildCrossProjectGraph("proj-a", "proj-b");
+        linker.buildCrossProjectGraph("proj-a", "proj-b");
 
         // The cross-project edge A#caller() → B#handle() should have been added
-        assertThat(merged.getCallees("com.example.A#caller()"))
-                .contains("com.example.B#handle()");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.callees("com.example.A#caller()"))
+                    .contains("com.example.B#handle()");
+        }
     }
 
     @Test
@@ -91,14 +87,8 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("proj-a");
         Path indexB = tempDir.resolve("proj-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#callsB()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.example.B#callsA()");
-        graphB.addMethod("com.example.B#targetOfA()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#callsB()");
+        createGraph(indexB, "com.example.B#callsA()", "com.example.B#targetOfA()");
 
         ProjectMeta metaA = projectMeta("proj-a", indexA);
         metaA.getUnresolvedRefs().add(
@@ -109,14 +99,16 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(metaB);
 
-        CallGraph merged = linker.buildCrossProjectGraph("proj-a", "proj-b");
+        linker.buildCrossProjectGraph("proj-a", "proj-b");
 
-        // A → B direction
-        assertThat(merged.getCallees("com.example.A#callsB()"))
-                .contains("com.example.B#targetOfA()");
-        // B → A direction
-        assertThat(merged.getCallees("com.example.B#callsA()"))
-                .contains("com.example.A#callsB()");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            // A → B direction
+            assertThat(merged.callees("com.example.A#callsB()"))
+                    .contains("com.example.B#targetOfA()");
+            // B → A direction
+            assertThat(merged.callees("com.example.B#callsA()"))
+                    .contains("com.example.A#callsB()");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -130,14 +122,10 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("scored-a");
         Path indexB = tempDir.resolve("scored-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.Sender#send()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.lib.BufferedWriter#write(String)");
-        graphB.addMethod("com.lib.FileWriter#write(String)");   // correct target
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.Sender#send()");
+        createGraph(indexB,
+                "com.lib.BufferedWriter#write(String)",
+                "com.lib.FileWriter#write(String)");   // correct target
 
         ProjectMeta metaA = projectMeta("scored-a", indexA);
         ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
@@ -146,11 +134,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(projectMeta("scored-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("scored-a", "scored-b");
+        linker.buildCrossProjectGraph("scored-a", "scored-b");
 
-        assertThat(merged.getCallees("com.app.Sender#send()"))
-                .contains("com.lib.FileWriter#write(String)")
-                .doesNotContain("com.lib.BufferedWriter#write(String)");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.callees("com.app.Sender#send()"))
+                    .contains("com.lib.FileWriter#write(String)")
+                    .doesNotContain("com.lib.BufferedWriter#write(String)");
+        }
     }
 
     @Test
@@ -160,14 +150,10 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("param-a");
         Path indexB = tempDir.resolve("param-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.Client#run()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.lib.Processor#process(String)");           // wrong arity
-        graphB.addMethod("com.lib.Processor#process(String,int)");       // correct arity
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.Client#run()");
+        createGraph(indexB,
+                "com.lib.Processor#process(String)",          // wrong arity
+                "com.lib.Processor#process(String,int)");     // correct arity
 
         ProjectMeta metaA = projectMeta("param-a", indexA);
         ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
@@ -176,11 +162,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(projectMeta("param-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("param-a", "param-b");
+        linker.buildCrossProjectGraph("param-a", "param-b");
 
-        assertThat(merged.getCallees("com.app.Client#run()"))
-                .contains("com.lib.Processor#process(String,int)")
-                .doesNotContain("com.lib.Processor#process(String)");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.callees("com.app.Client#run()"))
+                    .contains("com.lib.Processor#process(String,int)")
+                    .doesNotContain("com.lib.Processor#process(String)");
+        }
     }
 
     @Test
@@ -189,14 +177,10 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("pkg-a");
         Path indexB = tempDir.resolve("pkg-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.Main#start()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.db.jdbc.Connection#connect()");    // correct package
-        graphB.addMethod("com.net.http.Connection#connect()");   // wrong package
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.Main#start()");
+        createGraph(indexB,
+                "com.db.jdbc.Connection#connect()",    // correct package
+                "com.net.http.Connection#connect()");  // wrong package
 
         ProjectMeta metaA = projectMeta("pkg-a", indexA);
         // packageHint inferred from "import com.db.jdbc.Connection"
@@ -206,11 +190,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(projectMeta("pkg-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("pkg-a", "pkg-b");
+        linker.buildCrossProjectGraph("pkg-a", "pkg-b");
 
-        assertThat(merged.getCallees("com.app.Main#start()"))
-                .contains("com.db.jdbc.Connection#connect()")
-                .doesNotContain("com.net.http.Connection#connect()");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.callees("com.app.Main#start()"))
+                    .contains("com.db.jdbc.Connection#connect()")
+                    .doesNotContain("com.net.http.Connection#connect()");
+        }
     }
 
     @Test
@@ -219,13 +205,8 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("fallback-a");
         Path indexB = tempDir.resolve("fallback-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.Worker#doWork()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.lib.Engine#execute()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.Worker#doWork()");
+        createGraph(indexB, "com.lib.Engine#execute()");
 
         ProjectMeta metaA = projectMeta("fallback-a", indexA);
         // packageHint points to nonexistent package — should fall back and still resolve
@@ -235,11 +216,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(projectMeta("fallback-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("fallback-a", "fallback-b");
+        linker.buildCrossProjectGraph("fallback-a", "fallback-b");
 
-        // Falls back to name-only match — still resolves
-        assertThat(merged.getCallees("com.app.Worker#doWork()"))
-                .contains("com.lib.Engine#execute()");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            // Falls back to name-only match — still resolves
+            assertThat(merged.callees("com.app.Worker#doWork()"))
+                    .contains("com.lib.Engine#execute()");
+        }
     }
 
     @Test
@@ -251,14 +234,10 @@ class CrossProjectLinkerTest {
         Path indexA = tempDir.resolve("score-weight-a");
         Path indexB = tempDir.resolve("score-weight-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.Service#run()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.lib.WrongStore#save(String)");      // param match only (+1)
-        graphB.addMethod("com.lib.DataStore#save(String,int)");   // class match only (+2)
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.Service#run()");
+        createGraph(indexB,
+                "com.lib.WrongStore#save(String)",      // param match only (+1)
+                "com.lib.DataStore#save(String,int)");  // class match only (+2)
 
         ProjectMeta metaA = projectMeta("score-weight-a", indexA);
         ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
@@ -267,11 +246,13 @@ class CrossProjectLinkerTest {
         registry.register(metaA);
         registry.register(projectMeta("score-weight-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("score-weight-a", "score-weight-b");
+        linker.buildCrossProjectGraph("score-weight-a", "score-weight-b");
 
-        assertThat(merged.getCallees("com.app.Service#run()"))
-                .contains("com.lib.DataStore#save(String,int)")
-                .doesNotContain("com.lib.WrongStore#save(String)");
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.callees("com.app.Service#run()"))
+                    .contains("com.lib.DataStore#save(String,int)")
+                    .doesNotContain("com.lib.WrongStore#save(String)");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -280,43 +261,42 @@ class CrossProjectLinkerTest {
 
     @Test
     void rebuildCrossProjectGraph_picksUpNewGraphAfterReindex() throws IOException {
-        // Simulate re-index: proj-a's graph.graphml is updated with a new method,
-        // then buildCrossProjectGraph is called again — it must reflect the new state.
         Path indexA = tempDir.resolve("refresh-a");
         Path indexB = tempDir.resolve("refresh-b");
 
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.app.A#oldMethod()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
-
-        CallGraph graphB = new CallGraph();
-        graphB.addMethod("com.lib.B#helper()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        createGraph(indexA, "com.app.A#oldMethod()");
+        createGraph(indexB, "com.lib.B#helper()");
 
         ProjectMeta metaA = projectMeta("refresh-a", indexA);
         registry.register(metaA);
         registry.register(projectMeta("refresh-b", indexB));
 
         // Initial build
-        CallGraph merged1 = linker.buildCrossProjectGraph("refresh-a", "refresh-b");
-        assertThat(merged1.contains("com.app.A#oldMethod()")).isTrue();
-        assertThat(merged1.contains("com.app.A#newMethod()")).isFalse();
+        linker.buildCrossProjectGraph("refresh-a", "refresh-b");
+        try (CallGraph merged1 = linker.loadCrossProjectGraph()) {
+            assertThat(fqnExists(merged1, "com.app.A#oldMethod()")).isTrue();
+            assertThat(fqnExists(merged1, "com.app.A#newMethod()")).isFalse();
+        }
 
-        // Simulate re-index: overwrite proj-a's graph with a new one
-        CallGraph updatedGraphA = new CallGraph();
-        updatedGraphA.addMethod("com.app.A#newMethod()");
+        // Simulate re-index: overwrite proj-a's ArcadeDB with a new graph
+        try (CallGraph g = CallGraph.open(indexA.resolve("callgraph.arcadedb"))) {
+            g.clear();
+            g.addMethod("com.app.A#newMethod()", "com.app.A");
+            g.flush();
+        }
         ProjectMeta.UnresolvedRef ref = new ProjectMeta.UnresolvedRef(
                 "com.app.A#newMethod()", "helper", null, 0, null, 1);
         metaA.setUnresolvedRefs(List.of(ref));
-        registry.register(metaA);   // update registry with new unresolved refs
-        serializer.save(updatedGraphA, indexA.resolve("graph.graphml"));
+        registry.register(metaA);
 
         // Rebuild — should reflect the fresh graph
-        CallGraph merged2 = linker.buildCrossProjectGraph("refresh-a", "refresh-b");
-        assertThat(merged2.contains("com.app.A#newMethod()")).isTrue();
-        assertThat(merged2.contains("com.app.A#oldMethod()")).isFalse();
-        assertThat(merged2.getCallees("com.app.A#newMethod()"))
-                .contains("com.lib.B#helper()");
+        linker.buildCrossProjectGraph("refresh-a", "refresh-b");
+        try (CallGraph merged2 = linker.loadCrossProjectGraph()) {
+            assertThat(fqnExists(merged2, "com.app.A#newMethod()")).isTrue();
+            assertThat(fqnExists(merged2, "com.app.A#oldMethod()")).isFalse();
+            assertThat(merged2.callees("com.app.A#newMethod()"))
+                    .contains("com.lib.B#helper()");
+        }
     }
 
     @Test
@@ -327,33 +307,59 @@ class CrossProjectLinkerTest {
     }
 
     @Test
-    void loadCrossProjectGraph_returnsEmptyWhenFileDoesNotExist() throws IOException {
-        // The cross-graph file lives at DEFAULT_BASE — we can't easily redirect that,
-        // but if it doesn't exist loadCrossProjectGraph() must return an empty graph gracefully
-        // (this validates the fallback path; the file may or may not exist on this machine)
-        assertThatCode(() -> linker.loadCrossProjectGraph()).doesNotThrowAnyException();
+    void loadCrossProjectGraph_returnsEmptyWhenFileDoesNotExist() {
+        // loadCrossProjectGraph() creates an empty ArcadeDB if none exists — must not throw
+        assertThatCode(() -> {
+            try (CallGraph g = linker.loadCrossProjectGraph()) {
+                // just verify it opened successfully
+            }
+        }).doesNotThrowAnyException();
     }
 
     @Test
     void buildCrossProjectGraph_handlesAbsentGraphFileGracefully() throws IOException {
-        // Project registered but graph.graphml was never written
+        // Project registered but callgraph.arcadedb was never written
         Path indexA = tempDir.resolve("proj-a");
         Path indexB = tempDir.resolve("proj-b");
 
-        // Only create directories, no graph.graphml files
-        java.nio.file.Files.createDirectories(indexA);
-        java.nio.file.Files.createDirectories(indexB);
+        // Only create base directories, no callgraph.arcadedb subdirectory
+        Files.createDirectories(indexA);
+        Files.createDirectories(indexB);
 
         registry.register(projectMeta("proj-a", indexA));
         registry.register(projectMeta("proj-b", indexB));
 
-        CallGraph merged = linker.buildCrossProjectGraph("proj-a", "proj-b");
-
         // Empty graphs merge to empty graph — no exception
-        assertThat(merged.nodeCount()).isEqualTo(0);
+        linker.buildCrossProjectGraph("proj-a", "proj-b");
+
+        try (CallGraph merged = linker.loadCrossProjectGraph()) {
+            assertThat(merged.methodCount()).isEqualTo(0);
+        }
     }
 
     // --- helpers ---
+
+    /** Create an ArcadeDB call graph at {@code indexPath/callgraph.arcadedb} with the given FQNs. */
+    private static void createGraph(Path indexPath, String... fqns) throws IOException {
+        Files.createDirectories(indexPath);
+        try (CallGraph g = CallGraph.open(indexPath.resolve("callgraph.arcadedb"))) {
+            for (String fqn : fqns) {
+                g.addMethod(fqn, classOf(fqn));
+            }
+            g.flush();
+        }
+    }
+
+    /** Returns true when the FQN appears in the graph (as a project-owned method). */
+    private static boolean fqnExists(CallGraph graph, String fqn) {
+        return graph.allFqns().anyMatch(fqn::equals);
+    }
+
+    /** Extract class prefix from a FQN like "com.example.Foo#bar()" → "com.example.Foo". */
+    private static String classOf(String fqn) {
+        int h = fqn.indexOf('#');
+        return h > 0 ? fqn.substring(0, h) : fqn;
+    }
 
     private static ProjectMeta projectMeta(String name, Path indexPath) {
         return new ProjectMeta(name, "/src/" + name, indexPath.toAbsolutePath().toString());

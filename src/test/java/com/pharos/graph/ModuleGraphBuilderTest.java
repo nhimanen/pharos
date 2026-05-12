@@ -24,6 +24,7 @@ class ModuleGraphBuilderTest {
     private TestRegistry registry;
     private ModuleGraphBuilder builder;
 
+
     @BeforeEach
     void setUp() {
         registry = new TestRegistry();
@@ -34,97 +35,103 @@ class ModuleGraphBuilderTest {
 
     @Test
     void autoLink_upgradesExternalNodeWhenRegistryProjectMatches() {
-        ModuleGraph graph = new ModuleGraph();
-        ModuleNode externalNode = graph.addOrUpdate(
-                ModuleNode.external("com.example", "my-lib", "1.0"));
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            graph.addOrUpdate("com.example:my-lib", "com.example", "my-lib", "1.0", "EXTERNAL", null);
 
-        ProjectMeta meta = new ProjectMeta("my-lib-project", "/path", "/index");
-        meta.setGroupId("com.example");
-        meta.setArtifactId("my-lib");
-        meta.setMavenVersion("1.5");
-        registry.register(meta);
+            ProjectMeta meta = new ProjectMeta("my-lib-project", "/path", "/index");
+            meta.setGroupId("com.example");
+            meta.setArtifactId("my-lib");
+            meta.setMavenVersion("1.5");
+            registry.register(meta);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).containsExactly("my-lib-project");
-        assertThat(externalNode.isIndexed()).isTrue();
-        assertThat(externalNode.getProjectName()).isEqualTo("my-lib-project");
-        assertThat(externalNode.getVersion()).isEqualTo("1.5");
+            assertThat(linked).containsExactly("my-lib-project");
+            ModuleNodeData node = graph.findByKey("com.example:my-lib").orElseThrow();
+            assertThat(node.isIndexed()).isTrue();
+            assertThat(node.projectName()).isEqualTo("my-lib-project");
+            assertThat(node.version()).isEqualTo("1.5");
+        }
     }
 
     @Test
     void autoLink_doesNotUpgradeAlreadyIndexedNode() {
-        ModuleGraph graph = new ModuleGraph();
-        graph.addOrUpdate(ModuleNode.indexed("com.example", "lib", "1.0", "existing-project"));
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "INDEXED", "existing-project");
 
-        ProjectMeta meta = new ProjectMeta("another-project", "/path", "/index");
-        meta.setGroupId("com.example");
-        meta.setArtifactId("lib");
-        registry.register(meta);
+            ProjectMeta meta = new ProjectMeta("another-project", "/path", "/index");
+            meta.setGroupId("com.example");
+            meta.setArtifactId("lib");
+            registry.register(meta);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).isEmpty();
+            assertThat(linked).isEmpty();
+        }
     }
 
     @Test
     void autoLink_skipsProjectsWithoutMavenCoordinates() {
-        ModuleGraph graph = new ModuleGraph();
-        graph.addOrUpdate(ModuleNode.external("com.example", "lib", "1.0"));
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "EXTERNAL", null);
 
-        ProjectMeta meta = new ProjectMeta("some-project", "/path", "/index");
-        // groupId / artifactId intentionally not set
-        registry.register(meta);
+            ProjectMeta meta = new ProjectMeta("some-project", "/path", "/index");
+            // groupId / artifactId intentionally not set
+            registry.register(meta);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).isEmpty();
+            assertThat(linked).isEmpty();
+        }
     }
 
     @Test
     void autoLink_upgradesMultipleNodes() {
-        ModuleGraph graph = new ModuleGraph();
-        graph.addOrUpdate(ModuleNode.external("com.example", "lib-a", "1.0"));
-        graph.addOrUpdate(ModuleNode.external("com.example", "lib-b", "1.0"));
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            graph.addOrUpdate("com.example:lib-a", "com.example", "lib-a", "1.0", "EXTERNAL", null);
+            graph.addOrUpdate("com.example:lib-b", "com.example", "lib-b", "1.0", "EXTERNAL", null);
 
-        ProjectMeta metaA = new ProjectMeta("proj-a", "/path", "/index");
-        metaA.setGroupId("com.example");
-        metaA.setArtifactId("lib-a");
-        metaA.setMavenVersion("1.0");
-        registry.register(metaA);
+            ProjectMeta metaA = new ProjectMeta("proj-a", "/path", "/index");
+            metaA.setGroupId("com.example");
+            metaA.setArtifactId("lib-a");
+            metaA.setMavenVersion("1.0");
+            registry.register(metaA);
 
-        ProjectMeta metaB = new ProjectMeta("proj-b", "/path", "/index");
-        metaB.setGroupId("com.example");
-        metaB.setArtifactId("lib-b");
-        metaB.setMavenVersion("1.0");
-        registry.register(metaB);
+            ProjectMeta metaB = new ProjectMeta("proj-b", "/path", "/index");
+            metaB.setGroupId("com.example");
+            metaB.setArtifactId("lib-b");
+            metaB.setMavenVersion("1.0");
+            registry.register(metaB);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).containsExactlyInAnyOrder("proj-a", "proj-b");
+            assertThat(linked).containsExactlyInAnyOrder("proj-a", "proj-b");
+        }
     }
 
     @Test
     void autoLink_returnsEmptyWhenGraphIsEmpty() {
-        ModuleGraph graph = new ModuleGraph();
-        ProjectMeta meta = new ProjectMeta("proj", "/path", "/index");
-        meta.setGroupId("com.example");
-        meta.setArtifactId("lib");
-        registry.register(meta);
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            ProjectMeta meta = new ProjectMeta("proj", "/path", "/index");
+            meta.setGroupId("com.example");
+            meta.setArtifactId("lib");
+            registry.register(meta);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).isEmpty();
+            assertThat(linked).isEmpty();
+        }
     }
 
     @Test
     void autoLink_returnsEmptyWhenRegistryIsEmpty() {
-        ModuleGraph graph = new ModuleGraph();
-        graph.addOrUpdate(ModuleNode.external("com.example", "lib", "1.0"));
+        try (ModuleGraph graph = ModuleGraph.open(tempDir.resolve("graph.arcadedb"))) {
+            graph.addOrUpdate("com.example:lib", "com.example", "lib", "1.0", "EXTERNAL", null);
 
-        List<String> linked = builder.autoLink(graph);
+            List<String> linked = builder.autoLink(graph);
 
-        assertThat(linked).isEmpty();
+            assertThat(linked).isEmpty();
+        }
     }
 
     // --- In-memory test registry that avoids writing to ~/.pharos/registry.json ---

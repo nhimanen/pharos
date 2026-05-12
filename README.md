@@ -118,3 +118,5 @@ claude mcp add -s user pharos -- java --enable-native-access=ALL-UNNAMED -jar ~/
 4. **Index** — Lucene stores everything with BM25 for keyword search and KNN for vector search; graph centrality boosts results for heavily-called methods
 
 Config and indexes are stored in `~/.pharos/`.
+
+## TODO

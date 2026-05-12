@@ -17,6 +17,10 @@ public class WebCommand implements Callable<Integer> {
             defaultValue = "7070")
     private int port;
 
+    @Option(names = {"--no-open"},
+            description = "Start the server without opening a browser window (useful for daemon mode)")
+    private boolean noOpen;
+
     private final WebServer webServer;
 
     public WebCommand(WebServer webServer) {
@@ -27,7 +31,6 @@ public class WebCommand implements Callable<Integer> {
     public Integer call() {
         try {
             webServer.start(port);
-            boolean noOpen = false;
             if (!noOpen) {
                 tryOpenBrowser("http://localhost:" + port);
             }

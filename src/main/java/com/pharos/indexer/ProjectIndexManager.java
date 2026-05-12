@@ -6,7 +6,6 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.graph.CallGraphBuilder;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleGraphBuilder;
@@ -213,8 +212,7 @@ public class ProjectIndexManager {
 
         // Pass 1: build call graph — needed to compute in-degrees and caller contexts
         progress.onProgress("Building call graph", 0, 0);
-        CallGraph graph = buildAndSaveGraph(project, projectIndexDir);
-        GraphIndexData graphData = GraphIndexData.build(graph, project);
+        GraphIndexData graphData = buildAndSaveGraph(project, projectIndexDir);
 
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
@@ -226,7 +224,7 @@ public class ProjectIndexManager {
         stateTracker.save();
 
         // Update registry
-        ProjectMeta meta = buildMeta(projectName, projectRoot, projectIndexDir, project, graph);
+        ProjectMeta meta = buildMeta(projectName, projectRoot, projectIndexDir, project);
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
 
@@ -402,10 +400,10 @@ public class ProjectIndexManager {
         // This avoids a full project re-parse (which would double the parse cost on every
         // incremental run) while keeping the graph consistent.
         progress.onProgress("Patching call graph", 0, 0);
-        CallGraph graph = patchGraph(projectIndexDir, parsedDirtyFiles, deletedFiles, stateTracker);
+        patchGraph(projectIndexDir, parsedDirtyFiles, deletedFiles, stateTracker);
 
         // Build lightweight ProjectMeta from Lucene reader counts (no re-parse needed)
-        ProjectMeta meta = buildMetaFromIndex(projectName, projectRoot, projectIndexDir, graph, currentFiles.size());
+        ProjectMeta meta = buildMetaFromIndex(projectName, projectRoot, projectIndexDir, currentFiles.size());
         // Inherit known packages and unresolved refs from the previous registry entry so
         // cross-project linking can still work without a full parse
         registry.find(projectName).ifPresent(prev -> {
@@ -652,68 +650,49 @@ public class ProjectIndexManager {
     /**
      * Patches the persisted call graph for an incremental run:
      * <ol>
-     *   <li>Load the existing {@code graph.graphml} (falls back to empty graph if absent).</li>
-     *   <li>Remove all vertices/edges for dirty and deleted files using the class names
-     *       recorded in {@link FileStateTracker} (deleted files) or from the freshly-parsed
-     *       {@link ParsedFile} objects (dirty files).</li>
+     *   <li>Open the existing ArcadeDB call graph (created if absent).</li>
+     *   <li>Evict all vertices for dirty and deleted files' class prefixes.</li>
      *   <li>Splice in new vertices/edges for each freshly-parsed dirty file.</li>
-     *   <li>Save and return the updated graph.</li>
      * </ol>
      * This avoids a full project re-parse just to rebuild the graph on every incremental run.
      */
-    private CallGraph patchGraph(Path projectIndexDir,
-                                  List<ParsedFile> parsedDirtyFiles,
-                                  List<Path> deletedFiles,
-                                  FileStateTracker stateTracker) {
-        Path graphFile = projectIndexDir.resolve("graph.graphml");
-        CallGraphSerializer serializer = new CallGraphSerializer();
-        CallGraph graph;
-        try {
-            graph = serializer.load(graphFile);
-            log.debug("Loaded call graph for patching: {} nodes, {} edges",
-                    graph.nodeCount(), graph.edgeCount());
-        } catch (Exception e) {
-            log.warn("Could not load existing graph for patching, starting fresh: {}", e.getMessage());
-            graph = new CallGraph();
-        }
+    private void patchGraph(Path projectIndexDir,
+                             List<ParsedFile> parsedDirtyFiles,
+                             List<Path> deletedFiles,
+                             FileStateTracker stateTracker) {
+        Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
+        try (CallGraph graph = CallGraph.open(dbDir)) {
+            log.debug("Opened call graph for patching: {} methods", graph.methodCount());
 
-        // Evict stale nodes for deleted files using class names from the state tracker
-        for (Path deleted : deletedFiles) {
-            List<String> classNames = stateTracker.getTrackedClassNames(deleted);
-            if (!classNames.isEmpty()) {
-                graph.removeMethodsFromClasses(classNames);
-                log.debug("Patched graph: removed {} class(es) for deleted {}", classNames.size(), deleted.getFileName());
+            // Collect class prefixes to evict (deleted files + dirty files)
+            List<String> toEvict = new ArrayList<>();
+            for (Path deleted : deletedFiles) {
+                toEvict.addAll(stateTracker.getTrackedClassNames(deleted));
             }
-        }
+            for (ParsedFile pf : parsedDirtyFiles) {
+                pf.classes().forEach(c -> toEvict.add(c.qualifiedClassName()));
+            }
+            graph.evictClasses(toEvict);
 
-        // Evict stale nodes for dirty files using their freshly-parsed class names,
-        // then splice in the new nodes and edges from the fresh parse.
-        CallGraphBuilder builder = new CallGraphBuilder();
-        for (ParsedFile pf : parsedDirtyFiles) {
-            List<String> classNames = pf.classes().stream()
-                    .map(ParsedClass::qualifiedClassName)
-                    .collect(Collectors.toList());
-            graph.removeMethodsFromClasses(classNames);
-            builder.buildFile(graph, pf);
-        }
+            // Splice in fresh vertices/edges for dirty files
+            CallGraphBuilder builder = new CallGraphBuilder();
+            for (ParsedFile pf : parsedDirtyFiles) {
+                builder.buildFile(graph, pf);
+            }
 
-        log.debug("Patched call graph: {} nodes, {} edges after update", graph.nodeCount(), graph.edgeCount());
-
-        try {
-            serializer.save(graph, graphFile);
+            CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
+            log.debug("Patched call graph: {} methods after update", graph.methodCount());
         } catch (Exception e) {
-            log.warn("Failed to save patched call graph: {}", e.getMessage());
+            log.warn("Failed to patch call graph: {}", e.getMessage());
         }
-        return graph;
     }
 
     /**
-     * Builds a lightweight {@link ProjectMeta} for incremental runs where we have
-     * the graph and scanner file count but did not re-parse the full project.
-     * Method/class counts are read from the existing Lucene index.
+     * Builds a lightweight {@link ProjectMeta} for incremental runs where we did not
+     * re-parse the full project. Method/class counts are read from the existing Lucene index.
      */
     private ProjectMeta buildMetaFromIndex(String projectName, Path projectRoot,
-                                            Path projectIndexDir, CallGraph graph,
+                                            Path projectIndexDir,
                                             int fileCount) {
         ProjectMeta meta = new ProjectMeta(
                 projectName,
@@ -740,24 +719,23 @@ public class ProjectIndexManager {
         return meta;
     }
 
-    private CallGraph buildAndSaveGraph(ParsedProject project, Path projectIndexDir) {
-        CallGraph graph = new CallGraph();
-        CallGraphBuilder builder = new CallGraphBuilder();
-        builder.build(graph, project);
-
-        try {
-            CallGraphSerializer serializer = new CallGraphSerializer();
-            serializer.save(graph, projectIndexDir.resolve("graph.graphml"));
-            log.debug("Call graph saved: {} nodes, {} edges",
-                    graph.nodeCount(), graph.edgeCount());
+    private GraphIndexData buildAndSaveGraph(ParsedProject project, Path projectIndexDir) {
+        Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
+        try (CallGraph graph = CallGraph.open(dbDir)) {
+            graph.clear();
+            new CallGraphBuilder().build(graph, project);
+            CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
+            log.debug("Call graph built: {} methods, {} calls",
+                    graph.methodCount(), graph.callCount());
+            return GraphIndexData.build(graph, project);
         } catch (Exception e) {
-            log.warn("Failed to save call graph: {}", e.getMessage());
+            log.warn("Failed to build call graph: {}", e.getMessage());
+            return GraphIndexData.empty();
         }
-        return graph;
     }
 
     private ProjectMeta buildMeta(String projectName, Path projectRoot, Path projectIndexDir,
-                                   ParsedProject project, CallGraph graph) {
+                                   ParsedProject project) {
         ProjectMeta meta = new ProjectMeta(
                 projectName,
                 projectRoot.toAbsolutePath().toString(),
@@ -855,7 +833,7 @@ public class ProjectIndexManager {
             // Single pass: compute in-degree and caller simple names together
             for (ParsedMethod method : allMethods) {
                 String fqn = method.fqn();
-                java.util.Set<String> callers = graph.getCallers(fqn);
+                java.util.Set<String> callers = graph.callers(fqn);
                 deg.put(fqn, callers.size());
                 List<String> simpleCallerNames = callers.stream()
                         .map(callerFqn -> {
@@ -871,6 +849,10 @@ public class ProjectIndexManager {
                 names.put(fqn, simpleCallerNames);
             }
             return new GraphIndexData(deg, names);
+        }
+
+        static GraphIndexData empty() {
+            return new GraphIndexData(new java.util.HashMap<>(), new java.util.HashMap<>());
         }
 
         int inDegree(String fqn) {

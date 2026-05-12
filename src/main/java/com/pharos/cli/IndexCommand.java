@@ -40,6 +40,32 @@ public class IndexCommand implements Callable<Integer> {
             description = "Suppress progress indicator (useful when stdout is not a terminal)")
     private boolean noProgress = false;
 
+    @Option(names = {"--full"},
+            description = "Force a full re-index even if the project was previously indexed (re-parses all files)")
+    private boolean full = false;
+
+    @Option(names = {"--force"},
+            description = "Delete the existing index before re-indexing (implies --full)")
+    private boolean force = false;
+
+    @Option(names = {"--no-embed"},
+            description = "Skip vector embedding generation (faster indexing, disables semantic search)")
+    private boolean noEmbed = false;
+
+    @Option(names = {"--single"},
+            description = "Treat the path as a single project even if sub-projects are detected")
+    private boolean single = false;
+
+    @Option(names = {"--depth"},
+            description = "Max directory depth to search for sub-projects when discovering a workspace (default: 3)",
+            defaultValue = "3")
+    private int depth = 3;
+
+    @Option(names = {"--project-threads"},
+            description = "Number of projects to index concurrently when indexing a workspace (default: 1)",
+            defaultValue = "1")
+    private int projectThreads = 1;
+
     private final ProjectIndexManager indexManager;
     private final CrossProjectLinker crossProjectLinker;
     private final ProjectRegistry registry;
@@ -58,9 +84,7 @@ public class IndexCommand implements Callable<Integer> {
         Path root = path.toAbsolutePath();
 
         try {
-            boolean single = false;
             if (!single) {
-                int depth = 3;
                 List<DiscoveredProject> projects = ProjectDiscovery.discover(root, depth);
                 if (projects.size() > 1) {
                     return indexMultiple(projects);
@@ -82,7 +106,6 @@ public class IndexCommand implements Callable<Integer> {
     }
 
     private int indexMultiple(List<DiscoveredProject> projects) {
-        int projectThreads = 1;
         System.out.printf("Discovered %d projects — indexing each separately (parallelism: %d)%n",
                 projects.size(), projectThreads);
         System.out.println();
@@ -162,9 +185,8 @@ public class IndexCommand implements Callable<Integer> {
                 }
             }
             // Build the merged cross-project graph in one pass
-            var crossGraph = crossProjectLinker.buildCrossProjectGraph(projectNames);
-            System.out.printf("Cross-project graph: %d nodes, %d edges%n",
-                    crossGraph.nodeCount(), crossGraph.edgeCount());
+            crossProjectLinker.buildCrossProjectGraph(projectNames);
+            System.out.println("Cross-project graph built.");
         } catch (Exception e) {
             System.err.printf("Warning: cross-project linking failed: %s%n", e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
@@ -199,11 +221,8 @@ public class IndexCommand implements Callable<Integer> {
      * The caller is responsible for progress display lifecycle and printing the completion line.
      */
     private ProjectMeta doIndexCore(Path projectPath, String name, ProgressListener listener) throws Exception {
-        boolean force = false;
-        boolean full = false;
         boolean incremental = !full && !force && registry.find(name).isPresent()
                 && indexManager.indexExists(name);
-        boolean noEmbed = false;
         return indexManager.index(projectPath, name, incremental, force, !noEmbed, listener);
     }
 
@@ -221,9 +240,8 @@ public class IndexCommand implements Callable<Integer> {
         all.add(projectName);
         all.addAll(linked);
         try {
-            var crossGraph = crossProjectLinker.buildCrossProjectGraph(all);
-            System.out.printf("Refreshed cross-project graph: %d nodes, %d edges%n",
-                    crossGraph.nodeCount(), crossGraph.edgeCount());
+            crossProjectLinker.buildCrossProjectGraph(all);
+            System.out.println("Refreshed cross-project graph.");
         } catch (Exception e) {
             System.err.printf("Warning: cross-project graph refresh failed: %s%n", e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();

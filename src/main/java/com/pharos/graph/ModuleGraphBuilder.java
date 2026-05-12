@@ -13,55 +13,47 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
- * Builds and maintains the module-level dependency graph.
+ * Builds and maintains the module-level dependency graph (ArcadeDB-backed).
  *
- * The graph is stored at {@code ~/.pharos/module-graph.graphml} and is
+ * The graph is stored at {@code ~/.pharos/module-graph.arcadedb/} and is
  * automatically updated whenever a project is indexed.
  *
  * External nodes (Maven dependencies without indexed source) live only in this
  * graph — they are never written to {@link ProjectRegistry}.
  *
- * This class is thread-safe via synchronized methods on the load-modify-save cycle.
+ * This class is thread-safe: each mutating method opens, modifies and closes
+ * the database within a synchronized block.
  */
 public class ModuleGraphBuilder {
 
     private static final Logger log = LoggerFactory.getLogger(ModuleGraphBuilder.class);
 
-    static final Path GRAPH_FILE =
-            IndexConfig.DEFAULT_BASE.resolve("module-graph.graphml");
+    static final Path DB_DIR = IndexConfig.DEFAULT_BASE.resolve("module-graph.arcadedb");
 
-    private final ModuleGraphSerializer serializer;
     private final ProjectRegistry registry;
 
     public ModuleGraphBuilder(ProjectRegistry registry) {
-        this.registry   = registry;
-        this.serializer = new ModuleGraphSerializer();
+        this.registry = registry;
     }
 
-    /** Load the persisted module graph (empty graph if file does not exist yet). */
-    public ModuleGraph load() throws IOException {
-        return serializer.load(GRAPH_FILE);
-    }
-
-    /** Atomically persist the module graph. */
-    public void save(ModuleGraph graph) throws IOException {
-        serializer.save(graph, GRAPH_FILE);
+    /** Open the module graph (creates the DB if it does not exist yet). */
+    public ModuleGraph open() {
+        return ModuleGraph.open(DB_DIR);
     }
 
     /**
      * Incorporate a newly-indexed project into the module graph.
      *
      * Steps:
-     *  1. Load the existing graph.
+     *  1. Open the ArcadeDB graph.
      *  2. Add/upgrade the project's own node to INDEXED.
-     *  3. For each dependency in pomInfo: add an EXTERNAL node if not already present
-     *     (leave existing INDEXED nodes untouched).
+     *  3. For each dependency in pomInfo: add an EXTERNAL node if not already present.
      *  4. Add dependency edges (deduplicated by scope).
      *  5. Auto-upgrade any EXTERNAL nodes whose moduleKey matches an already-indexed project.
-     *  6. Save the graph.
-     *  7. Update ProjectMeta with Maven coordinates and re-register.
+     *  6. Update ProjectMeta with Maven coordinates and re-register.
      *
      * @param projectRoot absolute project root path (used only for logging)
      * @param meta        the ProjectMeta that was just written to the registry
@@ -75,41 +67,45 @@ public class ModuleGraphBuilder {
             return List.of();
         }
 
-        ModuleGraph graph = load();
         MavenPomReader.MavenCoordinates coords = pomInfo.coordinates();
+        String ownKey = coords.moduleKey();
 
-        // Step 2: register this project as INDEXED
-        ModuleNode self = ModuleNode.indexed(
-                coords.groupId(), coords.artifactId(), coords.version(), meta.getName());
-        ModuleNode canonicalSelf = graph.addOrUpdate(self);
+        try (ModuleGraph graph = open()) {
+            // Register this project as INDEXED
+            graph.addOrUpdate(
+                    ownKey,
+                    coords.groupId(),
+                    coords.artifactId(),
+                    coords.version(),
+                    "INDEXED",
+                    meta.getName());
 
-        // Step 3 & 4: add dependency nodes and edges
-        for (MavenDependency dep : pomInfo.dependencies()) {
-            ModuleNode depNode = graph.findByKey(dep.moduleKey());
-            if (depNode == null) {
-                depNode = graph.addOrUpdate(
-                        ModuleNode.external(dep.groupId(), dep.artifactId(), dep.version()));
+            // Add dependency nodes and edges
+            for (MavenDependency dep : pomInfo.dependencies()) {
+                Optional<ModuleNodeData> existing = graph.findByKey(dep.moduleKey());
+                if (existing.isEmpty()) {
+                    graph.addOrUpdate(
+                            dep.moduleKey(), dep.groupId(), dep.artifactId(),
+                            dep.version(), "EXTERNAL", null);
+                }
+                graph.addDependency(ownKey, dep.moduleKey(),
+                        dep.effectiveScope(), dep.version());
             }
-            // depNode may already be INDEXED — that's fine, addDependency just adds an edge
-            graph.addDependency(canonicalSelf, depNode,
-                    ModuleDep.of(dep.effectiveScope(), dep.version()));
+
+            // Auto-upgrade EXTERNAL nodes that match already-indexed projects
+            List<String> autoLinked = autoLink(graph);
+
+            log.info("Module graph updated for '{}' ({}): {} total nodes, auto-linked: {}",
+                    meta.getName(), ownKey, graph.moduleCount(), autoLinked);
+
+            // Store Maven coordinates in ProjectMeta
+            meta.setGroupId(coords.groupId());
+            meta.setArtifactId(coords.artifactId());
+            meta.setMavenVersion(coords.version());
+            registry.register(meta);
+
+            return autoLinked;
         }
-
-        // Step 5: auto-upgrade EXTERNAL nodes that match already-indexed projects
-        List<String> autoLinked = autoLink(graph);
-
-        // Step 6: persist
-        save(graph);
-
-        // Step 7: store Maven coordinates in ProjectMeta
-        meta.setGroupId(coords.groupId());
-        meta.setArtifactId(coords.artifactId());
-        meta.setMavenVersion(coords.version());
-        registry.register(meta);
-
-        log.info("Module graph updated for '{}' ({}): {} total nodes, auto-linked: {}",
-                meta.getName(), coords.moduleKey(), graph.nodeCount(), autoLinked);
-        return autoLinked;
     }
 
     /**
@@ -123,10 +119,10 @@ public class ModuleGraphBuilder {
         for (ProjectMeta p : registry.listAll()) {
             if (p.getGroupId() == null || p.getArtifactId() == null) continue;
             String key = p.getGroupId() + ":" + p.getArtifactId();
-            ModuleNode node = graph.findByKey(key);
-            if (node != null && !node.isIndexed()) {
-                node.upgrade(p.getMavenVersion() != null ? p.getMavenVersion() : "unknown",
-                        p.getName());
+            Optional<ModuleNodeData> nodeOpt = graph.findByKey(key);
+            if (nodeOpt.isPresent() && !nodeOpt.get().isIndexed()) {
+                String version = p.getMavenVersion() != null ? p.getMavenVersion() : "unknown";
+                graph.upgradeToIndexed(key, version, p.getName());
                 linked.add(p.getName());
                 log.info("Auto-upgraded EXTERNAL node '{}' to INDEXED (project '{}')",
                         key, p.getName());

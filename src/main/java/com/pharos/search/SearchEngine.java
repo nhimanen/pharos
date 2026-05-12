@@ -30,6 +30,14 @@ public class SearchEngine {
 
     private static final Logger log = LoggerFactory.getLogger(SearchEngine.class);
 
+    /**
+     * Score multiplier applied to results whose project matches the requested project.
+     * Only active when {@link SearchRequest#project()} is non-null (single-project search).
+     * Modelled after Solr's boost-by-field pattern: results from the focal project bubble
+     * up above same-relevance hits from other projects loaded via cross-project linking.
+     */
+    private static final float PROJECT_AFFINITY_BOOST = 1.5f;
+
     private final LuceneIndexer luceneIndexer;
     private final EmbeddingProvider embedder;
     private final ProjectRegistry registry;
@@ -111,6 +119,13 @@ public class SearchEngine {
             default -> primary = List.of();
         }
 
+        // Project-affinity boost: when the caller has scoped the search to a specific project,
+        // multiply scores of results from that project by PROJECT_AFFINITY_BOOST so they rank
+        // above cross-project hits that may have leaked in via neighborhood expansion or linked
+        // indexes. Applied after all strategy-level boosts (graph in-degree, source-path penalty)
+        // so the multipliers compose correctly.
+        primary = applyProjectAffinityBoost(primary, req.project());
+
         if (!expand || primary.isEmpty()) {
             return new SearchResponse(primary, trace);
         }
@@ -119,6 +134,37 @@ public class SearchEngine {
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
         return new SearchResponse(expanded, trace);
+    }
+
+    /**
+     * Applies a score multiplier ({@value #PROJECT_AFFINITY_BOOST}x) to results whose
+     * {@link SearchResult#project()} matches {@code requestedProject}.  When
+     * {@code requestedProject} is null or blank — i.e. a cross-project search — no boost
+     * is applied and the list is returned unchanged.
+     *
+     * <p>Results are re-sorted by descending score after the multiplier is applied so the
+     * ranking stays consistent with the boosted values.
+     */
+    private List<SearchResult> applyProjectAffinityBoost(List<SearchResult> results, String requestedProject) {
+        if (requestedProject == null || requestedProject.isEmpty()) {
+            return results;
+        }
+        return results.stream()
+                .map(r -> {
+                    if (requestedProject.equals(r.project())) {
+                        return new SearchResult(
+                                r.id(), r.project(), r.packageName(),
+                                r.className(), r.qualifiedClassName(), r.methodName(),
+                                r.signature(), r.returnType(), r.body(), r.javadoc(),
+                                r.accessModifier(), r.filePath(),
+                                r.startLine(), r.endLine(),
+                                r.score() * PROJECT_AFFINITY_BOOST, r.searchType(), r.docType()
+                        );
+                    }
+                    return r;
+                })
+                .sorted(java.util.Comparator.comparingDouble(SearchResult::score).reversed())
+                .collect(Collectors.toList());
     }
 
     /**

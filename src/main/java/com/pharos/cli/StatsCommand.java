@@ -3,7 +3,6 @@ package com.pharos.cli;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
-import com.pharos.graph.CallGraphSerializer;
 import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.index.DirectoryReader;
 import picocli.CommandLine.*;
@@ -63,13 +62,11 @@ public class StatsCommand implements Callable<Integer> {
             }
 
             // Graph stats
-            try {
-                Path graphFile = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-                CallGraph graph = new CallGraphSerializer().load(graphFile);
-                System.out.printf("  Graph nodes:  %d%n", graph.nodeCount());
-                System.out.printf("  Graph edges:  %d%n", graph.edgeCount());
+            try (CallGraph graph = CallGraph.open(Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb"))) {
+                System.out.printf("  Graph methods: %d%n", graph.methodCount());
+                System.out.printf("  Graph calls:   %d%n", graph.callCount());
             } catch (Exception e) {
-                System.out.printf("  Graph:        (unavailable)%n");
+                System.out.printf("  Graph:         (unavailable)%n");
             }
 
             System.out.printf("  Unresolved:   %d call refs (for cross-project linking)%n",

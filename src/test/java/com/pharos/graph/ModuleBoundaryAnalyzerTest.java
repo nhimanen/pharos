@@ -9,6 +9,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -25,7 +27,7 @@ class ModuleBoundaryAnalyzerTest {
 
     private TestRegistry registry;
     private ModuleBoundaryAnalyzer analyzer;
-    private CallGraphSerializer serializer;
+
 
     @BeforeEach
     void setUp() {
@@ -34,16 +36,13 @@ class ModuleBoundaryAnalyzerTest {
         LuceneIndexerStub luceneStub = new LuceneIndexerStub();
         SearchEngine searchEngine = new SearchEngine(
                 luceneStub, new NoOpEmbeddingProvider(), registry);
-        analyzer   = new ModuleBoundaryAnalyzer(registry, searchEngine);
-        serializer = new CallGraphSerializer();
+        analyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);
     }
 
     @Test
     void analyze_returnsProjectName() throws Exception {
         Path indexPath = tempDir.resolve("proj-a");
-        CallGraph graph = new CallGraph();
-        graph.addMethod("com.example.A#doWork()");
-        serializer.save(graph, indexPath.resolve("graph.graphml"));
+        createGraph(indexPath, "com.example.A#doWork()");
 
         registry.register(projectMeta("proj-a", indexPath));
 
@@ -62,9 +61,7 @@ class ModuleBoundaryAnalyzerTest {
     @Test
     void analyze_noLinkedProjects_entryPointsIsEmpty() throws Exception {
         Path indexPath = tempDir.resolve("proj-alone");
-        CallGraph graph = new CallGraph();
-        graph.addMethod("com.example.Alone#work()");
-        serializer.save(graph, indexPath.resolve("graph.graphml"));
+        createGraph(indexPath, "com.example.Alone#work()");
 
         registry.register(projectMeta("proj-alone", indexPath));
 
@@ -79,14 +76,14 @@ class ModuleBoundaryAnalyzerTest {
         Path indexB = tempDir.resolve("proj-b");
 
         // proj-a has doWork()
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#doWork()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#doWork()");
 
         // proj-b's call graph has an edge caller() → doWork()
-        CallGraph graphB = new CallGraph();
-        graphB.addCall("com.example.B#caller()", "com.example.A#doWork()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        Files.createDirectories(indexB);
+        try (CallGraph g = CallGraph.open(indexB.resolve("callgraph.arcadedb"))) {
+            g.addCall("com.example.B#caller()", "com.example.A#doWork()");
+            g.flush();
+        }
 
         ProjectMeta metaA = projectMeta("proj-a", indexA);
         metaA.getLinkedProjects().add("proj-b");
@@ -101,9 +98,7 @@ class ModuleBoundaryAnalyzerTest {
     @Test
     void analyze_unresolvedRefsBecomesExitPoints() throws Exception {
         Path indexPath = tempDir.resolve("proj-exit");
-        CallGraph graph = new CallGraph();
-        graph.addMethod("com.example.Exit#run()");
-        serializer.save(graph, indexPath.resolve("graph.graphml"));
+        createGraph(indexPath, "com.example.Exit#run()");
 
         ProjectMeta meta = projectMeta("proj-exit", indexPath);
         meta.getUnresolvedRefs().add(
@@ -122,16 +117,15 @@ class ModuleBoundaryAnalyzerTest {
     @Test
     void analyze_entryPointsSorted() throws Exception {
         Path indexA = tempDir.resolve("proj-a");
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#beta()");
-        graphA.addMethod("com.example.A#alpha()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#beta()", "com.example.A#alpha()");
 
         Path indexB = tempDir.resolve("proj-b");
-        CallGraph graphB = new CallGraph();
-        graphB.addCall("com.example.B#x()", "com.example.A#beta()");
-        graphB.addCall("com.example.B#y()", "com.example.A#alpha()");
-        serializer.save(graphB, indexB.resolve("graph.graphml"));
+        Files.createDirectories(indexB);
+        try (CallGraph g = CallGraph.open(indexB.resolve("callgraph.arcadedb"))) {
+            g.addCall("com.example.B#x()", "com.example.A#beta()");
+            g.addCall("com.example.B#y()", "com.example.A#alpha()");
+            g.flush();
+        }
 
         ProjectMeta metaA = projectMeta("proj-a", indexA);
         metaA.getLinkedProjects().add("proj-b");
@@ -148,12 +142,10 @@ class ModuleBoundaryAnalyzerTest {
     @Test
     void analyze_missingLinkedGraphFile_skippedGracefully() throws Exception {
         Path indexA = tempDir.resolve("proj-a");
-        CallGraph graphA = new CallGraph();
-        graphA.addMethod("com.example.A#work()");
-        serializer.save(graphA, indexA.resolve("graph.graphml"));
+        createGraph(indexA, "com.example.A#work()");
 
         ProjectMeta metaA = projectMeta("proj-a", indexA);
-        // Link to a project whose graph file doesn't exist
+        // Link to a project whose callgraph.arcadedb directory doesn't exist
         metaA.getLinkedProjects().add("ghost-project");
         registry.register(metaA);
         registry.register(projectMeta("ghost-project", tempDir.resolve("nonexistent")));
@@ -165,6 +157,23 @@ class ModuleBoundaryAnalyzerTest {
     }
 
     // --- helpers ---
+
+    /** Create an ArcadeDB call graph at {@code indexPath/callgraph.arcadedb} with the given FQNs. */
+    private static void createGraph(Path indexPath, String... fqns) throws IOException {
+        Files.createDirectories(indexPath);
+        try (CallGraph g = CallGraph.open(indexPath.resolve("callgraph.arcadedb"))) {
+            for (String fqn : fqns) {
+                g.addMethod(fqn, classOf(fqn));
+            }
+            g.flush();
+        }
+    }
+
+    /** Extract class prefix from a FQN like "com.example.Foo#bar()" → "com.example.Foo". */
+    private static String classOf(String fqn) {
+        int h = fqn.indexOf('#');
+        return h > 0 ? fqn.substring(0, h) : fqn;
+    }
 
     private static ProjectMeta projectMeta(String name, Path indexPath) {
         ProjectMeta meta = new ProjectMeta(name, "/src/" + name, indexPath.toAbsolutePath().toString());

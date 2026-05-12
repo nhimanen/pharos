@@ -19,7 +19,6 @@
         <lucene.version>10.4.0</lucene.version>
         <javaparser.version>3.26.2</javaparser.version>
         <picocli.version>4.7.6</picocli.version>
-        <jgrapht.version>1.5.2</jgrapht.version>
         <djl.version>0.28.0</djl.version>
         <onnxruntime.version>1.19.2</onnxruntime.version>
         <jackson.version>2.17.2</jackson.version>
@@ -80,16 +79,11 @@
             <version>${picocli.version}</version>
         </dependency>
 
-        <!-- ===== JGraphT for call graph ===== -->
+        <!-- ===== ArcadeDB for call graph and module graph ===== -->
         <dependency>
-            <groupId>org.jgrapht</groupId>
-            <artifactId>jgrapht-core</artifactId>
-            <version>${jgrapht.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.jgrapht</groupId>
-            <artifactId>jgrapht-io</artifactId>
-            <version>${jgrapht.version}</version>
+            <groupId>com.arcadedb</groupId>
+            <artifactId>arcadedb-engine</artifactId>
+            <version>25.1.1</version>
         </dependency>
 
         <!-- ===== DJL + ONNX Runtime (optional vector embeddings) ===== -->
@@ -188,7 +182,7 @@
                 <configuration>
                     <!-- JavaParser reflects on JDK classes including jdk.incubator.vector
                          when parsing corpora (e.g. Lucene) that use the Vector API. -->
-                    <argLine>--add-modules jdk.incubator.vector</argLine>
+                    <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2</argLine>
                     <excludedGroups>${excludedGroups}</excludedGroups>
                 </configuration>
             </plugin>

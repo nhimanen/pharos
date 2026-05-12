@@ -5,7 +5,7 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
-import com.pharos.graph.ModuleNode;
+import com.pharos.graph.ModuleNodeData;
 import com.pharos.indexer.LuceneIndexer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,13 +35,14 @@ class RemoveIndexCommandTest {
     private LuceneIndexer luceneIndexer;
     private TestModuleGraphBuilder moduleGraphBuilder;
 
+
     @BeforeEach
     void setUp() {
         config = IndexConfig.defaults();
         config.setIndexDir(tempDir.resolve("indexes"));
         registry = new TestRegistry();
         luceneIndexer = new LuceneIndexer(config);
-        moduleGraphBuilder = new TestModuleGraphBuilder(registry);
+        moduleGraphBuilder = new TestModuleGraphBuilder(registry, tempDir);
     }
 
     // --- exit codes ---
@@ -148,10 +149,10 @@ class RemoveIndexCommandTest {
 
         run("my-project");
 
-        ModuleNode node = moduleGraphBuilder.graph.findByKey("com.example:my-lib");
+        ModuleNodeData node = moduleGraphBuilder.findByKey("com.example:my-lib");
         assertThat(node).isNotNull();
         assertThat(node.isIndexed()).isFalse();
-        assertThat(node.getProjectName()).isNull();
+        assertThat(node.projectName()).isNull();
     }
 
     @Test
@@ -169,7 +170,7 @@ class RemoveIndexCommandTest {
 
         run("my-project");
 
-        assertThat(moduleGraphBuilder.saved).isTrue();
+        assertThat(moduleGraphBuilder.opened).isTrue();
     }
 
     @Test
@@ -181,9 +182,9 @@ class RemoveIndexCommandTest {
 
         run("proj-a");
 
-        ModuleNode libB = moduleGraphBuilder.graph.findByKey("com.example:lib-b");
+        ModuleNodeData libB = moduleGraphBuilder.findByKey("com.example:lib-b");
         assertThat(libB.isIndexed()).isTrue();
-        assertThat(libB.getProjectName()).isEqualTo("proj-b");
+        assertThat(libB.projectName()).isEqualTo("proj-b");
     }
 
     // --- helpers ---
@@ -235,18 +236,32 @@ class RemoveIndexCommandTest {
     // --- in-memory module graph builder (avoids ~/.pharos) ---
 
     static class TestModuleGraphBuilder extends ModuleGraphBuilder {
-        final ModuleGraph graph = new ModuleGraph();
-        boolean saved = false;
+        private final Path dbPath;
+        /** Set to true when open() is called (equivalent to "graph was used and saved"). */
+        boolean opened = false;
 
-        TestModuleGraphBuilder(ProjectRegistry registry) { super(registry); }
-
-        @Override public ModuleGraph load() { return graph; }
+        TestModuleGraphBuilder(ProjectRegistry registry, Path tempDir) {
+            super(registry);
+            this.dbPath = tempDir.resolve("test-module.arcadedb");
+        }
 
         @Override
-        public void save(ModuleGraph g) { saved = true; }
+        public ModuleGraph open() {
+            opened = true;
+            return ModuleGraph.open(dbPath);
+        }
 
         void addIndexedNode(String groupId, String artifactId, String version, String projectName) {
-            graph.addOrUpdate(ModuleNode.indexed(groupId, artifactId, version, projectName));
+            String key = groupId + ":" + artifactId;
+            try (ModuleGraph g = ModuleGraph.open(dbPath)) {
+                g.addOrUpdate(key, groupId, artifactId, version, "INDEXED", projectName);
+            }
+        }
+
+        ModuleNodeData findByKey(String key) {
+            try (ModuleGraph g = ModuleGraph.open(dbPath)) {
+                return g.findByKey(key).orElse(null);
+            }
         }
     }
 }

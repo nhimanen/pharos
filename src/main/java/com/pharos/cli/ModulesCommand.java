@@ -2,12 +2,13 @@ package com.pharos.cli;
 
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
-import com.pharos.graph.ModuleNode;
+import com.pharos.graph.ModuleNodeData;
 import picocli.CommandLine.*;
 
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.stream.Collectors;
 
 @Command(
         name = "modules",
@@ -32,34 +33,34 @@ public class ModulesCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
-        try {
-            ModuleGraph graph = builder.load();
-            if (graph.nodeCount() == 0) {
+        try (ModuleGraph graph = builder.open()) {
+            long total = graph.moduleCount();
+            if (total == 0) {
                 System.out.println("No modules registered yet. Run 'pharos index' on a Maven project first.");
                 return 0;
             }
 
-            List<ModuleNode> nodes = graph.allNodes().stream()
+            List<ModuleNodeData> nodes = graph.allModules()
                     .filter(n -> !indexedOnly  || n.isIndexed())
                     .filter(n -> !externalOnly || !n.isIndexed())
-                    .sorted(Comparator.comparing(ModuleNode::getModuleKey))
-                    .toList();
+                    .sorted(Comparator.comparing(ModuleNodeData::moduleKey))
+                    .collect(Collectors.toList());
 
             System.out.printf("%-55s  %-14s  %4s  %4s  %s%n",
                     "MODULE", "STATUS", "DEPS", "USED", "VERSION");
             System.out.println("-".repeat(95));
 
-            for (ModuleNode n : nodes) {
-                int depCount = graph.getDependencies(n).size();
-                int usedBy   = graph.getDependents(n).size();
+            for (ModuleNodeData n : nodes) {
+                int depCount = graph.dependencies(n.moduleKey()).size();
+                int usedBy   = graph.dependents(n.moduleKey()).size();
                 String status = n.isIndexed()
-                        ? "indexed[" + n.getProjectName() + "]"
+                        ? "indexed[" + n.projectName() + "]"
                         : "external";
                 System.out.printf("%-55s  %-14s  %4d  %4d  %s%n",
-                        n.getModuleKey(), status, depCount, usedBy, n.getVersion());
+                        n.moduleKey(), status, depCount, usedBy, n.version());
             }
             System.out.printf("%n%d node(s), %d edge(s) total%n",
-                    graph.nodeCount(), graph.edgeCount());
+                    total, graph.dependencyCount());
             return 0;
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());

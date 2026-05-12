@@ -2,7 +2,7 @@ package com.pharos.cli;
 
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
-import com.pharos.graph.ModuleNode;
+import com.pharos.graph.ModuleNodeData;
 import picocli.CommandLine.*;
 
 import java.util.*;
@@ -27,9 +27,8 @@ public class ModuleDepsCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
-        try {
-            ModuleGraph graph = builder.load();
-            ModuleNode node = resolve(graph, moduleRef);
+        try (ModuleGraph graph = builder.open()) {
+            ModuleNodeData node = resolve(graph, moduleRef);
             if (node == null) {
                 System.err.printf("Module not found: %s%n" +
                         "Use 'pharos modules' to list available modules.%n", moduleRef);
@@ -37,30 +36,30 @@ public class ModuleDepsCommand implements Callable<Integer> {
             }
 
             System.out.printf("Module: %s  [%s]  version: %s%n%n",
-                    node.getModuleKey(),
-                    node.isIndexed() ? "indexed/" + node.getProjectName() : "external",
-                    node.getVersion());
+                    node.moduleKey(),
+                    node.isIndexed() ? "indexed/" + node.projectName() : "external",
+                    node.version());
 
             boolean transitive = false;
-            Set<ModuleNode> deps = transitive
+            Set<ModuleNodeData> deps = transitive
                     ? bfsReach(graph, node, true)
-                    : graph.getDependencies(node);
+                    : graph.dependencies(node.moduleKey());
             System.out.printf("Dependencies (%s%d):%n", transitive ? "transitive, " : "", deps.size());
-            deps.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
+            deps.stream().sorted(Comparator.comparing(ModuleNodeData::moduleKey))
                     .forEach(d -> System.out.printf("  → %-55s  [%s]  %s%n",
-                            d.getModuleKey(),
+                            d.moduleKey(),
                             d.isIndexed() ? "indexed" : "external",
-                            d.getVersion()));
+                            d.version()));
 
-            Set<ModuleNode> dependents = transitive
+            Set<ModuleNodeData> dependents = transitive
                     ? bfsReach(graph, node, false)
-                    : graph.getDependents(node);
+                    : graph.dependents(node.moduleKey());
             System.out.printf("%nUsed by (%s%d):%n", transitive ? "transitive, " : "", dependents.size());
-            dependents.stream().sorted(Comparator.comparing(ModuleNode::getModuleKey))
+            dependents.stream().sorted(Comparator.comparing(ModuleNodeData::moduleKey))
                     .forEach(d -> System.out.printf("  ← %-55s  [%s]  %s%n",
-                            d.getModuleKey(),
+                            d.moduleKey(),
                             d.isIndexed() ? "indexed" : "external",
-                            d.getVersion()));
+                            d.version()));
 
             return 0;
         } catch (Exception e) {
@@ -69,22 +68,22 @@ public class ModuleDepsCommand implements Callable<Integer> {
         }
     }
 
-    private static ModuleNode resolve(ModuleGraph graph, String ref) {
-        ModuleNode n = graph.findByKey(ref);
-        if (n != null) return n;
+    private static ModuleNodeData resolve(ModuleGraph graph, String ref) {
+        Optional<ModuleNodeData> n = graph.findByKey(ref);
+        if (n.isPresent()) return n.get();
         return graph.findByProjectName(ref).orElse(null);
     }
 
-    private static Set<ModuleNode> bfsReach(ModuleGraph graph, ModuleNode start, boolean outbound) {
-        Set<ModuleNode> visited = new LinkedHashSet<>();
-        Deque<ModuleNode> queue = new ArrayDeque<>();
+    private static Set<ModuleNodeData> bfsReach(ModuleGraph graph, ModuleNodeData start, boolean outbound) {
+        Set<ModuleNodeData> visited = new LinkedHashSet<>();
+        Deque<ModuleNodeData> queue = new ArrayDeque<>();
         queue.add(start);
         while (!queue.isEmpty()) {
-            ModuleNode cur = queue.pop();
-            Set<ModuleNode> next = outbound
-                    ? graph.getDependencies(cur)
-                    : graph.getDependents(cur);
-            for (ModuleNode n : next) {
+            ModuleNodeData cur = queue.pop();
+            Set<ModuleNodeData> next = outbound
+                    ? graph.dependencies(cur.moduleKey())
+                    : graph.dependents(cur.moduleKey());
+            for (ModuleNodeData n : next) {
                 if (visited.add(n)) queue.add(n);
             }
         }

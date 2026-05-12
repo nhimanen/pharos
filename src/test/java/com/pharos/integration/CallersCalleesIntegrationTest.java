@@ -5,8 +5,10 @@ import com.pharos.graph.CallGraphBuilder;
 import com.pharos.parser.JavaCodeParser;
 import com.pharos.parser.model.ParsedMethod;
 import com.pharos.parser.model.ParsedProject;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URL;
 import java.nio.file.Path;
@@ -24,6 +26,9 @@ import static org.assertj.core.api.Assertions.*;
  * GreetingService → User.
  */
 class CallersCalleesIntegrationTest {
+
+    @TempDir
+    static Path tempDir;
 
     private static CallGraph graph;
 
@@ -44,7 +49,7 @@ class CallersCalleesIntegrationTest {
         JavaCodeParser parser = new JavaCodeParser();
         ParsedProject project = parser.parseProject(projectRoot, "sample-app");
 
-        graph = new CallGraph();
+        graph = CallGraph.open(tempDir.resolve("callgraph.arcadedb"));
         new CallGraphBuilder().build(graph, project);
 
         // Resolve FQNs from parsed methods so we don't hard-code parameter formats
@@ -55,34 +60,39 @@ class CallersCalleesIntegrationTest {
         formalGreet= fqn(project, "GreetingService","formalGreet");
     }
 
+    @AfterAll
+    static void closeGraph() {
+        if (graph != null) graph.close();
+    }
+
     // --- all methods appear as nodes ---
 
     @Test
     void graph_containsAllParsedMethods() {
-        assertThat(graph.contains(getName)).isTrue();
-        assertThat(graph.contains(getEmail)).isTrue();
-        assertThat(graph.contains(greet)).isTrue();
-        assertThat(graph.contains(farewell)).isTrue();
-        assertThat(graph.contains(formalGreet)).isTrue();
+        assertThat(contains(getName)).isTrue();
+        assertThat(contains(getEmail)).isTrue();
+        assertThat(contains(greet)).isTrue();
+        assertThat(contains(farewell)).isTrue();
+        assertThat(contains(formalGreet)).isTrue();
     }
 
     // --- callees: "what does this method call?" ---
 
     @Test
     void callees_ofGreet_includesGetName() {
-        Set<String> callees = graph.getCallees(greet);
+        Set<String> callees = graph.callees(greet);
         assertThat(callees).contains(getName);
     }
 
     @Test
     void callees_ofFarewell_includesGetName() {
-        Set<String> callees = graph.getCallees(farewell);
+        Set<String> callees = graph.callees(farewell);
         assertThat(callees).contains(getName);
     }
 
     @Test
     void callees_ofFormalGreet_includesGetNameAndGetEmail() {
-        Set<String> callees = graph.getCallees(formalGreet);
+        Set<String> callees = graph.callees(formalGreet);
         assertThat(callees)
                 .contains(getName)
                 .contains(getEmail);
@@ -91,14 +101,14 @@ class CallersCalleesIntegrationTest {
     @Test
     void callees_ofGetName_isEmpty() {
         // getName() is a simple field accessor — it calls nothing
-        assertThat(graph.getCallees(getName)).isEmpty();
+        assertThat(graph.callees(getName)).isEmpty();
     }
 
     // --- callers: "where is this method used?" ---
 
     @Test
     void callers_ofGetName_includesAllThreeGreetingMethods() {
-        Set<String> callers = graph.getCallers(getName);
+        Set<String> callers = graph.callers(getName);
         assertThat(callers)
                 .contains(greet)
                 .contains(farewell)
@@ -107,13 +117,13 @@ class CallersCalleesIntegrationTest {
 
     @Test
     void callers_ofGetEmail_includesFormalGreet() {
-        Set<String> callers = graph.getCallers(getEmail);
+        Set<String> callers = graph.callers(getEmail);
         assertThat(callers).contains(formalGreet);
     }
 
     @Test
     void callers_ofGetEmail_doesNotIncludeGreetOrFarewell() {
-        Set<String> callers = graph.getCallers(getEmail);
+        Set<String> callers = graph.callers(getEmail);
         assertThat(callers)
                 .doesNotContain(greet)
                 .doesNotContain(farewell);
@@ -121,10 +131,14 @@ class CallersCalleesIntegrationTest {
 
     @Test
     void callers_ofUnknownFqn_returnsEmpty() {
-        assertThat(graph.getCallers("com.example.DoesNotExist#phantom()")).isEmpty();
+        assertThat(graph.callers("com.example.DoesNotExist#phantom()")).isEmpty();
     }
 
-    // --- helper ---
+    // --- helpers ---
+
+    private static boolean contains(String fqn) {
+        return graph.allFqns().anyMatch(fqn::equals);
+    }
 
     private static String fqn(ParsedProject project, String className, String methodName) {
         return project.allMethods().stream()

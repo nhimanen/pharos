@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
@@ -16,22 +17,18 @@ import java.util.stream.Collectors;
 /**
  * Links call graphs across projects by resolving previously-unresolved call references.
  *
- * When project A calls a method from project B (an external dependency),
- * JavaParser cannot resolve the type during A's indexing pass.
- * This linker runs after both projects are indexed and linked via {@code pharos link},
- * matching unresolved calls in A against known packages in B.
+ * When project A calls a method from project B, JavaParser cannot resolve the type
+ * during A's indexing pass.  This linker runs after both projects are indexed and
+ * matched, resolving unresolved calls in A against known packages in B.
  *
  * <h3>Performance design</h3>
  * <ul>
- *   <li><b>Method-name index ({@link GraphIndex})</b> — each loaded call graph is indexed
- *       by simple method name once.  Per-ref lookup drops from O(M) linear scan to O(1).</li>
- *   <li><b>Parallel pair resolution</b> — (i, j) project pairs are resolved concurrently;
- *       each pair is independent so no synchronisation is needed until merge.</li>
- *   <li><b>Freshness guard</b> — if the cross-project graph file is newer than the
- *       {@code lastIndexed} timestamp of every involved project, the rebuild is skipped
- *       entirely and the cached file is returned.</li>
- *   <li><b>Save guard</b> — the cross-project graph is only re-serialised when at least
- *       one new edge was resolved; a deletion-only incremental run never touches the file.</li>
+ *   <li><b>GraphIndex</b> — each project graph is indexed by simple method name once.
+ *       Lookup drops from O(M) linear scan to O(1).</li>
+ *   <li><b>Parallel pair resolution</b> — (i,j) project pairs resolved concurrently.</li>
+ *   <li><b>Freshness guard</b> — cross-project graph is skipped when already newer than
+ *       every involved project's {@code graph.stamp} sentinel file.</li>
+ *   <li><b>Save guard</b> — cross-project graph only rewritten when edges changed.</li>
  * </ul>
  */
 public class CrossProjectLinker {
@@ -39,69 +36,57 @@ public class CrossProjectLinker {
     private static final Logger log = LoggerFactory.getLogger(CrossProjectLinker.class);
 
     private final ProjectRegistry registry;
-    private final CallGraphSerializer serializer;
+    private final Path crossDbDir;
+    private final Path crossStamp;
 
     public CrossProjectLinker(IndexConfig config, ProjectRegistry registry) {
         this.registry = registry;
-        this.serializer = new CallGraphSerializer();
+        Path base = (config != null && config.getIndexDir() != null)
+                ? config.getIndexDir().getParent()
+                : IndexConfig.DEFAULT_BASE;
+        this.crossDbDir = base.resolve("cross-project.arcadedb");
+        this.crossStamp = base.resolve("cross-project.stamp");
+    }
+
+    /** Convenience overload for exactly two projects. */
+    public void buildCrossProjectGraph(String project1, String project2) throws IOException {
+        buildCrossProjectGraph(List.of(project1, project2));
     }
 
     /**
-     * Build a merged cross-project call graph by combining graphs from
-     * all mutually-linked projects and resolving cross-project call edges.
+     * Build the cross-project call graph by combining all given projects and
+     * resolving cross-project call edges into
+     * {@code ~/.pharos/cross-project.arcadedb/}.
      */
-    public CallGraph buildCrossProjectGraph(String project1, String project2) throws IOException {
-        return buildCrossProjectGraph(List.of(project1, project2));
-    }
-
-    /**
-     * Build a merged cross-project call graph across all given projects.
-     * Resolves unresolved refs in each project against all other projects.
-     * All projects must already be registered and indexed.
-     *
-     * @param projectNames names of projects to link (must be ≥ 2)
-     */
-    public CallGraph buildCrossProjectGraph(List<String> projectNames) throws IOException {
+    public void buildCrossProjectGraph(List<String> projectNames) throws IOException {
         if (projectNames.size() < 2) {
             throw new IllegalArgumentException("Need at least 2 projects to link");
         }
 
-        Path crossGraphPath = IndexConfig.DEFAULT_BASE.resolve("cross-project-graph.graphml");
-
-        // Freshness guard (#5): if the cross-project graph was written after every
-        // involved project's last index, the existing file is already up to date.
-        if (Files.exists(crossGraphPath) && isCrossGraphFresh(crossGraphPath, projectNames)) {
+        // Freshness guard: skip if cross-project DB is already up to date
+        if (isCrossGraphFresh(crossStamp, projectNames)) {
             log.info("Cross-project graph is already up to date for {}, skipping rebuild",
                     projectNames);
-            return serializer.load(crossGraphPath);
+            return;
         }
 
-        // --- Load per-project graphs and build lookup indices (#1) ---
+        // Load per-project graphs and build lookup indices
         List<ProjectMeta> metas = new ArrayList<>();
-        Map<String, CallGraph> graphs = new LinkedHashMap<>();
-        CallGraph merged = new CallGraph();
+        Map<String, GraphIndex> indices = new LinkedHashMap<>();
 
         for (String name : projectNames) {
             ProjectMeta meta = registry.find(name)
                     .orElseThrow(() -> new IllegalArgumentException("Project not found: " + name));
             metas.add(meta);
-            Path graphPath = Path.of(meta.getIndexPath()).resolve("graph.graphml");
-            if (Files.exists(graphPath)) {
-                CallGraph g = serializer.load(graphPath);
-                graphs.put(name, g);
-                mergeInto(merged, g);
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            if (Files.isDirectory(dbDir)) {
+                try (CallGraph g = CallGraph.open(dbDir)) {
+                    indices.put(name, new GraphIndex(g));
+                }
             }
         }
 
-        // Build O(1)-lookup indices from each loaded graph (#1)
-        Map<String, GraphIndex> indices = new LinkedHashMap<>();
-        for (Map.Entry<String, CallGraph> e : graphs.entrySet()) {
-            indices.put(e.getKey(), new GraphIndex(e.getValue()));
-        }
-
-        // --- Parallel project-pair resolution (#6) ---
-        // Each (i,j) pair is independent: source project i resolved against target j.
-        // Workers collect their edges locally; we merge into the graph serially at the end.
+        // Parallel (i,j) pair resolution
         List<int[]> pairs = new ArrayList<>();
         for (int i = 0; i < metas.size(); i++) {
             for (int j = 0; j < metas.size(); j++) {
@@ -109,8 +94,8 @@ public class CrossProjectLinker {
             }
         }
 
-        int threads = Math.min(pairs.size(),
-                Math.max(1, Runtime.getRuntime().availableProcessors()));
+        int threads = Math.min(pairs.size(), Math.max(1,
+                Runtime.getRuntime().availableProcessors()));
         ExecutorService pool = Executors.newFixedThreadPool(threads,
                 r -> { Thread t = new Thread(r, "cross-linker"); t.setDaemon(true); return t; });
 
@@ -134,13 +119,10 @@ public class CrossProjectLinker {
         pool.shutdown();
 
         // Collect resolved edges
-        int resolved = 0;
+        List<String[]> resolvedEdges = new ArrayList<>();
         try {
             for (Future<List<String[]>> f : futures) {
-                for (String[] edge : f.get()) {
-                    merged.addCall(edge[0], edge[1]);
-                    resolved++;
-                }
+                resolvedEdges.addAll(f.get());
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -151,64 +133,64 @@ public class CrossProjectLinker {
         }
 
         log.info("Cross-project linking: {} new edges across {} projects",
-                resolved, projectNames.size());
+                resolvedEdges.size(), projectNames.size());
 
-        // Save guard (#4): only rewrite the file when something actually changed
-        if (resolved > 0 || !Files.exists(crossGraphPath)) {
-            serializer.save(merged, crossGraphPath);
+        // Save guard: only rewrite if something changed
+        if (!resolvedEdges.isEmpty() || !Files.isDirectory(crossDbDir)) {
+            try (CallGraph crossGraph = CallGraph.open(crossDbDir)) {
+                crossGraph.clear();
+                // Seed all project-owned methods from each per-project graph
+                for (String name : projectNames) {
+                    Path dbDir = Path.of(
+                            registry.find(name).map(ProjectMeta::getIndexPath).orElse(""))
+                            .resolve("callgraph.arcadedb");
+                    if (Files.isDirectory(dbDir)) {
+                        try (CallGraph g = CallGraph.open(dbDir)) {
+                            g.allFqns().forEach(fqn -> crossGraph.addMethod(fqn, fqn));
+                            crossGraph.flush();
+                        }
+                    }
+                }
+                // Add resolved cross-project edges
+                for (String[] edge : resolvedEdges) {
+                    crossGraph.addCall(edge[0], edge[1]);
+                }
+                crossGraph.flush();
+            }
+            touchStamp(crossStamp);
         }
-
-        return merged;
     }
 
     /**
-     * Loads the cross-project graph (previously built via link command).
-     * Falls back to an empty graph if not yet built.
+     * Opens the cross-project graph for querying (e.g., by PathCommand).
+     * Caller must close the returned graph.
      */
-    public CallGraph loadCrossProjectGraph() throws IOException {
-        Path crossGraphPath = IndexConfig.DEFAULT_BASE.resolve("cross-project-graph.graphml");
-        if (!Files.exists(crossGraphPath)) {
-            return new CallGraph();
-        }
-        return serializer.load(crossGraphPath);
+    public CallGraph loadCrossProjectGraph() {
+        return CallGraph.open(crossDbDir);
     }
 
     // -------------------------------------------------------------------------
-    // Freshness check (#5)
+    // Freshness check
     // -------------------------------------------------------------------------
 
-    /**
-     * Returns {@code true} when the existing cross-project graph file is newer than
-     * all relevant input artefacts for every involved project:
-     * <ul>
-     *   <li>{@code lastIndexed} timestamp stored in the registry</li>
-     *   <li>The project's own {@code graph.graphml} file</li>
-     *   <li>The project's {@code unresolved-refs.json} file (written by
-     *       {@link ProjectRegistry#saveRefs} whenever refs change)</li>
-     * </ul>
-     * Checking the files directly means that a refs update without a full re-index
-     * (e.g. a manual {@code registry.register()} call) is still detected correctly.
-     */
-    private boolean isCrossGraphFresh(Path crossGraphPath, List<String> projectNames) {
+    private boolean isCrossGraphFresh(Path stamp, List<String> projectNames) {
+        if (!Files.exists(stamp)) return false;
         try {
-            long crossMtime = Files.getLastModifiedTime(crossGraphPath).toMillis();
+            long crossMtime = Files.getLastModifiedTime(stamp).toMillis();
             for (String name : projectNames) {
                 Optional<ProjectMeta> opt = registry.find(name);
                 if (opt.isEmpty()) return false;
                 ProjectMeta m = opt.get();
 
-                // lastIndexed in registry
                 if (m.getLastIndexed() == null) return false;
                 if (m.getLastIndexed().toEpochMilli() > crossMtime) return false;
 
                 if (m.getIndexPath() != null) {
-                    // project call graph file
-                    Path graphFile = Path.of(m.getIndexPath()).resolve("graph.graphml");
-                    if (Files.exists(graphFile)
-                            && Files.getLastModifiedTime(graphFile).toMillis() > crossMtime) {
+                    Path graphStamp = Path.of(m.getIndexPath()).resolve("graph.stamp");
+                    if (Files.exists(graphStamp)
+                            && Files.getLastModifiedTime(graphStamp).toMillis() > crossMtime) {
                         return false;
                     }
-                    // unresolved-refs file (touched any time refs change)
                     Path refsFile = Path.of(m.getIndexPath()).resolve("unresolved-refs.json");
                     if (Files.exists(refsFile)
                             && Files.getLastModifiedTime(refsFile).toMillis() > crossMtime) {
@@ -223,23 +205,16 @@ public class CrossProjectLinker {
     }
 
     // -------------------------------------------------------------------------
-    // Method-name index (#1)
+    // Method-name index
     // -------------------------------------------------------------------------
 
-    /**
-     * Per-graph lookup structure built once after loading.
-     * Eliminates the O(M) linear scan in the original {@code findInGraph} —
-     * name lookups are now O(1) map gets.
-     */
     static class GraphIndex {
-        /** Simple method name → all FQNs in this graph that have that name. */
         private final Map<String, List<String>> byName;
 
         GraphIndex(CallGraph graph) {
             Map<String, List<String>> map = new HashMap<>();
-            for (String fqn : graph.allMethods()) {
-                map.computeIfAbsent(simpleMethodName(fqn), k -> new ArrayList<>()).add(fqn);
-            }
+            graph.allFqns().forEach(fqn ->
+                    map.computeIfAbsent(simpleMethodName(fqn), k -> new ArrayList<>()).add(fqn));
             this.byName = map;
         }
 
@@ -249,28 +224,13 @@ public class CrossProjectLinker {
     }
 
     // -------------------------------------------------------------------------
-    // Reference resolution (uses GraphIndex)
+    // Reference resolution
     // -------------------------------------------------------------------------
 
-    /**
-     * Find the best-matching method in the target project's index for the given ref.
-     *
-     * <p>Matching strategy:
-     * <ol>
-     *   <li>Name lookup: O(1) map get via {@link GraphIndex} (was O(M) stream scan).</li>
-     *   <li>Package filter (hard): if a {@code packageHint} is available, keep only
-     *       candidates whose class package starts with that hint; fall back to the full
-     *       name-match list when nothing survives.</li>
-     *   <li>Soft score: +2 for class name match, +1 for param count match.</li>
-     *   <li>Tie-break: shortest FQN.</li>
-     * </ol>
-     */
     private String findInIndex(ProjectMeta.UnresolvedRef ref, GraphIndex index) {
-        // 1. O(1) name lookup
         List<String> byName = index.byMethodName(ref.calleeMethodName);
         if (byName.isEmpty()) return null;
 
-        // 2. Package filter (hard, with fallback)
         List<String> candidates = byName;
         if (ref.packageHint != null) {
             List<String> inPackage = byName.stream()
@@ -279,7 +239,6 @@ public class CrossProjectLinker {
             if (!inPackage.isEmpty()) candidates = inPackage;
         }
 
-        // 3. Soft score + tie-break by FQN length
         return candidates.stream()
                 .max(Comparator
                         .comparingInt((String fqn) -> softScore(fqn, ref))
@@ -288,8 +247,21 @@ public class CrossProjectLinker {
     }
 
     // -------------------------------------------------------------------------
-    // FQN utilities
+    // Utilities
     // -------------------------------------------------------------------------
+
+    public static void touchStamp(Path stampFile) {
+        try {
+            if (Files.exists(stampFile)) {
+                Files.setLastModifiedTime(stampFile, FileTime.fromMillis(System.currentTimeMillis()));
+            } else {
+                Files.createDirectories(stampFile.getParent());
+                Files.createFile(stampFile);
+            }
+        } catch (IOException e) {
+            // non-fatal: freshness check will just rebuild next time
+        }
+    }
 
     private static String simpleMethodName(String fqn) {
         int hash = fqn.indexOf('#');
@@ -335,18 +307,5 @@ public class CrossProjectLinker {
         if (ref.paramCount > 0 && extractParamCount(fqn) == ref.paramCount)
             score += 1;
         return score;
-    }
-
-    // -------------------------------------------------------------------------
-    // Graph merge
-    // -------------------------------------------------------------------------
-
-    private void mergeInto(CallGraph target, CallGraph source) {
-        source.allMethods().forEach(target::addMethod);
-        source.getInternalGraph().edgeSet().forEach(edge -> {
-            String src = source.getInternalGraph().getEdgeSource(edge);
-            String tgt = source.getInternalGraph().getEdgeTarget(edge);
-            target.addCall(src, tgt);
-        });
     }
 }
