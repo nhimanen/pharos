@@ -139,5 +139,3 @@ claude mcp add -s user pharos -- java --enable-native-access=ALL-UNNAMED -jar ~/
 Config and indexes are stored in `~/.pharos/`.
 
 ## TODO
-- query support to web UI with hit highlighting. When clicking result adjust the graph to reflect the hit
-- for bm25, use lucene boosts to bring up better results to the top k
