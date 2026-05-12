@@ -75,24 +75,21 @@ if [ "$RESTART_ONLY" = false ]; then
   cp -r "$REPO_DIR/.claude/skills/pharos" "$CLAUDE_SKILLS/"
 fi
 
-# ── 4. Restart daemon if running ──────────────────────────────────────────────
+# ── 4. Restart daemon (always, unless --restart-only was used with no daemon) ──
 
-DAEMON_RUNNING=false
-if curl -s "http://localhost:$DAEMON_PORT/health" >/dev/null 2>&1; then
-  DAEMON_RUNNING=true
-fi
-
-if [ "$DAEMON_RUNNING" = true ]; then
-  echo "Daemon is running on port $DAEMON_PORT — restarting to pick up new JAR..."
+if [ "$RESTART_ONLY" = true ] && ! curl -s "http://localhost:$DAEMON_PORT/health" >/dev/null 2>&1; then
+  echo "Daemon is not running on port $DAEMON_PORT — nothing to restart."
+else
+  # Stop any existing daemon
   if [ -f "$DAEMON_PID_FILE" ]; then
     OLD_PID="$(cat "$DAEMON_PID_FILE")"
     kill "$OLD_PID" 2>/dev/null || true
     rm -f "$DAEMON_PID_FILE"
   fi
-  # Kill any stray process on the port
   kill "$(lsof -ti:"$DAEMON_PORT" 2>/dev/null)" 2>/dev/null || true
   sleep 1
 
+  echo "Starting daemon on port $DAEMON_PORT..."
   nohup java --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
     -jar "$PHAROS_BIN/pharos.jar" web --port "$DAEMON_PORT" \
@@ -109,8 +106,6 @@ if [ "$DAEMON_RUNNING" = true ]; then
     echo -n "."
     sleep 0.5
   done
-elif [ "$RESTART_ONLY" = true ]; then
-  echo "Daemon is not running on port $DAEMON_PORT — nothing to restart."
 fi
 
 echo ""
