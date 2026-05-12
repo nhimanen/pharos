@@ -802,18 +802,25 @@ function renderGraph(nodes, edges, mode) {
 
   if (!S.useCanvas) renderSVGGraph(ns, es, mode);
 
-  // Force simulation
-  const linkDist  = mode === 'modules' ? 90  : mode === 'classes' ? 70  : 50;
-  const charge    = mode === 'modules' ? -220 : mode === 'classes' ? -160 : -100;
-  const chargeCap = mode === 'modules' ? 220  : mode === 'classes' ? 180  : 140;
+  // Force simulation — scale forces with node count so large graphs spread out
+  const n = ns.length;
+  const scaleFactor = Math.max(1, Math.sqrt(n / 10));
+  const baseLinkDist  = mode === 'modules' ? 90  : mode === 'classes' ? 70  : 50;
+  const baseCharge    = mode === 'modules' ? -220 : mode === 'classes' ? -160 : -100;
+  const baseChargeCap = mode === 'modules' ? 220  : mode === 'classes' ? 180  : 140;
+  const linkDist  = baseLinkDist  * scaleFactor;
+  const charge    = baseCharge    * scaleFactor;
+  const chargeCap = baseChargeCap * scaleFactor;
+  const centerStr = Math.max(0.01, 0.08 / scaleFactor);
+  const axisStr   = Math.max(0.005, 0.04 / scaleFactor);
   const cx = rect.width / 2, cy = rect.height / 2;
 
   simulation = d3.forceSimulation(ns)
     .force('link',    d3.forceLink(es).id(d => d.id).distance(linkDist).strength(0.65))
     .force('charge',  d3.forceManyBody().strength(charge).distanceMax(chargeCap))
-    .force('center',  d3.forceCenter(cx, cy).strength(0.08))
-    .force('gx',      d3.forceX(cx).strength(0.04))
-    .force('gy',      d3.forceY(cy).strength(0.04))
+    .force('center',  d3.forceCenter(cx, cy).strength(centerStr))
+    .force('gx',      d3.forceX(cx).strength(axisStr))
+    .force('gy',      d3.forceY(cy).strength(axisStr))
     .force('collide', d3.forceCollide().radius(d => nodeR(d, mode) + 4))
     .on('tick', () => {
       if (S.useCanvas) {
