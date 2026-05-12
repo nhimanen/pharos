@@ -488,6 +488,7 @@ async function refreshProjects() {
 async function loadModuleGraph() {
   S.view = 'modules'; S.selectedProject = null; S.selectedClass = null;
   S.langFilter = null; S.langCounts = {}; S.testFilter = 'all';
+  document.getElementById('file-tree-section').style.display = 'none';
   setActiveBtn('btn-modules');
   document.getElementById('pkg-filter').innerHTML = '<option value="">All packages</option>';
   document.getElementById('pkg-filter').style.display = 'none';
@@ -559,6 +560,7 @@ async function fetchLanguages(projectName) {
 async function browseProject(name) {
   S.selectedProject = name;
   renderProjectList();
+  initFileTree(name);
   await loadClassGraph(name);
 }
 
@@ -801,13 +803,17 @@ function renderGraph(nodes, edges, mode) {
   if (!S.useCanvas) renderSVGGraph(ns, es, mode);
 
   // Force simulation
-  const linkDist = mode === 'modules' ? 120 : mode === 'classes' ? 100 : 70;
-  const charge   = mode === 'modules' ? -400 : mode === 'classes' ? -300 : -180;
+  const linkDist  = mode === 'modules' ? 90  : mode === 'classes' ? 70  : 50;
+  const charge    = mode === 'modules' ? -220 : mode === 'classes' ? -160 : -100;
+  const chargeCap = mode === 'modules' ? 220  : mode === 'classes' ? 180  : 140;
+  const cx = rect.width / 2, cy = rect.height / 2;
 
   simulation = d3.forceSimulation(ns)
-    .force('link',    d3.forceLink(es).id(d => d.id).distance(linkDist).strength(0.4))
-    .force('charge',  d3.forceManyBody().strength(charge))
-    .force('center',  d3.forceCenter(rect.width / 2, rect.height / 2))
+    .force('link',    d3.forceLink(es).id(d => d.id).distance(linkDist).strength(0.65))
+    .force('charge',  d3.forceManyBody().strength(charge).distanceMax(chargeCap))
+    .force('center',  d3.forceCenter(cx, cy).strength(0.08))
+    .force('gx',      d3.forceX(cx).strength(0.04))
+    .force('gy',      d3.forceY(cy).strength(0.04))
     .force('collide', d3.forceCollide().radius(d => nodeR(d, mode) + 4))
     .on('tick', () => {
       if (S.useCanvas) {
@@ -1346,6 +1352,138 @@ function renderProjectList() {
     item.addEventListener('click', () => browseProject(item.dataset.project)));
 }
 
+// ── File tree ─────────────────────────────────────────────────
+async function initFileTree(projectName) {
+  const section   = document.getElementById('file-tree-section');
+  const container = document.getElementById('file-tree-root');
+  if (!projectName) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  container.innerHTML = '<div class="loading">Loading…</div>';
+
+  const meta     = S.projects.find(p => p.name === projectName);
+  const rootPath = meta?.rootPath || '';
+
+  try {
+    const { dirs, files } = await loadTreeLevel(projectName, rootPath);
+    container.innerHTML = '';
+    if (!dirs.size && !files.size) {
+      container.innerHTML = '<div class="loading">No indexed files found</div>';
+    } else {
+      renderTreeEntries(container, projectName, rootPath, dirs, files, 0);
+    }
+  } catch (_) {
+    container.innerHTML = '<div class="loading">Failed to load tree</div>';
+  }
+}
+
+async function loadTreeLevel(project, path) {
+  const params = new URLSearchParams({ project, limit: 2000 });
+  if (path) params.set('path', path);
+  const data = await fetch(`/api/skeleton?${params}`).then(r => r.json());
+  return deriveTreeEntries(data, path);
+}
+
+function deriveTreeEntries(skeletonData, basePath) {
+  const normBase = (basePath || '').replace(/\\/g, '/').replace(/\/$/, '');
+  const dirs  = new Map(); // dirName  → class count
+  const files = new Map(); // fileName → [qualifiedClassName, ...]
+
+  for (const cls of skeletonData) {
+    const fp  = (cls.filePath || '').replace(/\\/g, '/');
+    let rel;
+    if (normBase && fp.startsWith(normBase + '/')) {
+      rel = fp.slice(normBase.length + 1);
+    } else if (!normBase) {
+      rel = fp.replace(/^\/+/, '');
+    } else {
+      continue;
+    }
+
+    const sep = rel.indexOf('/');
+    if (sep === -1) {
+      if (!files.has(rel)) files.set(rel, []);
+      files.get(rel).push(cls.qualifiedClassName);
+    } else {
+      const dir = rel.slice(0, sep);
+      dirs.set(dir, (dirs.get(dir) || 0) + 1);
+    }
+  }
+  return { dirs, files };
+}
+
+function renderTreeEntries(container, project, basePath, dirs, files, depth) {
+  const indent = depth * 14;
+
+  for (const [name] of [...dirs.entries()].sort()) {
+    const dirPath  = basePath.replace(/\/$/, '') + '/' + name;
+    const row      = document.createElement('div');
+    row.className  = 'ft-row ft-dir';
+    row.style.paddingLeft = (12 + indent) + 'px';
+    row.innerHTML  =
+      `<span class="ft-chevron">▶</span>` +
+      `<span class="ft-icon">📁</span>` +
+      `<span class="ft-name" title="${esc(name)}">${esc(name)}/</span>`;
+
+    const childWrap = document.createElement('div');
+    childWrap.style.display = 'none';
+    let loaded = false;
+
+    row.addEventListener('click', async () => {
+      const chevron = row.querySelector('.ft-chevron');
+      const isOpen  = chevron.classList.contains('open');
+      if (isOpen) {
+        chevron.classList.remove('open');
+        childWrap.style.display = 'none';
+        return;
+      }
+      chevron.classList.add('open');
+      childWrap.style.display = 'block';
+      if (loaded) return;
+      loaded = true;
+      childWrap.innerHTML =
+        `<div class="loading" style="padding-left:${12 + indent + 14}px">Loading…</div>`;
+      try {
+        const { dirs: sd, files: sf } = await loadTreeLevel(project, dirPath);
+        childWrap.innerHTML = '';
+        if (!sd.size && !sf.size) {
+          childWrap.innerHTML =
+            `<div class="ft-empty" style="padding-left:${12 + indent + 14}px">Empty</div>`;
+        } else {
+          renderTreeEntries(childWrap, project, dirPath, sd, sf, depth + 1);
+        }
+      } catch (_) {
+        childWrap.innerHTML =
+          `<div class="loading" style="padding-left:${12 + indent + 14}px">Error</div>`;
+      }
+    });
+
+    container.appendChild(row);
+    container.appendChild(childWrap);
+  }
+
+  for (const [name, classes] of [...files.entries()].sort()) {
+    const row     = document.createElement('div');
+    row.className = 'ft-row ft-file';
+    row.style.paddingLeft = (12 + indent) + 'px';
+    row.innerHTML =
+      `<span class="ft-chevron" style="visibility:hidden">▶</span>` +
+      `<span class="ft-icon">📄</span>` +
+      `<span class="ft-name" title="${esc(name)}">${esc(name)}</span>` +
+      `<span class="ft-badge">${classes.length}</span>`;
+    row.addEventListener('click', () => drillToFile(project, classes));
+    container.appendChild(row);
+  }
+}
+
+function drillToFile(project, qualifiedClassNames) {
+  if (!qualifiedClassNames.length) return;
+  if (qualifiedClassNames.length === 1) {
+    loadMethodGraph(project, qualifiedClassNames[0]);
+  } else {
+    loadCallGraph(project, null, qualifiedClassNames[0]);
+  }
+}
+
 // ── Test/production filter ────────────────────────────────────
 function renderTestFilter() {
   const el = document.getElementById('test-filter');
@@ -1555,6 +1693,8 @@ function setStatus(txt)   { document.getElementById('status-bar').textContent = 
 function setActiveBtn(id) {
   document.querySelectorAll('.btn-view').forEach(b => b.classList.remove('active'));
   if (id) { const el = document.getElementById(id); if (el) el.classList.add('active'); }
+  // Restore toggle-buttons that track independent state
+  document.getElementById('btn-hide-external').classList.toggle('active', S.hideExternal);
 }
 function trunc(s, n)    { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
 function shortId(id)    { return id ? id.split(/[.#]/).pop() : id; }

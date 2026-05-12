@@ -388,3 +388,33 @@ line.link { transition: stroke-opacity .1s; }
   pointer-events: none;
   stroke-linejoin: round;
 }
+
+/* ── File tree ───────────────────────────────────────────── */
+#file-tree-root { padding-bottom: 4px; }
+.ft-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 12px; cursor: pointer;
+  font-size: 12px; color: var(--text-dim);
+  transition: background .1s;
+  user-select: none; min-width: 0;
+}
+.ft-row:hover { background: var(--bg3); }
+.ft-file { color: var(--text); }
+.ft-file:hover { color: var(--accent); background: var(--bg3); }
+.ft-chevron {
+  flex-shrink: 0; width: 12px; line-height: 1;
+  font-size: 9px; color: var(--text-xdim);
+  display: inline-block; transition: transform .15s;
+}
+.ft-chevron.open { transform: rotate(90deg); }
+.ft-icon { flex-shrink: 0; font-size: 11px; line-height: 1; }
+.ft-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ft-badge {
+  flex-shrink: 0; font-size: 10px;
+  color: var(--text-xdim); background: var(--bg);
+  border-radius: 4px; padding: 0 4px; line-height: 1.6;
+}
+.ft-empty { color: var(--text-xdim); font-style: italic; font-size: 11px; }
