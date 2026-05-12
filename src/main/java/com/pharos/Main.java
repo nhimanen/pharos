@@ -13,6 +13,7 @@ import com.pharos.indexer.ProjectIndexManager;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.GenericFileParser;
 import com.pharos.parser.JavaCodeParser;
+import com.pharos.parser.JsCodeParser;
 import com.pharos.parser.LanguageProfile;
 import com.pharos.parser.PythonCodeParser;
 import com.pharos.parser.RegexCodeParser;
@@ -46,6 +47,7 @@ public class Main {
         List<CodeParser> parsers = new java.util.ArrayList<>();
         parsers.add(new JavaCodeParser(List.of(), List.of(), parseThreads));
         parsers.add(new PythonCodeParser());
+        parsers.add(new JsCodeParser());
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(

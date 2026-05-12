@@ -39,7 +39,7 @@ const S = {
   projects:        [],
   graphData:       null,
   searchQuery:     '',
-  hideExternal:    false,
+  hideExternal:    true,
   // Focus modes
   focusMode:       'none',   // 'none'|'ego'|'expand'|'topn'|'collapse-leaves'
   egoHops:         2,
@@ -253,7 +253,7 @@ function initControls() {
   document.getElementById('btn-hide-external').addEventListener('click', () => {
     S.hideExternal = !S.hideExternal;
     document.getElementById('btn-hide-external').classList.toggle('active', S.hideExternal);
-    if (S.graphData) rerender();
+    if (S.graphData) { rerender(); fitToView(); }
   });
 
   const searchInput = document.getElementById('search-input');
@@ -369,6 +369,30 @@ function zoomBy(factor) {
 function resetZoom() {
   const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
   target.transition().duration(350).call(zoomBehavior.transform, d3.zoomIdentity);
+}
+
+function fitToView(delayMs = 600) {
+  setTimeout(() => {
+    if (!currentNodes.length) return;
+    const rect = document.getElementById('graph-container').getBoundingClientRect();
+    const W = rect.width, H = rect.height;
+    const pad = 48;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of currentNodes) {
+      if (n.x == null) continue;
+      minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+      minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+    }
+    if (!isFinite(minX)) return;
+    const dx = maxX - minX || 1, dy = maxY - minY || 1;
+    const scale = Math.min(2, 0.92 * Math.min((W - pad * 2) / dx, (H - pad * 2) / dy));
+    const tx = W / 2 - scale * (minX + maxX) / 2;
+    const ty = H / 2 - scale * (minY + maxY) / 2;
+    const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
+    target.transition().duration(400).call(
+      zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale)
+    );
+  }, delayMs);
 }
 
 // ── Context menu ─────────────────────────────────────────────

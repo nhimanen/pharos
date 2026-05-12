@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -37,6 +38,54 @@ public class SearchEngine {
      * up above same-relevance hits from other projects loaded via cross-project linking.
      */
     private static final float PROJECT_AFFINITY_BOOST = 1.5f;
+
+    /** Boost applied when the query contains an explicit {@code project:query} or {@code in:lang} modifier. */
+    private static final float QUERY_HINT_BOOST = 1.8f;
+
+    /** Softer boost when a project name or language keyword appears in the query without a modifier colon. */
+    private static final float IMPLICIT_HINT_BOOST = 1.3f;
+
+    /**
+     * Language keyword → file extension suffixes recognised by the {@code in:<lang>} modifier.
+     * The value is matched as a suffix of {@link SearchResult#filePath()}.
+     */
+    private static final Map<String, String> LANG_EXTENSIONS = Map.ofEntries(
+            Map.entry("java",       ".java"),
+            Map.entry("python",     ".py"),
+            Map.entry("py",         ".py"),
+            Map.entry("kotlin",     ".kt"),
+            Map.entry("kt",         ".kt"),
+            Map.entry("scala",      ".scala"),
+            Map.entry("groovy",     ".groovy"),
+            Map.entry("javascript", ".js"),
+            Map.entry("js",         ".js"),
+            Map.entry("typescript", ".ts"),
+            Map.entry("ts",         ".ts"),
+            Map.entry("go",         ".go"),
+            Map.entry("rust",       ".rs"),
+            Map.entry("rs",         ".rs"),
+            Map.entry("ruby",       ".rb"),
+            Map.entry("rb",         ".rb"),
+            Map.entry("csharp",     ".cs"),
+            Map.entry("cs",         ".cs"),
+            Map.entry("cpp",        ".cpp"),
+            Map.entry("php",        ".php"),
+            Map.entry("swift",      ".swift"),
+            Map.entry("markdown",   ".md"),
+            Map.entry("md",         ".md")
+    );
+
+    /**
+     * Parsed modifiers extracted from the raw query string.
+     *
+     * @param cleanedQuery       the query with explicit modifier tokens stripped
+     * @param projectBoost       project name to boost, or null
+     * @param projectExplicit    true = found via {@code project:query} (stronger boost)
+     * @param langExtension      file extension to boost, or null
+     * @param langExplicit       true = found via {@code in:lang} (stronger boost)
+     */
+    private record QueryHints(String cleanedQuery, String projectBoost, boolean projectExplicit,
+                               String langExtension, boolean langExplicit) {}
 
     private final LuceneIndexer luceneIndexer;
     private final EmbeddingProvider embedder;
@@ -77,6 +126,17 @@ public class SearchEngine {
     public SearchResponse searchWithTrace(SearchRequest req, boolean expand) throws IOException {
         SearchTrace trace = new SearchTrace();
         trace.start();
+
+        // Parse query modifiers (project:query, in:lang) before dispatching
+        List<String> knownProjects = registry.listAll().stream()
+                .map(ProjectMeta::getName).collect(Collectors.toList());
+        QueryHints hints = parseQueryHints(req.query(), knownProjects);
+        if (!hints.cleanedQuery().equals(req.query())) {
+            req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
+                    req.projects(), req.limit(), req.outputFormat(), req.docType());
+            log.debug("Query rewritten: '{}' → project={} lang={} query='{}'",
+                    hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
+        }
 
         List<String> projects = resolveProjects(req);
         if (projects.isEmpty()) {
@@ -125,6 +185,7 @@ public class SearchEngine {
         // indexes. Applied after all strategy-level boosts (graph in-degree, source-path penalty)
         // so the multipliers compose correctly.
         primary = applyProjectAffinityBoost(primary, req.project());
+        primary = applyQueryHintBoosts(primary, hints);
 
         if (!expand || primary.isEmpty()) {
             return new SearchResponse(primary, trace);
@@ -134,6 +195,128 @@ public class SearchEngine {
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
         return new SearchResponse(expanded, trace);
+    }
+
+    /**
+     * Parses query modifier tokens from the raw query string:
+     * <ul>
+     *   <li>{@code project:rest} — if the token before {@code :} matches a known project name,
+     *       treat it as a project boost hint and use everything after {@code :} as the query.</li>
+     *   <li>{@code in:lang} — boosts results whose filePath matches the language's extension.</li>
+     * </ul>
+     * Both modifiers are removed from the query that is sent to the search strategy so they
+     * don't pollute BM25 scoring.
+     */
+    static QueryHints parseQueryHints(String rawQuery, List<String> knownProjects) {
+        if (rawQuery == null || rawQuery.isBlank()) {
+            return new QueryHints(rawQuery, null, false, null, false);
+        }
+
+        String projectBoost = null;
+        boolean projectExplicit = false;
+        String langExtension = null;
+        boolean langExplicit = false;
+        String query = rawQuery.trim();
+
+        // ── Explicit project:<rest> prefix ─────────────────────────────
+        // The very first token may be "project:rest" — if "project" is a known project name,
+        // treat it as a strong boost directive and strip it from the query.
+        int firstColon = query.indexOf(':');
+        int firstSpace = query.indexOf(' ');
+        // Colon must be in the first token: before the first space, or no space at all
+        if (firstColon > 0 && (firstSpace < 0 || firstColon < firstSpace)) {
+            String prefix = query.substring(0, firstColon).toLowerCase();
+            String after  = query.substring(firstColon + 1).trim();
+            for (String p : knownProjects) {
+                if (p.equalsIgnoreCase(prefix)) {
+                    projectBoost = p;
+                    projectExplicit = true;
+                    query = after;
+                    break;
+                }
+            }
+        }
+
+        // ── Scan tokens for in:<lang> and implicit mentions ─────────────
+        String[] tokens = query.split("\\s+");
+        List<String> kept = new ArrayList<>();
+        for (String tok : tokens) {
+            String lower = tok.toLowerCase();
+
+            // Explicit in:lang modifier — strip from query
+            if (lower.startsWith("in:")) {
+                String lang = lower.substring(3);
+                String ext = LANG_EXTENSIONS.get(lang);
+                if (ext != null) {
+                    langExtension = ext;
+                    langExplicit = true;
+                    continue;
+                }
+            }
+
+            // Implicit language keyword anywhere in query (softer boost, keep in query)
+            if (langExtension == null) {
+                String ext = LANG_EXTENSIONS.get(lower);
+                if (ext != null) {
+                    langExtension = ext;
+                    langExplicit = false;
+                    // keep token in query — it still carries BM25 signal
+                }
+            }
+
+            // Implicit project name mention (softer boost, keep in query)
+            if (projectBoost == null) {
+                for (String p : knownProjects) {
+                    if (p.equalsIgnoreCase(lower)) {
+                        projectBoost = p;
+                        projectExplicit = false;
+                        break;
+                    }
+                }
+            }
+
+            kept.add(tok);
+        }
+        query = String.join(" ", kept).trim();
+        if (query.isEmpty()) query = rawQuery.trim(); // safety: never blank
+
+        return new QueryHints(query, projectBoost, projectExplicit, langExtension, langExplicit);
+    }
+
+    /**
+     * Applies {@value #QUERY_HINT_BOOST}x to results that match the extracted query hints:
+     * project name from {@code project:query} syntax and/or language from {@code in:lang}.
+     * Both boosts stack (multiply) when both modifiers are present.
+     */
+    private List<SearchResult> applyQueryHintBoosts(List<SearchResult> results, QueryHints hints) {
+        if (hints.projectBoost() == null && hints.langExtension() == null) return results;
+        float projMult = hints.projectExplicit() ? QUERY_HINT_BOOST : IMPLICIT_HINT_BOOST;
+        float langMult = hints.langExplicit()    ? QUERY_HINT_BOOST : IMPLICIT_HINT_BOOST;
+        boolean changed = false;
+        List<SearchResult> out = new ArrayList<>(results.size());
+        for (SearchResult r : results) {
+            float mult = 1.0f;
+            if (hints.projectBoost() != null && hints.projectBoost().equals(r.project())) {
+                mult *= projMult;
+            }
+            if (hints.langExtension() != null && r.filePath() != null
+                    && r.filePath().endsWith(hints.langExtension())) {
+                mult *= langMult;
+            }
+            if (mult != 1.0f) {
+                r = new SearchResult(r.id(), r.project(), r.packageName(),
+                        r.className(), r.qualifiedClassName(), r.methodName(),
+                        r.signature(), r.returnType(), r.body(), r.javadoc(),
+                        r.accessModifier(), r.filePath(),
+                        r.startLine(), r.endLine(),
+                        r.score() * mult, r.searchType(), r.docType());
+                changed = true;
+            }
+            out.add(r);
+        }
+        if (!changed) return results;
+        out.sort(java.util.Comparator.comparingDouble(SearchResult::score).reversed());
+        return out;
     }
 
     /**

@@ -68,6 +68,11 @@ if [ "$RESTART_ONLY" = false ]; then
   else
     echo "Warning: $LINK exists and is not a symlink — skipping. Remove it manually if needed."
   fi
+
+  CLAUDE_SKILLS="$HOME/.claude/skills"
+  echo "Installing Claude skill -> $CLAUDE_SKILLS/pharos/..."
+  mkdir -p "$CLAUDE_SKILLS"
+  cp -r "$REPO_DIR/.claude/skills/pharos" "$CLAUDE_SKILLS/"
 fi
 
 # ── 4. Restart daemon if running ──────────────────────────────────────────────
@@ -89,6 +94,7 @@ if [ "$DAEMON_RUNNING" = true ]; then
   sleep 1
 
   nohup java --enable-native-access=ALL-UNNAMED \
+    --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
     -jar "$PHAROS_BIN/pharos.jar" web --port "$DAEMON_PORT" \
     >> "$HOME/.pharos/daemon.log" 2>&1 &
   NEW_PID=$!

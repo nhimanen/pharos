@@ -4,10 +4,12 @@ The Pharos of Alexandria was one of the Seven Wonders of the Ancient World — a
 
 ## What it does
 
-Pharos indexes Java projects and gives you three ways to navigate them:
+Pharos indexes multi-language projects and gives you three ways to navigate them:
 
-- **Keyword and semantic search** across methods, classes, and javadoc
-- **Call graph exploration** — who calls what, down to method level — visualized in a browser UI
+- **Keyword search** across methods, classes, and documentation with per-field BM25 tuning and query modifiers (`project:query`, `in:java`)
+- **Call graph exploration** — who calls what, down to method level — powered by ArcadeDB and visualized in a browser UI
+- **Module dependency graph** — Maven, Gradle, npm, Python, and CMake projects in one unified view
+- **Project skeleton** — public API surface as a filesystem tree, scoped to any subdirectory
 - **Claude skill** — teaches Claude Code to use `pharos` for code navigation instead of grep
 
 ## Requirements
@@ -15,30 +17,52 @@ Pharos indexes Java projects and gives you three ways to navigate them:
 - Java 21+
 - Python 3.8+ (for the `pharos` CLI client)
 - Maven (to build)
+- Node.js 14+ (optional — enables JavaScript/TypeScript indexing)
 
 ## Build & install
 
 ```bash
-mvn clean package -DskipTests
-cp pharos ~/.local/bin/pharos && chmod +x ~/.local/bin/pharos
+./setup.sh            # build JAR, install to ~/.pharos/bin/, restart daemon
+./setup.sh --skip-build   # reinstall without rebuilding
+./setup.sh --restart-only # just restart the running daemon
 ```
 
-The `pharos` script auto-discovers the JAR from `target/` (dev) or `~/.pharos/bin/pharos.jar` (installed).
+`setup.sh` also copies the Claude skill to `~/.claude/skills/pharos/` automatically.
 
-To install the JAR to a stable location (survives `mvn clean`):
-```bash
-mkdir -p ~/.pharos/bin && cp target/pharos-*.jar ~/.pharos/bin/pharos.jar
-```
+## Supported languages
+
+| Language | Parser | Notes |
+|---|---|---|
+| Java | JavaParser (full symbol resolution) | Call graph edges, type-resolved FQNs |
+| Python | AST via `python3` subprocess | Classes, functions, call refs |
+| JavaScript / TypeScript | AST via `node` subprocess | Classes, functions, arrow fns, interfaces |
+| Kotlin, Scala, Rust, Go, Swift, C#, and more | Regex-based | Classes and methods; no call graph |
+| Markdown, YAML, shell scripts | Generic chunker | Full-text search |
+
+## Module graph support
+
+The module dependency graph is populated automatically during indexing from whichever build file is present:
+
+| Build system | File | Module key |
+|---|---|---|
+| Maven | `pom.xml` | `groupId:artifactId` |
+| Gradle | `settings.gradle` + `build.gradle` | `group:name` |
+| Python | `pyproject.toml` / `setup.py` | `python:package` |
+| Node.js | `package.json` | `npm:name` or `scope:name` |
+| CMake | `CMakeLists.txt` | `cmake:projectname` |
 
 ## Usage
 
 ```bash
-# Index a project (incremental by default)
-pharos index /path/to/project
+# Index a project
+pharos index /path/to/project                    # incremental
+pharos index /path/to/project --force --no-embed # clean re-index, skip embedding
+pharos index /path/to/workspace --project-threads 4  # parallel workspace indexing
 
-# Search
-pharos search "parse method signature"
-pharos search "LuceneIndexer" --type keyword
+# Search with query modifiers
+pharos search "lucene:searching"           # boost lucene project results
+pharos search "parse tokens in:java"       # boost Java file results
+pharos search "parse tokens"              # regular cross-project search
 
 # Get full method body
 pharos method "com.pharos.indexer.LuceneIndexer#index(ParsedMethod)"
@@ -46,7 +70,17 @@ pharos method "com.pharos.indexer.LuceneIndexer#index(ParsedMethod)"
 # Call graph
 pharos callers "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
 pharos callees "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
-pharos path  "com.pharos.Main#main(String[])" "com.pharos.parser.JavaCodeParser#parseProject(Path,String)"
+pharos path    "com.pharos.Main#main(String[])" "com.pharos.parser.JavaCodeParser#parseProject(Path,String)"
+
+# Project structure as a filesystem tree
+pharos skeleton myproject
+pharos skeleton myproject --path src/main/java/com/example/api --depth 1
+
+# Module dependencies
+pharos modules
+pharos deps com.pharos:pharos --transitive
+pharos mod-path com.example:module-a com.example:module-b
+pharos boundary myproject
 
 # Web UI (graph browser, port 7171)
 pharos web
@@ -55,17 +89,9 @@ pharos web
 pharos projects
 ```
 
-Index multiple projects and link them for cross-project call resolution:
-
-```bash
-pharos index /path/to/project-a
-pharos index /path/to/project-b
-pharos link project-a project-b   # (via java -jar for now; web API coming)
-```
-
 ### Daemon
 
-`pharos` keeps a background JVM running to avoid cold-start latency on every command (port 7171, `PHAROS_PORT` to override):
+`pharos` keeps a background JVM running to avoid cold-start latency (port 7171, `PHAROS_PORT` to override):
 
 ```bash
 pharos daemon status
@@ -77,23 +103,16 @@ pharos daemon logs
 
 ### Skill (recommended)
 
-Install the bundled skill so Claude Code automatically uses `pharos` for code navigation instead of grep or file reads:
+`setup.sh` installs the skill to `~/.claude/skills/pharos/` automatically. To install manually:
 
 ```bash
-# User-level (all projects)
 mkdir -p ~/.claude/skills/pharos
 cp .claude/skills/pharos/SKILL.md ~/.claude/skills/pharos/SKILL.md
-
-# Or project-level only
-mkdir -p /path/to/your-project/.claude/skills/pharos
-cp .claude/skills/pharos/SKILL.md /path/to/your-project/.claude/skills/pharos/SKILL.md
 ```
 
-Once installed Claude Code will call `pharos search`, `pharos callers`, etc. when navigating indexed projects.
+Once installed Claude Code will call `pharos search`, `pharos callers`, `pharos skeleton`, etc. when navigating indexed projects.
 
 ### MCP server (alternative)
-
-If you prefer tool-call integration over CLI, register the MCP server:
 
 ```bash
 claude mcp add -s user pharos -- java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar mcp-server
@@ -106,17 +125,19 @@ claude mcp add -s user pharos -- java --enable-native-access=ALL-UNNAMED -jar ~/
 | `get_callers` / `get_callees` | Call graph edges |
 | `find_call_path` | Shortest call chain between two methods |
 | `list_projects` | Indexed projects with stats |
-| `get_module_deps` | Direct/transitive Maven deps |
-| `find_module_path` | Shortest Maven dependency path |
+| `get_module_deps` | Direct/transitive deps |
+| `find_module_path` | Shortest dependency path |
 | `get_module_boundary` | Entry/exit points for a module |
 
 ## How it works
 
-1. **Parse** — JavaParser resolves symbols across source roots and JARs, producing fully-qualified method and call reference data
-2. **Graph** — call references become a directed graph (GraphML); Maven coordinates become a module dependency graph
-3. **Embed** — optional semantic vectors via DJL + ONNX (falls back gracefully if unavailable)
-4. **Index** — Lucene stores everything with BM25 for keyword search and KNN for vector search; graph centrality boosts results for heavily-called methods
+1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers for other languages extract methods, classes, and call references
+2. **Graph** — call references become a directed graph (ArcadeDB embedded graph database); build files become a module dependency graph
+3. **Embed** — optional semantic vectors via DJL + ONNX (falls back gracefully if unavailable; skip with `--no-embed`)
+4. **Index** — Lucene stores everything with per-field BM25 for keyword search and KNN for vector search; graph in-degree boosts results for heavily-called methods
 
 Config and indexes are stored in `~/.pharos/`.
 
 ## TODO
+- query support to web UI with hit highlighting. When clicking result adjust the graph to reflect the hit
+- for bm25, use lucene boosts to bring up better results to the top k

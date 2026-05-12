@@ -11,7 +11,11 @@ import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.JavaCodeParser;
+import com.pharos.parser.CMakeReader;
+import com.pharos.parser.GradleBuildReader;
 import com.pharos.parser.MavenPomReader;
+import com.pharos.parser.PackageJsonReader;
+import com.pharos.parser.PyprojectReader;
 import com.pharos.parser.model.*;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.Term;
@@ -585,15 +589,35 @@ public class ProjectIndexManager {
     }
 
     /**
-     * Auto-detects pom.xml at {@code projectRoot}, parses it, and incorporates the
+     * Auto-detects the project's build system, parses it, and incorporates the
      * project into the module-level dependency graph.
+     *
+     * Detection order (first match wins):
+     *   1. Maven  — pom.xml
+     *   2. Gradle — settings.gradle / build.gradle
+     *   3. Python — pyproject.toml / setup.py / setup.cfg
+     *   4. CMake  — CMakeLists.txt
+     *
      * For each newly auto-linked project, also triggers cross-project call graph linking.
      */
     private void updateModuleGraph(Path projectRoot, ProjectMeta meta) {
-        MavenPomReader reader = new MavenPomReader();
-        MavenPomReader.findPom(projectRoot)
-                .flatMap(reader::read)
-                .ifPresentOrElse(
+        Optional<MavenPomReader.PomInfo> pomInfoOpt =
+                MavenPomReader.findPom(projectRoot).flatMap(new MavenPomReader()::read);
+
+        if (pomInfoOpt.isEmpty() && GradleBuildReader.isGradleProject(projectRoot)) {
+            pomInfoOpt = new GradleBuildReader().read(projectRoot);
+        }
+        if (pomInfoOpt.isEmpty() && PyprojectReader.isPythonProject(projectRoot)) {
+            pomInfoOpt = new PyprojectReader().read(projectRoot);
+        }
+        if (pomInfoOpt.isEmpty() && PackageJsonReader.isNodeProject(projectRoot)) {
+            pomInfoOpt = new PackageJsonReader().read(projectRoot);
+        }
+        if (pomInfoOpt.isEmpty() && CMakeReader.isCMakeProject(projectRoot)) {
+            pomInfoOpt = new CMakeReader().read(projectRoot);
+        }
+
+        pomInfoOpt.ifPresentOrElse(
                         pomInfo -> {
                             try {
                                 List<String> autoLinked =
