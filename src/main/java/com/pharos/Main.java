@@ -102,6 +102,8 @@ public class Main {
                 return (K) new IndexCommand(indexManager, crossProjectLinker, registry, config);
             if (cls == SearchCommand.class)
                 return (K) new SearchCommand(searchEngine);
+            if (cls == GetMethodCommand.class)
+                return (K) new GetMethodCommand(searchEngine);
             if (cls == CallersCommand.class)
                 return (K) new CallersCommand(searchEngine, registry, config);
             if (cls == CalleesCommand.class)

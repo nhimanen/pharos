@@ -12,6 +12,7 @@ import picocli.CommandLine.*;
         subcommands = {
                 IndexCommand.class,
                 SearchCommand.class,
+                GetMethodCommand.class,
                 CallersCommand.class,
                 CalleesCommand.class,
                 PathCommand.class,
