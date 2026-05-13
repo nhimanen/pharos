@@ -52,6 +52,10 @@ public class IndexCommand implements Callable<Integer> {
             description = "Skip vector embedding generation (faster indexing, disables semantic search)")
     private boolean noEmbed = false;
 
+    @Option(names = {"--no-synonyms"},
+            description = "Skip auto-mining of synonym rules after indexing")
+    private boolean noSynonyms = false;
+
     @Option(names = {"--single"},
             description = "Treat the path as a single project even if sub-projects are detected")
     private boolean single = false;
@@ -223,7 +227,7 @@ public class IndexCommand implements Callable<Integer> {
     private ProjectMeta doIndexCore(Path projectPath, String name, ProgressListener listener) throws Exception {
         boolean incremental = !full && !force && registry.find(name).isPresent()
                 && indexManager.indexExists(name);
-        return indexManager.index(projectPath, name, incremental, force, !noEmbed, listener);
+        return indexManager.index(projectPath, name, incremental, force, !noEmbed, !noSynonyms, listener);
     }
 
     /**

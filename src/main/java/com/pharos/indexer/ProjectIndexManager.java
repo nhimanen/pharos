@@ -193,12 +193,19 @@ public class ProjectIndexManager {
     /**
      * Index a project with optional force-wipe of the existing index.
      *
-     * @param force if true, deletes the existing Lucene directory before indexing —
-     *              required after Lucene version upgrades or to recover from corrupt indexes
+     * @param force          if true, deletes the existing Lucene directory before indexing —
+     *                       required after Lucene version upgrades or to recover from corrupt indexes
+     * @param buildSynonyms  if true, mine and append synonym rules after indexing
      */
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               ProgressListener progress) throws IOException {
+        return index(projectRoot, projectName, incremental, force, generateEmbeddings, true, progress);
+    }
+
+    public ProjectMeta index(Path projectRoot, String projectName,
+                              boolean incremental, boolean force, boolean generateEmbeddings,
+                              boolean buildSynonyms, ProgressListener progress) throws IOException {
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -214,16 +221,17 @@ public class ProjectIndexManager {
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, progress);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, progress);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress);
         }
     }
 
     private ProjectMeta indexFull(Path projectRoot, String projectName,
                                    Path projectIndexDir, FileStateTracker stateTracker,
-                                   boolean generateEmbeddings, ProgressListener progress) throws IOException {
+                                   boolean generateEmbeddings, boolean buildSynonyms,
+                                   ProgressListener progress) throws IOException {
         stateTracker.clear();
 
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
@@ -293,13 +301,14 @@ public class ProjectIndexManager {
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
 
-        expandSynonyms(projectName);
+        if (buildSynonyms) expandSynonyms(projectName);
         return meta;
     }
 
     private ProjectMeta indexIncremental(Path projectRoot, String projectName,
                                           Path projectIndexDir, FileStateTracker stateTracker,
-                                          boolean generateEmbeddings, ProgressListener progress) throws IOException {
+                                          boolean generateEmbeddings, boolean buildSynonyms,
+                                          ProgressListener progress) throws IOException {
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -480,7 +489,7 @@ public class ProjectIndexManager {
 
         // Only re-mine synonyms when content actually changed — synonym expansion does a full
         // Lucene scan + TF-IDF computation which is expensive to run for deletion-only updates.
-        if (!dirtyFiles.isEmpty()) {
+        if (buildSynonyms && !dirtyFiles.isEmpty()) {
             expandSynonyms(projectName);
         }
         return meta;
