@@ -15,6 +15,7 @@ import picocli.CommandLine.*;
                 GetMethodCommand.class,
                 CallersCommand.class,
                 CalleesCommand.class,
+                GetClassCommand.class,
                 PathCommand.class,
                 ProjectsCommand.class,
                 LinkCommand.class,
