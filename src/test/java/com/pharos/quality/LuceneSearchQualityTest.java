@@ -291,6 +291,41 @@ class LuceneSearchQualityTest {
                 "conceptual",
                 "'leaf segment' and 'parallel scoring' map to 'LeafReaderContext' and 'LeafSlice' " +
                 "respectively; developer won't guess 'LeafReaderContext' from 'iterate over segments'"
+            ),
+
+            // ── proximity: phrase matching should lift exact-phrase class/method names ──
+
+            new LuceneQueryCase(
+                "minimum-competitive-score",
+                "set minimum competitive score to skip non competitive documents",
+                List.of("WANDScorer", "MaxScoreCache"),
+                List.of("MaxScoreAccumulator", "BlockMaxConjunctionScorer"),
+                "proximity",
+                "setMinCompetitiveScore splits to 'set minimum competitive score' — exact phrase in " +
+                "methodName; individual terms (minimum, score) are common across scoring classes " +
+                "making OR noisy; phrase boost should surface WANDScorer at rank 1"
+            ),
+
+            new LuceneQueryCase(
+                "stored-fields-reader",
+                "stored fields reader codec implementation",
+                List.of("StoredFieldsReader"),
+                List.of("StoredFieldsWriter", "Lucene90StoredFieldsFormat"),
+                "proximity",
+                "StoredFieldsReader splits to 'stored fields reader' — exact phrase in className; " +
+                "'stored' and 'fields' appear throughout Lucene making OR results noisy; " +
+                "phrase match on className should rank StoredFieldsReader at rank 1"
+            ),
+
+            new LuceneQueryCase(
+                "top-field-collector",
+                "top field docs collector sort by field value",
+                List.of("TopFieldCollector"),
+                List.of("TopFieldDocs", "SortField", "FieldValueHitQueue"),
+                "proximity",
+                "TopFieldCollector splits to 'top field collector'; 'top', 'field', 'collector', " +
+                "'sort' all appear independently in many Lucene classes; phrase 'top field collector' " +
+                "on className should suppress unrelated collectors"
             )
         );
     }
@@ -608,6 +643,25 @@ class LuceneSearchQualityTest {
         assertThat(hyMrr)
                 .as("Hybrid semantic MRR (%.3f) must be >= keyword (%.3f) − 0.15".formatted(hyMrr, kwMrr))
                 .isGreaterThanOrEqualTo(kwMrr - 0.15);
+    }
+
+    /**
+     * Proximity keyword MRR &ge; 0.40.
+     *
+     * <p>These queries are phrased so that the target class/method name is the exact
+     * concatenation of the query tokens (e.g. "top field collector" → TopFieldCollector).
+     * Plain OR retrieval is noisy because each token appears independently in many classes.
+     * Phrase boosting must lift the exact-name match into the top-3 on average.
+     */
+    @Test
+    @Order(10)
+    void regression_proximity_keyword_mrrAboveFloor() throws IOException {
+        List<LuceneQueryCase> proximity = cases().stream()
+                .filter(c -> "proximity".equals(c.category())).toList();
+        double mrr = aggregate(proximity, false)[0];
+        assertThat(mrr)
+                .as("Proximity keyword MRR must be >= 0.40; got %.3f — phrase boost required".formatted(mrr))
+                .isGreaterThanOrEqualTo(0.40);
     }
 
     // ── Vector score distribution diagnostic ─────────────────────────────────

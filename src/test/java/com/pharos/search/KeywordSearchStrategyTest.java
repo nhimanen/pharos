@@ -34,7 +34,10 @@ class KeywordSearchStrategyTest {
     @BeforeEach
     void setUp() throws IOException {
         dir = new ByteBuffersDirectory();
-        strategy = new KeywordSearchStrategy();
+        // Use a tempDir-relative path so no synonyms file is loaded — prevents the
+        // production ~/.pharos/synonyms.txt from expanding query terms and making
+        // scoring tests non-deterministic.
+        strategy = new KeywordSearchStrategy(tempDir.resolve("synonyms.txt"));
     }
 
     @AfterEach
@@ -297,6 +300,107 @@ class KeywordSearchStrategyTest {
         List<SearchResult> second = s.search(reader, SearchRequest.keyword("arithmetic", "proj", 10));
         assertThat(second).isNotEmpty();
         assertThat(second.get(0).methodName()).isEqualTo("multiply");
+    }
+
+    // --- 3-stage proximity ranking ---
+
+    /**
+     * Doc B has two of the three query terms in the high-boost methodName field (4× each),
+     * giving it a strong OR score but failing the AND clause (missing "segment").
+     * Doc A has all three terms adjacent in javadoc: AND and phrase SHOULD clauses combined
+     * must overcome Doc B's methodName advantage.
+     *
+     * Before 3-stage scoring Doc B wins via OR alone.
+     * After: Doc A gets AND bonus (all terms present) + phrase bonus (terms adjacent) → wins.
+     */
+    @Test
+    void search_phraseMatch_ranksAboveScatteredTerms() throws IOException {
+        // Doc B (written first): "merge" + "result" in methodName (4× boost, 2 of 3 terms).
+        // AND fails (missing "segment"); phrase fails for the same reason.
+        writeMethod("proj", "Alpha", "mergeResult",
+                "public void mergeResult()",
+                "perform work",
+                null, 0);
+        // Doc A (written second): all three terms adjacent in javadoc → AND + phrase both fire.
+        writeMethod("proj", "Beta", "handle",
+                "public void handle()",
+                "handle work",
+                "merge segment result process", 0);
+        openReader();
+
+        List<SearchResult> results = search("merge segment result", "proj");
+
+        assertThat(results).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(results.get(0).methodName()).isEqualTo("handle");
+    }
+
+    /**
+     * Variant with a different partial-match pattern: Doc B has two query terms split across
+     * methodName (merge) and className (segment), while Doc A has all three in javadoc.
+     * The min-should-match SHOULD clause tips the balance once all terms are present.
+     */
+    @Test
+    void search_allTermsPresentAndAdjacent_outranksHighBoostPartialMatch() throws IOException {
+        // "merge" + "segment" appear across methodName/className (high boost) but "result" absent.
+        writeMethod("proj", "SegmentManager", "mergeItems",
+                "public void mergeItems()",
+                "perform work",
+                null, 0);
+        // All three terms adjacent in javadoc → min-should-match + phrase both fire.
+        writeMethod("proj", "Compactor", "compact",
+                "public void compact()",
+                "handle work",
+                "merge segment result process", 0);
+        openReader();
+
+        List<SearchResult> results = search("merge segment result", "proj");
+
+        assertThat(results).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(results.get(0).methodName()).isEqualTo("compact");
+    }
+
+    /**
+     * 4-token query: min-should-match floor is ceil(4 * 0.75) = 3.
+     * Doc A has all 4 tokens; Doc B has only 1 token in a high-boost field.
+     * Doc A must rank first via the middle tier even though Doc B has a field-boost advantage.
+     */
+    @Test
+    void search_minShouldMatch_fourTermQuery_threeOfFourRequired() throws IOException {
+        // Doc B: only "index" in methodName (4× boost) — misses "writer", "commit", "flush".
+        writeMethod("proj", "Repository", "indexItems",
+                "public void indexItems()",
+                "perform work",
+                null, 0);
+        // Doc A: all 4 terms in javadoc → min-should-match fires (4/4 ≥ 3 required).
+        writeMethod("proj", "IndexManager", "manage",
+                "public void manage()",
+                "handle work",
+                "index writer commit flush operations", 0);
+        openReader();
+
+        List<SearchResult> results = search("index writer commit flush", "proj");
+
+        assertThat(results).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(results.get(0).methodName()).isEqualTo("manage");
+    }
+
+    /**
+     * Regression: the OR base tier must still return documents that miss one query term.
+     * Adding phrase and AND as SHOULD (not MUST) must not filter out partial matches.
+     */
+    @Test
+    void search_orFallback_returnsDocWithPartialTermMatch() throws IOException {
+        writeMethod("proj", "Validator", "validateSchema",
+                "public void validateSchema()",
+                "check structure",
+                "validate schema document", 0);
+        openReader();
+
+        // "xml" is absent from the document — OR fallback must still return it on "validate"+"schema"
+        List<SearchResult> results = search("validate xml schema", "proj");
+
+        assertThat(results).isNotEmpty();
+        assertThat(results.get(0).methodName()).isEqualTo("validateSchema");
     }
 
     // --- helpers ---

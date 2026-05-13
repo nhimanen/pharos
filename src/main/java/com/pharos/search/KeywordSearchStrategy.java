@@ -4,11 +4,14 @@ import com.pharos.config.IndexConfig;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.queryparser.classic.MultiFieldQueryParser;
 import org.apache.lucene.queryparser.classic.ParseException;
+import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
@@ -57,6 +60,45 @@ public class KeywordSearchStrategy {
      * called. Keeps relevance dominant while surfacing hub methods.
      */
     private static final float GRAPH_BOOST_WEIGHT = 0.3f;
+
+    /**
+     * Score multiplier applied to the min-should-match-tier SHOULD clause.
+     * A document that contains at least {@code ceil(n * MIN_MATCH_RATIO)} of the n query tokens
+     * gets this bonus on top of the base OR score.
+     */
+    private static final float MIN_MATCH_BOOST = 1.5f;
+
+    /**
+     * Fraction of query tokens that must be present for the middle tier to fire.
+     * 0.75 → for a 4-token query, 3 tokens required; for 3 tokens, all 3 required.
+     * Floored at 2 so a 2-token query always requires both terms.
+     */
+    private static final float MIN_MATCH_RATIO = 0.75f;
+
+    /**
+     * Score multiplier applied to the phrase-tier SHOULD clause (terms adjacent/near each other).
+     * A document where query tokens appear consecutively (within PHRASE_SLOP positions) in a
+     * key field gets this bonus, making it rank above equally-relevant but scattered matches.
+     */
+    private static final float PHRASE_BOOST = 3.0f;
+
+    /**
+     * Maximum edit distance (position swaps) allowed in the phrase query.
+     * slop=2 tolerates stop-word gaps (e.g. "find by email" → positions 0,1,3 after stop removal,
+     * distance=1) without accepting reversed-order matches (which need ≥3 swaps for 3-term queries).
+     */
+    private static final int PHRASE_SLOP = 2;
+
+    /**
+     * Fields on which phrase queries are built — high-signal, relatively short fields where
+     * term adjacency is meaningful. Body is excluded: it's too long and noisy for phrase scoring.
+     */
+    private static final String[] PHRASE_FIELDS = {
+            DocumentMapper.F_METHOD_NAME,
+            DocumentMapper.F_CLASS_NAME,
+            DocumentMapper.F_JAVADOC,
+            DocumentMapper.F_SIGNATURE,
+    };
 
     /**
      * Per-field BM25 similarities. Different k1/b values reflect how each field
@@ -163,11 +205,48 @@ public class KeywordSearchStrategy {
 
         Query query;
         try {
-            MultiFieldQueryParser parser = new MultiFieldQueryParser(SEARCH_FIELDS, analyzer, FIELD_BOOSTS);
-            parser.setDefaultOperator(org.apache.lucene.queryparser.classic.QueryParser.Operator.OR);
-            // Escape special chars that might cause parse errors
             String escaped = MultiFieldQueryParser.escape(req.query());
-            query = parser.parse(escaped);
+
+            // Stage 3 (base): OR — any term matches; provides recall for partial queries.
+            MultiFieldQueryParser orParser = new MultiFieldQueryParser(SEARCH_FIELDS, analyzer, FIELD_BOOSTS);
+            orParser.setDefaultOperator(QueryParser.Operator.OR);
+            Query orQuery = orParser.parse(escaped);
+
+            List<String> terms = analyzeTerms(req.query());
+            if (terms.size() >= 2) {
+                // Stage 2: min-should-match — ceil(n * 0.75) tokens must be present somewhere.
+                // Built per-token so each token expands across all fields with its boost,
+                // avoiding the multi-token callerContext phrase-query artifact from a bulk parse.
+                BooleanQuery.Builder minMatchBuilder = new BooleanQuery.Builder();
+                MultiFieldQueryParser perTermParser =
+                        new MultiFieldQueryParser(SEARCH_FIELDS, analyzer, FIELD_BOOSTS);
+                perTermParser.setDefaultOperator(QueryParser.Operator.OR);
+                for (String term : terms) {
+                    try {
+                        minMatchBuilder.add(
+                                perTermParser.parse(MultiFieldQueryParser.escape(term)),
+                                BooleanClause.Occur.SHOULD);
+                    } catch (ParseException e) {
+                        log.warn("Per-term parse error for '{}': {}", term, e.getMessage());
+                    }
+                }
+                int minMatch = Math.max(2, (int) Math.ceil(terms.size() * MIN_MATCH_RATIO));
+                minMatchBuilder.setMinimumNumberShouldMatch(minMatch);
+                Query minMatchQuery = minMatchBuilder.build();
+
+                // Stage 1: Phrase — terms appear close together in a key field; highest bonus.
+                Query phraseQuery = buildPhraseQuery(terms);
+
+                BooleanQuery.Builder tiered = new BooleanQuery.Builder();
+                tiered.add(orQuery, BooleanClause.Occur.SHOULD);
+                tiered.add(new BoostQuery(minMatchQuery, MIN_MATCH_BOOST), BooleanClause.Occur.SHOULD);
+                if (phraseQuery != null) {
+                    tiered.add(new BoostQuery(phraseQuery, PHRASE_BOOST), BooleanClause.Occur.SHOULD);
+                }
+                query = tiered.build();
+            } else {
+                query = orQuery;
+            }
         } catch (ParseException e) {
             log.warn("Query parse error: {}", e.getMessage());
             return List.of();
@@ -190,6 +269,46 @@ public class KeywordSearchStrategy {
 
         TopDocs hits = searcher.search(query, req.limit());
         return toResults(searcher, hits, "keyword");
+    }
+
+    /**
+     * Runs the query analyzer over {@code text} and returns the resulting tokens.
+     * Used to build per-term AND and phrase queries from the raw query string.
+     */
+    private List<String> analyzeTerms(String text) {
+        List<String> terms = new ArrayList<>();
+        try (TokenStream ts = analyzer.tokenStream(DocumentMapper.F_BODY, text)) {
+            CharTermAttribute attr = ts.addAttribute(CharTermAttribute.class);
+            ts.reset();
+            while (ts.incrementToken()) {
+                terms.add(attr.toString());
+            }
+            ts.end();
+        } catch (IOException e) {
+            log.warn("Term analysis failed: {}", e.getMessage());
+        }
+        return terms;
+    }
+
+    /**
+     * Builds a phrase query across PHRASE_FIELDS — each field becomes a SHOULD clause
+     * so matching any single field earns the phrase bonus.
+     *
+     * Returns null if fewer than 2 terms are provided (phrase is undefined for 1 term).
+     */
+    private Query buildPhraseQuery(List<String> terms) {
+        if (terms.size() < 2) return null;
+        BooleanQuery.Builder phraseBuilder = new BooleanQuery.Builder();
+        for (String field : PHRASE_FIELDS) {
+            PhraseQuery.Builder pqb = new PhraseQuery.Builder();
+            pqb.setSlop(PHRASE_SLOP);
+            for (int i = 0; i < terms.size(); i++) {
+                pqb.add(new Term(field, terms.get(i)), i);
+            }
+            float fieldBoost = FIELD_BOOSTS.getOrDefault(field, 1.0f);
+            phraseBuilder.add(new BoostQuery(pqb.build(), fieldBoost), BooleanClause.Occur.SHOULD);
+        }
+        return phraseBuilder.build();
     }
 
     public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits, String type) throws IOException {
