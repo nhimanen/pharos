@@ -14,6 +14,7 @@ import picocli.CommandLine.*;
                 SearchCommand.class,
                 CallersCommand.class,
                 CalleesCommand.class,
+                GetClassCommand.class,
                 PathCommand.class,
                 ProjectsCommand.class,
                 LinkCommand.class,

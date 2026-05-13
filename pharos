@@ -169,6 +169,26 @@ def fmt_method(r: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_class(r: dict) -> str:
+    if not r:
+        return "Class not found."
+    label = r.get("label", r.get("qualifiedClassName", "?"))
+    project = r.get("project", "")
+    body = r.get("body", "")
+    fp = r.get("filePath", "")
+    start = r.get("startLine", "")
+    end = r.get("endLine", "")
+    source_available = r.get("sourceAvailable", True)
+
+    lines = [f"**{label}** [{project}]"]
+    if not source_available:
+        lines.append("\n*(source file unavailable — showing indexed synthesis)*")
+    lines.append(f"\n```java\n{body}\n```")
+    if fp:
+        lines.append(f"\n`{fp}:{start}-{end}`")
+    return "\n".join(lines)
+
+
 def _truncate(items: list, limit: int) -> tuple:
     """Return (visible_items, truncated_count). limit=0 means no cap."""
     if limit > 0 and len(items) > limit:
@@ -436,6 +456,12 @@ def cmd_method(args):
     ensure_daemon()
     data = _api_get("/api/method", {"fqn": args.fqn})
     print(fmt_method(data))
+
+
+def cmd_class(args):
+    ensure_daemon()
+    data = _api_get("/api/class", {"fqn": args.fqn})
+    print(fmt_class(data))
 
 
 def cmd_callers(args):
@@ -738,6 +764,30 @@ EXAMPLES
     )
     p_method.add_argument("fqn", help="Fully qualified method name")
     p_method.set_defaults(func=cmd_method)
+
+    # class
+    p_class = sub.add_parser(
+        "class",
+        help="Get full class body (fields, enum constants, class-level annotations) by qualified name",
+        description="""\
+Retrieve the full source of a class — including class-level annotations,
+field declarations with initializers, enum constants, and nested types —
+by its qualified name.
+
+The body is sliced directly from the source file at the indexed line range,
+so it captures everything the file contains, not just what was indexed.
+
+QUALIFIED NAME FORMAT
+  com.example.MyClass
+
+EXAMPLES
+  pharos class "com.pharos.search.SearchEngine"
+  pharos class "com.example.MyEnum"
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_class.add_argument("fqn", help="Qualified class name (e.g. com.example.MyClass)")
+    p_class.set_defaults(func=cmd_class)
 
     # callers
     p_callers = sub.add_parser(

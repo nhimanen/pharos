@@ -391,6 +391,23 @@ public class SearchEngine {
 
     /** Look up a method by its exact FQN (e.g., "com.example.MyClass#myMethod(String,int)"). */
     public SearchResult getMethodByFqn(String fqn) throws IOException {
+        return getByFqn(fqn);
+    }
+
+    /**
+     * Look up a class by its qualified name (e.g., "com.example.MyClass").
+     * Returns the class document if it was indexed (docType="class"), else null.
+     * The returned {@link SearchResult} carries the file path and line range; callers
+     * that need the full source body (including field initializers and enum constants
+     * that aren't individually indexed) should read the file slice themselves.
+     */
+    public SearchResult getClassByFqn(String qualifiedClassName) throws IOException {
+        SearchResult r = getByFqn(qualifiedClassName);
+        if (r == null || !"class".equals(r.docType())) return null;
+        return r;
+    }
+
+    private SearchResult getByFqn(String fqn) throws IOException {
         List<String> projects = registry.listAll().stream()
                 .map(ProjectMeta::getName)
                 .collect(Collectors.toList());
@@ -399,8 +416,7 @@ public class SearchEngine {
         IndexReader reader = luceneIndexer.openMultiReader(projects);
         IndexSearcher searcher = new IndexSearcher(reader);
 
-        // Search across all projects by matching the FQN suffix of the id field
-        // id format: "projectName:fqn" — search all projects
+        // id format: "projectName:fqn" — search across all projects for an exact match
         for (String project : projects) {
             String id = project + ":" + fqn;
             TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_ID, id)), 1);

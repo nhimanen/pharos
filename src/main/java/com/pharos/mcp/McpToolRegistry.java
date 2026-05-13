@@ -11,6 +11,7 @@ import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResponse;
 import com.pharos.search.SearchResult;
+import com.pharos.search.SourceReader;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -30,6 +31,7 @@ import java.util.stream.Collectors;
  * - find_call_path:  shortest path between two methods
  * - list_projects:   show indexed projects
  * - get_method:      retrieve full method body by FQN
+ * - get_class:       retrieve full class body (fields, enum constants, annotations) by FQN
  */
 public class McpToolRegistry {
 
@@ -94,6 +96,10 @@ public class McpToolRegistry {
                         "Retrieve full method body and context by fully qualified name",
                         Map.of("fqn", Map.of("type", "string", "description", "Fully qualified method: com.example.MyClass#myMethod(String,int)")),
                         List.of("fqn")),
+                toolDef("get_class",
+                        "Retrieve full class body (fields, enum constants, class-level annotations, nested types) by qualified class name",
+                        Map.of("fqn", Map.of("type", "string", "description", "Qualified class name: com.example.MyClass")),
+                        List.of("fqn")),
 
                 // Module-level graph tools
                 toolDef("list_modules",
@@ -136,6 +142,7 @@ public class McpToolRegistry {
             case "find_call_path"  -> callFindCallPath(args);
             case "list_projects"   -> callListProjects();
             case "get_method"          -> callGetMethod(args);
+            case "get_class"           -> callGetClass(args);
             case "list_modules"        -> callListModules(args);
             case "get_module_deps"     -> callGetModuleDeps(args);
             case "find_module_path"    -> callFindModulePath(args);
@@ -249,6 +256,22 @@ public class McpToolRegistry {
         if (result == null) return "Method not found: " + fqn;
         return String.format("**%s** [%s]\n\n```java\n%s\n```\n\n`%s:%d-%d`",
                 result.label(), result.project(), result.body(),
+                result.filePath(), result.startLine(), result.endLine());
+    }
+
+    private String callGetClass(JsonNode args) throws Exception {
+        String fqn = args.path("fqn").asText();
+        SearchResult result = searchEngine.getClassByFqn(fqn);
+        if (result == null) return "Class not found: " + fqn;
+        String body = SourceReader.readRange(result.filePath(), result.startLine(), result.endLine());
+        if (body == null) {
+            // Fallback: file not readable — emit the synthesized body the index stored
+            body = result.body() != null
+                    ? "// source file unavailable; indexed body follows\n" + result.body()
+                    : "// source file unavailable";
+        }
+        return String.format("**%s** [%s]\n\n```java\n%s\n```\n\n`%s:%d-%d`",
+                result.label(), result.project(), body,
                 result.filePath(), result.startLine(), result.endLine());
     }
 

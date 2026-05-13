@@ -136,6 +136,17 @@ public class WebServer {
             ctx.json(methodToMap(r));
         });
 
+        // API: single class by qualified name — body is sliced from the source file
+        // to include fields, enum constants and class-level annotations that aren't
+        // individually indexed.
+        app.get("/api/class", ctx -> {
+            String fqn = ctx.queryParam("fqn");
+            if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            SearchResult r = searchEngine.getClassByFqn(fqn);
+            if (r == null) { ctx.status(404).result("Not found"); return; }
+            ctx.json(classToMap(r));
+        });
+
         // API: callers of a method
         app.get("/api/callers", ctx -> {
             String fqn = ctx.queryParam("fqn");
@@ -685,6 +696,19 @@ public class WebServer {
         m.put("returnType", r.returnType());
         m.put("body", r.body());
         m.put("accessModifier", r.accessModifier());
+        return m;
+    }
+
+    private Map<String, Object> classToMap(SearchResult r) {
+        Map<String, Object> m = resultToMap(r);
+        m.put("packageName", r.packageName());
+        m.put("className", r.className());
+        m.put("qualifiedClassName", r.qualifiedClassName());
+        m.put("accessModifier", r.accessModifier());
+        String sourceBody = SourceReader.readRange(r.filePath(), r.startLine(), r.endLine());
+        // Fall back to the index's synthesized body if the source file isn't readable
+        m.put("body", sourceBody != null ? sourceBody : r.body());
+        m.put("sourceAvailable", sourceBody != null);
         return m;
     }
 

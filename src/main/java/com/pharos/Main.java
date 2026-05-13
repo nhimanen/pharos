@@ -106,6 +106,8 @@ public class Main {
                 return (K) new CallersCommand(searchEngine, registry, config);
             if (cls == CalleesCommand.class)
                 return (K) new CalleesCommand(searchEngine, registry, config);
+            if (cls == GetClassCommand.class)
+                return (K) new GetClassCommand(searchEngine);
             if (cls == PathCommand.class)
                 return (K) new PathCommand(registry, config);
             if (cls == ProjectsCommand.class)
