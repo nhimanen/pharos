@@ -996,7 +996,7 @@ class LuceneSearchQualityTest {
             IrMetrics.RelevanceMap rel = qc.relevanceMap();
             // Fetch 100 method-level hits to get good class coverage
             List<SearchResult> vec = searchEngine.search(new SearchRequest(
-                    qc.query(), SearchRequest.SearchType.VECTOR, "lucene", null, 100, "text", "method"));
+                    qc.query(), SearchRequest.SearchType.VECTOR, "lucene", null, 100, "text", "method", null));
 
             // Group scores by class
             java.util.Map<String, List<Float>> scoresByClass = new java.util.LinkedHashMap<>();
@@ -1222,7 +1222,7 @@ class LuceneSearchQualityTest {
 
     private List<SearchResult> searchVector(String query) throws IOException {
         return searchEngine.search(new SearchRequest(query, SearchRequest.SearchType.VECTOR,
-                "lucene", null, 20, "text", null));
+                "lucene", null, 20, "text", null, null));
     }
 
     /**

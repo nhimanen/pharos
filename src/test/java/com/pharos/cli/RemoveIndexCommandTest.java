@@ -3,10 +3,12 @@ package com.pharos.cli;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.embedding.NoOpEmbeddingProvider;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.graph.ModuleNodeData;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.indexer.ProjectIndexManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,7 +36,7 @@ class RemoveIndexCommandTest {
     private TestRegistry registry;
     private LuceneIndexer luceneIndexer;
     private TestModuleGraphBuilder moduleGraphBuilder;
-
+    private ProjectIndexManager indexManager;
 
     @BeforeEach
     void setUp() {
@@ -43,6 +45,8 @@ class RemoveIndexCommandTest {
         registry = new TestRegistry();
         luceneIndexer = new LuceneIndexer(config);
         moduleGraphBuilder = new TestModuleGraphBuilder(registry, tempDir);
+        indexManager = new ProjectIndexManager(config, luceneIndexer, registry,
+                new NoOpEmbeddingProvider(), moduleGraphBuilder);
     }
 
     // --- exit codes ---
@@ -190,7 +194,7 @@ class RemoveIndexCommandTest {
     // --- helpers ---
 
     private int run(String projectName) {
-        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, luceneIndexer, moduleGraphBuilder);
+        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager);
         return new CommandLine(cmd).execute(projectName);
     }
 

@@ -49,6 +49,11 @@ public class SearchCommand implements Callable<Integer> {
             defaultValue = "all")
     private String docType;
 
+    @Option(names = {"--scope"},
+            description = "Filter by source scope: prod | test | docs | all (default: all)",
+            defaultValue = "all")
+    private String scope;
+
     private final SearchEngine searchEngine;
 
     public SearchCommand(SearchEngine searchEngine) {
@@ -59,9 +64,10 @@ public class SearchCommand implements Callable<Integer> {
     public Integer call() {
         try {
             String resolvedDocType = "all".equalsIgnoreCase(docType) ? null : docType;
+            String resolvedScope   = "all".equalsIgnoreCase(scope)   ? null : scope;
             SearchRequest req = new SearchRequest(
                     query, SearchRequest.SearchType.from(type),
-                    project, null, limit, format, resolvedDocType);
+                    project, null, limit, format, resolvedDocType, resolvedScope);
 
             SearchResponse response = searchEngine.searchWithTrace(req, expand);
             List<SearchResult> results = response.results();

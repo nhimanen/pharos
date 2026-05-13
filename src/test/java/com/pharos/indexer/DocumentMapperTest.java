@@ -204,6 +204,33 @@ class DocumentMapperTest {
         );
     }
 
+    // --- computeScope ---
+
+    @Test
+    void computeScope_prodForMainJava() {
+        assertThat(DocumentMapper.computeScope("/src/main/java/com/example/Foo.java", false)).isEqualTo("prod");
+    }
+
+    @Test
+    void computeScope_testForSrcTestPath() {
+        assertThat(DocumentMapper.computeScope("/src/test/java/com/example/FooTest.java", false)).isEqualTo("test");
+    }
+
+    @Test
+    void computeScope_testForBenchmarkPath() {
+        assertThat(DocumentMapper.computeScope("/benchmark/com/example/Bench.java", false)).isEqualTo("test");
+    }
+
+    @Test
+    void computeScope_docsForMarkdown() {
+        assertThat(DocumentMapper.computeScope("/README.md", false)).isEqualTo("docs");
+    }
+
+    @Test
+    void computeScope_docsForChunkAnnotation() {
+        assertThat(DocumentMapper.computeScope("/src/main/java/Foo.java", true)).isEqualTo("docs");
+    }
+
     private static ParsedClass testClass() {
         return new ParsedClass(
                 PROJECT, "com.example", "Calculator", "com.example.Calculator",

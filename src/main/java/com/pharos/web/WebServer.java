@@ -115,9 +115,11 @@ public class WebServer {
             int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(20);
             String docType = ctx.queryParam("docType");
             if ("all".equals(docType)) docType = null;
+            String scope = ctx.queryParam("scope");
+            if ("all".equals(scope)) scope = null;
             if (project != null && project.isBlank()) project = null;
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
-                    project, null, limit, "text", docType);
+                    project, null, limit, "text", docType, scope);
             try {
                 ctx.json(searchEngine.search(req).stream()
                         .map(this::resultToMap).collect(Collectors.toList()));

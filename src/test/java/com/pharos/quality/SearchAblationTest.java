@@ -265,7 +265,7 @@ class SearchAblationTest {
     private static SearchRequest methodRequest(String query) {
         return new SearchRequest(
                 query, SearchRequest.SearchType.KEYWORD,
-                SearchQualityDataset.PROJECT, null, 20, "text", "method");
+                SearchQualityDataset.PROJECT, null, 20, "text", "method", null);
     }
 
     @FunctionalInterface

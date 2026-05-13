@@ -133,7 +133,7 @@ public class SearchEngine {
         QueryHints hints = parseQueryHints(req.query(), knownProjects);
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
-                    req.projects(), req.limit(), req.outputFormat(), req.docType());
+                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope());
             log.debug("Query rewritten: '{}' → project={} lang={} query='{}'",
                     hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
         }

@@ -252,7 +252,7 @@ public class KeywordSearchStrategy {
             return List.of();
         }
 
-        // Optional project + docType filters
+        // Optional project + docType + scope filters
         BooleanQuery.Builder filtered = new BooleanQuery.Builder().add(query, BooleanClause.Occur.MUST);
         boolean hasFilter = false;
         if (req.project() != null && !req.project().isEmpty()) {
@@ -262,6 +262,11 @@ public class KeywordSearchStrategy {
         }
         if (req.docType() != null && !req.docType().isEmpty()) {
             filtered.add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, req.docType())),
+                    BooleanClause.Occur.FILTER);
+            hasFilter = true;
+        }
+        if (req.scope() != null && !req.scope().isEmpty()) {
+            filtered.add(new TermQuery(new Term(DocumentMapper.F_SCOPE, req.scope())),
                     BooleanClause.Occur.FILTER);
             hasFilter = true;
         }

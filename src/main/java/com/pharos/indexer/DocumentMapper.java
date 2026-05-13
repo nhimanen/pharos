@@ -48,6 +48,12 @@ public class DocumentMapper {
      */
     public static final String F_DOC_TYPE          = "docType";
 
+    /**
+     * Source scope of the document.
+     * Values: "prod" (production Java), "test" (test/benchmark Java), "docs" (non-Java files)
+     */
+    public static final String F_SCOPE             = "scope";
+
     // Graph-derived fields (populated during two-pass indexing)
     /** Number of methods that call this method — used for graph-boosted ranking. */
     public static final String F_IN_DEGREE         = "inDegree";
@@ -59,6 +65,23 @@ public class DocumentMapper {
     public static final String F_CALLER_CONTEXT    = "callerContext";
 
     private DocumentMapper() {}
+
+    /**
+     * Classifies a file path into one of three scopes:
+     *   "docs" — non-Java files (markdown, config, shell scripts)
+     *   "test" — Java test or benchmark sources
+     *   "prod" — everything else (production Java)
+     */
+    static String computeScope(String filePath, boolean isChunk) {
+        if (isChunk) return "docs";
+        if (filePath == null) return "prod";
+        String p = filePath.replace('\\', '/');
+        if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".yml")
+                || p.endsWith(".yaml") || p.endsWith(".sh") || p.endsWith(".xml")) return "docs";
+        if (p.contains("/src/test/") || p.contains("/test/")
+                || p.contains("/benchmark/") || p.contains("/jmh/")) return "test";
+        return "prod";
+    }
 
     /**
      * Converts a ParsedMethod to a Lucene Document.
@@ -76,6 +99,7 @@ public class DocumentMapper {
         // Chunks (generic file sections) are identified by the __chunk__ annotation
         boolean isChunk = method.annotations() != null && method.annotations().contains("__chunk__");
         doc.add(new StringField(F_DOC_TYPE, isChunk ? "chunk" : "method", Field.Store.YES));
+        doc.add(new StringField(F_SCOPE, computeScope(method.filePath(), isChunk), Field.Store.YES));
 
         // --- Exact match fields (StringField: stored, not tokenized) ---
         doc.add(new StringField(F_ID, method.id(), Field.Store.YES));
@@ -267,6 +291,7 @@ public class DocumentMapper {
 
         // --- Document type discriminator ---
         doc.add(new StringField(F_DOC_TYPE, "class", Field.Store.YES));
+        doc.add(new StringField(F_SCOPE, computeScope(nvl(cls.filePath()), false), Field.Store.YES));
 
         // --- ID: "project:qualifiedClassName" ---
         String id = cls.projectName() + ":" + cls.qualifiedClassName();

@@ -12,7 +12,8 @@ public record SearchRequest(
         List<String> projects, // explicit list of projects (null = all from registry)
         int limit,
         String outputFormat,   // "text" or "json"
-        String docType         // null = all, "method", "class"
+        String docType,        // null = all, "method", "class", "chunk"
+        String scope           // null = all, "prod", "test", "docs"
 ) {
     public enum SearchType {
         KEYWORD, VECTOR, HYBRID;
@@ -28,10 +29,10 @@ public record SearchRequest(
     }
 
     public static SearchRequest keyword(String query, String project, int limit) {
-        return new SearchRequest(query, SearchType.KEYWORD, project, null, limit, "text", null);
+        return new SearchRequest(query, SearchType.KEYWORD, project, null, limit, "text", null, null);
     }
 
     public static SearchRequest hybrid(String query, String project, int limit) {
-        return new SearchRequest(query, SearchType.HYBRID, project, null, limit, "text", null);
+        return new SearchRequest(query, SearchType.HYBRID, project, null, limit, "text", null, null);
     }
 }

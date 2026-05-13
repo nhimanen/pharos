@@ -187,7 +187,7 @@ class SearchIndexIntegrationTest {
     @Test
     void search_methodFilter_excludesClassDocuments() throws IOException {
         SearchRequest req = new SearchRequest("name email user", SearchRequest.SearchType.KEYWORD,
-                PROJECT, null, 20, "text", "method");
+                PROJECT, null, 20, "text", "method", null);
         List<SearchResult> results = strategy.search(reader, req);
 
         assertThat(results).allMatch(r -> "method".equals(r.docType()));
@@ -215,13 +215,13 @@ class SearchIndexIntegrationTest {
 
     private List<SearchResult> searchMethods(String query, int limit) throws IOException {
         SearchRequest req = new SearchRequest(query, SearchRequest.SearchType.KEYWORD,
-                PROJECT, null, limit, "text", "method");
+                PROJECT, null, limit, "text", "method", null);
         return strategy.search(reader, req);
     }
 
     private List<SearchResult> searchClasses(String query, int limit) throws IOException {
         SearchRequest req = new SearchRequest(query, SearchRequest.SearchType.KEYWORD,
-                PROJECT, null, limit, "text", "class");
+                PROJECT, null, limit, "text", "class", null);
         return strategy.search(reader, req);
     }
 

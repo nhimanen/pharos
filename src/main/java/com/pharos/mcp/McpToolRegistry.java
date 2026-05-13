@@ -70,7 +70,8 @@ public class McpToolRegistry {
                                 "project", Map.of("type", "string", "description", "Restrict search to a specific project (optional)"),
                                 "limit", Map.of("type", "integer", "description", "Maximum results (default: 10)"),
                                 "expand", Map.of("type", "boolean", "description", "Append callee methods of top-3 hits as related results (default: false)"),
-                                "doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)")
+                                "doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)"),
+                                "scope", Map.of("type", "string", "enum", List.of("prod", "test", "docs", "all"), "description", "Filter by source scope: prod (production Java), test (test/benchmark), docs (non-Java files), or all (default: all)")
                         ),
                         List.of("query")),
                 toolDef("get_callers",
@@ -159,11 +160,13 @@ public class McpToolRegistry {
         boolean expand = args.path("expand").asBoolean(false);
         String docTypeRaw = args.path("doc_type").asText("all");
         String docType = "all".equals(docTypeRaw) ? null : docTypeRaw;
+        String scopeRaw = args.path("scope").asText("all");
+        String scope = "all".equals(scopeRaw) ? null : scopeRaw;
 
         if (project != null && project.isEmpty()) project = null;
 
         SearchRequest req = new SearchRequest(
-                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType);
+                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope);
         SearchResponse response = searchEngine.searchWithTrace(req, expand);
         List<SearchResult> results = response.results();
         if (log.isDebugEnabled()) {

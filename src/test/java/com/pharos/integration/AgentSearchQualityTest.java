@@ -245,7 +245,7 @@ class AgentSearchQualityTest {
                 SearchRequest.keyword(scenario.nlQuery(), "lucene", 20));
         List<SearchResult> hybridResults = searchEngine.search(new SearchRequest(
                 scenario.nlQuery(), SearchRequest.SearchType.HYBRID,
-                "lucene", null, 20, "text", null));
+                "lucene", null, 20, "text", null, null));
 
         long kwHits     = countHits(kwResults,     scenario.expectedClasses());
         long hybridHits = countHits(hybridResults, scenario.expectedClasses());
@@ -323,7 +323,7 @@ class AgentSearchQualityTest {
             List<SearchResult> kwRes = searchEngine.search(
                     SearchRequest.keyword(s.nlQuery(), "lucene", 20));
             List<SearchResult> hybridRes = searchEngine.search(new SearchRequest(
-                    s.nlQuery(), SearchRequest.SearchType.HYBRID, "lucene", null, 20, "text", null));
+                    s.nlQuery(), SearchRequest.SearchType.HYBRID, "lucene", null, 20, "text", null, null));
 
             long kwHits     = countHits(kwRes, s.expectedClasses());
             long hybridHits = countHits(hybridRes, s.expectedClasses());

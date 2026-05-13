@@ -8,6 +8,7 @@ import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.graph.CallGraphBuilder;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CrossProjectLinker;
+import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.JavaCodeParser;
@@ -106,6 +107,52 @@ public class ProjectIndexManager {
     }
 
     /**
+     * Removes all data associated with a project:
+     * <ol>
+     *   <li>Downgrades the module-graph node from INDEXED → EXTERNAL (preserves dep edges)</li>
+     *   <li>Deletes the cross-project stamp so the next link rebuilds the cross graph</li>
+     *   <li>Closes and deletes the Lucene index</li>
+     *   <li>Deletes the full project index directory (call graph, file-state, etc.)</li>
+     *   <li>Removes {@code linkedProjects} back-references from other registry entries</li>
+     *   <li>Unregisters the project from the registry</li>
+     * </ol>
+     * Safe to call when the project is not registered or has no index on disk — each step
+     * is a no-op when the resource does not exist.
+     */
+    public void removeProject(String projectName) throws IOException {
+        // 1. Downgrade module-graph node INDEXED → EXTERNAL (preserves dep edges)
+        try (ModuleGraph moduleGraph = moduleGraphBuilder.open()) {
+            moduleGraph.findByProjectName(projectName)
+                    .ifPresent(node -> moduleGraph.downgradeToExternal(node.moduleKey()));
+        } catch (Exception e) {
+            log.warn("Could not update module graph for '{}': {}", projectName, e.getMessage());
+        }
+
+        // 2. Invalidate cross-project graph so the next link rebuilds it
+        Files.deleteIfExists(IndexConfig.DEFAULT_BASE.resolve("cross-project.stamp"));
+
+        // 3. Close cached reader and delete the Lucene segment directory
+        luceneIndexer.deleteIndex(projectName);
+
+        // 4. Delete the full project index directory (callgraph, file-state, etc.)
+        Path projectDir = luceneIndexer.getProjectIndexDir(projectName);
+        if (Files.exists(projectDir)) {
+            try (var stream = Files.walk(projectDir)) {
+                stream.sorted(Comparator.reverseOrder())
+                      .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
+            }
+        }
+
+        // 5. Remove back-references in other projects' linkedProjects lists
+        registry.unlinkAll(projectName);
+
+        // 6. Remove from registry
+        registry.unregister(projectName);
+
+        log.info("Removed all data for project '{}'", projectName);
+    }
+
+    /**
      * Index a project.
      *
      * @param projectRoot        path to the project root directory
@@ -142,9 +189,9 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               ProgressListener progress) throws IOException {
-        if (force && luceneIndexer.indexExists(projectName)) {
-            log.info("Force re-index: wiping existing index for '{}'", projectName);
-            luceneIndexer.deleteIndex(projectName);
+        if (force) {
+            log.info("Force re-index: removing all project data for '{}'", projectName);
+            removeProject(projectName);
         }
 
         log.info("Starting {} index of project '{}' at {}",

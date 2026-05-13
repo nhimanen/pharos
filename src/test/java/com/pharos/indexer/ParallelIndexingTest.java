@@ -188,7 +188,7 @@ class ParallelIndexingTest {
         try (IndexReader reader = makeLuceneIndexer(config).openMultiReader(List.of("test"))) {
             for (String method : expectedMethods) {
                 SearchRequest req = new SearchRequest(method, SearchRequest.SearchType.KEYWORD,
-                        "test", null, 10, "text", "method");
+                        "test", null, 10, "text", "method", null);
                 List<SearchResult> results = strategy.search(reader, req);
                 assertThat(results)
                         .as("Method '%s' not found with indexThreads=%d", method, indexThreads)
@@ -242,7 +242,7 @@ class ParallelIndexingTest {
             for (int i = 0; i < 10; i++) {
                 String method = "onlyOnce" + i;
                 SearchRequest req = new SearchRequest(method, SearchRequest.SearchType.KEYWORD,
-                        "test", null, 50, "text", "method");
+                        "test", null, 50, "text", "method", null);
                 List<SearchResult> results = strategy.search(reader, req);
                 long matchCount = results.stream()
                         .filter(r -> method.equals(r.methodName()))

@@ -300,7 +300,7 @@ class IncrementalIndexingTest {
     private List<SearchResult> searchMethods(String query, String project) throws IOException {
         var reader = luceneIndexer.openMultiReader(List.of(project));
         SearchRequest req = new SearchRequest(query, SearchRequest.SearchType.KEYWORD,
-                project, null, 20, "text", "method");
+                project, null, 20, "text", "method", null);
         return strategy.search(reader, req);
     }
 

@@ -131,7 +131,7 @@ public class Main {
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
                         moduleGraphBuilder, luceneIndexer, boundaryAnalyzer));
             if (cls == RemoveIndexCommand.class)
-                return (K) new RemoveIndexCommand(registry, luceneIndexer, moduleGraphBuilder);
+                return (K) new RemoveIndexCommand(registry, indexManager);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

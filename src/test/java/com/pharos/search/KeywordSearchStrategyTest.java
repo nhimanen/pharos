@@ -122,7 +122,7 @@ class KeywordSearchStrategyTest {
         openReader();
 
         SearchRequest req = new SearchRequest("something", SearchRequest.SearchType.KEYWORD,
-                "proj", null, 10, "text", "method");
+                "proj", null, 10, "text", "method", null);
         List<SearchResult> results = strategy.search(reader, req);
 
         assertThat(results).isNotEmpty();
@@ -136,7 +136,7 @@ class KeywordSearchStrategyTest {
         openReader();
 
         SearchRequest req = new SearchRequest("arithmetic", SearchRequest.SearchType.KEYWORD,
-                "proj", null, 10, "text", "class");
+                "proj", null, 10, "text", "class", null);
         List<SearchResult> results = strategy.search(reader, req);
 
         assertThat(results).isNotEmpty();
@@ -150,7 +150,7 @@ class KeywordSearchStrategyTest {
         openReader();
 
         SearchRequest req = new SearchRequest("my", SearchRequest.SearchType.KEYWORD,
-                "proj", null, 10, "text", null);
+                "proj", null, 10, "text", null, null);
         List<SearchResult> results = strategy.search(reader, req);
 
         assertThat(results).anyMatch(r -> "method".equals(r.docType()));

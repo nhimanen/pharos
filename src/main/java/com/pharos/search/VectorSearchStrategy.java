@@ -55,16 +55,22 @@ public class VectorSearchStrategy {
     private static Query buildFilter(SearchRequest req) {
         boolean hasProject = req.project() != null && !req.project().isEmpty();
         boolean hasDocType = req.docType() != null && !req.docType().isEmpty();
-        if (!hasProject && !hasDocType) return null;
-        if (hasProject && !hasDocType) {
+        boolean hasScope   = req.scope()   != null && !req.scope().isEmpty();
+
+        if (!hasProject && !hasDocType && !hasScope) return null;
+
+        // Single-filter fast path
+        if (hasProject && !hasDocType && !hasScope)
             return new TermQuery(new Term(DocumentMapper.F_PROJECT, req.project()));
-        }
-        if (!hasProject) {
+        if (!hasProject && hasDocType && !hasScope)
             return new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, req.docType()));
-        }
-        return new BooleanQuery.Builder()
-                .add(new TermQuery(new Term(DocumentMapper.F_PROJECT, req.project())), BooleanClause.Occur.FILTER)
-                .add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, req.docType())), BooleanClause.Occur.FILTER)
-                .build();
+        if (!hasProject && !hasDocType)
+            return new TermQuery(new Term(DocumentMapper.F_SCOPE, req.scope()));
+
+        BooleanQuery.Builder b = new BooleanQuery.Builder();
+        if (hasProject) b.add(new TermQuery(new Term(DocumentMapper.F_PROJECT, req.project())), BooleanClause.Occur.FILTER);
+        if (hasDocType) b.add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, req.docType())), BooleanClause.Occur.FILTER);
+        if (hasScope)   b.add(new TermQuery(new Term(DocumentMapper.F_SCOPE,    req.scope())),   BooleanClause.Occur.FILTER);
+        return b.build();
     }
 }
