@@ -1,5 +1,6 @@
 package com.pharos.indexer;
 
+import com.pharos.analysis.ConceptMiner;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -32,6 +33,7 @@ class RemoveProjectIntegrationTest {
     private static final String PROJECT = "sample-project";
 
     private Path projectRoot;
+    private Path synonymsFile;
     private IndexConfig config;
     private LuceneIndexer luceneIndexer;
     private TestRegistry registry;
@@ -54,8 +56,10 @@ class RemoveProjectIntegrationTest {
                 "  public String hello(String name) { return \"Hello \" + name; }\n" +
                 "}");
 
+        synonymsFile = tempDir.resolve("synonyms.txt");
         config = IndexConfig.defaults();
         config.setIndexDir(tempDir.resolve("indexes"));
+        config.setSynonymsFile(synonymsFile);
 
         registry = new TestRegistry();
         luceneIndexer = new LuceneIndexer(config);
@@ -157,7 +161,76 @@ class RemoveProjectIntegrationTest {
                 .doesNotThrowAnyException();
     }
 
+    // --- synonym cleanup ---
+
+    @Test
+    void afterRemove_autoMinedSynonymRulesAreStripped() throws Exception {
+        indexManager.index(projectRoot, PROJECT, false, false);
+        writeSynonymRules(PROJECT, "replication   => replicationmanager",
+                                   "iterator      => luceneiterator");
+
+        indexManager.removeProject(PROJECT);
+
+        String remaining = Files.readString(synonymsFile);
+        assertThat(remaining).doesNotContain("# auto:" + PROJECT);
+        assertThat(remaining).doesNotContain("replicationmanager");
+        assertThat(remaining).doesNotContain("luceneiterator");
+    }
+
+    @Test
+    void afterRemove_synonymRulesFromOtherProjectsArePreserved() throws Exception {
+        indexManager.index(projectRoot, PROJECT, false, false);
+        writeSynonymRules(PROJECT,       "myterm        => myclass");
+        writeSynonymRules("other-proj",  "otherterm     => otherclass");
+
+        indexManager.removeProject(PROJECT);
+
+        String remaining = Files.readString(synonymsFile);
+        assertThat(remaining).contains("otherterm");
+        assertThat(remaining).contains("otherclass");
+        assertThat(remaining).doesNotContain("myterm");
+    }
+
+    @Test
+    void afterRemove_manualSynonymRulesArePreserved() throws Exception {
+        indexManager.index(projectRoot, PROJECT, false, false);
+        // Manual (no auto tag) synonym written by the user
+        Files.writeString(synonymsFile,
+                "# user-added\nbm25, okapi bm25\n",
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.APPEND);
+        writeSynonymRules(PROJECT, "autoterm => autoclass");
+
+        indexManager.removeProject(PROJECT);
+
+        String remaining = Files.readString(synonymsFile);
+        assertThat(remaining).contains("bm25, okapi bm25");
+        assertThat(remaining).doesNotContain("autoterm");
+    }
+
+    @Test
+    void afterRemove_noSynonymFile_doesNotThrow() throws Exception {
+        indexManager.index(projectRoot, PROJECT, false, false);
+        // synonymsFile was never created
+
+        assertThatCode(() -> indexManager.removeProject(PROJECT))
+                .doesNotThrowAnyException();
+    }
+
     // --- helpers ---
+
+    /** Appends a simulated auto-mined synonym section for {@code projectName}. */
+    private void writeSynonymRules(String projectName, String... rules) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%n# ── Auto-mined from '%s' on 2026-01-01 (%d rules) ─%n",
+                projectName, rules.length));
+        for (String rule : rules) {
+            sb.append(String.format("%-32s  # auto:%s:2026-01-01%n", rule, projectName));
+        }
+        Files.writeString(synonymsFile, sb.toString(),
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.APPEND);
+    }
 
     private void writeJava(String filename, String content) throws IOException {
         Path file = projectRoot.resolve("src/main/java/com/example").resolve(filename);

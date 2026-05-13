@@ -175,6 +175,7 @@ public class ConceptMiner {
         List<ClassDoc> docs = new ArrayList<>(hits.scoreDocs.length);
         for (ScoreDoc sd : hits.scoreDocs) {
             Document luceneDoc = storedFields.document(sd.doc);
+            String kind       = nvl(luceneDoc.get("kind"));
             String className  = luceneDoc.get(DocumentMapper.F_CLASS_NAME);
             String qualName   = luceneDoc.get(DocumentMapper.F_QUALIFIED_CLASS);
             String javadoc    = nvl(luceneDoc.get(DocumentMapper.F_JAVADOC));
@@ -183,6 +184,7 @@ public class ConceptMiner {
             // Combine javadoc + synthesized body as text source; javadoc is primary
             String text = javadoc.isBlank() ? body : javadoc + "\n" + body;
             if (className == null || className.isBlank()) continue;
+            if ("document".equals(kind)) continue; // skip GenericFileParser docs (non-code files)
 
             docs.add(new ClassDoc(className, qualName, javadoc, text,
                     extractLinks(javadoc)));
@@ -477,6 +479,40 @@ public class ConceptMiner {
                 java.nio.file.StandardOpenOption.APPEND);
 
         return newRules.size();
+    }
+
+    /**
+     * Removes all synonym rules auto-mined from {@code projectName} from {@code synonymFile}.
+     * Strips both the section-header comment and every rule line tagged {@code # auto:<projectName>:}.
+     *
+     * @return number of lines removed
+     */
+    public static int removeProjectSynonyms(Path synonymFile, String projectName) throws IOException {
+        if (!Files.exists(synonymFile)) return 0;
+        List<String> lines = Files.readAllLines(synonymFile);
+        String headerMarker  = "# ── Auto-mined from '" + projectName + "'";
+        String ruleMarker    = "# auto:" + projectName + ":";
+        List<String> kept = new ArrayList<>();
+        int removed = 0;
+        for (String line : lines) {
+            if (line.contains(headerMarker) || line.contains(ruleMarker)) {
+                removed++;
+            } else {
+                kept.add(line);
+            }
+        }
+        if (removed == 0) return 0;
+        // Collapse runs of blank lines left by removed sections (max one blank between blocks)
+        List<String> compacted = new ArrayList<>();
+        boolean lastBlank = false;
+        for (String line : kept) {
+            boolean isBlank = line.isBlank();
+            if (isBlank && lastBlank) continue;
+            compacted.add(line);
+            lastBlank = isBlank;
+        }
+        Files.writeString(synonymFile, String.join(System.lineSeparator(), compacted));
+        return removed;
     }
 
     /** Reads existing synonyms.txt and collects all left-hand terms (before {@code =>}). */

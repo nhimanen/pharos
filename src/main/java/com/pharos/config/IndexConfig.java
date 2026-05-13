@@ -22,6 +22,7 @@ public class IndexConfig {
     public static final Path DEFAULT_BASE = Path.of(System.getProperty("user.home"), ".pharos");
 
     private Path indexDir;
+    private Path synonymsFile;
     private String embeddingModelUrl;
     private int embeddingDimensions;
     private int hnswMaxConnections;
@@ -45,7 +46,8 @@ public class IndexConfig {
 
     // Jackson requires no-arg constructor
     public IndexConfig() {
-        this.indexDir = DEFAULT_BASE.resolve("indexes");
+        this.indexDir    = DEFAULT_BASE.resolve("indexes");
+        this.synonymsFile = DEFAULT_BASE.resolve("synonyms.txt");
         this.embeddingModelUrl = null;
         this.embeddingDimensions = 768;
         this.embeddingMaxTokens = 512;
@@ -113,6 +115,9 @@ public class IndexConfig {
     // Getters and setters
     public Path getIndexDir() { return indexDir; }
     public void setIndexDir(Path indexDir) { this.indexDir = indexDir; }
+
+    public Path getSynonymsFile() { return synonymsFile; }
+    public void setSynonymsFile(Path synonymsFile) { this.synonymsFile = synonymsFile; }
 
     public String getEmbeddingModelUrl() { return embeddingModelUrl; }
     public void setEmbeddingModelUrl(String embeddingModelUrl) { this.embeddingModelUrl = embeddingModelUrl; }

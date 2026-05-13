@@ -113,6 +113,7 @@ public class ProjectIndexManager {
      *   <li>Deletes the cross-project stamp so the next link rebuilds the cross graph</li>
      *   <li>Closes and deletes the Lucene index</li>
      *   <li>Deletes the full project index directory (call graph, file-state, etc.)</li>
+     *   <li>Strips auto-mined synonym rules for this project from {@code synonyms.txt}</li>
      *   <li>Removes {@code linkedProjects} back-references from other registry entries</li>
      *   <li>Unregisters the project from the registry</li>
      * </ol>
@@ -143,10 +144,19 @@ public class ProjectIndexManager {
             }
         }
 
-        // 5. Remove back-references in other projects' linkedProjects lists
+        // 5. Strip auto-mined synonym rules for this project from synonyms.txt
+        Path synonymFile = config.getSynonymsFile();
+        try {
+            int removed = ConceptMiner.removeProjectSynonyms(synonymFile, projectName);
+            if (removed > 0) log.info("Removed {} synonym lines for '{}'", removed, projectName);
+        } catch (Exception e) {
+            log.warn("Could not clean synonyms for '{}': {}", projectName, e.getMessage());
+        }
+
+        // 6. Remove back-references in other projects' linkedProjects lists
         registry.unlinkAll(projectName);
 
-        // 6. Remove from registry
+        // 7. Remove from registry
         registry.unregister(projectName);
 
         log.info("Removed all data for project '{}'", projectName);
@@ -864,7 +874,7 @@ public class ProjectIndexManager {
      * the primary indexing pipeline.
      */
     private void expandSynonyms(String projectName) {
-        Path synonymFile = IndexConfig.DEFAULT_BASE.resolve("synonyms.txt");
+        Path synonymFile = config.getSynonymsFile();
         try {
             org.apache.lucene.index.IndexReader reader =
                     luceneIndexer.openMultiReader(List.of(projectName));
