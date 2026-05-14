@@ -2446,21 +2446,31 @@ class SynonymMiningQualityTest {
     // ── Strategy: Acronym / parenthetical expansion ───────────────────────────
 
     /**
-     * Extracts expansion bigrams from two parenthetical patterns in the first
-     * javadoc sentence and maps them to the class name:
-     * <ul>
-     *   <li><b>Expansion (ABBREV)</b> — e.g. "finite state machine (FST)"
-     *       → bigrams "finitestatemachine", "statemachine" → FST
-     *   <li><b>ABBREV (Expansion)</b> — e.g. "WAND (Weak AND)"
-     *       → bigram "weakand" → WANDScorer
-     * </ul>
-     * Both directions handle the same underlying concept: the author wrote the
-     * full name and the short name together, so both should retrieve the class.
+     * Improved acronym/initialism strategy with three fixes over the original:
+     *
+     * <ol>
+     *   <li><b>Acronym length ≥ 3</b> — 2-char acronyms produce too many false
+     *       positives (BB, NC, NG match coincidentally).
+     *   <li><b>Content-word bigrams only</b> — stopwords in expansions ("part
+     *       <i>of</i> speech", "log <i>of</i> odds") produce noisy bigrams like
+     *       "partof". Bigrams are generated only between adjacent non-stopword
+     *       words; full-phrase compounds (joining all words including stopwords)
+     *       are still emitted as they represent the natural search term.
+     *   <li><b>CamelCase acronym detection</b> — class names like
+     *       {@code HnswGraph} write the acronym in title-case (Hnsw).
+     *       Tokens with zero vowels are treated as acronyms, enabling HNSW →
+     *       "hierarchical navigable small world" → {@code smallworld}.
+     * </ol>
+     *
+     * <p>Both parenthetical patterns are retained:
+     * "finite state machine (FST)" and "WAND (Weak AND)".
      */
-    private static final Pattern PAT_EXPANSION_ABBREV =
-            Pattern.compile("([a-zA-Z][\\w\\s-]{3,35})\\s*\\(([A-Z]{2,10})\\)");
-    private static final Pattern PAT_ABBREV_EXPANSION =
-            Pattern.compile("\\b([A-Z]{2,10})\\s+\\(([a-zA-Z][\\w\\s-]{3,35})\\)");
+    private static final Pattern PAT_EXPANSION_ABBREV_V2 =
+            Pattern.compile("([a-zA-Z][\\w\\s-]{3,35})\\s*\\(([A-Z]{3,10})\\)");
+    private static final Pattern PAT_ABBREV_EXPANSION_V2 =
+            Pattern.compile("\\b([A-Z]{3,10})\\s+\\(([a-zA-Z][\\w\\s-]{3,35})\\)");
+    private static final Pattern CAMEL_SPLIT =
+            Pattern.compile("(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])");
 
     static Map<String, Set<String>> mineAcronymExpansions(IndexReader reader) throws IOException {
         List<ClassDoc> docs = loadClassDocs(reader);
@@ -2470,34 +2480,86 @@ class SynonymMiningQualityTest {
             String sent = firstSentence(d.javadoc);
             if (sent.isBlank()) continue;
 
-            // Pattern 1: expansion (ABBREV) — extract bigrams/trigrams from expansion
-            Matcher m1 = PAT_EXPANSION_ABBREV.matcher(sent);
-            while (m1.find()) {
-                emitNgrams(m1.group(1).trim().toLowerCase(), d.simpleName, result);
-            }
+            // Parenthetical patterns (≥3-char acronyms only)
+            Matcher m1 = PAT_EXPANSION_ABBREV_V2.matcher(sent);
+            while (m1.find())
+                emitExpansionNgramsV2(m1.group(1).trim().toLowerCase(), d.simpleName, result);
+            Matcher m2 = PAT_ABBREV_EXPANSION_V2.matcher(sent);
+            while (m2.find())
+                emitExpansionNgramsV2(m2.group(2).trim().toLowerCase(), d.simpleName, result);
 
-            // Pattern 2: ABBREV (expansion) — extract bigrams/trigrams from expansion
-            Matcher m2 = PAT_ABBREV_EXPANSION.matcher(sent);
-            while (m2.find()) {
-                emitNgrams(m2.group(2).trim().toLowerCase(), d.simpleName, result);
+            // CamelCase acronym tokens: extract vowel-free tokens from class name
+            for (String tok : CAMEL_SPLIT.split(d.simpleName)) {
+                if (tok.length() < 3 || tok.length() > 6) continue;
+                if (tok.toLowerCase().matches(".*[aeiou].*")) continue; // has vowels → not acronym
+                String acronym = tok.toUpperCase();
+                // Search first sentence for matching initialism
+                for (String phrase : findInitialismMatches(acronym, sent))
+                    emitExpansionNgramsV2(phrase, d.simpleName, result);
             }
         }
         return result;
     }
 
-    /** Splits phrase on spaces/hyphens, emits adjacent bigrams and trigrams. */
-    private static void emitNgrams(String phrase, String className,
-                                    Map<String, Set<String>> result) {
-        String[] words = phrase.split("[\\s-]+");
-        for (int i = 0; i < words.length - 1; i++) {
-            if (words[i].length() < 2 || words[i + 1].length() < 2) continue;
-            String bi = words[i] + words[i + 1];
+    /**
+     * Finds sequences of N consecutive words in {@code text} whose first
+     * letters spell {@code acronym} (case-insensitive).
+     */
+    private static List<String> findInitialismMatches(String acronym, String text) {
+        String clean = text.toLowerCase().replaceAll("[^a-z\\s]", " ");
+        String[] words = clean.trim().split("\\s+");
+        int n = acronym.length();
+        List<String> matches = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int i = 0; i <= words.length - n; i++) {
+            StringBuilder initials = new StringBuilder();
+            for (int j = i; j < i + n; j++) {
+                if (words[j].isEmpty()) { initials.append('?'); continue; }
+                initials.append(words[j].charAt(0));
+            }
+            if (initials.toString().equalsIgnoreCase(acronym)) {
+                String phrase = String.join(" ", java.util.Arrays.copyOfRange(words, i, i + n));
+                if (seen.add(phrase)) matches.add(phrase);
+            }
+        }
+        return matches;
+    }
+
+    /**
+     * Emits n-grams from an expansion phrase:
+     * <ul>
+     *   <li>Content-word bigrams (adjacent non-stopword pairs): "part speech"
+     *   <li>Full-phrase compound (all words joined): "partofspeech"
+     *   <li>Trigrams including stopword connectors: emitted only when phrase > 2 words
+     * </ul>
+     */
+    private static void emitExpansionNgramsV2(String phrase, String className,
+                                               Map<String, Set<String>> result) {
+        String[] words = phrase.trim().split("[\\s-]+");
+        if (words.length == 0) return;
+
+        // Content-word bigrams (skip stopwords)
+        List<String> content = new ArrayList<>();
+        for (String w : words)
+            if (w.length() >= 3 && !STOPWORDS.contains(w)) content.add(w);
+        for (int i = 0; i < content.size() - 1; i++) {
+            String bi = content.get(i) + content.get(i + 1);
             if (bi.length() >= 4) result.computeIfAbsent(bi, k -> new HashSet<>()).add(className);
         }
+
+        // Full-phrase compound (all words joined, including stopwords)
+        if (words.length >= 2) {
+            String full = String.join("", words);
+            if (full.length() >= 4 && full.length() <= 20 && !Character.isDigit(full.charAt(0)))
+                result.computeIfAbsent(full, k -> new HashSet<>()).add(className);
+        }
+
+        // Trigrams (3 consecutive words including stopwords as connectors)
         for (int i = 0; i < words.length - 2; i++) {
             if (words[i].length() < 2) continue;
             String tri = words[i] + words[i + 1] + words[i + 2];
-            if (tri.length() >= 6) result.computeIfAbsent(tri, k -> new HashSet<>()).add(className);
+            if (tri.length() >= 6 && tri.length() <= 20 && !Character.isDigit(tri.charAt(0)))
+                result.computeIfAbsent(tri, k -> new HashSet<>()).add(className);
         }
     }
 

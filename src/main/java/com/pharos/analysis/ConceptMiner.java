@@ -96,13 +96,16 @@ public class ConceptMiner {
     private static final Pattern HYPHEN_COMPOUND =
             Pattern.compile("([a-zA-Z0-9]{1,})-([a-zA-Z0-9]{1,})");
 
-    // ── Acronym / parenthetical expansion patterns ────────────────────────────
-    // "finite state machine (FST)" → bigrams/trigrams of the expansion → FST
+    // ── Acronym / parenthetical + initialism expansion patterns ─────────────
+    // "finite state machine (FST)" — expansion before abbreviation in parens
     private static final Pattern PAT_EXPANSION_ABBREV =
-            Pattern.compile("([a-zA-Z][\\w\\s-]{3,35})\\s*\\(([A-Z]{2,10})\\)");
-    // "WAND (Weak AND)" → bigrams of expansion → WANDScorer
+            Pattern.compile("([a-zA-Z][\\w\\s-]{3,35})\\s*\\(([A-Z]{3,10})\\)");
+    // "WAND (Weak AND)" — abbreviation before expansion in parens
     private static final Pattern PAT_ABBREV_EXPANSION =
-            Pattern.compile("\\b([A-Z]{2,10})\\s+\\(([a-zA-Z][\\w\\s-]{3,35})\\)");
+            Pattern.compile("\\b([A-Z]{3,10})\\s+\\(([a-zA-Z][\\w\\s-]{3,35})\\)");
+    // Splits "HnswGraph" into ["Hnsw", "Graph"]
+    private static final Pattern CAMEL_SPLIT =
+            Pattern.compile("(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])");
 
     // ── Entry point ───────────────────────────────────────────────────────────
 
@@ -383,17 +386,30 @@ public class ConceptMiner {
             }
         }
 
-        // ── Source 3: parenthetical acronym expansions ────────────────────────
-        // Handles two patterns found in technical javadocs:
-        //   "finite state machine (FST)" → trigram "finitestatemachine" → FST
-        //   "WAND (Weak AND)"            → bigram  "weakand"            → WANDScorer
+        // ── Source 3: acronym / initialism expansion ──────────────────────────
+        // Three sub-strategies:
+        //   a) "finite state machine (FST)" → expansion (ABBREV)
+        //   b) "WAND (Weak AND)"            → ABBREV (expansion)
+        //   c) vowel-free camelCase tokens  → "HnswGraph" [Hnsw] scanned for
+        //      "hierarchical navigable small world" → "smallworld" → HnswGraph
         for (ClassDoc d : docs) {
             String sent = firstSentenceOf(d.javadoc);
             if (sent.isBlank()) continue;
+
+            // a) & b): parenthetical patterns (≥3-char acronyms only)
             Matcher m1 = PAT_EXPANSION_ABBREV.matcher(sent);
             while (m1.find()) emitExpansionNgrams(m1.group(1), d.className, result);
             Matcher m2 = PAT_ABBREV_EXPANSION.matcher(sent);
             while (m2.find()) emitExpansionNgrams(m2.group(2), d.className, result);
+
+            // c): CamelCase tokens with zero vowels → treat as acronyms
+            for (String tok : CAMEL_SPLIT.split(d.className)) {
+                if (tok.length() < 3 || tok.length() > 6) continue;
+                if (tok.toLowerCase().matches(".*[aeiou].*")) continue;
+                String acronym = tok.toUpperCase();
+                for (String phrase : findInitialismInText(acronym, sent))
+                    emitExpansionNgrams(phrase, d.className, result);
+            }
         }
 
         // ── Source 2: javadoc prose bigrams (top-P% PPMI per class) ──────────
@@ -442,20 +458,65 @@ public class ConceptMiner {
         map.computeIfAbsent(term, k -> new HashSet<>()).add(className);
     }
 
-    /** Splits phrase on spaces/hyphens and emits adjacent bigrams and trigrams. */
+    /**
+     * Emits n-grams from an expansion phrase with three strategies:
+     * <ul>
+     *   <li><b>Content-word bigrams</b> — adjacent non-stopword pairs only;
+     *       avoids noise like "partof" from "part of speech".
+     *   <li><b>Full-phrase compound</b> — all words joined (including stopwords
+     *       as connectors), e.g. "partofspeech" from "part of speech".
+     *   <li><b>Trigrams</b> — three consecutive words including any stopword
+     *       connectors, for longer expansions.
+     * </ul>
+     */
     private static void emitExpansionNgrams(String phrase, String className,
                                              Map<String, Set<String>> result) {
         String[] words = phrase.trim().toLowerCase().split("[\\s-]+");
-        for (int i = 0; i < words.length - 1; i++) {
-            if (words[i].length() < 2 || words[i + 1].length() < 2) continue;
-            String bi = words[i] + words[i + 1];
+        if (words.length == 0) return;
+
+        // Content-word bigrams (skip stopwords)
+        List<String> content = new ArrayList<>();
+        for (String w : words)
+            if (w.length() >= 3 && !STOPWORDS.contains(w)) content.add(w);
+        for (int i = 0; i < content.size() - 1; i++) {
+            String bi = content.get(i) + content.get(i + 1);
             if (bi.length() >= 4) addRule(result, bi, className);
         }
+
+        // Full-phrase compound
+        if (words.length >= 2) {
+            String full = String.join("", words);
+            if (full.length() >= 4 && full.length() <= 20 && !Character.isDigit(full.charAt(0)))
+                addRule(result, full, className);
+        }
+
+        // Trigrams (consecutive, including stopwords as connectors)
         for (int i = 0; i < words.length - 2; i++) {
             if (words[i].length() < 2) continue;
             String tri = words[i] + words[i + 1] + words[i + 2];
-            if (tri.length() >= 6) addRule(result, tri, className);
+            if (tri.length() >= 6 && tri.length() <= 20 && !Character.isDigit(tri.charAt(0)))
+                addRule(result, tri, className);
         }
+    }
+
+    /** Finds N-word sequences in {@code text} whose first letters spell {@code acronym}. */
+    private static List<String> findInitialismInText(String acronym, String text) {
+        String clean = text.toLowerCase().replaceAll("[^a-z\\s]", " ");
+        String[] words = clean.trim().split("\\s+");
+        int n = acronym.length();
+        List<String> matches = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int i = 0; i <= words.length - n; i++) {
+            StringBuilder initials = new StringBuilder();
+            for (int j = i; j < i + n; j++)
+                initials.append(words[j].isEmpty() ? '?' : words[j].charAt(0));
+            if (initials.toString().equalsIgnoreCase(acronym)) {
+                String phrase = String.join(" ",
+                        java.util.Arrays.copyOfRange(words, i, i + n));
+                if (seen.add(phrase)) matches.add(phrase);
+            }
+        }
+        return matches;
     }
 
     /** Splits a camelCase or underscore-separated identifier into lowercase words. */
