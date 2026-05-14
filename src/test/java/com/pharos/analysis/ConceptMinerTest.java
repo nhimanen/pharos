@@ -28,12 +28,7 @@ class ConceptMinerTest {
     private ByteBuffersDirectory dir;
     private DirectoryReader reader;
 
-    /**
-     * Relaxed miner for unit tests: minDf=1 so single-class terms qualify,
-     * maxDfFraction=80 so common terms are still included, tfidfThreshold=0
-     * so any scoring term is emitted.  Production uses (10, 2, 30, 0.05).
-     */
-    private final ConceptMiner miner = new ConceptMiner(10, 1, 80, 0.0);
+    private final ConceptMiner miner = new ConceptMiner();
 
     @BeforeEach
     void setUp() {
@@ -50,11 +45,10 @@ class ConceptMinerTest {
 
     @Test
     void appendNewSynonyms_createsFileAndWritesRules() throws Exception {
-        // Two class docs with distinct discriminative terms so TF-IDF fires
-        writeClassDoc("proj", "Tokenizer", "com.example.Tokenizer",
-                "tokenization segmentation whitespace splitting tokens");
-        writeClassDoc("proj", "Segmenter", "com.example.Segmenter",
-                "tokenization segmentation chunking boundary tokens");
+        // Multi-word class names produce bigrams from Source 1 (class name decomposition):
+        // "TokenStreamFilter" → tokens [token, stream, filter] → bigrams [tokenstream, streamfilter]
+        writeClassDoc("proj", "TokenStreamFilter", "com.example.TokenStreamFilter", "");
+        writeClassDoc("proj", "ByteBlockAllocator",  "com.example.ByteBlockAllocator",  "");
         openReader();
 
         Path synonymFile = tempDir.resolve("synonyms.txt");
@@ -64,17 +58,14 @@ class ConceptMinerTest {
         assertThat(added).isGreaterThan(0);
 
         String content = Files.readString(synonymFile);
-        // Rules must be in directed format "term => classname"
         assertThat(content).contains("=>");
-        // Auto-header comment must be present
         assertThat(content).contains("# ── Auto-mined from 'proj'");
     }
 
     @Test
-    void appendNewSynonyms_returnsZeroWhenNoClassDocs() throws Exception {
-        // Only method docs — ConceptMiner searches for docType=class
-        writeMethodDoc("proj", "SomeClass", "doWork",
-                "performs important work in the system");
+    void appendNewSynonyms_noRulesWhenNoClassDocs() throws Exception {
+        // Method docs alone produce nothing — method names are no longer a source.
+        writeMethodDoc("proj", "SomeClass", "doWork", "performs important work");
         openReader();
 
         Path synonymFile = tempDir.resolve("synonyms.txt");
@@ -86,51 +77,42 @@ class ConceptMinerTest {
 
     @Test
     void appendNewSynonyms_skipsTermsAlreadyInFile() throws Exception {
-        // Write a synonym file that already covers "tokenization"
         Path synonymFile = tempDir.resolve("synonyms.txt");
-        Files.writeString(synonymFile, "tokenization => tokenizer\n");
+        Files.writeString(synonymFile, "tokenstream => tokenstreamfilter\n");
 
-        writeClassDoc("proj", "Tokenizer", "com.example.Tokenizer",
-                "tokenization segmentation whitespace splitting tokens");
-        writeClassDoc("proj", "Segmenter", "com.example.Segmenter",
-                "tokenization segmentation chunking boundary tokens");
+        writeClassDoc("proj", "TokenStreamFilter", "com.example.TokenStreamFilter", "");
+        writeClassDoc("proj", "ByteBlockAllocator",  "com.example.ByteBlockAllocator",  "");
         openReader();
 
         miner.appendNewSynonyms(reader, synonymFile, "proj");
 
         String content = Files.readString(synonymFile);
-        // "tokenization" already covered on LHS — must not appear again as LHS
         long lhsOccurrences = content.lines()
                 .filter(l -> !l.startsWith("#") && l.contains("=>"))
-                .filter(l -> l.split("=>")[0].strip().equals("tokenization"))
+                .filter(l -> l.split("=>")[0].strip().equals("tokenstream"))
                 .count();
-        assertThat(lhsOccurrences).isEqualTo(1); // only the original hand-crafted rule
+        assertThat(lhsOccurrences).isEqualTo(1);
     }
 
     @Test
     void appendNewSynonyms_appendsOnSubsequentRuns() throws Exception {
-        writeClassDoc("proj", "Alpha", "com.example.Alpha",
-                "cryptographic hashing digest algorithm secure");
-        writeClassDoc("proj", "Beta", "com.example.Beta",
-                "cryptographic hashing digest algorithm signature");
+        writeClassDoc("proj", "TokenStreamFilter", "com.example.TokenStreamFilter", "");
+        writeClassDoc("proj", "ByteBlockAllocator",  "com.example.ByteBlockAllocator",  "");
         openReader();
 
         Path synonymFile = tempDir.resolve("synonyms.txt");
         int firstRun  = miner.appendNewSynonyms(reader, synonymFile, "proj");
         int secondRun = miner.appendNewSynonyms(reader, synonymFile, "proj");
 
-        // All terms from the first run are now in the LHS set — second run adds nothing
         assertThat(firstRun).isGreaterThan(0);
         assertThat(secondRun).isEqualTo(0);
     }
 
     @Test
     void appendNewSynonyms_shortTermsAreSkipped() throws Exception {
-        // "dig" (3 chars) and "sha" (3 chars) are below the 5-char minimum
-        writeClassDoc("proj", "Digest", "com.example.Digest",
-                "dig sha cryptographic hashing digest algorithm");
-        writeClassDoc("proj", "Hasher", "com.example.Hasher",
-                "dig sha cryptographic hashing digest computation");
+        // Single-char tokens from class name splits are below the 4-char minimum
+        writeClassDoc("proj", "BPReorderer", "com.example.BPReorderer", "");
+        writeClassDoc("proj", "BPIndexer",   "com.example.BPIndexer",   "");
         openReader();
 
         Path synonymFile = tempDir.resolve("synonyms.txt");
@@ -138,23 +120,19 @@ class ConceptMinerTest {
 
         if (Files.exists(synonymFile)) {
             String content = Files.readString(synonymFile);
-            // Short tokens must not appear as LHS rule terms
             content.lines()
                     .filter(l -> !l.startsWith("#") && l.contains("=>"))
                     .forEach(line -> {
                         String lhs = line.split("=>")[0].strip();
-                        assertThat(lhs.length()).isGreaterThanOrEqualTo(5);
+                        assertThat(lhs.length()).isGreaterThanOrEqualTo(4);
                     });
         }
     }
 
     @Test
     void appendNewSynonyms_termEqualsClassnameIsSkipped() throws Exception {
-        // "tokenizer" == className.toLowerCase() — must be skipped
-        writeClassDoc("proj", "Tokenizer", "com.example.Tokenizer",
-                "tokenizer splits whitespace segmentation boundary");
-        writeClassDoc("proj", "Splitter", "com.example.Splitter",
-                "tokenizer splits whitespace segmentation delimiter");
+        writeClassDoc("proj", "TokenStreamFilter", "com.example.TokenStreamFilter", "");
+        writeClassDoc("proj", "ByteBlockAllocator",  "com.example.ByteBlockAllocator",  "");
         openReader();
 
         Path synonymFile = tempDir.resolve("synonyms.txt");

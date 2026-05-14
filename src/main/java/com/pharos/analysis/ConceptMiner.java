@@ -93,72 +93,61 @@ public class ConceptMiner {
         "whether","non","sub","pre","post","multi","single","multiple"
     ));
 
+    private static final Pattern HYPHEN_COMPOUND =
+            Pattern.compile("([a-zA-Z0-9]{1,})-([a-zA-Z0-9]{1,})");
+
+    // ── Acronym / parenthetical expansion patterns ────────────────────────────
+    // "finite state machine (FST)" → bigrams/trigrams of the expansion → FST
+    private static final Pattern PAT_EXPANSION_ABBREV =
+            Pattern.compile("([a-zA-Z][\\w\\s-]{3,35})\\s*\\(([A-Z]{2,10})\\)");
+    // "WAND (Weak AND)" → bigrams of expansion → WANDScorer
+    private static final Pattern PAT_ABBREV_EXPANSION =
+            Pattern.compile("\\b([A-Z]{2,10})\\s+\\(([a-zA-Z][\\w\\s-]{3,35})\\)");
+
     // ── Entry point ───────────────────────────────────────────────────────────
 
     static void main(String[] args) throws Exception {
         String projectName = args.length > 0 ? args[0] : "lucene";
-        int topTermsPerClass   = args.length > 1 ? Integer.parseInt(args[1]) : 12;
-        int minDocFreq         = 2;   // term must appear in ≥2 class docs (not a typo)
-        int maxDocFreqFraction = 30;  // term must appear in ≤30% of classes (not noise)
-        double tfidfThreshold  = 0.05; // minimum TF-IDF score to include a term
 
-        System.out.printf("ConceptMiner — project: %s | top terms/class: %d%n%n",
-                projectName, topTermsPerClass);
+        System.out.printf("ConceptMiner — project: %s%n%n", projectName);
 
-        IndexConfig config     = IndexConfig.load();
+        IndexConfig config       = IndexConfig.load();
         ProjectRegistry registry = new ProjectRegistry(config);
-        LuceneIndexer indexer  = new LuceneIndexer(config);
+        LuceneIndexer indexer    = new LuceneIndexer(config);
 
         registry.find(projectName).orElseThrow(() ->
                 new IllegalArgumentException("Project not indexed: " + projectName));
 
         IndexReader reader = indexer.openMultiReader(List.of(projectName));
         try {
-            new ConceptMiner(topTermsPerClass, minDocFreq, maxDocFreqFraction, tfidfThreshold)
-                    .mine(reader);
+            new ConceptMiner().mine(reader);
         } finally {
             indexer.close();
         }
     }
 
-    // ── Instance ──────────────────────────────────────────────────────────────
+    public ConceptMiner() {}
 
-    private final int    topTermsPerClass;
-    private final int    minDocFreq;
-    private final int    maxDocFreqFraction;
-    private final double tfidfThreshold;
+    // ── Diagnostic pipeline ───────────────────────────────────────────────────
 
-    public ConceptMiner(int topTermsPerClass, int minDocFreq,
-                        int maxDocFreqFraction, double tfidfThreshold) {
-        this.topTermsPerClass   = topTermsPerClass;
-        this.minDocFreq         = minDocFreq;
-        this.maxDocFreqFraction = maxDocFreqFraction;
-        this.tfidfThreshold     = tfidfThreshold;
-    }
-
-    // ── Mining pipeline ───────────────────────────────────────────────────────
-
+    /**
+     * Runs the combined mining strategy and prints a human-readable report to
+     * stdout for inspection.  Intended for CLI use; not called during normal indexing.
+     */
     public void mine(IndexReader reader) throws IOException {
-        // 1. Load all class documents
         List<ClassDoc> docs = loadClassDocs(reader);
         System.out.printf("Loaded %d class documents%n%n", docs.size());
 
-        // 2. Build document-frequency table: term → number of class docs containing it
-        Map<String, Integer> docFreq = buildDocFreq(docs);
-        int totalDocs = docs.size();
-        int maxDf = Math.max(1, totalDocs * maxDocFreqFraction / 100);
+        Map<String, Set<String>> rules = mineAll(reader);
 
-        // 3. Compute TF-IDF and extract top terms per class
-        for (ClassDoc doc : docs) {
-            doc.topTerms = topTermsByTfIdf(doc, docFreq, totalDocs, maxDf);
-        }
+        // Invert rules for the per-class concept map view
+        Map<String, List<String>> byClass = new TreeMap<>();
+        for (Map.Entry<String, Set<String>> e : rules.entrySet())
+            for (String cls : e.getValue())
+                byClass.computeIfAbsent(cls, k -> new ArrayList<>()).add(e.getKey());
 
-        // 4. Build inverted index: term → classes
-        Map<String, List<String>> inverted = buildInverted(docs, docFreq, totalDocs, maxDf);
-
-        // 5. Print output
-        printConceptMap(docs);
-        printInvertedIndex(inverted, docFreq, totalDocs);
+        printConceptMap(byClass);
+        printSynonymCandidates(rules);
         printCrossReferences(docs);
     }
 
@@ -192,56 +181,6 @@ public class ConceptMiner {
         // Sort by class name for stable output
         docs.sort(Comparator.comparing(d -> d.className));
         return docs;
-    }
-
-    // ── TF-IDF ───────────────────────────────────────────────────────────────
-
-    private Map<String, Integer> buildDocFreq(List<ClassDoc> docs) {
-        Map<String, Integer> df = new HashMap<>();
-        for (ClassDoc doc : docs) {
-            for (String term : uniqueTerms(doc.text)) {
-                df.merge(term, 1, Integer::sum);
-            }
-        }
-        return df;
-    }
-
-    private List<String> topTermsByTfIdf(ClassDoc doc, Map<String, Integer> docFreq,
-                                          int totalDocs, int maxDf) {
-        Map<String, Integer> tf = termFreq(doc.text);
-        int docLen = tf.values().stream().mapToInt(i -> i).sum();
-        if (docLen == 0) return List.of();
-
-        return tf.entrySet().stream()
-                .filter(e -> {
-                    int df = docFreq.getOrDefault(e.getKey(), 0);
-                    return df >= minDocFreq && df <= maxDf;
-                })
-                .map(e -> {
-                    double tfNorm = (double) e.getValue() / docLen;
-                    double idf    = Math.log((double) totalDocs / docFreq.get(e.getKey()));
-                    return Map.entry(e.getKey(), tfNorm * idf);
-                })
-                .filter(e -> e.getValue() >= tfidfThreshold)
-                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .limit(topTermsPerClass)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
-    }
-
-    private Map<String, List<String>> buildInverted(List<ClassDoc> docs,
-                                                     Map<String, Integer> docFreq,
-                                                     int totalDocs, int maxDf) {
-        Map<String, List<String>> inv = new TreeMap<>();
-        for (ClassDoc doc : docs) {
-            for (String term : doc.topTerms) {
-                int df = docFreq.getOrDefault(term, 0);
-                if (df >= minDocFreq && df <= maxDf) {
-                    inv.computeIfAbsent(term, k -> new ArrayList<>()).add(doc.className);
-                }
-            }
-        }
-        return inv;
     }
 
     // ── Term extraction helpers ───────────────────────────────────────────────
@@ -310,49 +249,36 @@ public class ConceptMiner {
 
     // ── Output ────────────────────────────────────────────────────────────────
 
-    private void printConceptMap(List<ClassDoc> docs) {
+    private void printConceptMap(Map<String, List<String>> byClass) {
         System.out.println(bar());
-        System.out.println("  CONCEPT MAP — discriminative terms per class (TF-IDF)");
+        System.out.println("  CONCEPT MAP — mined terms per class (combined strategy)");
         System.out.println(bar());
-        System.out.printf("  %-40s  %s%n", "Class", "Top terms");
+        System.out.printf("  %-40s  %s%n", "Class", "Mined terms");
         System.out.println("  " + "─".repeat(100));
 
-        for (ClassDoc doc : docs) {
-            if (doc.topTerms.isEmpty() && doc.links.isEmpty()) continue;
+        byClass.forEach((cls, terms) -> {
+            if (terms.isEmpty()) return;
+            List<String> sorted = terms.stream().sorted().toList();
             System.out.printf("  %-40s  %s%n",
-                    truncate(doc.className, 38),
-                    String.join(", ", doc.topTerms));
-            if (!doc.links.isEmpty()) {
-                System.out.printf("  %-40s  @link: %s%n", "",
-                        String.join(", ", doc.links.stream().limit(6).toList()));
-            }
-        }
+                    truncate(cls, 38),
+                    truncate(String.join(", ", sorted), 80));
+        });
+
         System.out.println(bar());
         System.out.println();
     }
 
-    private void printInvertedIndex(Map<String, List<String>> inverted,
-                                     Map<String, Integer> docFreq, int totalDocs) {
+    private void printSynonymCandidates(Map<String, Set<String>> rules) {
         System.out.println(bar());
-        System.out.println("  SYNONYM CANDIDATES — concept term → classes");
-        System.out.printf("  (terms appearing in 2–%d%% of classes; sorted by specificity)%n",
-                maxDocFreqFraction);
+        System.out.println("  SYNONYM CANDIDATES — term → classes");
         System.out.println(bar());
-        System.out.printf("  %-28s  %5s  %s%n", "Term", "df", "Classes");
+        System.out.printf("  %-32s  %s%n", "Term", "Classes");
         System.out.println("  " + "─".repeat(100));
 
-        // Sort by doc-frequency ascending (most specific / discriminative first)
-        inverted.entrySet().stream()
-                .sorted(Comparator.comparingInt(e ->
-                        docFreq.getOrDefault(e.getKey(), 0)))
-                .forEach(e -> {
-                    int df = docFreq.getOrDefault(e.getKey(), 0);
-                    String classes = e.getValue().stream()
-                            .sorted()
-                            .collect(Collectors.joining(", "));
-                    System.out.printf("  %-28s  %5d  %s%n",
-                            e.getKey(), df, truncate(classes, 80));
-                });
+        new TreeMap<>(rules).forEach((term, classes) -> {
+            String cls = classes.stream().sorted().collect(Collectors.joining(", "));
+            System.out.printf("  %-32s  %s%n", term, truncate(cls, 80));
+        });
 
         System.out.println(bar());
         System.out.println();
@@ -385,9 +311,8 @@ public class ConceptMiner {
         final String       className;
         final String       qualName;
         final String       javadoc;
-        final String       text;    // javadoc + synthesized body
-        final List<String> links;   // @link / @see targets
-        List<String>       topTerms = List.of();
+        final String       text;  // javadoc + synthesized body
+        final List<String> links; // @link / @see targets
 
         ClassDoc(String className, String qualName, String javadoc,
                  String text, List<String> links) {
@@ -409,6 +334,182 @@ public class ConceptMiner {
     }
 
     private static String bar() { return "━".repeat(72); }
+
+    // ── Combined mining ───────────────────────────────────────────────────────
+
+    /**
+     * Mines synonym candidates from two sources that proved effective on a
+     * vocabulary-gap golden set. Other sources (method names, package paths,
+     * @link cross-references, PPMI single tokens) only find terms already present
+     * in the index — BM25 handles those without synonyms.
+     *
+     * <ol>
+     *   <li><b>Class name decomposition</b> — camelCase tokens, adjacent bigrams,
+     *       and adjacent trigrams (e.g. {@code skiplist} from
+     *       {@code MultiLevelSkipListReader}, {@code weakand} from
+     *       {@code WANDScorer}).
+     *   <li><b>Javadoc prose bigrams (top-P% PPMI per class)</b> — adjacent word
+     *       pairs where at least one token is a non-stopword of ≥ 3 chars, plus
+     *       hyphen-merged compounds ({@code "KD-tree"} → {@code kdtree}).
+     *       Scored by PPMI; the top {@value #DEFAULT_BIGRAM_PCT}% per class are
+     *       kept.  Percentile-based so the threshold adapts to any corpus size.
+     * </ol>
+     */
+    // Top-P% of positive-PPMI bigrams kept per class. Percentile is corpus-agnostic.
+    private static final double DEFAULT_BIGRAM_PCT = 10.0;
+
+    public Map<String, Set<String>> mineAll(IndexReader reader) throws IOException {
+        return mineAll(reader, DEFAULT_BIGRAM_PCT);
+    }
+
+    /** Variant that exposes the bigram percentile for tuning. */
+    public Map<String, Set<String>> mineAll(IndexReader reader, double bigramTopPct)
+            throws IOException {
+        List<ClassDoc> docs = loadClassDocs(reader);
+        Map<String, Set<String>> result = new HashMap<>();
+
+        // ── Source 1: class name tokens + bigrams + trigrams ──────────────────
+        for (ClassDoc d : docs) {
+            String[] toks = splitIdentifier(d.className).split("\\s+");
+            for (String t : toks)
+                if (normalize(t) != null) addRule(result, t, d.className);
+            for (int i = 0; i < toks.length - 1; i++) {
+                String bi = toks[i] + toks[i + 1];
+                if (bi.length() >= 4) addRule(result, bi, d.className);
+            }
+            for (int i = 0; i < toks.length - 2; i++) {
+                String tri = toks[i] + toks[i + 1] + toks[i + 2];
+                if (tri.length() >= 6) addRule(result, tri, d.className);
+            }
+        }
+
+        // ── Source 3: parenthetical acronym expansions ────────────────────────
+        // Handles two patterns found in technical javadocs:
+        //   "finite state machine (FST)" → trigram "finitestatemachine" → FST
+        //   "WAND (Weak AND)"            → bigram  "weakand"            → WANDScorer
+        for (ClassDoc d : docs) {
+            String sent = firstSentenceOf(d.javadoc);
+            if (sent.isBlank()) continue;
+            Matcher m1 = PAT_EXPANSION_ABBREV.matcher(sent);
+            while (m1.find()) emitExpansionNgrams(m1.group(1), d.className, result);
+            Matcher m2 = PAT_ABBREV_EXPANSION.matcher(sent);
+            while (m2.find()) emitExpansionNgrams(m2.group(2), d.className, result);
+        }
+
+        // ── Source 2: javadoc prose bigrams (top-P% PPMI per class) ──────────
+        // Percentile mode: rank bigrams by PPMI within each class, keep top-P%.
+        // This is corpus-agnostic — a class with 20 bigrams keeps 2 at P=10%,
+        // a class with 200 keeps 20; the absolute PPMI scale doesn't matter.
+        Map<String, Integer> bigramDf = new HashMap<>();
+        for (ClassDoc d : docs)
+            for (String b : new HashSet<>(hybridBigrams(d.text)))
+                bigramDf.merge(b, 1, Integer::sum);
+        int totalDocs = docs.size();
+
+        for (ClassDoc d : docs) {
+            List<String> bigrams = hybridBigrams(d.text);
+            Map<String, Integer> tf = new HashMap<>();
+            for (String b : bigrams) tf.merge(b, 1, Integer::sum);
+            int docLen = bigrams.size();
+            if (docLen == 0) continue;
+
+            List<Map.Entry<String, Double>> scored = new ArrayList<>();
+            for (Map.Entry<String, Integer> e : tf.entrySet()) {
+                int df = bigramDf.getOrDefault(e.getKey(), 1);
+                double ppmi = Math.log(((double) e.getValue() / docLen)
+                                       / ((double) df / totalDocs));
+                if (ppmi > 0) scored.add(Map.entry(e.getKey(), ppmi));
+            }
+            if (scored.isEmpty()) continue;
+            scored.sort(Map.Entry.<String, Double>comparingByValue().reversed());
+            int keep = Math.max(1, (int) Math.ceil(scored.size() * bigramTopPct / 100.0));
+            scored.subList(0, Math.min(keep, scored.size()))
+                  .forEach(e -> addRule(result, e.getKey(), d.className));
+        }
+
+        // Drop terms too long to be useful queries or starting with a digit
+        result.entrySet().removeIf(e -> {
+            String t = e.getKey();
+            return t.length() > 20 || Character.isDigit(t.charAt(0));
+        });
+
+        return result;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static void addRule(Map<String, Set<String>> map, String term, String className) {
+        map.computeIfAbsent(term, k -> new HashSet<>()).add(className);
+    }
+
+    /** Splits phrase on spaces/hyphens and emits adjacent bigrams and trigrams. */
+    private static void emitExpansionNgrams(String phrase, String className,
+                                             Map<String, Set<String>> result) {
+        String[] words = phrase.trim().toLowerCase().split("[\\s-]+");
+        for (int i = 0; i < words.length - 1; i++) {
+            if (words[i].length() < 2 || words[i + 1].length() < 2) continue;
+            String bi = words[i] + words[i + 1];
+            if (bi.length() >= 4) addRule(result, bi, className);
+        }
+        for (int i = 0; i < words.length - 2; i++) {
+            if (words[i].length() < 2) continue;
+            String tri = words[i] + words[i + 1] + words[i + 2];
+            if (tri.length() >= 6) addRule(result, tri, className);
+        }
+    }
+
+    /** Splits a camelCase or underscore-separated identifier into lowercase words. */
+    private static String splitIdentifier(String name) {
+        if (name == null || name.isBlank()) return nvl(name);
+        String[] parts = name.split("_");
+        StringBuilder sb = new StringBuilder();
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+            String split = part.replaceAll("([a-z])([A-Z])", "$1 $2")
+                               .replaceAll("([A-Z]+)([A-Z][a-z])", "$1 $2");
+            if (!sb.isEmpty()) sb.append(' ');
+            sb.append(split.toLowerCase());
+        }
+        return sb.toString();
+    }
+
+    /** Returns the first sentence of a javadoc comment (up to 200 chars if no period found). */
+    private static String firstSentenceOf(String javadoc) {
+        if (javadoc == null || javadoc.isBlank()) return "";
+        String clean = javadoc.replaceAll("(?m)^\\s*\\*\\s?", " ").trim();
+        for (int i = 0; i < clean.length(); i++) {
+            char c = clean.charAt(i);
+            if ((c == '.' || c == '!' || c == '?') &&
+                    (i + 1 >= clean.length() || Character.isWhitespace(clean.charAt(i + 1)))) {
+                return clean.substring(0, i);
+            }
+        }
+        return clean.substring(0, Math.min(clean.length(), 200));
+    }
+
+    /**
+     * Hybrid bigrams: hyphen-merged compounds + adjacent pairs where at least
+     * one token is a non-stopword of >= 3 chars.
+     */
+    private static List<String> hybridBigrams(String text) {
+        List<String> bigrams = new ArrayList<>();
+        Matcher hm = HYPHEN_COMPOUND.matcher(text);
+        while (hm.find()) {
+            String merged = (hm.group(1) + hm.group(2)).toLowerCase();
+            if (merged.length() >= 4) bigrams.add(merged);
+        }
+        String[] tokens = text.toLowerCase().split("[^a-zA-Z0-9]+");
+        for (int i = 0; i < tokens.length - 1; i++) {
+            String t1 = tokens[i], t2 = tokens[i + 1];
+            boolean t1ok = t1.length() >= 3 && !STOPWORDS.contains(t1);
+            boolean t2ok = t2.length() >= 3 && !STOPWORDS.contains(t2);
+            if ((t1ok || t2ok) && t1.length() >= 2 && t2.length() >= 2) {
+                String bi = t1 + t2;
+                if (bi.length() >= 4) bigrams.add(bi);
+            }
+        }
+        return bigrams;
+    }
 
     // ── Auto-expansion: append new synonym rules to synonyms.txt ─────────────
 
@@ -434,45 +535,37 @@ public class ConceptMiner {
      */
     public int appendNewSynonyms(IndexReader reader, Path synonymFile,
                                   String projectName) throws IOException {
-        // Load existing left-hand terms to avoid duplicates
         Set<String> existingLhs = loadExistingLhs(synonymFile);
 
-        List<ClassDoc> docs = loadClassDocs(reader);
-        Map<String, Integer> docFreq = buildDocFreq(docs);
-        int totalDocs = docs.size();
-        int maxDf = Math.max(1, totalDocs * maxDocFreqFraction / 100);
+        // Mine using all seven sources with default configuration
+        Map<String, Set<String>> allRules = mineAll(reader);
 
-        for (ClassDoc doc : docs) {
-            doc.topTerms = topTermsByTfIdf(doc, docFreq, totalDocs, maxDf);
-        }
-
-        // Build new rules: discriminative term => className (lowercased)
-        // Only include terms with df in [minDocFreq, maxDf] that aren't already covered
         List<String> newRules = new ArrayList<>();
         String date = java.time.LocalDate.now().toString();
+        // Track within-batch LHS to prevent duplicate terms in the same run
+        Set<String> emitted = new HashSet<>(existingLhs);
 
-        for (ClassDoc doc : docs) {
-            String classTarget = doc.className.toLowerCase();
-            for (String term : doc.topTerms) {
-                if (existingLhs.contains(term)) continue;
-                // Only emit terms that look like meaningful concepts (≥5 chars, not pure classname)
-                if (term.length() < 5) continue;
-                if (term.equals(classTarget)) continue;
+        // Iterate in stable order for deterministic output
+        for (Map.Entry<String, Set<String>> e : new TreeMap<>(allRules).entrySet()) {
+            String term = e.getKey();
+            if (term.length() < 4)      continue; // skip very short tokens
+            if (emitted.contains(term)) continue; // already covered
+
+            for (String cls : new TreeSet<>(e.getValue())) {
+                String classTarget = cls.toLowerCase();
+                if (term.equals(classTarget)) continue; // skip identity rules
                 newRules.add(String.format("%-32s => %s  # auto:%s:%s",
                         term, classTarget, projectName, date));
-                existingLhs.add(term); // prevent duplicates within this batch
             }
+            emitted.add(term);
         }
 
         if (newRules.isEmpty()) return 0;
 
-        // Append to file
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n# ── Auto-mined from '%s' on %s (%d rules) ─%n",
                 projectName, date, newRules.size()));
-        for (String rule : newRules) {
-            sb.append(rule).append('\n');
-        }
+        for (String rule : newRules) sb.append(rule).append('\n');
 
         Files.writeString(synonymFile, sb.toString(),
                 java.nio.file.StandardOpenOption.CREATE,

@@ -887,7 +887,7 @@ public class ProjectIndexManager {
         try {
             org.apache.lucene.index.IndexReader reader =
                     luceneIndexer.openMultiReader(List.of(projectName));
-            ConceptMiner miner = new ConceptMiner(10, 2, 30, 0.05);
+            ConceptMiner miner = new ConceptMiner();
             int added = miner.appendNewSynonyms(reader, synonymFile, projectName);
             if (added > 0) {
                 log.info("Synonym expansion: appended {} new rules to {}", added, synonymFile);
