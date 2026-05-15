@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -34,6 +35,15 @@ import java.util.stream.Collectors;
 public class CrossProjectLinker {
 
     private static final Logger log = LoggerFactory.getLogger(CrossProjectLinker.class);
+
+    /**
+     * One lock per cross-project DB path.  Serialises concurrent calls to
+     * buildCrossProjectGraph() when multiple projects are indexed in parallel
+     * (--project-threads > 1) and each triggers a cross-project rebuild on
+     * the same directory.
+     */
+    private static final ConcurrentHashMap<Path, ReentrantLock> REBUILD_LOCKS =
+            new ConcurrentHashMap<>();
 
     private final ProjectRegistry registry;
     private final Path crossDbDir;
@@ -63,6 +73,20 @@ public class CrossProjectLinker {
             throw new IllegalArgumentException("Need at least 2 projects to link");
         }
 
+        // Serialise concurrent rebuilds on the same DB directory.
+        // When indexing a workspace with --project-threads > 1, multiple projects
+        // finish simultaneously and all call buildCrossProjectGraph; without this
+        // lock they race to delete+recreate the same directory.
+        ReentrantLock lock = REBUILD_LOCKS.computeIfAbsent(crossDbDir, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            buildCrossProjectGraphLocked(projectNames);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void buildCrossProjectGraphLocked(List<String> projectNames) throws IOException {
         // Freshness guard: skip if cross-project DB is already up to date
         if (isCrossGraphFresh(crossStamp, projectNames)) {
             log.info("Cross-project graph is already up to date for {}, skipping rebuild",

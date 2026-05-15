@@ -118,8 +118,10 @@ public class CallGraph implements AutoCloseable {
     public void clear() {
         methodBatch.clear();
         callBatch.clear();
+        db.begin();
         db.command("sql", "TRUNCATE TYPE calls UNSAFE");
         db.command("sql", "TRUNCATE TYPE Method UNSAFE");
+        db.commit();
     }
 
     // -------------------------------------------------------------------------
