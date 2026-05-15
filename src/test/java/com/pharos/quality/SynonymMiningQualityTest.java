@@ -1,5 +1,6 @@
 package com.pharos.quality;
 
+import com.pharos.analysis.ConceptMiner;
 import com.pharos.config.IndexConfig;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
@@ -1632,6 +1633,65 @@ class SynonymMiningQualityTest {
             }
             System.out.println();
         }
+    }
+
+    // ── End-to-end appendNewSynonyms benchmark ────────────────────────────────
+
+    @Test
+    @Order(5)
+    void performance_appendNewSynonyms_end_to_end() throws Exception {
+        int warmup = 1, runs = 3;
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("synonyms_bench", ".txt");
+
+        System.out.println();
+        System.out.println(bar());
+        System.out.println("  appendNewSynonyms END-TO-END  (warmup=" + warmup + "  runs=" + runs + ")");
+        System.out.println(bar());
+
+        ConceptMiner miner = new ConceptMiner();
+
+        // Warm up
+        for (int i = 0; i < warmup; i++) {
+            ConceptMiner.removeProjectSynonyms(tmp, "lucene");
+            miner.appendNewSynonyms(luceneReader, tmp, "lucene");
+        }
+
+        // Time each step separately on final run
+        long[] totals = new long[runs];
+        long[] mineAllTimes = new long[runs];
+        long[] filterTimes  = new long[runs];
+
+        for (int i = 0; i < runs; i++) {
+            ConceptMiner.removeProjectSynonyms(tmp, "lucene");
+
+            long t0 = System.currentTimeMillis();
+            var rules = miner.mineAll(luceneReader);
+            long t1 = System.currentTimeMillis();
+            var filtered = ConceptMiner.filterRedundant(rules, luceneReader, 5);
+            long t2 = System.currentTimeMillis();
+
+            mineAllTimes[i] = t1 - t0;
+            filterTimes[i]  = t2 - t1;
+            totals[i]       = t2 - t0;
+        }
+
+        // Final appendNewSynonyms (includes file write)
+        ConceptMiner.removeProjectSynonyms(tmp, "lucene");
+        long ta = System.currentTimeMillis();
+        int added = miner.appendNewSynonyms(luceneReader, tmp, "lucene");
+        long tb = System.currentTimeMillis();
+        java.nio.file.Files.deleteIfExists(tmp);
+
+        System.out.printf("  %-28s │ %6d ms%n", "mineAll (median)",   median(mineAllTimes));
+        System.out.printf("  %-28s │ %6d ms%n", "filterRedundant (median)", median(filterTimes));
+        System.out.printf("  %-28s │ %6d ms%n", "total w/o file write", median(totals));
+        System.out.printf("  %-28s │ %6d ms  (%,d rules written)%n",
+                "appendNewSynonyms (full)", tb - ta, added);
+        System.out.println(bar());
+        System.out.printf("  Run times (ms) mineAll: %s%n", java.util.Arrays.toString(mineAllTimes));
+        System.out.printf("  Run times (ms) filter:  %s%n", java.util.Arrays.toString(filterTimes));
+        System.out.println(bar());
+        System.out.println();
     }
 
     private static long median(long[] times) {

@@ -703,6 +703,13 @@ public class ConceptMiner {
             if (term.length() < 4)      continue; // skip very short tokens
             if (emitted.contains(term)) continue; // already covered
 
+            // Fan-out cap: a trigger mapping to >2 classes is too generic to be
+            // a useful synonym — it provides no discriminative value and causes
+            // BooleanQuery clause explosion at search time (default limit 1024;
+            // with 7 fields, even 10 synonyms per term in a 2-word query
+            // creates ~140 clauses per term × 3 query tiers = ~840 clauses).
+            if (e.getValue().size() > 2) continue;
+
             for (String cls : new TreeSet<>(e.getValue())) {
                 String classTarget = cls.toLowerCase();
                 if (term.equals(classTarget)) continue; // skip identity rules
