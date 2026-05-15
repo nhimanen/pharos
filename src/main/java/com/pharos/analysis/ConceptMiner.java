@@ -7,6 +7,9 @@ import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TermQuery;
@@ -572,6 +575,89 @@ public class ConceptMiner {
         return bigrams;
     }
 
+    // ── Redundancy filter ─────────────────────────────────────────────────────
+
+    /**
+     * Removes rules where the trigger already surfaces the target class via plain
+     * BM25 without any synonym expansion. Such rules add no retrieval value.
+     *
+     * <p>For each unique trigger, a multi-field {@link BooleanQuery} is run
+     * against the project index using the standard (no-synonym) analyzer.
+     * If the target class appears in the top-{@code topK} results, the rule is
+     * dropped. Only rules that would <em>fail</em> to return the class without
+     * the synonym are retained.
+     *
+     * <p>Results are cached per trigger so each unique term is only searched once.
+     *
+     * @param rules   rules to filter (trigger → set of class names)
+     * @param reader  open index reader for the target project
+     * @param topK    number of top results to check (5 is strict; 10 is lenient)
+     * @return filtered map with redundant rules removed
+     */
+    public static Map<String, Set<String>> filterRedundant(
+            Map<String, Set<String>> rules,
+            IndexReader reader,
+            int topK) throws IOException {
+
+        IndexSearcher searcher = new IndexSearcher(reader);
+        StoredFields  sf       = searcher.storedFields();
+
+        // Field weights matching the BM25 search strategy
+        String[] fields = {
+            DocumentMapper.F_CLASS_NAME,  DocumentMapper.F_METHOD_NAME,
+            DocumentMapper.F_JAVADOC,     DocumentMapper.F_BODY
+        };
+        float[] boosts = { 1.5f, 3.0f, 2.0f, 1.0f };
+
+        // Cache trigger → set of class names found in top-K
+        Map<String, Set<String>> cache = new HashMap<>();
+
+        Map<String, Set<String>> result = new HashMap<>();
+
+        for (Map.Entry<String, Set<String>> e : rules.entrySet()) {
+            String trigger = e.getKey();
+
+            Set<String> topClasses = cache.computeIfAbsent(trigger, t -> {
+                try {
+                    // Inner query: trigger MUST appear in at least one text field.
+                    // Without minimumNumberShouldMatch, optional SHOULD clauses
+                    // would return ALL class docs when the MUST clause is present.
+                    BooleanQuery.Builder inner = new BooleanQuery.Builder();
+                    inner.setMinimumNumberShouldMatch(1);
+                    for (int i = 0; i < fields.length; i++) {
+                        inner.add(new BoostQuery(
+                                new TermQuery(new Term(fields[i], t)), boosts[i]),
+                                BooleanClause.Occur.SHOULD);
+                    }
+                    // Outer: inner MUST match AND docType=class MUST match
+                    BooleanQuery.Builder outer = new BooleanQuery.Builder();
+                    outer.add(inner.build(), BooleanClause.Occur.MUST);
+                    outer.add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, "class")),
+                            BooleanClause.Occur.MUST);
+
+                    TopDocs hits = searcher.search(outer.build(), topK);
+                    Set<String> cls = new HashSet<>();
+                    for (ScoreDoc sd : hits.scoreDocs) {
+                        String cn = sf.document(sd.doc).get(DocumentMapper.F_CLASS_NAME);
+                        if (cn != null) cls.add(cn.toLowerCase());
+                    }
+                    return cls;
+                } catch (Exception ex) {
+                    return Set.of();
+                }
+            });
+
+            // Keep only class mappings the trigger cannot reach without a synonym
+            Set<String> nonRedundant = e.getValue().stream()
+                    .filter(cls -> !topClasses.contains(cls.toLowerCase()))
+                    .collect(Collectors.toSet());
+
+            if (!nonRedundant.isEmpty()) result.put(trigger, nonRedundant);
+        }
+
+        return result;
+    }
+
     // ── Auto-expansion: append new synonym rules to synonyms.txt ─────────────
 
     /**
@@ -598,8 +684,13 @@ public class ConceptMiner {
                                   String projectName) throws IOException {
         Set<String> existingLhs = loadExistingLhs(synonymFile);
 
-        // Mine using all seven sources with default configuration
+        // Mine using all sources with default configuration
         Map<String, Set<String>> allRules = mineAll(reader);
+
+        // Drop rules that BM25 already handles without synonyms — keeps only
+        // genuine vocabulary-gap bridges where the trigger would fail to find
+        // the target class without synonym expansion.
+        allRules = filterRedundant(allRules, reader, 5);
 
         List<String> newRules = new ArrayList<>();
         String date = java.time.LocalDate.now().toString();

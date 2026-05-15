@@ -33,17 +33,27 @@ import java.util.Map;
  */
 public class CrossEncoderTranslator implements Translator<String[], Float> {
 
-    private final Path tokenizerJson;
-    private final int  maxLength;
+    private final Path    tokenizerJson;
+    private final int     maxLength;
+    private final boolean includeTokenTypeIds;
     private HuggingFaceTokenizer tokenizer;
 
     /**
-     * @param tokenizerJson local path to tokenizer.json
-     * @param maxLength     maximum sequence length (query + document combined)
+     * @param tokenizerJson      local path to tokenizer.json
+     * @param maxLength          maximum sequence length (query + document combined)
+     * @param includeTokenTypeIds true for BERT-based models (ms-marco, BGE);
+     *                            false for RoBERTa-based models (stsb-roberta)
      */
+    public CrossEncoderTranslator(Path tokenizerJson, int maxLength,
+                                   boolean includeTokenTypeIds) {
+        this.tokenizerJson      = tokenizerJson;
+        this.maxLength          = maxLength;
+        this.includeTokenTypeIds = includeTokenTypeIds;
+    }
+
+    /** Defaults to including token_type_ids (BERT-style). */
     public CrossEncoderTranslator(Path tokenizerJson, int maxLength) {
-        this.tokenizerJson = tokenizerJson;
-        this.maxLength     = maxLength;
+        this(tokenizerJson, maxLength, true);
     }
 
     @Override
@@ -64,11 +74,14 @@ public class CrossEncoderTranslator implements Translator<String[], Float> {
         Encoding enc = tokenizer.encode(pair[0], pair[1]);
         NDManager mgr = ctx.getNDManager();
 
-        NDArray inputIds   = mgr.create(enc.getIds())           .reshape(1, -1);
-        NDArray attnMask   = mgr.create(enc.getAttentionMask()) .reshape(1, -1);
-        NDArray tokenTypes = mgr.create(enc.getTypeIds())        .reshape(1, -1);
+        NDArray inputIds = mgr.create(enc.getIds())           .reshape(1, -1);
+        NDArray attnMask = mgr.create(enc.getAttentionMask()) .reshape(1, -1);
 
-        return new NDList(inputIds, attnMask, tokenTypes);
+        if (includeTokenTypeIds) {
+            NDArray tokenTypes = mgr.create(enc.getTypeIds()).reshape(1, -1);
+            return new NDList(inputIds, attnMask, tokenTypes);
+        }
+        return new NDList(inputIds, attnMask);
     }
 
     /** Extracts the relevance score from the logits tensor. */
