@@ -17,7 +17,13 @@ import com.pharos.parser.JsCodeParser;
 import com.pharos.parser.LanguageProfile;
 import com.pharos.parser.PythonCodeParser;
 import com.pharos.parser.RegexCodeParser;
+import com.pharos.embedding.CrossEncoderProvider;
 import com.pharos.search.SearchEngine;
+import com.pharos.search.pipeline.CrossEncoder;
+import com.pharos.search.pipeline.CrossEncoderProviderAdapter;
+import com.pharos.search.pipeline.NoOpCrossEncoder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
 
 import java.util.List;
@@ -29,6 +35,8 @@ import java.util.List;
  * All dependencies are created once here and injected into subcommands.
  */
 public class Main {
+
+    private static final Logger log = LoggerFactory.getLogger(Main.class);
 
     static void main(String[] args) {
         IndexConfig config = IndexConfig.load();
@@ -52,7 +60,8 @@ public class Main {
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
                 config, luceneIndexer, registry, embedder, moduleGraphBuilder, parsers);
-        SearchEngine searchEngine = new SearchEngine(luceneIndexer, embedder, registry);
+        CrossEncoder crossEncoder = buildCrossEncoder(config);
+        SearchEngine searchEngine = new SearchEngine(luceneIndexer, embedder, registry, crossEncoder);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);
         CrossProjectLinker crossProjectLinker = new CrossProjectLinker(config, registry);
 
@@ -63,6 +72,16 @@ public class Main {
 
         int exitCode = cmd.execute(args);
         System.exit(exitCode);
+    }
+
+    private static CrossEncoder buildCrossEncoder(IndexConfig config) {
+        if (!config.isCrossEncoderEnabled()) return new NoOpCrossEncoder();
+        try {
+            return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
+        } catch (Exception e) {
+            log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
+            return new NoOpCrossEncoder();
+        }
     }
 
     /**

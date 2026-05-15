@@ -252,6 +252,21 @@ def fmt_path(data: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_pipelines(pipelines: list) -> str:
+    if not pipelines:
+        return "No pipelines available."
+    lines = ["Available search pipelines:\n"]
+    for p in pipelines:
+        avail = "" if p.get("available", True) else "  [unavailable — required component not loaded]"
+        lines.append(f"  {p['id']:<26} {p['label']}{avail}")
+        desc = p.get("description", "")
+        if desc:
+            lines.append(f"  {'':26} {desc}")
+        lines.append("")
+    lines.append("Use with:  pharos search \"query\" --pipeline <id>")
+    return "\n".join(lines).rstrip()
+
+
 def fmt_projects(projects: list, limit: int = 0) -> str:
     if not projects:
         return "No projects indexed yet. Run `pharos index <path>` first."
@@ -464,11 +479,12 @@ def fmt_boundary(data: dict, limit: int = 0) -> str:
 
 def cmd_search(args):
     ensure_daemon()
-    params = {
-        "q": args.query,
-        "type": args.type,
-        "limit": args.limit,
-    }
+    params = {"q": args.query, "limit": args.limit}
+    # --pipeline takes precedence over --type; both route through SearchType.from() on the server
+    if getattr(args, "pipeline", None):
+        params["pipeline"] = args.pipeline
+    else:
+        params["type"] = args.type
     if args.project:
         params["project"] = args.project
     if args.doc_type != "all":
@@ -477,6 +493,12 @@ def cmd_search(args):
         params["expand"] = "true"
     results = _api_get("/api/search", params)
     print(fmt_search(results))
+
+
+def cmd_pipelines(args):
+    ensure_daemon()
+    pipelines = _api_get("/api/pipelines")
+    print(fmt_pipelines(pipelines))
 
 
 def cmd_method(args):
@@ -664,6 +686,7 @@ COMMANDS
   mod-path    Find dependency path between two modules
   boundary    Show entry/exit points of a module
   skeleton    Show public/protected class and method signatures of a project
+  pipelines   List available search pipelines and their ids
   daemon      Manage the background daemon (start|stop|restart|status|logs)
 
 DAEMON
@@ -757,6 +780,10 @@ EXAMPLES
     p_search.add_argument(
         "--type", choices=["hybrid", "keyword", "vector"], default="hybrid",
         help="Search strategy: hybrid (default), keyword (BM25, best for exact names), vector (semantic)"
+    )
+    p_search.add_argument(
+        "--pipeline", metavar="ID", default=None,
+        help="Named pipeline id (overrides --type). Run 'pharos pipelines' to see available ids."
     )
     p_search.add_argument("--project", metavar="NAME", help="Restrict to a specific indexed project")
     p_search.add_argument("--limit", type=int, default=10, metavar="N", help="Max results (default: 10)")
@@ -954,6 +981,15 @@ EXAMPLES
     p_skeleton.add_argument("--depth", type=int, default=-1, metavar="N",
                             help="Max directory levels below --path to include (-1 = unlimited)")
     p_skeleton.set_defaults(func=cmd_skeleton)
+
+    # pipelines
+    p_pipelines = sub.add_parser(
+        "pipelines",
+        help="List available search pipelines",
+        description="List all search pipelines with their ids, labels, and availability.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_pipelines.set_defaults(func=cmd_pipelines)
 
     # daemon
     p_daemon = sub.add_parser(

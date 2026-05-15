@@ -44,6 +44,13 @@ public class IndexConfig {
      */
     private int indexThreads;
 
+    /**
+     * When true, loads a cross-encoder ONNX model to enable HYBRID_RERANKED and
+     * HYBRID_CROSS_ENCODER_MERGE search modes. Requires a compatible model on HuggingFace Hub.
+     * Degrades gracefully to BordaMerge when the model cannot be loaded.
+     */
+    private boolean crossEncoderEnabled = true;
+
     // Jackson requires no-arg constructor
     public IndexConfig() {
         this.indexDir    = DEFAULT_BASE.resolve("indexes");
@@ -142,4 +149,7 @@ public class IndexConfig {
 
     public int getIndexThreads() { return indexThreads; }
     public void setIndexThreads(int indexThreads) { this.indexThreads = indexThreads; }
+
+    public boolean isCrossEncoderEnabled() { return crossEncoderEnabled; }
+    public void setCrossEncoderEnabled(boolean crossEncoderEnabled) { this.crossEncoderEnabled = crossEncoderEnabled; }
 }

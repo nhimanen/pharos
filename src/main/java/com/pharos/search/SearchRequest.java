@@ -16,13 +16,20 @@ public record SearchRequest(
         String scope           // null = all, "prod", "test", "docs"
 ) {
     public enum SearchType {
-        KEYWORD, VECTOR, HYBRID;
+        KEYWORD, VECTOR, HYBRID,
+        /** BordaMerge followed by cross-encoder reranking. Degrades to HYBRID when no encoder is configured. */
+        HYBRID_RERANKED,
+        /** Cross-encoder scores all candidates and acts as the merge step. Degrades to deduplicated pool when no encoder is configured. */
+        HYBRID_CROSS_ENCODER_MERGE;
 
         public static SearchType from(String s) {
             return switch (s.toLowerCase()) {
-                case "keyword" -> KEYWORD;
-                case "vector"  -> VECTOR;
-                case "hybrid"  -> HYBRID;
+                case "keyword"                            -> KEYWORD;
+                case "vector"                             -> VECTOR;
+                case "hybrid"                             -> HYBRID;
+                case "hybrid-reranked", "hybrid_reranked" -> HYBRID_RERANKED;
+                case "hybrid-ce-merge",
+                     "hybrid_cross_encoder_merge"         -> HYBRID_CROSS_ENCODER_MERGE;
                 default -> HYBRID;
             };
         }

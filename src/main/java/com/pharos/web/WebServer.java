@@ -70,6 +70,9 @@ public class WebServer {
             }
         });
 
+        // API: available search pipelines — for UI pipeline selector
+        app.get("/api/pipelines", ctx -> ctx.json(searchEngine.listPipelines()));
+
         // API: project list
         app.get("/api/projects", ctx ->
                 ctx.json(registry.listAll().stream()
@@ -106,12 +109,14 @@ public class WebServer {
             ctx.json(buildLanguageBreakdown(meta));
         });
 
-        // API: search
+        // API: search — ?pipeline=<id> takes precedence over ?type=<id> for UI use
         app.get("/api/search", ctx -> {
             String q = ctx.queryParam("q");
             if (q == null || q.isBlank()) { ctx.json(List.of()); return; }
             String project = ctx.queryParam("project");
-            String type = ctx.queryParamAsClass("type", String.class).getOrDefault("hybrid");
+            String pipeline = ctx.queryParam("pipeline");
+            String type = pipeline != null ? pipeline
+                    : ctx.queryParamAsClass("type", String.class).getOrDefault("hybrid");
             int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(20);
             String docType = ctx.queryParam("docType");
             if ("all".equals(docType)) docType = null;
@@ -680,6 +685,7 @@ public class WebServer {
         m.put("id", r.id());
         m.put("label", r.label());
         m.put("project", r.project());
+        m.put("className", r.className());
         m.put("signature", r.signature());
         m.put("javadoc", r.javadoc());
         m.put("filePath", r.filePath());
@@ -687,13 +693,13 @@ public class WebServer {
         m.put("endLine", r.endLine());
         m.put("score", r.score());
         m.put("docType", r.docType());
+        m.put("searchType", r.searchType());
         return m;
     }
 
     private Map<String, Object> methodToMap(SearchResult r) {
         Map<String, Object> m = resultToMap(r);
         m.put("packageName", r.packageName());
-        m.put("className", r.className());
         m.put("methodName", r.methodName());
         m.put("returnType", r.returnType());
         m.put("body", r.body());

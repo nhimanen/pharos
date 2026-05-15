@@ -9,6 +9,9 @@ import java.util.*;
 /**
  * Hybrid search combining BM25 keyword search and KNN vector search.
  *
+ * @deprecated Use {@link com.pharos.search.pipeline.SearchPipeline} with
+ *     {@link com.pharos.search.pipeline.BordaMerger} instead.
+ *
  * <p>Fusion strategy: <b>Borda count with agreement bonus</b>.
  * Each result list contributes linear Borda points: rank 1 scores {@code listSize} points,
  * rank 2 scores {@code listSize - 1}, etc.  Documents that appear in <em>both</em> lists
@@ -30,6 +33,7 @@ import java.util.*;
  *
  * <p>Degrades gracefully to keyword-only when embeddings are unavailable.
  */
+@Deprecated
 public class HybridSearchStrategy {
 
     /** Multiplier applied to docs present in both keyword and vector lists. */

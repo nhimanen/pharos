@@ -5,6 +5,15 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.search.pipeline.BordaMerger;
+import com.pharos.search.pipeline.CrossEncoder;
+import com.pharos.search.pipeline.CrossEncoderMerger;
+import com.pharos.search.pipeline.CrossEncoderReranker;
+import com.pharos.search.pipeline.KeywordRetrievalStage;
+import com.pharos.search.pipeline.NoOpCrossEncoder;
+import com.pharos.search.pipeline.PipelineDescriptor;
+import com.pharos.search.pipeline.SearchPipeline;
+import com.pharos.search.pipeline.VectorRetrievalStage;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
@@ -17,6 +26,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -88,20 +98,61 @@ public class SearchEngine {
                                String langExtension, boolean langExplicit) {}
 
     private final LuceneIndexer luceneIndexer;
-    private final EmbeddingProvider embedder;
     private final ProjectRegistry registry;
-    private final KeywordSearchStrategy keywordStrategy;
-    private final HybridSearchStrategy hybridStrategy;
-    private final VectorSearchStrategy vectorStrategy;
+    private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
+    private final List<PipelineDescriptor> pipelineDescriptors;
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
+        this(luceneIndexer, embedder, registry, new NoOpCrossEncoder());
+    }
+
+    public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
+                        ProjectRegistry registry, CrossEncoder crossEncoder) {
         this.luceneIndexer = luceneIndexer;
-        this.embedder = embedder;
         this.registry = registry;
-        this.keywordStrategy = new KeywordSearchStrategy();
-        this.hybridStrategy = new HybridSearchStrategy(embedder);
-        this.vectorStrategy = new VectorSearchStrategy(embedder);
+
+        KeywordSearchStrategy kw  = new KeywordSearchStrategy();
+        VectorSearchStrategy  vec = new VectorSearchStrategy(embedder);
+
+        KeywordRetrievalStage kwStage  = new KeywordRetrievalStage(kw);
+        VectorRetrievalStage  vecStage = new VectorRetrievalStage(vec);
+        BordaMerger           borda    = new BordaMerger();
+        CrossEncoderMerger    ceMerger   = new CrossEncoderMerger(crossEncoder);
+        CrossEncoderReranker  ceReranker = new CrossEncoderReranker(crossEncoder);
+
+        Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
+        map.put(SearchRequest.SearchType.KEYWORD,
+                SearchPipeline.builder().retriever(kwStage).build());
+        map.put(SearchRequest.SearchType.VECTOR,
+                SearchPipeline.builder().retriever(vecStage).build());
+        map.put(SearchRequest.SearchType.HYBRID,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(borda).build());
+        map.put(SearchRequest.SearchType.HYBRID_RERANKED,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(borda).reranker(ceReranker).build());
+        map.put(SearchRequest.SearchType.HYBRID_CROSS_ENCODER_MERGE,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(ceMerger).build());
+        this.pipelines = Map.copyOf(map);
+
+        boolean vecAvailable = embedder.isAvailable();
+        boolean ceAvailable  = crossEncoder.isAvailable();
+        this.pipelineDescriptors = List.of(
+            new PipelineDescriptor("keyword",        "Keyword (BM25)",
+                    "BM25 keyword search with field boosts and graph in-degree scoring", true),
+            new PipelineDescriptor("vector",         "Semantic (Vector)",
+                    "HNSW nearest-neighbor search over embedded method/class bodies", vecAvailable),
+            new PipelineDescriptor("hybrid",         "Hybrid",
+                    "Borda-count fusion of keyword and vector results with agreement bonus", true),
+            new PipelineDescriptor("hybrid-reranked","Hybrid + Reranker",
+                    "Hybrid fusion followed by cross-encoder reranking over the merged list", ceAvailable),
+            new PipelineDescriptor("hybrid-ce-merge","CE Merge",
+                    "Cross-encoder scores all deduplicated candidates and acts as the merge step", ceAvailable)
+        );
+    }
+
+    /** Returns the ordered list of available pipelines for UI display. */
+    public List<PipelineDescriptor> listPipelines() {
+        return pipelineDescriptors;
     }
 
     public List<SearchResult> search(SearchRequest req) throws IOException {
@@ -146,38 +197,9 @@ public class SearchEngine {
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
-        List<SearchResult> primary;
-        switch (req.type()) {
-            case KEYWORD -> {
-                long t = System.currentTimeMillis();
-                primary = keywordStrategy.search(reader, req);
-                trace.record("keyword search", t);
-            }
-            case VECTOR -> {
-                long tEmbed = System.currentTimeMillis();
-                // Embedding happens inside VectorSearchStrategy; we measure the whole call
-                primary = vectorStrategy.search(reader, req);
-                trace.record("vector search (incl. embed)", tEmbed);
-            }
-            case HYBRID -> {
-                long tKw = System.currentTimeMillis();
-                List<SearchResult> kwResults = keywordStrategy.search(reader, req);
-                trace.record("keyword search", tKw);
-
-                if (!embedder.isAvailable()) {
-                    primary = kwResults;
-                    trace.record("vector search skipped (no embedder)", System.currentTimeMillis());
-                } else {
-                    long tVec = System.currentTimeMillis();
-                    List<SearchResult> vecResults = vectorStrategy.search(reader, req);
-                    trace.record("vector search (incl. embed)", tVec);
-                    long tRrf = System.currentTimeMillis();
-                    primary = hybridStrategy.fuse(kwResults, vecResults, req.limit(), req.query());
-                    trace.record("rrf fusion", tRrf);
-                }
-            }
-            default -> primary = List.of();
-        }
+        SearchPipeline pipeline = pipelines.getOrDefault(req.type(),
+                pipelines.get(SearchRequest.SearchType.HYBRID));
+        List<SearchResult> primary = pipeline.execute(reader, req, trace);
 
         // Project-affinity boost: when the caller has scoped the search to a specific project,
         // multiply scores of results from that project by PROJECT_AFFINITY_BOOST so they rank

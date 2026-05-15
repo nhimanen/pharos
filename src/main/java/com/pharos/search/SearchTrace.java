@@ -23,7 +23,7 @@ public class SearchTrace {
         overallStart = System.currentTimeMillis();
     }
 
-    void record(String name, long spanStart) {
+    public void record(String name, long spanStart) {
         spans.add(new Span(name, spanStart, System.currentTimeMillis()));
     }
 

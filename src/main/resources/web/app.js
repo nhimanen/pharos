@@ -84,9 +84,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   initGraph();
   initControls();
   initContextMenu();
+  await loadPipelines();
   await refreshProjects();
   await loadModuleGraph();
 });
+
+async function loadPipelines() {
+  const sel = document.getElementById('pipeline-select');
+  try {
+    const pipelines = await fetch('/api/pipelines').then(r => r.json());
+    sel.innerHTML = pipelines.map(p =>
+      `<option value="${p.id}" ${p.available ? '' : 'disabled'} title="${p.description}">` +
+      `${p.label}${p.available ? '' : ' (unavailable)'}</option>`
+    ).join('');
+  } catch {
+    sel.innerHTML = '<option value="hybrid">Hybrid</option>';
+  }
+}
 
 // ── Graph canvas setup ────────────────────────────────────────
 function initGraph() {
@@ -1323,23 +1337,24 @@ function renderRelatedList(el, title, items) {
     <ul class="related-list">${rows}${more}</ul>`;
 }
 
-function focusNode(fqnOrId) {
+function focusNode(fqnOrId, zoomScale) {
   // Match by exact id or by the FQN embedded in id (after ':')
   const node = currentNodes.find(n => n.id === fqnOrId || extractFqn(n.id) === fqnOrId);
-  if (!node || node.x == null) return;
+  if (!node || node.x == null) return false;
 
-  // Pan the graph so the node is centred
+  // Pan + optionally zoom so the node is centred
   const cr = document.getElementById('graph-container').getBoundingClientRect();
-  const t  = S.zoomTransform;
+  const k  = zoomScale != null ? zoomScale : S.zoomTransform.k;
   const newTransform = d3.zoomIdentity
-    .translate(cr.width / 2 - node.x * t.k, cr.height / 2 - node.y * t.k)
-    .scale(t.k);
+    .translate(cr.width / 2 - node.x * k, cr.height / 2 - node.y * k)
+    .scale(k);
 
   const target = S.useCanvas ? d3.select(canvasEl) : svgSel;
   target.transition().duration(500).call(zoomBehavior.transform, newTransform);
 
   // Select the node (shows detail, highlights circle)
   selectNode(node);
+  return true;
 }
 
 function closeDetail() {
@@ -1606,10 +1621,12 @@ async function doSearch() {
   const q = document.getElementById('search-input').value.trim();
   if (!q) { applyLocalFilter(); closeSearchResults(); return; }
 
-  const proj = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
+  const proj     = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
+  const pipeline = document.getElementById('pipeline-select').value;
+  const pipelineParam = pipeline ? `&pipeline=${encodeURIComponent(pipeline)}` : '';
   let hits;
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}&limit=30`);
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}${pipelineParam}&limit=30`);
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Search failed (${res.status}): ${msg}`);
@@ -1648,14 +1665,20 @@ async function doSearch() {
     srPanel.innerHTML = '<div class="sr-none">No results found</div>';
   } else {
     srPanel.innerHTML = hits.map((r, i) => {
-      const method  = r.label || r.id || '';
-      const cls     = r.className || '';
-      const sig     = r.signature || '';
-      const snip    = (r.javadoc || r.body || '').replace(/\s+/g, ' ').slice(0, 100);
-      const project = r.project || '';
+      const method   = r.label || r.id || '';
+      const cls      = r.className || '';
+      const sig      = r.signature || '';
+      const snip     = (r.javadoc || '').replace(/\s+/g, ' ').slice(0, 200);
+      const project  = r.project || '';
+      const docType  = r.docType || 'method';
+      const srchType = r.searchType || '';
+      const badge    = `<span class="sr-badge sr-badge-${esc(docType)}">${esc(docType)}</span>`;
+      const typeBadge = srchType && srchType !== 'hybrid' && srchType !== 'related'
+        ? `<span class="sr-badge sr-badge-type">${esc(srchType)}</span>` : '';
       return `<div class="sr-item" data-idx="${i}" data-fqn="${esc(extractFqn(r.id))}"
-                   data-project="${esc(project)}" data-class="${esc(cls)}" title="${esc(sig)}">
-        <div class="sr-method">${highlightTerms(method, q)}<span class="sr-project">${esc(project)}</span></div>
+                   data-project="${esc(project)}" data-class="${esc(cls)}"
+                   data-doc-type="${esc(docType)}">
+        <div class="sr-method">${highlightTerms(method, q)}${badge}${typeBadge}<span class="sr-project">${esc(project)}</span></div>
         ${cls  ? `<div class="sr-class">${esc(cls)}</div>` : ''}
         ${sig  ? `<div class="sr-sig">${highlightTerms(sig, q)}</div>` : ''}
         ${snip ? `<div class="sr-snip">${highlightTerms(snip, q)}</div>` : ''}
@@ -1675,16 +1698,32 @@ srPanel.addEventListener('click', async e => {
   const fqn     = item.dataset.fqn;
   const project = item.dataset.project;
   const cls     = item.dataset.class;
+  const docType = item.dataset.docType;
 
   if (!fqn || !project) return;
 
-  // Switch to call graph view for that project if needed
-  if (S.view !== 'call' || S.selectedProject !== project) {
-    await loadCallGraph(project, null, cls || null);
-    // Give the simulation a moment to settle, then try to focus
-    setTimeout(() => focusNode(fqn), 600);
+  const ZOOM_SCALE = 2.0;
+
+  const tryFocus = (fqn, attempts) => {
+    if (focusNode(fqn, ZOOM_SCALE)) return;
+    if (attempts < 8) setTimeout(() => tryFocus(fqn, attempts + 1), 250);
+  };
+
+  // For class-type results navigate to the class graph, otherwise the call graph
+  if (docType === 'class') {
+    if (S.view !== 'classes' || S.selectedProject !== project) {
+      await loadClassGraph(project);
+      setTimeout(() => tryFocus(fqn, 0), 400);
+    } else {
+      tryFocus(fqn, 0);
+    }
   } else {
-    focusNode(fqn);
+    if (S.view !== 'call' || S.selectedProject !== project) {
+      await loadCallGraph(project, null, cls || null);
+      setTimeout(() => tryFocus(fqn, 0), 400);
+    } else {
+      tryFocus(fqn, 0);
+    }
   }
 });
 

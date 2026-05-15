@@ -51,7 +51,8 @@ public class CrossEncoderProvider implements AutoCloseable {
 
     private final Model     model;
     private final Path      tokenizerFile;
-    private final Predictor<String[], Float> predictor;
+    private final Predictor<String[], Float>       predictor;
+    private final Predictor<List<String[]>, float[]> batchPredictor;
     private final String    label;
 
     /** ms-marco MiniLM-L-6 quantized (default). */
@@ -82,6 +83,9 @@ public class CrossEncoderProvider implements AutoCloseable {
         boolean useTokenTypes = probeTokenTypeIds(tokenizerFile, includeTokenTypeIds);
         predictor = model.newPredictor(
                 new CrossEncoderTranslator(
+                        tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
+        batchPredictor = model.newPredictor(
+                new CrossEncoderBatchTranslator(
                         tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
         log.info("Cross-encoder [{}] loaded (token_type_ids={}).", label, useTokenTypes);
     }
@@ -169,9 +173,31 @@ public class CrossEncoderProvider implements AutoCloseable {
         }
     }
 
+    /**
+     * Scores all (query, document) pairs in a single batched ONNX forward pass.
+     * Substantially faster than calling {@link #score} in a loop.
+     *
+     * @param query     the search query (same for all documents)
+     * @param documents the candidate documents to score
+     * @return relevance scores in [0, 1], one per document, same order
+     */
+    public float[] scoreBatch(String query, List<String> documents) {
+        if (documents.isEmpty()) return new float[0];
+        try {
+            List<String[]> pairs = documents.stream()
+                    .map(doc -> new String[]{query, doc})
+                    .toList();
+            return batchPredictor.predict(pairs);
+        } catch (TranslateException e) {
+            log.warn("Cross-encoder batch scoring failed: {}", e.getMessage());
+            return new float[documents.size()];
+        }
+    }
+
     @Override
     public void close() {
         predictor.close();
+        batchPredictor.close();
         model.close();
     }
 
