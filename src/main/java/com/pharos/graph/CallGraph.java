@@ -226,7 +226,11 @@ public class CallGraph implements AutoCloseable {
      * External stubs (added implicitly for unresolved callees) are excluded.
      */
     public Stream<String> allFqns() {
-        ResultSet rs = db.query("sql", "SELECT fqn FROM Method WHERE classPrefix <> ''");
+        // Use range predicate (classPrefix > '') rather than not-equal (<> '')
+        // so ArcadeDB can satisfy the query via the LSM_TREE index on classPrefix
+        // instead of doing a full O(M) type scan.  Stubs have classPrefix='' which
+        // sorts below any real package string, so they are correctly excluded.
+        ResultSet rs = db.query("sql", "SELECT fqn FROM Method WHERE classPrefix > ''");
         List<String> fqns = new ArrayList<>();
         while (rs.hasNext()) {
             Object v = rs.next().getProperty("fqn");
