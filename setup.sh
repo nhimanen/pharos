@@ -16,6 +16,47 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── 0. Java check ─────────────────────────────────────────────────────────────
+
+REQUIRED_JAVA=25
+
+_java_version() {
+  java -version 2>&1 | awk -F '"' '/version/ {print $2}' | cut -d'.' -f1
+}
+
+_install_java_sdkman() {
+  local version="$1"
+  echo "Java $version not found. Attempting to install via SDKMAN..."
+
+  # Install SDKMAN if not present
+  if [ ! -f "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
+    echo "Installing SDKMAN..."
+    curl -s "https://get.sdkman.io" | bash
+  fi
+
+  # shellcheck disable=SC1091
+  source "$HOME/.sdkman/bin/sdkman-init.sh"
+  sdk install java "${version}-tem" || sdk install java "${version}.0.0-tem" || {
+    echo "Error: could not install Java $version via SDKMAN." >&2
+    echo "Please install Java $version manually: https://sdkman.io/usage" >&2
+    exit 1
+  }
+  sdk default java "$(sdk list java 2>/dev/null | grep -oP '\d+\.\S+tem' | grep "^${version}" | head -1)"
+  echo "Java $version installed via SDKMAN."
+}
+
+if ! command -v java &>/dev/null; then
+  _install_java_sdkman "$REQUIRED_JAVA"
+else
+  JAVA_VER="$(_java_version)"
+  if [ -z "$JAVA_VER" ] || [ "$JAVA_VER" -lt "$REQUIRED_JAVA" ] 2>/dev/null; then
+    echo "Warning: Java $JAVA_VER found but Java $REQUIRED_JAVA+ is required."
+    _install_java_sdkman "$REQUIRED_JAVA"
+  else
+    echo "Java $JAVA_VER found. ✓"
+  fi
+fi
 PHAROS_BIN="$HOME/.pharos/bin"
 LOCAL_BIN="$HOME/.local/bin"
 DAEMON_PID_FILE="$HOME/.pharos/daemon.pid"
@@ -92,6 +133,7 @@ else
   echo "Starting daemon on port $DAEMON_PORT..."
   nohup java --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
+    --add-modules jdk.incubator.vector \
     -jar "$PHAROS_BIN/pharos.jar" web --port "$DAEMON_PORT" \
     >> "$HOME/.pharos/daemon.log" 2>&1 &
   NEW_PID=$!

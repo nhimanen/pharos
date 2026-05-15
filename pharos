@@ -68,6 +68,7 @@ def _start_daemon():
     proc = subprocess.Popen(
         ["java", "--enable-native-access=ALL-UNNAMED",
          "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
+         "--add-modules", "jdk.incubator.vector",
          "-jar", str(JAR),
          "web", "--port", str(DAEMON_PORT), "--no-open"],
         stdout=log_fh,
@@ -534,9 +535,8 @@ def cmd_index(args):
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
     jvm_flags = ["--enable-native-access=ALL-UNNAMED",
-                 "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED"]
-    if args.vector_incubator:
-        jvm_flags.append("--add-modules jdk.incubator.vector")
+                 "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
+                 "--add-modules", "jdk.incubator.vector"]
     cmd = ["java"] + jvm_flags + ["-jar", str(JAR), "index", str(args.path)]
     if args.project:
         cmd += ["--project", args.project]
