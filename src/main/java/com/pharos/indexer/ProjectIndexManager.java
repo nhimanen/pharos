@@ -41,6 +41,8 @@ import java.util.stream.Collectors;
 public class ProjectIndexManager {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexManager.class);
+    /** Number of embedding texts per ONNX forward pass during global batching. */
+    private static final int EMBED_CHUNK_SIZE = 32;
 
     private final IndexConfig config;
     private final LuceneIndexer luceneIndexer;
@@ -395,69 +397,84 @@ public class ProjectIndexManager {
                 progress.onProgress("Removing deleted files", ++doneWork, totalWork);
             }
 
-            for (Path file : dirtyFiles) {
-                // Delete existing docs for this file (both methods and classes)
-                writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH, file.toAbsolutePath().toString()));
+            // Pass 1: delete stale docs and parse all dirty files.
+            // Collect embedding texts per file (no ONNX yet) so we can embed in one global batch.
+            boolean doEmbed = generateEmbeddings && embedder.isAvailable();
+            List<String> allIncrementalTexts = doEmbed ? new ArrayList<>() : List.of();
+            List<Integer> fileTextStarts = new ArrayList<>();     // offset in allIncrementalTexts per parsed file
+            List<List<String>> parsedSynthBodies = new ArrayList<>();
 
-                // Re-parse and re-index using the matching language parser
+            for (Path file : dirtyFiles) {
+                writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH, file.toAbsolutePath().toString()));
                 CodeParser fileParser = parserFor(file);
                 if (fileParser == null) {
                     log.debug("No parser for {}, skipping", file.getFileName());
-                    progress.onProgress("Indexing", ++doneWork, totalWork);
                     continue;
                 }
                 try {
                     ParsedFile parsedFile = fileParser.parseFile(file, projectName);
                     parsedDirtyFiles.add(parsedFile);
 
-                    // Build embedding texts per file and batch them in one call
-                    List<String> methodTexts = parsedFile.methods().stream()
-                            .map(DocumentMapper::buildEmbeddingText)
-                            .collect(Collectors.toList());
                     Map<String, List<ParsedMethod>> methodsByClass = parsedFile.methods().stream()
                             .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
-                    List<String> synthesizedBodies = parsedFile.classes().stream()
+                    List<String> synthBodies = parsedFile.classes().stream()
                             .map(cls -> buildSynthesizedBody(
                                     methodsByClass.getOrDefault(cls.qualifiedClassName(), List.of())))
                             .collect(Collectors.toList());
-                    List<String> classTexts = new ArrayList<>(parsedFile.classes().size());
-                    for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
-                        classTexts.add(DocumentMapper.buildClassEmbeddingText(
-                                parsedFile.classes().get(ci), synthesizedBodies.get(ci)));
+                    parsedSynthBodies.add(synthBodies);
+
+                    if (doEmbed) {
+                        fileTextStarts.add(allIncrementalTexts.size());
+                        for (ParsedMethod m : parsedFile.methods()) {
+                            allIncrementalTexts.add(DocumentMapper.buildEmbeddingText(m));
+                        }
+                        for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
+                            allIncrementalTexts.add(DocumentMapper.buildClassEmbeddingText(
+                                    parsedFile.classes().get(ci), synthBodies.get(ci)));
+                        }
+                    } else {
+                        fileTextStarts.add(0);
                     }
-
-                    // Batch embed all methods + classes in this file in one ONNX pass
-                    List<String> allTexts = new ArrayList<>(methodTexts.size() + classTexts.size());
-                    allTexts.addAll(methodTexts);
-                    allTexts.addAll(classTexts);
-                    float[][] allEmbeddings = (generateEmbeddings && embedder.isAvailable())
-                            ? embedder.embedBatch(allTexts)
-                            : new float[allTexts.size()][];
-
-                    // Re-index methods
-                    for (int mi = 0; mi < parsedFile.methods().size(); mi++) {
-                        ParsedMethod method = parsedFile.methods().get(mi);
-                        float[] embedding = allEmbeddings[mi];
-                        writer.addDocument(DocumentMapper.toDocument(method, embedding));
-                    }
-
-                    // Re-index classes
-                    int classOffset = parsedFile.methods().size();
-                    for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
-                        ParsedClass cls = parsedFile.classes().get(ci);
-                        String synthesizedBody = synthesizedBodies.get(ci);
-                        float[] embedding = allEmbeddings[classOffset + ci];
-                        writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBody, embedding));
-                    }
-
-                    List<String> classNames = parsedFile.classes().stream()
-                            .map(ParsedClass::qualifiedClassName)
-                            .collect(Collectors.toList());
-                    stateTracker.track(file, classNames);
-                    log.debug("Re-indexed {}", file.getFileName());
                 } catch (Exception e) {
-                    log.warn("Failed to re-index {}: {}", file, e.getMessage());
+                    log.warn("Failed to parse {}: {}", file, e.getMessage());
                 }
+            }
+
+            // Pass 2: embed all dirty-file texts in one global chunked ONNX pass.
+            final float[][] incrementalEmbeddings;
+            if (doEmbed && !allIncrementalTexts.isEmpty()) {
+                int totalChunks = (allIncrementalTexts.size() + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+                incrementalEmbeddings = embedder.embedChunked(allIncrementalTexts, EMBED_CHUNK_SIZE,
+                        done -> progress.onProgress("Embedding", done, totalChunks));
+            } else {
+                incrementalEmbeddings = new float[0][];
+            }
+
+            // Pass 3: write Lucene documents using pre-computed embeddings.
+            for (int i = 0; i < parsedDirtyFiles.size(); i++) {
+                ParsedFile parsedFile = parsedDirtyFiles.get(i);
+                List<String> synthBodies = parsedSynthBodies.get(i);
+                int offset = fileTextStarts.get(i);
+
+                for (int mi = 0; mi < parsedFile.methods().size(); mi++) {
+                    ParsedMethod method = parsedFile.methods().get(mi);
+                    float[] embedding = (offset + mi < incrementalEmbeddings.length)
+                            ? incrementalEmbeddings[offset + mi] : null;
+                    writer.addDocument(DocumentMapper.toDocument(method, embedding));
+                }
+                int classOffset = parsedFile.methods().size();
+                for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
+                    ParsedClass cls = parsedFile.classes().get(ci);
+                    float[] embedding = (offset + classOffset + ci < incrementalEmbeddings.length)
+                            ? incrementalEmbeddings[offset + classOffset + ci] : null;
+                    writer.addDocument(DocumentMapper.toClassDocument(cls, synthBodies.get(ci), embedding));
+                }
+
+                List<String> classNames = parsedFile.classes().stream()
+                        .map(ParsedClass::qualifiedClassName)
+                        .collect(Collectors.toList());
+                stateTracker.track(Path.of(parsedFile.filePath()), classNames);
+                log.debug("Re-indexed {}", parsedFile.filePath());
                 progress.onProgress("Indexing", ++doneWork, totalWork);
             }
             writer.commit();
@@ -499,25 +516,66 @@ public class ProjectIndexManager {
                                FileStateTracker stateTracker, boolean generateEmbeddings,
                                GraphIndexData graphData, ProgressListener progress) throws IOException {
         int indexThreads = config.resolvedIndexThreads();
+        List<ParsedFile> files = project.files();
+        int totalFiles = files.size();
         log.debug("Indexing with {} thread(s)", indexThreads);
 
         // Build method lookup per class for synthesized class bodies (read-only after construction)
         Map<String, List<ParsedMethod>> methodsByClass = project.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
-
-        // Pre-compute synthesized bodies once per class. In the parallel path, multiple threads
-        // may index methods from the same class — memoizing avoids redundant string concatenation.
         ConcurrentHashMap<String, String> synthesizedBodyCache = new ConcurrentHashMap<>();
 
-        int totalFiles = project.files().size();
+        // Phase 1: collect synthesized bodies and embedding texts for every file without
+        // touching ONNX.  Per-file texts occupy a contiguous slice of allTexts:
+        //   methods at [fileOffsets[fi], fileOffsets[fi] + file.methods().size())
+        //   classes  at [fileOffsets[fi] + file.methods().size(), fileOffsets[fi+1])
+        boolean doEmbed = generateEmbeddings && embedder.isAvailable();
+        List<String> allTexts = doEmbed ? new ArrayList<>() : List.of();
+        int[] fileOffsets = new int[totalFiles];
+        List<List<String>> fileSynthBodies = new ArrayList<>(totalFiles);
+
+        for (int fi = 0; fi < totalFiles; fi++) {
+            ParsedFile file = files.get(fi);
+            List<String> synthBodies = file.classes().stream()
+                    .map(cls -> synthesizedBodyCache.computeIfAbsent(
+                            cls.qualifiedClassName(),
+                            k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
+                    .collect(Collectors.toList());
+            fileSynthBodies.add(synthBodies);
+
+            if (doEmbed) {
+                fileOffsets[fi] = allTexts.size();
+                for (ParsedMethod m : file.methods()) {
+                    allTexts.add(DocumentMapper.buildEmbeddingText(m));
+                }
+                for (int ci = 0; ci < file.classes().size(); ci++) {
+                    allTexts.add(DocumentMapper.buildClassEmbeddingText(
+                            file.classes().get(ci), synthBodies.get(ci)));
+                }
+            }
+        }
+
+        // Phase 2: single global ONNX pass with length-sorted chunking.
+        // Large batches amortise JNI + session overhead; sorting groups similar-length sequences
+        // together so padding waste within each chunk is minimised.
+        final float[][] globalEmbeddings;
+        if (doEmbed && !allTexts.isEmpty()) {
+            int totalChunks = (allTexts.size() + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+            globalEmbeddings = embedder.embedChunked(allTexts, EMBED_CHUNK_SIZE,
+                    done -> progress.onProgress("Embedding", done, totalChunks));
+        } else {
+            globalEmbeddings = new float[0][];
+        }
+
+        // Phase 3: write Lucene documents — no ONNX here, safe to parallelise freely.
         AtomicInteger doneFiles = new AtomicInteger(0);
         AtomicInteger totalMethods = new AtomicInteger(0);
 
         if (indexThreads <= 1) {
-            // Sequential path — preserves original behaviour exactly
-            for (ParsedFile file : project.files()) {
-                indexFile(writer, file, stateTracker, generateEmbeddings, graphData,
-                        methodsByClass, synthesizedBodyCache);
+            for (int fi = 0; fi < totalFiles; fi++) {
+                ParsedFile file = files.get(fi);
+                writeFileDocs(writer, file, stateTracker, graphData,
+                        fileSynthBodies.get(fi), globalEmbeddings, fileOffsets[fi]);
                 int done = doneFiles.incrementAndGet();
                 totalMethods.addAndGet(file.methods().size());
                 progress.onProgress("Indexing", done, totalFiles);
@@ -526,33 +584,31 @@ public class ProjectIndexManager {
                 }
             }
         } else {
-            // Parallel path:
-            //   • IndexWriter.addDocument() is thread-safe in Lucene
-            //   • EmbeddingProvider uses ThreadLocal Predictors (one per thread)
-            //   • FileStateTracker uses ConcurrentHashMap — no external lock needed
-            //   • synthesizedBodyCache is ConcurrentHashMap — safe for concurrent reads/writes
+            // IndexWriter.addDocument() is thread-safe; embeddings are pre-computed read-only
+            // arrays; FileStateTracker uses ConcurrentHashMap — the parallel write is safe.
             ExecutorService pool = Executors.newFixedThreadPool(indexThreads,
                     r -> { Thread t = new Thread(r, "indexer"); t.setDaemon(true); return t; });
             try {
                 List<Future<?>> futures = new ArrayList<>(totalFiles);
-                for (ParsedFile file : project.files()) {
+                for (int fi = 0; fi < totalFiles; fi++) {
+                    final int fiFinal = fi;
                     futures.add(pool.submit(() -> {
                         try {
-                            indexFile(writer, file, stateTracker, generateEmbeddings,
-                                    graphData, methodsByClass, synthesizedBodyCache);
+                            ParsedFile file = files.get(fiFinal);
+                            writeFileDocs(writer, file, stateTracker, graphData,
+                                    fileSynthBodies.get(fiFinal), globalEmbeddings, fileOffsets[fiFinal]);
+                            int done = doneFiles.incrementAndGet();
+                            totalMethods.addAndGet(file.methods().size());
+                            progress.onProgress("Indexing", done, totalFiles);
+                            if (totalMethods.get() % 500 == 0) {
+                                log.debug("Indexed {} methods...", totalMethods.get());
+                            }
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
-                        }
-                        int done = doneFiles.incrementAndGet();
-                        totalMethods.addAndGet(file.methods().size());
-                        progress.onProgress("Indexing", done, totalFiles);
-                        if (totalMethods.get() % 500 == 0) {
-                            log.debug("Indexed {} methods...", totalMethods.get());
                         }
                         return null;
                     }));
                 }
-                // Await completion and surface any exceptions
                 for (Future<?> f : futures) {
                     try {
                         f.get();
@@ -574,52 +630,22 @@ public class ProjectIndexManager {
     }
 
     /**
-     * Indexes a single file's methods and classes into the Lucene writer.
-     * Safe to call from multiple threads simultaneously:
-     *   - {@link IndexWriter#addDocument} is thread-safe
-     *   - {@link FileStateTracker#track} uses ConcurrentHashMap internally
-     *   - {@link EmbeddingProvider#embed} uses thread-local Predictors
-     *   - {@code synthesizedBodyCache} is a ConcurrentHashMap — bodies are computed once per class
+     * Writes Lucene documents for a single file's methods and classes using pre-computed embeddings.
+     * Safe to call from multiple threads: IndexWriter.addDocument and FileStateTracker are thread-safe.
+     *
+     * @param globalEmbeddings flat array of all embeddings computed in Phase 2 (may be empty)
+     * @param embeddingOffset  index of this file's first embedding in {@code globalEmbeddings}
      */
-    private void indexFile(IndexWriter writer, ParsedFile file,
-                           FileStateTracker stateTracker, boolean generateEmbeddings,
-                           GraphIndexData graphData,
-                           Map<String, List<ParsedMethod>> methodsByClass,
-                           ConcurrentHashMap<String, String> synthesizedBodyCache) throws IOException {
-        // Resolve synthesized bodies for classes in this file (memoized across files in full index)
-        List<String> synthesizedBodies = file.classes().stream()
-                .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                        cls.qualifiedClassName(),
-                        k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
-                .collect(Collectors.toList());
-
-        // Batch all embedding texts for this file into a single ONNX forward pass
-        float[][] allEmbeddings;
-        if (generateEmbeddings && embedder.isAvailable()) {
-            List<String> methodTexts = file.methods().stream()
-                    .map(DocumentMapper::buildEmbeddingText)
-                    .collect(Collectors.toList());
-            List<String> classTexts = new ArrayList<>(file.classes().size());
-            for (int ci = 0; ci < file.classes().size(); ci++) {
-                classTexts.add(DocumentMapper.buildClassEmbeddingText(
-                        file.classes().get(ci), synthesizedBodies.get(ci)));
-            }
-            List<String> allTexts = new ArrayList<>(methodTexts.size() + classTexts.size());
-            allTexts.addAll(methodTexts);
-            allTexts.addAll(classTexts);
-            try {
-                allEmbeddings = embedder.embedBatch(allTexts);
-            } catch (Exception e) {
-                log.debug("Batch embedding failed for {}: {}", file.filePath(), e.getMessage());
-                allEmbeddings = new float[allTexts.size()][];
-            }
-        } else {
-            allEmbeddings = new float[file.methods().size() + file.classes().size()][];
-        }
-
+    private void writeFileDocs(IndexWriter writer, ParsedFile file,
+                               FileStateTracker stateTracker,
+                               GraphIndexData graphData,
+                               List<String> synthesizedBodies,
+                               float[][] globalEmbeddings,
+                               int embeddingOffset) throws IOException {
         for (int mi = 0; mi < file.methods().size(); mi++) {
             ParsedMethod method = file.methods().get(mi);
-            float[] embedding = allEmbeddings[mi];
+            float[] embedding = (embeddingOffset + mi < globalEmbeddings.length)
+                    ? globalEmbeddings[embeddingOffset + mi] : null;
             int inDegree = graphData.inDegree(method.fqn());
             List<String> callerNames = graphData.callerSimpleNames(method.fqn());
             writer.addDocument(DocumentMapper.toDocument(method, embedding, inDegree, callerNames));
@@ -628,9 +654,9 @@ public class ProjectIndexManager {
         int classOffset = file.methods().size();
         for (int ci = 0; ci < file.classes().size(); ci++) {
             ParsedClass cls = file.classes().get(ci);
-            String synthesizedBody = synthesizedBodies.get(ci);
-            float[] embedding = allEmbeddings[classOffset + ci];
-            writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBody, embedding));
+            float[] embedding = (embeddingOffset + classOffset + ci < globalEmbeddings.length)
+                    ? globalEmbeddings[embeddingOffset + classOffset + ci] : null;
+            writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBodies.get(ci), embedding));
         }
 
         List<String> classNames = file.classes().stream()
