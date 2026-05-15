@@ -137,8 +137,16 @@ public class CrossProjectLinker {
 
         // Save guard: only rewrite if something changed
         if (!resolvedEdges.isEmpty() || !Files.isDirectory(crossDbDir)) {
+            // Delete and recreate instead of clear() — avoids the O(M) DELETE VERTEX
+            // scan and the LSM compaction-file-removal race that causes
+            // "File with id N has been removed" errors on concurrent writes.
+            if (Files.isDirectory(crossDbDir)) {
+                try (var s = Files.walk(crossDbDir)) {
+                    s.sorted(java.util.Comparator.reverseOrder())
+                     .forEach(p -> { try { Files.delete(p); } catch (java.io.IOException ignored) {} });
+                }
+            }
             try (CallGraph crossGraph = CallGraph.open(crossDbDir)) {
-                crossGraph.clear();
                 // Seed all project-owned methods from each per-project graph
                 for (String name : projectNames) {
                     Path dbDir = Path.of(

@@ -110,13 +110,16 @@ public class CallGraph implements AutoCloseable {
         flushCalls();
     }
 
-    /** Delete all vertices and edges (used before a full re-index). */
+    /**
+     * Delete all vertices and edges.
+     * Uses TRUNCATE TYPE (O(1)) rather than DELETE VERTEX (O(M) full scan)
+     * to avoid both the scan cost and LSM compaction-file-removal races.
+     */
     public void clear() {
         methodBatch.clear();
         callBatch.clear();
-        db.begin();
-        db.command("sql", "DELETE VERTEX FROM Method");
-        db.commit();
+        db.command("sql", "TRUNCATE TYPE calls UNSAFE");
+        db.command("sql", "TRUNCATE TYPE Method UNSAFE");
     }
 
     // -------------------------------------------------------------------------
