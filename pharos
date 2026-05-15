@@ -14,6 +14,9 @@ JAR resolution order:
   2. ~/.pharos/bin/pharos.jar            (installed)
 
 Daemon port: 7171  (override with PHAROS_PORT env var)
+
+Env vars honored on every JVM launch:
+  PHAROS_HEAP   pass -Xmx<value> (e.g. PHAROS_HEAP=16g pharos index ...)
 """
 
 import argparse
@@ -41,10 +44,35 @@ def _resolve_jar() -> Path:
 
 JAR = _resolve_jar()
 PHAROS_DIR = Path.home() / ".pharos"
+PHAROS_DUMPS = PHAROS_DIR / "dumps"
 DAEMON_PORT = int(os.environ.get("PHAROS_PORT", "7171"))
 DAEMON_PID_FILE = PHAROS_DIR / "daemon.pid"
 DAEMON_LOG_FILE = PHAROS_DIR / "daemon.log"
 BASE_URL = f"http://localhost:{DAEMON_PORT}"
+
+
+# ── Shared JVM flags ─────────────────────────────────────────────────────────
+
+def _jvm_flags() -> list:
+    """Common JVM args for every pharos subprocess: native-access opens for
+    Lucene/ArcadeDB, vector incubator module for SIMD-accelerated KNN, and
+    HeapDumpOnOutOfMemoryError so a post-mortem .hprof lands in ~/.pharos/dumps/.
+
+    Honors PHAROS_HEAP (e.g. "16g") to set -Xmx — useful for indexing large
+    projects where the JVM's default heuristic cap (~25% of RAM) isn't enough.
+    """
+    PHAROS_DUMPS.mkdir(parents=True, exist_ok=True)
+    flags = [
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
+        "--add-modules", "jdk.incubator.vector",
+        "-XX:+HeapDumpOnOutOfMemoryError",
+        f"-XX:HeapDumpPath={PHAROS_DUMPS}",
+    ]
+    heap = os.environ.get("PHAROS_HEAP", "").strip()
+    if heap:
+        flags.insert(0, f"-Xmx{heap}")
+    return flags
 
 # ── Daemon management ─────────────────────────────────────────────────────────
 
@@ -66,11 +94,9 @@ def _start_daemon():
     PHAROS_DIR.mkdir(parents=True, exist_ok=True)
     log_fh = open(DAEMON_LOG_FILE, "a")
     proc = subprocess.Popen(
-        ["java", "--enable-native-access=ALL-UNNAMED",
-         "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
-         "--add-modules", "jdk.incubator.vector",
-         "-jar", str(JAR),
-         "web", "--port", str(DAEMON_PORT), "--no-open"],
+        ["java"] + _jvm_flags() + [
+            "-jar", str(JAR),
+            "web", "--port", str(DAEMON_PORT), "--no-open"],
         stdout=log_fh,
         stderr=log_fh,
         stdin=subprocess.DEVNULL,
@@ -534,10 +560,7 @@ def cmd_index(args):
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
-    jvm_flags = ["--enable-native-access=ALL-UNNAMED",
-                 "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
-                 "--add-modules", "jdk.incubator.vector"]
-    cmd = ["java"] + jvm_flags + ["-jar", str(JAR), "index", str(args.path)]
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", str(args.path)]
     if args.project:
         cmd += ["--project", args.project]
     if args.full:
@@ -713,8 +736,6 @@ EXAMPLES
                          help="Max directory depth to search for sub-projects (default: 3)")
     p_index.add_argument("--project-threads", dest="project_threads", type=int, default=1, metavar="N",
                          help="Projects to index concurrently (default: 1)")
-    p_index.add_argument("--vector-incubator", dest="vector_incubator", action="store_true",
-                         help="Enable JVM Vector API (--add-modules jdk.incubator.vector) for faster SIMD embedding")
     p_index.set_defaults(func=cmd_index)
 
     # search

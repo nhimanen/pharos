@@ -12,6 +12,10 @@
 #   ./setup.sh            # build + install
 #   ./setup.sh --skip-build   # install without rebuilding (uses existing target/ JAR)
 #   ./setup.sh --restart-only # just restart a running daemon
+#
+# Env vars honored:
+#   PHAROS_PORT   override daemon port (default: 7171)
+#   PHAROS_HEAP   pass -Xmx<value> to the daemon JVM (e.g. PHAROS_HEAP=16g)
 
 set -euo pipefail
 
@@ -58,6 +62,7 @@ else
   fi
 fi
 PHAROS_BIN="$HOME/.pharos/bin"
+PHAROS_DUMPS="$HOME/.pharos/dumps"
 LOCAL_BIN="$HOME/.local/bin"
 DAEMON_PID_FILE="$HOME/.pharos/daemon.pid"
 DAEMON_PORT="${PHAROS_PORT:-7171}"
@@ -130,10 +135,21 @@ else
   kill "$(lsof -ti:"$DAEMON_PORT" 2>/dev/null)" 2>/dev/null || true
   sleep 1
 
+  mkdir -p "$PHAROS_DUMPS"
+  # Build JVM args: shared flags + optional -Xmx from PHAROS_HEAP
+  JVM_ARGS=(
+    "--enable-native-access=ALL-UNNAMED"
+    "--add-opens" "java.base/java.nio.channels.spi=ALL-UNNAMED"
+    "--add-modules" "jdk.incubator.vector"
+    "-XX:+HeapDumpOnOutOfMemoryError"
+    "-XX:HeapDumpPath=$PHAROS_DUMPS"
+  )
+  if [ -n "${PHAROS_HEAP:-}" ]; then
+    JVM_ARGS=("-Xmx${PHAROS_HEAP}" "${JVM_ARGS[@]}")
+    echo "Daemon heap: -Xmx${PHAROS_HEAP}"
+  fi
   echo "Starting daemon on port $DAEMON_PORT..."
-  nohup java --enable-native-access=ALL-UNNAMED \
-    --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
-    --add-modules jdk.incubator.vector \
+  nohup java "${JVM_ARGS[@]}" \
     -jar "$PHAROS_BIN/pharos.jar" web --port "$DAEMON_PORT" \
     >> "$HOME/.pharos/daemon.log" 2>&1 &
   NEW_PID=$!
