@@ -191,11 +191,65 @@ class RemoveIndexCommandTest {
         assertThat(libB.projectName()).isEqualTo("proj-b");
     }
 
+    // --- --all flag ---
+
+    @Test
+    void all_removesEveryProject() {
+        registerProject("proj-a");
+        registerProject("proj-b");
+        registerProject("proj-c");
+
+        assertThat(runAll()).isEqualTo(0);
+
+        assertThat(registry.listAll()).isEmpty();
+    }
+
+    @Test
+    void all_returnsZeroWhenRegistryEmpty() {
+        assertThat(runAll()).isEqualTo(0);
+    }
+
+    @Test
+    void all_andProjectName_returnsExitCode2() {
+        registerProject("my-project");
+
+        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager))
+                .execute("my-project", "--all");
+
+        assertThat(exit).isEqualTo(2);
+        // Nothing should have been removed — invalid argument combination
+        assertThat(registry.find("my-project")).isPresent();
+    }
+
+    @Test
+    void noArgs_returnsExitCode2() {
+        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager)).execute();
+        assertThat(exit).isEqualTo(2);
+    }
+
+    @Test
+    void all_cleansFilesystemForEveryProject() throws IOException {
+        registerProject("proj-a");
+        registerProject("proj-b");
+        Path dirA = createProjectDir("proj-a");
+        Path dirB = createProjectDir("proj-b");
+
+        runAll();
+
+        assertThat(dirA).doesNotExist();
+        assertThat(dirB).doesNotExist();
+    }
+
     // --- helpers ---
 
     private int run(String projectName) {
         RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager);
         return new CommandLine(cmd).execute(projectName);
+    }
+
+    private int runAll() {
+        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager);
+        return new CommandLine(cmd).execute("--all");
     }
 
     private void registerProject(String name) {
