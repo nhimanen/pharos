@@ -71,6 +71,10 @@ public class SynonymProvider {
         for (String raw : Files.readAllLines(synonymFile)) {
             String line = raw.strip();
             if (line.isEmpty() || line.startsWith("#")) continue;
+            // Strip inline comments (e.g. "term => class  # auto:project:date")
+            int commentIdx = line.indexOf('#');
+            if (commentIdx >= 0) line = line.substring(0, commentIdx).strip();
+            if (line.isEmpty()) continue;
 
             if (line.contains("=>")) {
                 // Directed: "phrase one, phrase two => target1, target2"
