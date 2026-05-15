@@ -712,7 +712,8 @@ public class ConceptMiner {
 
             for (String cls : new TreeSet<>(e.getValue())) {
                 String classTarget = cls.toLowerCase();
-                if (term.equals(classTarget)) continue; // skip identity rules
+                if (term.equals(classTarget)) continue;     // skip identity rules
+                if (classTarget.startsWith("test")) continue; // skip test classes
                 newRules.add(String.format("%-32s => %s  # auto:%s:%s",
                         term, classTarget, projectName, date));
             }

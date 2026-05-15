@@ -885,14 +885,20 @@ public class ProjectIndexManager {
     private void expandSynonyms(String projectName) {
         Path synonymFile = config.getSynonymsFile();
         try {
+            // Remove stale rules for this project first so every reindex applies
+            // current filters (fanout cap, test-class filter, redundancy filter).
+            int removed = ConceptMiner.removeProjectSynonyms(synonymFile, projectName);
+            if (removed > 0)
+                log.debug("Synonym expansion: removed {} stale rules for '{}'", removed, projectName);
+
             org.apache.lucene.index.IndexReader reader =
                     luceneIndexer.openMultiReader(List.of(projectName));
             ConceptMiner miner = new ConceptMiner();
             int added = miner.appendNewSynonyms(reader, synonymFile, projectName);
             if (added > 0) {
-                log.info("Synonym expansion: appended {} new rules to {}", added, synonymFile);
+                log.info("Synonym expansion: wrote {} rules for '{}'", added, projectName);
             } else {
-                log.debug("Synonym expansion: no new rules for '{}'", projectName);
+                log.debug("Synonym expansion: no rules generated for '{}'", projectName);
             }
         } catch (Exception e) {
             log.warn("Synonym expansion failed for '{}' (non-fatal): {}", projectName, e.getMessage());

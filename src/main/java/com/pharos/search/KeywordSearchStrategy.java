@@ -34,13 +34,22 @@ import java.util.stream.Collectors;
  * BM25 keyword search using MultiFieldQueryParser with field-level boosting.
  *
  * Field boost hierarchy (query-time multipliers):
- * - methodName: 4x  (direct method name match is the strongest signal)
- * - javadoc: 2x     (documentation describes intent)
- * - className: 2x   (class name is nearly as specific as method name for class searches)
- * - signature: 1.5x (type information adds context)
- * - body: 0.5x      (implementation details; long field, mostly noise)
+ * - methodName: 4x  (direct method name match — highest field signal)
+ * - className:  4x  (class name match — equally strong as methodName; class docs additionally
+ *                    get post-BM25 docTypeBonus ×1.8 so they rank above individual methods)
+ * - signature:  1.5x (type information adds context)
  * - annotations: 1x
- * - callerContext: 1x (callers are ambient context, not the target)
+ * - callerContext: 1x (callers are ambient context)
+ * - body: 0.5x      (implementation details; long field, mostly noise)
+ * - javadoc: 2.0x   (kept at original; single-term name matches (4x) already beat
+ *                    single-term javadoc (2x); phrase matches over all terms legitimately win)
+ *
+ * Post-BM25 multipliers (applied in toResults()):
+ * - docType=class:            ×1.8 so class documents rank above individual methods
+ * - access=public:            ×1.0 (base)
+ * - access=protected:         ×0.85
+ * - access=package-private:  ×0.75
+ * - access=private:           ×0.5
  *
  * Per-field BM25 parameters (via PerFieldSimilarityWrapper):
  * - methodName, className: k1=0.5, b=0.0  — short identifier fields; no length norm,
@@ -138,12 +147,12 @@ public class KeywordSearchStrategy {
     private static final Map<String, Float> FIELD_BOOSTS = new HashMap<>();
     static {
         FIELD_BOOSTS.put(DocumentMapper.F_METHOD_NAME,    4.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_JAVADOC,        2.0f);
-        FIELD_BOOSTS.put(DocumentMapper.F_CLASS_NAME,     2.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_CLASS_NAME,     4.0f);
         FIELD_BOOSTS.put(DocumentMapper.F_SIGNATURE,      1.5f);
-        FIELD_BOOSTS.put(DocumentMapper.F_BODY,           0.5f);
         FIELD_BOOSTS.put(DocumentMapper.F_ANNOTATIONS,    1.0f);
         FIELD_BOOSTS.put(DocumentMapper.F_CALLER_CONTEXT, 1.0f);
+        FIELD_BOOSTS.put(DocumentMapper.F_BODY,           0.5f);
+        FIELD_BOOSTS.put(DocumentMapper.F_JAVADOC,        2.0f);
     }
 
     /**
@@ -332,14 +341,19 @@ public class KeywordSearchStrategy {
             rawHits.add(new RawHit(doc, sd.score));
         }
 
-        // Second pass: apply log-normalized in-degree boost + source-path penalty, then re-sort
+        // Second pass: apply log-normalized in-degree boost + source-path penalty
+        //   + doc-type bonus (class > method) + access-modifier multiplier, then re-sort
         final int maxDeg = maxInDegree;
         return rawHits.stream()
                 .map(hit -> {
                     int inDeg = getInt(hit.doc(), DocumentMapper.F_IN_DEGREE);
                     float normBoost = (float) (Math.log1p(inDeg) / Math.log1p(maxDeg));
-                    float penalty = sourcePathPenalty(hit.doc().get(DocumentMapper.F_FILE_PATH));
-                    float boostedScore = hit.rawScore() * (1.0f + GRAPH_BOOST_WEIGHT * normBoost) * penalty;
+                    float penalty    = sourcePathPenalty(hit.doc().get(DocumentMapper.F_FILE_PATH));
+                    float typeBonus  = docTypeBonus(hit.doc().get(DocumentMapper.F_DOC_TYPE));
+                    float accessMult = accessMultiplier(hit.doc().get(DocumentMapper.F_ACCESS));
+                    float boostedScore = hit.rawScore()
+                            * (1.0f + GRAPH_BOOST_WEIGHT * normBoost)
+                            * penalty * typeBonus * accessMult;
                     return docToResult(hit.doc(), boostedScore, type);
                 })
                 .sorted(Comparator.comparingDouble(SearchResult::score).reversed())
@@ -381,6 +395,33 @@ public class KeywordSearchStrategy {
      *   .md / .txt   → 0.20   (documentation files)
      *   otherwise    → 1.00
      */
+    /**
+     * Bonus multiplier by document type so the ranking order is:
+     *   class &gt; method/chunk
+     * Applied on top of BM25 so a class whose name matches the query always
+     * ranks above individual methods in that class for the same BM25 score.
+     */
+    static float docTypeBonus(String docType) {
+        if ("class".equals(docType)) return 1.8f;
+        return 1.0f;
+    }
+
+    /**
+     * Multiplier by access modifier so the ranking order is:
+     *   public &gt; protected &gt; package-private &gt; private
+     * Private implementation details rank last unless the BM25 score is
+     * substantially higher (i.e. the query is very specific to that method).
+     */
+    static float accessMultiplier(String access) {
+        if (access == null || access.isBlank()) return 0.75f; // package-private
+        return switch (access.toLowerCase()) {
+            case "public"    -> 1.00f;
+            case "protected" -> 0.85f;
+            case "private"   -> 0.50f;
+            default          -> 0.75f; // package-private or unrecognised
+        };
+    }
+
     static float sourcePathPenalty(String filePath) {
         if (filePath == null) return 1.0f;
         String p = filePath.replace('\\', '/');
