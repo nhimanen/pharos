@@ -152,7 +152,7 @@ class PythonSearchIntegrationTest {
     private List<SearchResult> search(String query) throws Exception {
         SearchRequest req = new SearchRequest(
                 query, SearchRequest.SearchType.KEYWORD,
-                null, null, 20, "text", null, null);
+                null, null, 20, "text", null, null, 0);
         KeywordSearchStrategy strategy = new KeywordSearchStrategy();
         return strategy.search(reader, req);
     }

@@ -282,7 +282,7 @@ class IndexCommandParallelTest {
     private List<SearchResult> search(String query, String project) throws IOException {
         var reader = luceneIndexer.openMultiReader(List.of(project));
         SearchRequest req = new SearchRequest(query, SearchRequest.SearchType.KEYWORD,
-                project, null, 20, "text", "method", null);
+                project, null, 20, "text", "method", null, 0);
         return strategy.search(reader, req);
     }
 

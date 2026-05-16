@@ -221,7 +221,7 @@ class SearchQualityBenchmarkTest {
     private List<SearchResult> searchMethods(String query) throws IOException {
         SearchRequest req = new SearchRequest(
                 query, SearchRequest.SearchType.KEYWORD,
-                SearchQualityDataset.PROJECT, null, 20, "text", "method", null);
+                SearchQualityDataset.PROJECT, null, 20, "text", "method", null, 0);
         return strategy.search(corpus.reader(), req);
     }
 

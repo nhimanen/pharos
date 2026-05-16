@@ -18,7 +18,7 @@ class CrossEncoderRerankerTest {
 
     private static SearchRequest req(String query) {
         return new SearchRequest(query, SearchRequest.SearchType.HYBRID_RERANKED, null, null,
-                10, "text", null, null);
+                10, "text", null, null, 0);
     }
 
     @Test
