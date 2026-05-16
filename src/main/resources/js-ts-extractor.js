@@ -145,6 +145,56 @@ function findBlockEnd(src, openPos) {
     return src.length - 1;
 }
 
+/**
+ * Scan backwards from lineNo (1-based) to collect TypeScript/JS decorators
+ * (@Decorator or @Decorator(...)) on the lines immediately preceding a declaration.
+ */
+function extractDecorators(lines, lineNo) {
+    const decorators = [];
+    let i = lineNo - 2; // 0-based index of the line before the declaration
+    while (i >= 0) {
+        const line = lines[i].trim();
+        if (line === '') { i--; continue; }
+        const m = /^@([A-Za-z$_][A-Za-z0-9$_]*)/.exec(line);
+        if (m) { decorators.unshift(m[1]); i--; }
+        else break;
+    }
+    return decorators;
+}
+
+/**
+ * Extract class property / field declarations from a class body.
+ * Handles TypeScript typed fields and plain JavaScript class fields.
+ * Skips method declarations (lines followed by '(').
+ */
+function extractClassFields(srcLines, startLine, endLine) {
+    const fields = [];
+    const seen = new Set();
+    // Modifiers that can precede a field name
+    const MOD_RE = /^(?:(?:public|private|protected|readonly|static|override|abstract|declare)\s+)*/;
+    const FIELD_RE = /^([A-Za-z$_][A-Za-z0-9$_]*)[?!]?\s*(?::\s*([^=;\n{(]+?))?(?:\s*=|\s*;|$)/;
+
+    for (let i = startLine; i <= endLine - 1 && i < srcLines.length; i++) {
+        const raw  = srcLines[i];
+        const line = raw.trim();
+        if (!line || line.startsWith('//') || line.startsWith('*') || line.startsWith('/*')) continue;
+        // Strip leading modifiers
+        const stripped = line.replace(MOD_RE, '');
+        const m = FIELD_RE.exec(stripped);
+        if (!m) continue;
+        const name = m[1];
+        if (BUILTIN_CALLS.has(name) || name === 'constructor') continue;
+        // If the very next non-space char after the name (and optional ?) is '(' it's a method
+        const afterName = stripped.slice(m[1].length).trimStart();
+        if (afterName.startsWith('(') || afterName.startsWith('?:') && afterName[2] === '(') continue;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const fieldType = m[2] ? m[2].trim().replace(/\s+/g, ' ') : null;
+        fields.push({ name, type: fieldType, line: i + 1 });
+    }
+    return fields;
+}
+
 /** Extract simple call names from a function body text. */
 function extractCalls(body) {
     const calls = new Set();
@@ -186,7 +236,7 @@ function extractFile(filePath, rootDir) {
     const classMap  = {};  // className → ParsedClass
 
     // ── Classes ──────────────────────────────────────────────────────────────
-    // Matches: [export] [default] [abstract] class Foo [extends Bar] [implements I] {
+    // Matches: [export] [default] [abstract] class Foo [extends Bar] [implements I, J] {
     const CLASS_RE = /(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Z$_][A-Za-z0-9$_]*)(?:\s+extends\s+([A-Za-z0-9$_.]+))?/g;
     let m;
     while ((m = CLASS_RE.exec(clean)) !== null) {
@@ -198,9 +248,18 @@ function extractFile(filePath, rootDir) {
         const endLine  = lineOf(src, closePos);
         const qualified= pkg ? pkg + '.' + name : name;
         const jsdoc    = extractJsdoc(lines, lineNo);
+        const decs     = extractDecorators(lines, lineNo);
 
-        const cls = { name, qualified, bases: base ? [base] : [], decorators: [],
-                      docstring: jsdoc, start: lineNo, end: endLine };
+        // Extract `implements` clause from the header text (between match end and '{')
+        const header = clean.slice(m.index + m[0].length, openPos);
+        const implM  = /\bimplements\s+([\w$.,\s]+)/.exec(header);
+        const interfaces = implM
+            ? implM[1].split(',').map(s => s.trim()).filter(Boolean)
+            : [];
+
+        const cls = { name, qualified, bases: base ? [base] : [], interfaces,
+                      decorators: decs, docstring: jsdoc, start: lineNo, end: endLine,
+                      fields: extractClassFields(lines, lineNo, endLine) };
         classes.push(cls);
         classMap[name] = { cls, openPos, closePos };
     }
@@ -217,8 +276,13 @@ function extractFile(filePath, rootDir) {
         const qualified= pkg ? pkg + '.' + name : name;
         const jsdoc    = extractJsdoc(lines, lineNo);
 
-        const cls = { name, qualified, bases: [], decorators: ['interface'],
-                      docstring: jsdoc, start: lineNo, end: endLine };
+        // TypeScript interfaces can extend multiple interfaces
+        const iHeader   = clean.slice(m.index + m[0].length, openPos >= 0 ? openPos : m.index + m[0].length + 200);
+        const iExtends  = /\bextends\s+([\w$.,\s]+)/.exec(iHeader);
+        const iBases    = iExtends ? iExtends[1].split(',').map(s => s.trim()).filter(Boolean) : [];
+        const cls = { name, qualified, bases: iBases, interfaces: [],
+                      decorators: ['interface'], docstring: jsdoc, start: lineNo, end: endLine,
+                      fields: extractClassFields(lines, lineNo, endLine) };
         classes.push(cls);
         classMap[name] = { cls, openPos, closePos };
     }
@@ -281,12 +345,13 @@ function extractFile(filePath, rootDir) {
         }
 
         const jsdoc  = extractJsdoc(lines, lineNo);
+        const decs   = extractDecorators(lines, lineNo);
         const isCtor = name === 'constructor' || (className && name === className);
         const calls  = extractCalls(bodyText);
 
         functions.push({
             name, class_name: className,
-            params, decorators: [],
+            params, decorators: decs,
             docstring: jsdoc,
             body: src.slice(fc.pos, Math.min(fc.pos + 200, src.length)).split('\n')[0].trim(),
             calls, start: lineNo, end: endLine, is_constructor: isCtor,

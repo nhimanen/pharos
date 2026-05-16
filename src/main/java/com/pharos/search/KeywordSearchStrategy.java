@@ -7,6 +7,10 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.search.highlight.QueryScorer;
+import org.apache.lucene.search.highlight.SimpleHTMLFormatter;
+import org.apache.lucene.search.highlight.SimpleSpanFragmenter;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.queryparser.classic.MultiFieldQueryParser;
@@ -221,6 +225,21 @@ public class KeywordSearchStrategy {
         IndexSearcher searcher = new IndexSearcher(reader);
         searcher.setSimilarity(PER_FIELD_SIMILARITY);
 
+        Query query = buildQuery(req);
+        if (query == null) return List.of();
+
+        TopDocs hits = searcher.search(query, req.limit());
+        return toResults(searcher, hits, "keyword");
+    }
+
+    /**
+     * Builds the full Lucene query for {@code req} (tiered BM25 + filters).
+     * Returns null if the query string cannot be parsed.
+     * Exposed so the {@link com.pharos.search.pipeline.UnifiedRetrievalStage} can
+     * re-run the same query independently and hand the TopDocs to a rescorer.
+     */
+    public Query buildQuery(SearchRequest req) {
+        reloadIfChanged();
         Query query;
         try {
             String escaped = MultiFieldQueryParser.escape(req.query());
@@ -232,9 +251,6 @@ public class KeywordSearchStrategy {
 
             List<String> terms = analyzeTerms(req.query());
             if (terms.size() >= 2) {
-                // Stage 2: min-should-match — ceil(n * 0.75) tokens must be present somewhere.
-                // Built per-token so each token expands across all fields with its boost,
-                // avoiding the multi-token callerContext phrase-query artifact from a bulk parse.
                 BooleanQuery.Builder minMatchBuilder = new BooleanQuery.Builder();
                 MultiFieldQueryParser perTermParser =
                         new MultiFieldQueryParser(SEARCH_FIELDS, analyzer, FIELD_BOOSTS);
@@ -252,7 +268,6 @@ public class KeywordSearchStrategy {
                 minMatchBuilder.setMinimumNumberShouldMatch(minMatch);
                 Query minMatchQuery = minMatchBuilder.build();
 
-                // Stage 1: Phrase — terms appear close together in a key field; highest bonus.
                 Query phraseQuery = buildPhraseQuery(terms);
 
                 BooleanQuery.Builder tiered = new BooleanQuery.Builder();
@@ -267,8 +282,13 @@ public class KeywordSearchStrategy {
             }
         } catch (ParseException e) {
             log.warn("Query parse error: {}", e.getMessage());
-            return List.of();
+            return null;
         }
+
+        // rVSM identifier expansion: if the raw query contains camelCase or underscore tokens,
+        // add their constituent words as soft SHOULD boosts so documents that match the split
+        // form also get a score lift — without changing recall (base query is still MUST).
+        query = withIdentifierExpansion(req.query(), query);
 
         // Optional project + docType + scope filters
         BooleanQuery.Builder filtered = new BooleanQuery.Builder().add(query, BooleanClause.Occur.MUST);
@@ -288,24 +308,30 @@ public class KeywordSearchStrategy {
                     BooleanClause.Occur.FILTER);
             hasFilter = true;
         }
-        if (hasFilter) query = filtered.build();
-
-        TopDocs hits = searcher.search(query, req.limit());
-        return toResults(searcher, hits, "keyword");
+        return hasFilter ? filtered.build() : query;
     }
 
     /**
      * Runs the query analyzer over {@code text} and returns the resulting tokens.
-     * Used to build per-term AND and phrase queries from the raw query string.
+     * Used both internally for query construction and externally for snippet matching.
+     * Reloads the synonym file if it has changed since the last call.
      */
-    private List<String> analyzeTerms(String text) {
+    public List<String> analyzeTerms(String text) {
+        reloadIfChanged();
+        return analyzeTermsDirect(text);
+    }
+
+    /**
+     * Same as {@link #analyzeTerms} but skips the synonym-file reload check.
+     * Safe to call in a tight loop after {@link #analyzeTerms} has already been called
+     * to trigger a reload if needed (e.g. when tokenizing many body lines for snippet extraction).
+     */
+    List<String> analyzeTermsDirect(String text) {
         List<String> terms = new ArrayList<>();
         try (TokenStream ts = analyzer.tokenStream(DocumentMapper.F_BODY, text)) {
             CharTermAttribute attr = ts.addAttribute(CharTermAttribute.class);
             ts.reset();
-            while (ts.incrementToken()) {
-                terms.add(attr.toString());
-            }
+            while (ts.incrementToken()) terms.add(attr.toString());
             ts.end();
         } catch (IOException e) {
             log.warn("Term analysis failed: {}", e.getMessage());
@@ -332,6 +358,154 @@ public class KeywordSearchStrategy {
             phraseBuilder.add(new BoostQuery(pqb.build(), fieldBoost), BooleanClause.Occur.SHOULD);
         }
         return phraseBuilder.build();
+    }
+
+    // -------------------------------------------------------------------------
+    // Keyword snippet position resolver (Lucene Highlighter-based)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Builds a {@link SnippetResolver} that finds the best-matching line in a
+     * result's stored body using the Lucene {@link Highlighter}.
+     *
+     * <p>The resolver captures the query and the current analyzer instance.
+     * It is called lazily — only for results that survive to the final ranked set.
+     * It uses the exact same {@link Query} structure (phrase boosts, min-match tiers)
+     * as the BM25 retrieval, so highlighted positions are consistent with scoring.
+     *
+     * @param query the query built by {@link #buildQuery} for the current request;
+     *              {@code null} returns {@link SnippetResolver#none()}
+     */
+    public SnippetResolver buildKeywordResolver(Query query) {
+        if (query == null) return SnippetResolver.none();
+        reloadIfChanged();
+        final Analyzer capturedAnalyzer = this.analyzer;
+
+        return result -> {
+            String body = result.body();
+            if (body == null || body.isBlank()) return null;
+            try {
+                // Use QueryScorer.getTokenScore() with OffsetAttribute to find the character
+                // offset of the highest-scoring token — consistent with the actual BM25 query.
+                QueryScorer scorer = new QueryScorer(query, DocumentMapper.F_BODY);
+                scorer.setExpandMultiTermQuery(true);
+
+                TokenStream ts = capturedAnalyzer.tokenStream(DocumentMapper.F_BODY, body);
+                ts = scorer.init(ts);
+                OffsetAttribute offsetAttr = ts.addAttribute(OffsetAttribute.class);
+                ts.reset();
+
+                int   bestCharOffset = 0;
+                float bestScore      = -1f;
+                while (ts.incrementToken()) {
+                    float score = scorer.getTokenScore();
+                    if (score > bestScore) {
+                        bestScore      = score;
+                        bestCharOffset = offsetAttr.startOffset();
+                    }
+                }
+                ts.end();
+                ts.close();
+
+                if (bestScore <= 0f) return null; // no query terms found in body
+
+                // Map character offset to file line number
+                int lineInBody = countNewlines(body, bestCharOffset);
+                int fileLine   = result.startLine() + lineInBody;
+                return new Snippet(null, fileLine, fileLine); // text filled by SnippetDecorator
+            } catch (Exception e) {
+                log.debug("Keyword resolver failed for {}: {}", result.label(), e.getMessage());
+                return null;
+            }
+        };
+    }
+
+    private static int countNewlines(String text, int upToOffset) {
+        int count = 0;
+        int end = Math.min(upToOffset, text.length());
+        for (int i = 0; i < end; i++) { if (text.charAt(i) == '\n') count++; }
+        return count;
+    }
+
+    // -------------------------------------------------------------------------
+    // rVSM identifier expansion
+    // -------------------------------------------------------------------------
+
+    /**
+     * Score multiplier for the expansion SHOULD clause.
+     * Low enough that direct-match results stay on top while split-word matches
+     * get a meaningful lift to break ties and surface cross-vocabulary candidates.
+     */
+    static final float EXPANSION_BOOST = 0.5f;
+
+    /** Minimum word length after splitting — filters stop-words like "by", "to". */
+    private static final int EXPANSION_MIN_WORD = 3;
+
+    /**
+     * Fields used for identifier expansion. These are the high-signal fields
+     * where constituent words of a camelCase identifier are most diagnostic.
+     */
+    private static final String[] EXPANSION_FIELDS = {
+            DocumentMapper.F_METHOD_NAME,
+            DocumentMapper.F_CLASS_NAME,
+            DocumentMapper.F_JAVADOC,
+    };
+
+    /**
+     * Wraps {@code baseQuery} with a soft SHOULD clause that matches constituent
+     * words of camelCase / underscore-joined tokens in the raw query string.
+     *
+     * <p>Example: raw query {@code "getUserById"} → base query searches
+     * {@code "getuserbyid"} (exact); the expansion additionally boosts documents
+     * that contain {@code "get"}, {@code "user"}, {@code "id"} in their
+     * method/class name or javadoc.  Documents already matched by the base query
+     * are the only ones returned (MUST), but those that also match split words
+     * score higher (SHOULD).
+     *
+     * <p>Returns {@code baseQuery} unchanged when no identifier-like tokens are found.
+     */
+    static Query withIdentifierExpansion(String rawQuery, Query baseQuery) {
+        if (rawQuery == null || rawQuery.isBlank()) return baseQuery;
+
+        BooleanQuery.Builder expansionTerms = new BooleanQuery.Builder();
+        boolean hasExpansion = false;
+
+        for (String token : rawQuery.trim().split("\\s+")) {
+            if (!isIdentifierLike(token)) continue;
+
+            String split = DocumentMapper.splitIdentifier(token);
+            if (split.isBlank() || split.equalsIgnoreCase(token)) continue; // no real split occurred
+
+            for (String word : split.split("\\s+")) {
+                if (word.length() < EXPANSION_MIN_WORD) continue;
+                for (String field : EXPANSION_FIELDS) {
+                    expansionTerms.add(new TermQuery(new Term(field, word)),
+                            BooleanClause.Occur.SHOULD);
+                }
+                hasExpansion = true;
+            }
+        }
+
+        if (!hasExpansion) return baseQuery;
+
+        BooleanQuery.Builder combined = new BooleanQuery.Builder();
+        combined.add(baseQuery, BooleanClause.Occur.MUST);
+        combined.add(new BoostQuery(expansionTerms.build(), EXPANSION_BOOST),
+                BooleanClause.Occur.SHOULD);
+        return combined.build();
+    }
+
+    /**
+     * Returns true when a query token looks like a programmatic identifier —
+     * camelCase (uppercase letter after position 0) or underscore-joined.
+     * Single capitalised words like "Connection" are excluded (no mid-word upper).
+     */
+    static boolean isIdentifierLike(String token) {
+        if (token.contains("_")) return true;
+        for (int i = 1; i < token.length(); i++) {
+            if (Character.isUpperCase(token.charAt(i))) return true;
+        }
+        return false;
     }
 
     public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits, String type) throws IOException {

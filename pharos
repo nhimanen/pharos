@@ -163,6 +163,9 @@ def fmt_search(results: list) -> str:
         end = r.get("endLine", "")
         score = r.get("score", 0)
 
+        snippet         = r.get("snippet")
+        snippet_start   = r.get("snippetStartLine", start)
+        snippet_end     = r.get("snippetEndLine",   end)
         lines.append(f"[{doc_type}] **{label}** [{project}]  score={score:.3f}")
         if sig:
             lines.append(f"  {sig}")
@@ -170,8 +173,12 @@ def fmt_search(results: list) -> str:
             first_line = javadoc.strip().split("\n")[0][:120]
             lines.append(f"  {first_line}")
         if fp:
-            loc = f"{fp}:{start}-{end}" if start else fp
+            # Show snippet line range when available (more precise than full method range)
+            loc = f"{fp}:{snippet_start}-{snippet_end}" if snippet_start else fp
             lines.append(f"  {loc}")
+        if snippet:
+            for sl in snippet.split("\n")[:8]:  # cap at 8 lines for terminal display
+                lines.append(f"  {sl}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -213,6 +220,60 @@ def fmt_class(r: dict) -> str:
     lines.append(f"\n```java\n{body}\n```")
     if fp:
         lines.append(f"\n`{fp}:{start}-{end}`")
+    return "\n".join(lines)
+
+
+def fmt_class_context(ctx: dict) -> str:
+    if not ctx:
+        return "Class not found."
+    label   = ctx.get("label", ctx.get("fqn", "?"))
+    project = ctx.get("project", "")
+    fp      = ctx.get("filePath", "")
+    start   = ctx.get("startLine", "")
+    end     = ctx.get("endLine", "")
+    javadoc = ctx.get("javadoc") or ""
+
+    lines = [f"**{label}** [{project}]"]
+    if fp:
+        lines.append(f"`{fp}:{start}-{end}`")
+    if javadoc:
+        lines.append(f"/** {javadoc.strip().splitlines()[0][:120]} */")
+    lines.append("")
+
+    fields = ctx.get("fields", [])
+    if fields:
+        lines.append(f"Fields ({len(fields)}):")
+        for f in fields:
+            ftype = f.get("type") or "?"
+            lines.append(f"  [{f.get('accessMod', '')}] {f.get('name', '?')}: {ftype}")
+        lines.append("")
+
+    ctors = ctx.get("constructors", [])
+    if ctors:
+        lines.append(f"Constructors ({len(ctors)}):")
+        for c in ctors:
+            lines.append(f"  {c.get('signature', c.get('fqn', '?'))}")
+        lines.append("")
+
+    methods = ctx.get("publicMethods", [])
+    if methods:
+        lines.append(f"Public methods ({len(methods)}):")
+        for m in methods:
+            sig = m.get("signature", m.get("fqn", "?"))
+            callers = m.get("callers", [])
+            lines.append(f"  {sig}")
+            for c in callers[:5]:
+                lines.append(f"    ← {c}")
+            if len(callers) > 5:
+                lines.append(f"    ← ... and {len(callers) - 5} more")
+        lines.append("")
+
+    body = ctx.get("body", "")
+    if body:
+        lines.append("```java")
+        lines.append(body)
+        lines.append("```")
+
     return "\n".join(lines)
 
 
@@ -493,8 +554,43 @@ def cmd_search(args):
         params["expand"] = "true"
     if getattr(args, "oversample", 0) > 0:
         params["oversample"] = args.oversample
-    results = _api_get("/api/search", params)
+    if getattr(args, "snippet_lines", 15) != 15:
+        params["snippetLines"] = args.snippet_lines
+    if getattr(args, "trace", False):
+        params["trace"] = "true"
+
+    raw = _api_get("/api/search", params)
+
+    # The server returns a plain list normally, or {results, searchMeta} when ?trace=true
+    if isinstance(raw, dict) and "results" in raw:
+        results = raw["results"]
+        meta = raw.get("searchMeta")
+    else:
+        results = raw
+        meta = None
+
     print(fmt_search(results))
+
+    sugg = raw.get("suggestions") if isinstance(raw, dict) else None
+    if sugg:
+        print("\n[no results — suggestions:]")
+        for fm in sugg.get("fuzzyMatches", []):
+            print(f"  did you mean: {fm['label']}  (edit distance {fm['editDistance']})")
+        tokens = sugg.get("tokenMatches", [])
+        if tokens:
+            print(f"  matching tokens: {', '.join(tokens)}")
+        note = sugg.get("filterNote")
+        if note:
+            print(f"  filter note: {note}")
+
+    if meta:
+        requested = meta.get("requestedType", "?")
+        resolved  = meta.get("resolvedType", requested)
+        total_ms  = meta.get("totalMs", 0)
+        type_info = f"{requested} → {resolved}" if resolved != requested else requested
+        print(f"\n[trace] type={type_info}  total={total_ms}ms")
+        for stage in meta.get("stages", []):
+            print(f"[trace]   {stage['name']:<28} {stage['ms']}ms")
 
 
 def cmd_pipelines(args):
@@ -511,8 +607,42 @@ def cmd_method(args):
 
 def cmd_class(args):
     ensure_daemon()
-    data = _api_get("/api/class", {"fqn": args.fqn})
-    print(fmt_class(data))
+    params = {"fqn": args.fqn}
+    if getattr(args, "context", False):
+        params["context"] = "true"
+        data = _api_get("/api/class", params)
+        print(fmt_class_context(data))
+    else:
+        data = _api_get("/api/class", params)
+        print(fmt_class(data))
+
+
+def fmt_impact(r: dict) -> str:
+    if not r:
+        return "No result."
+    root    = r.get("root", "?")
+    total   = r.get("totalCallers", 0)
+    trunc   = r.get("truncated", False)
+    by_depth = r.get("byDepth", {})
+
+    if total == 0:
+        return f"No transitive callers found for: {root}"
+
+    lines = [f"Transitive callers of: {root}"]
+    lines.append(f"Total unique callers: {total}{' (truncated)' if trunc else ''}\n")
+    for depth_str, callers in sorted(by_depth.items(), key=lambda x: int(x[0])):
+        lines.append(f"Depth {depth_str} ({len(callers)}):")
+        for c in callers:
+            lines.append(f"  {c}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def cmd_impact(args):
+    ensure_daemon()
+    params = {"fqn": args.fqn, "depth": args.depth, "maxCallers": args.max_callers}
+    data = _api_get("/api/impact", params)
+    print(fmt_impact(data))
 
 
 def cmd_callers(args):
@@ -780,8 +910,8 @@ EXAMPLES
     )
     p_search.add_argument("query", help="Search query (natural language or keyword)")
     p_search.add_argument(
-        "--type", choices=["hybrid", "keyword", "vector"], default="hybrid",
-        help="Search strategy: hybrid (default), keyword (BM25, best for exact names), vector (semantic)"
+        "--type", choices=["auto", "hybrid", "keyword", "vector", "unified"], default="auto",
+        help="Search strategy: auto (default), hybrid, keyword (BM25), vector (semantic), unified (single-pass BM25+multi-vector)"
     )
     p_search.add_argument(
         "--pipeline", metavar="ID", default=None,
@@ -797,6 +927,10 @@ EXAMPLES
                           help="Append callee methods of top-3 hits as related results")
     p_search.add_argument("--oversample", type=int, default=0, metavar="N",
                           help="Retriever fetch multiplier (e.g. 3 = fetch 3× candidates before merge/rerank). 0 = pipeline default")
+    p_search.add_argument("--trace", action="store_true",
+                          help="Print pipeline trace (resolved type, stage timings) after results")
+    p_search.add_argument("--snippet-lines", dest="snippet_lines", type=int, default=15, metavar="N",
+                          help="Lines of source per snippet centred on best keyword/vector match (default: 15)")
     p_search.set_defaults(func=cmd_search)
 
     # method
@@ -839,6 +973,8 @@ EXAMPLES
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_class.add_argument("fqn", help="Qualified class name (e.g. com.example.MyClass)")
+    p_class.add_argument("--context", "-c", action="store_true",
+                         help="Include fields, constructors (injected deps), public methods, and their callers")
     p_class.set_defaults(func=cmd_class)
 
     # callers
@@ -858,6 +994,31 @@ EXAMPLES
     p_callers.add_argument("--limit", type=int, default=0, metavar="N",
                            help="Max results to show (default: 0 = no limit)")
     p_callers.set_defaults(func=cmd_callers)
+
+    # impact (transitive callers)
+    p_impact = sub.add_parser(
+        "impact",
+        help="Transitive caller analysis: find all methods that could be affected by a change",
+        description="""\
+Find all unique methods that transitively call the given method, up to a
+depth limit. Returns a flat deduplicated set grouped by hop distance.
+No source bodies are fetched, allowing traversal of very large call graphs.
+
+Use this for impact analysis: 'what breaks if I change this method?'
+
+EXAMPLES
+  pharos impact "com.example.PaymentService#processPayment(Order)"
+  pharos impact "com.example.AuthService#validateToken(String)" --depth 3
+  pharos impact "com.example.Utils#format(String)" --max 500
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_impact.add_argument("fqn", help="Method FQN to find callers for")
+    p_impact.add_argument("--depth", type=int, default=5, metavar="N",
+                          help="Max hops to traverse (default: 5, max: 10)")
+    p_impact.add_argument("--max", dest="max_callers", type=int, default=2000, metavar="N",
+                          help="Cap on total unique callers (default: 2000)")
+    p_impact.set_defaults(func=cmd_impact)
 
     # callees
     p_callees = sub.add_parser(

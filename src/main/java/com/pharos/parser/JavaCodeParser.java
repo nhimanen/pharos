@@ -5,6 +5,8 @@ import com.github.javaparser.ParseResult;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.*;
+import com.github.javaparser.ast.expr.*;
+import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.symbolsolver.JavaSymbolSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
@@ -416,5 +418,266 @@ public class JavaCodeParser implements CodeParser {
     @Override
     public List<String> supportedExtensions() {
         return EXTENSIONS;
+    }
+
+    // -------------------------------------------------------------------------
+    // Relationship extraction
+    // -------------------------------------------------------------------------
+
+    private static final Set<String> PRIMITIVE_TYPES = Set.of(
+            "void", "boolean", "byte", "char", "short", "int", "long", "float", "double");
+
+    private static final Set<String> JAVA_LANG_SKIP = Set.of(
+            "String", "Object", "Number", "Boolean", "Integer", "Long", "Double", "Float",
+            "Short", "Byte", "Character", "Void", "Enum", "Record",
+            "Override", "Deprecated", "SuppressWarnings", "FunctionalInterface", "SafeVarargs");
+
+    @Override
+    public ParsedRelationships buildRelationships(ParsedProject project) {
+        // Build project-wide lookup: simpleName → qualifiedName
+        Map<String, String> simpleToQual = new HashMap<>();
+        for (ParsedClass cls : project.allClasses()) {
+            simpleToQual.putIfAbsent(cls.className(), cls.qualifiedClassName());
+        }
+
+        List<ParsedRelationships.TypeEdge>   inherits         = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge>   implementsEdges  = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge>   returns          = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge>   takes            = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge>   annotatedBy      = new ArrayList<>();
+        List<ParsedRelationships.FieldDecl>  fields           = new ArrayList<>();
+        List<ParsedRelationships.FieldAccess> reads           = new ArrayList<>();
+        List<ParsedRelationships.FieldAccess> writes          = new ArrayList<>();
+
+        for (ParsedFile file : project.files()) {
+            // Build per-file import map: simpleName → qualifiedName
+            Map<String, String> importMap = buildImportMap(file.imports());
+
+            for (ParsedClass cls : file.classes()) {
+                String clsFqn = cls.qualifiedClassName();
+
+                // Inheritance
+                if (cls.superclass() != null && !cls.superclass().isBlank()) {
+                    String superFqn = resolve(cls.superclass(), clsFqn, simpleToQual, importMap);
+                    if (superFqn != null) inherits.add(new ParsedRelationships.TypeEdge(clsFqn, superFqn));
+                }
+                for (String iface : cls.interfaces()) {
+                    String ifaceFqn = resolve(iface, clsFqn, simpleToQual, importMap);
+                    if (ifaceFqn != null) implementsEdges.add(new ParsedRelationships.TypeEdge(clsFqn, ifaceFqn));
+                }
+
+                // Class annotations
+                for (String ann : cls.annotations()) {
+                    if (!JAVA_LANG_SKIP.contains(ann)) {
+                        String annFqn = resolve(ann, clsFqn, simpleToQual, importMap);
+                        annotatedBy.add(new ParsedRelationships.TypeEdge(clsFqn,
+                                annFqn != null ? annFqn : ann));
+                    }
+                }
+            }
+
+            for (ParsedMethod method : file.methods()) {
+                String methodFqn = method.fqn();
+
+                // Return type
+                String rt = method.returnType();
+                if (rt != null && !PRIMITIVE_TYPES.contains(rt) && !rt.isBlank() && !rt.equals("void")) {
+                    String base = stripGenerics(rt);
+                    if (!JAVA_LANG_SKIP.contains(base)) {
+                        String rtFqn = resolve(base, method.qualifiedClassName(), simpleToQual, importMap);
+                        returns.add(new ParsedRelationships.TypeEdge(methodFqn,
+                                rtFqn != null ? rtFqn : base));
+                    }
+                }
+
+                // Parameter types
+                for (String pt : method.paramTypes()) {
+                    String base = stripGenerics(pt);
+                    if (!base.isBlank() && !PRIMITIVE_TYPES.contains(base) && !JAVA_LANG_SKIP.contains(base)) {
+                        String ptFqn = resolve(base, method.qualifiedClassName(), simpleToQual, importMap);
+                        takes.add(new ParsedRelationships.TypeEdge(methodFqn,
+                                ptFqn != null ? ptFqn : base));
+                    }
+                }
+
+                // Method annotations
+                for (String ann : method.annotations()) {
+                    if (!JAVA_LANG_SKIP.contains(ann)) {
+                        String annFqn = resolve(ann, method.qualifiedClassName(), simpleToQual, importMap);
+                        annotatedBy.add(new ParsedRelationships.TypeEdge(methodFqn,
+                                annFqn != null ? annFqn : ann));
+                    }
+                }
+            }
+
+            // Field declarations and accesses — targeted re-parse of this file's AST
+            extractFieldData(file, simpleToQual, importMap, fields, reads, writes);
+        }
+
+        return new ParsedRelationships(project.projectName(),
+                inherits, implementsEdges, fields, reads, writes, returns, takes, annotatedBy);
+    }
+
+    /** Re-parses a file (reusing cached solver) to collect field declarations and accesses. */
+    private void extractFieldData(ParsedFile file,
+                                   Map<String, String> simpleToQual,
+                                   Map<String, String> importMap,
+                                   List<ParsedRelationships.FieldDecl>  fields,
+                                   List<ParsedRelationships.FieldAccess> reads,
+                                   List<ParsedRelationships.FieldAccess> writes) {
+        Path filePath = Path.of(file.filePath());
+        if (!Files.exists(filePath)) return;
+        try {
+            Path sourceRoot = findSourceRoot(filePath);
+            JavaParser[] parsers = parserCache.computeIfAbsent(sourceRoot, root -> new JavaParser[]{
+                    createParser(root, ParserConfiguration.LanguageLevel.JAVA_21),
+                    createParser(root, ParserConfiguration.LanguageLevel.RAW)
+            });
+            ParseResult<CompilationUnit> result = parsers[0].parse(filePath);
+            if (!result.isSuccessful()) result = parsers[1].parse(filePath);
+            if (!result.isSuccessful() || result.getResult().isEmpty()) return;
+            CompilationUnit cu = result.getResult().get();
+
+            // Field declarations — visit every class/interface in the file
+            cu.findAll(ClassOrInterfaceDeclaration.class).forEach(classDecl -> {
+                String classQual = buildQualifiedNameFromCu(file.packageName(), classDecl);
+                for (FieldDeclaration fd : classDecl.getFields()) {
+                    String access = fd.getAccessSpecifier().asString().toLowerCase();
+                    if (access.isEmpty()) access = "package-private";
+                    String fieldType = fd.getVariable(0).getTypeAsString();
+                    for (VariableDeclarator vd : fd.getVariables()) {
+                        String fieldFqn = classQual + "#" + vd.getNameAsString();
+                        fields.add(new ParsedRelationships.FieldDecl(
+                                fieldFqn, classQual, stripGenerics(fieldType), access));
+                    }
+                }
+            });
+
+            // Field accesses — only explicit this.field and super.field (reliable without full resolution)
+            cu.findAll(MethodDeclaration.class).forEach(md -> {
+                md.getBody().ifPresent(body -> {
+                    String ownerQual = md.findAncestor(ClassOrInterfaceDeclaration.class)
+                            .map(c -> buildQualifiedNameFromCu(file.packageName(), c))
+                            .orElse(null);
+                    if (ownerQual == null) return;
+
+                    List<String> paramNames = md.getParameters().stream()
+                            .map(p -> p.getNameAsString()).toList();
+                    String methodFqn = ownerQual + "#" + md.getNameAsString() + "(" +
+                            md.getParameters().stream().map(p -> p.getTypeAsString())
+                                    .collect(java.util.stream.Collectors.joining(",")) + ")";
+
+                    collectFieldAccesses(body, methodFqn, ownerQual, paramNames, reads, writes);
+                });
+            });
+            // Also handle constructors
+            cu.findAll(ConstructorDeclaration.class).forEach(cd -> {
+                String ownerQual = cd.findAncestor(ClassOrInterfaceDeclaration.class)
+                        .map(c -> buildQualifiedNameFromCu(file.packageName(), c))
+                        .orElse(null);
+                if (ownerQual == null) return;
+                List<String> paramNames = cd.getParameters().stream()
+                        .map(p -> p.getNameAsString()).toList();
+                String methodFqn = ownerQual + "#<init>(" +
+                        cd.getParameters().stream().map(p -> p.getTypeAsString())
+                                .collect(java.util.stream.Collectors.joining(",")) + ")";
+                collectFieldAccesses(cd.getBody(), methodFqn, ownerQual, paramNames, reads, writes);
+            });
+
+        } catch (Exception e) {
+            log.debug("Field extraction failed for {}: {}", file.filePath(), e.getMessage());
+        }
+    }
+
+    private void collectFieldAccesses(BlockStmt body, String methodFqn, String ownerQual,
+                                       List<String> paramNames,
+                                       List<ParsedRelationships.FieldAccess> reads,
+                                       List<ParsedRelationships.FieldAccess> writes) {
+        // Track local variable declarations to exclude them from implicit field access
+        Set<String> localVars = new HashSet<>(paramNames);
+        body.findAll(VariableDeclarator.class).forEach(vd -> localVars.add(vd.getNameAsString()));
+
+        // Explicit this.field / super.field accesses
+        body.findAll(FieldAccessExpr.class).forEach(fae -> {
+            Expression scope = fae.getScope();
+            if (!(scope instanceof ThisExpr) && !(scope instanceof SuperExpr)) return;
+            String fieldFqn = ownerQual + "#" + fae.getNameAsString();
+            boolean isWrite = isAssignmentTarget(fae);
+            (isWrite ? writes : reads).add(new ParsedRelationships.FieldAccess(methodFqn, fieldFqn));
+        });
+
+        // Implicit field access: bare name that is NOT a local/param variable
+        body.findAll(NameExpr.class).forEach(ne -> {
+            String name = ne.getNameAsString();
+            if (name.length() <= 1 || localVars.contains(name)) return;
+            // Try symbol resolution — only adds if JavaParser confirms it's a field
+            try {
+                var resolved = ne.resolve();
+                if (!resolved.isField()) return;
+                String declClass = resolved.asField().declaringType().getQualifiedName();
+                String fieldFqn = declClass + "#" + name;
+                boolean isWrite = isAssignmentTarget(ne);
+                (isWrite ? writes : reads).add(new ParsedRelationships.FieldAccess(methodFqn, fieldFqn));
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private static boolean isAssignmentTarget(Expression expr) {
+        var parent = expr.getParentNode().orElse(null);
+        return parent instanceof AssignExpr ae && ae.getTarget() == expr;
+    }
+
+    private static String buildQualifiedNameFromCu(String packageName, ClassOrInterfaceDeclaration n) {
+        List<String> parts = new ArrayList<>();
+        parts.add(n.getNameAsString());
+        com.github.javaparser.ast.Node parent = n.getParentNode().orElse(null);
+        while (parent instanceof ClassOrInterfaceDeclaration enclosing) {
+            parts.add(0, enclosing.getNameAsString());
+            parent = enclosing.getParentNode().orElse(null);
+        }
+        String classPath = String.join(".", parts);
+        return packageName == null || packageName.isEmpty() ? classPath : packageName + "." + classPath;
+    }
+
+    private static Map<String, String> buildImportMap(List<String> imports) {
+        Map<String, String> map = new HashMap<>();
+        for (String imp : imports) {
+            // "import com.example.Foo" → "Foo" → "com.example.Foo"
+            String stripped = imp.trim()
+                    .replaceFirst("^import\\s+(static\\s+)?", "")
+                    .replaceFirst(";$", "").trim();
+            if (stripped.endsWith(".*") || stripped.isEmpty()) continue;
+            int dot = stripped.lastIndexOf('.');
+            if (dot >= 0) map.put(stripped.substring(dot + 1), stripped);
+        }
+        return map;
+    }
+
+    /** Strip generic parameters and array brackets: {@code List<String>} → {@code List}. */
+    private static String stripGenerics(String type) {
+        if (type == null) return "";
+        int lt = type.indexOf('<');
+        String base = lt >= 0 ? type.substring(0, lt) : type;
+        return base.replace("[]", "").replace("...", "").trim();
+    }
+
+    /**
+     * Resolve a simple or partially-qualified type name to a project-known FQN.
+     * Resolution order: exact project class match → import map → return null.
+     */
+    private static String resolve(String name, String contextClass,
+                                   Map<String, String> simpleToQual,
+                                   Map<String, String> importMap) {
+        if (name == null || name.isBlank()) return null;
+        String stripped = stripGenerics(name);
+        // Already qualified (contains a dot and not a primitive)
+        if (stripped.contains(".")) return stripped;
+        // Import map
+        String fromImport = importMap.get(stripped);
+        if (fromImport != null) return fromImport;
+        // Project class map
+        String fromProject = simpleToQual.get(stripped);
+        if (fromProject != null) return fromProject;
+        return null; // unresolvable
     }
 }

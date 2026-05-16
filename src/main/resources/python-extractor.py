@@ -62,6 +62,61 @@ def get_docstring(node):
     return ast.get_docstring(node)
 
 
+def type_annotation_str(node):
+    """Convert an annotation AST node to a string (best-effort)."""
+    try:
+        return ast.unparse(node)
+    except AttributeError:
+        # Python < 3.8 has no ast.unparse
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+
+def extract_class_fields(class_node):
+    """Extract field declarations from a class body.
+
+    Two sources:
+    - Class-level annotated attributes: ``name: Type [= value]``  (ast.AnnAssign)
+    - Instance attributes set in __init__: ``self.name = ...``    (ast.Assign)
+    """
+    fields = []
+    seen = set()
+
+    # 1. Class-level annotated attributes (PEP 526 / dataclass style)
+    for item in ast.iter_child_nodes(class_node):
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            name = item.target.id
+            if name not in seen:
+                seen.add(name)
+                fields.append({
+                    "name": name,
+                    "type": type_annotation_str(item.annotation),
+                    "line": item.lineno,
+                })
+
+    # 2. Instance attributes assigned in __init__ (self.x = ...)
+    for item in ast.iter_child_nodes(class_node):
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "__init__":
+            for stmt in ast.walk(item):
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if (isinstance(target, ast.Attribute) and
+                                isinstance(target.value, ast.Name) and
+                                target.value.id == "self" and
+                                target.attr not in seen):
+                            seen.add(target.attr)
+                            fields.append({
+                                "name": target.attr,
+                                "type": None,
+                                "line": stmt.lineno,
+                            })
+
+    return fields
+
+
 def source_segment(source_lines, start_line, end_line):
     """Extract source lines (1-based, inclusive)."""
     lines = source_lines[start_line - 1:end_line]
@@ -115,6 +170,7 @@ def extract_file(filepath, root_dir, source_lines):
                 "docstring": get_docstring(node),
                 "start": node.lineno,
                 "end": end_line,
+                "fields": extract_class_fields(node),
             })
 
             # Methods inside the class

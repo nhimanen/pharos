@@ -5,8 +5,9 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
-import com.pharos.graph.CallGraphBuilder;
 import com.pharos.graph.CallGraph;
+import com.pharos.graph.CallGraphBuilder;
+import com.pharos.graph.KnowledgeGraphBuilder;
 import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
@@ -241,14 +242,17 @@ public class ProjectIndexManager {
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
                                    ProgressListener progress) throws IOException {
-        stateTracker.clear();
-
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
+        // Check dirty status against the pre-existing state before clearing it, so synonym mining
+        // can be skipped when no source files have actually changed.
         progress.onProgress("Scanning", 0, 0);
         Set<String> supportedExts = allSupportedExtensions();
         Map<CodeParser, List<Path>> filesByParser = new java.util.LinkedHashMap<>();
         for (CodeParser p : parsers) filesByParser.put(p, new ArrayList<>());
+
+        // Treat a brand-new project (no prior state) as always changed.
+        boolean[] anyChanges = { stateTracker.trackedFiles().isEmpty() };
 
         Set<String> skipDirs = Set.of(
                 ".git", ".hg", ".svn",
@@ -271,12 +275,25 @@ public class ProjectIndexManager {
                 for (CodeParser p : parsers) {
                     if (p.supportedExtensions().stream().anyMatch(name::endsWith)) {
                         filesByParser.get(p).add(file);
+                        if (!anyChanges[0] && stateTracker.isDirty(file)) anyChanges[0] = true;
                         break;
                     }
                 }
                 return FileVisitResult.CONTINUE;
             }
         });
+
+        // Also treat removed files as a change.
+        if (!anyChanges[0]) {
+            Set<Path> currentFiles = filesByParser.values().stream()
+                    .flatMap(List::stream)
+                    .collect(java.util.stream.Collectors.toSet());
+            for (Path tracked : stateTracker.trackedFiles()) {
+                if (!currentFiles.contains(tracked)) { anyChanges[0] = true; break; }
+            }
+        }
+
+        stateTracker.clear();
 
         // Parse the collected files using each parser (shared parsers across the batch)
         progress.onProgress("Parsing", 0, parsers.size());
@@ -288,9 +305,22 @@ public class ProjectIndexManager {
         }
         ParsedProject project = merge(projectName, projectRoot, perLang);
 
-        // Pass 1: build call graph — needed to compute in-degrees and caller contexts
+        // Build knowledge-graph relationships from parsed data (best-effort, per parser)
+        List<com.pharos.parser.model.ParsedRelationships> allRelationships = new ArrayList<>();
+        int relIdx = 0;
+        for (Map.Entry<CodeParser, List<Path>> entry : filesByParser.entrySet()) {
+            try {
+                allRelationships.add(entry.getKey().buildRelationships(project));
+            } catch (Exception e) {
+                log.warn("buildRelationships failed for parser {}: {}", entry.getKey().getClass().getSimpleName(), e.getMessage());
+            }
+            progress.onProgress("Extracting relationships", ++relIdx, parsers.size());
+        }
+        com.pharos.parser.model.ParsedRelationships relationships = mergeRelationships(projectName, allRelationships);
+
+        // Pass 1: build call graph + knowledge graph — needed to compute in-degrees and caller contexts
         progress.onProgress("Building call graph", 0, 0);
-        GraphIndexData graphData = buildAndSaveGraph(project, projectIndexDir);
+        GraphIndexData graphData = buildAndSaveGraph(project, relationships, projectIndexDir);
 
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
@@ -310,7 +340,7 @@ public class ProjectIndexManager {
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
 
-        if (buildSynonyms) expandSynonyms(projectName);
+        if (buildSynonyms && anyChanges[0]) expandSynonyms(projectName);
         return meta;
     }
 
@@ -578,11 +608,19 @@ public class ProjectIndexManager {
         int[] fileOffsets = new int[totalFiles];
         List<List<String>> fileSynthBodies = new ArrayList<>(totalFiles);
 
+        // Per-file, per-document chunk lists — kept in memory so Phase 3 knows
+        // how many embeddings to read per document.
+        // fileMethodChunks[fi][mi] = List<Chunk> for method mi (1 chunk for short, N for long)
+        // fileClassChunks[fi][ci]  = List<Chunk> for class ci (header + group chunks)
+        Chunker chunker = new DefaultChunker();
+        List<List<List<Chunk>>> fileMethodChunks = new ArrayList<>(totalFiles);
+        List<List<List<Chunk>>> fileClassChunks  = new ArrayList<>(totalFiles);
+
         Path spoolPath = projectIndexDir.resolve("embed.spool");
         Path cachePath = projectIndexDir.resolve("embed.cache");
         try {
-            // Phase 1: build synth bodies and spool all embedding texts to disk.
-            // Only fileOffsets[] (one int per file) stays in heap — texts go straight to disk.
+            // Phase 1: build chunk lists and spool all embedding texts to disk.
+            // Methods always contribute 1 slot; classes contribute N slots (one per chunk).
             int totalSlots = 0;
             if (doEmbed) {
                 Files.createDirectories(projectIndexDir);
@@ -597,15 +635,33 @@ public class ProjectIndexManager {
                                 .collect(Collectors.toList());
                         fileSynthBodies.add(synthBodies);
                         fileOffsets[fi] = totalSlots;
+
+                        // Methods: 1 chunk for short, N for long (multi-chunk)
+                        List<List<Chunk>> methodChunksPerFile = new ArrayList<>(file.methods().size());
                         for (ParsedMethod m : file.methods()) {
-                            spoolWrite(spool, DocumentMapper.buildEmbeddingText(m));
-                            totalSlots++;
+                            List<Chunk> mChunks = chunker.chunkMethod(m, true);
+                            methodChunksPerFile.add(mChunks);
+                            for (Chunk c : mChunks) {
+                                spoolWrite(spool, c.text());
+                                totalSlots++;
+                            }
                         }
+                        fileMethodChunks.add(methodChunksPerFile);
+
+                        // Classes: 1-N chunks each
+                        List<List<Chunk>> classChunksList = new ArrayList<>(file.classes().size());
                         for (int ci = 0; ci < file.classes().size(); ci++) {
-                            spoolWrite(spool, DocumentMapper.buildClassEmbeddingText(
-                                    file.classes().get(ci), synthBodies.get(ci)));
-                            totalSlots++;
+                            ParsedClass cls = file.classes().get(ci);
+                            List<ParsedMethod> clsMethods = methodsByClass.getOrDefault(
+                                    cls.qualifiedClassName(), List.of());
+                            List<Chunk> clsChunks = chunker.chunkClass(cls, synthBodies.get(ci), clsMethods);
+                            classChunksList.add(clsChunks);
+                            for (Chunk c : clsChunks) {
+                                spoolWrite(spool, c.text());
+                                totalSlots++;
+                            }
                         }
+                        fileClassChunks.add(classChunksList);
                     }
                 }
             } else {
@@ -617,6 +673,8 @@ public class ProjectIndexManager {
                                     k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
                             .collect(Collectors.toList());
                     fileSynthBodies.add(synthBodies);
+                    fileMethodChunks.add(List.of()); // empty = no-embed fallback
+                    fileClassChunks.add(List.of());
                 }
             }
 
@@ -653,9 +711,10 @@ public class ProjectIndexManager {
                 if (indexThreads <= 1) {
                     for (int fi = 0; fi < totalFiles; fi++) {
                         ParsedFile file = files.get(fi);
-                        int slotCount = file.methods().size() + file.classes().size();
+                        int slotCount = fileSlotCount(file, fileMethodChunks.get(fi), fileClassChunks.get(fi));
                         float[][] embs = readCachedEmbeddings(cacheChannel, fileOffsets[fi], slotCount, dims);
-                        writeFileDocs(writer, file, stateTracker, graphData, fileSynthBodies.get(fi), embs, 0);
+                        writeFileDocs(writer, file, stateTracker, graphData, fileSynthBodies.get(fi),
+                                embs, fileMethodChunks.get(fi), fileClassChunks.get(fi));
                         int done = doneFiles.incrementAndGet();
                         totalMethods.addAndGet(file.methods().size());
                         progress.onProgress("Indexing", done, totalFiles);
@@ -671,11 +730,12 @@ public class ProjectIndexManager {
                             futures.add(pool.submit(() -> {
                                 try {
                                     ParsedFile file = files.get(fiFinal);
-                                    int slotCount = file.methods().size() + file.classes().size();
+                                    int slotCount = fileSlotCount(file, fileMethodChunks.get(fiFinal), fileClassChunks.get(fiFinal));
                                     float[][] embs = readCachedEmbeddings(
                                             cacheChannel, fileOffsets[fiFinal], slotCount, dims);
                                     writeFileDocs(writer, file, stateTracker, graphData,
-                                            fileSynthBodies.get(fiFinal), embs, 0);
+                                            fileSynthBodies.get(fiFinal), embs,
+                                            fileMethodChunks.get(fiFinal), fileClassChunks.get(fiFinal));
                                     int done = doneFiles.incrementAndGet();
                                     totalMethods.addAndGet(file.methods().size());
                                     progress.onProgress("Indexing", done, totalFiles);
@@ -792,28 +852,69 @@ public class ProjectIndexManager {
                                GraphIndexData graphData,
                                List<String> synthesizedBodies,
                                float[][] globalEmbeddings,
-                               int embeddingOffset) throws IOException {
+                               List<List<Chunk>> methodChunkMeta,
+                               List<List<Chunk>> classChunkMeta) throws IOException {
+        int slot = 0;
+
+        // Methods — 1 or more chunks each (long methods get N chunks)
         for (int mi = 0; mi < file.methods().size(); mi++) {
             ParsedMethod method = file.methods().get(mi);
-            float[] embedding = (embeddingOffset + mi < globalEmbeddings.length)
-                    ? globalEmbeddings[embeddingOffset + mi] : null;
-            int inDegree = graphData.inDegree(method.fqn());
+            int inDegree     = graphData.inDegree(method.fqn());
             List<String> callerNames = graphData.callerSimpleNames(method.fqn());
-            writer.addDocument(DocumentMapper.toDocument(method, embedding, inDegree, callerNames));
+            int n = (!methodChunkMeta.isEmpty() && mi < methodChunkMeta.size())
+                    ? methodChunkMeta.get(mi).size() : 0;
+            if (n > 0 && slot + n <= globalEmbeddings.length) {
+                float[][] chunkEmbs = java.util.Arrays.copyOfRange(globalEmbeddings, slot, slot + n);
+                List<Chunk> mChunkList = methodChunkMeta.get(mi);
+                int[][] ranges = mChunkList.stream()
+                        .map(c -> new int[]{c.startLine(), c.endLine()})
+                        .toArray(int[][]::new);
+                writer.addDocument(DocumentMapper.toDocumentMultiVec(method, chunkEmbs, ranges, inDegree, callerNames));
+                slot += n;
+            } else {
+                writer.addDocument(DocumentMapper.toDocument(method, (float[]) null, inDegree, callerNames));
+            }
         }
 
-        int classOffset = file.methods().size();
+        // Classes — N chunks each
         for (int ci = 0; ci < file.classes().size(); ci++) {
             ParsedClass cls = file.classes().get(ci);
-            float[] embedding = (embeddingOffset + classOffset + ci < globalEmbeddings.length)
-                    ? globalEmbeddings[embeddingOffset + classOffset + ci] : null;
-            writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBodies.get(ci), embedding));
+            int n = (!classChunkMeta.isEmpty() && ci < classChunkMeta.size())
+                    ? classChunkMeta.get(ci).size() : 0;
+            if (n > 0 && slot + n <= globalEmbeddings.length) {
+                float[][] chunkEmbs = java.util.Arrays.copyOfRange(globalEmbeddings, slot, slot + n);
+                List<Chunk> cChunkList = classChunkMeta.get(ci);
+                int[][] ranges = cChunkList.stream()
+                        .map(c -> new int[]{c.startLine(), c.endLine()})
+                        .toArray(int[][]::new);
+                writer.addDocument(DocumentMapper.toClassDocumentMultiVec(cls, synthesizedBodies.get(ci), chunkEmbs, ranges));
+                slot += n;
+            } else {
+                writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBodies.get(ci), (float[]) null));
+            }
         }
 
         List<String> classNames = file.classes().stream()
                 .map(ParsedClass::qualifiedClassName)
                 .collect(Collectors.toList());
         stateTracker.track(Path.of(file.filePath()), classNames);
+    }
+
+    /** Total embedding slots for a file = sum(methodChunks) + sum(classChunks). */
+    private static int fileSlotCount(ParsedFile file, List<List<Chunk>> methodChunkMeta,
+                                     List<List<Chunk>> classChunkMeta) {
+        int n = 0;
+        if (methodChunkMeta != null && !methodChunkMeta.isEmpty()) {
+            for (List<Chunk> mc : methodChunkMeta) n += mc.size();
+        } else {
+            n += file.methods().size(); // fallback: 1 per method
+        }
+        if (classChunkMeta != null && !classChunkMeta.isEmpty()) {
+            for (List<Chunk> cc : classChunkMeta) n += cc.size();
+        } else {
+            n += file.classes().size();
+        }
+        return n;
     }
 
     /**
@@ -947,6 +1048,19 @@ public class ProjectIndexManager {
                 builder.buildFile(graph, pf);
             }
 
+            // Rebuild knowledge-graph edges for dirty files
+            if (!parsedDirtyFiles.isEmpty()) {
+                ParsedProject miniProject = new com.pharos.parser.model.ParsedProject(
+                        "incremental", "", parsedDirtyFiles);
+                com.pharos.parser.model.ParsedRelationships rel =
+                        parsers.stream()
+                               .filter(p -> p.supportedExtensions().contains(".java"))
+                               .findFirst()
+                               .map(p -> { try { return p.buildRelationships(miniProject); } catch (Exception e2) { return com.pharos.parser.model.ParsedRelationships.empty("incremental"); } })
+                               .orElse(com.pharos.parser.model.ParsedRelationships.empty("incremental"));
+                new com.pharos.graph.KnowledgeGraphBuilder().build(graph, rel);
+            }
+
             CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             log.debug("Patched call graph: {} methods after update", graph.methodCount());
         } catch (Exception e) {
@@ -986,11 +1100,14 @@ public class ProjectIndexManager {
         return meta;
     }
 
-    private GraphIndexData buildAndSaveGraph(ParsedProject project, Path projectIndexDir) {
+    private GraphIndexData buildAndSaveGraph(ParsedProject project,
+                                              com.pharos.parser.model.ParsedRelationships relationships,
+                                              Path projectIndexDir) {
         Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
         try (CallGraph graph = CallGraph.open(dbDir)) {
             graph.clear();
             new CallGraphBuilder().build(graph, project);
+            new KnowledgeGraphBuilder().build(graph, relationships);
             CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             log.debug("Call graph built: {} methods, {} calls",
                     graph.methodCount(), graph.callCount());
@@ -999,6 +1116,30 @@ public class ProjectIndexManager {
             log.warn("Failed to build call graph: {}", e.getMessage());
             return GraphIndexData.empty();
         }
+    }
+
+    private static com.pharos.parser.model.ParsedRelationships mergeRelationships(
+            String projectName, List<com.pharos.parser.model.ParsedRelationships> all) {
+        List<com.pharos.parser.model.ParsedRelationships.TypeEdge>   inherits   = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.TypeEdge>   implEdges  = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.FieldDecl>  fields     = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.FieldAccess> reads     = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.FieldAccess> writes    = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.TypeEdge>   returns    = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.TypeEdge>   takes      = new ArrayList<>();
+        List<com.pharos.parser.model.ParsedRelationships.TypeEdge>   annotated  = new ArrayList<>();
+        for (var r : all) {
+            inherits.addAll(r.inherits());
+            implEdges.addAll(r.implementsEdges());
+            fields.addAll(r.fields());
+            reads.addAll(r.reads());
+            writes.addAll(r.writes());
+            returns.addAll(r.returns());
+            takes.addAll(r.takes());
+            annotated.addAll(r.annotatedBy());
+        }
+        return new com.pharos.parser.model.ParsedRelationships(
+                projectName, inherits, implEdges, fields, reads, writes, returns, takes, annotated);
     }
 
     private ProjectMeta buildMeta(String projectName, Path projectRoot, Path projectIndexDir,

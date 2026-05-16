@@ -2,6 +2,7 @@ package com.pharos.parser;
 
 import com.pharos.parser.model.ParsedFile;
 import com.pharos.parser.model.ParsedProject;
+import com.pharos.parser.model.ParsedRelationships;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -52,6 +53,18 @@ public interface CodeParser {
             }
         }
         return new ParsedProject(projectName, projectRoot.toString(), results);
+    }
+
+    /**
+     * Extracts structural relationships (inheritance, field access, annotations, type refs)
+     * from an already-parsed project.  Called immediately after {@link #parseFiles} in the
+     * indexing pipeline; implementations may reuse internal solver state from the prior call.
+     *
+     * <p>The default returns an empty result — parsers that cannot extract these relationships
+     * (e.g. dynamic languages) do not need to override.
+     */
+    default ParsedRelationships buildRelationships(ParsedProject project) {
+        return ParsedRelationships.empty(project.projectName());
     }
 
     /**

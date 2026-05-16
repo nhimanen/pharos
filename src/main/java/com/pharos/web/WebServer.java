@@ -116,7 +116,7 @@ public class WebServer {
             String project = ctx.queryParam("project");
             String pipeline = ctx.queryParam("pipeline");
             String type = pipeline != null ? pipeline
-                    : ctx.queryParamAsClass("type", String.class).getOrDefault("hybrid");
+                    : ctx.queryParamAsClass("type", String.class).getOrDefault("auto");
             int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(20);
             int oversample = ctx.queryParamAsClass("oversample", Integer.class).getOrDefault(0);
             String docType = ctx.queryParam("docType");
@@ -124,11 +124,44 @@ public class WebServer {
             String scope = ctx.queryParam("scope");
             if ("all".equals(scope)) scope = null;
             if (project != null && project.isBlank()) project = null;
+            boolean trace       = "true".equalsIgnoreCase(ctx.queryParam("trace"));
+            int snippetLines    = ctx.queryParamAsClass("snippetLines", Integer.class).getOrDefault(15);
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
                     project, null, limit, "text", docType, scope, oversample);
             try {
-                ctx.json(searchEngine.search(req).stream()
-                        .map(this::resultToMap).collect(Collectors.toList()));
+                SearchResponse resp = searchEngine.searchWithTrace(req, false);
+                List<SearchResult> decorated = searchEngine
+                        .newSnippetDecorator(snippetLines, resp)
+                        .decorate(resp.results(), q);
+                List<Map<String, Object>> results = decorated.stream()
+                        .map(this::resultToMap).collect(Collectors.toList());
+                boolean needsEnvelope = trace || (resp.suggestions() != null && !resp.suggestions().isEmpty());
+                if (needsEnvelope) {
+                    Map<String, Object> out = new LinkedHashMap<>();
+                    out.put("results", results);
+                    if (trace) {
+                        Map<String, Object> meta = new LinkedHashMap<>();
+                        meta.put("requestedType", type);
+                        meta.put("resolvedType",  resp.resolvedType() != null ? resp.resolvedType() : type);
+                        meta.put("totalMs",       resp.trace().totalMs());
+                        meta.put("stages", resp.trace().spans().stream().map(s -> {
+                            Map<String, Object> stage = new LinkedHashMap<>();
+                            stage.put("name", s.name()); stage.put("ms", s.durationMs()); return stage;
+                        }).collect(Collectors.toList()));
+                        out.put("searchMeta", meta);
+                    }
+                    var sugg = resp.suggestions();
+                    if (sugg != null && !sugg.isEmpty()) {
+                        Map<String, Object> sm = new LinkedHashMap<>();
+                        if (!sugg.fuzzyMatches().isEmpty()) sm.put("fuzzyMatches", sugg.fuzzyMatches());
+                        if (!sugg.tokenMatches().isEmpty()) sm.put("tokenMatches", sugg.tokenMatches());
+                        if (sugg.filterNote() != null) sm.put("filterNote", sugg.filterNote());
+                        out.put("suggestions", sm);
+                    }
+                    ctx.json(out);
+                } else {
+                    ctx.json(results);
+                }
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -144,15 +177,25 @@ public class WebServer {
             ctx.json(methodToMap(r));
         });
 
-        // API: single class by qualified name — body is sliced from the source file
-        // to include fields, enum constants and class-level annotations that aren't
-        // individually indexed.
+        // API: class body — ?fqn=  (add ?context=true for full context including fields/constructors/callers)
         app.get("/api/class", ctx -> {
-            String fqn = ctx.queryParam("fqn");
+            String fqn     = ctx.queryParam("fqn");
+            boolean withCtx = "true".equalsIgnoreCase(ctx.queryParam("context"));
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
-            SearchResult r = searchEngine.getClassByFqn(fqn);
-            if (r == null) { ctx.status(404).result("Not found"); return; }
-            ctx.json(classToMap(r));
+            try {
+                if (withCtx) {
+                    SearchEngine.ClassContext context = searchEngine.getClassContext(fqn);
+                    if (context == null) { ctx.status(404).result("Not found"); return; }
+                    ctx.json(classContextToMap(context));
+                } else {
+                    SearchResult r = searchEngine.getClassByFqn(fqn);
+                    if (r == null) { ctx.status(404).result("Not found"); return; }
+                    ctx.json(classToMap(r));
+                }
+            } catch (Exception e) {
+                log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
+                ctx.status(500).json(Map.of("error", e.getMessage()));
+            }
         });
 
         // API: callers of a method
@@ -180,6 +223,48 @@ public class WebServer {
             } catch (IOException e) {
                 log.warn("findCallees failed for '{}': {}", fqn, e.getMessage());
                 ctx.status(503).result(e.getMessage());
+            }
+        });
+
+        // API: transitive callers (impact analysis) — ?fqn=&depth=5&maxCallers=2000
+        app.get("/api/impact", ctx -> {
+            String fqn = ctx.queryParam("fqn");
+            if (fqn == null || fqn.isBlank()) { ctx.status(400).result("fqn required"); return; }
+            int depth      = Math.min(10, ctx.queryParamAsClass("depth",      Integer.class).getOrDefault(5));
+            int maxCallers = ctx.queryParamAsClass("maxCallers", Integer.class).getOrDefault(2000);
+            try {
+                ctx.json(searchEngine.findTransitiveCallers(fqn, depth, maxCallers));
+            } catch (Exception e) {
+                log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
+                ctx.status(500).json(Map.of("error", e.getMessage()));
+            }
+        });
+
+        // API: knowledge-graph usages — ?fqn=&kind=all
+        app.get("/api/usages", ctx -> {
+            String fqn = ctx.queryParam("fqn");
+            if (fqn == null || fqn.isBlank()) { ctx.status(400).result("fqn required"); return; }
+            String kind = ctx.queryParamAsClass("kind", String.class).getOrDefault("all");
+            try {
+                ctx.json(searchEngine.findUsages(fqn, kind));
+            } catch (Exception e) {
+                log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
+                ctx.status(500).json(Map.of("error", e.getMessage()));
+            }
+        });
+
+        // API: multi-hop call-chain traversal — ?fqn=&depth=2&direction=callees&maxBodyChars=500
+        app.get("/api/trace", ctx -> {
+            String fqn = ctx.queryParam("fqn");
+            if (fqn == null || fqn.isBlank()) { ctx.status(400).result("fqn required"); return; }
+            int    depth        = Math.min(4, ctx.queryParamAsClass("depth",        Integer.class).getOrDefault(2));
+            String direction    = ctx.queryParamAsClass("direction", String.class).getOrDefault("callees");
+            int    maxBodyChars = ctx.queryParamAsClass("maxBodyChars", Integer.class).getOrDefault(500);
+            try {
+                ctx.json(searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars));
+            } catch (Exception e) {
+                log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
+                ctx.status(500).json(Map.of("error", e.getMessage()));
             }
         });
 
@@ -667,6 +752,45 @@ public class WebServer {
 
     // ── DTO mappers ────────────────────────────────────────────────────────────
 
+    private Map<String, Object> classContextToMap(SearchEngine.ClassContext ctx) {
+        SearchResult cls = ctx.classResult();
+        String fqnStr = cls.id().substring(cls.project().length() + 1);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("fqn",      fqnStr);
+        m.put("label",    cls.label());
+        m.put("project",  cls.project());
+        m.put("javadoc",  cls.javadoc());
+        m.put("body",     ctx.body());
+        m.put("filePath", cls.filePath());
+        m.put("startLine", cls.startLine());
+        m.put("endLine",   cls.endLine());
+        m.put("fields", ctx.fields().stream().map(f -> {
+            Map<String, Object> fm = new LinkedHashMap<>();
+            fm.put("fqn",       f.fqn());
+            fm.put("name",      f.fieldName());
+            fm.put("type",      f.fieldType());
+            fm.put("accessMod", f.accessMod());
+            return fm;
+        }).collect(Collectors.toList()));
+        m.put("constructors", ctx.constructors().stream().map(c -> {
+            Map<String, Object> cm = new LinkedHashMap<>();
+            cm.put("fqn",       c.id().substring(c.project().length() + 1));
+            cm.put("signature", c.signature());
+            cm.put("javadoc",   c.javadoc());
+            return cm;
+        }).collect(Collectors.toList()));
+        m.put("publicMethods", ctx.publicMethods().stream().map(pm -> {
+            String pmFqn = pm.id().substring(pm.project().length() + 1);
+            Map<String, Object> pm2 = new LinkedHashMap<>();
+            pm2.put("fqn",       pmFqn);
+            pm2.put("signature", pm.signature());
+            pm2.put("javadoc",   pm.javadoc());
+            pm2.put("callers",   ctx.publicMethodCallers().getOrDefault(pmFqn, List.of()));
+            return pm2;
+        }).collect(Collectors.toList()));
+        return m;
+    }
+
     private Map<String, Object> projectToMap(ProjectMeta p) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("name", p.getName());
@@ -695,6 +819,13 @@ public class WebServer {
         m.put("score", r.score());
         m.put("docType", r.docType());
         m.put("searchType", r.searchType());
+        // Snippet fields — populated by SnippetDecorator when present
+        Snippet snip = r.snippet();
+        if (snip != null) {
+            m.put("snippet",          snip.text());
+            m.put("snippetStartLine", snip.startLine());
+            m.put("snippetEndLine",   snip.endLine());
+        }
         return m;
     }
 

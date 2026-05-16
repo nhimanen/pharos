@@ -6,6 +6,8 @@ import com.pharos.parser.model.ParsedMethod;
 import org.apache.lucene.document.*;
 import org.apache.lucene.index.VectorSimilarityFunction;
 
+import java.util.Arrays;
+
 import java.util.List;
 
 /**
@@ -41,6 +43,20 @@ public class DocumentMapper {
     public static final String F_START_LINE        = "startLine";
     public static final String F_END_LINE          = "endLine";
     public static final String F_VECTOR            = "vectorEmbedding";
+    /**
+     * Multi-vector field for late-interaction rescoring.
+     * Stores one embedding vector per logical chunk of the document (via
+     * {@link LateInteractionField}) alongside the single representative vector
+     * in {@link #F_VECTOR} used for HNSW approximate retrieval.
+     */
+    public static final String F_CHUNK_VECTORS     = "chunkVectors";
+    /**
+     * Compact binary stored field: {@code [N:int32][start0:int32][end0:int32]...[startN-1][endN-1]}.
+     * Parallel to {@link #F_CHUNK_VECTORS} — entry i gives the source line range of chunk i.
+     * Used by {@link com.pharos.search.SnippetResolver} to map the best-scoring chunk index
+     * back to a file line range without re-reading source files.
+     */
+    public static final String F_CHUNK_LINE_RANGES = "chunkLineRanges";
 
     /**
      * Discriminates method documents from class documents in the same index.
@@ -184,6 +200,35 @@ public class DocumentMapper {
         return doc;
     }
 
+    /**
+     * Multi-vector overload: writes one {@link LateInteractionField} (all chunk embeddings)
+     * and one {@link KnnFloatVectorField} (mean of chunk embeddings as the HNSW representative).
+     *
+     * @param chunkEmbeddings one float[] per logical chunk; must be non-null and non-empty
+     */
+    public static Document toDocumentMultiVec(ParsedMethod method, float[][] chunkEmbeddings,
+                                               int inDegree, List<String> callerNames) {
+        return toDocumentMultiVec(method, chunkEmbeddings, null, inDegree, callerNames);
+    }
+
+    /**
+     * Multi-vector overload with explicit chunk line ranges.
+     *
+     * @param chunkLineRanges parallel to {@code chunkEmbeddings}: {@code int[i] = {startLine, endLine}}
+     *                        for chunk i.  May be null — ranges are omitted from the document.
+     */
+    public static Document toDocumentMultiVec(ParsedMethod method, float[][] chunkEmbeddings,
+                                               int[][] chunkLineRanges,
+                                               int inDegree, List<String> callerNames) {
+        float[] representative = meanPool(chunkEmbeddings);
+        Document doc = toDocument(method, representative, inDegree, callerNames);
+        doc.add(new LateInteractionField(F_CHUNK_VECTORS, chunkEmbeddings));
+        if (chunkLineRanges != null && chunkLineRanges.length > 0) {
+            doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
+        }
+        return doc;
+    }
+
     /** Convenience overload for callers that don't have graph data yet (incremental updates). */
     public static Document toDocument(ParsedMethod method, float[] embedding) {
         return toDocument(method, embedding, 0, List.of());
@@ -198,6 +243,13 @@ public class DocumentMapper {
         StringBuilder sb = new StringBuilder();
         if (method.javadoc() != null && !method.javadoc().isBlank()) {
             sb.append("/** ").append(method.javadoc().trim()).append(" */\n");
+        } else {
+            // No javadoc — synthesize a natural-language description from the parsed structure
+            // so the embedding captures semantics even for undocumented methods.
+            String synthesized = synthesizeDescription(method);
+            if (!synthesized.isBlank()) {
+                sb.append("// ").append(synthesized).append('\n');
+            }
         }
         // Include split identifier so the embedding captures natural-language semantics
         // e.g. "getUserById" → "get user by id" alongside the original camelCase signature
@@ -215,6 +267,170 @@ public class DocumentMapper {
         if (body != null) sb.append(body);
         sb.append("\n}");
         return sb.toString();
+    }
+
+    /**
+     * Synthesizes a compact natural-language description from a method's parsed structure
+     * when no javadoc is present.
+     *
+     * <p>Format: <code>{verb phrase}: given {params} — returns {type} — calls {callees}</code>
+     *
+     * <p>Examples:
+     * <ul>
+     *   <li>{@code findActive(String tenantId)} → {@code "find active: given tenant id — returns list of User — calls findByTenantAndStatus"}</li>
+     *   <li>{@code processPayment(Order order, BigDecimal amount)} → {@code "process payment: given order, amount — returns boolean"}</li>
+     *   <li>{@code UserService(UserRepo repo)} → {@code "creates UserService: given repo"}</li>
+     * </ul>
+     */
+    public static String synthesizeDescription(ParsedMethod method) {
+        StringBuilder sb = new StringBuilder();
+
+        // Verb phrase from split method name
+        if (method.isConstructor()) {
+            sb.append("creates ").append(method.className());
+        } else {
+            String verbPhrase = splitIdentifier(method.methodName());
+            if (!verbPhrase.isBlank()) sb.append(verbPhrase);
+        }
+
+        // Parameters
+        List<String> pNames = method.paramNames();
+        List<String> pTypes = method.paramTypes();
+        if (!pNames.isEmpty()) {
+            List<String> paramParts = new java.util.ArrayList<>();
+            for (int i = 0; i < pNames.size(); i++) {
+                String pName = pNames.get(i);
+                if ("self".equals(pName) || "this".equals(pName)) continue;
+                String label = splitIdentifier(pName);
+                if (!label.isBlank()) paramParts.add(label);
+            }
+            if (!paramParts.isEmpty()) {
+                sb.append(": given ").append(String.join(", ", paramParts));
+            }
+        }
+
+        // Return type (skip for constructors and void)
+        if (!method.isConstructor()) {
+            String formatted = formatReturnType(method.returnType());
+            if (formatted != null) {
+                sb.append(" — returns ").append(formatted);
+            }
+        }
+
+        // Top-5 called method names (resolved only)
+        if (method.calledMethods() != null) {
+            String callees = method.calledMethods().stream()
+                    .filter(CallReference::resolved)
+                    .map(c -> {
+                        String fqn = c.calleeFqn();
+                        int hash = fqn.indexOf('#');
+                        int paren = fqn.indexOf('(');
+                        String name = hash >= 0
+                                ? fqn.substring(hash + 1, paren > hash ? paren : fqn.length())
+                                : c.calleeSimpleName();
+                        return splitIdentifier(name);
+                    })
+                    .filter(s -> !s.isBlank())
+                    .distinct()
+                    .limit(5)
+                    .collect(java.util.stream.Collectors.joining(", "));
+            if (!callees.isBlank()) {
+                sb.append(" — calls ").append(callees);
+            }
+        }
+
+        return sb.toString();
+    }
+
+    /**
+     * Formats a Java return type into natural language, with collection-awareness.
+     *
+     * <ul>
+     *   <li>{@code List<User>}       → {@code "list of User"}</li>
+     *   <li>{@code Set<Order>}        → {@code "set of Order"}</li>
+     *   <li>{@code Map<String,User>}  → {@code "map of String to User"}</li>
+     *   <li>{@code Optional<User>}    → {@code "optional User"}</li>
+     *   <li>{@code User[]}            → {@code "array of User"}</li>
+     *   <li>{@code User}              → {@code "User"}</li>
+     *   <li>{@code void}              → {@code null} (omitted from description)</li>
+     * </ul>
+     */
+    public static String formatReturnType(String returnType) {
+        if (returnType == null || returnType.isBlank()) return null;
+        String rt = returnType.trim();
+        if ("void".equals(rt)) return null;
+
+        // Array: Type[]
+        if (rt.endsWith("[]")) {
+            String element = rt.substring(0, rt.length() - 2).trim();
+            return "array of " + stripGenericParams(element);
+        }
+
+        int lt = rt.indexOf('<');
+        if (lt > 0) {
+            String outer = rt.substring(0, lt).trim();
+            String inner = rt.substring(lt + 1, rt.lastIndexOf('>') > lt ? rt.lastIndexOf('>') : rt.length()).trim();
+            String outerLower = outer.toLowerCase();
+
+            // Map variants
+            if (MAP_TYPES.contains(outerLower)) {
+                int comma = inner.indexOf(',');
+                if (comma > 0) {
+                    String key   = stripGenericParams(inner.substring(0, comma).trim());
+                    String value = stripGenericParams(inner.substring(comma + 1).trim());
+                    return "map of " + key + " to " + value;
+                }
+                return "map";
+            }
+
+            // Optional / Future / Mono / Flux (single-element wrapper)
+            if (WRAPPER_TYPES.contains(outerLower)) {
+                return outerLower.replace("completablefuture", "future").replace("listenablefuture", "future")
+                        + " " + stripGenericParams(inner);
+            }
+
+            // Collection types
+            String collectionWord = COLLECTION_WORDS.get(outerLower);
+            if (collectionWord != null) {
+                return collectionWord + " of " + stripGenericParams(inner);
+            }
+
+            // Unknown generic — just use outer name
+            return outer;
+        }
+
+        // Primitive or simple class name
+        return rt;
+    }
+
+    private static String stripGenericParams(String type) {
+        if (type == null) return "";
+        int lt = type.indexOf('<');
+        String base = lt >= 0 ? type.substring(0, lt).trim() : type.trim();
+        return base.replace("[]", "").trim();
+    }
+
+    private static final java.util.Set<String> MAP_TYPES = java.util.Set.of(
+            "map", "hashmap", "linkedhashmap", "treemap", "concurrentmap",
+            "concurrenthashmap", "enummap", "sortedmap", "navigablemap");
+
+    private static final java.util.Set<String> WRAPPER_TYPES = java.util.Set.of(
+            "optional", "completablefuture", "listenablefuture", "future",
+            "mono", "flux", "observable", "single", "maybe");
+
+    private static final java.util.Map<String, String> COLLECTION_WORDS;
+    static {
+        java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
+        for (String t : new String[]{"list","arraylist","linkedlist","copyonwritearraylist","vector"})
+            m.put(t, "list");
+        for (String t : new String[]{"set","hashset","linkedhashset","treeset","enumset","sortedset","navigableset"})
+            m.put(t, "set");
+        for (String t : new String[]{"collection","iterable","queue","deque","arraydeque","linkedblockingqueue"})
+            m.put(t, "collection");
+        m.put("stream", "stream");
+        m.put("page",   "page");
+        m.put("slice",  "slice");
+        COLLECTION_WORDS = java.util.Collections.unmodifiableMap(m);
     }
 
     /**
@@ -252,7 +468,7 @@ public class DocumentMapper {
      *   "MAX_RETRY_COUNT"  → "max retry count"
      *   "parseXMLDocument" → "parse x m l document"  (single-char runs kept as-is by BM25)
      */
-    static String splitIdentifier(String name) {
+    public static String splitIdentifier(String name) {
         if (name == null || name.isBlank()) return nvl(name);
         // Split on underscores first, then on camelCase transitions
         String[] parts = name.split("_");
@@ -346,6 +562,62 @@ public class DocumentMapper {
         }
 
         return doc;
+    }
+
+    /**
+     * Multi-vector overload for classes: mean-pools chunk embeddings as representative
+     * vector and stores all chunks in a {@link LateInteractionField}.
+     */
+    public static Document toClassDocumentMultiVec(ParsedClass cls, String synthesizedBody,
+                                                    float[][] chunkEmbeddings) {
+        return toClassDocumentMultiVec(cls, synthesizedBody, chunkEmbeddings, null);
+    }
+
+    /** Multi-vector overload for classes with explicit chunk line ranges. */
+    public static Document toClassDocumentMultiVec(ParsedClass cls, String synthesizedBody,
+                                                    float[][] chunkEmbeddings,
+                                                    int[][] chunkLineRanges) {
+        float[] representative = meanPool(chunkEmbeddings);
+        Document doc = toClassDocument(cls, synthesizedBody, representative);
+        doc.add(new LateInteractionField(F_CHUNK_VECTORS, chunkEmbeddings));
+        if (chunkLineRanges != null && chunkLineRanges.length > 0) {
+            doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
+        }
+        return doc;
+    }
+
+    /**
+     * Encodes chunk line ranges as a compact byte array.
+     * Format: {@code [N:int32][start0:int32][end0:int32]...[startN-1:int32][endN-1:int32]}.
+     */
+    public static byte[] encodeLineRanges(int[][] ranges) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(4 + ranges.length * 8);
+        buf.putInt(ranges.length);
+        for (int[] r : ranges) { buf.putInt(r[0]); buf.putInt(r[1]); }
+        return buf.array();
+    }
+
+    /** Decodes a byte array produced by {@link #encodeLineRanges}. */
+    public static int[][] decodeLineRanges(byte[] encoded) {
+        if (encoded == null || encoded.length < 4) return new int[0][];
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(encoded);
+        int n = buf.getInt();
+        int[][] ranges = new int[n][2];
+        for (int i = 0; i < n; i++) { ranges[i][0] = buf.getInt(); ranges[i][1] = buf.getInt(); }
+        return ranges;
+    }
+
+    /** Mean-pools an array of chunk embeddings into one representative vector. */
+    public static float[] meanPool(float[][] chunks) {
+        if (chunks == null || chunks.length == 0) return null;
+        if (chunks.length == 1) return chunks[0];
+        int dims = chunks[0].length;
+        float[] mean = new float[dims];
+        for (float[] v : chunks) {
+            for (int d = 0; d < dims; d++) mean[d] += v[d];
+        }
+        for (int d = 0; d < dims; d++) mean[d] /= chunks.length;
+        return mean;
     }
 
     /** Build embedding input text for a class — javadoc + synthesized body (truncated). */

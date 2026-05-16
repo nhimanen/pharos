@@ -74,11 +74,31 @@ public class CallGraph implements AutoCloseable {
     private static void initSchema(Database db) {
         if (!db.getSchema().existsType("Method")) {
             var methodType = db.getSchema().createVertexType("Method");
-            methodType.createProperty("fqn",         Type.STRING);
-            methodType.createProperty("classPrefix",  Type.STRING);
+            methodType.createProperty("fqn",        Type.STRING);
+            methodType.createProperty("classPrefix", Type.STRING);
             db.getSchema().createEdgeType("calls");
             db.getSchema().createTypeIndex(Schema.INDEX_TYPE.LSM_TREE, true,  "Method", "fqn");
             db.getSchema().createTypeIndex(Schema.INDEX_TYPE.LSM_TREE, false, "Method", "classPrefix");
+        }
+        // Knowledge-graph vertex/edge types (additive — safe on existing databases)
+        if (!db.getSchema().existsType("CodeType")) {
+            var t = db.getSchema().createVertexType("CodeType");
+            t.createProperty("fqn",         Type.STRING);
+            t.createProperty("classPrefix", Type.STRING);
+            db.getSchema().createTypeIndex(Schema.INDEX_TYPE.LSM_TREE, true, "CodeType", "fqn");
+        }
+        if (!db.getSchema().existsType("CodeField")) {
+            var f = db.getSchema().createVertexType("CodeField");
+            f.createProperty("fqn",         Type.STRING);
+            f.createProperty("ownerFqn",    Type.STRING);
+            f.createProperty("fieldType",   Type.STRING);
+            f.createProperty("accessMod",   Type.STRING);
+            db.getSchema().createTypeIndex(Schema.INDEX_TYPE.LSM_TREE, true,  "CodeField", "fqn");
+            db.getSchema().createTypeIndex(Schema.INDEX_TYPE.LSM_TREE, false, "CodeField", "ownerFqn");
+        }
+        for (String edge : new String[]{"inherits", "implements_iface", "declares_field",
+                "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by"}) {
+            if (!db.getSchema().existsType(edge)) db.getSchema().createEdgeType(edge);
         }
     }
 
@@ -110,17 +130,57 @@ public class CallGraph implements AutoCloseable {
         flushCalls();
     }
 
+    // -------------------------------------------------------------------------
+    // Knowledge-graph mutations
+    // -------------------------------------------------------------------------
+
+    /** Batch buffers for knowledge-graph vertices and edges. */
+    private final List<String[]>  codeTypeBatch  = new ArrayList<>(BATCH_SIZE); // [fqn, classPrefix]
+    private final List<String[]>  codeFieldBatch = new ArrayList<>(BATCH_SIZE); // [fqn, ownerFqn, type, access]
+    private final List<String[]>  kgEdgeBatch    = new ArrayList<>(BATCH_SIZE); // [edgeType, fromFqn, fromVType, toFqn, toVType]
+
+    public void addCodeType(String fqn, String classPrefix) {
+        codeTypeBatch.add(new String[]{fqn, classPrefix != null ? classPrefix : ""});
+        if (codeTypeBatch.size() >= BATCH_SIZE) flushCodeTypes();
+    }
+
+    public void addCodeField(String fieldFqn, String ownerFqn, String fieldType, String accessMod) {
+        codeFieldBatch.add(new String[]{fieldFqn, ownerFqn, fieldType, accessMod});
+        if (codeFieldBatch.size() >= BATCH_SIZE) flushCodeFields();
+    }
+
+    /** Add a typed knowledge-graph edge. {@code fromType}/{@code toType}: "Method","CodeType","CodeField". */
+    public void addKgEdge(String edgeType, String fromFqn, String fromVType, String toFqn, String toVType) {
+        kgEdgeBatch.add(new String[]{edgeType, fromFqn, fromVType, toFqn, toVType});
+        if (kgEdgeBatch.size() >= BATCH_SIZE) flushKgEdges();
+    }
+
+    /** Commit all knowledge-graph pending batches. */
+    public void flushKnowledge() {
+        flushCodeTypes();
+        flushCodeFields();
+        flushKgEdges();
+    }
+
     /**
-     * Delete all vertices and edges.
-     * Uses TRUNCATE TYPE (O(1)) rather than DELETE VERTEX (O(M) full scan)
-     * to avoid both the scan cost and LSM compaction-file-removal races.
+     * Delete all vertices and edges (call graph + knowledge graph).
+     * Uses TRUNCATE TYPE (O(1)) rather than DELETE VERTEX (O(M) full scan).
      */
     public void clear() {
         methodBatch.clear();
         callBatch.clear();
+        codeTypeBatch.clear();
+        codeFieldBatch.clear();
+        kgEdgeBatch.clear();
         db.begin();
-        db.command("sql", "TRUNCATE TYPE calls UNSAFE");
+        for (String edge : new String[]{"calls", "inherits", "implements_iface", "declares_field",
+                "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by"}) {
+            if (db.getSchema().existsType(edge))
+                db.command("sql", "TRUNCATE TYPE " + edge + " UNSAFE");
+        }
         db.command("sql", "TRUNCATE TYPE Method UNSAFE");
+        if (db.getSchema().existsType("CodeType"))  db.command("sql", "TRUNCATE TYPE CodeType UNSAFE");
+        if (db.getSchema().existsType("CodeField")) db.command("sql", "TRUNCATE TYPE CodeField UNSAFE");
         db.commit();
     }
 
@@ -137,9 +197,12 @@ public class CallGraph implements AutoCloseable {
         if (classPrefixes == null || classPrefixes.isEmpty()) return;
         db.begin();
         for (String cls : classPrefixes) {
-            if (cls != null && !cls.isEmpty()) {
-                db.command("sql", "DELETE VERTEX FROM Method WHERE classPrefix = ?", cls);
-            }
+            if (cls == null || cls.isEmpty()) continue;
+            db.command("sql", "DELETE VERTEX FROM Method WHERE classPrefix = ?", cls);
+            if (db.getSchema().existsType("CodeType"))
+                db.command("sql", "DELETE VERTEX FROM CodeType WHERE classPrefix = ?", cls);
+            if (db.getSchema().existsType("CodeField"))
+                db.command("sql", "DELETE VERTEX FROM CodeField WHERE ownerFqn = ?", cls);
         }
         db.commit();
         log.debug("Evicted {} class(es) from call graph", classPrefixes.size());
@@ -253,6 +316,111 @@ public class CallGraph implements AutoCloseable {
     }
 
     // -------------------------------------------------------------------------
+    // Knowledge-graph queries
+    // -------------------------------------------------------------------------
+
+    /** Direct subclasses of {@code classFqn} (one hop via inherits or implements_iface, in-edges). */
+    public Set<String> directSubclasses(String classFqn) {
+        return kgNeighbors(classFqn, "CodeType", Vertex.DIRECTION.IN,
+                new String[]{"inherits", "implements_iface"});
+    }
+
+    /** Direct superclasses / implemented interfaces of {@code classFqn} (out-edges). */
+    public Set<String> directSuperTypes(String classFqn) {
+        return kgNeighbors(classFqn, "CodeType", Vertex.DIRECTION.OUT,
+                new String[]{"inherits", "implements_iface"});
+    }
+
+    /** BFS over inherits + implements_iface to collect all transitive subclasses. */
+    public List<String> allSubclasses(String classFqn) {
+        return kgBfs(classFqn, "CodeType", Vertex.DIRECTION.IN,
+                new String[]{"inherits", "implements_iface"});
+    }
+
+    /** All methods that read a field (reads_field in-edges on CodeField vertex). */
+    public Set<String> fieldReaders(String fieldFqn) {
+        return kgNeighbors(fieldFqn, "CodeField", Vertex.DIRECTION.IN, new String[]{"reads_field"});
+    }
+
+    /** All methods that write a field. */
+    public Set<String> fieldWriters(String fieldFqn) {
+        return kgNeighbors(fieldFqn, "CodeField", Vertex.DIRECTION.IN, new String[]{"writes_field"});
+    }
+
+    /** All fields declared by a class (FQNs only). */
+    public Set<String> declaredFields(String classFqn) {
+        return kgNeighbors(classFqn, "CodeType", Vertex.DIRECTION.OUT, new String[]{"declares_field"});
+    }
+
+    /** Rich field info for all fields declared by a class. */
+    public List<FieldInfo> getFieldsOf(String classFqn) {
+        if (!db.getSchema().existsType("CodeField")) return List.of();
+        ResultSet rs = db.query("sql",
+                "SELECT fqn, fieldType, accessMod FROM CodeField WHERE ownerFqn = ?", classFqn);
+        List<FieldInfo> result = new ArrayList<>();
+        while (rs.hasNext()) {
+            var rec = rs.next();
+            String fqn   = rec.getProperty("fqn");
+            String type  = rec.getProperty("fieldType");
+            String access = rec.getProperty("accessMod");
+            if (fqn != null) result.add(new FieldInfo(fqn, type, access));
+        }
+        return result;
+    }
+
+    /** Field declaration with type and access modifier. */
+    public record FieldInfo(String fqn, String fieldType, String accessMod) {
+        public String fieldName() {
+            int hash = fqn.indexOf('#');
+            return hash >= 0 ? fqn.substring(hash + 1) : fqn;
+        }
+    }
+
+    /** All methods/classes annotated with the given annotation FQN or simple name. */
+    public Set<String> annotatedWith(String annotationFqn) {
+        return kgNeighbors(annotationFqn, "CodeType", Vertex.DIRECTION.IN, new String[]{"annotated_by"});
+    }
+
+    /** All methods that return the given type. */
+    public Set<String> methodsReturning(String typeFqn) {
+        return kgNeighbors(typeFqn, "CodeType", Vertex.DIRECTION.IN, new String[]{"returns_type"});
+    }
+
+    /** All methods that take the given type as a parameter. */
+    public Set<String> methodsTaking(String typeFqn) {
+        return kgNeighbors(typeFqn, "CodeType", Vertex.DIRECTION.IN, new String[]{"takes_type"});
+    }
+
+    private Set<String> kgNeighbors(String fqn, String vType, Vertex.DIRECTION dir, String[] edgeTypes) {
+        Vertex v = lookupKgVertex(fqn, vType);
+        if (v == null) return Set.of();
+        Set<String> result = new LinkedHashSet<>();
+        for (Vertex neighbor : v.getVertices(dir, edgeTypes)) {
+            String f = neighbor.getString("fqn");
+            if (f != null) result.add(f);
+        }
+        return result;
+    }
+
+    private List<String> kgBfs(String startFqn, String vType, Vertex.DIRECTION dir, String[] edgeTypes) {
+        Set<String> visited = new LinkedHashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        queue.add(startFqn);
+        visited.add(startFqn);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            Vertex v = lookupKgVertex(current, vType);
+            if (v == null) continue;
+            for (Vertex n : v.getVertices(dir, edgeTypes)) {
+                String f = n.getString("fqn");
+                if (f != null && visited.add(f)) queue.add(f);
+            }
+        }
+        visited.remove(startFqn);
+        return new ArrayList<>(visited);
+    }
+
+    // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
@@ -323,6 +491,85 @@ public class CallGraph implements AutoCloseable {
         ResultSet rs = db.query("sql", "SELECT FROM Method WHERE fqn = ?", fqn);
         if (!rs.hasNext()) return null;
         return rs.next().getVertex().orElse(null);
+    }
+
+    private Vertex lookupKgVertex(String fqn, String vType) {
+        ResultSet rs = db.query("sql", "SELECT FROM " + vType + " WHERE fqn = ?", fqn);
+        if (!rs.hasNext()) return null;
+        return rs.next().getVertex().orElse(null);
+    }
+
+    private void flushCodeTypes() {
+        if (codeTypeBatch.isEmpty()) return;
+        db.begin();
+        for (String[] m : codeTypeBatch) {
+            ResultSet rs = db.query("sql", "SELECT @rid FROM CodeType WHERE fqn = ?", m[0]);
+            if (!rs.hasNext()) {
+                MutableVertex v = db.newVertex("CodeType");
+                v.set("fqn", m[0]);
+                v.set("classPrefix", m[1]);
+                v.save();
+            }
+        }
+        db.commit();
+        codeTypeBatch.clear();
+    }
+
+    private void flushCodeFields() {
+        if (codeFieldBatch.isEmpty()) return;
+        db.begin();
+        for (String[] f : codeFieldBatch) {
+            ResultSet rs = db.query("sql", "SELECT @rid FROM CodeField WHERE fqn = ?", f[0]);
+            if (!rs.hasNext()) {
+                MutableVertex v = db.newVertex("CodeField");
+                v.set("fqn",       f[0]);
+                v.set("ownerFqn",  f[1]);
+                v.set("fieldType", f[2]);
+                v.set("accessMod", f[3]);
+                v.save();
+            }
+        }
+        db.commit();
+        codeFieldBatch.clear();
+    }
+
+    private void flushKgEdges() {
+        if (kgEdgeBatch.isEmpty()) return;
+        db.begin();
+        for (String[] e : kgEdgeBatch) {
+            String edgeType = e[0], fromFqn = e[1], fromVType = e[2], toFqn = e[3], toVType = e[4];
+            try {
+                MutableVertex from = ensureKgVertex(fromFqn, fromVType);
+                MutableVertex to   = ensureKgVertex(toFqn,   toVType);
+                if (from != null && to != null) from.newEdge(edgeType, to, true);
+            } catch (Exception ex) {
+                log.debug("KG edge {} → {} ({}): {}", fromFqn, toFqn, edgeType, ex.getMessage());
+            }
+        }
+        db.commit();
+        kgEdgeBatch.clear();
+    }
+
+    private MutableVertex ensureKgVertex(String fqn, String vType) {
+        String sql = "SELECT FROM " + vType + " WHERE fqn = ?";
+        ResultSet rs = db.query("sql", sql, fqn);
+        if (rs.hasNext()) {
+            Vertex v = rs.next().getVertex().orElse(null);
+            if (v != null) return v.modify();
+        }
+        // Fall back to Method vertex for method FQNs in relational edges
+        if ("Method".equals(vType)) {
+            rs = db.query("sql", "SELECT FROM Method WHERE fqn = ?", fqn);
+            if (rs.hasNext()) {
+                Vertex v = rs.next().getVertex().orElse(null);
+                if (v != null) return v.modify();
+            }
+        }
+        MutableVertex v = db.newVertex(vType);
+        v.set("fqn", fqn);
+        v.set("classPrefix", "");
+        v.save();
+        return v;
     }
 
     @Override

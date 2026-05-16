@@ -2,10 +2,13 @@ package com.pharos.search;
 
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.graph.CallGraph;
+import com.pharos.search.SourceReader;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.search.pipeline.BordaMerger;
+import com.pharos.search.pipeline.UnifiedRetrievalStage;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderMerger;
 import com.pharos.search.pipeline.CrossEncoderReranker;
@@ -19,15 +22,25 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.util.BytesRef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Deque;
 import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -100,30 +113,49 @@ public class SearchEngine {
 
     private final LuceneIndexer luceneIndexer;
     private final ProjectRegistry registry;
+    private final KeywordSearchStrategy keywordStrategy;
+    private final VectorSearchStrategy  vectorStrategy;
+    private final EmbeddingProvider     embedder;
+    private final QueryClassifier queryClassifier;
+    private final ZeroResultAdvisor zeroResultAdvisor;
     private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
     private final List<PipelineDescriptor> pipelineDescriptors;
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
-        this(luceneIndexer, embedder, registry, new NoOpCrossEncoder());
+        this(luceneIndexer, embedder, registry, new NoOpCrossEncoder(), new DefaultQueryClassifier());
     }
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry, CrossEncoder crossEncoder) {
+        this(luceneIndexer, embedder, registry, crossEncoder, new DefaultQueryClassifier());
+    }
+
+    public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
+                        ProjectRegistry registry, CrossEncoder crossEncoder,
+                        QueryClassifier queryClassifier) {
         this.luceneIndexer = luceneIndexer;
-        this.registry = registry;
+        this.registry      = registry;
+        this.embedder      = embedder;
+        this.queryClassifier = queryClassifier;
 
         KeywordSearchStrategy kw  = new KeywordSearchStrategy();
+        this.keywordStrategy = kw;
         VectorSearchStrategy  vec = new VectorSearchStrategy(embedder);
+        this.vectorStrategy  = vec;
+        this.zeroResultAdvisor = new ZeroResultAdvisor(luceneIndexer, registry, kw);
 
-        KeywordRetrievalStage kwStage  = new KeywordRetrievalStage(kw);
-        VectorRetrievalStage  vecStage = new VectorRetrievalStage(vec);
-        BordaMerger           borda    = new BordaMerger();
-        CrossEncoderMerger    ceMerger         = new CrossEncoderMerger(crossEncoder);
-        CrossEncoderReranker  ceReranker       = new CrossEncoderReranker(crossEncoder);
-        DiversityReranker     diversityReranker = new DiversityReranker(0.5f);
+        KeywordRetrievalStage  kwStage       = new KeywordRetrievalStage(kw);
+        VectorRetrievalStage   vecStage      = new VectorRetrievalStage(vec);
+        UnifiedRetrievalStage  unifiedStage  = new UnifiedRetrievalStage(kw, embedder);
+        BordaMerger            borda         = new BordaMerger();
+        CrossEncoderMerger     ceMerger      = new CrossEncoderMerger(crossEncoder);
+        CrossEncoderReranker   ceReranker    = new CrossEncoderReranker(crossEncoder);
+        DiversityReranker      diversityReranker = new DiversityReranker(0.5f);
 
         Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
+        map.put(SearchRequest.SearchType.UNIFIED,
+                SearchPipeline.builder().retriever(unifiedStage).build());
         map.put(SearchRequest.SearchType.KEYWORD,
                 SearchPipeline.builder().retriever(kwStage).build());
         map.put(SearchRequest.SearchType.VECTOR,
@@ -165,6 +197,25 @@ public class SearchEngine {
         return pipelineDescriptors;
     }
 
+    /**
+     * Creates a {@link SnippetDecorator} backed by this engine's keyword analyzer.
+     * The decorator uses the same Lucene analysis chain as search-time query parsing,
+     * so stop-word removal and synonym expansion are consistent between query and body tokens.
+     *
+     * @param windowLines lines of context per snippet (clamped to [5, 50])
+     */
+    /** Creates a decorator with no resolver signal (for callers without a SearchResponse). */
+    public SnippetDecorator newSnippetDecorator(int windowLines) {
+        return new SnippetDecorator(windowLines, SnippetResolver.none(), SnippetResolver.none());
+    }
+
+    /** Creates a decorator with both keyword and vector position resolvers from a SearchResponse. */
+    public SnippetDecorator newSnippetDecorator(int windowLines, SearchResponse response) {
+        SnippetResolver kw  = response.keywordResolver()  != null ? response.keywordResolver()  : SnippetResolver.none();
+        SnippetResolver vec = response.vectorResolver() != null ? response.vectorResolver() : SnippetResolver.none();
+        return new SnippetDecorator(windowLines, kw, vec);
+    }
+
     public List<SearchResult> search(SearchRequest req) throws IOException {
         return search(req, false);
     }
@@ -202,31 +253,62 @@ public class SearchEngine {
         List<String> projects = resolveProjects(req);
         if (projects.isEmpty()) {
             log.warn("No indexed projects found. Run 'pharos index <path>' first.");
-            return new SearchResponse(List.of(), trace);
+            return new SearchResponse(List.of(), trace, req.type().name().toLowerCase(), null);
         }
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
-        SearchPipeline pipeline = pipelines.getOrDefault(req.type(),
+        SearchRequest.SearchType resolvedType = req.type();
+        if (resolvedType == SearchRequest.SearchType.AUTO) {
+            resolvedType = queryClassifier.classify(hints.cleanedQuery());
+            log.debug("AUTO classified '{}' → {}", hints.cleanedQuery(), resolvedType);
+        }
+        final String resolvedTypeName = resolvedType.name().toLowerCase();
+
+        // Query-type-adaptive candidate pool: when the caller hasn't set an explicit
+        // oversample factor, inject one based on the resolved query type and shape.
+        // Identifier/CamelCase queries have high BM25 precision — a large vector pool
+        // adds noise.  NL queries need broader vector recall.
+        // UNIFIED and VECTOR manage their own oversampling internally; leave them alone.
+        if (req.oversampleFactor() == 0) {
+            int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
+            if (adaptive > 0) {
+                req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+                log.debug("Adaptive oversample: type={} query='{}' factor={}",
+                        resolvedTypeName, hints.cleanedQuery(), adaptive);
+            }
+        }
+
+        SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
 
-        // Project-affinity boost: when the caller has scoped the search to a specific project,
-        // multiply scores of results from that project by PROJECT_AFFINITY_BOOST so they rank
-        // above cross-project hits that may have leaked in via neighborhood expansion or linked
-        // indexes. Applied after all strategy-level boosts (graph in-degree, source-path penalty)
-        // so the multipliers compose correctly.
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
 
-        if (!expand || primary.isEmpty()) {
-            return new SearchResponse(primary, trace);
+        if (primary.isEmpty()) {
+            ZeroResultAdvisor.Suggestions suggestions = zeroResultAdvisor.advise(req, projects);
+            return new SearchResponse(List.of(), trace, resolvedTypeName, suggestions, null, null);
+        }
+
+        // Build snippet resolvers lazily — called only for final results, not all candidates.
+        SnippetResolver kwResolver  = keywordStrategy.buildKeywordResolver(
+                keywordStrategy.buildQuery(new SearchRequest(
+                        hints.cleanedQuery(), resolvedType, req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())));
+        SnippetResolver vecResolver = embedder.isAvailable()
+                ? vectorStrategy.buildVectorResolver(reader, embedder.embed(hints.cleanedQuery()))
+                : SnippetResolver.none();
+
+        if (!expand) {
+            return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver);
         }
 
         long tExpand = System.currentTimeMillis();
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
-        return new SearchResponse(expanded, trace);
+        return new SearchResponse(expanded, trace, resolvedTypeName, null, kwResolver, vecResolver);
     }
 
     /**
@@ -461,6 +543,229 @@ public class SearchEngine {
         return null;
     }
 
+    /**
+     * Bulk lookup by FQN — opens the index once and fetches all requested methods/classes
+     * in a single {@link TermInSetQuery} pass.
+     *
+     * @param fqns bare FQNs (no project prefix) — methods or classes
+     * @return map from FQN to result; FQNs not found are absent from the map
+     */
+    public Map<String, SearchResult> getByFqns(List<String> fqns) throws IOException {
+        if (fqns.isEmpty()) return Map.of();
+
+        List<String> projects = registry.listAll().stream()
+                .map(ProjectMeta::getName).collect(Collectors.toList());
+        if (projects.isEmpty()) return Map.of();
+
+        IndexReader reader = luceneIndexer.openMultiReader(projects);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        // Build all "project:fqn" id candidates for TermInSetQuery
+        List<BytesRef> ids = new ArrayList<>();
+        for (String project : projects) {
+            for (String fqn : fqns) {
+                ids.add(new BytesRef(project + ":" + fqn));
+            }
+        }
+
+        int maxHits = fqns.size() * projects.size();
+        TopDocs hits = searcher.search(new TermInSetQuery(DocumentMapper.F_ID, ids), maxHits);
+
+        Map<String, SearchResult> result = new LinkedHashMap<>();
+        StoredFields storedFields = searcher.storedFields();
+        for (var sd : hits.scoreDocs) {
+            Document doc = storedFields.document(sd.doc);
+            SearchResult r = KeywordSearchStrategy.docToResult(doc, 1.0f, "exact");
+            String fqn = r.id().substring(r.project().length() + 1); // strip "project:" prefix
+            result.putIfAbsent(fqn, r); // first project match wins
+        }
+        return result;
+    }
+
+    /**
+     * Traverses the call graph in BFS order up to {@code depth} hops from {@code rootFqn},
+     * bulk-fetches method bodies for every visited node in one Lucene pass, and returns a
+     * flat node list (BFS order) with children FQNs attached.
+     *
+     * @param direction  {@code "callers"}, {@code "callees"}, or {@code "both"}
+     * @param maxBodyChars  body text is truncated to this length (0 = no truncation)
+     */
+    public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
+                                          int maxBodyChars) throws IOException {
+        List<CallGraph> graphs = openAllGraphs();
+        try {
+            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, direction, 50);
+
+            // Bulk-fetch bodies — one Lucene query for all visited FQNs.
+            Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()));
+
+            List<CallChainResult.ChainNode> nodes = bfs.fqnDepth().entrySet().stream()
+                    .sorted(Comparator.comparingInt(Map.Entry::getValue))
+                    .map(e -> {
+                        String       fqn      = e.getKey();
+                        int          nd       = e.getValue();
+                        SearchResult r        = bodies.get(fqn);
+                        List<String> children = bfs.fqnChildren().getOrDefault(fqn, List.of());
+                        String body = r != null ? r.body() : null;
+                        if (body != null && maxBodyChars > 0 && body.length() > maxBodyChars)
+                            body = body.substring(0, maxBodyChars) + "\n// ...";
+                        return new CallChainResult.ChainNode(
+                                fqn, r != null ? r.label() : fqn, nd,
+                                r != null ? r.signature() : null,
+                                r != null ? r.filePath() : null,
+                                r != null ? r.startLine() : 0,
+                                r != null ? r.endLine() : 0,
+                                body, children);
+                    })
+                    .collect(Collectors.toList());
+
+            return new CallChainResult(rootFqn, direction, depth,
+                    nodes.size(), bfs.truncated(), nodes);
+        } finally {
+            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared BFS infrastructure
+    // -------------------------------------------------------------------------
+
+    private record BfsResult(
+            Map<String, Integer>      fqnDepth,    // fqn → hop distance from root
+            Map<String, List<String>> fqnChildren, // fqn → neighbor FQNs at next depth
+            boolean truncated
+    ) {}
+
+    /** Opens an ArcadeDB call graph for every indexed project. Caller must close all returned graphs. */
+    private List<CallGraph> openAllGraphs() {
+        List<CallGraph> graphs = new ArrayList<>();
+        for (ProjectMeta meta : registry.listAll()) {
+            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            if (Files.isDirectory(dbDir)) {
+                try { graphs.add(CallGraph.open(dbDir)); } catch (Exception ignored) {}
+            }
+        }
+        return graphs;
+    }
+
+    /**
+     * BFS over the call graph starting from {@code rootFqn}.
+     * Deduplicates visited FQNs — each node appears once at its minimum depth.
+     *
+     * @param maxNodes hard cap on the total number of unique FQNs collected (including root)
+     */
+    private static BfsResult bfsCallGraph(List<CallGraph> graphs, String rootFqn,
+                                           int depth, String direction, int maxNodes) {
+        Map<String, Integer>      fqnDepth    = new LinkedHashMap<>();
+        Map<String, List<String>> fqnChildren = new LinkedHashMap<>();
+        Deque<String>             queue       = new ArrayDeque<>();
+        boolean                   truncated   = false;
+
+        fqnDepth.put(rootFqn, 0);
+        queue.add(rootFqn);
+
+        outer:
+        while (!queue.isEmpty()) {
+            String current      = queue.poll();
+            int    currentDepth = fqnDepth.get(current);
+            if (currentDepth >= depth) continue;
+
+            Set<String> neighbors = neighborsFromGraphs(graphs, current, direction);
+            List<String> children = new ArrayList<>(neighbors);
+            fqnChildren.put(current, children);
+
+            for (String neighbor : children) {
+                if (fqnDepth.containsKey(neighbor)) continue;
+                if (fqnDepth.size() >= maxNodes) { truncated = true; break outer; }
+                fqnDepth.put(neighbor, currentDepth + 1);
+                queue.add(neighbor);
+            }
+        }
+        return new BfsResult(fqnDepth, fqnChildren, truncated);
+    }
+
+    // -------------------------------------------------------------------------
+    // Transitive callers — lightweight impact-analysis variant (no body fetch)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Impact surface of changing {@code rootFqn}: all unique transitive callers up to
+     * {@code depth} hops, returned as a flat deduplicated set grouped by distance.
+     * Unlike {@link #traceCallChain}, this fetches no source bodies, allowing much
+     * larger traversals suitable for impact analysis on widely-used APIs.
+     *
+     * @param maxCallers cap on unique callers collected (default 2000)
+     */
+    public record TransitiveCallersResult(
+            String root,
+            int    maxDepth,
+            int    totalCallers,
+            boolean truncated,
+            List<Map.Entry<String, Integer>> callers  // fqn → depth, sorted by depth then fqn
+    ) {}
+
+    public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
+                                                          int maxCallers) throws IOException {
+        List<CallGraph> graphs = openAllGraphs();
+        try {
+            // +1 to include root in the cap budget, then exclude it from results
+            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, "callers",
+                    Math.max(1, maxCallers + 1));
+
+            List<Map.Entry<String, Integer>> callers = bfs.fqnDepth().entrySet().stream()
+                    .filter(e -> !e.getKey().equals(rootFqn))   // exclude root itself
+                    .sorted(Comparator.comparingInt(Map.Entry<String, Integer>::getValue)
+                            .thenComparing(Map.Entry::getKey))
+                    .collect(Collectors.toList());
+
+            return new TransitiveCallersResult(
+                    rootFqn, depth, callers.size(), bfs.truncated(), callers);
+        } finally {
+            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+        }
+    }
+
+    /**
+     * Returns an adaptive candidate-pool oversample factor based on query type and shape,
+     * or 0 to leave the pipeline's own default in place.
+     *
+     * <p>Rationale (Hornet / hybrid-search research):
+     * <ul>
+     *   <li><b>KEYWORD</b> — pure BM25; no vector candidates are fetched, so oversample = 1
+     *       (passing 1 is a no-op since the KEYWORD pipeline has no vector retriever).</li>
+     *   <li><b>HYBRID + CamelCase query</b> — BM25 precision is high for identifier queries;
+     *       a large vector pool introduces noise.  Use 1 = "no extra candidates beyond limit".</li>
+     *   <li><b>HYBRID + natural-language query</b> — semantic recall matters; keep the
+     *       standard 3× pool so the vector retriever can surface paraphrased matches.</li>
+     *   <li><b>VECTOR / UNIFIED / others</b> — these pipelines manage their own oversampling
+     *       internally; return 0 to leave them untouched.</li>
+     * </ul>
+     */
+    private static int adaptiveOversample(SearchRequest.SearchType resolvedType, String query) {
+        return switch (resolvedType) {
+            case KEYWORD -> 1;
+            case HYBRID  -> queryHasCamelCase(query) ? 1 : 3;
+            default      -> 0; // VECTOR, UNIFIED, HYBRID_* — handle internally
+        };
+    }
+
+    /** Returns true when the query contains at least one uppercase letter (CamelCase signal). */
+    private static boolean queryHasCamelCase(String query) {
+        return query != null && query.chars().anyMatch(Character::isUpperCase);
+    }
+
+    private static Set<String> neighborsFromGraphs(List<CallGraph> graphs,
+                                                    String fqn, String direction) {
+        Set<String> result = new LinkedHashSet<>();
+        for (CallGraph g : graphs) {
+            try {
+                if (!"callees".equals(direction)) result.addAll(g.callers(fqn));
+                if (!"callers".equals(direction)) result.addAll(g.callees(fqn));
+            } catch (Exception ignored) {}
+        }
+        return result;
+    }
+
     /** Find all methods that call the given FQN (reverse lookup via calledMethods field). */
     public List<SearchResult> findCallers(String calleeFqn, String project) throws IOException {
         SearchRequest req = SearchRequest.keyword("", project, 100);
@@ -522,5 +827,165 @@ public class SearchEngine {
                 .map(ProjectMeta::getName)
                 .filter(name -> luceneIndexer.indexExists(name))
                 .collect(Collectors.toList());
+    }
+
+    // -------------------------------------------------------------------------
+    // Knowledge-graph queries
+    // -------------------------------------------------------------------------
+
+    /**
+     * Result of a {@link #findUsages} call, grouping usages by kind.
+     * Lists contain FQNs (methods, classes, fields) or annotation names.
+     */
+    public record UsageResult(
+            String fqn,
+            List<String> callers,
+            List<String> subclasses,
+            List<String> superTypes,
+            List<String> fieldReaders,
+            List<String> fieldWriters,
+            List<String> annotatedWith,
+            List<String> methodsReturning,
+            List<String> methodsTaking
+    ) {}
+
+    /**
+     * Finds all usages of {@code fqn} across every kind of structural relationship
+     * stored in the knowledge graph.
+     *
+     * <p>Results are aggregated across all indexed projects' call graphs.
+     *
+     * @param kind  {@code "all"} | {@code "callers"} | {@code "subclasses"} |
+     *              {@code "field_readers"} | {@code "field_writers"} |
+     *              {@code "annotated"} | {@code "type_refs"}
+     */
+    public UsageResult findUsages(String fqn, String kind) throws IOException {
+        boolean all = "all".equals(kind);
+        List<String> callers        = new ArrayList<>();
+        List<String> subclasses     = new ArrayList<>();
+        List<String> superTypes     = new ArrayList<>();
+        List<String> fieldReaders   = new ArrayList<>();
+        List<String> fieldWriters   = new ArrayList<>();
+        List<String> annotatedWith  = new ArrayList<>();
+        List<String> returning      = new ArrayList<>();
+        List<String> taking         = new ArrayList<>();
+
+        List<CallGraph> graphs = openAllGraphs();
+        try {
+            for (CallGraph g : graphs) {
+                if (all || "callers".equals(kind))
+                    callers.addAll(g.callers(fqn));
+                if (all || "subclasses".equals(kind)) {
+                    subclasses.addAll(g.directSubclasses(fqn));
+                    superTypes.addAll(g.directSuperTypes(fqn));
+                }
+                if (all || "field_readers".equals(kind))
+                    fieldReaders.addAll(g.fieldReaders(fqn));
+                if (all || "field_writers".equals(kind))
+                    fieldWriters.addAll(g.fieldWriters(fqn));
+                if (all || "annotated".equals(kind))
+                    annotatedWith.addAll(g.annotatedWith(fqn));
+                if (all || "type_refs".equals(kind)) {
+                    returning.addAll(g.methodsReturning(fqn));
+                    taking.addAll(g.methodsTaking(fqn));
+                }
+            }
+        } finally {
+            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+        }
+
+        return new UsageResult(fqn, callers, subclasses, superTypes,
+                fieldReaders, fieldWriters, annotatedWith, returning, taking);
+    }
+
+    // -------------------------------------------------------------------------
+    // Class context
+    // -------------------------------------------------------------------------
+
+    /**
+     * Aggregated context for a single class: body, fields, constructors,
+     * public methods, and their direct callers — assembled in one call.
+     */
+    public record ClassContext(
+            SearchResult classResult,
+            String body,                                   // full source body from file
+            List<CallGraph.FieldInfo> fields,              // declared fields (from knowledge graph)
+            List<SearchResult> constructors,               // <init> method documents
+            List<SearchResult> publicMethods,              // public method documents
+            Map<String, List<String>> publicMethodCallers  // public method fqn → caller fqns (max 10 each)
+    ) {}
+
+    /**
+     * Fetches all context needed to understand a class in a single call.
+     * Opens the knowledge graph once for field data and once for caller lookups.
+     *
+     * @param classFqn qualified class name, e.g. {@code "com.example.AuthService"}
+     * @return fully assembled context, or null if the class is not indexed
+     */
+    public ClassContext getClassContext(String classFqn) throws IOException {
+        SearchResult cls = getClassByFqn(classFqn);
+        if (cls == null) return null;
+
+        // Full body from source file (same logic as MCP get_class)
+        String body = SourceReader.readRange(cls.filePath(), cls.startLine(), cls.endLine());
+        if (body == null) body = cls.body();
+
+        // All method documents for this class from Lucene
+        List<String> projects = resolveProjects(SearchRequest.keyword("", null, 100));
+        IndexReader reader = luceneIndexer.openMultiReader(projects);
+        IndexSearcher searcher = new IndexSearcher(reader);
+        BooleanQuery methodsQuery = new BooleanQuery.Builder()
+                .add(new TermQuery(new Term(DocumentMapper.F_QUALIFIED_CLASS, classFqn)),
+                        BooleanClause.Occur.MUST)
+                .add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, "method")),
+                        BooleanClause.Occur.MUST)
+                .build();
+        TopDocs hits = searcher.search(methodsQuery, 200);
+        List<SearchResult> allMethods = KeywordSearchStrategy.toResults(searcher, hits, "exact");
+
+        List<SearchResult> constructors  = new ArrayList<>();
+        List<SearchResult> publicMethods = new ArrayList<>();
+        for (SearchResult m : allMethods) {
+            if ("<init>".equals(m.methodName())) constructors.add(m);
+            else if ("public".equals(m.accessModifier()))  publicMethods.add(m);
+        }
+
+        // Fields from knowledge graph
+        List<CallGraph.FieldInfo> fields = new ArrayList<>();
+        List<CallGraph> kgGraphs = openAllGraphs();
+        try {
+            for (CallGraph g : kgGraphs) fields.addAll(g.getFieldsOf(classFqn));
+        } finally {
+            for (CallGraph g : kgGraphs) { try { g.close(); } catch (Exception ignored) {} }
+        }
+
+        // Callers for each public method (cap at 10 per method)
+        Map<String, List<String>> callerMap = new LinkedHashMap<>();
+        for (SearchResult m : publicMethods) {
+            String methodFqn = m.id().substring(m.project().length() + 1);
+            List<SearchResult> callers = findCallers(methodFqn, null);
+            if (!callers.isEmpty()) {
+                callerMap.put(methodFqn, callers.stream()
+                        .limit(10)
+                        .map(r -> r.id().substring(r.project().length() + 1))
+                        .collect(Collectors.toList()));
+            }
+        }
+
+        return new ClassContext(cls, body, fields, constructors, publicMethods, callerMap);
+    }
+
+    /**
+     * BFS over the inheritance graph returning all transitive subclasses of {@code classFqn}.
+     */
+    public List<String> getSubclassHierarchy(String classFqn) {
+        List<String> result = new ArrayList<>();
+        List<CallGraph> graphs = openAllGraphs();
+        try {
+            for (CallGraph g : graphs) result.addAll(g.allSubclasses(classFqn));
+        } finally {
+            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+        }
+        return result;
     }
 }

@@ -17,6 +17,10 @@ public record SearchRequest(
         int oversampleFactor   // 0 = use pipeline default; >0 overrides retriever fetch multiplier
 ) {
     public enum SearchType {
+        /** Automatically select KEYWORD or HYBRID based on query shape. Resolved by {@link QueryClassifier} before dispatch. */
+        AUTO,
+        /** Single BM25 pass with late-interaction vector similarity as a multiplicative boost — one unified result list. */
+        UNIFIED,
         KEYWORD, VECTOR, HYBRID,
         /** BordaMerge followed by cross-encoder reranking. Degrades to HYBRID when no encoder is configured. */
         HYBRID_RERANKED,
@@ -29,6 +33,8 @@ public record SearchRequest(
 
         public static SearchType from(String s) {
             return switch (s.toLowerCase()) {
+                case "unified"                                        -> UNIFIED;
+                case "auto"                                           -> AUTO;
                 case "keyword"                                        -> KEYWORD;
                 case "vector"                                         -> VECTOR;
                 case "hybrid"                                         -> HYBRID;
@@ -38,7 +44,7 @@ public record SearchRequest(
                 case "hybrid-diverse", "hybrid_diverse"               -> HYBRID_DIVERSE;
                 case "hybrid-reranked-diverse",
                      "hybrid_reranked_diverse"                        -> HYBRID_RERANKED_DIVERSE;
-                default -> HYBRID;
+                default -> AUTO;
             };
         }
     }

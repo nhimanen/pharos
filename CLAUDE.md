@@ -22,6 +22,14 @@ java -jar target/pharos-*.jar search <query>    # Keyword search
 java -jar target/pharos-*.jar mcp-server        # Start MCP server (stdio JSON-RPC)
 ```
 
+**Python CLI client:** `./pharos` at the project root is the primary user-facing CLI. It starts a background JVM daemon on first use and proxies all commands via the web API (avoids JVM cold-start). Always check/update `./pharos` when adding new commands or API parameters — the Java CLI and the Python client must stay in sync.
+
+```bash
+./pharos search "query"           # Uses auto type-classification by default
+./pharos search "query" --trace   # Shows pipeline trace (resolved type, stage timings)
+./pharos index /path/to/project   # Index via daemon
+```
+
 Config is stored in `~/.pharos/config.json`; project registry in `~/.pharos/registry.json`.
 
 ## Architecture

@@ -129,6 +129,12 @@ public class Main {
                 return (K) new CalleesCommand(searchEngine, registry, config);
             if (cls == GetClassCommand.class)
                 return (K) new GetClassCommand(searchEngine);
+            if (cls == UsagesCommand.class)
+                return (K) new UsagesCommand(searchEngine);
+            if (cls == TraceCallChainCommand.class)
+                return (K) new TraceCallChainCommand(searchEngine);
+            if (cls == TransitiveCallersCommand.class)
+                return (K) new TransitiveCallersCommand(searchEngine);
             if (cls == PathCommand.class)
                 return (K) new PathCommand(registry, config);
             if (cls == ProjectsCommand.class)

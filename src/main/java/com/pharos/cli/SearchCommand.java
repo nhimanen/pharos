@@ -4,6 +4,7 @@ import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResponse;
 import com.pharos.search.SearchResult;
+import com.pharos.search.Snippet;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import picocli.CommandLine.*;
@@ -26,8 +27,8 @@ public class SearchCommand implements Callable<Integer> {
     private String project;
 
     @Option(names = {"--type", "-t"},
-            description = "Search type: keyword | vector | hybrid (default: hybrid)",
-            defaultValue = "hybrid")
+            description = "Search type: auto | keyword | vector | hybrid | unified (default: auto)",
+            defaultValue = "auto")
     private String type;
 
     @Option(names = {"--limit", "-n"},
@@ -54,6 +55,15 @@ public class SearchCommand implements Callable<Integer> {
             defaultValue = "all")
     private String scope;
 
+    @Option(names = {"--trace"},
+            description = "Print pipeline trace (resolved type, stage timings) to stderr after results")
+    private boolean trace = false;
+
+    @Option(names = {"--snippet-lines"},
+            description = "Lines of source to include as snippet centred on best keyword/vector match (default: 15)",
+            defaultValue = "15")
+    private int snippetLines = 15;
+
     private final SearchEngine searchEngine;
 
     public SearchCommand(SearchEngine searchEngine) {
@@ -70,13 +80,10 @@ public class SearchCommand implements Callable<Integer> {
                     project, null, limit, format, resolvedDocType, resolvedScope, 0);
 
             SearchResponse response = searchEngine.searchWithTrace(req, expand);
-            List<SearchResult> results = response.results();
+            List<SearchResult> results = searchEngine
+                    .newSnippetDecorator(snippetLines, response)
+                    .decorate(response.results(), query);
             long elapsedMs = response.trace().totalMs();
-
-            boolean debug = false;
-            if (debug) {
-                System.err.println(response.trace().format());
-            }
 
             if (results.isEmpty()) {
                 System.out.printf("No results found for: %s  (%.3fs)%n", query, elapsedMs / 1000.0);
@@ -84,9 +91,18 @@ public class SearchCommand implements Callable<Integer> {
             }
 
             if ("json".equals(format)) {
-                printJson(results, elapsedMs);
+                printJson(results, elapsedMs, response);
             } else {
                 printText(results, elapsedMs);
+            }
+            if (trace) {
+                String requested = type;
+                String resolved  = response.resolvedType() != null ? response.resolvedType() : type;
+                String typeInfo  = resolved.equals(requested) ? requested : requested + " → " + resolved;
+                System.err.printf("%n[trace] type=%-20s total=%dms%n", typeInfo, elapsedMs);
+                for (var span : response.trace().spans()) {
+                    System.err.printf("[trace]   %-28s %dms%n", span.name(), span.durationMs());
+                }
             }
             return 0;
         } catch (Exception e) {
@@ -134,8 +150,19 @@ public class SearchCommand implements Callable<Integer> {
                 String javadoc = r.javadoc().length() > 120 ? r.javadoc().substring(0, 120) + "..." : r.javadoc();
                 System.out.printf("   /** %s */%n", javadoc.replaceAll("\\s+", " ").trim());
             }
-            System.out.printf("   %s:%d-%d (score: %.4f)%n%n",
-                    r.filePath(), r.startLine(), r.endLine(), r.score());
+            // Show snippet location — prefer precise snippet range over full method range
+            Snippet snip = r.snippet();
+            if (snip != null && snip.text() != null && !snip.text().isBlank()) {
+                System.out.printf("   %s:%d-%d (score: %.4f)%n",
+                        r.filePath(), snip.startLine(), snip.endLine(), r.score());
+                for (String line : snip.text().split("\n")) {
+                    System.out.printf("   %s%n", line);
+                }
+                System.out.println();
+            } else {
+                System.out.printf("   %s:%d-%d (score: %.4f)%n%n",
+                        r.filePath(), r.startLine(), r.endLine(), r.score());
+            }
             boolean showBody = false;
             if (showBody && r.body() != null) {
                 System.out.println("   " + r.body().replace("\n", "\n   "));
@@ -144,14 +171,37 @@ public class SearchCommand implements Callable<Integer> {
         }
     }
 
-    private void printJson(List<SearchResult> results, long elapsedMs) throws Exception {
-        ObjectMapper mapper = new ObjectMapper()
-                .enable(SerializationFeature.INDENT_OUTPUT);
+    private void printJson(List<SearchResult> results, long elapsedMs, SearchResponse response) throws Exception {
+        ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         long primaryCount = results.stream().filter(r -> !"related".equals(r.searchType())).count();
         var envelope = mapper.createObjectNode()
                 .put("total", primaryCount)
                 .put("latencyMs", elapsedMs);
-        envelope.set("results", mapper.valueToTree(results));
+        if (trace) {
+            String resolved = response.resolvedType() != null ? response.resolvedType() : type;
+            var meta = envelope.putObject("searchMeta");
+            meta.put("requestedType", type);
+            meta.put("resolvedType", resolved);
+            meta.put("totalMs", elapsedMs);
+            var stages = meta.putArray("stages");
+            for (var span : response.trace().spans()) {
+                stages.addObject().put("name", span.name()).put("ms", span.durationMs());
+            }
+        }
+        // Enrich results with snippet fields before serialisation
+        var resultArray = mapper.createArrayNode();
+        for (SearchResult r : results) {
+            var node = mapper.valueToTree(r);
+            Snippet snip = r.snippet();
+            if (snip != null) {
+                ((com.fasterxml.jackson.databind.node.ObjectNode) node)
+                        .put("snippet",          snip.text())
+                        .put("snippetStartLine", snip.startLine())
+                        .put("snippetEndLine",   snip.endLine());
+            }
+            resultArray.add(node);
+        }
+        envelope.set("results", resultArray);
         System.out.println(mapper.writeValueAsString(envelope));
     }
 }

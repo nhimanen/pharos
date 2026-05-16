@@ -47,6 +47,13 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
     /** One cached temp-file path per classpath resource name. */
     private static final Map<String, Path> SCRIPT_CACHE = new ConcurrentHashMap<>();
 
+    /**
+     * Field declarations collected during the most recent {@link #parsedFilesFromJson} call.
+     * Populated by {@link #mapClass} and consumed by {@link #buildRelationships}.
+     * Cleared at the start of each {@link #parsedFilesFromJson} invocation.
+     */
+    private final List<ParsedRelationships.FieldDecl> collectedFields = new ArrayList<>();
+
     // -------------------------------------------------------------------------
     // Abstract contract
     // -------------------------------------------------------------------------
@@ -120,6 +127,7 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
     // -------------------------------------------------------------------------
 
     private List<ParsedFile> mapJson(String json, String projectName) throws IOException {
+        collectedFields.clear(); // reset before each parse batch
         JsonNode array;
         try {
             array = MAPPER.readTree(json);
@@ -206,11 +214,27 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
         int start = cls.path("start").asInt(0);
         int end   = cls.path("end").asInt(0);
 
+        // JS/TS extractor emits an explicit "interfaces" key for `implements` clauses;
+        // Python puts all bases in "bases" (no implements/extends distinction).
+        JsonNode ifaceNode = cls.path("interfaces");
+        List<String> interfaces = (!ifaceNode.isMissingNode() && ifaceNode.isArray())
+                ? jsonStringList(ifaceNode)
+                : (bases.size() > 1 ? bases.subList(1, bases.size()) : List.of());
+
+        // Collect field declarations emitted by the extractor
+        for (JsonNode field : cls.path("fields")) {
+            String fieldName = field.path("name").asText(null);
+            if (fieldName == null || fieldName.isBlank()) continue;
+            String fieldType = field.path("type").isNull() ? null : field.path("type").asText(null);
+            String fieldFqn  = qualified + "#" + fieldName;
+            collectedFields.add(new ParsedRelationships.FieldDecl(fieldFqn, qualified, fieldType, ""));
+        }
+
         return new ParsedClass(
                 projectName, pkg, name, qualified,
                 "class",
                 bases.isEmpty() ? null : bases.get(0),
-                bases.size() > 1 ? bases.subList(1, bases.size()) : List.of(),
+                interfaces,
                 decorators,
                 "public", false, false,
                 docstring, filePath, start, end);
@@ -339,6 +363,46 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
                 return null;
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Relationship extraction (best-effort from parsed data — no re-parsing)
+    // -------------------------------------------------------------------------
+
+    @Override
+    public ParsedRelationships buildRelationships(ParsedProject project) {
+        List<ParsedRelationships.TypeEdge> inherits        = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge> implementsEdges = new ArrayList<>();
+        List<ParsedRelationships.TypeEdge> annotatedBy     = new ArrayList<>();
+
+        for (ParsedFile file : project.files()) {
+            for (ParsedClass cls : file.classes()) {
+                String clsFqn = cls.qualifiedClassName();
+                if (cls.superclass() != null && !cls.superclass().isBlank()) {
+                    inherits.add(new ParsedRelationships.TypeEdge(clsFqn, cls.superclass()));
+                }
+                for (String iface : cls.interfaces()) {
+                    if (!iface.isBlank())
+                        implementsEdges.add(new ParsedRelationships.TypeEdge(clsFqn, iface));
+                }
+                for (String ann : cls.annotations()) {
+                    if (!ann.isBlank())
+                        annotatedBy.add(new ParsedRelationships.TypeEdge(clsFqn, ann));
+                }
+            }
+            for (ParsedMethod method : file.methods()) {
+                for (String ann : method.annotations()) {
+                    if (!ann.isBlank())
+                        annotatedBy.add(new ParsedRelationships.TypeEdge(method.fqn(), ann));
+                }
+            }
+        }
+
+        return new ParsedRelationships(project.projectName(),
+                inherits, implementsEdges,
+                new ArrayList<>(collectedFields),  // snapshot of fields collected during parsing
+                List.of(), List.of(),              // no field reads/writes (dynamic dispatch)
+                List.of(), List.of(), annotatedBy);
     }
 
     // -------------------------------------------------------------------------

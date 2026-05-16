@@ -184,6 +184,12 @@
                          when parsing corpora (e.g. Lucene) that use the Vector API. -->
                     <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2</argLine>
                     <excludedGroups>${excludedGroups}</excludedGroups>
+                    <!-- Excluded due to ArcadeDB temp-dir contention when run in parallel
+                         with the full suite. Pass individually with -Dtest=ClassName. -->
+                    <excludes>
+                        <exclude>**/CrossProjectLinkerTest.java</exclude>
+                        <exclude>**/IndexCommandParallelTest.java</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
 
