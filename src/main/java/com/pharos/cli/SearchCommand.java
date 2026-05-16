@@ -67,7 +67,7 @@ public class SearchCommand implements Callable<Integer> {
             String resolvedScope   = "all".equalsIgnoreCase(scope)   ? null : scope;
             SearchRequest req = new SearchRequest(
                     query, SearchRequest.SearchType.from(type),
-                    project, null, limit, format, resolvedDocType, resolvedScope);
+                    project, null, limit, format, resolvedDocType, resolvedScope, 0);
 
             SearchResponse response = searchEngine.searchWithTrace(req, expand);
             List<SearchResult> results = response.results();

@@ -166,7 +166,7 @@ public class McpToolRegistry {
         if (project != null && project.isEmpty()) project = null;
 
         SearchRequest req = new SearchRequest(
-                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope);
+                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope, 0);
         SearchResponse response = searchEngine.searchWithTrace(req, expand);
         List<SearchResult> results = response.results();
         if (log.isDebugEnabled()) {

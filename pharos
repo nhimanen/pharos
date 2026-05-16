@@ -491,6 +491,8 @@ def cmd_search(args):
         params["docType"] = args.doc_type
     if args.expand:
         params["expand"] = "true"
+    if getattr(args, "oversample", 0) > 0:
+        params["oversample"] = args.oversample
     results = _api_get("/api/search", params)
     print(fmt_search(results))
 
@@ -793,6 +795,8 @@ EXAMPLES
     )
     p_search.add_argument("--expand", action="store_true",
                           help="Append callee methods of top-3 hits as related results")
+    p_search.add_argument("--oversample", type=int, default=0, metavar="N",
+                          help="Retriever fetch multiplier (e.g. 3 = fetch 3× candidates before merge/rerank). 0 = pipeline default")
     p_search.set_defaults(func=cmd_search)
 
     # method

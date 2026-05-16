@@ -9,6 +9,7 @@ import com.pharos.search.pipeline.BordaMerger;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderMerger;
 import com.pharos.search.pipeline.CrossEncoderReranker;
+import com.pharos.search.pipeline.DiversityReranker;
 import com.pharos.search.pipeline.KeywordRetrievalStage;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import com.pharos.search.pipeline.PipelineDescriptor;
@@ -118,8 +119,9 @@ public class SearchEngine {
         KeywordRetrievalStage kwStage  = new KeywordRetrievalStage(kw);
         VectorRetrievalStage  vecStage = new VectorRetrievalStage(vec);
         BordaMerger           borda    = new BordaMerger();
-        CrossEncoderMerger    ceMerger   = new CrossEncoderMerger(crossEncoder);
-        CrossEncoderReranker  ceReranker = new CrossEncoderReranker(crossEncoder);
+        CrossEncoderMerger    ceMerger         = new CrossEncoderMerger(crossEncoder);
+        CrossEncoderReranker  ceReranker       = new CrossEncoderReranker(crossEncoder);
+        DiversityReranker     diversityReranker = new DiversityReranker(0.5f);
 
         Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
         map.put(SearchRequest.SearchType.KEYWORD,
@@ -132,6 +134,10 @@ public class SearchEngine {
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(borda).reranker(ceReranker).build());
         map.put(SearchRequest.SearchType.HYBRID_CROSS_ENCODER_MERGE,
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(ceMerger).build());
+        map.put(SearchRequest.SearchType.HYBRID_DIVERSE,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).build());
+        map.put(SearchRequest.SearchType.HYBRID_RERANKED_DIVERSE,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).reranker(ceReranker).build());
         this.pipelines = Map.copyOf(map);
 
         boolean vecAvailable = embedder.isAvailable();
@@ -145,8 +151,12 @@ public class SearchEngine {
                     "Borda-count fusion of keyword and vector results with agreement bonus", true),
             new PipelineDescriptor("hybrid-reranked","Hybrid + Reranker",
                     "Hybrid fusion followed by cross-encoder reranking over the merged list", ceAvailable),
-            new PipelineDescriptor("hybrid-ce-merge","CE Merge",
-                    "Cross-encoder scores all deduplicated candidates and acts as the merge step", ceAvailable)
+            new PipelineDescriptor("hybrid-ce-merge",          "CE Merge",
+                    "Cross-encoder scores all deduplicated candidates and acts as the merge step", ceAvailable),
+            new PipelineDescriptor("hybrid-diverse",           "Hybrid + Diversity",
+                    "Hybrid fusion with doc-type diversity reranking to balance method/class/chunk results", true),
+            new PipelineDescriptor("hybrid-reranked-diverse",  "Hybrid + CE + Diversity",
+                    "Cross-encoder reranking followed by doc-type diversity reranking", ceAvailable)
         );
     }
 
@@ -184,7 +194,7 @@ public class SearchEngine {
         QueryHints hints = parseQueryHints(req.query(), knownProjects);
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
-                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope());
+                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor());
             log.debug("Query rewritten: '{}' → project={} lang={} query='{}'",
                     hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
         }

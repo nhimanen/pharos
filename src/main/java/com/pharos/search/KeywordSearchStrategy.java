@@ -14,9 +14,11 @@ import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.*;
+import org.apache.lucene.search.similarities.BasicStats;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
 import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.search.similarities.SimilarityBase;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,11 +53,11 @@ import java.util.stream.Collectors;
  * - access=package-private:  ×0.75
  * - access=private:           ×0.5
  *
- * Per-field BM25 parameters (via PerFieldSimilarityWrapper):
- * - methodName, className: k1=0.5, b=0.0  — short identifier fields; no length norm,
- *   low TF saturation (one occurrence is enough)
- * - javadoc, signature, callerContext: k1=1.0, b=0.5  — medium-length text
- * - body, annotations: k1=1.2, b=0.9  — long fields; aggressive length norm so long
+ * Per-field similarity (via PerFieldSimilarityWrapper):
+ * - methodName, className, signature: IDF-only — identifier-heavy fields; presence of the
+ *   term is what matters, not frequency or field length
+ * - javadoc, callerContext: BM25 k1=1.0, b=0.5  — natural-language-ish text
+ * - body, annotations: BM25 k1=1.2, b=0.9  — long fields; aggressive length norm so long
  *   implementations don't beat short, focused methods
  */
 public class KeywordSearchStrategy {
@@ -110,14 +112,21 @@ public class KeywordSearchStrategy {
     };
 
     /**
-     * Per-field BM25 similarities. Different k1/b values reflect how each field
-     * behaves as a retrieval signal for code:
-     * - identifier fields (methodName, className): short, uniform length → b=0, low k1
-     * - text fields (javadoc, signature): moderate length → standard params
-     * - body: long, highly variable → aggressive length normalization (high b)
+     * IDF-only similarity for identifier fields (methodName, className).
+     * Score = log((N+1)/(df+1)) + 1 — purely how rare/specific the term is in the corpus.
+     * Term frequency and field length are ignored: one occurrence is as good as ten,
+     * and a short class name is not penalized against a long one.
      */
+    private static final class IdfOnlySimilarity extends SimilarityBase {
+        @Override
+        public double score(BasicStats stats, double freq, double docLen) {
+            return Math.log((stats.getNumberOfDocuments() + 1.0) / (stats.getDocFreq() + 1.0)) + 1.0;
+        }
+        @Override public String toString() { return "IDF"; }
+    }
+
     private static final Similarity PER_FIELD_SIMILARITY = new PerFieldSimilarityWrapper() {
-        private final BM25Similarity idSim   = new BM25Similarity(0.5f, 0.0f);
+        private final Similarity     idSim   = new IdfOnlySimilarity();
         private final BM25Similarity textSim = new BM25Similarity(1.0f, 0.5f);
         private final BM25Similarity bodySim = new BM25Similarity(1.2f, 0.9f);
 
@@ -125,9 +134,9 @@ public class KeywordSearchStrategy {
         public Similarity get(String field) {
             return switch (field) {
                 case DocumentMapper.F_METHOD_NAME,
-                     DocumentMapper.F_CLASS_NAME   -> idSim;
+                     DocumentMapper.F_CLASS_NAME,
+                     DocumentMapper.F_SIGNATURE     -> idSim;
                 case DocumentMapper.F_JAVADOC,
-                     DocumentMapper.F_SIGNATURE,
                      DocumentMapper.F_CALLER_CONTEXT -> textSim;
                 default                            -> bodySim;
             };
@@ -348,8 +357,9 @@ public class KeywordSearchStrategy {
                 .map(hit -> {
                     int inDeg = getInt(hit.doc(), DocumentMapper.F_IN_DEGREE);
                     float normBoost = (float) (Math.log1p(inDeg) / Math.log1p(maxDeg));
-                    float penalty    = sourcePathPenalty(hit.doc().get(DocumentMapper.F_FILE_PATH));
-                    float typeBonus  = docTypeBonus(hit.doc().get(DocumentMapper.F_DOC_TYPE));
+                    String filePath  = hit.doc().get(DocumentMapper.F_FILE_PATH);
+                    float penalty    = sourcePathPenalty(filePath);
+                    float typeBonus  = docTypeBonus(hit.doc().get(DocumentMapper.F_DOC_TYPE), filePath);
                     float accessMult = accessMultiplier(hit.doc().get(DocumentMapper.F_ACCESS));
                     float boostedScore = hit.rawScore()
                             * (1.0f + GRAPH_BOOST_WEIGHT * normBoost)
@@ -401,9 +411,13 @@ public class KeywordSearchStrategy {
      * Applied on top of BM25 so a class whose name matches the query always
      * ranks above individual methods in that class for the same BM25 score.
      */
-    static float docTypeBonus(String docType) {
-        if ("class".equals(docType)) return 1.8f;
-        return 1.0f;
+    static float docTypeBonus(String docType, String filePath) {
+        if (!"class".equals(docType)) return 1.0f;
+        if (filePath != null) {
+            String p = filePath.replace('\\', '/');
+            if (p.contains("/src/test/") || p.contains("/test/")) return 1.0f; // test classes don't get class bonus
+        }
+        return 1.8f;
     }
 
     /**

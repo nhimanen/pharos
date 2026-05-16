@@ -23,8 +23,15 @@ import org.apache.lucene.index.Term;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
@@ -287,7 +294,7 @@ public class ProjectIndexManager {
 
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
-            indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress);
+            indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir);
             writer.commit();
         }
 
@@ -397,87 +404,113 @@ public class ProjectIndexManager {
                 progress.onProgress("Removing deleted files", ++doneWork, totalWork);
             }
 
-            // Pass 1: delete stale docs and parse all dirty files.
-            // Collect embedding texts per file (no ONNX yet) so we can embed in one global batch.
+            // Pass 1: delete stale docs and parse all dirty files; spool embedding texts to disk.
             boolean doEmbed = generateEmbeddings && embedder.isAvailable();
-            List<String> allIncrementalTexts = doEmbed ? new ArrayList<>() : List.of();
-            List<Integer> fileTextStarts = new ArrayList<>();     // offset in allIncrementalTexts per parsed file
+            int dims = embedder.dimensions();
+            List<Integer> fileSlotStarts = new ArrayList<>();  // slot offset per parsed file
             List<List<String>> parsedSynthBodies = new ArrayList<>();
 
-            for (Path file : dirtyFiles) {
-                writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH, file.toAbsolutePath().toString()));
-                CodeParser fileParser = parserFor(file);
-                if (fileParser == null) {
-                    log.debug("No parser for {}, skipping", file.getFileName());
-                    continue;
-                }
-                try {
-                    ParsedFile parsedFile = fileParser.parseFile(file, projectName);
-                    parsedDirtyFiles.add(parsedFile);
-
-                    Map<String, List<ParsedMethod>> methodsByClass = parsedFile.methods().stream()
-                            .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
-                    List<String> synthBodies = parsedFile.classes().stream()
-                            .map(cls -> buildSynthesizedBody(
-                                    methodsByClass.getOrDefault(cls.qualifiedClassName(), List.of())))
-                            .collect(Collectors.toList());
-                    parsedSynthBodies.add(synthBodies);
-
-                    if (doEmbed) {
-                        fileTextStarts.add(allIncrementalTexts.size());
-                        for (ParsedMethod m : parsedFile.methods()) {
-                            allIncrementalTexts.add(DocumentMapper.buildEmbeddingText(m));
+            Path spoolPath = projectIndexDir.resolve("embed-incr.spool");
+            Path cachePath = projectIndexDir.resolve("embed-incr.cache");
+            try {
+                int totalSlots = 0;
+                try (DataOutputStream spool = doEmbed
+                        ? new DataOutputStream(new BufferedOutputStream(
+                                Files.newOutputStream(spoolPath), 1 << 16))
+                        : null) {
+                    for (Path file : dirtyFiles) {
+                        writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH,
+                                file.toAbsolutePath().toString()));
+                        CodeParser fileParser = parserFor(file);
+                        if (fileParser == null) {
+                            log.debug("No parser for {}, skipping", file.getFileName());
+                            continue;
                         }
-                        for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
-                            allIncrementalTexts.add(DocumentMapper.buildClassEmbeddingText(
-                                    parsedFile.classes().get(ci), synthBodies.get(ci)));
+                        try {
+                            ParsedFile parsedFile = fileParser.parseFile(file, projectName);
+                            parsedDirtyFiles.add(parsedFile);
+
+                            Map<String, List<ParsedMethod>> methodsByClass = parsedFile.methods().stream()
+                                    .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
+                            List<String> synthBodies = parsedFile.classes().stream()
+                                    .map(cls -> buildSynthesizedBody(
+                                            methodsByClass.getOrDefault(cls.qualifiedClassName(), List.of())))
+                                    .collect(Collectors.toList());
+                            parsedSynthBodies.add(synthBodies);
+
+                            fileSlotStarts.add(totalSlots);
+                            if (doEmbed) {
+                                for (ParsedMethod m : parsedFile.methods()) {
+                                    spoolWrite(spool, DocumentMapper.buildEmbeddingText(m));
+                                    totalSlots++;
+                                }
+                                for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
+                                    spoolWrite(spool, DocumentMapper.buildClassEmbeddingText(
+                                            parsedFile.classes().get(ci), synthBodies.get(ci)));
+                                    totalSlots++;
+                                }
+                            }
+                        } catch (Exception e) {
+                            log.warn("Failed to parse {}: {}", file, e.getMessage());
                         }
-                    } else {
-                        fileTextStarts.add(0);
                     }
-                } catch (Exception e) {
-                    log.warn("Failed to parse {}: {}", file, e.getMessage());
-                }
-            }
-
-            // Pass 2: embed all dirty-file texts in one global chunked ONNX pass.
-            final float[][] incrementalEmbeddings;
-            if (doEmbed && !allIncrementalTexts.isEmpty()) {
-                int totalChunks = (allIncrementalTexts.size() + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
-                incrementalEmbeddings = embedder.embedChunked(allIncrementalTexts, EMBED_CHUNK_SIZE,
-                        done -> progress.onProgress("Embedding", done, totalChunks));
-            } else {
-                incrementalEmbeddings = new float[0][];
-            }
-
-            // Pass 3: write Lucene documents using pre-computed embeddings.
-            for (int i = 0; i < parsedDirtyFiles.size(); i++) {
-                ParsedFile parsedFile = parsedDirtyFiles.get(i);
-                List<String> synthBodies = parsedSynthBodies.get(i);
-                int offset = fileTextStarts.get(i);
-
-                for (int mi = 0; mi < parsedFile.methods().size(); mi++) {
-                    ParsedMethod method = parsedFile.methods().get(mi);
-                    float[] embedding = (offset + mi < incrementalEmbeddings.length)
-                            ? incrementalEmbeddings[offset + mi] : null;
-                    writer.addDocument(DocumentMapper.toDocument(method, embedding));
-                }
-                int classOffset = parsedFile.methods().size();
-                for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
-                    ParsedClass cls = parsedFile.classes().get(ci);
-                    float[] embedding = (offset + classOffset + ci < incrementalEmbeddings.length)
-                            ? incrementalEmbeddings[offset + classOffset + ci] : null;
-                    writer.addDocument(DocumentMapper.toClassDocument(cls, synthBodies.get(ci), embedding));
                 }
 
-                List<String> classNames = parsedFile.classes().stream()
-                        .map(ParsedClass::qualifiedClassName)
-                        .collect(Collectors.toList());
-                stateTracker.track(Path.of(parsedFile.filePath()), classNames);
-                log.debug("Re-indexed {}", parsedFile.filePath());
-                progress.onProgress("Indexing", ++doneWork, totalWork);
+                // Pass 2: stream spool through ONNX in chunks, write embedding cache.
+                if (doEmbed && totalSlots > 0) {
+                    int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+                    try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
+                                 Files.newInputStream(spoolPath), 1 << 16));
+                         DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
+                                 Files.newOutputStream(cachePath), 1 << 16))) {
+                        int chunksDone = 0;
+                        int slot = 0;
+                        while (slot < totalSlots) {
+                            int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
+                            List<String> chunk = new ArrayList<>(end - slot);
+                            for (int i = slot; i < end; i++) chunk.add(spoolRead(spool));
+                            float[][] embeddings = embedder.embedBatch(chunk);
+                            for (int i = 0; i < embeddings.length; i++) cacheWrite(cache, embeddings[i], dims);
+                            slot = end;
+                            progress.onProgress("Embedding", ++chunksDone, totalChunks);
+                        }
+                    }
+                }
+
+                // Pass 3: write Lucene documents reading embeddings from cache.
+                FileChannel cacheChannel = (doEmbed && totalSlots > 0)
+                        ? FileChannel.open(cachePath, StandardOpenOption.READ) : null;
+                try {
+                    for (int i = 0; i < parsedDirtyFiles.size(); i++) {
+                        ParsedFile parsedFile = parsedDirtyFiles.get(i);
+                        List<String> synthBodies = parsedSynthBodies.get(i);
+                        int slotCount = parsedFile.methods().size() + parsedFile.classes().size();
+                        float[][] embs = readCachedEmbeddings(cacheChannel, fileSlotStarts.get(i), slotCount, dims);
+
+                        for (int mi = 0; mi < parsedFile.methods().size(); mi++) {
+                            writer.addDocument(DocumentMapper.toDocument(
+                                    parsedFile.methods().get(mi), embs[mi]));
+                        }
+                        int classOff = parsedFile.methods().size();
+                        for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
+                            writer.addDocument(DocumentMapper.toClassDocument(
+                                    parsedFile.classes().get(ci), synthBodies.get(ci), embs[classOff + ci]));
+                        }
+
+                        List<String> classNames = parsedFile.classes().stream()
+                                .map(ParsedClass::qualifiedClassName).collect(Collectors.toList());
+                        stateTracker.track(Path.of(parsedFile.filePath()), classNames);
+                        log.debug("Re-indexed {}", parsedFile.filePath());
+                        progress.onProgress("Indexing", ++doneWork, totalWork);
+                    }
+                } finally {
+                    if (cacheChannel != null) cacheChannel.close();
+                }
+                writer.commit();
+            } finally {
+                Files.deleteIfExists(spoolPath);
+                Files.deleteIfExists(cachePath);
             }
-            writer.commit();
         }
 
         stateTracker.save();
@@ -512,121 +545,239 @@ public class ProjectIndexManager {
         return meta;
     }
 
+    /**
+     * Indexes a parsed project into Lucene using a streaming spool/cache pattern to
+     * bound heap usage regardless of project size.
+     *
+     * <p>Three sequential phases:
+     * <ol>
+     *   <li>Spool — write every embedding text to {@code embed.spool} (length-prefixed bytes);
+     *       only {@code int[] fileOffsets} kept in RAM.</li>
+     *   <li>Embed — stream spool in chunks of {@value #EMBED_CHUNK_SIZE}, batch-embed each chunk,
+     *       write float arrays to {@code embed.cache} (fixed-size slots seekable by index).</li>
+     *   <li>Write — read embeddings from cache per file (one range-read), write Lucene docs;
+     *       safe to parallelise because {@link FileChannel} reads are thread-safe.</li>
+     * </ol>
+     * Both temp files are deleted in a {@code finally} block even on error or OOM.
+     */
     private void indexProject(IndexWriter writer, ParsedProject project,
                                FileStateTracker stateTracker, boolean generateEmbeddings,
-                               GraphIndexData graphData, ProgressListener progress) throws IOException {
+                               GraphIndexData graphData, ProgressListener progress,
+                               Path projectIndexDir) throws IOException {
         int indexThreads = config.resolvedIndexThreads();
         List<ParsedFile> files = project.files();
         int totalFiles = files.size();
-        log.debug("Indexing with {} thread(s)", indexThreads);
+        int dims = embedder.dimensions();
+        log.debug("Indexing {} files with {} thread(s)", totalFiles, indexThreads);
 
-        // Build method lookup per class for synthesized class bodies (read-only after construction)
         Map<String, List<ParsedMethod>> methodsByClass = project.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
         ConcurrentHashMap<String, String> synthesizedBodyCache = new ConcurrentHashMap<>();
 
-        // Phase 1: collect synthesized bodies and embedding texts for every file without
-        // touching ONNX.  Per-file texts occupy a contiguous slice of allTexts:
-        //   methods at [fileOffsets[fi], fileOffsets[fi] + file.methods().size())
-        //   classes  at [fileOffsets[fi] + file.methods().size(), fileOffsets[fi+1])
         boolean doEmbed = generateEmbeddings && embedder.isAvailable();
-        List<String> allTexts = doEmbed ? new ArrayList<>() : List.of();
         int[] fileOffsets = new int[totalFiles];
         List<List<String>> fileSynthBodies = new ArrayList<>(totalFiles);
 
-        for (int fi = 0; fi < totalFiles; fi++) {
-            ParsedFile file = files.get(fi);
-            List<String> synthBodies = file.classes().stream()
-                    .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                            cls.qualifiedClassName(),
-                            k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
-                    .collect(Collectors.toList());
-            fileSynthBodies.add(synthBodies);
-
+        Path spoolPath = projectIndexDir.resolve("embed.spool");
+        Path cachePath = projectIndexDir.resolve("embed.cache");
+        try {
+            // Phase 1: build synth bodies and spool all embedding texts to disk.
+            // Only fileOffsets[] (one int per file) stays in heap — texts go straight to disk.
+            int totalSlots = 0;
             if (doEmbed) {
-                fileOffsets[fi] = allTexts.size();
-                for (ParsedMethod m : file.methods()) {
-                    allTexts.add(DocumentMapper.buildEmbeddingText(m));
-                }
-                for (int ci = 0; ci < file.classes().size(); ci++) {
-                    allTexts.add(DocumentMapper.buildClassEmbeddingText(
-                            file.classes().get(ci), synthBodies.get(ci)));
-                }
-            }
-        }
-
-        // Phase 2: single global ONNX pass with length-sorted chunking.
-        // Large batches amortise JNI + session overhead; sorting groups similar-length sequences
-        // together so padding waste within each chunk is minimised.
-        final float[][] globalEmbeddings;
-        if (doEmbed && !allTexts.isEmpty()) {
-            int totalChunks = (allTexts.size() + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
-            globalEmbeddings = embedder.embedChunked(allTexts, EMBED_CHUNK_SIZE,
-                    done -> progress.onProgress("Embedding", done, totalChunks));
-        } else {
-            globalEmbeddings = new float[0][];
-        }
-
-        // Phase 3: write Lucene documents — no ONNX here, safe to parallelise freely.
-        AtomicInteger doneFiles = new AtomicInteger(0);
-        AtomicInteger totalMethods = new AtomicInteger(0);
-
-        if (indexThreads <= 1) {
-            for (int fi = 0; fi < totalFiles; fi++) {
-                ParsedFile file = files.get(fi);
-                writeFileDocs(writer, file, stateTracker, graphData,
-                        fileSynthBodies.get(fi), globalEmbeddings, fileOffsets[fi]);
-                int done = doneFiles.incrementAndGet();
-                totalMethods.addAndGet(file.methods().size());
-                progress.onProgress("Indexing", done, totalFiles);
-                if (totalMethods.get() % 500 == 0) {
-                    log.debug("Indexed {} methods...", totalMethods.get());
-                }
-            }
-        } else {
-            // IndexWriter.addDocument() is thread-safe; embeddings are pre-computed read-only
-            // arrays; FileStateTracker uses ConcurrentHashMap — the parallel write is safe.
-            ExecutorService pool = Executors.newFixedThreadPool(indexThreads,
-                    r -> { Thread t = new Thread(r, "indexer"); t.setDaemon(true); return t; });
-            try {
-                List<Future<?>> futures = new ArrayList<>(totalFiles);
-                for (int fi = 0; fi < totalFiles; fi++) {
-                    final int fiFinal = fi;
-                    futures.add(pool.submit(() -> {
-                        try {
-                            ParsedFile file = files.get(fiFinal);
-                            writeFileDocs(writer, file, stateTracker, graphData,
-                                    fileSynthBodies.get(fiFinal), globalEmbeddings, fileOffsets[fiFinal]);
-                            int done = doneFiles.incrementAndGet();
-                            totalMethods.addAndGet(file.methods().size());
-                            progress.onProgress("Indexing", done, totalFiles);
-                            if (totalMethods.get() % 500 == 0) {
-                                log.debug("Indexed {} methods...", totalMethods.get());
-                            }
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
+                Files.createDirectories(projectIndexDir);
+                try (DataOutputStream spool = new DataOutputStream(new BufferedOutputStream(
+                        Files.newOutputStream(spoolPath), 1 << 16))) {
+                    for (int fi = 0; fi < totalFiles; fi++) {
+                        ParsedFile file = files.get(fi);
+                        List<String> synthBodies = file.classes().stream()
+                                .map(cls -> synthesizedBodyCache.computeIfAbsent(
+                                        cls.qualifiedClassName(),
+                                        k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
+                                .collect(Collectors.toList());
+                        fileSynthBodies.add(synthBodies);
+                        fileOffsets[fi] = totalSlots;
+                        for (ParsedMethod m : file.methods()) {
+                            spoolWrite(spool, DocumentMapper.buildEmbeddingText(m));
+                            totalSlots++;
                         }
-                        return null;
-                    }));
-                }
-                for (Future<?> f : futures) {
-                    try {
-                        f.get();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Indexing interrupted", e);
-                    } catch (ExecutionException e) {
-                        Throwable cause = e.getCause();
-                        if (cause instanceof UncheckedIOException u) throw u.getCause();
-                        if (cause instanceof IOException io) throw io;
-                        throw new IOException("Indexing task failed: " + cause.getMessage(), cause);
+                        for (int ci = 0; ci < file.classes().size(); ci++) {
+                            spoolWrite(spool, DocumentMapper.buildClassEmbeddingText(
+                                    file.classes().get(ci), synthBodies.get(ci)));
+                            totalSlots++;
+                        }
                     }
                 }
+            } else {
+                for (int fi = 0; fi < totalFiles; fi++) {
+                    ParsedFile file = files.get(fi);
+                    List<String> synthBodies = file.classes().stream()
+                            .map(cls -> synthesizedBodyCache.computeIfAbsent(
+                                    cls.qualifiedClassName(),
+                                    k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
+                            .collect(Collectors.toList());
+                    fileSynthBodies.add(synthBodies);
+                }
+            }
+
+            // Phase 2: stream spool through ONNX in chunks, write fixed-size embedding cache.
+            // Peak heap: one chunk of texts + one chunk of embeddings (~200 KB for chunk size 32).
+            if (doEmbed && totalSlots > 0) {
+                int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+                try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
+                             Files.newInputStream(spoolPath), 1 << 16));
+                     DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
+                             Files.newOutputStream(cachePath), 1 << 16))) {
+                    int chunksDone = 0;
+                    int slot = 0;
+                    while (slot < totalSlots) {
+                        int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
+                        List<String> chunk = new ArrayList<>(end - slot);
+                        for (int i = slot; i < end; i++) chunk.add(spoolRead(spool));
+                        float[][] embeddings = embedder.embedBatch(chunk);
+                        for (int i = 0; i < embeddings.length; i++) cacheWrite(cache, embeddings[i], dims);
+                        slot = end;
+                        progress.onProgress("Embedding", ++chunksDone, totalChunks);
+                    }
+                }
+            }
+
+            // Phase 3: write Lucene documents. Each file reads its embedding range from the
+            // cache in one shot; FileChannel is thread-safe so the parallel path works as-is.
+            FileChannel cacheChannel = (doEmbed && totalSlots > 0)
+                    ? FileChannel.open(cachePath, StandardOpenOption.READ) : null;
+            try {
+                AtomicInteger doneFiles = new AtomicInteger(0);
+                AtomicInteger totalMethods = new AtomicInteger(0);
+
+                if (indexThreads <= 1) {
+                    for (int fi = 0; fi < totalFiles; fi++) {
+                        ParsedFile file = files.get(fi);
+                        int slotCount = file.methods().size() + file.classes().size();
+                        float[][] embs = readCachedEmbeddings(cacheChannel, fileOffsets[fi], slotCount, dims);
+                        writeFileDocs(writer, file, stateTracker, graphData, fileSynthBodies.get(fi), embs, 0);
+                        int done = doneFiles.incrementAndGet();
+                        totalMethods.addAndGet(file.methods().size());
+                        progress.onProgress("Indexing", done, totalFiles);
+                        if (totalMethods.get() % 500 == 0) log.debug("Indexed {} methods...", totalMethods.get());
+                    }
+                } else {
+                    ExecutorService pool = Executors.newFixedThreadPool(indexThreads,
+                            r -> { Thread t = new Thread(r, "indexer"); t.setDaemon(true); return t; });
+                    try {
+                        List<Future<?>> futures = new ArrayList<>(totalFiles);
+                        for (int fi = 0; fi < totalFiles; fi++) {
+                            final int fiFinal = fi;
+                            futures.add(pool.submit(() -> {
+                                try {
+                                    ParsedFile file = files.get(fiFinal);
+                                    int slotCount = file.methods().size() + file.classes().size();
+                                    float[][] embs = readCachedEmbeddings(
+                                            cacheChannel, fileOffsets[fiFinal], slotCount, dims);
+                                    writeFileDocs(writer, file, stateTracker, graphData,
+                                            fileSynthBodies.get(fiFinal), embs, 0);
+                                    int done = doneFiles.incrementAndGet();
+                                    totalMethods.addAndGet(file.methods().size());
+                                    progress.onProgress("Indexing", done, totalFiles);
+                                    if (totalMethods.get() % 500 == 0)
+                                        log.debug("Indexed {} methods...", totalMethods.get());
+                                } catch (IOException e) {
+                                    throw new UncheckedIOException(e);
+                                }
+                                return null;
+                            }));
+                        }
+                        for (Future<?> f : futures) {
+                            try {
+                                f.get();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new IOException("Indexing interrupted", e);
+                            } catch (ExecutionException e) {
+                                Throwable cause = e.getCause();
+                                if (cause instanceof UncheckedIOException u) throw u.getCause();
+                                if (cause instanceof IOException io) throw io;
+                                throw new IOException("Indexing task failed: " + cause.getMessage(), cause);
+                            }
+                        }
+                    } finally {
+                        pool.shutdown();
+                    }
+                }
+                log.debug("Total methods indexed: {}", totalMethods.get());
             } finally {
-                pool.shutdown();
+                if (cacheChannel != null) cacheChannel.close();
+            }
+        } finally {
+            Files.deleteIfExists(spoolPath);
+            Files.deleteIfExists(cachePath);
+        }
+    }
+
+    // ── Spool / cache helpers ──────────────────────────────────────────────────
+
+    /** Writes one text slot: [4-byte length][UTF-8 bytes]. Length 0 signals null/blank. */
+    private static void spoolWrite(DataOutputStream out, String text) throws IOException {
+        if (text == null || text.isBlank()) {
+            out.writeInt(0);
+        } else {
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            out.writeInt(bytes.length);
+            out.write(bytes);
+        }
+    }
+
+    /** Reads one text slot from the spool. Returns null for zero-length entries. */
+    private static String spoolRead(DataInputStream in) throws IOException {
+        int len = in.readInt();
+        if (len == 0) return null;
+        byte[] bytes = new byte[len];
+        in.readFully(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Writes one embedding slot to the cache (fixed size: {@code dims} floats).
+     * A null embedding is written as NaN in the first position (sentinel) + zeros.
+     */
+    private static void cacheWrite(DataOutputStream out, float[] embedding, int dims) throws IOException {
+        if (embedding != null) {
+            for (float f : embedding) out.writeFloat(f);
+        } else {
+            out.writeFloat(Float.NaN);
+            for (int i = 1; i < dims; i++) out.writeFloat(0f);
+        }
+    }
+
+    /**
+     * Reads {@code count} embedding slots starting at {@code startSlot} from the cache file.
+     * Uses a single range read for efficiency. Returns null slots where the NaN sentinel is set.
+     * Thread-safe: uses absolute-position {@link FileChannel#read(ByteBuffer, long)}.
+     */
+    private static float[][] readCachedEmbeddings(FileChannel cache, int startSlot, int count, int dims)
+            throws IOException {
+        float[][] result = new float[count][];
+        if (cache == null || count == 0) return result;
+        int totalBytes = count * dims * 4;
+        ByteBuffer buf = ByteBuffer.allocate(totalBytes);
+        long pos = (long) startSlot * dims * 4;
+        while (buf.hasRemaining()) {
+            int n = cache.read(buf, pos + buf.position());
+            if (n < 0) break;
+        }
+        buf.flip();
+        for (int i = 0; i < count; i++) {
+            float first = buf.getFloat();
+            if (Float.isNaN(first)) {
+                buf.position(buf.position() + (dims - 1) * 4);
+            } else {
+                float[] emb = new float[dims];
+                emb[0] = first;
+                for (int d = 1; d < dims; d++) emb[d] = buf.getFloat();
+                result[i] = emb;
             }
         }
-        log.debug("Total methods indexed: {}", totalMethods.get());
+        return result;
     }
 
     /**
