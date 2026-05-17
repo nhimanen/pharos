@@ -54,10 +54,21 @@ public class CallGraph implements AutoCloseable {
     /**
      * When true the database was just cleared and is guaranteed empty — skip the
      * "SELECT @rid ... WHERE fqn = ?" existence check in flush methods, turning
-     * O(N × query_cost) into a plain batch insert.  Dramatically faster for full
-     * re-indexes of large projects (lucene, solr, vespa).
+     * O(N × query_cost) into O(N × HashSet.contains) batch inserts.
+     * Cleared and reset by {@link #clear()}.
      */
     private boolean freshStart = false;
+
+    /**
+     * FQNs inserted during the current session (populated by flush methods).
+     * Replaces the per-entry {@code SELECT @rid} existence check when
+     * {@link #freshStart} is true — handles both intra- and inter-batch
+     * duplicates without any DB queries.
+     * Cleared by {@link #clear()}.
+     */
+    private final Set<String> insertedMethodFqns   = new LinkedHashSet<>();
+    private final Set<String> insertedCodeTypeFqns = new LinkedHashSet<>();
+    private final Set<String> insertedCodeFieldFqns = new LinkedHashSet<>();
 
     private CallGraph(Database db) {
         this.db = db;
@@ -180,7 +191,10 @@ public class CallGraph implements AutoCloseable {
         codeTypeBatch.clear();
         codeFieldBatch.clear();
         kgEdgeBatch.clear();
-        freshStart = true; // DB is about to be empty — skip existence checks on insert
+        freshStart = true; // DB is about to be empty — use session sets instead of DB queries
+        insertedMethodFqns.clear();
+        insertedCodeTypeFqns.clear();
+        insertedCodeFieldFqns.clear();
         db.begin();
         for (String edge : new String[]{"calls", "inherits", "implements_iface", "declares_field",
                 "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by"}) {
@@ -437,15 +451,16 @@ public class CallGraph implements AutoCloseable {
         if (methodBatch.isEmpty()) return;
         db.begin();
         for (String[] m : methodBatch) {
-            // Skip existence check on a fresh DB — avoids O(N × query) on full re-indexes.
-            boolean exists = !freshStart && db.query("sql",
-                    "SELECT @rid FROM Method WHERE fqn = ?", m[0]).hasNext();
-            if (!exists) {
-                MutableVertex v = db.newVertex("Method");
-                v.set("fqn", m[0]);
-                v.set("classPrefix", m[1]);
-                v.save();
+            if (freshStart) {
+                // Fast path: use in-memory set — O(1), handles intra- and inter-batch duplicates.
+                if (!insertedMethodFqns.add(m[0])) continue;
+            } else {
+                if (db.query("sql", "SELECT @rid FROM Method WHERE fqn = ?", m[0]).hasNext()) continue;
             }
+            MutableVertex v = db.newVertex("Method");
+            v.set("fqn", m[0]);
+            v.set("classPrefix", m[1]);
+            v.save();
         }
         db.commit();
         methodBatch.clear();
@@ -513,14 +528,15 @@ public class CallGraph implements AutoCloseable {
         if (codeTypeBatch.isEmpty()) return;
         db.begin();
         for (String[] m : codeTypeBatch) {
-            boolean exists = !freshStart && db.query("sql",
-                    "SELECT @rid FROM CodeType WHERE fqn = ?", m[0]).hasNext();
-            if (!exists) {
-                MutableVertex v = db.newVertex("CodeType");
-                v.set("fqn", m[0]);
-                v.set("classPrefix", m[1]);
-                v.save();
+            if (freshStart) {
+                if (!insertedCodeTypeFqns.add(m[0])) continue;
+            } else {
+                if (db.query("sql", "SELECT @rid FROM CodeType WHERE fqn = ?", m[0]).hasNext()) continue;
             }
+            MutableVertex v = db.newVertex("CodeType");
+            v.set("fqn", m[0]);
+            v.set("classPrefix", m[1]);
+            v.save();
         }
         db.commit();
         codeTypeBatch.clear();
@@ -530,16 +546,17 @@ public class CallGraph implements AutoCloseable {
         if (codeFieldBatch.isEmpty()) return;
         db.begin();
         for (String[] f : codeFieldBatch) {
-            boolean exists = !freshStart && db.query("sql",
-                    "SELECT @rid FROM CodeField WHERE fqn = ?", f[0]).hasNext();
-            if (!exists) {
-                MutableVertex v = db.newVertex("CodeField");
-                v.set("fqn",       f[0]);
-                v.set("ownerFqn",  f[1]);
-                v.set("fieldType", f[2]);
-                v.set("accessMod", f[3]);
-                v.save();
+            if (freshStart) {
+                if (!insertedCodeFieldFqns.add(f[0])) continue;
+            } else {
+                if (db.query("sql", "SELECT @rid FROM CodeField WHERE fqn = ?", f[0]).hasNext()) continue;
             }
+            MutableVertex v = db.newVertex("CodeField");
+            v.set("fqn",       f[0]);
+            v.set("ownerFqn",  f[1]);
+            v.set("fieldType", f[2]);
+            v.set("accessMod", f[3]);
+            v.save();
         }
         db.commit();
         codeFieldBatch.clear();
