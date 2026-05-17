@@ -646,15 +646,20 @@ public class ProjectIndexManager {
                         fileSynthBodies.add(synthBodies);
                         fileOffsets[fi] = totalSlots;
 
-                        // Methods: 1 chunk for short, N for long (multi-chunk)
+                        // Methods: 1 chunk for short, N for long (multi-chunk).
+                        // After spooling the text we strip it from the Chunk — only startLine/endLine
+                        // are needed in Phase 3. Dropping the text strings now frees ~80 MB for
+                        // large projects (lucene: 50k methods × ~800 chars each) before embedding.
                         List<List<Chunk>> methodChunksPerFile = new ArrayList<>(file.methods().size());
                         for (ParsedMethod m : file.methods()) {
                             List<Chunk> mChunks = chunker.chunkMethod(m, true);
-                            methodChunksPerFile.add(mChunks);
+                            List<Chunk> stripped = new ArrayList<>(mChunks.size());
                             for (Chunk c : mChunks) {
                                 spoolWrite(spool, c.text());
                                 totalSlots++;
+                                stripped.add(new Chunk(null, c.startLine(), c.endLine())); // text not needed after spool
                             }
+                            methodChunksPerFile.add(stripped);
                         }
                         fileMethodChunks.add(methodChunksPerFile);
 
@@ -665,11 +670,13 @@ public class ProjectIndexManager {
                             List<ParsedMethod> clsMethods = methodsByClass.getOrDefault(
                                     cls.qualifiedClassName(), List.of());
                             List<Chunk> clsChunks = chunker.chunkClass(cls, synthBodies.get(ci), clsMethods);
-                            classChunksList.add(clsChunks);
+                            List<Chunk> stripped = new ArrayList<>(clsChunks.size());
                             for (Chunk c : clsChunks) {
                                 spoolWrite(spool, c.text());
                                 totalSlots++;
+                                stripped.add(new Chunk(null, c.startLine(), c.endLine()));
                             }
+                            classChunksList.add(stripped);
                         }
                         fileClassChunks.add(classChunksList);
                     }
