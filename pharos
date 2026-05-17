@@ -53,16 +53,35 @@ BASE_URL = f"http://localhost:{DAEMON_PORT}"
 
 # ── Shared JVM flags ─────────────────────────────────────────────────────────
 
+def _default_heap() -> str:
+    """Returns a heap size string (e.g. '6g') based on available RAM.
+
+    Target: 75 % of physical RAM, clamped to [2g, 24g].
+    This overrides the JVM's default heuristic (~25% of RAM) which is too
+    conservative for indexing large projects (ParsedProject bodies + ONNX model
+    + ArcadeDB page cache can easily consume 4–8 GB for projects like lucene).
+    Override with PHAROS_HEAP=Ng to use a specific value.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        target_gb = max(2, min(24, int(total_bytes * 0.75 / (1024 ** 3))))
+        return f"{target_gb}g"
+    except Exception:
+        return "4g"  # safe fallback when sysconf is unavailable
+
+
 def _jvm_flags() -> list:
     """Common JVM args for every pharos subprocess: native-access opens for
     Lucene/ArcadeDB, vector incubator module for SIMD-accelerated KNN, and
     HeapDumpOnOutOfMemoryError so a post-mortem .hprof lands in ~/.pharos/dumps/.
 
-    Honors PHAROS_HEAP (e.g. "16g") to set -Xmx — useful for indexing large
-    projects where the JVM's default heuristic cap (~25% of RAM) isn't enough.
+    Heap: defaults to 75 % of RAM (clamped 2–24 g) so large projects (lucene,
+    solr, vespa) can be indexed without OOM. Override with PHAROS_HEAP=Ng.
     """
     PHAROS_DUMPS.mkdir(parents=True, exist_ok=True)
+    heap = os.environ.get("PHAROS_HEAP", "").strip() or _default_heap()
     flags = [
+        f"-Xmx{heap}",
         "--enable-native-access=ALL-UNNAMED",
         "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
         "--add-modules", "jdk.incubator.vector",
@@ -72,9 +91,6 @@ def _jvm_flags() -> list:
         # for pharos — ArcadeDB queries are I/O-bound, not CPU-bound).
         "-Dpolyglot.engine.WarnInterpreterOnly=false",
     ]
-    heap = os.environ.get("PHAROS_HEAP", "").strip()
-    if heap:
-        flags.insert(0, f"-Xmx{heap}")
     return flags
 
 # ── Daemon management ─────────────────────────────────────────────────────────
