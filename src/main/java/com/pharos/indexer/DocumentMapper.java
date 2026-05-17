@@ -144,7 +144,11 @@ public class DocumentMapper {
             doc.add(new TextField(F_SIGNATURE, splitSig, Field.Store.NO));
         }
         doc.add(new TextField(F_SIGNATURE, nvl(method.signature()), Field.Store.YES));
-        doc.add(new TextField(F_BODY, nvl(method.body()), Field.Store.YES));
+        // Body may be null (lazy loading) — read from source file when not in memory.
+        // preloadedLines is non-null when the caller has already read the file for this batch.
+        String methodBody = method.body() != null ? method.body()
+                : readBodyFromFile(method.filePath(), method.startLine(), method.endLine(), null);
+        doc.add(new TextField(F_BODY, methodBody, Field.Store.YES));
         if (method.javadoc() != null && !method.javadoc().isBlank()) {
             doc.add(new TextField(F_JAVADOC, method.javadoc(), Field.Store.YES));
         }
@@ -220,13 +224,45 @@ public class DocumentMapper {
     public static Document toDocumentMultiVec(ParsedMethod method, float[][] chunkEmbeddings,
                                                int[][] chunkLineRanges,
                                                int inDegree, List<String> callerNames) {
+        return toDocumentMultiVec(method, chunkEmbeddings, chunkLineRanges, inDegree, callerNames, null);
+    }
+
+    /** Overload with preloaded source lines for efficient lazy body reading. */
+    public static Document toDocumentMultiVec(ParsedMethod method, float[][] chunkEmbeddings,
+                                               int[][] chunkLineRanges,
+                                               int inDegree, List<String> callerNames,
+                                               java.util.List<String> preloadedLines) {
         float[] representative = meanPool(chunkEmbeddings);
-        Document doc = toDocument(method, representative, inDegree, callerNames);
+        Document doc = toDocument(method, representative, inDegree, callerNames, preloadedLines);
         doc.add(new LateInteractionField(F_CHUNK_VECTORS, chunkEmbeddings));
         if (chunkLineRanges != null && chunkLineRanges.length > 0) {
             doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
         }
         return doc;
+    }
+
+    /**
+     * Overload that accepts preloaded source lines so lazy body reads (body == null)
+     * share a single in-memory list rather than re-reading the file per method.
+     */
+    public static Document toDocument(ParsedMethod method, float[] embedding,
+                                       int inDegree, List<String> callerNames,
+                                       java.util.List<String> preloadedLines) {
+        if (method.body() != null || preloadedLines == null || preloadedLines.isEmpty()) {
+            return toDocument(method, embedding, inDegree, callerNames);
+        }
+        // Create a body-filled copy so the normal toDocument path finds a non-null body.
+        String body = readBodyFromFile(method.filePath(), method.startLine(),
+                method.endLine(), preloadedLines);
+        ParsedMethod withBody = new com.pharos.parser.model.ParsedMethod(
+                method.id(), method.projectName(), method.packageName(), method.className(),
+                method.qualifiedClassName(), method.methodName(), method.signature(),
+                method.returnType(), method.paramTypes(), method.paramNames(),
+                body, method.javadoc(), method.annotations(), method.accessModifier(),
+                method.isStatic(), method.isConstructor(), method.isAbstract(),
+                method.isSynchronized(), method.thrownExceptions(), method.calledMethods(),
+                method.filePath(), method.startLine(), method.endLine());
+        return toDocument(withBody, embedding, inDegree, callerNames);
     }
 
     /** Convenience overload for callers that don't have graph data yet (incremental updates). */
@@ -258,7 +294,9 @@ public class DocumentMapper {
             sb.append("// ").append(splitName).append('\n');
         }
         sb.append(method.signature()).append(" {\n");
-        String body = method.body();
+        // Body may be null (lazy loading) — read from source file when not in memory
+        String body = method.body() != null ? method.body()
+                : readBodyFromFile(method.filePath(), method.startLine(), method.endLine());
         // Truncate body to stay within model context (jina-v2-base-code: 8192 tokens ≈ 32 000 chars;
         // 8 000 chars leaves room for javadoc + signature overhead)
         if (body != null && body.length() > 8_000) {
@@ -605,6 +643,38 @@ public class DocumentMapper {
         int[][] ranges = new int[n][2];
         for (int i = 0; i < n; i++) { ranges[i][0] = buf.getInt(); ranges[i][1] = buf.getInt(); }
         return ranges;
+    }
+
+    /**
+     * Reads a method or class body directly from the source file.
+     * Called when {@link com.pharos.parser.model.ParsedMethod#body()} returns null
+     * (lazy-loading strategy — bodies are not stored in ParsedMethod to reduce heap).
+     *
+     * <p>Performance: callers in the indexing pipeline preload the file's line list once
+     * and pass it here to avoid repeated {@link java.nio.file.Files#readAllLines} calls
+     * for every method in the same file.
+     *
+     * @param lines  preloaded source lines for the file, or null to read on demand
+     */
+    public static String readBodyFromFile(String filePath, int startLine, int endLine,
+                                           java.util.List<String> lines) {
+        if (startLine < 1 || endLine < startLine) return "";
+        java.util.List<String> src = lines;
+        if (src == null) {
+            try {
+                src = java.nio.file.Files.readAllLines(java.nio.file.Path.of(filePath));
+            } catch (java.io.IOException e) {
+                return "";
+            }
+        }
+        int from = Math.min(startLine - 1, src.size());
+        int to   = Math.min(endLine, src.size());
+        return from < to ? String.join("\n", src.subList(from, to)) : "";
+    }
+
+    /** Convenience overload that reads from disk without a preloaded line list. */
+    public static String readBodyFromFile(String filePath, int startLine, int endLine) {
+        return readBodyFromFile(filePath, startLine, endLine, null);
     }
 
     /** Mean-pools an array of chunk embeddings into one representative vector. */

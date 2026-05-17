@@ -23,6 +23,17 @@ public interface Chunker {
      */
     List<Chunk> chunkMethod(ParsedMethod method, boolean multiChunk);
 
+    /**
+     * Variant of {@link #chunkMethod(ParsedMethod, boolean)} that accepts preloaded source
+     * lines for the method's file.  When {@link ParsedMethod#body()} is null (lazy loading),
+     * body text is extracted from {@code preloadedLines} rather than re-reading the file for
+     * each method — callers that process multiple methods from the same file should use this.
+     */
+    default List<Chunk> chunkMethodWithLines(ParsedMethod method, boolean multiChunk,
+                                              List<String> preloadedLines) {
+        return chunkMethod(method, multiChunk);
+    }
+
     /** Convenience single-chunk overload — equivalent to {@code chunkMethod(method, false)}. */
     default Chunk chunkMethod(ParsedMethod method) {
         List<Chunk> chunks = chunkMethod(method, false);

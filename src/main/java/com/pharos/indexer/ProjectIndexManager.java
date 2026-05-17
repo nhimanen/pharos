@@ -50,7 +50,7 @@ public class ProjectIndexManager {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexManager.class);
     /** Number of embedding texts per ONNX forward pass during global batching. */
-    private static final int EMBED_CHUNK_SIZE = 32;
+    private static final int EMBED_CHUNK_SIZE = 8;
 
     private final IndexConfig config;
     private final LuceneIndexer luceneIndexer;
@@ -650,9 +650,12 @@ public class ProjectIndexManager {
                         // After spooling the text we strip it from the Chunk — only startLine/endLine
                         // are needed in Phase 3. Dropping the text strings now frees ~80 MB for
                         // large projects (lucene: 50k methods × ~800 chars each) before embedding.
+                        // Preload source lines once per file — lazy body reads (body==null) use this
+                        // list instead of reopening the file N times for the same file.
+                        java.util.List<String> fileLines = preloadSourceLines(file.filePath());
                         List<List<Chunk>> methodChunksPerFile = new ArrayList<>(file.methods().size());
                         for (ParsedMethod m : file.methods()) {
-                            List<Chunk> mChunks = chunker.chunkMethod(m, true);
+                            List<Chunk> mChunks = chunker.chunkMethodWithLines(m, true, fileLines);
                             List<Chunk> stripped = new ArrayList<>(mChunks.size());
                             for (Chunk c : mChunks) {
                                 spoolWrite(spool, c.text());
@@ -873,6 +876,9 @@ public class ProjectIndexManager {
                                List<List<Chunk>> classChunkMeta) throws IOException {
         int slot = 0;
 
+        // Preload source lines once per file — methods with lazy bodies (body==null) all share this.
+        java.util.List<String> fileLines = preloadSourceLines(file.filePath());
+
         // Methods — 1 or more chunks each (long methods get N chunks)
         for (int mi = 0; mi < file.methods().size(); mi++) {
             ParsedMethod method = file.methods().get(mi);
@@ -886,10 +892,10 @@ public class ProjectIndexManager {
                 int[][] ranges = mChunkList.stream()
                         .map(c -> new int[]{c.startLine(), c.endLine()})
                         .toArray(int[][]::new);
-                writer.addDocument(DocumentMapper.toDocumentMultiVec(method, chunkEmbs, ranges, inDegree, callerNames));
+                writer.addDocument(DocumentMapper.toDocumentMultiVec(method, chunkEmbs, ranges, inDegree, callerNames, fileLines));
                 slot += n;
             } else {
-                writer.addDocument(DocumentMapper.toDocument(method, (float[]) null, inDegree, callerNames));
+                writer.addDocument(DocumentMapper.toDocument(method, (float[]) null, inDegree, callerNames, fileLines));
             }
         }
 
@@ -915,6 +921,19 @@ public class ProjectIndexManager {
                 .map(ParsedClass::qualifiedClassName)
                 .collect(Collectors.toList());
         stateTracker.track(Path.of(file.filePath()), classNames);
+    }
+
+    /**
+     * Reads all source lines for a file into memory once, so lazy body reads
+     * ({@link ParsedMethod#body()} == null) for all methods in that file share a single list.
+     * Returns an empty list on I/O failure; callers handle null bodies gracefully.
+     */
+    private static java.util.List<String> preloadSourceLines(String filePath) {
+        try {
+            return java.nio.file.Files.readAllLines(java.nio.file.Path.of(filePath));
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 
     /** Total embedding slots for a file = sum(methodChunks) + sum(classChunks). */

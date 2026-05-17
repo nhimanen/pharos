@@ -73,7 +73,10 @@ public class MethodVisitor extends VoidVisitorAdapter<List<ParsedMethod>> {
 
         String access = extractAccess(n.getAccessSpecifier().asString());
         String signature = buildSignature(n, access, paramTypes, paramNames);
-        String body = n.toString();
+        // Body is stored as null and loaded lazily from the source file on demand
+        // (see DocumentMapper.readBodyFromFile). This avoids holding all method
+        // bodies in the ParsedProject heap during graph-building and embedding.
+        String body = null;
         String javadoc = extractJavadoc(n);
 
         List<String> annotations = n.getAnnotations().stream()
@@ -140,7 +143,7 @@ public class MethodVisitor extends VoidVisitorAdapter<List<ParsedMethod>> {
                 signature,
                 containingClass.className(), // return type for constructors = class name
                 paramTypes, paramNames,
-                n.toString(), extractJavadoc(n), annotations, access,
+                null, extractJavadoc(n), annotations, access,
                 false, true, false, false,
                 thrown, calls,
                 filePath,

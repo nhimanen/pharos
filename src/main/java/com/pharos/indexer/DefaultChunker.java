@@ -60,7 +60,7 @@ public class DefaultChunker implements Chunker {
     @Override
     public Chunk chunkMethod(ParsedMethod method) {
         String prefix = buildMethodPrefix(method);
-        String body   = method.body() != null ? method.body() : "";
+        String body   = resolveBody(method, null);
 
         int available = MAX_CHARS - prefix.length() - 10; // -10 for closing "}"
 
@@ -73,72 +73,186 @@ public class DefaultChunker implements Chunker {
     }
 
     private Chunk chunkLongMethod(String prefix, String body, int methodStartLine) {
-        // Single-chunk path for callers that need List<Chunk> — delegate to the list builder
-        return buildMethodChunks(prefix, body, methodStartLine).get(0);
+        List<Chunk> chunks = buildMethodChunks(prefix, body, methodStartLine);
+        return chunks.isEmpty() ? new Chunk(prefix, methodStartLine, methodStartLine) : chunks.get(0);
     }
 
     /**
-     * Splits a long method body into multiple chunks, each within the context window.
-     * Called by {@link #chunkMethod} when the method exceeds {@value #MAX_CHARS} chars.
+     * Splits a long method body into multiple chunks using an index-based line scan.
+     *
+     * <p>Improvements over a naive split-based approach:
+     * <ul>
+     *   <li>No {@code body.split("\n")} — avoids allocating N String objects for each line;
+     *       instead a single {@code int[]} of line-start positions is built from the char array.</li>
+     *   <li>No rollback — the split point is determined by a forward scan before any
+     *       StringBuilder is touched, so each chunk text is built exactly once.</li>
+     *   <li>Prefix pre-appended — the final chunk String is produced by a single
+     *       {@code sb.toString()} with no extra {@code prefix + body} concatenation.</li>
+     *   <li>Overlap extracted from line indexes — no {@code chunkBody.toString()} pass.</li>
+     * </ul>
      */
     private List<Chunk> buildMethodChunks(String prefix, String body, int methodStartLine) {
         int available = MAX_CHARS - prefix.length() - PREFIX_RESERVE;
-        String[] lines = body.split("\n", -1);
 
-        List<Chunk> chunks = new ArrayList<>();
-        int lineIdx = 0;
-        String overlapLines = "";
+        // Build line-start position array — one pass over chars, no String allocation per line.
+        int[] lineStarts = buildLineStarts(body);
+        int lineCount    = lineStarts.length;
 
-        while (lineIdx < lines.length) {
-            StringBuilder chunkBody = new StringBuilder();
-            if (!overlapLines.isEmpty()) {
-                chunkBody.append("// ...\n").append(overlapLines).append("// ...\n");
-            }
-            int chunkStartIdx = lineIdx;
-            int lastBlankIdx  = -1;
+        List<Chunk> chunks  = new ArrayList<>(Math.max(1, body.length() / Math.max(1, available) + 1));
+        int lineIdx         = 0;
+        int overlapFrom     = -1; // start line index of overlap region, -1 = none
+        int overlapTo       = -1; // exclusive end
 
-            while (lineIdx < lines.length) {
-                String line = lines[lineIdx];
-                if (chunkBody.length() + line.length() + 1 > available) {
-                    // Prefer blank-line split (if one exists in the second half of the chunk)
-                    if (lastBlankIdx > chunkStartIdx && chunkBody.length() > available / 2) {
-                        // Roll back to last blank line — rebuild chunkBody up to that point
-                        chunkBody.setLength(0);
-                        if (!overlapLines.isEmpty())
-                            chunkBody.append("// ...\n").append(overlapLines).append("// ...\n");
-                        for (int i = chunkStartIdx; i <= lastBlankIdx; i++)
-                            chunkBody.append(lines[i]).append('\n');
-                        lineIdx = lastBlankIdx + 1;
-                    }
-                    break;
-                }
-                if (line.isBlank()) lastBlankIdx = lineIdx;
-                chunkBody.append(line).append('\n');
-                lineIdx++;
+        while (lineIdx < lineCount) {
+            int chunkFrom = lineIdx;
+
+            // Overlap header overhead: "// ...\n" + overlap lines + "// ...\n" ≈ 14 + overlapLen
+            int overlapLen = overlapFrom >= 0 ? rangeLength(body, lineStarts, overlapFrom, overlapTo) + 14 : 0;
+
+            // Forward scan: find where adding the next line would exceed `available`
+            int charsUsed  = overlapLen;
+            int lastBlank  = -1;
+            int chunkTo    = chunkFrom;
+            while (chunkTo < lineCount) {
+                int lineLen = lineLen(body, lineStarts, chunkTo);
+                if (charsUsed + lineLen + 1 > available) break;
+                if (isBlankAt(body, lineStarts, chunkTo)) lastBlank = chunkTo;
+                charsUsed += lineLen + 1;
+                chunkTo++;
             }
 
-            boolean hasMore = lineIdx < lines.length;
-            if (hasMore) chunkBody.append("// ...");
+            // Prefer a blank-line boundary in the second half of the chunk
+            if (lastBlank > chunkFrom && charsUsed > available / 2) chunkTo = lastBlank + 1;
+            if (chunkTo <= chunkFrom) chunkTo = chunkFrom + 1; // always advance
 
-            int chunkEndIdx = lineIdx - 1;
-            int startLine   = methodStartLine + chunkStartIdx;
-            int endLine     = methodStartLine + chunkEndIdx;
-            chunks.add(new Chunk(prefix + chunkBody, startLine, endLine));
+            // Build chunk text in ONE pass — prefix first, then overlap header, then lines
+            StringBuilder sb = new StringBuilder(prefix.length() + charsUsed + 20);
+            sb.append(prefix);
+            if (overlapFrom >= 0) {
+                sb.append("// ...\n");
+                appendLines(sb, body, lineStarts, overlapFrom, overlapTo);
+                sb.append("// ...\n");
+            }
+            appendLines(sb, body, lineStarts, chunkFrom, chunkTo);
+            if (chunkTo < lineCount) sb.append("// ...");
 
-            // Overlap: first 2 non-empty lines of this chunk's body (after the "..." marker)
-            overlapLines = firstNonEmptyLines(chunkBody.toString(), 2);
+            chunks.add(new Chunk(sb.toString(),
+                    methodStartLine + chunkFrom,
+                    methodStartLine + Math.min(chunkTo, lineCount) - 1));
+
+            // Overlap for next chunk: first 2 non-empty lines — scan indexes, no String copy
+            int[] ov = firstNonEmptyLineRange(body, lineStarts, chunkFrom, chunkTo, 2);
+            overlapFrom = ov[0];
+            overlapTo   = ov[1];
+            lineIdx     = chunkTo;
         }
 
         return chunks.isEmpty()
-                ? List.of(new Chunk(prefix + body.substring(0, Math.min(body.length(), available)), methodStartLine, methodStartLine))
+                ? List.of(new Chunk(prefix + body.substring(0, Math.min(body.length(), available)),
+                          methodStartLine, methodStartLine))
                 : chunks;
+    }
+
+    // -------------------------------------------------------------------------
+    // Line-index helpers (operate on char positions, no String allocation)
+    // -------------------------------------------------------------------------
+
+    /** Returns an int[] where entry i is the char offset of line i's start in {@code s}. */
+    private static int[] buildLineStarts(String s) {
+        if (s.isEmpty()) return new int[]{0};
+        int count = 1;
+        for (int i = 0; i < s.length(); i++) if (s.charAt(i) == '\n') count++;
+        int[] starts = new int[count];
+        int idx = 1;
+        for (int i = 0; i < s.length() && idx < count; i++)
+            if (s.charAt(i) == '\n') starts[idx++] = i + 1;
+        return starts;
+    }
+
+    /** Length of line {@code li} (excluding the trailing newline). */
+    private static int lineLen(String s, int[] starts, int li) {
+        int start = starts[li];
+        int end   = li + 1 < starts.length ? starts[li + 1] - 1 : s.length();
+        return end - start;
+    }
+
+    /** True when line {@code li} contains only whitespace. */
+    private static boolean isBlankAt(String s, int[] starts, int li) {
+        int start = starts[li];
+        int end   = li + 1 < starts.length ? starts[li + 1] - 1 : s.length();
+        for (int i = start; i < end; i++) if (!Character.isWhitespace(s.charAt(i))) return false;
+        return true;
+    }
+
+    /** Total char length of lines [from, to) including their newlines. */
+    private static int rangeLength(String s, int[] starts, int from, int to) {
+        if (from >= to) return 0;
+        int start = starts[from];
+        int end   = to < starts.length ? starts[to] : s.length() + 1; // +1 for implicit newline
+        return end - start;
+    }
+
+    /** Appends lines [from, to) from {@code s} (using precomputed starts) to {@code sb}. */
+    private static void appendLines(StringBuilder sb, String s, int[] starts, int from, int to) {
+        for (int li = from; li < to; li++) {
+            int start = starts[li];
+            int end   = li + 1 < starts.length ? starts[li + 1] - 1 : s.length();
+            sb.append(s, start, end).append('\n');
+        }
+    }
+
+    /**
+     * Returns [firstNonEmptyLine, exclusiveEnd] covering the first {@code n} non-empty
+     * lines in [from, to).  Returns [-1, -1] when none found.
+     */
+    private static int[] firstNonEmptyLineRange(String s, int[] starts, int from, int to, int n) {
+        int count = 0, first = -1, last = -1;
+        for (int li = from; li < to && count < n; li++) {
+            if (!isBlankAt(s, starts, li)) {
+                if (first < 0) first = li;
+                last = li;
+                count++;
+            }
+        }
+        if (first < 0) return new int[]{-1, -1};
+        return new int[]{first, last + 1};
     }
 
     @Override
     public List<Chunk> chunkMethod(ParsedMethod method, boolean multiChunk) {
         if (!multiChunk) return List.of(chunkMethod(method));
         String prefix = buildMethodPrefix(method);
-        String body   = method.body() != null ? method.body() : "";
+        String body   = resolveBody(method, null);
+        int available = MAX_CHARS - prefix.length() - 10;
+        if (body.length() <= available) {
+            return List.of(new Chunk(prefix + body + "\n}", method.startLine(), method.endLine()));
+        }
+        return buildMethodChunks(prefix, body, method.startLine());
+    }
+
+    /**
+     * Returns the method body — from {@link ParsedMethod#body()} when present,
+     * otherwise read from the source file via {@link DocumentMapper#readBodyFromFile}.
+     *
+     * @param preloadedLines  source lines for the file already in memory, or null to read on demand
+     */
+    public static String resolveBody(ParsedMethod method, java.util.List<String> preloadedLines) {
+        String body = method.body();
+        if (body != null) return body;
+        return DocumentMapper.readBodyFromFile(
+                method.filePath(), method.startLine(), method.endLine(), preloadedLines);
+    }
+
+    public List<Chunk> chunkMethodWithLines(ParsedMethod method, boolean multiChunk,
+                                             List<String> preloadedLines) {
+        String prefix = buildMethodPrefix(method);
+        String body   = resolveBody(method, preloadedLines);
+        if (!multiChunk) {
+            int avail = MAX_CHARS - prefix.length() - 10;
+            return body.length() <= avail
+                    ? List.of(new Chunk(prefix + body + "\n}", method.startLine(), method.endLine()))
+                    : List.of(chunkLongMethod(prefix, body, method.startLine()));
+        }
         int available = MAX_CHARS - prefix.length() - 10;
         if (body.length() <= available) {
             return List.of(new Chunk(prefix + body + "\n}", method.startLine(), method.endLine()));
@@ -335,20 +449,7 @@ public class DefaultChunker implements Chunker {
         return hard; // hard split as last resort
     }
 
-    /** Extracts the first {@code n} non-empty lines from text for use as overlap. */
-    private static String firstNonEmptyLines(String text, int n) {
-        StringBuilder sb = new StringBuilder();
-        int count = 0;
-        for (String line : text.split("\n", -1)) {
-            if (!line.isBlank() && !line.startsWith("//")) {
-                sb.append(line).append('\n');
-                if (++count >= n) break;
-            }
-        }
-        return sb.length() > OVERLAP_CHARS ? sb.substring(0, OVERLAP_CHARS) : sb.toString();
-    }
-
-    /** Returns a short overlap string (first sentences up to OVERLAP_CHARS) from the chunk. */
+/** Returns a short overlap string (first sentences up to OVERLAP_CHARS) from the chunk. */
     private static String extractOverlap(String piece) {
         if (piece.length() <= OVERLAP_CHARS) return piece;
         // Find sentence end near OVERLAP_CHARS
