@@ -538,36 +538,40 @@ public class JavaCodeParser implements CodeParser {
             if (!result.isSuccessful() || result.getResult().isEmpty()) return;
             CompilationUnit cu = result.getResult().get();
 
-            // Field declarations — visit every class/interface in the file
+            // Pass 1: field declarations — build classQual → fieldNames map as a side effect.
+            // This is used in pass 2 for O(1) implicit-access detection without the symbol resolver.
+            Map<String, Set<String>> classFieldNames = new LinkedHashMap<>();
             cu.findAll(ClassOrInterfaceDeclaration.class).forEach(classDecl -> {
                 String classQual = buildQualifiedNameFromCu(file.packageName(), classDecl);
+                Set<String> names = new LinkedHashSet<>();
                 for (FieldDeclaration fd : classDecl.getFields()) {
                     String access = fd.getAccessSpecifier().asString().toLowerCase();
                     if (access.isEmpty()) access = "package-private";
                     String fieldType = fd.getVariable(0).getTypeAsString();
                     for (VariableDeclarator vd : fd.getVariables()) {
-                        String fieldFqn = classQual + "#" + vd.getNameAsString();
+                        String varName = vd.getNameAsString();
+                        names.add(varName);
                         fields.add(new ParsedRelationships.FieldDecl(
-                                fieldFqn, classQual, stripGenerics(fieldType), access));
+                                classQual + "#" + varName, classQual, stripGenerics(fieldType), access));
                     }
                 }
+                classFieldNames.put(classQual, names);
             });
 
-            // Field accesses — only explicit this.field and super.field (reliable without full resolution)
+            // Pass 2: field accesses — explicit this.field + heuristic bare-name detection.
             cu.findAll(MethodDeclaration.class).forEach(md -> {
                 md.getBody().ifPresent(body -> {
                     String ownerQual = md.findAncestor(ClassOrInterfaceDeclaration.class)
                             .map(c -> buildQualifiedNameFromCu(file.packageName(), c))
                             .orElse(null);
                     if (ownerQual == null) return;
-
                     List<String> paramNames = md.getParameters().stream()
                             .map(p -> p.getNameAsString()).toList();
                     String methodFqn = ownerQual + "#" + md.getNameAsString() + "(" +
                             md.getParameters().stream().map(p -> p.getTypeAsString())
                                     .collect(java.util.stream.Collectors.joining(",")) + ")";
-
-                    collectFieldAccesses(body, methodFqn, ownerQual, paramNames, reads, writes);
+                    collectFieldAccesses(body, methodFqn, ownerQual, paramNames,
+                            classFieldNames.getOrDefault(ownerQual, Set.of()), reads, writes);
                 });
             });
             // Also handle constructors
@@ -581,7 +585,8 @@ public class JavaCodeParser implements CodeParser {
                 String methodFqn = ownerQual + "#<init>(" +
                         cd.getParameters().stream().map(p -> p.getTypeAsString())
                                 .collect(java.util.stream.Collectors.joining(",")) + ")";
-                collectFieldAccesses(cd.getBody(), methodFqn, ownerQual, paramNames, reads, writes);
+                collectFieldAccesses(cd.getBody(), methodFqn, ownerQual, paramNames,
+                        classFieldNames.getOrDefault(ownerQual, Set.of()), reads, writes);
             });
 
         } catch (Exception e) {
@@ -591,13 +596,14 @@ public class JavaCodeParser implements CodeParser {
 
     private void collectFieldAccesses(BlockStmt body, String methodFqn, String ownerQual,
                                        List<String> paramNames,
+                                       Set<String> classFieldNames,
                                        List<ParsedRelationships.FieldAccess> reads,
                                        List<ParsedRelationships.FieldAccess> writes) {
-        // Track local variable declarations to exclude them from implicit field access
+        // Local variables and parameters shadow field names — exclude them from implicit detection.
         Set<String> localVars = new HashSet<>(paramNames);
         body.findAll(VariableDeclarator.class).forEach(vd -> localVars.add(vd.getNameAsString()));
 
-        // Explicit this.field / super.field accesses
+        // Explicit this.field / super.field — always reliable.
         body.findAll(FieldAccessExpr.class).forEach(fae -> {
             Expression scope = fae.getScope();
             if (!(scope instanceof ThisExpr) && !(scope instanceof SuperExpr)) return;
@@ -606,20 +612,18 @@ public class JavaCodeParser implements CodeParser {
             (isWrite ? writes : reads).add(new ParsedRelationships.FieldAccess(methodFqn, fieldFqn));
         });
 
-        // Implicit field access: bare name that is NOT a local/param variable
-        body.findAll(NameExpr.class).forEach(ne -> {
-            String name = ne.getNameAsString();
-            if (name.length() <= 1 || localVars.contains(name)) return;
-            // Try symbol resolution — only adds if JavaParser confirms it's a field
-            try {
-                var resolved = ne.resolve();
-                if (!resolved.isField()) return;
-                String declClass = resolved.asField().declaringType().getQualifiedName();
-                String fieldFqn = declClass + "#" + name;
+        // Implicit bare field access: NameExpr whose name matches a declared field of the
+        // containing class and is not shadowed by a local variable or parameter.
+        // O(1) per expression — no symbol resolver needed.
+        if (!classFieldNames.isEmpty()) {
+            body.findAll(NameExpr.class).forEach(ne -> {
+                String name = ne.getNameAsString();
+                if (!classFieldNames.contains(name) || localVars.contains(name)) return;
+                String fieldFqn = ownerQual + "#" + name;
                 boolean isWrite = isAssignmentTarget(ne);
                 (isWrite ? writes : reads).add(new ParsedRelationships.FieldAccess(methodFqn, fieldFqn));
-            } catch (Exception ignored) {}
-        });
+            });
+        }
     }
 
     private static boolean isAssignmentTarget(Expression expr) {

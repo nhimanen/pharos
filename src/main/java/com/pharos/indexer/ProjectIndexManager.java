@@ -305,14 +305,18 @@ public class ProjectIndexManager {
         }
         ParsedProject project = merge(projectName, projectRoot, perLang);
 
-        // Build knowledge-graph relationships from parsed data (best-effort, per parser)
+        // Build knowledge-graph relationships from parsed data (best-effort, per parser).
+        // Catches Throwable (including OutOfMemoryError) so a large project cannot silently
+        // kill the indexing thread when the symbol resolver runs out of heap.
         List<com.pharos.parser.model.ParsedRelationships> allRelationships = new ArrayList<>();
         int relIdx = 0;
         for (Map.Entry<CodeParser, List<Path>> entry : filesByParser.entrySet()) {
             try {
                 allRelationships.add(entry.getKey().buildRelationships(project));
-            } catch (Exception e) {
-                log.warn("buildRelationships failed for parser {}: {}", entry.getKey().getClass().getSimpleName(), e.getMessage());
+            } catch (Throwable e) {
+                log.warn("buildRelationships failed for parser {} ({}): {}",
+                        entry.getKey().getClass().getSimpleName(),
+                        e.getClass().getSimpleName(), e.getMessage());
             }
             progress.onProgress("Extracting relationships", ++relIdx, parsers.size());
         }
@@ -1056,7 +1060,7 @@ public class ProjectIndexManager {
                         parsers.stream()
                                .filter(p -> p.supportedExtensions().contains(".java"))
                                .findFirst()
-                               .map(p -> { try { return p.buildRelationships(miniProject); } catch (Exception e2) { return com.pharos.parser.model.ParsedRelationships.empty("incremental"); } })
+                               .map(p -> { try { return p.buildRelationships(miniProject); } catch (Throwable e2) { return com.pharos.parser.model.ParsedRelationships.empty("incremental"); } })
                                .orElse(com.pharos.parser.model.ParsedRelationships.empty("incremental"));
                 new com.pharos.graph.KnowledgeGraphBuilder().build(graph, rel);
             }
