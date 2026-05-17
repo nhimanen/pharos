@@ -30,7 +30,21 @@ import java.util.*;
  */
 public class DefaultChunker implements Chunker {
 
-    /** Approximate character budget per embedding call (Jina-v2 / MiniLM: 512 tokens ≈ 2 000 chars). */
+    /**
+     * Character budget per chunk sent to the embedding model.
+     *
+     * <p>This is a char-level pre-filter; the embedding provider truncates to its token
+     * limit independently ({@code embeddingMaxTokens} in config, default 512 for MiniLM /
+     * 8192 for Jina-v2).  Rough conversion: ~4 chars per token for English/Java code.
+     *
+     * <ul>
+     *   <li>Jina-v2-base-code (8 192 tokens): 8 000 chars ≈ 2 000 tokens — deliberately
+     *       conservative so each chunk stays focused; uses ~25 % of available context.</li>
+     *   <li>all-MiniLM-L6-v2 (512 tokens): 8 000 chars exceeds the window; DJL truncates
+     *       silently to 512 tokens before encoding.  Consider lowering to 2 000 chars when
+     *       using MiniLM to avoid generating text that is immediately discarded.</li>
+     * </ul>
+     */
     static final int MAX_CHARS      = 8_000;
     /** Characters reserved for context prefix inside a chunk. */
     private static final int PREFIX_RESERVE = 400;
