@@ -105,8 +105,9 @@ public interface EmbeddingProvider {
         }
         try {
             return new DjlEmbeddingProvider(config.getEmbeddingModelUrl(), config.getEmbeddingDimensions(), config.getEmbeddingMaxTokens());
-        } catch (Exception e) {
-            log.warn("DJL embedding provider unavailable ({}), falling back to NoOp. Keyword search will still work.", e.getMessage());
+        } catch (Throwable e) {
+            log.warn("DJL embedding provider unavailable ({}: {}), falling back to NoOp. Keyword search will still work.",
+                    e.getClass().getSimpleName(), e.getMessage());
             return new NoOpEmbeddingProvider();
         }
     }

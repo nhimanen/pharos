@@ -51,6 +51,14 @@ public class CallGraph implements AutoCloseable {
     /** Pending call edges not yet committed: [callerFqn, calleeFqn]. */
     private final List<String[]> callBatch = new ArrayList<>(BATCH_SIZE);
 
+    /**
+     * When true the database was just cleared and is guaranteed empty — skip the
+     * "SELECT @rid ... WHERE fqn = ?" existence check in flush methods, turning
+     * O(N × query_cost) into a plain batch insert.  Dramatically faster for full
+     * re-indexes of large projects (lucene, solr, vespa).
+     */
+    private boolean freshStart = false;
+
     private CallGraph(Database db) {
         this.db = db;
     }
@@ -172,6 +180,7 @@ public class CallGraph implements AutoCloseable {
         codeTypeBatch.clear();
         codeFieldBatch.clear();
         kgEdgeBatch.clear();
+        freshStart = true; // DB is about to be empty — skip existence checks on insert
         db.begin();
         for (String edge : new String[]{"calls", "inherits", "implements_iface", "declares_field",
                 "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by"}) {
@@ -428,9 +437,10 @@ public class CallGraph implements AutoCloseable {
         if (methodBatch.isEmpty()) return;
         db.begin();
         for (String[] m : methodBatch) {
-            // Insert only if not already present (idempotent).
-            ResultSet rs = db.query("sql", "SELECT @rid FROM Method WHERE fqn = ?", m[0]);
-            if (!rs.hasNext()) {
+            // Skip existence check on a fresh DB — avoids O(N × query) on full re-indexes.
+            boolean exists = !freshStart && db.query("sql",
+                    "SELECT @rid FROM Method WHERE fqn = ?", m[0]).hasNext();
+            if (!exists) {
                 MutableVertex v = db.newVertex("Method");
                 v.set("fqn", m[0]);
                 v.set("classPrefix", m[1]);
@@ -503,8 +513,9 @@ public class CallGraph implements AutoCloseable {
         if (codeTypeBatch.isEmpty()) return;
         db.begin();
         for (String[] m : codeTypeBatch) {
-            ResultSet rs = db.query("sql", "SELECT @rid FROM CodeType WHERE fqn = ?", m[0]);
-            if (!rs.hasNext()) {
+            boolean exists = !freshStart && db.query("sql",
+                    "SELECT @rid FROM CodeType WHERE fqn = ?", m[0]).hasNext();
+            if (!exists) {
                 MutableVertex v = db.newVertex("CodeType");
                 v.set("fqn", m[0]);
                 v.set("classPrefix", m[1]);
@@ -519,8 +530,9 @@ public class CallGraph implements AutoCloseable {
         if (codeFieldBatch.isEmpty()) return;
         db.begin();
         for (String[] f : codeFieldBatch) {
-            ResultSet rs = db.query("sql", "SELECT @rid FROM CodeField WHERE fqn = ?", f[0]);
-            if (!rs.hasNext()) {
+            boolean exists = !freshStart && db.query("sql",
+                    "SELECT @rid FROM CodeField WHERE fqn = ?", f[0]).hasNext();
+            if (!exists) {
                 MutableVertex v = db.newVertex("CodeField");
                 v.set("fqn",       f[0]);
                 v.set("ownerFqn",  f[1]);

@@ -1116,8 +1116,11 @@ public class ProjectIndexManager {
             log.debug("Call graph built: {} methods, {} calls",
                     graph.methodCount(), graph.callCount());
             return GraphIndexData.build(graph, project);
-        } catch (Exception e) {
-            log.warn("Failed to build call graph: {}", e.getMessage());
+        } catch (Throwable e) {
+            // Catch Throwable (including OutOfMemoryError) so a large project cannot
+            // propagate through the ExecutorService and kill other queued projects.
+            log.warn("Failed to build call graph for '{}' ({}): {}",
+                    project.projectName(), e.getClass().getSimpleName(), e.getMessage());
             return GraphIndexData.empty();
         }
     }
