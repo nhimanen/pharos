@@ -182,7 +182,7 @@
                 <configuration>
                     <!-- JavaParser reflects on JDK classes including jdk.incubator.vector
                          when parsing corpora (e.g. Lucene) that use the Vector API. -->
-                    <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2</argLine>
+                    <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2 -Dpolyglot.engine.WarnInterpreterOnly=false</argLine>
                     <excludedGroups>${excludedGroups}</excludedGroups>
                     <!-- Excluded due to ArcadeDB temp-dir contention when run in parallel
                          with the full suite. Pass individually with -Dtest=ClassName. -->

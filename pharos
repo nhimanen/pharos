@@ -68,6 +68,9 @@ def _jvm_flags() -> list:
         "--add-modules", "jdk.incubator.vector",
         "-XX:+HeapDumpOnOutOfMemoryError",
         f"-XX:HeapDumpPath={PHAROS_DUMPS}",
+        # Suppress ArcadeDB/GraalVM Truffle warning about missing JVMCI (not needed
+        # for pharos — ArcadeDB queries are I/O-bound, not CPU-bound).
+        "-Dpolyglot.engine.WarnInterpreterOnly=false",
     ]
     heap = os.environ.get("PHAROS_HEAP", "").strip()
     if heap:
