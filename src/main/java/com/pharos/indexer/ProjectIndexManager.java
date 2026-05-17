@@ -326,6 +326,12 @@ public class ProjectIndexManager {
         progress.onProgress("Building call graph", 0, 0);
         GraphIndexData graphData = buildAndSaveGraph(project, relationships, projectIndexDir);
 
+        // Release relationships and intermediate lists before embedding starts.
+        // For large projects the relationship lists (returns, takes, etc.) can be
+        // tens of MBs; holding them through embedding causes OOM under heap pressure.
+        relationships = null;
+        allRelationships = null;
+
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
             indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir);
