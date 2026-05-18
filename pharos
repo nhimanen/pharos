@@ -729,28 +729,53 @@ def cmd_skeleton(args):
 
 
 def cmd_index(args):
-    """Run indexing by spawning the JAR directly (daemon is search-only, no write lock)."""
+    """Run indexing by spawning the JAR directly (daemon is search-only, no write lock).
+
+    Accepts multiple paths; each is indexed sequentially in its own JVM.
+    """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
-    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", str(args.path)]
-    if args.project:
-        cmd += ["--project", args.project]
-    if args.full:
-        cmd.append("--full")
-    if args.force:
-        cmd.append("--force")
-    if args.no_embed:
-        cmd.append("--no-embed")
-    if args.single:
-        cmd.append("--single")
-    if args.depth != 3:
-        cmd += ["--depth", str(args.depth)]
-    if args.project_threads != 1:
-        cmd += ["--project-threads", str(args.project_threads)]
+    # --project renames the indexed project; it only makes sense for a single path
+    if args.project and len(args.path) > 1:
+        die("--project cannot be combined with multiple paths "
+            "(each path needs a unique name; let pharos infer them).")
 
-    result = subprocess.run(cmd)
-    sys.exit(result.returncode)
+    # Build the JAR-side flags once — they don't vary per path
+    base_flags = []
+    if args.full:         base_flags.append("--full")
+    if args.force:        base_flags.append("--force")
+    if args.no_embed:     base_flags.append("--no-embed")
+    if args.single:       base_flags.append("--single")
+    if args.depth != 3:   base_flags += ["--depth", str(args.depth)]
+    if args.project_threads != 1:
+        base_flags += ["--project-threads", str(args.project_threads)]
+
+    failed = []
+    multi = len(args.path) > 1
+    for i, path in enumerate(args.path, 1):
+        if multi:
+            print(f"\n=== [{i}/{len(args.path)}] Indexing {path} ===\n",
+                  file=sys.stderr, flush=True)
+        cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", str(path)]
+        cmd += base_flags
+        if args.project:  # only valid for single path; guarded above
+            cmd += ["--project", args.project]
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            failed.append((path, rc))
+
+    if multi:
+        if failed:
+            print(f"\nFinished: {len(args.path) - len(failed)} succeeded, "
+                  f"{len(failed)} failed.", file=sys.stderr)
+            for path, rc in failed:
+                print(f"  ✗ {path} (exit {rc})", file=sys.stderr)
+        else:
+            print(f"\nFinished: all {len(args.path)} paths indexed.",
+                  file=sys.stderr)
+
+    sys.exit(1 if failed else 0)
 
 
 def cmd_web(args):
@@ -889,13 +914,16 @@ Spawns a fresh JVM process — the running daemon is not affected.
 
 EXAMPLES
   pharos index /path/to/myproject
-  pharos index /path/to/workspace          # discovers sub-projects automatically
-  pharos index /path/to/myproject --full   # force full re-index
-  pharos index /path/to/myproject --force  # delete index then re-index
+  pharos index /path/to/workspace               # discovers sub-projects automatically
+  pharos index ~/git/yeast ~/git/reserve        # multiple repos in one call
+  pharos index ~/git/{yeast,reserve,cooper}     # same, via shell brace-expansion
+  pharos index /path/to/myproject --full        # force full re-index
+  pharos index /path/to/myproject --force       # delete index then re-index
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_index.add_argument("path", help="Path to a project root or workspace")
+    p_index.add_argument("path", nargs="+",
+                         help="Path(s) to a project root or workspace (multiple allowed)")
     p_index.add_argument("--project", "-p", metavar="NAME",
                          help="Project name (default: directory name)")
     p_index.add_argument("--full", action="store_true",
