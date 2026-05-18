@@ -728,29 +728,80 @@ def cmd_skeleton(args):
     print(fmt_skeleton(classes, args.limit))
 
 
+def _parse_path_spec(spec: str) -> tuple:
+    """Split a 'path[:name]' spec into (path, name_or_None).
+
+    The optional ':name' suffix overrides the default/inferred project name
+    (same syntax we use with the semantic search indexer). Only splits if the
+    right-hand side is a clean name token — no '/', non-empty — so legitimate
+    paths that happen to contain a colon still parse correctly.
+    """
+    if ":" not in spec:
+        return spec, None
+    path, _, name = spec.rpartition(":")
+    if not name or "/" in name or not path:
+        return spec, None
+    return path, name
+
+
 def cmd_index(args):
-    """Run indexing by spawning the JAR directly (daemon is search-only, no write lock)."""
+    """Run indexing by spawning the JAR directly (daemon is search-only, no write lock).
+
+    Accepts multiple 'path[:name]' specs; each is indexed sequentially in its own JVM.
+    """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
-    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", str(args.path)]
-    if args.project:
-        cmd += ["--project", args.project]
-    if args.full:
-        cmd.append("--full")
-    if args.force:
-        cmd.append("--force")
-    if args.no_embed:
-        cmd.append("--no-embed")
-    if args.single:
-        cmd.append("--single")
-    if args.depth != 3:
-        cmd += ["--depth", str(args.depth)]
-    if args.project_threads != 1:
-        cmd += ["--project-threads", str(args.project_threads)]
+    # Parse path:name specs up front so we can validate the --project interaction
+    specs = [_parse_path_spec(p) for p in args.path]
+    any_inline_name = any(name is not None for _, name in specs)
 
-    result = subprocess.run(cmd)
-    sys.exit(result.returncode)
+    # --project renames the indexed project; only valid for a single path with no
+    # inline ':name'. Inline names always win over the global --project flag.
+    if args.project:
+        if len(specs) > 1:
+            die("--project cannot be combined with multiple paths "
+                "(use 'path:name' per path, or let pharos infer names).")
+        if any_inline_name:
+            die("--project conflicts with a 'path:name' suffix; specify one or the other.")
+
+    # Build the JAR-side flags once — they don't vary per path
+    base_flags = []
+    if args.full:         base_flags.append("--full")
+    if args.force:        base_flags.append("--force")
+    if args.no_embed:     base_flags.append("--no-embed")
+    if args.single:       base_flags.append("--single")
+    if args.depth != 3:   base_flags += ["--depth", str(args.depth)]
+    if args.project_threads != 1:
+        base_flags += ["--project-threads", str(args.project_threads)]
+
+    failed = []
+    multi = len(specs) > 1
+    for i, (path, inline_name) in enumerate(specs, 1):
+        name = inline_name or args.project  # inline wins; --project is the legacy single-path fallback
+        if multi:
+            label = f"{path} → {name}" if name else path
+            print(f"\n=== [{i}/{len(specs)}] Indexing {label} ===\n",
+                  file=sys.stderr, flush=True)
+        cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", str(path)]
+        cmd += base_flags
+        if name:
+            cmd += ["--project", name]
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            failed.append((path, rc))
+
+    if multi:
+        if failed:
+            print(f"\nFinished: {len(specs) - len(failed)} succeeded, "
+                  f"{len(failed)} failed.", file=sys.stderr)
+            for path, rc in failed:
+                print(f"  ✗ {path} (exit {rc})", file=sys.stderr)
+        else:
+            print(f"\nFinished: all {len(specs)} paths indexed.",
+                  file=sys.stderr)
+
+    sys.exit(1 if failed else 0)
 
 
 def cmd_web(args):
@@ -889,13 +940,18 @@ Spawns a fresh JVM process — the running daemon is not affected.
 
 EXAMPLES
   pharos index /path/to/myproject
-  pharos index /path/to/workspace          # discovers sub-projects automatically
-  pharos index /path/to/myproject --full   # force full re-index
-  pharos index /path/to/myproject --force  # delete index then re-index
+  pharos index /path/to/workspace                  # auto-discovers sub-projects
+  pharos index ~/git/yeast ~/git/reserve           # multiple repos in one call
+  pharos index ~/git/{yeast,reserve,cooper}        # same, via shell brace-expansion
+  pharos index ~/git/yeast:my-yeast                # override project name (path:name)
+  pharos index ~/git/yeast:y ~/git/reserve:r       # per-path name overrides
+  pharos index /path/to/myproject --full           # force full re-index
+  pharos index /path/to/myproject --force          # delete index then re-index
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_index.add_argument("path", help="Path to a project root or workspace")
+    p_index.add_argument("path", nargs="+",
+                         help="Path(s) — optionally 'path:name' to override the project name")
     p_index.add_argument("--project", "-p", metavar="NAME",
                          help="Project name (default: directory name)")
     p_index.add_argument("--full", action="store_true",
