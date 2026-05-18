@@ -178,6 +178,27 @@ public record LanguageProfile(
             BodyStyle.PARENS
     );
 
+    public static final LanguageProfile RUBY = new LanguageProfile(
+            "Ruby",
+            // Covers JRuby too — same syntax, same extensions.
+            List.of(".rb", ".rake"),
+            "#",
+            // First module declaration in the file serves as the "package" — Ruby
+            // doesn't have file-level namespace declarations, so this is a best
+            // effort and may be empty for top-level scripts.
+            Pattern.compile("^\\s*module\\s+([\\w:]+)"),
+            // Both `require 'foo'` and `require_relative 'foo/bar'` capture the path.
+            Pattern.compile("^\\s*require(?:_relative)?\\s+['\"]([^'\"]+)['\"]"),
+            // class Foo / class Foo < Bar / class Foo::Bar / module Foo (modules
+            // act as namespaces in Ruby and are treated as classes for indexing).
+            Pattern.compile("^\\s*(?:class|module)\\s+(\\w+)"),
+            // def name / def name(a, b) / def name a, b / def self.classmethod
+            // Group 1: method name (self. prefix dropped). Group 2: paren-wrapped
+            // params (optional; def-without-parens leaves params absent).
+            Pattern.compile("^\\s*def\\s+(?:self\\.)?(\\w+)(?:\\s*\\(([^)]*)\\))?"),
+            BodyStyle.DO_END  // Ruby uses `end` to close blocks
+    );
+
     public static final LanguageProfile VB_NET = new LanguageProfile(
             "VB.NET",
             List.of(".vb"),
@@ -197,6 +218,6 @@ public record LanguageProfile(
 
     /** All tier-2 profiles in registration order. */
     public static final List<LanguageProfile> ALL = List.of(
-            RUST, KOTLIN, SCALA, SWIFT, CSHARP, FSHARP, HASKELL, ELIXIR, CLOJURE, VB_NET
+            RUST, KOTLIN, SCALA, SWIFT, CSHARP, FSHARP, HASKELL, ELIXIR, CLOJURE, RUBY, VB_NET
     );
 }
