@@ -817,6 +817,57 @@ def cmd_web(args):
             pass
 
 
+def cmd_invalidate_embeddings(args):
+    """Mark file embeddings as stale so the next incremental index re-embeds them.
+
+    Reads file-state.json for the given project and sets chunkingVersion=0 on
+    the selected scope of files, causing hasOutdatedEmbeddings() to return true
+    and the incremental runner to re-embed those files on the next index run.
+    """
+    # Resolve index dir from config (mirrors IndexConfig.java default logic)
+    config_file = PHAROS_DIR / "config.json"
+    index_dir = PHAROS_DIR / "indexes"
+    if config_file.exists():
+        try:
+            cfg = json.loads(config_file.read_text())
+            if cfg.get("indexDir"):
+                index_dir = Path(cfg["indexDir"])
+        except Exception:
+            pass
+
+    state_file = index_dir / args.project / "file-state.json"
+    if not state_file.exists():
+        die(f"No file-state.json found for project '{args.project}' at {state_file}\n"
+            f"Has this project been indexed?")
+
+    # Extension sets matching DocumentMapper.computeScope()
+    DOC_EXTS  = {".md", ".txt", ".yml", ".yaml", ".sh", ".xml"}
+    JAVA_EXTS = {".java"}
+
+    scope = args.scope
+    def is_target(path: str) -> bool:
+        ext = Path(path).suffix.lower()
+        if scope == "docs":  return ext in DOC_EXTS
+        if scope == "java":  return ext in JAVA_EXTS
+        return True  # "all"
+
+    state = json.loads(state_file.read_text())
+    changed = 0
+    for path, entry in state.items():
+        if is_target(path):
+            entry["chunkingVersion"] = 0
+            changed += 1
+
+    # Atomic write
+    tmp = state_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(state_file)
+
+    scope_label = {"docs": "document", "java": "Java", "all": "all"}[scope]
+    print(f"Invalidated embeddings for {changed} {scope_label} file(s) in '{args.project}'.")
+    print(f"Run './pharos index <path>' to re-embed only those files.")
+
+
 def cmd_daemon(args):
     """Manage the background daemon."""
     action = args.action
@@ -887,9 +938,10 @@ COMMANDS
   deps        Show dependencies of a module
   mod-path    Find dependency path between two modules
   boundary    Show entry/exit points of a module
-  skeleton    Show public/protected class and method signatures of a project
-  pipelines   List available search pipelines and their ids
-  daemon      Manage the background daemon (start|stop|restart|status|logs)
+  skeleton              Show public/protected class and method signatures of a project
+  pipelines             List available search pipelines and their ids
+  invalidate-embeddings Mark file embeddings as stale so the next incremental index re-embeds them
+  daemon                Manage the background daemon (start|stop|restart|status|logs)
 
 DAEMON
   pharos uses a persistent background JVM to avoid cold-start latency.
@@ -1238,6 +1290,34 @@ EXAMPLES
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_pipelines.set_defaults(func=cmd_pipelines)
+
+    # invalidate-embeddings
+    p_inv = sub.add_parser(
+        "invalidate-embeddings",
+        help="Mark file embeddings as stale so the next incremental index re-embeds them",
+        description="""\
+Set chunkingVersion=0 in file-state.json for the selected scope of files so that the
+next incremental index run detects them as embedding-outdated and re-embeds them,
+using the persistent embedding cache where texts are unchanged.
+
+Use this when you have changed chunking logic for a specific file type and want to
+force selective re-embedding without a full index rebuild.
+
+EXAMPLES
+  pharos invalidate-embeddings myproject                    # re-embed docs only (default)
+  pharos invalidate-embeddings myproject --scope java       # re-embed Java files only
+  pharos invalidate-embeddings myproject --scope all        # re-embed everything
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_inv.add_argument("project", help="Project name as shown in 'pharos projects'")
+    p_inv.add_argument(
+        "--scope",
+        choices=["docs", "java", "all"],
+        default="docs",
+        help="Which files to invalidate: docs (.md/.yml/etc), java (.java), or all (default: docs)",
+    )
+    p_inv.set_defaults(func=cmd_invalidate_embeddings)
 
     # daemon
     p_daemon = sub.add_parser(
