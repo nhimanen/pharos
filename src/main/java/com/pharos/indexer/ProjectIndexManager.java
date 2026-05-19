@@ -430,14 +430,16 @@ public class ProjectIndexManager {
                 })
                 .collect(Collectors.toList());
 
-        // Expand dirty set when embedding-version constants have changed (e.g. CHUNKING_VERSION bump).
-        // All tracked files that aren't already dirty are added so they get re-parsed and re-embedded.
-        // The persistent embedding cache eliminates redundant ONNX calls for unchanged texts.
+        // Expand dirty set for files whose embedding versions are individually stale
+        // (e.g. CHUNKING_VERSION bumped, or model changed, or invalidate-embeddings ran for
+        // a specific scope).  Only the per-file stale entries are added — files with current
+        // versions (e.g. Java files when only docs were invalidated) are left untouched.
         if (embeddingCache != null && stateTracker.hasOutdatedEmbeddings()) {
             Set<Path> dirtySet = new java.util.HashSet<>(dirtyFiles);
             List<Path> versionDirty = new ArrayList<>();
             for (Path tracked : stateTracker.trackedFiles()) {
-                if (!dirtySet.contains(tracked) && currentFiles.contains(tracked)) {
+                if (!dirtySet.contains(tracked) && currentFiles.contains(tracked)
+                        && stateTracker.isEmbeddingOutdated(tracked)) {
                     versionDirty.add(tracked);
                 }
             }

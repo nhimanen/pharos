@@ -256,6 +256,52 @@ class FileStateTrackerTest {
         assertThat(mismatch.hasOutdatedEmbeddings()).isTrue();
     }
 
+    // --- isEmbeddingOutdated (per-file) ---
+
+    @Test
+    void isEmbeddingOutdated_untrackedFile_returnsTrue() {
+        FileStateTracker tracker = new FileStateTracker(indexDir, 1, "model:4");
+        assertThat(tracker.isEmbeddingOutdated(sourceDir.resolve("Unknown.java"))).isTrue();
+    }
+
+    @Test
+    void isEmbeddingOutdated_currentVersion_returnsFalse() throws Exception {
+        Path file = Files.writeString(sourceDir.resolve("A.java"), "class A {}");
+        FileStateTracker tracker = new FileStateTracker(indexDir, 1, "model:4");
+        tracker.track(file);
+        assertThat(tracker.isEmbeddingOutdated(file)).isFalse();
+    }
+
+    @Test
+    void isEmbeddingOutdated_oldChunkingVersion_returnsTrue() throws Exception {
+        Path file = Files.writeString(sourceDir.resolve("A.java"), "class A {}");
+        FileStateTracker old = new FileStateTracker(indexDir, 0, "model:4");
+        old.track(file);
+        old.save();
+
+        FileStateTracker current = new FileStateTracker(indexDir, 1, "model:4");
+        assertThat(current.isEmbeddingOutdated(file)).isTrue();
+    }
+
+    @Test
+    void isEmbeddingOutdated_perFile_onlyAffectsFilesWithStaleVersion() throws Exception {
+        Path stale = Files.writeString(sourceDir.resolve("Stale.java"), "class Stale {}");
+        Path fresh = Files.writeString(sourceDir.resolve("Fresh.java"), "class Fresh {}");
+
+        // Track stale with old version, fresh with current version
+        FileStateTracker oldTracker = new FileStateTracker(indexDir, 0, "model:4");
+        oldTracker.track(stale);
+        oldTracker.save();
+
+        FileStateTracker currentTracker = new FileStateTracker(indexDir, 1, "model:4");
+        currentTracker.track(fresh);
+        currentTracker.save();
+
+        FileStateTracker checker = new FileStateTracker(indexDir, 1, "model:4");
+        assertThat(checker.isEmbeddingOutdated(stale)).isTrue();
+        assertThat(checker.isEmbeddingOutdated(fresh)).isFalse();
+    }
+
     @Test
     void backwardsCompat_legacyStateWithoutVersionFields_treatedAsOutdated() throws Exception {
         Path file = Files.writeString(sourceDir.resolve("A.java"), "class A {}");

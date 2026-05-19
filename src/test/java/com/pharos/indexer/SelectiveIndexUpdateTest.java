@@ -186,6 +186,34 @@ class SelectiveIndexUpdateTest {
         assertThat(embedder.callCount()).isGreaterThan(0);
     }
 
+    // ── Mixed scope: only stale files re-embedded, current-version files untouched
+
+    @Test
+    void versionBump_onlyStaleFilesReembedded_currentVersionFilesUntouched() throws Exception {
+        writeJava("A.java", "package com.example;\npublic class A { public void alpha() {} }");
+        writeJava("B.java", "package com.example;\npublic class B { public void beta() {} }");
+
+        // Full index: all files tracked with current CHUNKING_VERSION
+        indexManager.index(projectRoot, "test", false, true);
+
+        // Downgrade only B.java to version 0 — A.java stays at current version
+        downgradeChunkingVersionFor("test", "B.java");
+
+        // Incremental: hasOutdatedEmbeddings()=true, but isEmbeddingOutdated() is only true
+        // for B.java. A.java must NOT be processed at all.
+        embedder.reset();
+        indexManager.index(projectRoot, "test", true, true);
+
+        // Some texts were embedded (B.java's), but fewer than a full re-index of both files
+        int reembedCount = embedder.callCount();
+        assertThat(reembedCount).isGreaterThan(0);
+
+        // Re-run immediately: B.java is now at current version, nothing dirty → 0 calls
+        embedder.reset();
+        indexManager.index(projectRoot, "test", true, true);
+        assertThat(embedder.callCount()).isEqualTo(0);
+    }
+
     // ── After version bump + re-index, versions are updated ──────────────
 
     @Test
@@ -224,6 +252,22 @@ class SelectiveIndexUpdateTest {
         state = state.replace("\"chunkingVersion\":" + IndexVersions.CHUNKING_VERSION,
                               "\"chunkingVersion\":0");
         Files.writeString(stateFile, state);
+    }
+
+    /** Downgrades chunkingVersion to 0 only for tracked entries whose path contains {@code fileNameSubstring}. */
+    private void downgradeChunkingVersionFor(String projectName, String fileNameSubstring) throws IOException {
+        Path stateFile = indexDir.resolve(projectName + "/file-state.json");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> state = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(stateFile.toFile(), Map.class);
+        for (Map.Entry<String, Object> e : state.entrySet()) {
+            if (e.getKey().contains(fileNameSubstring)) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> entry = (Map<String, Object>) e.getValue();
+                entry.put("chunkingVersion", 0);
+            }
+        }
+        new com.fasterxml.jackson.databind.ObjectMapper().writeValue(stateFile.toFile(), state);
     }
 
     private ProjectIndexManager buildManager() {

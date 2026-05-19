@@ -113,9 +113,7 @@ public class FileStateTracker {
     /**
      * Returns true if any tracked file was last embedded with a different chunking version
      * or model fingerprint than the values this tracker was constructed with.
-     *
-     * <p>When true, the incremental index runner expands its dirty set to include all
-     * tracked files so they are re-parsed and re-embedded against the new versions.
+     * Use as a fast guard before iterating with {@link #isEmbeddingOutdated(Path)}.
      */
     public boolean hasOutdatedEmbeddings() {
         if (state.isEmpty()) return false;
@@ -123,6 +121,19 @@ public class FileStateTracker {
             if (s.chunkingVersion != currentChunkingVersion) return true;
             if (currentModelFingerprint != null && !currentModelFingerprint.equals(s.modelFingerprint)) return true;
         }
+        return false;
+    }
+
+    /**
+     * Returns true if this specific file was last embedded under a different chunking
+     * version or model fingerprint.  Use this for per-file decisions so that only
+     * individually stale files are added to the dirty set — not all tracked files.
+     */
+    public boolean isEmbeddingOutdated(Path file) {
+        FileState s = state.get(file.toAbsolutePath().toString());
+        if (s == null) return true;
+        if (s.chunkingVersion != currentChunkingVersion) return true;
+        if (currentModelFingerprint != null && !currentModelFingerprint.equals(s.modelFingerprint)) return true;
         return false;
     }
 
