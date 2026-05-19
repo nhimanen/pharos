@@ -64,7 +64,18 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 
 ### Incremental Indexing
 
-`FileStateTracker` records file modification times in `<index-dir>/<project>/state.json`. Re-indexing without `--full` only re-parses changed files, deletes their old Lucene documents by `filePath`, and inserts fresh ones. The call graph is always fully rebuilt (it's fast compared to parsing).
+`FileStateTracker` records file modification times in `<index-dir>/<project>/file-state.json`. Re-indexing without `--full` only re-parses changed files, deletes their old Lucene documents by `filePath`, and inserts fresh ones. The call graph is always fully rebuilt (it's fast compared to parsing).
+
+#### Selective re-embedding and the embedding cache
+
+`PersistentEmbeddingCache` stores `SHA-256(embeddingText) → float[]` on disk at `<index-dir>/<project>/embed-cache.bin`. Both full and incremental index runs check this cache before calling the ONNX provider; unchanged embedding texts are served from cache at zero cost. The cache is invalidated automatically when the embedding model URL or dimensions change.
+
+`IndexVersions.CHUNKING_VERSION` is an `int` constant in `indexer/IndexVersions.java`. **Bump it whenever chunking logic changes** (e.g. `DefaultChunker`, `chunkDocument`, `chunkMethodWithLines`). On the next incremental run, `FileStateTracker.hasOutdatedEmbeddings()` detects the mismatch, adds all tracked files to the dirty set, and re-embeds them. Single-chunk methods whose embedding text hasn't changed will be served from the persistent cache with no ONNX call.
+
+**Workflow when changing chunking:**
+1. Edit chunking logic in `DefaultChunker` (or related classes).
+2. Increment `CHUNKING_VERSION` in `indexer/IndexVersions.java`.
+3. Run `./pharos index <project>` — changed files re-embed via ONNX; unchanged single-chunk methods use cache.
 
 ### MCP Server
 
