@@ -88,7 +88,7 @@ public final class SearchPipeline {
         if (retrievers.size() == 1) {
             merged = candidates.get(0);
         } else {
-            merged = merger.merge(candidates, req.limit(), req.query(), trace);
+            merged = merger.merge(candidates, req, trace);
         }
 
         // ── Rerank ────────────────────────────────────────────────────────────

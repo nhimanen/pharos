@@ -29,7 +29,9 @@ public final class CrossEncoderMerger implements MergeStage {
 
     @Override
     public List<SearchResult> merge(List<List<SearchResult>> candidates,
-                                    int limit, String query, SearchTrace trace) {
+                                    com.pharos.search.SearchRequest req, SearchTrace trace) {
+        int limit = req.limit();
+        String query = req.query();
         long t = System.currentTimeMillis();
 
         Map<String, SearchResult> deduped = new LinkedHashMap<>();

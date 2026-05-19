@@ -1,5 +1,6 @@
 package com.pharos.search.pipeline;
 
+import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResult;
 import org.junit.jupiter.api.Test;
 
@@ -15,6 +16,11 @@ class BordaMergerTest {
                 "/Cls.java", 1, 10, score, searchType, "method");
     }
 
+    private static SearchRequest req(String query, int limit) {
+        return new SearchRequest(query, SearchRequest.SearchType.HYBRID, null, null,
+                limit, "text", null, null, 0);
+    }
+
     private final BordaMerger merger = new BordaMerger();
 
     @Test
@@ -26,9 +32,7 @@ class BordaMergerTest {
         List<SearchResult> kw  = List.of(a, b);
         List<SearchResult> vec = List.of(a, c);
 
-        List<SearchResult> merged = merger.merge(List.of(kw, vec), 10, "naturalLanguage", null);
-
-        // "a" appears in both — should rank first with agreement bonus
+        List<SearchResult> merged = merger.merge(List.of(kw, vec), req("naturalLanguage", 10), null);
         assertThat(merged.get(0).id()).isEqualTo("proj:a");
     }
 
@@ -39,7 +43,7 @@ class BordaMergerTest {
         List<SearchResult> vec = List.of(result("proj:4", 1f, "v"), result("proj:5", 0.9f, "v"),
                 result("proj:6", 0.8f, "v"));
 
-        List<SearchResult> merged = merger.merge(List.of(kw, vec), 2, "query", null);
+        List<SearchResult> merged = merger.merge(List.of(kw, vec), req("query", 2), null);
         assertThat(merged).hasSize(2);
     }
 
@@ -48,33 +52,30 @@ class BordaMergerTest {
         List<SearchResult> kw  = List.of(result("proj:a", 1f, "k"));
         List<SearchResult> vec = List.of();
 
-        List<SearchResult> merged = merger.merge(List.of(kw, vec), 10, "query", null);
+        List<SearchResult> merged = merger.merge(List.of(kw, vec), req("query", 10), null);
         assertThat(merged).hasSize(1);
         assertThat(merged.get(0).id()).isEqualTo("proj:a");
     }
 
     @Test
     void camelCaseQueryFavoursKeywordWeight() {
-        // CamelCase → keyword weight 0.8, vector 0.2
-        // If keyword has doc "a" at rank 1 and vector has "b" at rank 1 (no overlap),
-        // "a" should rank higher than "b" because kw weight > vec weight.
+        // Falls back to legacy CamelCase detection when no classification — kw 0.8 > vec 0.2
         SearchResult kwTop  = result("proj:a", 1f, "k");
         SearchResult vecTop = result("proj:b", 1f, "v");
 
         List<SearchResult> merged = merger.merge(
-                List.of(List.of(kwTop), List.of(vecTop)), 10, "BooleanQuery", null);
+                List.of(List.of(kwTop), List.of(vecTop)), req("BooleanQuery", 10), null);
 
         assertThat(merged.get(0).id()).isEqualTo("proj:a");
     }
 
     @Test
     void equalWeightForNLQuery() {
-        // NL → kw=0.5, vec=0.5; single-element lists → equal Borda points, order is insertion-stable
         SearchResult kw  = result("proj:a", 1f, "k");
         SearchResult vec = result("proj:b", 1f, "v");
 
         List<SearchResult> merged = merger.merge(
-                List.of(List.of(kw), List.of(vec)), 10, "find methods that parse json", null);
+                List.of(List.of(kw), List.of(vec)), req("find methods that parse json", 10), null);
 
         assertThat(merged).hasSize(2);
     }
@@ -83,7 +84,7 @@ class BordaMergerTest {
     void searchTypeSetToHybrid() {
         SearchResult a = result("proj:a", 1f, "keyword");
         List<SearchResult> merged = merger.merge(
-                List.of(List.of(a), List.of(a)), 10, "query", null);
+                List.of(List.of(a), List.of(a)), req("query", 10), null);
         assertThat(merged.get(0).searchType()).isEqualTo("hybrid");
     }
 
@@ -104,7 +105,7 @@ class BordaMergerTest {
         SearchResult c = result("proj:c", 1f, "s3");
 
         List<SearchResult> merged = merger.merge(
-                List.of(List.of(a), List.of(b), List.of(c)), 10, "anything", null);
+                List.of(List.of(a), List.of(b), List.of(c)), req("anything", 10), null);
 
         assertThat(merged).hasSize(3);
     }

@@ -51,7 +51,7 @@ class SearchPipelineTest {
         SearchResult b = result("proj:b", 0.5f);
         RetrievalStage r1 = (reader, req, trace) -> List.of(a);
         RetrievalStage r2 = (reader, req, trace) -> List.of(b);
-        MergeStage merger = (lists, limit, query, trace) -> List.of(a, b);
+        MergeStage merger = (lists, req, trace) -> List.of(a, b);
 
         SearchPipeline pipeline = SearchPipeline.builder()
                 .retriever(r1).retriever(r2).merger(merger).build();
@@ -117,7 +117,7 @@ class SearchPipelineTest {
 
         RetrievalStage r1 = (reader, req, trace) -> List.of(a);
         RetrievalStage r2 = (reader, req, trace) -> List.of(b);
-        MergeStage merger = (lists, limit, query, trace) -> {
+        MergeStage merger = (lists, req, trace) -> {
             lists.forEach(l -> seenInputs.add(new ArrayList<>(l)));
             return List.of(a, b);
         };
