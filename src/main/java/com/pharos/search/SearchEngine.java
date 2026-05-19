@@ -159,16 +159,20 @@ public class SearchEngine {
         SearchPipeline kwPipeline = SearchPipeline.builder().retriever(kwStage).build();
         SearchPipeline hyPipeline = SearchPipeline.builder()
                 .retriever(kwStage).retriever(vecStage).merger(borda).build();
+        SearchPipeline hyRePipeline = SearchPipeline.builder()
+                .retriever(kwStage).retriever(vecStage).merger(borda).reranker(ceReranker).build();
 
         Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
 
-        // AUTO: QueryRouter classifies once, RouterDispatcher picks the right child pipeline
+        // AUTO: QueryRouter classifies once, RouterDispatcher picks the right child pipeline.
+        // CONFIG intent → hybrid-reranked: CE bridges vocabulary gaps ("configure" ↔ "set", etc.)
         map.put(SearchRequest.SearchType.AUTO,
                 SearchPipeline.builder()
                         .router(queryRouter)
                         .retriever(new RouterDispatcher(
-                                Map.of(SearchRequest.SearchType.KEYWORD, kwPipeline,
-                                       SearchRequest.SearchType.HYBRID,  hyPipeline),
+                                Map.of(SearchRequest.SearchType.KEYWORD,         kwPipeline,
+                                       SearchRequest.SearchType.HYBRID,          hyPipeline,
+                                       SearchRequest.SearchType.HYBRID_RERANKED, hyRePipeline),
                                 SearchRequest.SearchType.HYBRID))
                         .build());
 
