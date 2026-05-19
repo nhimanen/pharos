@@ -231,6 +231,65 @@ class DocumentMapperTest {
         assertThat(DocumentMapper.computeScope("/src/main/java/Foo.java", true)).isEqualTo("docs");
     }
 
+    // --- classType field ---
+
+    @Test
+    void toClassDocument_classType_concreteClass() {
+        ParsedClass cls = new ParsedClass(
+                PROJECT, "com.example", "Calculator", "com.example.Calculator",
+                "class", null, List.of(), List.of(),
+                "public", false /*isAbstract*/, false, null, "/src/C.java", 1, 10);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("class");
+    }
+
+    @Test
+    void toClassDocument_classType_abstractClass() {
+        ParsedClass cls = new ParsedClass(
+                PROJECT, "com.example", "BaseProcessor", "com.example.BaseProcessor",
+                "class", null, List.of(), List.of(),
+                "public", true /*isAbstract*/, false, null, "/src/BP.java", 1, 20);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("abstract");
+    }
+
+    @Test
+    void toClassDocument_classType_interface() {
+        ParsedClass cls = new ParsedClass(
+                PROJECT, "com.example", "Collector", "com.example.Collector",
+                "interface", null, List.of(), List.of(),
+                "public", false, false, null, "/src/Collector.java", 1, 5);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("interface");
+    }
+
+    @Test
+    void toClassDocument_classType_enum() {
+        ParsedClass cls = new ParsedClass(
+                PROJECT, "com.example", "Status", "com.example.Status",
+                "enum", null, List.of(), List.of(),
+                "public", false, false, null, "/src/Status.java", 1, 8);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("enum");
+    }
+
+    @Test
+    void toClassDocument_classType_record() {
+        ParsedClass cls = new ParsedClass(
+                PROJECT, "com.example", "Point", "com.example.Point",
+                "record", null, List.of(), List.of(),
+                "public", false, false, null, "/src/Point.java", 1, 3);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("record");
+    }
+
+    @Test
+    void toDocument_method_hasNoClassTypeField() {
+        Document doc = DocumentMapper.toDocument(testMethod(), null, 0, List.of());
+        // method documents must not carry a classType — field is class-only
+        assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isNull();
+    }
+
     private static ParsedClass testClass() {
         return new ParsedClass(
                 PROJECT, "com.example", "Calculator", "com.example.Calculator",

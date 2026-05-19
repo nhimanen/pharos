@@ -450,4 +450,85 @@ class KeywordSearchStrategyTest {
     private void openReader() throws IOException {
         reader = DirectoryReader.open(dir);
     }
+
+    // ── classTypeBonus ────────────────────────────────────────────────────────
+
+    @Test
+    void classTypeBonus_neutralWhenNoIntent() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", null)).isEqualTo(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus(null, "INTERFACE")).isEqualTo(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus(null, null)).isEqualTo(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_interfaceIntent_boostsInterfaceAndAbstract() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", "INTERFACE")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("abstract",  "INTERFACE")).isGreaterThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_interfaceIntent_interfaceHighestBoost() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", "INTERFACE"))
+            .isGreaterThan(KeywordSearchStrategy.classTypeBonus("abstract", "INTERFACE"));
+    }
+
+    @Test
+    void classTypeBonus_interfaceIntent_penalizesConcreteClass() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("class", "INTERFACE")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_abstractIntent_abstractHighestBoost() {
+        float a = KeywordSearchStrategy.classTypeBonus("abstract",  "ABSTRACT");
+        float i = KeywordSearchStrategy.classTypeBonus("interface", "ABSTRACT");
+        assertThat(a).isGreaterThan(1.0f);
+        assertThat(a).isGreaterThan(i);
+    }
+
+    @Test
+    void classTypeBonus_abstractIntent_penalizesConcreteClass() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("class", "ABSTRACT")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_enumIntent_onlyBoostsEnum() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("enum",      "ENUM")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("class",     "ENUM")).isLessThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", "ENUM")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_recordIntent_onlyBoostsRecord() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("record",    "RECORD")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("class",     "RECORD")).isLessThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", "RECORD")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_annotationIntent_onlyBoostsAnnotation() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("annotation", "ANNOTATION")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("class",      "ANNOTATION")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_implementationIntent_boostsConcreteTypes() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("class",  "IMPLEMENTATION")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("enum",   "IMPLEMENTATION")).isGreaterThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("record", "IMPLEMENTATION")).isGreaterThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_implementationIntent_penalizesAbstractAndInterface() {
+        assertThat(KeywordSearchStrategy.classTypeBonus("abstract",  "IMPLEMENTATION")).isLessThan(1.0f);
+        assertThat(KeywordSearchStrategy.classTypeBonus("interface", "IMPLEMENTATION")).isLessThan(1.0f);
+    }
+
+    @Test
+    void classTypeBonus_unrelatedIntentsAreNeutral() {
+        for (String classType : new String[]{"interface", "abstract", "class", "enum", "record"}) {
+            assertThat(KeywordSearchStrategy.classTypeBonus(classType, "BEHAVIORAL")).isEqualTo(1.0f);
+            assertThat(KeywordSearchStrategy.classTypeBonus(classType, "CONFIG")).isEqualTo(1.0f);
+            assertThat(KeywordSearchStrategy.classTypeBonus(classType, "KEYWORD")).isEqualTo(1.0f);
+        }
+    }
 }

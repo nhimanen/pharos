@@ -13,11 +13,21 @@ which method,BEHAVIORAL,
 interface for,INTERFACE,class
 interface to,INTERFACE,class
 interface that,INTERFACE,class
-abstract class for,INTERFACE,class
-abstract class that,INTERFACE,class
-base class for,INTERFACE,class
-superclass for,INTERFACE,class
-parent class for,INTERFACE,class
+abstract class for,ABSTRACT,class
+abstract class that,ABSTRACT,class
+base class for,ABSTRACT,class
+superclass for,ABSTRACT,class
+parent class for,ABSTRACT,class
+abstract base,ABSTRACT,class
+enum for,ENUM,class
+enum that,ENUM,class
+enum representing,ENUM,class
+enum with,ENUM,class
+record for,RECORD,class
+record that,RECORD,class
+data class for,RECORD,class
+annotation for,ANNOTATION,class
+annotation that,ANNOTATION,class
 method that,JAVADOC,
 method which,JAVADOC,
 returns the,JAVADOC,
@@ -59,6 +69,11 @@ resolves field,JAVADOC,
 normalises the,JAVADOC,
 class that,JAVADOC,
 collector that,JAVADOC,
+implementation of,IMPLEMENTATION,class
+concrete implementation,IMPLEMENTATION,class
+implementing class,IMPLEMENTATION,class
+class that implements,IMPLEMENTATION,class
+class which implements,IMPLEMENTATION,class
 configure the,CONFIG,
 configure maximum,CONFIG,
 configure ranking,CONFIG,

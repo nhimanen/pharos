@@ -63,6 +63,15 @@ public class DocumentMapper {
      * Values: "method" | "class"
      */
     public static final String F_DOC_TYPE          = "docType";
+    /**
+     * Class-type discriminator for class documents — not stored for method/chunk documents.
+     * Values: {@code "interface"}, {@code "abstract"}, {@code "enum"}, {@code "record"},
+     * {@code "annotation"}, {@code "class"} (concrete).
+     * Used by {@link com.pharos.search.KeywordSearchStrategy#classTypeBonus} to boost
+     * abstract/interface results when the query intent is {@code INTERFACE}, and to
+     * boost concrete classes when intent is {@code IMPLEMENTATION}.
+     */
+    public static final String F_CLASS_TYPE        = "classType";
 
     /**
      * Source scope of the document.
@@ -500,6 +509,23 @@ public class DocumentMapper {
     }
 
     /**
+     * Derives the {@link #F_CLASS_TYPE} value from a parsed class.
+     * Merges {@code kind} and {@code isAbstract} into a single searchable token:
+     * {@code interface}, {@code abstract}, {@code enum}, {@code record},
+     * {@code annotation}, or {@code class} (concrete).
+     */
+    private static String classTypeOf(com.pharos.parser.model.ParsedClass cls) {
+        if (cls.kind() == null) return "class";
+        return switch (cls.kind()) {
+            case "interface"   -> "interface";
+            case "enum"        -> "enum";
+            case "record"      -> "record";
+            case "annotation"  -> "annotation";
+            default            -> cls.isAbstract() ? "abstract" : "class";
+        };
+    }
+
+    /**
      * Splits a camelCase or underscore-separated identifier into lowercase words.
      * Examples:
      *   "getUserById"      → "get user by id"
@@ -560,6 +586,8 @@ public class DocumentMapper {
         // Store kind ("class", "interface", "enum", "record", "annotation") and superclass for display
         doc.add(new StringField("kind", nvl(cls.kind()), Field.Store.YES));
         doc.add(new StringField("superclass", nvl(cls.superclass()), Field.Store.YES));
+        // classType: merges kind + isAbstract into one field for boosting/filtering
+        doc.add(new StringField(F_CLASS_TYPE, classTypeOf(cls), Field.Store.YES));
 
         // --- Full-text fields ---
         doc.add(new TextField(F_CLASS_NAME, nvl(cls.className()), Field.Store.YES));

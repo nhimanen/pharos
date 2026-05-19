@@ -228,8 +228,9 @@ public class KeywordSearchStrategy {
         Query query = buildQuery(req);
         if (query == null) return List.of();
 
+        String intent = req.classification() != null ? req.classification().intent() : null;
         TopDocs hits = searcher.search(query, req.limit());
-        return toResults(searcher, hits, "keyword");
+        return toResults(searcher, hits, "keyword", intent);
     }
 
     /**
@@ -508,7 +509,20 @@ public class KeywordSearchStrategy {
         return false;
     }
 
+    /** Backward-compatible overload — no intent, classTypeBonus is neutral. */
     public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits, String type) throws IOException {
+        return toResults(searcher, hits, type, null);
+    }
+
+    /**
+     * Converts TopDocs to SearchResult list, applying in-degree boost, source-path penalty,
+     * doc-type bonus, {@link #classTypeBonus} (using {@code intent}), and access multiplier.
+     *
+     * @param intent the detected query intent (e.g. {@code "INTERFACE"}, {@code "IMPLEMENTATION"});
+     *               null disables classType boosting
+     */
+    public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits,
+                                               String type, String intent) throws IOException {
         if (hits.scoreDocs.length == 0) return List.of();
 
         StoredFields storedFields = searcher.storedFields();
@@ -525,7 +539,7 @@ public class KeywordSearchStrategy {
         }
 
         // Second pass: apply log-normalized in-degree boost + source-path penalty
-        //   + doc-type bonus (class > method) + access-modifier multiplier, then re-sort
+        //   + doc-type bonus (class > method) + classType bonus + access multiplier, then re-sort
         final int maxDeg = maxInDegree;
         return rawHits.stream()
                 .map(hit -> {
@@ -534,10 +548,11 @@ public class KeywordSearchStrategy {
                     String filePath  = hit.doc().get(DocumentMapper.F_FILE_PATH);
                     float penalty    = sourcePathPenalty(filePath);
                     float typeBonus  = docTypeBonus(hit.doc().get(DocumentMapper.F_DOC_TYPE), filePath);
+                    float ctBonus    = classTypeBonus(hit.doc().get(DocumentMapper.F_CLASS_TYPE), intent);
                     float accessMult = accessMultiplier(hit.doc().get(DocumentMapper.F_ACCESS));
                     float boostedScore = hit.rawScore()
                             * (1.0f + GRAPH_BOOST_WEIGHT * normBoost)
-                            * penalty * typeBonus * accessMult;
+                            * penalty * typeBonus * ctBonus * accessMult;
                     return docToResult(hit.doc(), boostedScore, type);
                 })
                 .sorted(Comparator.comparingDouble(SearchResult::score).reversed())
@@ -592,6 +607,71 @@ public class KeywordSearchStrategy {
             if (p.contains("/src/test/") || p.contains("/test/")) return 1.0f; // test classes don't get class bonus
         }
         return 1.8f;
+    }
+
+    /**
+     * Multiplier by {@link com.pharos.indexer.DocumentMapper#F_CLASS_TYPE} and query intent.
+     *
+     * <p>Intent → classType boost table:
+     * <pre>
+     *   INTERFACE:    interface 3.0×, abstract 1.8×, class 0.7×
+     *   ABSTRACT:     abstract 3.0×, interface 1.8×, class 0.7×
+     *   ENUM:         enum 3.0×, class 0.8×, other 0.6×
+     *   RECORD:       record 3.0×, class 0.8×, other 0.6×
+     *   ANNOTATION:   annotation 3.0×, interface 0.9×, class 0.7×
+     *   IMPLEMENTATION: class 2.5×, enum/record 1.5×, abstract 0.7×, interface 0.4×
+     * </pre>
+     *
+     * <p>Returns 1.0 for all other intents or when {@code classType} is null
+     * (method documents do not have a classType field).
+     */
+    static float classTypeBonus(String classType, String intent) {
+        if (classType == null || intent == null) return 1.0f;
+        return switch (intent) {
+            // Java interface: pure interfaces get maximum boost; abstract classes still relevant
+            case "INTERFACE" -> switch (classType) {
+                case "interface"   -> 3.0f;
+                case "abstract"    -> 1.8f;
+                case "class"       -> 0.7f;
+                default            -> 1.0f;
+            };
+            // Abstract class: abstract types get maximum boost; interfaces also conceptually valid
+            case "ABSTRACT" -> switch (classType) {
+                case "abstract"    -> 3.0f;
+                case "interface"   -> 1.8f;
+                case "class"       -> 0.7f;
+                default            -> 1.0f;
+            };
+            // Enum: strongly filter to enum types; other class types unlikely to be relevant
+            case "ENUM" -> switch (classType) {
+                case "enum"        -> 3.0f;
+                case "class"       -> 0.8f;
+                default            -> 0.6f;
+            };
+            // Record: strongly filter to record types
+            case "RECORD" -> switch (classType) {
+                case "record"      -> 3.0f;
+                case "class"       -> 0.8f;
+                default            -> 0.6f;
+            };
+            // Annotation: strongly filter to annotation types
+            case "ANNOTATION" -> switch (classType) {
+                case "annotation"  -> 3.0f;
+                case "interface"   -> 0.9f;  // annotations are @interface internally
+                case "class"       -> 0.7f;
+                default            -> 0.6f;
+            };
+            // Concrete implementation: boost non-abstract classes
+            case "IMPLEMENTATION" -> switch (classType) {
+                case "class"       -> 2.5f;
+                case "enum",
+                     "record"      -> 1.5f;  // enums/records are concrete, still valid
+                case "abstract"    -> 0.7f;
+                case "interface"   -> 0.4f;
+                default            -> 1.0f;
+            };
+            default -> 1.0f;
+        };
     }
 
     /**

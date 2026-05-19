@@ -80,12 +80,12 @@ public class FstQueryClassifier implements QueryRouter {
 
     private static QueryClassification mapIntent(String intent, String docType) {
         SearchRequest.SearchType type = switch (intent) {
-            case "BEHAVIORAL", "INTERFACE" -> SearchRequest.SearchType.HYBRID;
-            // CONFIG queries have vocabulary gaps between query description and method names/javadoc.
-            // The CE reranker bridges synonyms ("configure" ↔ "set", "pool" ↔ "per host") that
-            // BM25 cannot match. Route to hybrid-reranked so the CE runs over a hybrid pool.
-            case "CONFIG"                  -> SearchRequest.SearchType.HYBRID_RERANKED;
-            default                        -> SearchRequest.SearchType.KEYWORD;
+            case "BEHAVIORAL",
+                 "INTERFACE", "ABSTRACT",
+                 "ENUM", "RECORD", "ANNOTATION",
+                 "IMPLEMENTATION"              -> SearchRequest.SearchType.HYBRID;
+            case "CONFIG"                      -> SearchRequest.SearchType.HYBRID_RERANKED;
+            default                            -> SearchRequest.SearchType.KEYWORD;
         };
         return QueryClassification.of(type, docType, intent);
     }
