@@ -25,6 +25,7 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
@@ -516,6 +517,43 @@ public class SearchEngine {
     /** Look up a method by its exact FQN (e.g., "com.example.MyClass#myMethod(String,int)"). */
     public SearchResult getMethodByFqn(String fqn) throws IOException {
         return getByFqn(fqn);
+    }
+
+    /**
+     * Partial FQN lookup for when parameter types are omitted.
+     * Accepts "pkg.Class#method" or "Class#method" — the "#" must be present.
+     * Returns all matching methods (may be multiple overloads).
+     *
+     * <p>Uses a PrefixQuery on the {@code F_ID} StringField (format:
+     * {@code "project:qualifiedClass#methodName("}) — not analyzed, so the
+     * fully-qualified class name is matched exactly.
+     */
+    public List<SearchResult> findMethodsByPartialFqn(String partialFqn) throws IOException {
+        int hash = partialFqn.indexOf('#');
+        if (hash < 0) return List.of();
+        String className  = partialFqn.substring(0, hash);
+        String methodName = partialFqn.substring(hash + 1);
+        if (className.isEmpty() || methodName.isEmpty()) return List.of();
+
+        List<String> projects = registry.listAll().stream()
+                .map(ProjectMeta::getName).collect(Collectors.toList());
+        if (projects.isEmpty()) return List.of();
+
+        IndexReader reader = luceneIndexer.openMultiReader(projects);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        // F_ID is a StringField (not analyzed): "project:qualifiedClass#methodName(params)"
+        // A PrefixQuery on "project:qualifiedClass#methodName(" matches all overloads.
+        BooleanQuery.Builder qb = new BooleanQuery.Builder();
+        for (String project : projects) {
+            String idPrefix = project + ":" + className + "#" + methodName + "(";
+            qb.add(new PrefixQuery(new Term(DocumentMapper.F_ID, idPrefix)),
+                    BooleanClause.Occur.SHOULD);
+        }
+        qb.setMinimumNumberShouldMatch(1);
+
+        TopDocs hits = searcher.search(qb.build(), 50);
+        return KeywordSearchStrategy.toResults(searcher, hits, "exact");
     }
 
     /**

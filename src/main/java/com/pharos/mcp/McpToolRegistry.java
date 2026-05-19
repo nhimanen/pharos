@@ -474,6 +474,16 @@ public class McpToolRegistry {
         String fqn = args.path("fqn").asText();
         Map<String, SearchResult> found = searchEngine.getByFqns(List.of(fqn));
         SearchResult r = found.get(fqn);
+        if (r == null && fqn.contains("#") && !fqn.contains("(")) {
+            // Partial FQN — parameter types omitted. Try name-only lookup.
+            List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
+            if (candidates.isEmpty()) return "Method not found: " + fqn;
+            if (candidates.size() == 1) return mapper.writeValueAsString(resultToMap(candidates.get(0)));
+            String list = candidates.stream()
+                    .map(c -> c.id().substring(c.project().length() + 1))
+                    .collect(Collectors.joining(", "));
+            return "Ambiguous FQN — " + candidates.size() + " overloads found. Include parameter types: " + list;
+        }
         if (r == null) return "Method not found: " + fqn;
         return mapper.writeValueAsString(resultToMap(r));
     }

@@ -173,6 +173,22 @@ public class WebServer {
             String fqn = ctx.queryParam("fqn");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
             SearchResult r = searchEngine.getMethodByFqn(fqn);
+            if (r == null && fqn.contains("#") && !fqn.contains("(")) {
+                // Partial FQN — parameter types omitted. Try name-only lookup.
+                List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
+                if (candidates.isEmpty()) {
+                    ctx.status(404).result("Not found"); return;
+                } else if (candidates.size() == 1) {
+                    ctx.json(methodToMap(candidates.get(0))); return;
+                } else {
+                    String list = candidates.stream()
+                            .map(c -> "  " + c.id().substring(c.project().length() + 1))
+                            .collect(Collectors.joining("\n"));
+                    ctx.status(400).result(
+                            "Ambiguous FQN — " + candidates.size() + " overloads found. Include parameter types:\n" + list);
+                    return;
+                }
+            }
             if (r == null) { ctx.status(404).result("Not found"); return; }
             ctx.json(methodToMap(r));
         });
