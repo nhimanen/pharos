@@ -16,6 +16,7 @@ import com.pharos.search.pipeline.DiversityReranker;
 import com.pharos.search.pipeline.KeywordRetrievalStage;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import com.pharos.search.pipeline.PipelineDescriptor;
+import com.pharos.search.pipeline.RouterDispatcher;
 import com.pharos.search.pipeline.SearchPipeline;
 import com.pharos.search.pipeline.VectorRetrievalStage;
 import org.apache.lucene.document.Document;
@@ -117,7 +118,7 @@ public class SearchEngine {
     private final KeywordSearchStrategy keywordStrategy;
     private final VectorSearchStrategy  vectorStrategy;
     private final EmbeddingProvider     embedder;
-    private final QueryClassifier queryClassifier;
+    private final QueryRouter queryRouter;
     private final ZeroResultAdvisor zeroResultAdvisor;
     private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
     private final List<PipelineDescriptor> pipelineDescriptors;
@@ -134,11 +135,11 @@ public class SearchEngine {
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry, CrossEncoder crossEncoder,
-                        QueryClassifier queryClassifier) {
+                        QueryRouter queryRouter) {
         this.luceneIndexer = luceneIndexer;
         this.registry      = registry;
         this.embedder      = embedder;
-        this.queryClassifier = queryClassifier;
+        this.queryRouter   = queryRouter;
 
         KeywordSearchStrategy kw  = new KeywordSearchStrategy();
         this.keywordStrategy = kw;
@@ -154,9 +155,27 @@ public class SearchEngine {
         CrossEncoderReranker   ceReranker    = new CrossEncoderReranker(crossEncoder);
         DiversityReranker      diversityReranker = new DiversityReranker(0.5f);
 
+        // Child pipelines for the auto dispatcher (no router — classification already on req)
+        SearchPipeline kwPipeline = SearchPipeline.builder().retriever(kwStage).build();
+        SearchPipeline hyPipeline = SearchPipeline.builder()
+                .retriever(kwStage).retriever(vecStage).merger(borda).build();
+
         Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
+
+        // AUTO: QueryRouter classifies once, RouterDispatcher picks the right child pipeline
+        map.put(SearchRequest.SearchType.AUTO,
+                SearchPipeline.builder()
+                        .router(queryRouter)
+                        .retriever(new RouterDispatcher(
+                                Map.of(SearchRequest.SearchType.KEYWORD, kwPipeline,
+                                       SearchRequest.SearchType.HYBRID,  hyPipeline),
+                                SearchRequest.SearchType.HYBRID))
+                        .build());
+
+        // UNIFIED: QueryRouter classifies once, UnifiedRetrievalStage reads intent for adaptive weights
         map.put(SearchRequest.SearchType.UNIFIED,
-                SearchPipeline.builder().retriever(unifiedStage).build());
+                SearchPipeline.builder().router(queryRouter).retriever(unifiedStage).build());
+
         map.put(SearchRequest.SearchType.KEYWORD,
                 SearchPipeline.builder().retriever(kwStage).build());
         map.put(SearchRequest.SearchType.VECTOR,
@@ -176,6 +195,8 @@ public class SearchEngine {
         boolean vecAvailable = embedder.isAvailable();
         boolean ceAvailable  = crossEncoder.isAvailable();
         this.pipelineDescriptors = List.of(
+            new PipelineDescriptor("auto",           "Auto",
+                    "Automatically selects Keyword or Hybrid based on query shape", true),
             new PipelineDescriptor("keyword",        "Keyword (BM25)",
                     "BM25 keyword search with field boosts and graph in-degree scoring", true),
             new PipelineDescriptor("vector",         "Semantic (Vector)",
@@ -261,19 +282,9 @@ public class SearchEngine {
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
+        // Classification for AUTO and UNIFIED is now handled inside SearchPipeline via QueryRouter.
+        // For other types, resolvedType is simply req.type(); the pipeline runs as configured.
         SearchRequest.SearchType resolvedType = req.type();
-        if (resolvedType == SearchRequest.SearchType.AUTO) {
-            QueryClassification classification = queryClassifier.classify(hints.cleanedQuery());
-            resolvedType = classification.type();
-            // Apply docType filter from classifier only when the caller has not set one
-            if (classification.docType() != null && req.docType() == null) {
-                req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
-                        req.limit(), req.outputFormat(), classification.docType(), req.scope(),
-                        req.oversampleFactor());
-            }
-            log.debug("AUTO classified '{}' → {} docType={}", hints.cleanedQuery(),
-                    resolvedType, classification.docType());
-        }
         final String resolvedTypeName = resolvedType.name().toLowerCase();
 
         // Query-type-adaptive candidate pool: when the caller hasn't set an explicit

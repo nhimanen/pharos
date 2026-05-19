@@ -3,32 +3,52 @@ package com.pharos.search;
 import java.util.List;
 
 /**
- * Parameters for a code search query.
+ * Parameters for a code search query, including an optional {@link QueryClassification}
+ * populated by the {@link QueryRouter} at the start of pipeline execution.
  */
 public record SearchRequest(
         String query,
         SearchType type,
-        String project,        // null = search all projects
-        List<String> projects, // explicit list of projects (null = all from registry)
+        String project,              // null = search all projects
+        List<String> projects,       // explicit list of projects (null = all from registry)
         int limit,
-        String outputFormat,   // "text" or "json"
-        String docType,        // null = all, "method", "class", "chunk"
-        String scope,          // null = all, "prod", "test", "docs"
-        int oversampleFactor   // 0 = use pipeline default; >0 overrides retriever fetch multiplier
+        String outputFormat,         // "text" or "json"
+        String docType,              // null = all, "method", "class", "chunk"
+        String scope,                // null = all, "prod", "test", "docs"
+        int oversampleFactor,        // 0 = use pipeline default; >0 overrides retriever fetch multiplier
+        QueryClassification classification  // null until a QueryRouter runs; read-only after that
 ) {
+    /** Backward-compatible constructor without classification (most callers use this). */
+    public SearchRequest(String query, SearchType type, String project, List<String> projects,
+                         int limit, String outputFormat, String docType, String scope,
+                         int oversampleFactor) {
+        this(query, type, project, projects, limit, outputFormat, docType, scope, oversampleFactor, null);
+    }
+
+    /**
+     * Returns a copy with the given classification attached.
+     * If the classification carries a docType and none was set on this request,
+     * the classification's docType is applied (intent-driven filter injection).
+     */
+    public SearchRequest withClassification(QueryClassification c) {
+        String effectiveDocType = (docType == null && c.docType() != null) ? c.docType() : docType;
+        return new SearchRequest(query, type, project, projects, limit, outputFormat,
+                effectiveDocType, scope, oversampleFactor, c);
+    }
+
     public enum SearchType {
-        /** Automatically select KEYWORD or HYBRID based on query shape. Resolved by {@link QueryClassifier} before dispatch. */
+        /** Automatically select KEYWORD or HYBRID based on query shape — dispatched by {@link QueryRouter}. */
         AUTO,
-        /** Single BM25 pass with late-interaction vector similarity as a multiplicative boost — one unified result list. */
+        /** Single BM25∪KNN pass with late-interaction vector reranking and adaptive BM25/vector weights. */
         UNIFIED,
         KEYWORD, VECTOR, HYBRID,
         /** BordaMerge followed by cross-encoder reranking. Degrades to HYBRID when no encoder is configured. */
         HYBRID_RERANKED,
-        /** Cross-encoder scores all candidates and acts as the merge step. Degrades to deduplicated pool when no encoder is configured. */
+        /** Cross-encoder scores all candidates and acts as the merge step. */
         HYBRID_CROSS_ENCODER_MERGE,
         /** Borda-merge followed by doc-type diversity reranking. Always available. */
         HYBRID_DIVERSE,
-        /** Borda-merge → cross-encoder reranking → doc-type diversity reranking. CE step degrades gracefully when no encoder is configured. */
+        /** Borda-merge → cross-encoder reranking → doc-type diversity reranking. */
         HYBRID_RERANKED_DIVERSE;
 
         public static SearchType from(String s) {

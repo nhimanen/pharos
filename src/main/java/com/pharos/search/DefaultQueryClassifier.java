@@ -19,7 +19,7 @@ import java.util.Set;
  *   <li>Default → HYBRID (safe for short ambiguous queries)</li>
  * </ol>
  */
-public class DefaultQueryClassifier implements QueryClassifier {
+public class DefaultQueryClassifier implements QueryRouter {
 
     /**
      * Words that signal natural-language or command intent rather than code identifiers.
@@ -74,6 +74,6 @@ public class DefaultQueryClassifier implements QueryClassifier {
         return hy();
     }
 
-    private static QueryClassification kw() { return QueryClassification.of(SearchRequest.SearchType.KEYWORD); }
-    private static QueryClassification hy() { return QueryClassification.of(SearchRequest.SearchType.HYBRID); }
+    private static QueryClassification kw() { return QueryClassification.of(SearchRequest.SearchType.KEYWORD, null, "KEYWORD"); }
+    private static QueryClassification hy() { return QueryClassification.of(SearchRequest.SearchType.HYBRID, null, "HYBRID"); }
 }

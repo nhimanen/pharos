@@ -32,13 +32,15 @@ class FstQueryClassifierTest {
     @Test void javadoc_returnsThe() {
         var r = classifier.classify("returns the number of deleted documents in a segment");
         assertThat(r.type()).isEqualTo(SearchRequest.SearchType.KEYWORD);
-        assertThat(r.docType()).isEqualTo("method");
+        assertThat(r.intent()).isEqualTo("JAVADOC");
+        assertThat(r.docType()).isNull(); // docType filter removed from JAVADOC — too narrow
     }
 
     @Test void javadoc_methodThat() {
         var r = classifier.classify("method that tracks top scoring documents");
         assertThat(r.type()).isEqualTo(SearchRequest.SearchType.KEYWORD);
-        assertThat(r.docType()).isEqualTo("method");
+        assertThat(r.intent()).isEqualTo("JAVADOC");
+        assertThat(r.docType()).isNull();
     }
 
     @Test void config_setMaximum() {

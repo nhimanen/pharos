@@ -33,7 +33,7 @@ import java.util.Set;
  *   <li>Default → HYBRID</li>
  * </ol>
  */
-public class FstQueryClassifier implements QueryClassifier {
+public class FstQueryClassifier implements QueryRouter {
 
     private static final Logger log = LoggerFactory.getLogger(FstQueryClassifier.class);
 
@@ -79,63 +79,57 @@ public class FstQueryClassifier implements QueryClassifier {
     }
 
     private static QueryClassification mapIntent(String intent, String docType) {
-        return switch (intent) {
-            case "BEHAVIORAL" -> QueryClassification.of(SearchRequest.SearchType.HYBRID, docType);
-            case "INTERFACE"  -> QueryClassification.of(SearchRequest.SearchType.HYBRID, docType);
-            case "JAVADOC"    -> QueryClassification.of(SearchRequest.SearchType.KEYWORD, docType);
-            case "CONFIG"     -> QueryClassification.of(SearchRequest.SearchType.KEYWORD, docType);
-            case "LIFECYCLE"  -> QueryClassification.of(SearchRequest.SearchType.KEYWORD, docType);
-            default           -> QueryClassification.of(SearchRequest.SearchType.HYBRID, docType);
+        SearchRequest.SearchType type = switch (intent) {
+            case "BEHAVIORAL", "INTERFACE" -> SearchRequest.SearchType.HYBRID;
+            default                        -> SearchRequest.SearchType.KEYWORD;
         };
+        return QueryClassification.of(type, docType, intent);
     }
 
     private static QueryClassification heuristic(String query) {
         String q = query.trim();
 
-        // Rule 1: single token
-        if (!q.contains(" ")) return kw();
+        // Rule 1: single token → KEYWORD (exact identifier)
+        if (!q.contains(" ")) return kw("KEYWORD");
 
         // Rule 2: FQN
-        if (q.contains("#")) return kw();
+        if (q.contains("#")) return kw("KEYWORD");
 
         // Rule 3: annotation
-        if (q.startsWith("@")) return kw();
+        if (q.startsWith("@")) return kw("KEYWORD");
 
         // Rule 4: structural Java keyword
         String lower = q.toLowerCase();
         for (String m : new String[]{"throws ", "implements ", "extends ", "@override", "@deprecated"}) {
-            if (lower.contains(m)) return kw();
+            if (lower.contains(m)) return kw("KEYWORD");
         }
 
-        // Rule 5: CamelCase or ACRONYM token → technical identifier in a multi-word query
+        // Rule 5: CamelCase or ACRONYM → multi-word query containing a technical identifier
         for (String t : q.split("\\s+")) {
-            if (isTechnicalToken(t)) return kw();
+            if (isTechnicalToken(t)) return kw("KEYWORD");
         }
 
         // Rule 6: classify by stop-word presence + length
-        String[] tokens  = lower.split("\\s+");
-        boolean hasStop  = false;
+        String[] tokens = lower.split("\\s+");
+        boolean hasStop = false;
         for (String t : tokens) {
             if (STOP_WORDS.contains(t)) { hasStop = true; break; }
         }
 
-        if (!hasStop && tokens.length >= 4) return kw();   // technical phrase
-        if ( hasStop && tokens.length >= 4) return hy();   // natural-language sentence
+        if (!hasStop && tokens.length >= 4) return kw("KEYWORD_TECHNICAL");  // multi-word tech phrase
+        if ( hasStop && tokens.length >= 4) return hy("HYBRID");             // natural-language sentence
 
         // Rule 7: 2–3 tokens where every token has uppercase → multi-part identifier
         String[] orig = q.split("\\s+");
-        if (orig.length <= 3 && allHaveUppercase(orig)) return kw();
+        if (orig.length <= 3 && allHaveUppercase(orig)) return kw("KEYWORD");
 
-        return hy();
+        return hy("HYBRID");
     }
 
     private static boolean isTechnicalToken(String t) {
-        // PascalCase: starts upper, has lower, then upper again (e.g. HnswGraphBuilder)
-        if (t.matches("[A-Z][a-z]+[A-Z].*")) return true;
-        // camelCase: lowercase then uppercase (e.g. indexWriter)
-        if (t.matches(".*[a-z][A-Z].*")) return true;
-        // ACRONYM ≥3 chars (e.g. HNSW, ONNX, BM25, YQL)
-        if (t.matches("[A-Z0-9]{3,}")) return true;
+        if (t.matches("[A-Z][a-z]+[A-Z].*")) return true;  // PascalCase
+        if (t.matches(".*[a-z][A-Z].*"))     return true;  // camelCase
+        if (t.matches("[A-Z0-9]{3,}"))        return true;  // ACRONYM
         return false;
     }
 
@@ -146,11 +140,11 @@ public class FstQueryClassifier implements QueryClassifier {
         return true;
     }
 
-    private static QueryClassification kw() {
-        return QueryClassification.of(SearchRequest.SearchType.KEYWORD);
+    private static QueryClassification kw(String intent) {
+        return QueryClassification.of(SearchRequest.SearchType.KEYWORD, null, intent);
     }
 
-    private static QueryClassification hy() {
-        return QueryClassification.of(SearchRequest.SearchType.HYBRID);
+    private static QueryClassification hy(String intent) {
+        return QueryClassification.of(SearchRequest.SearchType.HYBRID, null, intent);
     }
 }

@@ -97,8 +97,10 @@ async function loadPipelines() {
       `<option value="${p.id}" ${p.available ? '' : 'disabled'} title="${p.description}">` +
       `${p.label}${p.available ? '' : ' (unavailable)'}</option>`
     ).join('');
+    const autoOpt = sel.querySelector('option[value="auto"]');
+    if (autoOpt) autoOpt.selected = true;
   } catch {
-    sel.innerHTML = '<option value="hybrid">Hybrid</option>';
+    sel.innerHTML = '<option value="auto">Auto</option><option value="hybrid">Hybrid</option>';
   }
 }
 
