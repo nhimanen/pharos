@@ -33,6 +33,10 @@ public class FileStateTracker {
         public String sha256;
         /** Qualified class names declared in this file — used to patch the call graph incrementally. */
         public List<String> classNames;
+        /** {@link IndexVersions#CHUNKING_VERSION} recorded when this file was last embedded. */
+        public int chunkingVersion;
+        /** {@link IndexVersions#modelFingerprint} recorded when this file was last embedded. */
+        public String modelFingerprint;
 
         public FileState() {}
         public FileState(long lastModifiedMs, String sha256) {
@@ -46,8 +50,24 @@ public class FileStateTracker {
         }
     }
 
+    /** Current index-version constants to stamp into every {@link #track} call. */
+    private final int currentChunkingVersion;
+    private final String currentModelFingerprint;
+
     public FileStateTracker(Path projectIndexDir) {
+        this(projectIndexDir, 0, null);
+    }
+
+    /**
+     * Constructs a tracker that stamps {@code currentChunkingVersion} and
+     * {@code currentModelFingerprint} into every {@link #track} call, enabling
+     * {@link #hasOutdatedEmbeddings} to detect when re-embedding is required.
+     */
+    public FileStateTracker(Path projectIndexDir, int currentChunkingVersion,
+                             String currentModelFingerprint) {
         this.stateFile = projectIndexDir.resolve("file-state.json");
+        this.currentChunkingVersion   = currentChunkingVersion;
+        this.currentModelFingerprint  = currentModelFingerprint;
         this.state = load();
     }
 
@@ -81,10 +101,29 @@ public class FileStateTracker {
             String key = file.toAbsolutePath().toString();
             long mtime = Files.getLastModifiedTime(file).toMillis();
             String hash = sha256(file);
-            state.put(key, new FileState(mtime, hash, classNames));
+            FileState s = new FileState(mtime, hash, classNames);
+            s.chunkingVersion   = currentChunkingVersion;
+            s.modelFingerprint  = currentModelFingerprint;
+            state.put(key, s);
         } catch (IOException e) {
             log.debug("Cannot track file {}: {}", file, e.getMessage());
         }
+    }
+
+    /**
+     * Returns true if any tracked file was last embedded with a different chunking version
+     * or model fingerprint than the values this tracker was constructed with.
+     *
+     * <p>When true, the incremental index runner expands its dirty set to include all
+     * tracked files so they are re-parsed and re-embedded against the new versions.
+     */
+    public boolean hasOutdatedEmbeddings() {
+        if (state.isEmpty()) return false;
+        for (FileState s : state.values()) {
+            if (s.chunkingVersion != currentChunkingVersion) return true;
+            if (currentModelFingerprint != null && !currentModelFingerprint.equals(s.modelFingerprint)) return true;
+        }
+        return false;
     }
 
     /** Returns the class names tracked for a file, or empty list if unknown. */

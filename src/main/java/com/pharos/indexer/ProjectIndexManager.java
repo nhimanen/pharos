@@ -227,21 +227,27 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        FileStateTracker stateTracker = new FileStateTracker(projectIndexDir);
+        String modelFp = IndexVersions.modelFingerprint(config);
+        FileStateTracker stateTracker = new FileStateTracker(
+                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp);
+        PersistentEmbeddingCache embeddingCache = (generateEmbeddings && embedder.isAvailable())
+                ? new PersistentEmbeddingCache(projectIndexDir, modelFp, embedder.dimensions())
+                : null;
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, embeddingCache);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, embeddingCache);
         }
     }
 
     private ProjectMeta indexFull(Path projectRoot, String projectName,
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
-                                   ProgressListener progress) throws IOException {
+                                   ProgressListener progress,
+                                   PersistentEmbeddingCache embeddingCache) throws IOException {
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
         // Check dirty status against the pre-existing state before clearing it, so synonym mining
@@ -334,7 +340,8 @@ public class ProjectIndexManager {
 
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
-            indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir);
+            indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress,
+                    projectIndexDir, embeddingCache);
             writer.commit();
         }
 
@@ -357,7 +364,8 @@ public class ProjectIndexManager {
     private ProjectMeta indexIncremental(Path projectRoot, String projectName,
                                           Path projectIndexDir, FileStateTracker stateTracker,
                                           boolean generateEmbeddings, boolean buildSynonyms,
-                                          ProgressListener progress) throws IOException {
+                                          ProgressListener progress,
+                                          PersistentEmbeddingCache embeddingCache) throws IOException {
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -421,6 +429,24 @@ public class ProjectIndexManager {
                     return true;
                 })
                 .collect(Collectors.toList());
+
+        // Expand dirty set when embedding-version constants have changed (e.g. CHUNKING_VERSION bump).
+        // All tracked files that aren't already dirty are added so they get re-parsed and re-embedded.
+        // The persistent embedding cache eliminates redundant ONNX calls for unchanged texts.
+        if (embeddingCache != null && stateTracker.hasOutdatedEmbeddings()) {
+            Set<Path> dirtySet = new java.util.HashSet<>(dirtyFiles);
+            List<Path> versionDirty = new ArrayList<>();
+            for (Path tracked : stateTracker.trackedFiles()) {
+                if (!dirtySet.contains(tracked) && currentFiles.contains(tracked)) {
+                    versionDirty.add(tracked);
+                }
+            }
+            if (!versionDirty.isEmpty()) {
+                log.info("Embedding version changed: adding {} file(s) for re-embedding in '{}'",
+                        versionDirty.size(), projectName);
+                dirtyFiles.addAll(versionDirty);
+            }
+        }
 
         if (dirtyFiles.isEmpty() && deletedFiles.isEmpty()) {
             log.info("No changes detected for '{}', index is up to date", projectName);
@@ -496,9 +522,10 @@ public class ProjectIndexManager {
                     }
                 }
 
-                // Pass 2: stream spool through ONNX in chunks, write embedding cache.
+                // Pass 2: stream spool through ONNX (with persistent cache short-circuit).
                 if (doEmbed && totalSlots > 0) {
                     int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+                    int[] cacheStats = {0, 0}; // [hits, misses]
                     try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
                                  Files.newInputStream(spoolPath), 1 << 16));
                          DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
@@ -507,13 +534,18 @@ public class ProjectIndexManager {
                         int slot = 0;
                         while (slot < totalSlots) {
                             int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
-                            List<String> chunk = new ArrayList<>(end - slot);
-                            for (int i = slot; i < end; i++) chunk.add(spoolRead(spool));
-                            float[][] embeddings = embedder.embedBatch(chunk);
-                            for (int i = 0; i < embeddings.length; i++) cacheWrite(cache, embeddings[i], dims);
+                            List<String> texts = new ArrayList<>(end - slot);
+                            for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
+                            float[][] embeddings = embedBatchWithCache(texts, embeddingCache, cacheStats);
+                            for (float[] e : embeddings) cacheWrite(cache, e, dims);
                             slot = end;
                             progress.onProgress("Embedding", ++chunksDone, totalChunks);
                         }
+                    }
+                    if (embeddingCache != null) embeddingCache.save();
+                    if (cacheStats[0] > 0 || cacheStats[1] > 0) {
+                        log.info("Embedding cache: {} hit(s), {} miss(es) for '{}'",
+                                cacheStats[0], cacheStats[1], projectName);
                     }
                 }
 
@@ -603,7 +635,7 @@ public class ProjectIndexManager {
     private void indexProject(IndexWriter writer, ParsedProject project,
                                FileStateTracker stateTracker, boolean generateEmbeddings,
                                GraphIndexData graphData, ProgressListener progress,
-                               Path projectIndexDir) throws IOException {
+                               Path projectIndexDir, PersistentEmbeddingCache embeddingCache) throws IOException {
         int indexThreads = config.resolvedIndexThreads();
         List<ParsedFile> files = project.files();
         int totalFiles = files.size();
@@ -700,10 +732,11 @@ public class ProjectIndexManager {
                 }
             }
 
-            // Phase 2: stream spool through ONNX in chunks, write fixed-size embedding cache.
+            // Phase 2: stream spool through ONNX (with persistent cache short-circuit).
             // Peak heap: one chunk of texts + one chunk of embeddings (~200 KB for chunk size 32).
             if (doEmbed && totalSlots > 0) {
                 int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
+                int[] cacheStats = {0, 0}; // [hits, misses]
                 try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
                              Files.newInputStream(spoolPath), 1 << 16));
                      DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
@@ -712,13 +745,17 @@ public class ProjectIndexManager {
                     int slot = 0;
                     while (slot < totalSlots) {
                         int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
-                        List<String> chunk = new ArrayList<>(end - slot);
-                        for (int i = slot; i < end; i++) chunk.add(spoolRead(spool));
-                        float[][] embeddings = embedder.embedBatch(chunk);
-                        for (int i = 0; i < embeddings.length; i++) cacheWrite(cache, embeddings[i], dims);
+                        List<String> texts = new ArrayList<>(end - slot);
+                        for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
+                        float[][] embeddings = embedBatchWithCache(texts, embeddingCache, cacheStats);
+                        for (float[] e : embeddings) cacheWrite(cache, e, dims);
                         slot = end;
                         progress.onProgress("Embedding", ++chunksDone, totalChunks);
                     }
+                }
+                if (embeddingCache != null) embeddingCache.save();
+                if (cacheStats[0] > 0 || cacheStats[1] > 0) {
+                    log.info("Embedding cache: {} hit(s), {} miss(es)", cacheStats[0], cacheStats[1]);
                 }
             }
 
@@ -816,6 +853,50 @@ public class ProjectIndexManager {
         byte[] bytes = new byte[len];
         in.readFully(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Embeds {@code texts} via the ONNX provider, using {@code embeddingCache} as a
+     * read-through layer keyed by SHA-256 of each text.
+     *
+     * <p>Cache hits are returned immediately; misses are batched into a single
+     * {@link com.pharos.embedding.EmbeddingProvider#embedBatch} call and then stored
+     * in the cache (lazy — caller must call {@link PersistentEmbeddingCache#save()} to persist).
+     *
+     * @param stats int[2] accumulator: {@code stats[0]} += hits, {@code stats[1]} += misses
+     */
+    private float[][] embedBatchWithCache(List<String> texts,
+                                           PersistentEmbeddingCache embeddingCache,
+                                           int[] stats) {
+        if (embeddingCache == null) {
+            return embedder.embedBatch(texts);
+        }
+        float[][] results = new float[texts.size()][];
+        List<Integer> missIdx  = new ArrayList<>();
+        List<String>  missText = new ArrayList<>();
+        for (int i = 0; i < texts.size(); i++) {
+            String text = texts.get(i);
+            float[] cached = (text != null)
+                    ? embeddingCache.get(PersistentEmbeddingCache.sha256Hex(text)) : null;
+            if (cached != null) {
+                results[i] = cached;
+                stats[0]++;
+            } else {
+                missIdx.add(i);
+                missText.add(text);
+                stats[1]++;
+            }
+        }
+        if (!missText.isEmpty()) {
+            float[][] fresh = embedder.embedBatch(missText);
+            for (int j = 0; j < missIdx.size(); j++) {
+                results[missIdx.get(j)] = fresh[j];
+                if (missText.get(j) != null && fresh[j] != null) {
+                    embeddingCache.put(PersistentEmbeddingCache.sha256Hex(missText.get(j)), fresh[j]);
+                }
+            }
+        }
+        return results;
     }
 
     /**
