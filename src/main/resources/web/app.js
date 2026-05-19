@@ -287,12 +287,13 @@ function initControls() {
   document.getElementById('detail-content').addEventListener('click', e => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
-    const { action, fqn, project, cls } = btn.dataset;
-    if (action === 'callers')     loadRelated(fqn, 'callers');
-    if (action === 'callees')     loadRelated(fqn, 'callees');
-    if (action === 'drill-proj')  loadClassGraph(project);
-    if (action === 'drill-class') loadMethodGraph(S.selectedProject, cls);
-    if (action === 'focus-node')  focusNode(fqn);
+    const { action, fqn, project, cls, filepath } = btn.dataset;
+    if (action === 'callers')      loadRelated(fqn, 'callers');
+    if (action === 'callees')      loadRelated(fqn, 'callees');
+    if (action === 'drill-proj')   loadClassGraph(project);
+    if (action === 'drill-class')  loadMethodGraph(S.selectedProject, cls);
+    if (action === 'focus-node')   focusNode(fqn);
+    if (action === 'locate-file')  locateFileInTree(filepath, project);
   });
 
   // Focus mode
@@ -1254,6 +1255,7 @@ function renderMethodDetail(m, d) {
     <div class="d-actions">
       <button data-action="callers" data-fqn="${esc(fqn)}">Callers</button>
       <button data-action="callees" data-fqn="${esc(fqn)}">Callees</button>
+      ${m.filePath ? `<button data-action="locate-file" data-filepath="${esc(m.filePath)}" data-project="${esc(m.project || '')}">Locate File</button>` : ''}
     </div>
     <div id="related-area"></div>`;
 }
@@ -1444,6 +1446,7 @@ function renderTreeEntries(container, project, basePath, dirs, files, depth) {
     const row      = document.createElement('div');
     row.className  = 'ft-row ft-dir';
     row.style.paddingLeft = (12 + indent) + 'px';
+    row.dataset.treepath = dirPath;
     row.innerHTML  =
       `<span class="ft-chevron">▶</span>` +
       `<span class="ft-icon">📁</span>` +
@@ -1495,6 +1498,7 @@ function renderTreeEntries(container, project, basePath, dirs, files, depth) {
       `<span class="ft-icon">📄</span>` +
       `<span class="ft-name" title="${esc(name)}">${esc(name)}</span>` +
       `<span class="ft-badge">${classes.length}</span>`;
+    row.dataset.treepath = basePath.replace(/\/$/, '') + '/' + name;
     row.addEventListener('click', () => drillToFile(project, classes));
     container.appendChild(row);
   }
@@ -1507,6 +1511,31 @@ function drillToFile(project, qualifiedClassNames) {
   } else {
     loadCallGraph(project, null, qualifiedClassNames[0]);
   }
+}
+
+async function locateFileInTree(filePath, projectHint) {
+  const project = projectHint || S.selectedProject;
+  if (!project || !filePath) return;
+
+  const normFile  = filePath.replace(/\\/g, '/');
+  const lastSlash = normFile.lastIndexOf('/');
+  const dirPath   = lastSlash >= 0 ? normFile.slice(0, lastSlash) : '';
+
+  try {
+    const params = new URLSearchParams({ project, limit: 500 });
+    if (dirPath) params.set('path', dirPath);
+    const data = await fetch(`/api/skeleton?${params}`).then(r => r.json());
+
+    const classNames = data
+      .filter(c => (c.filePath || '').replace(/\\/g, '/') === normFile)
+      .map(c => c.qualifiedClassName)
+      .filter(Boolean);
+
+    if (classNames.length > 0) {
+      document.getElementById('file-tree-section').style.display = 'block';
+      drillToFile(project, classNames);
+    }
+  } catch (_) {}
 }
 
 // ── Test/production filter ────────────────────────────────────
@@ -1596,8 +1625,89 @@ function applyLocalFilter() {
 
 // ── Search results dropdown ───────────────────────────────
 const srPanel = document.getElementById('search-results');
+let lastHits  = [];
 
 function closeSearchResults() { srPanel.classList.remove('open'); srPanel.innerHTML = ''; }
+
+// ── Document viewer ───────────────────────────────────────
+const docViewer = document.getElementById('doc-viewer');
+
+function closeDocViewer() { docViewer.style.display = 'none'; }
+
+document.getElementById('dv-close').addEventListener('click', closeDocViewer);
+docViewer.addEventListener('click', e => { if (e.target === docViewer) closeDocViewer(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDocViewer(); });
+
+function openDocViewer(r) {
+  const label = r.docType === 'class' || r.docType === 'document'
+    ? (r.qualifiedClassName || r.id)
+    : r.docType === 'chunk'
+      ? (r.qualifiedClassName || '') + ' § ' + (r.methodName || '')
+      : (r.qualifiedClassName || '') + '#' + (r.methodName || '');
+
+  document.getElementById('dv-title').textContent = label;
+
+  const docTypeCls = `dv-badge-${esc(r.docType || 'method')}`;
+  const fileLine = r.filePath
+    ? `${r.filePath}${r.startLine ? `:${r.startLine}–${r.endLine}` : ''}`
+    : '';
+  document.getElementById('dv-meta').innerHTML = `
+    <span class="dv-badge dv-badge-project">${esc(r.project || '')}</span>
+    <span class="dv-badge ${docTypeCls}">${esc(r.docType || 'method')}</span>
+    ${r.searchType ? `<span class="dv-badge dv-badge-type">${esc(r.searchType)}</span>` : ''}
+    ${r.score != null ? `<span class="dv-score">score ${r.score.toFixed(3)}</span>` : ''}
+    <button class="dv-nav-btn" id="dv-nav-btn">Locate in graph →</button>
+    ${fileLine ? `<div class="dv-filepath">${esc(fileLine)}</div>` : ''}
+  `;
+
+  document.getElementById('dv-nav-btn').addEventListener('click', () => {
+    closeDocViewer();
+    navigateToResult(r);
+  });
+
+  const isChunk = r.docType === 'chunk' || r.docType === 'document';
+  const isClass = r.docType === 'class';
+
+  const sections = [];
+
+  // Matched excerpt (snippet) — always first when available
+  if (r.snippet && r.snippet.text) {
+    const lineRange = r.snippet.startLine
+      ? ` · lines ${r.snippet.startLine}–${r.snippet.endLine}`
+      : '';
+    sections.push({
+      label: `Matched Excerpt${lineRange}`,
+      html: `<pre class="dv-code dv-snippet">${esc(r.snippet.text)}</pre>`
+    });
+  }
+
+  if (!isChunk && (r.accessModifier || r.returnType || r.signature)) {
+    const sig = [r.accessModifier, r.returnType, r.signature].filter(Boolean).join(' ');
+    sections.push({ label: 'Signature', html: `<div class="dv-sig">${esc(sig)}</div>` });
+  }
+  if (r.javadoc) {
+    const javadocLabel = isChunk ? 'Document' : 'Javadoc';
+    sections.push({ label: javadocLabel, html: `<div class="dv-javadoc">${esc(r.javadoc.trim())}</div>` });
+  }
+  if (r.body) {
+    const bodyLabel = isChunk ? 'Content' : isClass ? 'Members' : 'Body';
+    const bodyHtml  = isChunk
+      ? `<div class="dv-javadoc">${esc(r.body)}</div>`
+      : `<pre class="dv-code">${esc(r.body)}</pre>`;
+    sections.push({ label: bodyLabel, html: bodyHtml });
+  }
+  if (!sections.length) {
+    sections.push({ label: 'Info', html: `<div class="dv-javadoc">No additional content stored for this result.</div>` });
+  }
+
+  document.getElementById('dv-sections').innerHTML = sections.map(s => `
+    <div class="dv-section">
+      <div class="dv-section-label">${s.label}</div>
+      <div class="dv-section-body">${s.html}</div>
+    </div>`).join('');
+
+  docViewer.style.display = 'flex';
+}
 
 document.addEventListener('click', e => {
   if (!e.target.closest('.search-wrap')) closeSearchResults();
@@ -1632,6 +1742,7 @@ async function doSearch() {
       throw new Error(`Search failed (${res.status}): ${msg}`);
     }
     hits = await res.json();
+    lastHits = hits;
   } catch (err) {
     srPanel.innerHTML = `<div class="sr-none">Search error: ${esc(err.message)}</div>`;
     srPanel.classList.add('open');
@@ -1689,27 +1800,21 @@ async function doSearch() {
   setStatus(`${hits.length} search hits`);
 }
 
-// Click on a search result → load call graph for that project and focus the node
-srPanel.addEventListener('click', async e => {
-  const item = e.target.closest('.sr-item');
-  if (!item) return;
-  closeSearchResults();
-
-  const fqn     = item.dataset.fqn;
-  const project = item.dataset.project;
-  const cls     = item.dataset.class;
-  const docType = item.dataset.docType;
+// Navigate the graph to a search result (used by doc viewer "Locate in graph" button)
+async function navigateToResult(r) {
+  const fqn     = extractFqn(r.id);
+  const project = r.project;
+  const cls     = r.className;
+  const docType = r.docType;
 
   if (!fqn || !project) return;
 
   const ZOOM_SCALE = 2.0;
-
   const tryFocus = (fqn, attempts) => {
     if (focusNode(fqn, ZOOM_SCALE)) return;
     if (attempts < 8) setTimeout(() => tryFocus(fqn, attempts + 1), 250);
   };
 
-  // For class-type results navigate to the class graph, otherwise the call graph
   if (docType === 'class') {
     if (S.view !== 'classes' || S.selectedProject !== project) {
       await loadClassGraph(project);
@@ -1720,11 +1825,21 @@ srPanel.addEventListener('click', async e => {
   } else {
     if (S.view !== 'call' || S.selectedProject !== project) {
       await loadCallGraph(project, null, cls || null);
-      setTimeout(() => tryFocus(fqn, 0), 400);
-    } else {
-      tryFocus(fqn, 0);
     }
+    showDetail({ id: fqn, label: fqn.split('#').pop(), kind: docType || 'method' });
+    setTimeout(() => tryFocus(fqn, 0), 200);
   }
+}
+
+// Click on a search result → open document viewer
+srPanel.addEventListener('click', e => {
+  const item = e.target.closest('.sr-item');
+  if (!item) return;
+  closeSearchResults();
+
+  const idx = parseInt(item.dataset.idx, 10);
+  const hit = lastHits[idx];
+  if (hit) openDocViewer(hit);
 });
 
 // ── Package filter dropdown ───────────────────────────────────

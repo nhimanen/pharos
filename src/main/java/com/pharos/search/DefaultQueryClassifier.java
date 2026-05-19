@@ -45,43 +45,35 @@ public class DefaultQueryClassifier implements QueryClassifier {
     };
 
     @Override
-    public SearchRequest.SearchType classify(String query) {
-        if (query == null || query.isBlank()) return SearchRequest.SearchType.HYBRID;
+    public QueryClassification classify(String query) {
+        if (query == null || query.isBlank()) return QueryClassification.of(SearchRequest.SearchType.HYBRID);
 
         String q = query.trim();
 
-        // Rule 1: no spaces — single token (identifier, qualified name, or short keyword)
-        if (!q.contains(" ")) return SearchRequest.SearchType.KEYWORD;
+        if (!q.contains(" ")) return kw();
+        if (q.contains("#"))  return kw();
+        if (q.startsWith("@")) return kw();
 
-        // Rule 2: FQN — contains # regardless of spaces
-        if (q.contains("#")) return SearchRequest.SearchType.KEYWORD;
-
-        // Rule 3: annotation query
-        if (q.startsWith("@")) return SearchRequest.SearchType.KEYWORD;
-
-        // Rule 4: structural Java keyword
         String lower = q.toLowerCase();
         for (String marker : STRUCTURAL_MARKERS) {
-            if (lower.contains(marker)) return SearchRequest.SearchType.KEYWORD;
+            if (lower.contains(marker)) return kw();
         }
 
-        // Rule 5: stop word or command word present → natural language
         String[] tokens = lower.split("\\s+");
         for (String token : tokens) {
-            if (STOP_WORDS.contains(token)) return SearchRequest.SearchType.HYBRID;
+            if (STOP_WORDS.contains(token)) return hy();
         }
 
-        // Rule 6: long query → likely a phrase or sentence
-        if (tokens.length >= 4) return SearchRequest.SearchType.HYBRID;
+        if (tokens.length >= 4) return hy();
 
-        // Rule 7: 2–3 tokens where every token has at least one uppercase letter
-        // in the original query → multi-part identifier (e.g. "ConnectionPool Manager")
         String[] originalTokens = q.split("\\s+");
         boolean allIdentifiers = Arrays.stream(originalTokens)
                 .allMatch(t -> t.chars().anyMatch(Character::isUpperCase));
-        if (allIdentifiers) return SearchRequest.SearchType.KEYWORD;
+        if (allIdentifiers) return kw();
 
-        // Default: short ambiguous query — hybrid is the safe choice
-        return SearchRequest.SearchType.HYBRID;
+        return hy();
     }
+
+    private static QueryClassification kw() { return QueryClassification.of(SearchRequest.SearchType.KEYWORD); }
+    private static QueryClassification hy() { return QueryClassification.of(SearchRequest.SearchType.HYBRID); }
 }

@@ -910,6 +910,14 @@ Run 'pharos <command> --help' for detailed usage of each command.
 
 # ── Argument parser ───────────────────────────────────────────────────────────
 
+class HelpOnErrorParser(argparse.ArgumentParser):
+    """Prints subcommand help when required arguments are missing."""
+    def error(self, message):
+        self.print_help(sys.stderr)
+        print(f'\nerror: {message}', file=sys.stderr)
+        sys.exit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pharos",
@@ -918,7 +926,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Run 'pharos <command> --help' for detailed usage of each command.",
         add_help=True,
     )
-    sub = parser.add_subparsers(dest="command", metavar="command")
+    sub = parser.add_subparsers(dest="command", metavar="command", parser_class=HelpOnErrorParser)
 
     # web
     p_web = sub.add_parser(

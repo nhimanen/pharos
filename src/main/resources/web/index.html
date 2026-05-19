@@ -145,5 +145,17 @@
   </div>
 
   <div id="tooltip" class="tooltip" style="display:none"></div>
+
+  <!-- Floating document viewer -->
+  <div id="doc-viewer" class="dv-backdrop" style="display:none" aria-modal="true" role="dialog">
+    <div class="dv-modal">
+      <div class="dv-header">
+        <div class="dv-title" id="dv-title"></div>
+        <button class="dv-close" id="dv-close" title="Close (Esc)">✕</button>
+      </div>
+      <div class="dv-meta" id="dv-meta"></div>
+      <div class="dv-sections" id="dv-sections"></div>
+    </div>
+  </div>
 </body>
 </html>
