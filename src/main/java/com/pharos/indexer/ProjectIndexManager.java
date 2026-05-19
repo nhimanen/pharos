@@ -673,8 +673,7 @@ public class ProjectIndexManager {
                             List<ParsedMethod> clsMethods = methodsByClass.getOrDefault(
                                     cls.qualifiedClassName(), List.of());
                             List<Chunk> clsChunks = "document".equals(cls.kind())
-                                    ? chunker.chunkText(cls.javadoc() != null ? cls.javadoc() : cls.qualifiedClassName(),
-                                                        synthBodies.get(ci), cls.startLine())
+                                    ? chunker.chunkDocument(cls, synthBodies.get(ci))
                                     : chunker.chunkClass(cls, synthBodies.get(ci), clsMethods);
                             List<Chunk> stripped = new ArrayList<>(clsChunks.size());
                             for (Chunk c : clsChunks) {

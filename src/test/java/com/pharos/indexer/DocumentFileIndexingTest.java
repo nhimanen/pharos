@@ -138,6 +138,50 @@ class DocumentFileIndexingTest {
     }
 
     // -------------------------------------------------------------------------
+    // chunkDocument integration — verify the chunker path used for documents
+    // -------------------------------------------------------------------------
+
+    @Test
+    void chunkDocument_shortFile_producesOneChunkWithPrefix() throws Exception {
+        ParsedFile file = new GenericFileParser().parseFile(SAMPLE_DOCS.resolve("README.md"), PROJECT);
+        ParsedClass cls = file.classes().get(0);
+        String body = DocumentMapper.readBodyFromFile(cls.filePath(), cls.startLine(), cls.endLine());
+
+        DefaultChunker chunker = new DefaultChunker();
+        List<Chunk> chunks = chunker.chunkDocument(cls, body);
+
+        // README.md is small enough to fit in one chunk
+        assertThat(chunks).hasSize(1);
+        assertThat(chunks.get(0).text()).contains("[README]");
+        assertThat(chunks.get(0).text()).contains("Code Search"); // javadoc from first heading
+        assertThat(chunks.get(0).text()).contains("Installation"); // file content
+    }
+
+    @Test
+    void chunkDocument_allChunksContainDocumentPrefix() throws Exception {
+        // Build a large synthetic document that forces multiple chunks
+        ParsedClass syntheticDoc = new ParsedClass(
+                PROJECT, "docs", "large-doc", "docs.large-doc",
+                "document", null, List.of(), List.of(),
+                "public", false, false, "Large Document",
+                "/tmp/large-doc.md", 1, 500
+        );
+        String para = "word ".repeat(400) + "\n\n"; // ~2 000 chars
+        String largeContent = para.repeat(15);      // ~30 000 chars — forces splits
+
+        DefaultChunker chunker = new DefaultChunker();
+        List<Chunk> chunks = chunker.chunkDocument(syntheticDoc, largeContent);
+
+        assertThat(chunks.size()).isGreaterThanOrEqualTo(2);
+        for (Chunk chunk : chunks) {
+            assertThat(chunk.text())
+                    .as("every chunk must carry document prefix")
+                    .contains("[docs.large-doc]")
+                    .contains("Large Document");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

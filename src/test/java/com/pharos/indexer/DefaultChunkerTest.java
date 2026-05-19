@@ -380,6 +380,163 @@ class DefaultChunkerTest {
     }
 
     // -------------------------------------------------------------------------
+    // chunkDocument
+    // -------------------------------------------------------------------------
+
+    @Nested
+    class ChunkDocument {
+
+        private static ParsedClass docClass(String qualifiedName, String javadoc,
+                                             int startLine, int endLine) {
+            return new ParsedClass(
+                    "proj", "docs",
+                    qualifiedName, qualifiedName,
+                    "document", null, List.of(), List.of(),
+                    "public", false, false, javadoc,
+                    "/docs/" + qualifiedName + ".md", startLine, endLine
+            );
+        }
+
+        @Test
+        void shortContent_producesOneChunk() {
+            ParsedClass cls = docClass("README", "Code Search", 1, 5);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "Hello world.");
+
+            assertThat(chunks).hasSize(1);
+        }
+
+        @Test
+        void chunk_startsWithBracketedQualifiedName() {
+            ParsedClass cls = docClass("README", "Code Search", 1, 5);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "Hello world.");
+
+            assertThat(chunks.get(0).text()).startsWith("[README]");
+        }
+
+        @Test
+        void chunk_containsJavadocDescription() {
+            ParsedClass cls = docClass("README", "Code Search guide", 1, 5);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "Hello world.");
+
+            assertThat(chunks.get(0).text()).contains("Code Search guide");
+        }
+
+        @Test
+        void chunk_containsFileContent() {
+            ParsedClass cls = docClass("README", "Guide", 1, 3);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "Installation steps here.");
+
+            assertThat(chunks.get(0).text()).contains("Installation steps here.");
+        }
+
+        @Test
+        void longContent_producesMultipleChunks() {
+            ParsedClass cls = docClass("docs.large", "Large Doc", 1, 500);
+            // 25 000 chars across blank-line-separated paragraphs
+            String para = "word ".repeat(400) + "\n\n"; // ~2 000 chars per paragraph
+            String content = para.repeat(15);
+
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, content);
+
+            assertThat(chunks.size()).isGreaterThanOrEqualTo(2);
+        }
+
+        @Test
+        void allContinuationChunks_containDocumentPrefix() {
+            ParsedClass cls = docClass("docs.guide", "Guide", 1, 500);
+            String para = "word ".repeat(400) + "\n\n";
+            String content = para.repeat(15);
+
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, content);
+
+            for (Chunk chunk : chunks) {
+                assertThat(chunk.text())
+                        .as("every chunk must carry document prefix")
+                        .contains("[docs.guide]");
+            }
+        }
+
+        @Test
+        void continuationChunk_containsTrailingOverlapFromPreviousChunk() {
+            ParsedClass cls = docClass("docs.guide", "Guide", 1, 500);
+            // Distinct paragraphs so we can verify overlap comes from the END of chunk 1
+            String para1 = "ALPHA sentence. ".repeat(300) + "\n\n"; // ~4 800 chars
+            String para2 = "BETA sentence. ".repeat(300) + "\n\n";
+            String content = para1 + para2;
+
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, content);
+
+            assertThat(chunks.size()).isGreaterThanOrEqualTo(2);
+            String second = chunks.get(1).text();
+            // Overlap markers present
+            assertThat(second).contains("// ...");
+            // The overlap comes from the END of chunk 1: "ALPHA sentence." content,
+            // NOT from the very beginning of the document (no document title reuse).
+            assertThat(second).contains("ALPHA");
+        }
+
+        @Test
+        void continuationChunk_overlapIsFromEndNotBeginningOfPreviousChunk() {
+            ParsedClass cls = docClass("guide", "Guide Title", 1, 500);
+            // Filler must have per-line newlines so the chunker sees many short lines.
+            // With 400 lines × 20 chars (+ newline = 21 total) = ~8 400 chars > budget (~7 572),
+            // the chunker splits mid-filler. Chunk 1 ends with filler lines; chunk 2's
+            // overlap is the LAST 3 filler lines, not the first "FIRST_LINE" lines.
+            String firstLines = "FIRST_LINE content here.\n".repeat(5);  // distinctive prefix
+            String filler     = "middle filler line.\n".repeat(400);      // forces a split
+            String content    = firstLines + filler + "SECOND_PART content.";
+
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, content);
+
+            assertThat(chunks.size()).isGreaterThanOrEqualTo(2);
+            String second = chunks.get(1).text();
+            // Overlap comes from the end of chunk 1 (filler lines), not the beginning.
+            assertThat(second).doesNotContain("FIRST_LINE content here");
+        }
+
+        @Test
+        void splitsAtBlankLineBoundary_notMidWord() {
+            ParsedClass cls = docClass("README", "Doc", 1, 300);
+            // Two paragraphs separated by a blank line, first paragraph exceeds budget alone
+            String part1 = "alpha ".repeat(1400); // ~8 400 chars — exceeds MAX_CHARS alone
+            String part2 = "\n\nbeta section content here";
+            String content = part1 + part2;
+
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, content);
+
+            assertThat(chunks.size()).isGreaterThanOrEqualTo(2);
+            // Second chunk should start with the document prefix, not mid-content
+            assertThat(chunks.get(1).text()).startsWith("[README]");
+        }
+
+        @Test
+        void lineNumbers_spanCorrectRange() {
+            ParsedClass cls = docClass("README", "Doc", 1, 10);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "line one\nline two\nline three");
+
+            assertThat(chunks.get(0).startLine()).isEqualTo(1);
+            assertThat(chunks.get(0).endLine()).isGreaterThanOrEqualTo(1);
+        }
+
+        @Test
+        void emptyContent_producesOneChunkWithPrefixOnly() {
+            ParsedClass cls = docClass("empty", null, 1, 1);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "");
+
+            assertThat(chunks).hasSize(1);
+            assertThat(chunks.get(0).text()).contains("[empty]");
+        }
+
+        @Test
+        void noJavadoc_prefixContainsOnlyQualifiedName() {
+            ParsedClass cls = docClass("notes", null, 1, 5);
+            List<Chunk> chunks = CHUNKER.chunkDocument(cls, "some notes");
+
+            assertThat(chunks.get(0).text()).startsWith("[notes]\n");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // DefaultChunker.firstWord (package-private static)
     // -------------------------------------------------------------------------
 

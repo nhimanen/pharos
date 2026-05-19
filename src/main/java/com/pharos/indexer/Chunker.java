@@ -54,6 +54,20 @@ public interface Chunker {
     List<Chunk> chunkClass(ParsedClass cls, String synthesizedBody, List<ParsedMethod> methods);
 
     /**
+     * Splits a document-kind class (non-code file indexed by GenericFileParser) into
+     * context-window-sized chunks using the same blank-line-boundary splitting, budget
+     * accounting, and first-2-non-empty-lines overlap as {@link #chunkMethod}.
+     *
+     * <p>Every chunk — including continuations — carries the file's qualified name and
+     * description as a context prefix so each embedding is grounded in the source document
+     * even without surrounding text.
+     *
+     * @param cls     the document-kind ParsedClass (kind="document")
+     * @param content raw file content to split
+     */
+    List<Chunk> chunkDocument(ParsedClass cls, String content);
+
+    /**
      * Splits arbitrary text (markdown, prose, documentation) into context-window-sized chunks
      * using paragraph and sentence boundaries.
      *

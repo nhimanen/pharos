@@ -218,6 +218,23 @@ public class DefaultChunker implements Chunker {
         return new int[]{first, last + 1};
     }
 
+    /**
+     * Returns [firstLine, exclusiveEnd] covering the last {@code n} non-empty
+     * lines in [from, to), scanning backwards.  Returns [-1, -1] when none found.
+     */
+    private static int[] lastNonEmptyLineRange(String s, int[] starts, int from, int to, int n) {
+        int count = 0, first = -1, last = -1;
+        for (int li = to - 1; li >= from && count < n; li--) {
+            if (!isBlankAt(s, starts, li)) {
+                if (last < 0) last = li;
+                first = li;
+                count++;
+            }
+        }
+        if (first < 0) return new int[]{-1, -1};
+        return new int[]{first, last + 1};
+    }
+
     @Override
     public List<Chunk> chunkMethod(ParsedMethod method, boolean multiChunk) {
         if (!multiChunk) return List.of(chunkMethod(method));
@@ -305,6 +322,97 @@ public class DefaultChunker implements Chunker {
         }
 
         return chunks;
+    }
+
+    // -------------------------------------------------------------------------
+    // Document chunking (non-code files)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Splits a document-kind class into chunks.
+     *
+     * <p>Every chunk carries the file prefix ({@code [qualifiedName]\n/** description *\/\n})
+     * as a stable metadata header.  Continuation chunks also include a trailing overlap —
+     * the last {@value #DOC_OVERLAP_LINES} non-empty lines of the preceding chunk — so the
+     * embedding sees where the previous chunk left off rather than where it started.
+     */
+    @Override
+    public List<Chunk> chunkDocument(ParsedClass cls, String content) {
+        String prefix = buildClassPrefix(cls);
+        if (content == null || content.isBlank()) {
+            return List.of(new Chunk(prefix, cls.startLine(), cls.endLine()));
+        }
+        int available = MAX_CHARS - prefix.length() - 10;
+        if (content.length() <= available) {
+            return List.of(new Chunk(prefix + content, cls.startLine(), cls.endLine()));
+        }
+        return buildDocumentChunks(prefix, content, cls.startLine());
+    }
+
+    /** Non-empty lines from the end of the previous chunk to carry into each continuation. */
+    private static final int DOC_OVERLAP_LINES = 3;
+
+    /**
+     * Like {@link #buildMethodChunks} but uses <em>trailing</em> overlap: the last
+     * {@value #DOC_OVERLAP_LINES} non-empty lines of the previous chunk, not the first.
+     * This gives continuations context about what was just said rather than re-stating
+     * the document title or opening sentence.
+     */
+    private List<Chunk> buildDocumentChunks(String prefix, String content, int startLine) {
+        int available = MAX_CHARS - prefix.length() - PREFIX_RESERVE;
+
+        int[] lineStarts = buildLineStarts(content);
+        int lineCount    = lineStarts.length;
+
+        List<Chunk> chunks  = new ArrayList<>(Math.max(1, content.length() / Math.max(1, available) + 1));
+        int lineIdx         = 0;
+        int overlapFrom     = -1;
+        int overlapTo       = -1;
+
+        while (lineIdx < lineCount) {
+            int chunkFrom = lineIdx;
+
+            int overlapLen = overlapFrom >= 0 ? rangeLength(content, lineStarts, overlapFrom, overlapTo) + 14 : 0;
+
+            int charsUsed = overlapLen;
+            int lastBlank = -1;
+            int chunkTo   = chunkFrom;
+            while (chunkTo < lineCount) {
+                int lineLen = lineLen(content, lineStarts, chunkTo);
+                if (charsUsed + lineLen + 1 > available) break;
+                if (isBlankAt(content, lineStarts, chunkTo)) lastBlank = chunkTo;
+                charsUsed += lineLen + 1;
+                chunkTo++;
+            }
+
+            if (lastBlank > chunkFrom && charsUsed > available / 2) chunkTo = lastBlank + 1;
+            if (chunkTo <= chunkFrom) chunkTo = chunkFrom + 1;
+
+            StringBuilder sb = new StringBuilder(prefix.length() + charsUsed + 20);
+            sb.append(prefix);
+            if (overlapFrom >= 0) {
+                sb.append("// ...\n");
+                appendLines(sb, content, lineStarts, overlapFrom, overlapTo);
+                sb.append("// ...\n");
+            }
+            appendLines(sb, content, lineStarts, chunkFrom, chunkTo);
+            if (chunkTo < lineCount) sb.append("// ...");
+
+            chunks.add(new Chunk(sb.toString(),
+                    startLine + chunkFrom,
+                    startLine + Math.min(chunkTo, lineCount) - 1));
+
+            // Overlap for next chunk: LAST DOC_OVERLAP_LINES non-empty lines of this chunk.
+            int[] ov = lastNonEmptyLineRange(content, lineStarts, chunkFrom, chunkTo, DOC_OVERLAP_LINES);
+            overlapFrom = ov[0];
+            overlapTo   = ov[1];
+            lineIdx     = chunkTo;
+        }
+
+        return chunks.isEmpty()
+                ? List.of(new Chunk(prefix + content.substring(0, Math.min(content.length(), available)),
+                          startLine, startLine))
+                : chunks;
     }
 
     // -------------------------------------------------------------------------
