@@ -123,12 +123,12 @@ public class SearchEngine {
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
-        this(luceneIndexer, embedder, registry, new NoOpCrossEncoder(), new DefaultQueryClassifier());
+        this(luceneIndexer, embedder, registry, new NoOpCrossEncoder(), new FstQueryClassifier());
     }
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry, CrossEncoder crossEncoder) {
-        this(luceneIndexer, embedder, registry, crossEncoder, new DefaultQueryClassifier());
+        this(luceneIndexer, embedder, registry, crossEncoder, new FstQueryClassifier());
     }
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
@@ -181,6 +181,8 @@ public class SearchEngine {
                     "HNSW nearest-neighbor search over embedded method/class bodies", vecAvailable),
             new PipelineDescriptor("hybrid",         "Hybrid",
                     "Borda-count fusion of keyword and vector results with agreement bonus", true),
+            new PipelineDescriptor("unified",        "Unified",
+                    "Single BM25 pass with vector similarity as a score boost; no separate merge step", vecAvailable),
             new PipelineDescriptor("hybrid-reranked","Hybrid + Reranker",
                     "Hybrid fusion followed by cross-encoder reranking over the merged list", ceAvailable),
             new PipelineDescriptor("hybrid-ce-merge",          "CE Merge",
@@ -260,8 +262,16 @@ public class SearchEngine {
 
         SearchRequest.SearchType resolvedType = req.type();
         if (resolvedType == SearchRequest.SearchType.AUTO) {
-            resolvedType = queryClassifier.classify(hints.cleanedQuery());
-            log.debug("AUTO classified '{}' → {}", hints.cleanedQuery(), resolvedType);
+            QueryClassification classification = queryClassifier.classify(hints.cleanedQuery());
+            resolvedType = classification.type();
+            // Apply docType filter from classifier only when the caller has not set one
+            if (classification.docType() != null && req.docType() == null) {
+                req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), classification.docType(), req.scope(),
+                        req.oversampleFactor());
+            }
+            log.debug("AUTO classified '{}' → {} docType={}", hints.cleanedQuery(),
+                    resolvedType, classification.docType());
         }
         final String resolvedTypeName = resolvedType.name().toLowerCase();
 
