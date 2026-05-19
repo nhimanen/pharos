@@ -474,7 +474,7 @@ public class ProjectIndexManager {
                                     .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
                             List<String> synthBodies = parsedFile.classes().stream()
                                     .map(cls -> buildSynthesizedBody(
-                                            methodsByClass.getOrDefault(cls.qualifiedClassName(), List.of())))
+                                            cls, methodsByClass.getOrDefault(cls.qualifiedClassName(), List.of())))
                                     .collect(Collectors.toList());
                             parsedSynthBodies.add(synthBodies);
 
@@ -641,7 +641,7 @@ public class ProjectIndexManager {
                         List<String> synthBodies = file.classes().stream()
                                 .map(cls -> synthesizedBodyCache.computeIfAbsent(
                                         cls.qualifiedClassName(),
-                                        k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
+                                        k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
                                 .collect(Collectors.toList());
                         fileSynthBodies.add(synthBodies);
                         fileOffsets[fi] = totalSlots;
@@ -672,7 +672,10 @@ public class ProjectIndexManager {
                             ParsedClass cls = file.classes().get(ci);
                             List<ParsedMethod> clsMethods = methodsByClass.getOrDefault(
                                     cls.qualifiedClassName(), List.of());
-                            List<Chunk> clsChunks = chunker.chunkClass(cls, synthBodies.get(ci), clsMethods);
+                            List<Chunk> clsChunks = "document".equals(cls.kind())
+                                    ? chunker.chunkText(cls.javadoc() != null ? cls.javadoc() : cls.qualifiedClassName(),
+                                                        synthBodies.get(ci), cls.startLine())
+                                    : chunker.chunkClass(cls, synthBodies.get(ci), clsMethods);
                             List<Chunk> stripped = new ArrayList<>(clsChunks.size());
                             for (Chunk c : clsChunks) {
                                 spoolWrite(spool, c.text());
@@ -690,7 +693,7 @@ public class ProjectIndexManager {
                     List<String> synthBodies = file.classes().stream()
                             .map(cls -> synthesizedBodyCache.computeIfAbsent(
                                     cls.qualifiedClassName(),
-                                    k -> buildSynthesizedBody(methodsByClass.getOrDefault(k, List.of()))))
+                                    k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
                             .collect(Collectors.toList());
                     fileSynthBodies.add(synthBodies);
                     fileMethodChunks.add(List.of()); // empty = no-embed fallback
@@ -951,6 +954,19 @@ public class ProjectIndexManager {
             n += file.classes().size();
         }
         return n;
+    }
+
+    /**
+     * Returns the synthesized body for a class.
+     * For document-kind classes (non-code files indexed by GenericFileParser) the body is
+     * the raw file content so chunkers and BM25 see the actual text.
+     * For code classes it is the concatenation of method signatures and javadocs.
+     */
+    private static String buildSynthesizedBody(ParsedClass cls, List<ParsedMethod> methods) {
+        if ("document".equals(cls.kind())) {
+            return DocumentMapper.readBodyFromFile(cls.filePath(), cls.startLine(), cls.endLine());
+        }
+        return buildSynthesizedBody(methods);
     }
 
     /**

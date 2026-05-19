@@ -203,7 +203,7 @@ public class GenericFileParser implements CodeParser {
             ));
         }
 
-        return new ParsedFile(absPath, pkg, List.of(), List.of(fileClass), methods);
+        return new ParsedFile(absPath, pkg, List.of(), List.of(fileClass), List.of());
     }
 
     // -----------------------------------------------------------------------

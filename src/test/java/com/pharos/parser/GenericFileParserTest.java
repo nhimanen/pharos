@@ -39,68 +39,11 @@ class GenericFileParserTest {
     }
 
     @Test
-    void parseProject_markdownProducesChunkMethods() throws Exception {
+    void parseProject_producesNoChunkMethods() throws Exception {
         ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
 
-        List<ParsedMethod> chunks = project.allMethods();
-        assertThat(chunks).isNotEmpty();
-        // All must carry the __chunk__ annotation
-        assertThat(chunks).allMatch(m -> m.annotations().contains("__chunk__"));
-    }
-
-    @Test
-    void parseProject_markdownHeadingsBecomeSections() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        List<String> methodNames = project.allMethods().stream()
-                .map(ParsedMethod::methodName).toList();
-        // README.md has: Installation, Quick_Start, Features, Configuration, Contributing
-        assertThat(methodNames).contains("Installation", "Quick_Start", "Features");
-    }
-
-    @Test
-    void parseProject_breadcrumbStoredInSignature() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        // "Java Projects" is a subsection of "Indexing Your Project" in getting-started.md
-        ParsedMethod javaSection = project.allMethods().stream()
-                .filter(m -> m.methodName().equals("Java_Projects"))
-                .findFirst().orElseThrow();
-        // breadcrumb preserves raw heading text (spaces), method name is sanitized
-        assertThat(javaSection.signature()).contains("Indexing Your Project");
-        assertThat(javaSection.signature()).contains("Java Projects");
-    }
-
-    @Test
-    void parseProject_internalLinksExtracted() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        // README.md Installation section links to docs/getting-started.md
-        long linkCount = project.allMethods().stream()
-                .mapToLong(m -> m.calledMethods().size())
-                .sum();
-        assertThat(linkCount).isGreaterThan(0);
-    }
-
-    @Test
-    void parseProject_externalLinksIgnored() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        // No http:// links should appear as call refs
-        boolean anyExternal = project.allMethods().stream()
-                .flatMap(m -> m.calledMethods().stream())
-                .anyMatch(c -> c.calleeSimpleName().startsWith("http"));
-        assertThat(anyExternal).isFalse();
-    }
-
-    @Test
-    void parseProject_allLinksAreUnresolved() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        boolean allUnresolved = project.allMethods().stream()
-                .flatMap(m -> m.calledMethods().stream())
-                .allMatch(c -> !c.resolved());
-        assertThat(allUnresolved).isTrue();
+        // Each file is now a single document-class; no chunk ParsedMethods are emitted.
+        assertThat(project.allMethods()).isEmpty();
     }
 
     @Test
@@ -126,36 +69,12 @@ class GenericFileParserTest {
     }
 
     @Test
-    void parseProject_plainTextChunksAssParagraphs() throws Exception {
+    void parseProject_documentClassLineRangeSpansWholeFile() throws Exception {
         ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
 
-        // notes.txt has 3 paragraphs
-        List<ParsedMethod> txtChunks = project.allMethods().stream()
-                .filter(m -> m.filePath().endsWith("notes.txt"))
-                .toList();
-        assertThat(txtChunks).hasSizeGreaterThanOrEqualTo(2);
-    }
-
-    @Test
-    void parseProject_yamlTopLevelKeysAsChunks() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        List<ParsedMethod> yamlChunks = project.allMethods().stream()
-                .filter(m -> m.filePath().endsWith("config.yaml"))
-                .toList();
-        // config.yaml has 5 top-level keys
-        assertThat(yamlChunks).hasSize(5);
-        List<String> names = yamlChunks.stream().map(ParsedMethod::methodName).toList();
-        assertThat(names).contains("indexDir", "embeddingModel", "maxResults");
-    }
-
-    @Test
-    void parseProject_chunkLineRangeSet() throws Exception {
-        ParsedProject project = new GenericFileParser().parseProject(SAMPLE_DOCS, PROJECT);
-
-        project.allMethods().forEach(m -> {
-            assertThat(m.startLine()).isGreaterThan(0);
-            assertThat(m.endLine()).isGreaterThanOrEqualTo(m.startLine());
+        project.allClasses().forEach(c -> {
+            assertThat(c.startLine()).isEqualTo(1);
+            assertThat(c.endLine()).isGreaterThan(1);
         });
     }
 
@@ -171,14 +90,13 @@ class GenericFileParserTest {
     }
 
     @Test
-    void parseFile_singleMarkdown_returnsChunks() throws Exception {
+    void parseFile_singleMarkdown_returnsOneDocumentClassNoMethods() throws Exception {
         Path readme = SAMPLE_DOCS.resolve("README.md");
         var file = new GenericFileParser().parseFile(readme, PROJECT);
 
         assertThat(file.classes()).hasSize(1);
         assertThat(file.classes().get(0).kind()).isEqualTo("document");
-        assertThat(file.methods()).isNotEmpty();
-        assertThat(file.methods()).allMatch(m -> m.annotations().contains("__chunk__"));
+        assertThat(file.methods()).isEmpty();
     }
 
     // -----------------------------------------------------------------------
