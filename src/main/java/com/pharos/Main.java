@@ -157,6 +157,9 @@ public class Main {
                         moduleGraphBuilder, luceneIndexer, boundaryAnalyzer));
             if (cls == RemoveIndexCommand.class)
                 return (K) new RemoveIndexCommand(registry, indexManager);
+            if (cls == BackfillEmbeddingCacheCommand.class)
+                return (K) new BackfillEmbeddingCacheCommand(
+                        new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry));
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

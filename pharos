@@ -817,6 +817,15 @@ def cmd_web(args):
             pass
 
 
+def cmd_backfill_embedding_cache(args):
+    """Seed the embedding cache from the existing Lucene index without calling ONNX."""
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR),
+                                       "backfill-embedding-cache", args.project]
+    sys.exit(subprocess.run(cmd).returncode)
+
+
 def cmd_invalidate_embeddings(args):
     """Mark file embeddings as stale so the next incremental index re-embeds them.
 
@@ -940,8 +949,9 @@ COMMANDS
   boundary    Show entry/exit points of a module
   skeleton              Show public/protected class and method signatures of a project
   pipelines             List available search pipelines and their ids
-  invalidate-embeddings Mark file embeddings as stale so the next incremental index re-embeds them
-  daemon                Manage the background daemon (start|stop|restart|status|logs)
+  backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
+  invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
+  daemon                    Manage the background daemon (start|stop|restart|status|logs)
 
 DAEMON
   pharos uses a persistent background JVM to avoid cold-start latency.
@@ -1290,6 +1300,29 @@ EXAMPLES
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_pipelines.set_defaults(func=cmd_pipelines)
+
+    # backfill-embedding-cache
+    p_backfill = sub.add_parser(
+        "backfill-embedding-cache",
+        help="Seed the embedding cache from an existing Lucene index (no ONNX calls)",
+        description="""\
+Reads stored float vectors from the Lucene HNSW index and maps current chunk-text
+SHA-256 hashes to them, populating embed-cache.bin without running the ONNX model.
+
+Only single-chunk, non-docs-scoped, source-unchanged documents are backfilled.
+Multi-chunk methods (rare, very long bodies) are skipped and will be re-embedded
+on the next full index run, then cached normally from that point on.
+
+Run this once before 'pharos index --full' to avoid paying the full ONNX cost
+when the cache has never been populated (e.g. first run after adding the cache feature).
+
+EXAMPLES
+  pharos backfill-embedding-cache myproject
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_backfill.add_argument("project", help="Project name as shown in 'pharos projects'")
+    p_backfill.set_defaults(func=cmd_backfill_embedding_cache)
 
     # invalidate-embeddings
     p_inv = sub.add_parser(
