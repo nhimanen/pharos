@@ -161,7 +161,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
                 .rescore(searcher, unionDocs, req.limit());
 
         trace.record("unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
-        return KeywordSearchStrategy.toResults(searcher, reranked, "unified");
+        return KeywordSearchStrategy.toResults(searcher, reranked, "unified", intentLabel);
     }
 
     // ── Adaptive BM25 weight ──────────────────────────────────────────────────
@@ -180,14 +180,21 @@ public class UnifiedRetrievalStage implements RetrievalStage {
     private static float adaptiveBm25Bonus(com.pharos.search.QueryClassification c) {
         if (c == null || c.intent() == null) return BM25_BONUS;
         return switch (c.intent()) {
-            case "BEHAVIORAL"        -> 0.15f;  // vector-leaning — some BM25 recall helps
-            case "INTERFACE"         -> 0.05f;  // heavy vector — abstract types need semantics
+            // Vector-heavy: class type / behavioral queries need semantic recall
+            case "BEHAVIORAL"        -> 0.15f;
+            case "INTERFACE",
+                 "ABSTRACT",
+                 "ENUM",
+                 "RECORD",
+                 "ANNOTATION"        -> 0.05f;  // heavy vector — abstract/specific type queries
             case "HYBRID"            -> 0.10f;  // NL with stop words — vector-leaning
-            case "KEYWORD"           -> 0.30f;  // balanced — works well for Cat A (exact names)
-            case "JAVADOC"           -> 0.50f;  // javadoc field has strong BM25 term signal
-            case "LIFECYCLE"         -> 0.50f;  // exception/lifecycle class names are exact matches
-            case "KEYWORD_TECHNICAL" -> 0.70f;  // multi-word tech phrases — BM25-friendly Cat B/H
-            case "CONFIG"            -> 0.80f;  // setter/getter names — exact keyword matches
+            case "IMPLEMENTATION"    -> 0.20f;  // concrete class names partly in BM25
+            // Balanced / BM25-heavy: keyword signal is strong
+            case "KEYWORD"           -> 0.30f;
+            case "JAVADOC"           -> 0.50f;
+            case "LIFECYCLE"         -> 0.50f;
+            case "KEYWORD_TECHNICAL" -> 0.70f;
+            case "CONFIG"            -> 0.80f;
             default                  -> BM25_BONUS;
         };
     }
