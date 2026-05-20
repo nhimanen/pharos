@@ -109,12 +109,23 @@ public class EmbeddingCacheBackfiller {
         PersistentEmbeddingCache cache = new PersistentEmbeddingCache(projectIndexDir, modelFp, dims);
         FileStateTracker tracker = new FileStateTracker(projectIndexDir);
 
-        // ── Phase 1: collect single-chunk Java docs from the Lucene HNSW index ─────
-        // key = F_ID (FQN for methods, qualifiedClassName for classes)
-        Map<String, float[]>  idToVector   = new LinkedHashMap<>();
-        Map<String, Integer>  idToChunks   = new LinkedHashMap<>();
-        Map<String, String>   idToFilePath = new LinkedHashMap<>();
+        // Pre-build the set of non-dirty Java files so Phase 1 can skip them eagerly,
+        // avoiding loading vectors into memory for files we can never process.
+        Set<String> eligibleFiles = new java.util.HashSet<>();
+        for (Path p : tracker.trackedFiles()) {
+            if (p.toString().endsWith(".java") && Files.exists(p) && !tracker.isDirty(p)) {
+                eligibleFiles.add(p.toString());
+            }
+        }
 
+        // ── Phase 1: collect single-chunk Java docs from the Lucene HNSW index ─────
+        // Vectors are grouped by file path so Phase 2 can process and release one file
+        // at a time without holding the entire project's float[][] in memory at once.
+        // key = filePath → list of (id, vec) pairs
+        Map<String, List<String>>  fileToIds     = new LinkedHashMap<>();
+        Map<String, float[]>       idToVector    = new LinkedHashMap<>();
+
+        int totalVectors = 0, skippedDocs = 0, skippedMultiChunk = 0, skippedNotEligible = 0;
         IndexReader reader = luceneIndexer.openReader(projectName);
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
@@ -125,41 +136,54 @@ public class EmbeddingCacheBackfiller {
             KnnVectorValues.DocIndexIterator iter = fvv.iterator();
             int docId;
             while ((docId = iter.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-                float[] vec = fvv.vectorValue(iter.index()).clone(); // clone: backing array is reused
+                totalVectors++;
                 Document doc = sf.document(docId);
                 String id       = doc.get(DocumentMapper.F_ID);
                 String filePath = doc.get(DocumentMapper.F_FILE_PATH);
                 String scope    = doc.get(DocumentMapper.F_SCOPE);
                 if (id == null || filePath == null) continue;
-                if ("docs".equals(scope)) continue; // will be re-embedded, not backfilled
+                if ("docs".equals(scope)) { skippedDocs++; continue; }
+                // Only backfill Java files — we only have a Java chunker
+                if (!filePath.endsWith(".java")) { skippedNotEligible++; continue; }
+                // Skip dirty / missing files early to avoid loading their vectors
+                if (!eligibleFiles.contains(filePath)) { skippedNotEligible++; continue; }
 
                 BytesRef rangesRef = doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES);
-                int chunkCount = (rangesRef != null)
-                        ? DocumentMapper.decodeLineRanges(rangesRef.bytes).length
-                        : 1;
-                if (chunkCount != 1) continue; // multi-chunk: representative vector ≠ per-chunk vector
+                int chunkCount = 1;
+                if (rangesRef != null) {
+                    byte[] rangeBytes = java.util.Arrays.copyOfRange(
+                            rangesRef.bytes, rangesRef.offset, rangesRef.offset + rangesRef.length);
+                    chunkCount = DocumentMapper.decodeLineRanges(rangeBytes).length;
+                }
+                if (chunkCount != 1) { skippedMultiChunk++; continue; }
 
+                // Clone only after passing all filters — avoids cloning vectors we'll discard
+                float[] vec = fvv.vectorValue(iter.index()).clone();
                 idToVector.put(id, vec);
-                idToChunks.put(id, chunkCount);
-                idToFilePath.put(id, filePath);
+                fileToIds.computeIfAbsent(filePath, k -> new ArrayList<>()).add(id);
             }
         }
 
-        log.info("Found {} single-chunk Java docs to consider for backfill in '{}'",
-                idToVector.size(), projectName);
+        System.out.printf("Phase 1: %d total vectors — %d docs-scope, %d multi-chunk, " +
+                          "%d non-Java/dirty skipped, %d candidates%n",
+                totalVectors, skippedDocs, skippedMultiChunk, skippedNotEligible, idToVector.size());
 
-        // ── Phase 2: re-parse non-dirty files and map SHA-256(chunkText) → vector ──
-        Map<String, List<String>> fileToIds = new LinkedHashMap<>();
-        for (Map.Entry<String, String> e : idToFilePath.entrySet()) {
-            fileToIds.computeIfAbsent(e.getValue(), k -> new ArrayList<>()).add(e.getKey());
+        if (idToVector.isEmpty()) {
+            if (totalVectors == 0) {
+                System.out.println("  → No embedded documents found. " +
+                        "Was this project last indexed with --embed?");
+            }
+            cache.save();
+            return 0;
         }
 
-        int added = 0, skippedDirty = 0, skippedParseFail = 0, skippedMismatch = 0;
+        // ── Phase 2: re-parse one file at a time, release vectors after use ──────────
+        // Processing and immediately nulling out each file's vectors keeps peak heap at
+        // roughly (largest-file vector count × dims × 4) rather than the whole project.
+        int added = 0, skippedParseFail = 0, skippedMismatch = 0;
 
         for (Map.Entry<String, List<String>> entry : fileToIds.entrySet()) {
             Path file = Path.of(entry.getKey());
-            if (!Files.exists(file)) continue;
-            if (tracker.isDirty(file)) { skippedDirty++; continue; }
 
             ParsedFile parsedFile;
             try {
@@ -167,6 +191,7 @@ public class EmbeddingCacheBackfiller {
             } catch (Exception e) {
                 log.debug("Parse failed for {}: {}", file.getFileName(), e.getMessage());
                 skippedParseFail++;
+                entry.getValue().forEach(idToVector::remove); // release vectors
                 continue;
             }
 
@@ -179,9 +204,10 @@ public class EmbeddingCacheBackfiller {
                     .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
 
             for (String id : entry.getValue()) {
-                float[] vec = idToVector.get(id);
-                List<Chunk> chunks = null;
+                float[] vec = idToVector.remove(id); // remove immediately — releases reference
+                if (vec == null) continue;
 
+                List<Chunk> chunks = null;
                 if (byFqn.containsKey(id)) {
                     chunks = chunker.chunkMethodWithLines(byFqn.get(id), true, lines);
                 } else if (byQcn.containsKey(id)) {
@@ -195,8 +221,7 @@ public class EmbeddingCacheBackfiller {
                 }
 
                 if (chunks == null || chunks.size() != 1) {
-                    // Chunk count changed — source or chunker drifted, skip to avoid wrong mapping
-                    if (chunks != null && chunks.size() != 1) skippedMismatch++;
+                    if (chunks != null) skippedMismatch++;
                     continue;
                 }
 
@@ -206,9 +231,9 @@ public class EmbeddingCacheBackfiller {
         }
 
         cache.save();
-        System.out.printf("Backfill complete: %d entries added (%d dirty-file skips, " +
-                          "%d parse errors, %d chunk-count mismatches)%n",
-                added, skippedDirty, skippedParseFail, skippedMismatch);
+        System.out.printf("Backfill complete: %d entries added " +
+                          "(%d parse errors, %d chunk-count mismatches)%n",
+                added, skippedParseFail, skippedMismatch);
         return added;
     }
 
