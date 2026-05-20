@@ -138,10 +138,14 @@ public class EmbeddingCacheBackfiller {
             while ((docId = iter.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
                 totalVectors++;
                 Document doc = sf.document(docId);
-                String id       = doc.get(DocumentMapper.F_ID);
+                String rawId    = doc.get(DocumentMapper.F_ID);
                 String filePath = doc.get(DocumentMapper.F_FILE_PATH);
                 String scope    = doc.get(DocumentMapper.F_SCOPE);
-                if (id == null || filePath == null) continue;
+                if (rawId == null || filePath == null) continue;
+                // F_ID is stored as "projectName:fqn" — strip the prefix so we can
+                // look up against ParsedMethod.fqn() / ParsedClass.qualifiedClassName()
+                int colon = rawId.indexOf(':');
+                String id = colon >= 0 ? rawId.substring(colon + 1) : rawId;
                 if ("docs".equals(scope)) { skippedDocs++; continue; }
                 // Only backfill Java files — we only have a Java chunker
                 if (!filePath.endsWith(".java")) { skippedNotEligible++; continue; }
