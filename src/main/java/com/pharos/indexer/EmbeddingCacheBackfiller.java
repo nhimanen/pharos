@@ -63,6 +63,33 @@ public class EmbeddingCacheBackfiller {
     }
 
     /**
+     * Backfills the embedding cache for every registered project.
+     *
+     * @return total cache entries written across all projects
+     */
+    public int backfillAll() throws IOException {
+        var projects = registry.listAll();
+        if (projects.isEmpty()) {
+            System.out.println("No indexed projects found.");
+            return 0;
+        }
+        int total = 0;
+        int failed = 0;
+        for (var meta : projects) {
+            System.out.printf("%n=== Backfilling '%s' ===%n", meta.getName());
+            try {
+                total += backfill(meta.getName());
+            } catch (Exception e) {
+                System.err.printf("Failed for '%s': %s%n", meta.getName(), e.getMessage());
+                failed++;
+            }
+        }
+        System.out.printf("%nDone: %d project(s)%s, %d total entries added.%n",
+                projects.size(), failed > 0 ? " (" + failed + " failed)" : "", total);
+        return total;
+    }
+
+    /**
      * Backfills the embedding cache for the given project.
      *
      * @return number of cache entries written

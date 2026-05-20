@@ -821,8 +821,11 @@ def cmd_backfill_embedding_cache(args):
     """Seed the embedding cache from the existing Lucene index without calling ONNX."""
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
-    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR),
-                                       "backfill-embedding-cache", args.project]
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "backfill-embedding-cache"]
+    if args.all:
+        cmd.append("--all")
+    else:
+        cmd.append(args.project)
     sys.exit(subprocess.run(cmd).returncode)
 
 
@@ -1321,7 +1324,8 @@ EXAMPLES
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_backfill.add_argument("project", help="Project name as shown in 'pharos projects'")
+    p_backfill.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
+    p_backfill.add_argument("--all", action="store_true", help="Backfill every registered project")
     p_backfill.set_defaults(func=cmd_backfill_embedding_cache)
 
     # invalidate-embeddings
