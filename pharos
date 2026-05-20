@@ -829,14 +829,8 @@ def cmd_backfill_embedding_cache(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
-def cmd_invalidate_embeddings(args):
-    """Mark file embeddings as stale so the next incremental index re-embeds them.
-
-    Reads file-state.json for the given project and sets chunkingVersion=0 on
-    the selected scope of files, causing hasOutdatedEmbeddings() to return true
-    and the incremental runner to re-embed those files on the next index run.
-    """
-    # Resolve index dir from config (mirrors IndexConfig.java default logic)
+def _resolve_index_dir() -> Path:
+    """Read indexDir from ~/.pharos/config.json, falling back to the default."""
     config_file = PHAROS_DIR / "config.json"
     index_dir = PHAROS_DIR / "indexes"
     if config_file.exists():
@@ -846,22 +840,26 @@ def cmd_invalidate_embeddings(args):
                 index_dir = Path(cfg["indexDir"])
         except Exception:
             pass
+    return index_dir
 
-    state_file = index_dir / args.project / "file-state.json"
+
+def _invalidate_project_embeddings(index_dir: Path, project: str, scope: str) -> int:
+    """Set chunkingVersion=0 for files matching scope in a single project's file-state.json.
+
+    Returns the number of entries changed, or -1 if the state file is missing.
+    """
+    state_file = index_dir / project / "file-state.json"
     if not state_file.exists():
-        die(f"No file-state.json found for project '{args.project}' at {state_file}\n"
-            f"Has this project been indexed?")
+        return -1
 
-    # Extension sets matching DocumentMapper.computeScope()
     DOC_EXTS  = {".md", ".txt", ".yml", ".yaml", ".sh", ".xml"}
     JAVA_EXTS = {".java"}
 
-    scope = args.scope
     def is_target(path: str) -> bool:
         ext = Path(path).suffix.lower()
-        if scope == "docs":  return ext in DOC_EXTS
-        if scope == "java":  return ext in JAVA_EXTS
-        return True  # "all"
+        if scope == "docs": return ext in DOC_EXTS
+        if scope == "java": return ext in JAVA_EXTS
+        return True
 
     state = json.loads(state_file.read_text())
     changed = 0
@@ -870,14 +868,47 @@ def cmd_invalidate_embeddings(args):
             entry["chunkingVersion"] = 0
             changed += 1
 
-    # Atomic write
     tmp = state_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(state_file)
+    return changed
 
-    scope_label = {"docs": "document", "java": "Java", "all": "all"}[scope]
-    print(f"Invalidated embeddings for {changed} {scope_label} file(s) in '{args.project}'.")
-    print(f"Run './pharos index <path>' to re-embed only those files.")
+
+def cmd_invalidate_embeddings(args):
+    """Mark file embeddings as stale so the next incremental index re-embeds them."""
+    if args.all and args.project:
+        die("Specify either a project name or --all, not both.")
+    if not args.all and not args.project:
+        die("Missing project name. Pass a project name or use --all.")
+
+    index_dir = _resolve_index_dir()
+    scope_label = {"docs": "document", "java": "Java", "all": "all"}[args.scope]
+
+    if args.all:
+        registry_file = PHAROS_DIR / "registry.json"
+        if not registry_file.exists():
+            die("No registry found — have you indexed any projects yet?")
+        projects = list(json.loads(registry_file.read_text()).keys())
+        if not projects:
+            print("No indexed projects found.")
+            return
+        total = 0
+        for project in projects:
+            n = _invalidate_project_embeddings(index_dir, project, args.scope)
+            if n < 0:
+                print(f"  {project}: no file-state.json, skipped")
+            else:
+                print(f"  {project}: {n} {scope_label} file(s) invalidated")
+                total += n
+        print(f"\nDone: {total} {scope_label} file(s) invalidated across {len(projects)} project(s).")
+    else:
+        n = _invalidate_project_embeddings(index_dir, args.project, args.scope)
+        if n < 0:
+            die(f"No file-state.json found for project '{args.project}' at "
+                f"{index_dir / args.project / 'file-state.json'}\nHas this project been indexed?")
+        print(f"Invalidated embeddings for {n} {scope_label} file(s) in '{args.project}'.")
+
+    print("Run './pharos index <path>' to re-embed only those files.")
 
 
 def cmd_daemon(args):
@@ -1344,10 +1375,13 @@ EXAMPLES
   pharos invalidate-embeddings myproject                    # re-embed docs only (default)
   pharos invalidate-embeddings myproject --scope java       # re-embed Java files only
   pharos invalidate-embeddings myproject --scope all        # re-embed everything
+  pharos invalidate-embeddings --all                        # invalidate docs in every project
+  pharos invalidate-embeddings --all --scope all            # invalidate everything in every project
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_inv.add_argument("project", help="Project name as shown in 'pharos projects'")
+    p_inv.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
+    p_inv.add_argument("--all", action="store_true", help="Invalidate every registered project")
     p_inv.add_argument(
         "--scope",
         choices=["docs", "java", "all"],
