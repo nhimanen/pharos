@@ -160,6 +160,8 @@ public class Main {
             if (cls == BackfillEmbeddingCacheCommand.class)
                 return (K) new BackfillEmbeddingCacheCommand(
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry));
+            if (cls == MineCommand.class)
+                return (K) new MineCommand(registry, luceneIndexer);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

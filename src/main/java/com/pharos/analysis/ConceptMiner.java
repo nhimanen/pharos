@@ -4,6 +4,7 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.search.WormholeTermExtractor;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
@@ -152,6 +153,7 @@ public class ConceptMiner {
             for (String cls : e.getValue())
                 byClass.computeIfAbsent(cls, k -> new ArrayList<>()).add(e.getKey());
 
+        printWormholeTerms(reader, docs);
         printConceptMap(byClass);
         printSynonymCandidates(rules);
         printCrossReferences(docs);
@@ -414,6 +416,14 @@ public class ConceptMiner {
                     emitExpansionNgrams(phrase, d.className, result);
             }
         }
+
+        // ── Source 4: per-class method wormhole (cross-class fanout filter) ─────
+        // Two-pass: first collect all per-class PPMI candidates, then count how
+        // many classes each term tops.  Terms shared across many class wormholes
+        // (e.g. "init", "call") are generic Java idioms — drop them.
+        // Only terms specific to ≤ WORMHOLE_MAX_CLASS_FANOUT classes are kept.
+        mineWormhole(reader, docs).forEach(
+                (className, terms) -> terms.forEach(t -> addRule(result, t, className)));
 
         // ── Source 2: javadoc prose bigrams (top-P% PPMI per class) ──────────
         // Percentile mode: rank bigrams by PPMI within each class, keep top-P%.
@@ -766,6 +776,113 @@ public class ConceptMiner {
         }
         Files.writeString(synonymFile, String.join(System.lineSeparator(), compacted));
         return removed;
+    }
+
+    // Terms appearing as a top wormhole term for more than this many classes are too
+    // generic to be useful synonyms (e.g. "init", "call", "run").
+    private static final int WORMHOLE_MAX_CLASS_FANOUT = 3;
+
+    /**
+     * Two-pass wormhole mining for synonym generation.
+     * <ol>
+     *   <li>Run {@link WormholeTermExtractor} on each class's production methods as foreground.</li>
+     *   <li>Count how many distinct classes each candidate term surfaces in.</li>
+     *   <li>Drop terms present in more than {@link #WORMHOLE_MAX_CLASS_FANOUT} class wormholes —
+     *       they are Java idioms ("init", "call") rather than domain vocabulary.</li>
+     * </ol>
+     *
+     * @return className → discriminative terms list (classes with no survivors omitted)
+     */
+    private Map<String, List<String>> mineWormhole(IndexReader reader, List<ClassDoc> docs)
+            throws IOException {
+        WormholeTermExtractor wormhole = new WormholeTermExtractor();
+        Map<String, List<Integer>> methodsByClass = loadMethodDocIdsByClass(reader);
+
+        // Pass 1 — per-class PPMI candidates + cross-class frequency count
+        Map<String, List<String>> rawByClass    = new LinkedHashMap<>();
+        Map<String, Integer>      termClassCount = new HashMap<>();
+
+        for (ClassDoc d : docs) {
+            List<Integer> methodDocIds = methodsByClass.getOrDefault(d.className, List.of());
+            if (methodDocIds.size() < 2) continue;
+
+            List<WormholeTermExtractor.WormholeTerm> extracted = wormhole.extract(
+                    reader, methodDocIds,
+                    WormholeTermExtractor.METHOD_ONLY_FIELDS, 8, methodDocIds.size());
+
+            String classNameLower = d.className.toLowerCase();
+            List<String> candidates = extracted.stream()
+                    .filter(t -> t.statisticalScore() > 0
+                              && t.foregroundCount() >= 2
+                              && !t.term().equals(classNameLower))
+                    .map(WormholeTermExtractor.WormholeTerm::term)
+                    .collect(Collectors.toList());
+
+            if (!candidates.isEmpty()) {
+                rawByClass.put(d.className, candidates);
+                candidates.forEach(t -> termClassCount.merge(t, 1, Integer::sum));
+            }
+        }
+
+        // Pass 2 — drop cross-class generic terms
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> e : rawByClass.entrySet()) {
+            List<String> kept = e.getValue().stream()
+                    .filter(t -> termClassCount.getOrDefault(t, 0) <= WORMHOLE_MAX_CLASS_FANOUT)
+                    .collect(Collectors.toList());
+            if (!kept.isEmpty()) result.put(e.getKey(), kept);
+        }
+        return result;
+    }
+
+    /**
+     * Loads production-scope method documents from the index, grouped by simple class name.
+     * Test and benchmark methods are excluded: their vocabulary (assertThat, verify, mock…)
+     * is not useful for synonym mining and would pollute the wormhole signal.
+     */
+    private Map<String, List<Integer>> loadMethodDocIdsByClass(IndexReader reader) throws IOException {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        // Prod-scope methods only
+        BooleanQuery q = new BooleanQuery.Builder()
+                .add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, "method")),
+                        BooleanClause.Occur.MUST)
+                .add(new TermQuery(new Term(DocumentMapper.F_SCOPE, "prod")),
+                        BooleanClause.Occur.MUST)
+                .build();
+        TopDocs hits = searcher.search(q, Integer.MAX_VALUE);
+        StoredFields sf = searcher.storedFields();
+        Map<String, List<Integer>> byClass = new LinkedHashMap<>();
+        for (ScoreDoc sd : hits.scoreDocs) {
+            String className = sf.document(sd.doc).get(DocumentMapper.F_CLASS_NAME);
+            if (className != null && !className.isBlank())
+                byClass.computeIfAbsent(className, k -> new ArrayList<>()).add(sd.doc);
+        }
+        return byClass;
+    }
+
+    /**
+     * Prints per-class characteristic vocabulary after the cross-class fanout filter.
+     * Reuses {@link #mineWormhole} so the display reflects exactly what goes into the
+     * synonym rules — no separate extraction pass.
+     */
+    private void printWormholeTerms(IndexReader reader, List<ClassDoc> docs) throws IOException {
+        System.out.println(bar());
+        System.out.printf("  WORMHOLE TERMS — per-class (fanout filter ≤%d classes)%n",
+                WORMHOLE_MAX_CLASS_FANOUT);
+        System.out.println(bar());
+        System.out.printf("  %-38s  %s%n", "Class", "Discriminative terms");
+        System.out.println("  " + "─".repeat(100));
+
+        Map<String, List<String>> filtered = mineWormhole(reader, docs);
+        for (ClassDoc d : docs) {
+            List<String> terms = filtered.get(d.className);
+            if (terms == null || terms.isEmpty()) continue;
+            System.out.printf("  %-38s  %s%n",
+                    truncate(d.className, 36),
+                    String.join(", ", terms));
+        }
+        System.out.println(bar());
+        System.out.println();
     }
 
     /** Reads existing synonyms.txt and collects all left-hand terms (before {@code =>}). */

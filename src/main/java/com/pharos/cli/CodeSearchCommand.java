@@ -30,6 +30,7 @@ import picocli.CommandLine.*;
                 WebCommand.class,
                 RemoveIndexCommand.class,
                 BackfillEmbeddingCacheCommand.class,
+                MineCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,
