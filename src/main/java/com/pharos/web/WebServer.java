@@ -1,5 +1,6 @@
 package com.pharos.web;
 
+import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.*;
@@ -62,6 +63,37 @@ public class WebServer {
             config.staticFiles.add("/web", Location.CLASSPATH);
         });
 
+        // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
+        UsageLogger usage = new UsageLogger(IndexConfig.DEFAULT_BASE);
+        app.before(ctx -> {
+            if (ctx.path().startsWith("/api/")) {
+                ctx.attribute("usage.start", System.currentTimeMillis());
+            }
+        });
+        app.after(ctx -> {
+            Long start = ctx.attribute("usage.start");
+            if (start == null) return;          // not an /api/* call, or before-handler skipped it
+            long latency = System.currentTimeMillis() - start;
+            // Collapse Map<String,List<String>> -> Map<String,String> (first value); most
+            // params are single-valued, and the log stays human-readable as one-liners.
+            Map<String, String> params = new LinkedHashMap<>();
+            ctx.queryParamMap().forEach((k, vs) ->
+                    params.put(k, vs == null || vs.isEmpty() ? "" : vs.get(0)));
+            Integer resultCount       = ctx.attribute("usage.resultCount");
+            @SuppressWarnings("unchecked")
+            List<String> resultIds    = ctx.attribute("usage.resultIds");
+            usage.log(UsageLogger.Entry.of(
+                    ctx.path(),
+                    ctx.method().name(),
+                    params,
+                    latency,
+                    ctx.statusCode(),
+                    resultCount,
+                    resultIds,
+                    ctx.userAgent()
+            ));
+        });
+
         // Root → index.html
         app.get("/", ctx -> {
             try (InputStream is = WebServer.class.getResourceAsStream("/web/index.html")) {
@@ -74,10 +106,12 @@ public class WebServer {
         app.get("/api/pipelines", ctx -> ctx.json(searchEngine.listPipelines()));
 
         // API: project list
-        app.get("/api/projects", ctx ->
-                ctx.json(registry.listAll().stream()
-                        .map(this::projectToMap)
-                        .collect(Collectors.toList())));
+        app.get("/api/projects", ctx -> {
+            List<ProjectMeta> projects = registry.listAll();
+            recordResults(ctx, projects.size(),
+                    projects.stream().map(ProjectMeta::getName).collect(Collectors.toList()));
+            ctx.json(projects.stream().map(this::projectToMap).collect(Collectors.toList()));
+        });
 
         // API: module dependency graph
         app.get("/api/graph/modules", ctx -> ctx.json(buildModuleGraphData()));
@@ -133,6 +167,8 @@ public class WebServer {
                 List<SearchResult> decorated = searchEngine
                         .newSnippetDecorator(snippetLines, resp)
                         .decorate(resp.results(), q);
+                recordResults(ctx, decorated.size(),
+                        decorated.stream().map(SearchResult::id).collect(Collectors.toList()));
                 List<Map<String, Object>> results = decorated.stream()
                         .map(this::resultToMap).collect(Collectors.toList());
                 boolean needsEnvelope = trace || (resp.suggestions() != null && !resp.suggestions().isEmpty());
@@ -177,10 +213,14 @@ public class WebServer {
                 // Partial FQN — parameter types omitted. Try name-only lookup.
                 List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
                 if (candidates.isEmpty()) {
+                    recordSingle(ctx, null);
                     ctx.status(404).result("Not found"); return;
                 } else if (candidates.size() == 1) {
+                    recordSingle(ctx, candidates.get(0).id());
                     ctx.json(methodToMap(candidates.get(0))); return;
                 } else {
+                    recordResults(ctx, candidates.size(),
+                            candidates.stream().map(SearchResult::id).collect(Collectors.toList()));
                     String list = candidates.stream()
                             .map(c -> "  " + c.id().substring(c.project().length() + 1))
                             .collect(Collectors.joining("\n"));
@@ -189,7 +229,8 @@ public class WebServer {
                     return;
                 }
             }
-            if (r == null) { ctx.status(404).result("Not found"); return; }
+            if (r == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
+            recordSingle(ctx, r.id());
             ctx.json(methodToMap(r));
         });
 
@@ -201,11 +242,13 @@ public class WebServer {
             try {
                 if (withCtx) {
                     SearchEngine.ClassContext context = searchEngine.getClassContext(fqn);
-                    if (context == null) { ctx.status(404).result("Not found"); return; }
+                    if (context == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
+                    recordSingle(ctx, fqn);
                     ctx.json(classContextToMap(context));
                 } else {
                     SearchResult r = searchEngine.getClassByFqn(fqn);
-                    if (r == null) { ctx.status(404).result("Not found"); return; }
+                    if (r == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
+                    recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
                 }
             } catch (Exception e) {
@@ -220,8 +263,10 @@ public class WebServer {
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
             try {
-                ctx.json(searchEngine.findCallers(fqn, project).stream()
-                        .map(this::refToMap).collect(Collectors.toList()));
+                List<SearchResult> callers = searchEngine.findCallers(fqn, project);
+                recordResults(ctx, callers.size(),
+                        callers.stream().map(SearchResult::id).collect(Collectors.toList()));
+                ctx.json(callers.stream().map(this::refToMap).collect(Collectors.toList()));
             } catch (IOException e) {
                 log.warn("findCallers failed for '{}': {}", fqn, e.getMessage());
                 ctx.status(503).result(e.getMessage());
@@ -234,8 +279,10 @@ public class WebServer {
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
             try {
-                ctx.json(searchEngine.findCallees(fqn, project).stream()
-                        .map(this::refToMap).collect(Collectors.toList()));
+                List<SearchResult> callees = searchEngine.findCallees(fqn, project);
+                recordResults(ctx, callees.size(),
+                        callees.stream().map(SearchResult::id).collect(Collectors.toList()));
+                ctx.json(callees.stream().map(this::refToMap).collect(Collectors.toList()));
             } catch (IOException e) {
                 log.warn("findCallees failed for '{}': {}", fqn, e.getMessage());
                 ctx.status(503).result(e.getMessage());
@@ -296,6 +343,7 @@ public class WebServer {
                     if (!candidate.isEmpty()) { path = candidate; break; }
                 } catch (Exception ignored) {}
             }
+            recordResults(ctx, path.size(), path);
             Map<String, Object> res = new LinkedHashMap<>();
             res.put("path", path);
             res.put("hops", path.isEmpty() ? 0 : path.size() - 1);
@@ -434,6 +482,26 @@ public class WebServer {
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
         log.info("Web server started on port {}", port);
+    }
+
+    // ── Usage logging helpers ──────────────────────────────────────────────────
+
+    /**
+     * Attach {@code resultCount} and (optionally) {@code resultIds} to the request context
+     * so the {@code after} handler can write them into the usage log. IDs are capped at
+     * 20 to keep log lines a reasonable size; the count is unbounded.
+     */
+    private static void recordResults(io.javalin.http.Context ctx, int count, List<String> ids) {
+        ctx.attribute("usage.resultCount", count);
+        if (ids != null && !ids.isEmpty()) {
+            ctx.attribute("usage.resultIds", ids.size() > 20 ? ids.subList(0, 20) : ids);
+        }
+    }
+
+    /** Shortcut for endpoints that return a single result (or none, for 404). */
+    private static void recordSingle(io.javalin.http.Context ctx, String id) {
+        ctx.attribute("usage.resultCount", id == null ? 0 : 1);
+        ctx.attribute("usage.resultIds", id == null ? List.of() : List.of(id));
     }
 
     // ── Graph data builders ────────────────────────────────────────────────────
