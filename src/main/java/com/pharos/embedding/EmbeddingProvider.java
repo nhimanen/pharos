@@ -1,5 +1,6 @@
 package com.pharos.embedding;
 
+import com.pharos.config.EmbeddingProviderConfig;
 import com.pharos.config.IndexConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,16 +9,32 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.function.IntConsumer;
 import java.util.stream.IntStream;
 
 /**
  * Interface for generating vector embeddings from text.
- * Implemented by DjlEmbeddingProvider (DJL + ONNX) or NoOpEmbeddingProvider (disabled).
+ * Implemented by {@link DjlEmbeddingProvider} (DJL + ONNX, local model) and
+ * {@link OpenAiHttpEmbeddingProvider} (HTTP, remote model). {@link NoOpEmbeddingProvider}
+ * is the sentinel for "vector search disabled".
+ *
+ * <p>Each provider carries a stable {@link #modelId()} string. The id is used both
+ * to derive the Lucene field name where this provider's vectors are stored
+ * ({@code vec.<sanitized-modelId>}) and to look up the right provider at search
+ * time via {@link IndexConfig#getSearchEmbeddingModel()}.
  */
 public interface EmbeddingProvider {
 
     Logger log = LoggerFactory.getLogger(EmbeddingProvider.class);
+
+    /**
+     * Stable identifier for this provider — chosen by the user in
+     * {@code config.json}'s {@code embeddingProviders[].modelId}. Pharos uses
+     * it for Lucene field naming, cache keys, and {@link com.pharos.config.ProjectMeta#getEmbeddedModels()}
+     * tracking. Must be non-null and stable across restarts.
+     */
+    String modelId();
 
     /**
      * Embed text into a float vector.
@@ -96,19 +113,76 @@ public interface EmbeddingProvider {
     /** Returns false if this is a NoOp provider (embeddings not configured). */
     boolean isAvailable();
 
-    /** Factory: creates the appropriate provider based on config. */
-    static EmbeddingProvider create(IndexConfig config) {
-        if (config.getEmbeddingModelUrl() == null || config.getEmbeddingModelUrl().isBlank()) {
-            log.info("No embedding model configured — vector search disabled. " +
-                    "Set embeddingModelUrl in ~/.pharos/config.json to enable.");
-            return new NoOpEmbeddingProvider();
-        }
+    /**
+     * Build one provider from a single config entry. Errors during construction
+     * are logged and converted to a {@link NoOpEmbeddingProvider} so the daemon
+     * stays up even when one configured model is temporarily unreachable.
+     * Indexing/embedding commands should check {@link #isAvailable()} on each
+     * provider and fail loud rather than silently writing no vectors.
+     */
+    static EmbeddingProvider create(EmbeddingProviderConfig cfg) {
         try {
-            return new DjlEmbeddingProvider(config.getEmbeddingModelUrl(), config.getEmbeddingDimensions(), config.getEmbeddingMaxTokens());
+            switch (cfg.getType()) {
+                case "djl":
+                    return new DjlEmbeddingProvider(
+                            cfg.getModelId(), cfg.getUrl(),
+                            cfg.getDimensions(), cfg.getMaxTokens());
+                case "openai":
+                    return new OpenAiHttpEmbeddingProvider(cfg);
+                default:
+                    log.warn("Unknown embedding provider type '{}' for modelId='{}', falling back to NoOp.",
+                            cfg.getType(), cfg.getModelId());
+                    return new NoOpEmbeddingProvider(cfg.getModelId());
+            }
         } catch (Throwable e) {
-            log.warn("DJL embedding provider unavailable ({}: {}), falling back to NoOp. Keyword search will still work.",
-                    e.getClass().getSimpleName(), e.getMessage());
-            return new NoOpEmbeddingProvider();
+            log.warn("Embedding provider '{}' unavailable ({}: {}), falling back to NoOp. " +
+                    "Keyword search will still work.",
+                    cfg.getModelId(), e.getClass().getSimpleName(), e.getMessage());
+            return new NoOpEmbeddingProvider(cfg.getModelId());
         }
+    }
+
+    /**
+     * Build all providers declared in {@code config.embeddingProviders}, in order.
+     * Returns an empty list when no providers are configured — callers that need
+     * a working embedder should test the result and fall back to keyword-only
+     * search.
+     */
+    static List<EmbeddingProvider> createAll(IndexConfig config) {
+        List<EmbeddingProviderConfig> cfgs = config.getEmbeddingProviders();
+        if (cfgs == null || cfgs.isEmpty()) {
+            log.info("No embedding providers configured — vector search disabled. " +
+                    "Add an entry to 'embeddingProviders' in ~/.pharos/config.json to enable.");
+            return List.of();
+        }
+        List<EmbeddingProvider> out = new ArrayList<>(cfgs.size());
+        for (EmbeddingProviderConfig cfg : cfgs) {
+            out.add(create(cfg));
+        }
+        return out;
+    }
+
+    /**
+     * Pick the provider for search-time query embedding. Honours
+     * {@link IndexConfig#getSearchEmbeddingModel()}; if unset, falls back to the
+     * first configured provider. Returns a {@link NoOpEmbeddingProvider} when
+     * nothing is configured.
+     */
+    static EmbeddingProvider searchProvider(IndexConfig config) {
+        Optional<EmbeddingProviderConfig> chosen = config.resolveSearchProvider();
+        if (chosen.isEmpty()) return new NoOpEmbeddingProvider();
+        return create(chosen.get());
+    }
+
+    /**
+     * Legacy single-provider factory — kept so callers that still read the old
+     * {@code embeddingModelUrl} shape from {@link IndexConfig} keep working
+     * during the multi-provider migration.
+     *
+     * @deprecated use {@link #createAll(IndexConfig)} or {@link #searchProvider(IndexConfig)}
+     */
+    @Deprecated
+    static EmbeddingProvider create(IndexConfig config) {
+        return searchProvider(config);
     }
 }

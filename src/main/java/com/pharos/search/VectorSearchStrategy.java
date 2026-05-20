@@ -38,9 +38,15 @@ public class VectorSearchStrategy {
     private static final int RESCORE_FACTOR = 3;
 
     private final EmbeddingProvider embedder;
+    /** Cached per-modelId Lucene field name for KNN queries. Resolves the legacy
+     *  fallback path automatically (see {@link DocumentMapper#vectorFieldFor(String)}). */
+    private final String vectorField;
+    private final String chunkVectorField;
 
     public VectorSearchStrategy(EmbeddingProvider embedder) {
         this.embedder = embedder;
+        this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
+        this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
 
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
@@ -60,8 +66,8 @@ public class VectorSearchStrategy {
         int   firstPassK  = limit * RESCORE_FACTOR;
 
         Query vectorQuery = filter != null
-                ? new KnnFloatVectorQuery(DocumentMapper.F_VECTOR, queryVector, firstPassK, filter)
-                : new KnnFloatVectorQuery(DocumentMapper.F_VECTOR, queryVector, firstPassK);
+                ? new KnnFloatVectorQuery(vectorField, queryVector, firstPassK, filter)
+                : new KnnFloatVectorQuery(vectorField, queryVector, firstPassK);
 
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs firstPass = searcher.search(vectorQuery, firstPassK);
@@ -73,7 +79,7 @@ public class VectorSearchStrategy {
             float[][] queryMultiVec = new float[][] { queryVector };
             TopDocs reranked = LateInteractionRescorer
                     .withFallbackToFirstPassScore(
-                            DocumentMapper.F_CHUNK_VECTORS, queryMultiVec,
+                            chunkVectorField, queryMultiVec,
                             VectorSimilarityFunction.COSINE)
                     .rescore(searcher, firstPass, limit);
             return KeywordSearchStrategy.toResults(searcher, reranked, "vector");
@@ -110,7 +116,7 @@ public class VectorSearchStrategy {
                 var storedFields = searcher.storedFields();
                 var doc = storedFields.document(hits.scoreDocs[0].doc);
 
-                org.apache.lucene.util.BytesRef chunkVecsRef = doc.getBinaryValue(DocumentMapper.F_CHUNK_VECTORS);
+                org.apache.lucene.util.BytesRef chunkVecsRef = doc.getBinaryValue(chunkVectorField);
                 byte[] rangesBytes = doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES) != null
                         ? doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES).bytes : null;
                 if (chunkVecsRef == null || rangesBytes == null) return null;
@@ -143,10 +149,10 @@ public class VectorSearchStrategy {
         return denom < 1e-8f ? 0f : dot / denom;
     }
 
-    /** Returns true when the index contains the {@code chunkVectors} late-interaction field. */
-    private static boolean hasChunkVectors(IndexReader reader) {
+    /** Returns true when the index contains the per-model chunk-vectors late-interaction field. */
+    private boolean hasChunkVectors(IndexReader reader) {
         return reader.leaves().stream().anyMatch(
-                ctx -> ctx.reader().getFieldInfos().fieldInfo(DocumentMapper.F_CHUNK_VECTORS) != null);
+                ctx -> ctx.reader().getFieldInfos().fieldInfo(chunkVectorField) != null);
     }
 
     private static Query buildFilter(SearchRequest req) {

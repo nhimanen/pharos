@@ -92,14 +92,14 @@ class DocumentMapperTest {
 
     @Test
     void toClassDocument_setsDocTypeClass() {
-        Document doc = DocumentMapper.toClassDocument(testClass(), "body", null);
+        Document doc = DocumentMapper.toClassDocument(testClass(), "body", (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_DOC_TYPE)).isEqualTo("class");
     }
 
     @Test
     void toClassDocument_setsClassId() {
-        Document doc = DocumentMapper.toClassDocument(testClass(), "", null);
+        Document doc = DocumentMapper.toClassDocument(testClass(), "", (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_ID)).isEqualTo(PROJECT + ":com.example.Calculator");
     }
@@ -107,21 +107,21 @@ class DocumentMapperTest {
     @Test
     void toClassDocument_storesSynthesizedBodyAsF_BODY() {
         String body = "public int add(int a, int b)\n  // Adds two integers\n";
-        Document doc = DocumentMapper.toClassDocument(testClass(), body, null);
+        Document doc = DocumentMapper.toClassDocument(testClass(), body, (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_BODY)).isEqualTo(body);
     }
 
     @Test
     void toClassDocument_storesClassNameAsMethodName_forBoostCompatibility() {
-        Document doc = DocumentMapper.toClassDocument(testClass(), "", null);
+        Document doc = DocumentMapper.toClassDocument(testClass(), "", (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_METHOD_NAME)).isEqualTo("Calculator");
     }
 
     @Test
     void toClassDocument_storesInDegreeAsZero() {
-        Document doc = DocumentMapper.toClassDocument(testClass(), "", null);
+        Document doc = DocumentMapper.toClassDocument(testClass(), "", (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_IN_DEGREE)).isEqualTo("0");
     }
@@ -129,7 +129,7 @@ class DocumentMapperTest {
     @Test
     void toClassDocument_storesJavadocWhenPresent() {
         ParsedClass cls = classWithJavadoc("A calculator class.");
-        Document doc = DocumentMapper.toClassDocument(cls, "", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "", (float[]) null);
 
         assertThat(doc.get(DocumentMapper.F_JAVADOC)).isEqualTo("A calculator class.");
     }
@@ -239,7 +239,7 @@ class DocumentMapperTest {
                 PROJECT, "com.example", "Calculator", "com.example.Calculator",
                 "class", null, List.of(), List.of(),
                 "public", false /*isAbstract*/, false, null, "/src/C.java", 1, 10);
-        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", (float[]) null);
         assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("class");
     }
 
@@ -249,7 +249,7 @@ class DocumentMapperTest {
                 PROJECT, "com.example", "BaseProcessor", "com.example.BaseProcessor",
                 "class", null, List.of(), List.of(),
                 "public", true /*isAbstract*/, false, null, "/src/BP.java", 1, 20);
-        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", (float[]) null);
         assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("abstract");
     }
 
@@ -259,7 +259,7 @@ class DocumentMapperTest {
                 PROJECT, "com.example", "Collector", "com.example.Collector",
                 "interface", null, List.of(), List.of(),
                 "public", false, false, null, "/src/Collector.java", 1, 5);
-        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", (float[]) null);
         assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("interface");
     }
 
@@ -269,7 +269,7 @@ class DocumentMapperTest {
                 PROJECT, "com.example", "Status", "com.example.Status",
                 "enum", null, List.of(), List.of(),
                 "public", false, false, null, "/src/Status.java", 1, 8);
-        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", (float[]) null);
         assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("enum");
     }
 
@@ -279,7 +279,7 @@ class DocumentMapperTest {
                 PROJECT, "com.example", "Point", "com.example.Point",
                 "record", null, List.of(), List.of(),
                 "public", false, false, null, "/src/Point.java", 1, 3);
-        Document doc = DocumentMapper.toClassDocument(cls, "body", null);
+        Document doc = DocumentMapper.toClassDocument(cls, "body", (float[]) null);
         assertThat(doc.get(DocumentMapper.F_CLASS_TYPE)).isEqualTo("record");
     }
 

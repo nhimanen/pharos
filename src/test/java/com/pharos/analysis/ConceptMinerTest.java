@@ -160,7 +160,7 @@ class ConceptMinerTest {
                 "public", false, false, null,
                 "/src/" + className + ".java", 1, 50
         );
-        Document doc = DocumentMapper.toClassDocument(cls, synthesizedBody, null);
+        Document doc = DocumentMapper.toClassDocument(cls, synthesizedBody, (float[]) null);
         writeDoc(doc);
     }
 

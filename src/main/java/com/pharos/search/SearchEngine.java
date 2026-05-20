@@ -213,6 +213,15 @@ public class SearchEngine {
             return new SearchResponse(List.of(), trace, req.type().name().toLowerCase(), null);
         }
 
+        // Refuse vector-shaped queries when the configured search model has no
+        // corresponding vectors in one or more of the resolved projects. Throwing
+        // a clear exception beats silently returning empty results, which is the
+        // failure mode an unsuspecting user would otherwise see after swapping
+        // searchEmbeddingModel without re-indexing.
+        if (embedder.isAvailable() && requiresVectors(req.type())) {
+            validateSearchModelAvailable(projects);
+        }
+
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
         // Classification for AUTO and UNIFIED is now handled inside SearchPipeline via QueryRouter.
@@ -831,6 +840,47 @@ public class SearchEngine {
             }
         }
         return List.of();
+    }
+
+    /**
+     * Returns true for query types that route through a vector-search stage and
+     * therefore need a vector field present in the index.
+     */
+    private static boolean requiresVectors(SearchRequest.SearchType type) {
+        return switch (type) {
+            case VECTOR, HYBRID, HYBRID_RERANKED, HYBRID_CROSS_ENCODER_MERGE,
+                 HYBRID_DIVERSE, HYBRID_RERANKED_DIVERSE, UNIFIED -> true;
+            default -> false;  // KEYWORD, AUTO (which may resolve to keyword)
+        };
+    }
+
+    /**
+     * Checks every resolved project's {@code embeddedModels} carries the model
+     * id the configured search embedder uses. Pre-upgrade indexes have an empty
+     * {@code embeddedModels} list and are allowed only when the search embedder
+     * is the synthesized legacy one — they're served from the legacy
+     * {@code vectorEmbedding} field.
+     */
+    private void validateSearchModelAvailable(List<String> projects) {
+        String modelId = embedder.modelId();
+        boolean isLegacyModel = com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId);
+        for (String p : projects) {
+            ProjectMeta meta = registry.find(p).orElse(null);
+            if (meta == null) continue;  // shouldn't happen; resolveProjects already filtered
+            List<String> embeddedModels = meta.getEmbeddedModels();
+            boolean has = embeddedModels.contains(modelId)
+                    || (embeddedModels.isEmpty() && isLegacyModel);
+            if (!has) {
+                String available = embeddedModels.isEmpty()
+                        ? "<legacy / none recorded>"
+                        : String.join(", ", embeddedModels);
+                throw new VectorModelUnavailableException(String.format(
+                        "Project '%s' has no vectors for search embedding model '%s'. " +
+                        "Available model(s): %s. " +
+                        "Run: pharos embed --model=%s %s",
+                        p, modelId, available, modelId, p));
+            }
+        }
     }
 
     private List<String> resolveProjects(SearchRequest req) {

@@ -45,6 +45,8 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     private static final Path MODEL_CACHE =
             Path.of(System.getProperty("user.home"), ".djl.ai", "pharos");
 
+    /** Stable identifier from the provider config — used for Lucene field naming. */
+    private final String modelId;
     /** Non-null for zoo models (has a no-arg newPredictor()); null for HF models. */
     private final ZooModel<String, float[]> zooModel;
     private final Model hfModel;
@@ -73,9 +75,11 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     private final ThreadLocal<int[]> threadEmbedCount =
             ThreadLocal.withInitial(() -> new int[]{0});
 
-    public DjlEmbeddingProvider(String modelUrl, int dimensions, int maxTokens)
+    public DjlEmbeddingProvider(String modelId, String modelUrl, int dimensions, int maxTokens)
             throws ModelException, IOException {
-        log.info("Loading embedding model: {} (maxTokens={})", modelUrl, maxTokens);
+        log.info("Loading embedding model '{}' from {} (maxTokens={})",
+                modelId, modelUrl, maxTokens);
+        this.modelId = modelId;
         this.maxTokens = maxTokens;
         this.dimensions = dimensions;
 
@@ -89,7 +93,36 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             this.zooModel = loadZooModel(modelUrl);
         }
 
-        log.info("Embedding model loaded ({} dimensions)", dimensions);
+        log.info("Embedding model '{}' loaded ({} dimensions)", modelId, dimensions);
+    }
+
+    /**
+     * Legacy 3-arg constructor — derives a model id from the URL for callers
+     * that haven't been migrated to the multi-provider API yet.
+     *
+     * @deprecated use {@link #DjlEmbeddingProvider(String, String, int, int)} with
+     *             an explicit modelId from the provider config.
+     */
+    @Deprecated
+    public DjlEmbeddingProvider(String modelUrl, int dimensions, int maxTokens)
+            throws ModelException, IOException {
+        this(deriveLegacyModelId(modelUrl), modelUrl, dimensions, maxTokens);
+    }
+
+    private static String deriveLegacyModelId(String modelUrl) {
+        if (modelUrl == null || modelUrl.isBlank()) return "djl";
+        String s = modelUrl;
+        if (s.startsWith("hf://")) s = s.substring("hf://".length());
+        int slash = s.lastIndexOf('/');
+        if (slash >= 0) s = s.substring(slash + 1);
+        int colon = s.indexOf(':');
+        if (colon >= 0) s = s.substring(0, colon);
+        return s.isEmpty() ? "djl" : s;
+    }
+
+    @Override
+    public String modelId() {
+        return modelId;
     }
 
     /** Creates a fresh Predictor from the already-loaded model. Used on construction and periodic reset. */

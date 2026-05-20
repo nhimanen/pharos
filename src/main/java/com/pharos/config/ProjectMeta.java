@@ -25,6 +25,16 @@ public class ProjectMeta {
     private List<UnresolvedRef> unresolvedRefs; // saved for later cross-project linking
 
     /**
+     * Embedding model identifiers for which this project carries vectors in its
+     * Lucene index. Each entry corresponds to a {@code vec.<modelId>} (and
+     * possibly {@code chunkVec.<modelId>}) field on every document. Empty list
+     * means either keyword-only indexing or a legacy pre-multi-provider index
+     * (in which case search-side legacy fallback applies). Used by the search
+     * engine to refuse queries against a model whose vectors are absent.
+     */
+    private List<String> embeddedModels;
+
+    /**
      * Stable hash of {@link #unresolvedRefs} contents — used by the cross-project linker
      * guard to skip expensive graph linking when nothing has changed since the last run.
      * Zero means "not yet computed" (pre-existing index).
@@ -40,6 +50,7 @@ public class ProjectMeta {
         this.knownPackages = new ArrayList<>();
         this.linkedProjects = new ArrayList<>();
         this.unresolvedRefs = new ArrayList<>();
+        this.embeddedModels = new ArrayList<>();
     }
 
     public ProjectMeta(String name, String rootPath, String indexPath) {
@@ -146,6 +157,13 @@ public class ProjectMeta {
 
     public List<UnresolvedRef> getUnresolvedRefs() { return unresolvedRefs; }
     public void setUnresolvedRefs(List<UnresolvedRef> unresolvedRefs) { this.unresolvedRefs = unresolvedRefs; }
+
+    public List<String> getEmbeddedModels() {
+        return embeddedModels != null ? embeddedModels : new ArrayList<>();
+    }
+    public void setEmbeddedModels(List<String> embeddedModels) {
+        this.embeddedModels = embeddedModels == null ? new ArrayList<>() : embeddedModels;
+    }
 
     public String getGroupId()              { return groupId; }
     public void setGroupId(String groupId)  { this.groupId = groupId; }

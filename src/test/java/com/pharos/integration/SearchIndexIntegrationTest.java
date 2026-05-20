@@ -73,7 +73,7 @@ class SearchIndexIntegrationTest {
                     List<ParsedMethod> methods = methodsByClass.getOrDefault(
                             cls.qualifiedClassName(), List.of());
                     String synthesized = buildSynthesizedBody(methods);
-                    writer.addDocument(DocumentMapper.toClassDocument(cls, synthesized, null));
+                    writer.addDocument(DocumentMapper.toClassDocument(cls, synthesized, (float[]) null));
                 }
             }
             writer.commit();

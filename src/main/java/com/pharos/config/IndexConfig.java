@@ -1,6 +1,8 @@
 package com.pharos.config;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -10,6 +12,9 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * Global configuration for the code-search tool.
@@ -23,11 +28,33 @@ public class IndexConfig {
 
     private Path indexDir;
     private Path synonymsFile;
+
+    /**
+     * One or more embedding providers. Pharos can run several in parallel at
+     * index time and store one vector field per model in each Lucene document.
+     * Search picks one model via {@link #searchEmbeddingModel}.
+     */
+    private List<EmbeddingProviderConfig> embeddingProviders = new ArrayList<>();
+
+    /**
+     * Identifier of the embedding provider to use at search time. Must match the
+     * {@code modelId} of one of the configured {@link #embeddingProviders}. When
+     * null, the first provider in the list is used. When no providers are
+     * configured, vector/hybrid search degrades to keyword-only.
+     */
+    private String searchEmbeddingModel;
+
+    // ── Legacy single-provider fields (pre-multi-provider config) ─────────────
+    // Read from old config.json shapes via Jackson, then migrated into the
+    // embeddingProviders list at load() time. @JsonIgnore on the getters so
+    // they are NOT serialized back when save() is called — we want to drop the
+    // old shape on the first config write after upgrade.
     private String embeddingModelUrl;
     private int embeddingDimensions;
+    private int embeddingMaxTokens;
+
     private int hnswMaxConnections;
     private int hnswBeamWidth;
-    private int embeddingMaxTokens;
     private boolean verbose;
 
     /**
@@ -99,11 +126,48 @@ public class IndexConfig {
             ObjectMapper mapper = createMapper();
             IndexConfig config = mapper.readValue(configFile.toFile(), IndexConfig.class);
             if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
+            if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
+            config.migrateLegacyEmbeddingConfig();
+            for (EmbeddingProviderConfig p : config.embeddingProviders) p.validate();
             return config;
         } catch (IOException e) {
             log.warn("Could not read config file {}, using defaults: {}", configFile, e.getMessage());
             return defaults();
         }
+    }
+
+    /**
+     * Stable, sanitized identifier derived from the legacy {@code embeddingModelUrl}
+     * for indexes that were built before multi-provider support landed. Used both
+     * during config migration and at search time when an existing index has no
+     * recorded {@code embeddedModels} (the search engine reads the legacy
+     * {@code vectorEmbedding} field via this model id).
+     */
+    public static final String LEGACY_MODEL_ID = "legacy";
+
+    /**
+     * If the new {@link #embeddingProviders} list is empty but the old
+     * {@link #embeddingModelUrl} is set, synthesize a single legacy provider so
+     * downstream code (which only reads the new shape) keeps working. The legacy
+     * fields are NOT written back on save — see the {@code @JsonIgnore}-marked
+     * getters below.
+     */
+    private void migrateLegacyEmbeddingConfig() {
+        if (!embeddingProviders.isEmpty()) return;
+        if (embeddingModelUrl == null || embeddingModelUrl.isBlank()) return;
+
+        EmbeddingProviderConfig legacy = new EmbeddingProviderConfig();
+        legacy.setType("djl");
+        legacy.setModelId(LEGACY_MODEL_ID);
+        legacy.setUrl(embeddingModelUrl);
+        legacy.setDimensions(embeddingDimensions > 0 ? embeddingDimensions : 768);
+        legacy.setMaxTokens(embeddingMaxTokens > 0 ? embeddingMaxTokens : 512);
+        embeddingProviders.add(legacy);
+        if (searchEmbeddingModel == null || searchEmbeddingModel.isBlank()) {
+            searchEmbeddingModel = LEGACY_MODEL_ID;
+        }
+        log.info("Migrated legacy embeddingModelUrl='{}' into provider '{}'.",
+                embeddingModelUrl, LEGACY_MODEL_ID);
     }
 
     public void save() throws IOException {
@@ -126,14 +190,71 @@ public class IndexConfig {
     public Path getSynonymsFile() { return synonymsFile; }
     public void setSynonymsFile(Path synonymsFile) { this.synonymsFile = synonymsFile; }
 
-    public String getEmbeddingModelUrl() { return embeddingModelUrl; }
+    // Legacy single-provider getters — kept for callers that haven't been
+    // refactored to the multi-provider API yet (EmbeddingProvider.create,
+    // EmbeddingCacheBackfiller, IndexVersions.modelFingerprint, etc.).
+    // @JsonIgnore so they don't get serialized back; setters keep their
+    // Jackson-default deserialization so legacy config.json shapes load.
+    /** @deprecated use {@link #getEmbeddingProviders()} */
+    @JsonIgnore
+    @Deprecated
+    public String getEmbeddingModelUrl() {
+        if (embeddingModelUrl != null) return embeddingModelUrl;
+        return embeddingProviders.isEmpty() ? null : embeddingProviders.get(0).getUrl();
+    }
+    @JsonSetter("embeddingModelUrl")
     public void setEmbeddingModelUrl(String embeddingModelUrl) { this.embeddingModelUrl = embeddingModelUrl; }
 
-    public int getEmbeddingDimensions() { return embeddingDimensions; }
+    /** @deprecated use {@link #getEmbeddingProviders()} */
+    @JsonIgnore
+    @Deprecated
+    public int getEmbeddingDimensions() {
+        if (embeddingDimensions > 0) return embeddingDimensions;
+        return embeddingProviders.isEmpty() ? 768 : embeddingProviders.get(0).getDimensions();
+    }
+    @JsonSetter("embeddingDimensions")
     public void setEmbeddingDimensions(int embeddingDimensions) { this.embeddingDimensions = embeddingDimensions; }
 
-    public int getEmbeddingMaxTokens() { return embeddingMaxTokens; }
+    /** @deprecated use {@link #getEmbeddingProviders()} */
+    @JsonIgnore
+    @Deprecated
+    public int getEmbeddingMaxTokens() {
+        if (embeddingMaxTokens > 0) return embeddingMaxTokens;
+        return embeddingProviders.isEmpty() ? 512 : embeddingProviders.get(0).getMaxTokens();
+    }
+    @JsonSetter("embeddingMaxTokens")
     public void setEmbeddingMaxTokens(int embeddingMaxTokens) { this.embeddingMaxTokens = embeddingMaxTokens; }
+
+    public List<EmbeddingProviderConfig> getEmbeddingProviders() { return embeddingProviders; }
+    public void setEmbeddingProviders(List<EmbeddingProviderConfig> embeddingProviders) {
+        this.embeddingProviders = embeddingProviders == null ? new ArrayList<>() : embeddingProviders;
+    }
+
+    public String getSearchEmbeddingModel() { return searchEmbeddingModel; }
+    public void setSearchEmbeddingModel(String searchEmbeddingModel) {
+        this.searchEmbeddingModel = searchEmbeddingModel;
+    }
+
+    /**
+     * Resolves the search-time embedding provider. Returns the configured
+     * {@link #searchEmbeddingModel} if set, otherwise the first provider in the
+     * list, otherwise empty.
+     */
+    public Optional<EmbeddingProviderConfig> resolveSearchProvider() {
+        if (embeddingProviders.isEmpty()) return Optional.empty();
+        if (searchEmbeddingModel == null || searchEmbeddingModel.isBlank()) {
+            return Optional.of(embeddingProviders.get(0));
+        }
+        return findProviderConfig(searchEmbeddingModel);
+    }
+
+    /** Look up a provider config by its {@code modelId}. */
+    public Optional<EmbeddingProviderConfig> findProviderConfig(String modelId) {
+        if (modelId == null) return Optional.empty();
+        return embeddingProviders.stream()
+                .filter(p -> modelId.equals(p.getModelId()))
+                .findFirst();
+    }
 
     public int getHnswMaxConnections() { return hnswMaxConnections; }
     public void setHnswMaxConnections(int hnswMaxConnections) { this.hnswMaxConnections = hnswMaxConnections; }

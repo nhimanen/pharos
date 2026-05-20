@@ -55,33 +55,158 @@ public class ProjectIndexManager {
     private final IndexConfig config;
     private final LuceneIndexer luceneIndexer;
     private final ProjectRegistry registry;
-    private final EmbeddingProvider embedder;
+    /**
+     * All embedding providers configured for this index run. Each contributes one
+     * {@code vec.<modelId>} field per Lucene document — see
+     * {@link com.pharos.indexer.DocumentMapper#vectorFieldName(String)}. NoOp
+     * providers (those that failed construction) are kept in the list but
+     * skipped at embedding time.
+     */
+    private final List<EmbeddingProvider> embedders;
     private final ModuleGraphBuilder moduleGraphBuilder;
     /** Ordered list of language parsers; first match by extension wins. */
     private final List<CodeParser> parsers;
 
+    /**
+     * Legacy single-provider constructor. Equivalent to passing
+     * {@code List.of(embedder)} to the multi-provider variant. Kept so existing
+     * test code and callers that haven't been migrated still work unchanged.
+     *
+     * @deprecated use the {@code List<EmbeddingProvider>} variant.
+     */
+    @Deprecated
     public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
                                 ProjectRegistry registry, EmbeddingProvider embedder) {
-        this(config, luceneIndexer, registry, embedder, new ModuleGraphBuilder(registry));
+        this(config, luceneIndexer, registry, List.of(embedder), new ModuleGraphBuilder(registry));
     }
 
+    @Deprecated
     public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
                                 ProjectRegistry registry, EmbeddingProvider embedder,
                                 ModuleGraphBuilder moduleGraphBuilder) {
-        this(config, luceneIndexer, registry, embedder, moduleGraphBuilder,
+        this(config, luceneIndexer, registry, List.of(embedder), moduleGraphBuilder,
+                List.of(new JavaCodeParser()));
+    }
+
+    @Deprecated
+    public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
+                                ProjectRegistry registry, EmbeddingProvider embedder,
+                                ModuleGraphBuilder moduleGraphBuilder,
+                                List<CodeParser> parsers) {
+        this(config, luceneIndexer, registry, List.of(embedder), moduleGraphBuilder, parsers);
+    }
+
+    public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
+                                ProjectRegistry registry, List<EmbeddingProvider> embedders,
+                                ModuleGraphBuilder moduleGraphBuilder) {
+        this(config, luceneIndexer, registry, embedders, moduleGraphBuilder,
                 List.of(new JavaCodeParser()));
     }
 
     public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
-                                ProjectRegistry registry, EmbeddingProvider embedder,
+                                ProjectRegistry registry, List<EmbeddingProvider> embedders,
                                 ModuleGraphBuilder moduleGraphBuilder,
                                 List<CodeParser> parsers) {
         this.config = config;
         this.luceneIndexer = luceneIndexer;
         this.registry = registry;
-        this.embedder = embedder;
+        this.embedders = List.copyOf(embedders);
         this.moduleGraphBuilder = moduleGraphBuilder;
         this.parsers = List.copyOf(parsers);
+    }
+
+    /** Providers whose construction succeeded — the ones we actually embed with. */
+    private List<EmbeddingProvider> availableEmbedders() {
+        return embedders.stream().filter(EmbeddingProvider::isAvailable).collect(Collectors.toList());
+    }
+
+    /**
+     * Composite modelFp for {@link FileStateTracker} — invalidates per-file
+     * embeddings when the set of available models or any of their dims changes.
+     * Order-independent so config reordering doesn't trigger spurious re-embeds.
+     */
+    private String compositeModelFingerprint() {
+        List<EmbeddingProvider> avail = availableEmbedders();
+        if (avail.isEmpty()) return "none";
+        return avail.stream()
+                .map(e -> {
+                    Optional<com.pharos.config.EmbeddingProviderConfig> cfg = config.findProviderConfig(e.modelId());
+                    if (cfg.isPresent()) return IndexVersions.modelFingerprint(cfg.get());
+                    String url = config.getEmbeddingModelUrl();
+                    return e.modelId() + ":" + e.dimensions()
+                            + ":" + (url == null ? "" : url);
+                })
+                .sorted()
+                .collect(Collectors.joining(";"));
+    }
+
+    /**
+     * Per-model runtime state for the indexing pipeline: the provider itself,
+     * its persistent cache, the on-disk path where Phase 2 spills decoded float[]
+     * arrays, and the embedding batch size to use. One {@code EmbedRuntime}
+     * exists per available embedding provider for the duration of a single
+     * index/incremental run.
+     */
+    static final class EmbedRuntime {
+        final EmbeddingProvider provider;
+        /** Persistent cache (text-hash → float[]). May be null when caching is disabled. */
+        final PersistentEmbeddingCache cache;
+        /** Phase-2 spill file for this model's decoded vectors. */
+        final Path cachePath;
+        final int dims;
+        final int chunkSize;
+
+        EmbedRuntime(EmbeddingProvider provider, PersistentEmbeddingCache cache,
+                     Path cachePath, int chunkSize) {
+            this.provider = provider;
+            this.cache = cache;
+            this.cachePath = cachePath;
+            this.dims = provider.dimensions();
+            this.chunkSize = chunkSize;
+        }
+
+        String modelId() { return provider.modelId(); }
+    }
+
+    /**
+     * Build a runtime per available embedder for the given project. Cache files
+     * are namespaced by sanitized modelId so multiple providers can spill in
+     * parallel directories without clobbering each other.
+     */
+    private List<EmbedRuntime> buildRuntimes(Path projectIndexDir, boolean generateEmbeddings,
+                                              String cacheFilePrefix) {
+        if (!generateEmbeddings) return List.of();
+        List<EmbedRuntime> out = new ArrayList<>();
+        for (EmbeddingProvider e : availableEmbedders()) {
+            String fp = config.findProviderConfig(e.modelId())
+                    .map(IndexVersions::modelFingerprint)
+                    .orElseGet(() -> {
+                        // No matching provider config — synthesize a fingerprint from
+                        // modelId + dims + legacy URL so callers (mostly tests) that
+                        // mutate the deprecated embeddingModelUrl still trigger cache
+                        // invalidation as the original single-provider code did.
+                        String url = config.getEmbeddingModelUrl();
+                        return e.modelId() + ":" + e.dimensions()
+                                + ":" + (url == null ? "" : url);
+                    });
+            PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
+                    projectIndexDir, fp, e.dimensions());
+            String fileName = cacheFilePrefix + "." + sanitizeForFilename(e.modelId()) + ".cache";
+            Path cachePath = projectIndexDir.resolve(fileName);
+            int chunkSize = config.findProviderConfig(e.modelId())
+                    .map(com.pharos.config.EmbeddingProviderConfig::resolvedBatchSize)
+                    .orElse(EMBED_CHUNK_SIZE);
+            out.add(new EmbedRuntime(e, cache, cachePath, chunkSize));
+        }
+        return out;
+    }
+
+    /** Same sanitization as {@link DocumentMapper#vectorFieldName(String)} — keeps cache filenames boring. */
+    private static String sanitizeForFilename(String modelId) {
+        String s = modelId.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9._-]", "_")
+                .replaceAll("_+", "_");
+        return s.length() > 96 ? s.substring(0, 96) : s;
     }
 
     /** Returns the union of all extensions supported by registered parsers. */
@@ -227,19 +352,22 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        String modelFp = IndexVersions.modelFingerprint(config);
+        String modelFp = compositeModelFingerprint();
         FileStateTracker stateTracker = new FileStateTracker(
                 projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp);
-        PersistentEmbeddingCache embeddingCache = (generateEmbeddings && embedder.isAvailable())
-                ? new PersistentEmbeddingCache(projectIndexDir, modelFp, embedder.dimensions())
-                : null;
+        // Per-model runtimes — one PersistentEmbeddingCache + cache file per
+        // available provider. Full and incremental paths use slightly different
+        // cache-file prefixes so a parallel re-index can't clobber an in-progress
+        // incremental run.
+        List<EmbedRuntime> runtimes = buildRuntimes(projectIndexDir, generateEmbeddings,
+                incremental && luceneIndexer.indexExists(projectName) ? "embed-incr" : "embed");
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, embeddingCache);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, embeddingCache);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes);
         }
     }
 
@@ -247,7 +375,7 @@ public class ProjectIndexManager {
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
                                    ProgressListener progress,
-                                   PersistentEmbeddingCache embeddingCache) throws IOException {
+                                   List<EmbedRuntime> runtimes) throws IOException {
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
         // Check dirty status against the pre-existing state before clearing it, so synonym mining
@@ -341,15 +469,19 @@ public class ProjectIndexManager {
         // Pass 2: write Lucene index with graph-derived fields
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
             indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress,
-                    projectIndexDir, embeddingCache);
+                    projectIndexDir, runtimes);
             writer.commit();
         }
 
         // Save file state
         stateTracker.save();
 
-        // Update registry
+        // Update registry — record which models actually wrote vectors so the
+        // search engine can validate per-project model availability later.
         ProjectMeta meta = buildMeta(projectName, projectRoot, projectIndexDir, project);
+        meta.setEmbeddedModels(runtimes.stream()
+                .map(EmbedRuntime::modelId)
+                .collect(Collectors.toList()));
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
 
@@ -365,7 +497,7 @@ public class ProjectIndexManager {
                                           Path projectIndexDir, FileStateTracker stateTracker,
                                           boolean generateEmbeddings, boolean buildSynonyms,
                                           ProgressListener progress,
-                                          PersistentEmbeddingCache embeddingCache) throws IOException {
+                                          List<EmbedRuntime> runtimes) throws IOException {
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -434,7 +566,7 @@ public class ProjectIndexManager {
         // (e.g. CHUNKING_VERSION bumped, or model changed, or invalidate-embeddings ran for
         // a specific scope).  Only the per-file stale entries are added — files with current
         // versions (e.g. Java files when only docs were invalidated) are left untouched.
-        if (embeddingCache != null && stateTracker.hasOutdatedEmbeddings()) {
+        if (!runtimes.isEmpty() && stateTracker.hasOutdatedEmbeddings()) {
             Set<Path> dirtySet = new java.util.HashSet<>(dirtyFiles);
             List<Path> versionDirty = new ArrayList<>();
             for (Path tracked : stateTracker.trackedFiles()) {
@@ -473,13 +605,11 @@ public class ProjectIndexManager {
             }
 
             // Pass 1: delete stale docs and parse all dirty files; spool embedding texts to disk.
-            boolean doEmbed = generateEmbeddings && embedder.isAvailable();
-            int dims = embedder.dimensions();
+            boolean doEmbed = generateEmbeddings && !runtimes.isEmpty();
             List<Integer> fileSlotStarts = new ArrayList<>();  // slot offset per parsed file
             List<List<String>> parsedSynthBodies = new ArrayList<>();
 
             Path spoolPath = projectIndexDir.resolve("embed-incr.spool");
-            Path cachePath = projectIndexDir.resolve("embed-incr.cache");
             try {
                 int totalSlots = 0;
                 try (DataOutputStream spool = doEmbed
@@ -524,51 +654,82 @@ public class ProjectIndexManager {
                     }
                 }
 
-                // Pass 2: stream spool through ONNX (with persistent cache short-circuit).
+                // Pass 2: stream spool through each available provider — one cache
+                // file per model. Spool is read from the start for every provider so
+                // they see the same texts in the same slot order.
                 if (doEmbed && totalSlots > 0) {
-                    int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
-                    int[] cacheStats = {0, 0}; // [hits, misses]
-                    try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
-                                 Files.newInputStream(spoolPath), 1 << 16));
-                         DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
-                                 Files.newOutputStream(cachePath), 1 << 16))) {
-                        int chunksDone = 0;
-                        int slot = 0;
-                        while (slot < totalSlots) {
-                            int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
-                            List<String> texts = new ArrayList<>(end - slot);
-                            for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
-                            float[][] embeddings = embedBatchWithCache(texts, embeddingCache, cacheStats);
-                            for (float[] e : embeddings) cacheWrite(cache, e, dims);
-                            slot = end;
-                            progress.onProgress("Embedding", ++chunksDone, totalChunks);
+                    for (EmbedRuntime rt : runtimes) {
+                        int chunkSize = rt.chunkSize;
+                        int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
+                        int[] cacheStats = {0, 0}; // [hits, misses]
+                        try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
+                                     Files.newInputStream(spoolPath), 1 << 16));
+                             DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
+                                     Files.newOutputStream(rt.cachePath), 1 << 16))) {
+                            int chunksDone = 0;
+                            int slot = 0;
+                            while (slot < totalSlots) {
+                                int end = Math.min(slot + chunkSize, totalSlots);
+                                List<String> texts = new ArrayList<>(end - slot);
+                                for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
+                                float[][] embeddings = embedBatchWithCache(
+                                        rt.provider, texts, rt.cache, cacheStats);
+                                for (float[] e : embeddings) cacheWrite(cache, e, rt.dims);
+                                slot = end;
+                                progress.onProgress("Embedding[" + rt.modelId() + "]",
+                                        ++chunksDone, totalChunks);
+                            }
                         }
-                    }
-                    if (embeddingCache != null) embeddingCache.save();
-                    if (cacheStats[0] > 0 || cacheStats[1] > 0) {
-                        log.info("Embedding cache: {} hit(s), {} miss(es) for '{}'",
-                                cacheStats[0], cacheStats[1], projectName);
+                        if (rt.cache != null) rt.cache.save();
+                        if (cacheStats[0] > 0 || cacheStats[1] > 0) {
+                            log.info("Embedding cache[{}]: {} hit(s), {} miss(es) for '{}'",
+                                    rt.modelId(), cacheStats[0], cacheStats[1], projectName);
+                        }
                     }
                 }
 
-                // Pass 3: write Lucene documents reading embeddings from cache.
-                FileChannel cacheChannel = (doEmbed && totalSlots > 0)
-                        ? FileChannel.open(cachePath, StandardOpenOption.READ) : null;
+                // Pass 3: write Lucene documents, reading per-model embeddings.
+                Map<String, FileChannel> cacheChannels = new LinkedHashMap<>();
                 try {
+                    if (doEmbed && totalSlots > 0) {
+                        for (EmbedRuntime rt : runtimes) {
+                            cacheChannels.put(rt.modelId(),
+                                    FileChannel.open(rt.cachePath, StandardOpenOption.READ));
+                        }
+                    }
                     for (int i = 0; i < parsedDirtyFiles.size(); i++) {
                         ParsedFile parsedFile = parsedDirtyFiles.get(i);
                         List<String> synthBodies = parsedSynthBodies.get(i);
                         int slotCount = parsedFile.methods().size() + parsedFile.classes().size();
-                        float[][] embs = readCachedEmbeddings(cacheChannel, fileSlotStarts.get(i), slotCount, dims);
+                        int fileSlotStart = fileSlotStarts.get(i);
+
+                        // Read per-model embedding arrays for this file. Map preserves
+                        // insertion order so the downstream DocumentMapper sees fields
+                        // in the same order across docs.
+                        Map<String, float[][]> embsByModel = new LinkedHashMap<>();
+                        if (slotCount > 0) {
+                            for (EmbedRuntime rt : runtimes) {
+                                FileChannel ch = cacheChannels.get(rt.modelId());
+                                if (ch != null) {
+                                    embsByModel.put(rt.modelId(),
+                                            readCachedEmbeddings(ch, fileSlotStart, slotCount, rt.dims));
+                                }
+                            }
+                        }
 
                         for (int mi = 0; mi < parsedFile.methods().size(); mi++) {
+                            int slot = mi;
+                            Map<String, float[]> vectorsByModel = sliceVectorsAt(embsByModel, slot);
                             writer.addDocument(DocumentMapper.toDocument(
-                                    parsedFile.methods().get(mi), embs[mi]));
+                                    parsedFile.methods().get(mi), vectorsByModel,
+                                    0, List.of(), null));
                         }
                         int classOff = parsedFile.methods().size();
                         for (int ci = 0; ci < parsedFile.classes().size(); ci++) {
+                            int slot = classOff + ci;
+                            Map<String, float[]> vectorsByModel = sliceVectorsAt(embsByModel, slot);
                             writer.addDocument(DocumentMapper.toClassDocument(
-                                    parsedFile.classes().get(ci), synthBodies.get(ci), embs[classOff + ci]));
+                                    parsedFile.classes().get(ci), synthBodies.get(ci), vectorsByModel));
                         }
 
                         List<String> classNames = parsedFile.classes().stream()
@@ -578,12 +739,16 @@ public class ProjectIndexManager {
                         progress.onProgress("Indexing", ++doneWork, totalWork);
                     }
                 } finally {
-                    if (cacheChannel != null) cacheChannel.close();
+                    for (FileChannel ch : cacheChannels.values()) {
+                        try { ch.close(); } catch (IOException ignored) {}
+                    }
                 }
                 writer.commit();
             } finally {
                 Files.deleteIfExists(spoolPath);
-                Files.deleteIfExists(cachePath);
+                for (EmbedRuntime rt : runtimes) {
+                    Files.deleteIfExists(rt.cachePath);
+                }
             }
         }
 
@@ -598,6 +763,9 @@ public class ProjectIndexManager {
 
         // Build lightweight ProjectMeta from Lucene reader counts (no re-parse needed)
         ProjectMeta meta = buildMetaFromIndex(projectName, projectRoot, projectIndexDir, currentFiles.size());
+        meta.setEmbeddedModels(runtimes.stream()
+                .map(EmbedRuntime::modelId)
+                .collect(Collectors.toList()));
         // Inherit known packages and unresolved refs from the previous registry entry so
         // cross-project linking can still work without a full parse
         registry.find(projectName).ifPresent(prev -> {
@@ -637,18 +805,17 @@ public class ProjectIndexManager {
     private void indexProject(IndexWriter writer, ParsedProject project,
                                FileStateTracker stateTracker, boolean generateEmbeddings,
                                GraphIndexData graphData, ProgressListener progress,
-                               Path projectIndexDir, PersistentEmbeddingCache embeddingCache) throws IOException {
+                               Path projectIndexDir, List<EmbedRuntime> runtimes) throws IOException {
         int indexThreads = config.resolvedIndexThreads();
         List<ParsedFile> files = project.files();
         int totalFiles = files.size();
-        int dims = embedder.dimensions();
         log.debug("Indexing {} files with {} thread(s)", totalFiles, indexThreads);
 
         Map<String, List<ParsedMethod>> methodsByClass = project.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
         ConcurrentHashMap<String, String> synthesizedBodyCache = new ConcurrentHashMap<>();
 
-        boolean doEmbed = generateEmbeddings && embedder.isAvailable();
+        boolean doEmbed = generateEmbeddings && !runtimes.isEmpty();
         int[] fileOffsets = new int[totalFiles];
         List<List<String>> fileSynthBodies = new ArrayList<>(totalFiles);
 
@@ -661,7 +828,6 @@ public class ProjectIndexManager {
         List<List<List<Chunk>>> fileClassChunks  = new ArrayList<>(totalFiles);
 
         Path spoolPath = projectIndexDir.resolve("embed.spool");
-        Path cachePath = projectIndexDir.resolve("embed.cache");
         try {
             // Phase 1: build chunk lists and spool all embedding texts to disk.
             // Methods always contribute 1 slot; classes contribute N slots (one per chunk).
@@ -734,38 +900,50 @@ public class ProjectIndexManager {
                 }
             }
 
-            // Phase 2: stream spool through ONNX (with persistent cache short-circuit).
-            // Peak heap: one chunk of texts + one chunk of embeddings (~200 KB for chunk size 32).
+            // Phase 2: stream spool through each available provider — one cache file
+            // per model so search-time can pick which to query.
             if (doEmbed && totalSlots > 0) {
-                int totalChunks = (totalSlots + EMBED_CHUNK_SIZE - 1) / EMBED_CHUNK_SIZE;
-                int[] cacheStats = {0, 0}; // [hits, misses]
-                try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
-                             Files.newInputStream(spoolPath), 1 << 16));
-                     DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
-                             Files.newOutputStream(cachePath), 1 << 16))) {
-                    int chunksDone = 0;
-                    int slot = 0;
-                    while (slot < totalSlots) {
-                        int end = Math.min(slot + EMBED_CHUNK_SIZE, totalSlots);
-                        List<String> texts = new ArrayList<>(end - slot);
-                        for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
-                        float[][] embeddings = embedBatchWithCache(texts, embeddingCache, cacheStats);
-                        for (float[] e : embeddings) cacheWrite(cache, e, dims);
-                        slot = end;
-                        progress.onProgress("Embedding", ++chunksDone, totalChunks);
+                for (EmbedRuntime rt : runtimes) {
+                    int chunkSize = rt.chunkSize;
+                    int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
+                    int[] cacheStats = {0, 0}; // [hits, misses]
+                    try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
+                                 Files.newInputStream(spoolPath), 1 << 16));
+                         DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
+                                 Files.newOutputStream(rt.cachePath), 1 << 16))) {
+                        int chunksDone = 0;
+                        int slot = 0;
+                        while (slot < totalSlots) {
+                            int end = Math.min(slot + chunkSize, totalSlots);
+                            List<String> texts = new ArrayList<>(end - slot);
+                            for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
+                            float[][] embeddings = embedBatchWithCache(
+                                    rt.provider, texts, rt.cache, cacheStats);
+                            for (float[] e : embeddings) cacheWrite(cache, e, rt.dims);
+                            slot = end;
+                            progress.onProgress("Embedding[" + rt.modelId() + "]",
+                                    ++chunksDone, totalChunks);
+                        }
                     }
-                }
-                if (embeddingCache != null) embeddingCache.save();
-                if (cacheStats[0] > 0 || cacheStats[1] > 0) {
-                    log.info("Embedding cache: {} hit(s), {} miss(es)", cacheStats[0], cacheStats[1]);
+                    if (rt.cache != null) rt.cache.save();
+                    if (cacheStats[0] > 0 || cacheStats[1] > 0) {
+                        log.info("Embedding cache[{}]: {} hit(s), {} miss(es)",
+                                rt.modelId(), cacheStats[0], cacheStats[1]);
+                    }
                 }
             }
 
-            // Phase 3: write Lucene documents. Each file reads its embedding range from the
-            // cache in one shot; FileChannel is thread-safe so the parallel path works as-is.
-            FileChannel cacheChannel = (doEmbed && totalSlots > 0)
-                    ? FileChannel.open(cachePath, StandardOpenOption.READ) : null;
+            // Phase 3: write Lucene documents. Each file reads its per-model
+            // embedding ranges in one shot per provider; FileChannel is thread-safe
+            // so the parallel path works as-is.
+            Map<String, FileChannel> cacheChannels = new LinkedHashMap<>();
             try {
+                if (doEmbed && totalSlots > 0) {
+                    for (EmbedRuntime rt : runtimes) {
+                        cacheChannels.put(rt.modelId(),
+                                FileChannel.open(rt.cachePath, StandardOpenOption.READ));
+                    }
+                }
                 AtomicInteger doneFiles = new AtomicInteger(0);
                 AtomicInteger totalMethods = new AtomicInteger(0);
 
@@ -773,9 +951,10 @@ public class ProjectIndexManager {
                     for (int fi = 0; fi < totalFiles; fi++) {
                         ParsedFile file = files.get(fi);
                         int slotCount = fileSlotCount(file, fileMethodChunks.get(fi), fileClassChunks.get(fi));
-                        float[][] embs = readCachedEmbeddings(cacheChannel, fileOffsets[fi], slotCount, dims);
+                        Map<String, float[][]> embsByModel = readPerModelEmbeddings(
+                                cacheChannels, runtimes, fileOffsets[fi], slotCount);
                         writeFileDocs(writer, file, stateTracker, graphData, fileSynthBodies.get(fi),
-                                embs, fileMethodChunks.get(fi), fileClassChunks.get(fi));
+                                embsByModel, fileMethodChunks.get(fi), fileClassChunks.get(fi));
                         int done = doneFiles.incrementAndGet();
                         totalMethods.addAndGet(file.methods().size());
                         progress.onProgress("Indexing", done, totalFiles);
@@ -792,10 +971,10 @@ public class ProjectIndexManager {
                                 try {
                                     ParsedFile file = files.get(fiFinal);
                                     int slotCount = fileSlotCount(file, fileMethodChunks.get(fiFinal), fileClassChunks.get(fiFinal));
-                                    float[][] embs = readCachedEmbeddings(
-                                            cacheChannel, fileOffsets[fiFinal], slotCount, dims);
+                                    Map<String, float[][]> embsByModel = readPerModelEmbeddings(
+                                            cacheChannels, runtimes, fileOffsets[fiFinal], slotCount);
                                     writeFileDocs(writer, file, stateTracker, graphData,
-                                            fileSynthBodies.get(fiFinal), embs,
+                                            fileSynthBodies.get(fiFinal), embsByModel,
                                             fileMethodChunks.get(fiFinal), fileClassChunks.get(fiFinal));
                                     int done = doneFiles.incrementAndGet();
                                     totalMethods.addAndGet(file.methods().size());
@@ -827,12 +1006,68 @@ public class ProjectIndexManager {
                 }
                 log.debug("Total methods indexed: {}", totalMethods.get());
             } finally {
-                if (cacheChannel != null) cacheChannel.close();
+                for (FileChannel ch : cacheChannels.values()) {
+                    try { ch.close(); } catch (IOException ignored) {}
+                }
             }
         } finally {
             Files.deleteIfExists(spoolPath);
-            Files.deleteIfExists(cachePath);
+            for (EmbedRuntime rt : runtimes) {
+                Files.deleteIfExists(rt.cachePath);
+            }
         }
+    }
+
+    /**
+     * Reads each model's embedding slice for a single file in one range-read per
+     * provider. Map preserves runtime registration order so downstream Lucene
+     * field order is deterministic across docs.
+     */
+    private static Map<String, float[][]> readPerModelEmbeddings(
+            Map<String, FileChannel> cacheChannels, List<EmbedRuntime> runtimes,
+            int startSlot, int slotCount) throws IOException {
+        if (slotCount == 0 || cacheChannels.isEmpty()) return Map.of();
+        Map<String, float[][]> out = new LinkedHashMap<>(runtimes.size());
+        for (EmbedRuntime rt : runtimes) {
+            FileChannel ch = cacheChannels.get(rt.modelId());
+            if (ch == null) continue;
+            out.put(rt.modelId(),
+                    readCachedEmbeddings(ch, startSlot, slotCount, rt.dims));
+        }
+        return out;
+    }
+
+    /**
+     * Slice helper for the multi-chunk path: for a doc spanning {@code n} chunks
+     * starting at {@code slot}, pull one chunk-vectors array per model.
+     */
+    private static Map<String, float[][]> sliceChunkVectors(
+            Map<String, float[][]> embsByModel, int slot, int n) {
+        if (embsByModel == null || embsByModel.isEmpty()) return Map.of();
+        Map<String, float[][]> out = new LinkedHashMap<>(embsByModel.size());
+        for (Map.Entry<String, float[][]> e : embsByModel.entrySet()) {
+            float[][] arr = e.getValue();
+            if (arr != null && slot + n <= arr.length) {
+                out.put(e.getKey(), java.util.Arrays.copyOfRange(arr, slot, slot + n));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Slice helper for the incremental path: for a single doc slot, pull one
+     * vector per model out of the file-scoped per-model embedding arrays.
+     */
+    private static Map<String, float[]> sliceVectorsAt(Map<String, float[][]> embsByModel, int slot) {
+        if (embsByModel == null || embsByModel.isEmpty()) return Map.of();
+        Map<String, float[]> out = new LinkedHashMap<>(embsByModel.size());
+        for (Map.Entry<String, float[][]> e : embsByModel.entrySet()) {
+            float[][] arr = e.getValue();
+            if (arr != null && slot < arr.length && arr[slot] != null) {
+                out.put(e.getKey(), arr[slot]);
+            }
+        }
+        return out;
     }
 
     // ── Spool / cache helpers ──────────────────────────────────────────────────
@@ -867,11 +1102,11 @@ public class ProjectIndexManager {
      *
      * @param stats int[2] accumulator: {@code stats[0]} += hits, {@code stats[1]} += misses
      */
-    private float[][] embedBatchWithCache(List<String> texts,
+    private float[][] embedBatchWithCache(EmbeddingProvider provider, List<String> texts,
                                            PersistentEmbeddingCache embeddingCache,
                                            int[] stats) {
         if (embeddingCache == null) {
-            return embedder.embedBatch(texts);
+            return provider.embedBatch(texts);
         }
         float[][] results = new float[texts.size()][];
         List<Integer> missIdx  = new ArrayList<>();
@@ -890,7 +1125,7 @@ public class ProjectIndexManager {
             }
         }
         if (!missText.isEmpty()) {
-            float[][] fresh = embedder.embedBatch(missText);
+            float[][] fresh = provider.embedBatch(missText);
             for (int j = 0; j < missIdx.size(); j++) {
                 results[missIdx.get(j)] = fresh[j];
                 if (missText.get(j) != null && fresh[j] != null) {
@@ -949,17 +1184,21 @@ public class ProjectIndexManager {
      * Writes Lucene documents for a single file's methods and classes using pre-computed embeddings.
      * Safe to call from multiple threads: IndexWriter.addDocument and FileStateTracker are thread-safe.
      *
-     * @param globalEmbeddings flat array of all embeddings computed in Phase 2 (may be empty)
-     * @param embeddingOffset  index of this file's first embedding in {@code globalEmbeddings}
+     * @param embsByModel  modelId → file-scoped {@code float[slot][dims]} array. Empty map
+     *                     means no embeddings (keyword-only indexing). For each method/class
+     *                     this method slices the relevant chunk range per model and builds
+     *                     a {@code Map<String, float[][]>} for the multi-model DocumentMapper.
      */
     private void writeFileDocs(IndexWriter writer, ParsedFile file,
                                FileStateTracker stateTracker,
                                GraphIndexData graphData,
                                List<String> synthesizedBodies,
-                               float[][] globalEmbeddings,
+                               Map<String, float[][]> embsByModel,
                                List<List<Chunk>> methodChunkMeta,
                                List<List<Chunk>> classChunkMeta) throws IOException {
         int slot = 0;
+        int slotCap = embsByModel.values().stream().mapToInt(a -> a == null ? 0 : a.length)
+                .max().orElse(0);
 
         // Preload source lines once per file — methods with lazy bodies (body==null) all share this.
         java.util.List<String> fileLines = preloadSourceLines(file.filePath());
@@ -971,16 +1210,18 @@ public class ProjectIndexManager {
             List<String> callerNames = graphData.callerSimpleNames(method.fqn());
             int n = (!methodChunkMeta.isEmpty() && mi < methodChunkMeta.size())
                     ? methodChunkMeta.get(mi).size() : 0;
-            if (n > 0 && slot + n <= globalEmbeddings.length) {
-                float[][] chunkEmbs = java.util.Arrays.copyOfRange(globalEmbeddings, slot, slot + n);
+            if (n > 0 && slot + n <= slotCap) {
+                Map<String, float[][]> chunkVecsByModel = sliceChunkVectors(embsByModel, slot, n);
                 List<Chunk> mChunkList = methodChunkMeta.get(mi);
                 int[][] ranges = mChunkList.stream()
                         .map(c -> new int[]{c.startLine(), c.endLine()})
                         .toArray(int[][]::new);
-                writer.addDocument(DocumentMapper.toDocumentMultiVec(method, chunkEmbs, ranges, inDegree, callerNames, fileLines));
+                writer.addDocument(DocumentMapper.toDocumentMultiVec(
+                        method, chunkVecsByModel, ranges, inDegree, callerNames, fileLines));
                 slot += n;
             } else {
-                writer.addDocument(DocumentMapper.toDocument(method, (float[]) null, inDegree, callerNames, fileLines));
+                writer.addDocument(DocumentMapper.toDocument(
+                        method, Map.of(), inDegree, callerNames, fileLines));
             }
         }
 
@@ -989,16 +1230,18 @@ public class ProjectIndexManager {
             ParsedClass cls = file.classes().get(ci);
             int n = (!classChunkMeta.isEmpty() && ci < classChunkMeta.size())
                     ? classChunkMeta.get(ci).size() : 0;
-            if (n > 0 && slot + n <= globalEmbeddings.length) {
-                float[][] chunkEmbs = java.util.Arrays.copyOfRange(globalEmbeddings, slot, slot + n);
+            if (n > 0 && slot + n <= slotCap) {
+                Map<String, float[][]> chunkVecsByModel = sliceChunkVectors(embsByModel, slot, n);
                 List<Chunk> cChunkList = classChunkMeta.get(ci);
                 int[][] ranges = cChunkList.stream()
                         .map(c -> new int[]{c.startLine(), c.endLine()})
                         .toArray(int[][]::new);
-                writer.addDocument(DocumentMapper.toClassDocumentMultiVec(cls, synthesizedBodies.get(ci), chunkEmbs, ranges));
+                writer.addDocument(DocumentMapper.toClassDocumentMultiVec(
+                        cls, synthesizedBodies.get(ci), chunkVecsByModel, ranges));
                 slot += n;
             } else {
-                writer.addDocument(DocumentMapper.toClassDocument(cls, synthesizedBodies.get(ci), (float[]) null));
+                writer.addDocument(DocumentMapper.toClassDocument(
+                        cls, synthesizedBodies.get(ci), Map.of()));
             }
         }
 

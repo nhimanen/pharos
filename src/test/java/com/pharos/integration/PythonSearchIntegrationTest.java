@@ -64,7 +64,7 @@ class PythonSearchIntegrationTest {
                 List<ParsedMethod> methods = byClass.getOrDefault(cls.qualifiedClassName(), List.of());
                 String body = methods.stream()
                         .map(ParsedMethod::signature).collect(Collectors.joining("\n"));
-                writer.addDocument(DocumentMapper.toClassDocument(cls, body, null));
+                writer.addDocument(DocumentMapper.toClassDocument(cls, body, (float[]) null));
             }
             writer.commit();
         }
