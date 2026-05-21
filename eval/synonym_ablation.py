@@ -135,7 +135,7 @@ def run_benchmark(QUERIES):
 def main():
     # Load query set from benchmark.py
     bench_code = (Path(__file__).parent / "benchmark.py").read_text()
-    ns = {}
+    ns = {"__file__": str(Path(__file__).parent / "benchmark.py")}
     exec(bench_code.split("def _query_fingerprint")[0], ns)
     QUERIES = ns["QUERIES"]
 
