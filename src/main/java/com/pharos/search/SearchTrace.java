@@ -18,6 +18,7 @@ public class SearchTrace {
 
     private final List<Span> spans = new ArrayList<>();
     private long overallStart;
+    private QueryClassification classification;
 
     void start() {
         overallStart = System.currentTimeMillis();
@@ -33,6 +34,9 @@ public class SearchTrace {
     }
 
     public List<Span> spans() { return List.copyOf(spans); }
+
+    public void setClassification(QueryClassification c) { this.classification = c; }
+    public QueryClassification getClassification() { return classification; }
 
     /**
      * Renders a human-readable breakdown, e.g.:

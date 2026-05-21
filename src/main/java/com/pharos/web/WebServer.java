@@ -184,6 +184,12 @@ public class WebServer {
                             Map<String, Object> stage = new LinkedHashMap<>();
                             stage.put("name", s.name()); stage.put("ms", s.durationMs()); return stage;
                         }).collect(Collectors.toList()));
+                        var cls = resp.trace().getClassification();
+                        if (cls != null) {
+                            meta.put("classIntent",  cls.intent());
+                            meta.put("classType",    cls.type().name().toLowerCase());
+                            if (cls.docType() != null) meta.put("classDocType", cls.docType());
+                        }
                         out.put("searchMeta", meta);
                     }
                     var sugg = resp.suggestions();
@@ -202,6 +208,27 @@ public class WebServer {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
             }
+        });
+
+        // API: rate a search result — appends a judgment to eval/goldenset.jsonl
+        app.post("/api/rate", ctx -> {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> body = ctx.bodyAsClass(Map.class);
+            String query    = (String) body.getOrDefault("query", "");
+            String project  = (String) body.getOrDefault("project", "");
+            String pipeline = (String) body.getOrDefault("pipeline", "");
+            String resultId = (String) body.getOrDefault("result_id", "");
+            Object rankObj  = body.get("rank");
+            int    rank     = (rankObj instanceof Number n) ? n.intValue() : 0;
+            Object ratingRaw = body.get("rating");
+            String rating   = (ratingRaw instanceof String s) ? s : null;
+
+            if (query.isBlank() || resultId.isBlank()) {
+                ctx.status(400).json(Map.of("error", "query and result_id required"));
+                return;
+            }
+            appendRating(query, project, pipeline, resultId, rank, rating);
+            ctx.json(Map.of("status", "ok"));
         });
 
         // API: single method by FQN
@@ -502,6 +529,30 @@ public class WebServer {
     private static void recordSingle(io.javalin.http.Context ctx, String id) {
         ctx.attribute("usage.resultCount", id == null ? 0 : 1);
         ctx.attribute("usage.resultIds", id == null ? List.of() : List.of(id));
+    }
+
+    // ── Rating / goldenset ────────────────────────────────────────────────────
+
+    private static final Object RATING_LOCK = new Object();
+
+    private void appendRating(String query, String project, String pipeline,
+                               String resultId, int rank, String rating) throws IOException {
+        Path file = Path.of("eval/goldenset.jsonl");
+        Files.createDirectories(file.getParent());
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("query",     query);
+        entry.put("project",   project);
+        entry.put("pipeline",  pipeline);
+        entry.put("result_id", resultId);
+        entry.put("rank",      rank);
+        entry.put("rating",    rating);
+        entry.put("ts",        java.time.Instant.now().toString());
+        String line = mapper.writeValueAsString(entry) + "\n";
+        synchronized (RATING_LOCK) {
+            Files.writeString(file, line,
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.APPEND);
+        }
     }
 
     // ── Graph data builders ────────────────────────────────────────────────────
@@ -903,6 +954,7 @@ public class WebServer {
         m.put("score", r.score());
         m.put("docType", r.docType());
         m.put("searchType", r.searchType());
+        if (r.qualifiedClassName() != null) m.put("qualifiedClassName", r.qualifiedClassName());
         // Snippet fields — populated by SnippetDecorator when present
         Snippet snip = r.snippet();
         if (snip != null) {

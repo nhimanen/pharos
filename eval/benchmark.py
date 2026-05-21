@@ -2,14 +2,19 @@
 """
 200-query pipeline comparison with ground truth labels.
 Metrics: Precision@1, Precision@3, MRR@10 per pipeline per category.
+
+Flags:
+  --goldenset       also run goldenset evaluation after the main benchmark
+  --goldenset-only  run only goldenset evaluation (skip 200-query benchmark)
 """
-import hashlib, json, os, sys, urllib.parse, urllib.request
+import argparse, hashlib, json, os, sys, urllib.parse, urllib.request
 from collections import defaultdict
 
 BASE_URL = "http://localhost:7171"
 LIMIT = 10
 # Cache lives next to this script so results persist across sessions
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_cache.json")
+CACHE_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_cache.json")
+GOLDENSET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldenset.jsonl")
 PIPELINES = ["keyword", "auto", "vector", "unified", "hybrid", "hybrid-diverse", "hybrid-reranked", "hybrid-reranked-diverse"]
 
 CAT_LABELS = {
@@ -280,6 +285,14 @@ def reciprocal_rank(rank: int | None) -> float:
     return (1.0 / rank) if rank else 0.0
 
 
+def ndcg(rank: int | None, k: int) -> float:
+    """NDCG@k for a single relevant document: 1/log2(rank+1) if rank≤k, else 0."""
+    import math
+    if rank is None or rank > k:
+        return 0.0
+    return 1.0 / math.log2(rank + 1)
+
+
 def _query_fingerprint(query: str, project: str) -> str:
     """Short hash of query+project so stale cache entries are detected."""
     return hashlib.md5(f"{query}|{project}".encode()).hexdigest()[:8]
@@ -301,8 +314,114 @@ def _save_cache(cache: dict) -> None:
         json.dump(cache, f)
 
 
+def load_goldenset() -> list[dict]:
+    """Load goldenset.jsonl; last entry per (query,project,pipeline,result_id) wins."""
+    if not os.path.exists(GOLDENSET_FILE):
+        return []
+    seen = {}
+    with open(GOLDENSET_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                key = (entry["query"], entry.get("project", ""),
+                       entry["pipeline"], entry["result_id"])
+                seen[key] = entry
+            except Exception:
+                pass
+    return [e for e in seen.values() if e.get("rating") in ("good", "bad")]
+
+
+def run_goldenset_eval(cache: dict) -> str:
+    """Evaluate pipelines using user-supplied relevance judgments from goldenset.jsonl."""
+    entries = load_goldenset()
+    if not entries:
+        return "## Goldenset Evaluation\n\nNo judgments found in eval/goldenset.jsonl.\n"
+
+    # Group: (query, project, pipeline) → {good: set[id], bad: set[id]}
+    groups: dict = defaultdict(lambda: {"good": set(), "bad": set()})
+    for e in entries:
+        key = (e["query"], e.get("project", ""), e["pipeline"])
+        groups[key][e["rating"]].add(e["result_id"])
+
+    def gs_cache_key(query: str, project: str, pipeline: str) -> str:
+        h = hashlib.md5(f"gs|{query}|{project}|{pipeline}".encode()).hexdigest()[:8]
+        return f"gs:{h}"
+
+    # Fetch / serve from cache
+    needed_gs = [(q, p, pl) for (q, p, pl) in groups
+                 if gs_cache_key(q, p, pl) not in cache
+                 or cache[gs_cache_key(q, p, pl)].get("fp") != _query_fingerprint(q, p)]
+    if needed_gs:
+        print(f"Fetching {len(needed_gs)} goldenset (query, pipeline) pairs...", file=sys.stderr)
+    for (q, p, pl) in needed_gs:
+        ck = gs_cache_key(q, p, pl)
+        cache[ck] = {"fp": _query_fingerprint(q, p), "results": api_search(q, p, pl)}
+    if needed_gs:
+        _save_cache(cache)
+
+    per_pipeline: dict = defaultdict(lambda: {"mrr": 0.0, "p1": 0, "p3": 0, "p5": 0, "p10": 0, "n": 0})
+    rows = []
+    for (query, project, pipeline), judged in sorted(groups.items()):
+        ck = gs_cache_key(query, project, pipeline)
+        results = cache.get(ck, {}).get("results", [])
+        good_ids = judged["good"]
+        if not good_ids:
+            continue
+        first_good = None
+        for i, r in enumerate(results):
+            rid = r.get("id", "")
+            if any(rid.startswith(g) or g.startswith(rid) for g in good_ids):
+                first_good = i + 1
+                break
+        rr = reciprocal_rank(first_good)
+        pp = per_pipeline[pipeline]
+        pp["n"]   += 1
+        pp["mrr"] += rr
+        for k, kkey in [(1, "p1"), (3, "p3"), (5, "p5"), (10, "p10")]:
+            if first_good and first_good <= k:
+                pp[kkey] += 1
+        rows.append((query[:40], project, pipeline,
+                     first_good or ">10", f"{rr:.2f}",
+                     len(good_ids), len(judged["bad"])))
+
+    lines = ["## Goldenset Evaluation (user-rated judgments)\n"]
+    n_unique = len({(q, p) for q, p, _ in groups})
+    lines.append(f"{len(entries)} ratings across {n_unique} unique (query, project) pairs, "
+                 f"{len(per_pipeline)} pipeline(s).\n")
+
+    pls = sorted(per_pipeline)
+    lines.append("| Pipeline | n | P@1 | P@3 | P@5 | P@10 | MRR |")
+    lines.append("|----------|---|-----|-----|-----|------|-----|")
+    for pl in pls:
+        s = per_pipeline[pl]
+        n = s["n"] or 1
+        lines.append(f"| {pl} | {s['n']} | {s['p1']/n:.2f} | {s['p3']/n:.2f} | "
+                     f"{s['p5']/n:.2f} | {s['p10']/n:.2f} | {s['mrr']/n:.3f} |")
+    lines.append("")
+
+    lines.append("| Query | Project | Pipeline | First-good rank | RR | +rated | −rated |")
+    lines.append("|-------|---------|----------|-----------------|----|--------|--------|")
+    for row in rows:
+        lines.append(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} | {row[5]} | {row[6]} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--goldenset",      action="store_true", help="Run goldenset eval after main benchmark")
+    parser.add_argument("--goldenset-only", action="store_true", help="Run only goldenset eval")
+    args = parser.parse_args()
+
     cache = _load_cache()
+
+    if args.goldenset_only:
+        print(run_goldenset_eval(cache))
+        _save_cache(cache)
+        return
 
     # Build set of (idx, pipeline) pairs we still need to fetch
     needed = []
@@ -358,8 +477,9 @@ def main():
 
     # ── Overall metrics ────────────────────────────────────────────────────────
     def metrics(query_subset):
-        pk  = {k: {pl: 0 for pl in PIPELINES} for k in KS}
-        mrr = {pl: 0.0 for pl in PIPELINES}
+        pk   = {k: {pl: 0   for pl in PIPELINES} for k in KS}
+        mrr  = {pl: 0.0 for pl in PIPELINES}
+        ndcgs = {k: {pl: 0.0 for pl in PIPELINES} for k in KS}
         n = len(query_subset)
         for (idx, query, project, cat, gt_id, conf) in query_subset:
             for pl in PIPELINES:
@@ -367,14 +487,16 @@ def main():
                 for k in KS:
                     if r is not None and r <= k:
                         pk[k][pl] += 1
+                    ndcgs[k][pl] += ndcg(r, k)
                 mrr[pl] += reciprocal_rank(r)
         return (
-            {k: {pl: pk[k][pl]/n for pl in PIPELINES} for k in KS},
-            {pl: mrr[pl]/n for pl in PIPELINES},
+            {k: {pl: pk[k][pl]/n   for pl in PIPELINES} for k in KS},
+            {pl: mrr[pl]/n         for pl in PIPELINES},
+            {k: {pl: ndcgs[k][pl]/n for pl in PIPELINES} for k in KS},
             n
         )
 
-    pk_all, mrr_all, _ = metrics(QUERIES)
+    pk_all, mrr_all, ndcg_all, _ = metrics(QUERIES)
 
     lines.append("## Overall Metrics (200 queries)\n")
     lines.append(f"| Metric | {' | '.join(PIPELINES)} |")
@@ -382,6 +504,8 @@ def main():
     for k in KS:
         lines.append(f"| P@{k:<3}  | {' | '.join(f'{pk_all[k][pl]:.3f}' for pl in PIPELINES)} |")
     lines.append(f"| MRR@10 | {' | '.join(f'{mrr_all[pl]:.3f}' for pl in PIPELINES)} |")
+    for k in KS:
+        lines.append(f"| NDCG@{k:<2} | {' | '.join(f'{ndcg_all[k][pl]:.3f}' for pl in PIPELINES)} |")
     lines.append("")
 
     # ── Per-category metrics ───────────────────────────────────────────────────
@@ -391,7 +515,7 @@ def main():
         lines.append(f"|----------|---|{'|'.join(['---']*len(PIPELINES))}|------|")
         for cat in sorted(CAT_LABELS):
             subset = [q for q in QUERIES if q[3] == cat]
-            pk_cat, _, n = metrics(subset)
+            pk_cat, _, _ndcg, n = metrics(subset)
             vals = [pk_cat[k][pl] for pl in PIPELINES]
             best_pl = PIPELINES[vals.index(max(vals))]
             best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
@@ -405,7 +529,7 @@ def main():
     lines.append(f"|----------|---|{'|'.join(['---']*len(PIPELINES))}|------|")
     for cat in sorted(CAT_LABELS):
         subset = [q for q in QUERIES if q[3] == cat]
-        pk_cat, mrr_cat, n = metrics(subset)
+        pk_cat, mrr_cat, _ndcg, n = metrics(subset)
         vals = [mrr_cat[pl] for pl in PIPELINES]
         best_pl = PIPELINES[vals.index(max(vals))]
         best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
@@ -417,7 +541,7 @@ def main():
     lines.append("## All Metrics by Project\n")
     for proj in ["lucene", "solr", "vespa", "pharos"]:
         subset = [q for q in QUERIES if q[2] == proj]
-        pk_proj, mrr_proj, n = metrics(subset)
+        pk_proj, mrr_proj, _ndcg, n = metrics(subset)
         lines.append(f"### {proj.capitalize()} (n={n})\n")
         lines.append(f"| Metric | {' | '.join(PIPELINES)} |")
         lines.append(f"|--------|{'|'.join(['---']*len(PIPELINES))}|")
@@ -435,7 +559,7 @@ def main():
     lines.append(f"|----------|{pl_seps}|--------|")
     for cat in sorted(CAT_LABELS):
         subset = [q for q in QUERIES if q[3] == cat]
-        _, mrr, _ = metrics(subset)
+        _, mrr, _ndcg, _ = metrics(subset)
         vals = [mrr[pl] for pl in PIPELINES]
         best = PIPELINES[vals.index(max(vals))]
         cells = ' | '.join(f'{v:.3f}' for v in vals)
@@ -499,6 +623,11 @@ def main():
     lines.append("")
 
     print("\n".join(lines))
+
+    if args.goldenset:
+        print()
+        print(run_goldenset_eval(cache))
+        _save_cache(cache)
 
 
 if __name__ == "__main__":

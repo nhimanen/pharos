@@ -63,6 +63,7 @@ public final class SearchPipeline {
         if (router != null && req.classification() == null) {
             QueryClassification classification = router.classify(req.query());
             req = req.withClassification(classification);
+            trace.setClassification(classification);
         }
 
         // ── Oversample fetch request ──────────────────────────────────────────

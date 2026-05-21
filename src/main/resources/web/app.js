@@ -266,6 +266,12 @@ function onCanvasContextMenu(ev) {
 function initControls() {
   document.getElementById('btn-modules').addEventListener('click', loadModuleGraph);
 
+  document.getElementById('btn-trace').addEventListener('click', () => {
+    traceEnabled = !traceEnabled;
+    document.getElementById('btn-trace').classList.toggle('active', traceEnabled);
+    if (document.getElementById('search-input').value.trim()) doSearch();
+  });
+
   document.getElementById('btn-hide-external').addEventListener('click', () => {
     S.hideExternal = !S.hideExternal;
     document.getElementById('btn-hide-external').classList.toggle('active', S.hideExternal);
@@ -1628,6 +1634,11 @@ function applyLocalFilter() {
 // ── Search results dropdown ───────────────────────────────
 const srPanel = document.getElementById('search-results');
 let lastHits  = [];
+const ratingState = new Map();
+let lastSearchQuery    = '';
+let lastSearchProject  = '';
+let lastSearchPipeline = '';
+let traceEnabled = false;
 
 function closeSearchResults() { srPanel.classList.remove('open'); srPanel.innerHTML = ''; }
 
@@ -1649,13 +1660,19 @@ function openDocViewer(r) {
 
   document.getElementById('dv-title').textContent = label;
 
-  const docTypeCls = `dv-badge-${esc(r.docType || 'method')}`;
+  const isChunk   = r.docType === 'chunk' || r.docType === 'document';
+  const isDocFile = !isChunk && r.filePath && !/\.java$/.test(r.filePath);
+  const isClass   = !isChunk && !isDocFile && (r.docType === 'class' || r.docType === 'doc');
+  const isDoc     = !isChunk && isDocFile  && (r.docType === 'class' || r.docType === 'doc');
+
+  const badgeType  = isDoc ? 'doc' : (r.docType || 'method');
+  const docTypeCls = `dv-badge-${esc(badgeType)}`;
   const fileLine = r.filePath
     ? `${r.filePath}${r.startLine ? `:${r.startLine}–${r.endLine}` : ''}`
     : '';
   document.getElementById('dv-meta').innerHTML = `
     <span class="dv-badge dv-badge-project">${esc(r.project || '')}</span>
-    <span class="dv-badge ${docTypeCls}">${esc(r.docType || 'method')}</span>
+    <span class="dv-badge ${docTypeCls}">${esc(badgeType)}</span>
     ${r.searchType ? `<span class="dv-badge dv-badge-type">${esc(r.searchType)}</span>` : ''}
     ${r.score != null ? `<span class="dv-score">score ${r.score.toFixed(3)}</span>` : ''}
     <button class="dv-nav-btn" id="dv-nav-btn">Locate in graph →</button>
@@ -1666,9 +1683,6 @@ function openDocViewer(r) {
     closeDocViewer();
     navigateToResult(r);
   });
-
-  const isChunk = r.docType === 'chunk' || r.docType === 'document';
-  const isClass = r.docType === 'class';
 
   const sections = [];
 
@@ -1683,7 +1697,7 @@ function openDocViewer(r) {
     });
   }
 
-  if (!isChunk && (r.accessModifier || r.returnType || r.signature)) {
+  if (!isChunk && !isDoc && (r.accessModifier || r.returnType || r.signature)) {
     const sig = [r.accessModifier, r.returnType, r.signature].filter(Boolean).join(' ');
     sections.push({ label: 'Signature', html: `<div class="dv-sig">${esc(sig)}</div>` });
   }
@@ -1691,8 +1705,12 @@ function openDocViewer(r) {
     const javadocLabel = isChunk ? 'Document' : 'Javadoc';
     sections.push({ label: javadocLabel, html: `<div class="dv-javadoc">${esc(r.javadoc.trim())}</div>` });
   }
-  if (r.body) {
-    const bodyLabel = isChunk ? 'Content' : isClass ? 'Members' : 'Body';
+  if (isDoc) {
+    sections.push({ label: 'Content', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-doc-body' });
+  } else if (isClass) {
+    sections.push({ label: 'Methods', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-methods-body' });
+  } else if (r.body) {
+    const bodyLabel = isChunk ? 'Content' : 'Body';
     const bodyHtml  = isChunk
       ? `<div class="dv-javadoc">${esc(r.body)}</div>`
       : `<pre class="dv-code">${esc(r.body)}</pre>`;
@@ -1705,10 +1723,53 @@ function openDocViewer(r) {
   document.getElementById('dv-sections').innerHTML = sections.map(s => `
     <div class="dv-section">
       <div class="dv-section-label">${s.label}</div>
-      <div class="dv-section-body">${s.html}</div>
+      <div class="dv-section-body"${s.id ? ` id="${esc(s.id)}"` : ''}>${s.html}</div>
     </div>`).join('');
 
   docViewer.style.display = 'flex';
+
+  // For doc files: fetch and display full file content
+  if (isDoc && r.qualifiedClassName) {
+    fetch(`/api/class?fqn=${encodeURIComponent(r.qualifiedClassName)}`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        const el = document.getElementById('dv-doc-body');
+        if (!el) return;
+        if (!data || !data.body) { el.innerHTML = '<div class="dv-javadoc">Content unavailable.</div>'; return; }
+        el.innerHTML = `<pre class="dv-code">${esc(data.body)}</pre>`;
+      })
+      .catch(() => {
+        const el = document.getElementById('dv-doc-body');
+        if (el) el.innerHTML = '<div class="dv-javadoc">Could not load content.</div>';
+      });
+  }
+
+  // For Java class results: fetch full method signatures and fill the placeholder
+  if (isClass && r.qualifiedClassName) {
+    fetch(`/api/class?fqn=${encodeURIComponent(r.qualifiedClassName)}&context=true`)
+      .then(res => res.ok ? res.json() : null)
+      .then(ctx => {
+        const el = document.getElementById('dv-methods-body');
+        if (!el || !ctx) return;
+        const items = [
+          ...(ctx.constructors  || []),
+          ...(ctx.publicMethods || [])
+        ];
+        if (!items.length) {
+          el.innerHTML = '<div class="dv-javadoc">No public methods.</div>';
+          return;
+        }
+        el.innerHTML = items.map(m => `
+          <div class="dv-method-entry">
+            <div class="dv-sig">${esc(m.signature || '')}</div>
+            ${m.javadoc ? `<div class="dv-method-doc">${esc(m.javadoc.split('\n')[0].trim())}</div>` : ''}
+          </div>`).join('');
+      })
+      .catch(() => {
+        const el = document.getElementById('dv-methods-body');
+        if (el) el.innerHTML = '<div class="dv-javadoc">Could not load methods.</div>';
+      });
+  }
 }
 
 document.addEventListener('click', e => {
@@ -1735,15 +1796,28 @@ async function doSearch() {
 
   const proj     = S.selectedProject ? `&project=${encodeURIComponent(S.selectedProject)}` : '';
   const pipeline = document.getElementById('pipeline-select').value;
+
+  lastSearchQuery    = q;
+  lastSearchProject  = S.selectedProject || '';
+  lastSearchPipeline = pipeline || '';
+  ratingState.clear();
   const pipelineParam = pipeline ? `&pipeline=${encodeURIComponent(pipeline)}` : '';
-  let hits;
+  const traceParam    = traceEnabled ? '&trace=true' : '';
+  let hits, searchMeta = null;
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}${pipelineParam}&limit=30`);
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}${proj}${pipelineParam}${traceParam}&limit=30`);
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Search failed (${res.status}): ${msg}`);
     }
-    hits = await res.json();
+    const data = await res.json();
+    // Unwrap envelope {results, searchMeta, suggestions} if present
+    if (Array.isArray(data)) {
+      hits = data;
+    } else {
+      hits       = data.results || [];
+      searchMeta = data.searchMeta || null;
+    }
     lastHits = hits;
   } catch (err) {
     srPanel.innerHTML = `<div class="sr-none">Search error: ${esc(err.message)}</div>`;
@@ -1783,21 +1857,64 @@ async function doSearch() {
       const sig      = r.signature || '';
       const snip     = (r.javadoc || '').replace(/\s+/g, ' ').slice(0, 200);
       const project  = r.project || '';
-      const docType  = r.docType || 'method';
+      const rawDocType = r.docType || 'method';
+      const isDocFileResult = (rawDocType === 'class' || rawDocType === 'doc') && r.filePath && !/\.java$/.test(r.filePath);
+      const docType  = isDocFileResult ? 'doc' : rawDocType;
       const srchType = r.searchType || '';
+      const rid      = r.id || '';
       const badge    = `<span class="sr-badge sr-badge-${esc(docType)}">${esc(docType)}</span>`;
       const typeBadge = srchType && srchType !== 'hybrid' && srchType !== 'related'
         ? `<span class="sr-badge sr-badge-type">${esc(srchType)}</span>` : '';
+      const ratingVal = ratingState.get(rid) || '';
+      const goodCls = ratingVal === 'good' ? ' sr-btn--active-good' : '';
+      const badCls  = ratingVal === 'bad'  ? ' sr-btn--active-bad'  : '';
+      const score   = r.score != null ? r.score : null;
+      const scoreTxt = score != null
+        ? `<span class="sr-score" title="Relevance score">${score >= 1 ? score.toFixed(1) : score.toFixed(3)}</span>`
+        : '';
       return `<div class="sr-item" data-idx="${i}" data-fqn="${esc(extractFqn(r.id))}"
                    data-project="${esc(project)}" data-class="${esc(cls)}"
-                   data-doc-type="${esc(docType)}">
-        <div class="sr-method">${highlightTerms(method, q)}${badge}${typeBadge}<span class="sr-project">${esc(project)}</span></div>
+                   data-doc-type="${esc(docType)}" data-result-id="${esc(rid)}" data-rank="${i+1}">
+        <div class="sr-method">${highlightTerms(method, q)}${badge}${typeBadge}<span class="sr-project">${esc(project)}</span>${scoreTxt}</div>
         ${cls  ? `<div class="sr-class">${esc(cls)}</div>` : ''}
         ${sig  ? `<div class="sr-sig">${highlightTerms(sig, q)}</div>` : ''}
         ${snip ? `<div class="sr-snip">${highlightTerms(snip, q)}</div>` : ''}
+        <div class="sr-rating">
+          <button class="sr-btn sr-btn-good${goodCls}" data-rating="good" title="Good result">👍</button>
+          <button class="sr-btn sr-btn-bad${badCls}"   data-rating="bad"  title="Bad result">👎</button>
+        </div>
       </div>`;
     }).join('');
   }
+  // Prepend trace meta banner when enabled
+  if (searchMeta) {
+    const req      = searchMeta.requestedType || '';
+    const resolved = searchMeta.resolvedType  || req;
+    const totalMs  = searchMeta.totalMs != null ? `${searchMeta.totalMs}ms` : '';
+    const pipelineTxt = req && resolved && req !== resolved
+      ? `${esc(req)} → ${esc(resolved)}`
+      : esc(resolved || req);
+    const stages = (searchMeta.stages || [])
+      .map(s => `${esc(s.name)}&nbsp;${s.ms}ms`)
+      .join(' <span class="sr-trace-sep">·</span> ');
+    const intent  = searchMeta.classIntent  || '';
+    const clsType = searchMeta.classType    || '';
+    const clsDT   = searchMeta.classDocType || '';
+    const intentBadge = intent
+      ? `<span class="sr-trace-intent" title="Classifier: ${esc(clsType)}">${esc(intent)}</span>`
+      : '';
+    const docTypeBadge = clsDT
+      ? `<span class="sr-trace-doctype">docType:${esc(clsDT)}</span>`
+      : '';
+    const banner = `<div class="sr-trace">
+      <span class="sr-trace-pipeline">${pipelineTxt}</span>
+      ${intentBadge}${docTypeBadge}
+      ${totalMs ? `<span class="sr-trace-total">${esc(totalMs)}</span>` : ''}
+      ${stages  ? `<span class="sr-trace-stages">${stages}</span>` : ''}
+    </div>`;
+    srPanel.innerHTML = banner + srPanel.innerHTML;
+  }
+
   srPanel.classList.add('open');
   setStatus(`${hits.length} search hits`);
 }
@@ -1833,8 +1950,41 @@ async function navigateToResult(r) {
   }
 }
 
-// Click on a search result → open document viewer
+// Click on a search result → rate or open document viewer
 srPanel.addEventListener('click', e => {
+  // Rating buttons — handle before sr-item navigation
+  const ratingBtn = e.target.closest('.sr-btn');
+  if (ratingBtn) {
+    e.stopPropagation();
+    const item = ratingBtn.closest('.sr-item');
+    if (!item) return;
+    const resultId  = item.dataset.resultId;
+    const rank      = parseInt(item.dataset.rank, 10);
+    const newRating = ratingBtn.dataset.rating;
+    const curRating = ratingState.get(resultId);
+    const rating    = curRating === newRating ? null : newRating;  // toggle off if same
+
+    ratingState.set(resultId, rating);
+    item.querySelectorAll('.sr-btn').forEach(b => {
+      b.classList.remove('sr-btn--active-good', 'sr-btn--active-bad');
+    });
+    if (rating) ratingBtn.classList.add(`sr-btn--active-${rating}`);
+
+    fetch('/api/rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query:     lastSearchQuery,
+        project:   lastSearchProject,
+        pipeline:  lastSearchPipeline,
+        result_id: resultId,
+        rank:      rank,
+        rating:    rating,
+      })
+    }).catch(err => console.warn('Rating failed:', err));
+    return;
+  }
+
   const item = e.target.closest('.sr-item');
   if (!item) return;
   closeSearchResults();

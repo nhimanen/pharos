@@ -101,7 +101,7 @@ public class DocumentMapper {
         if (isChunk) return "docs";
         if (filePath == null) return "prod";
         String p = filePath.replace('\\', '/');
-        if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".yml")
+        if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".yml") || p.endsWith(".adoc")
                 || p.endsWith(".yaml") || p.endsWith(".sh") || p.endsWith(".xml")) return "docs";
         if (p.contains("/src/test/") || p.contains("/test/")
                 || p.contains("/benchmark/") || p.contains("/jmh/")) return "test";
@@ -570,7 +570,8 @@ public class DocumentMapper {
         Document doc = new Document();
 
         // --- Document type discriminator ---
-        doc.add(new StringField(F_DOC_TYPE, "class", Field.Store.YES));
+        String docType = "document".equals(cls.kind()) ? "doc" : "class";
+        doc.add(new StringField(F_DOC_TYPE, docType, Field.Store.YES));
         doc.add(new StringField(F_SCOPE, computeScope(nvl(cls.filePath()), false), Field.Store.YES));
 
         // --- ID: "project:qualifiedClassName" ---

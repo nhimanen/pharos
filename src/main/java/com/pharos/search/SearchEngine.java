@@ -993,13 +993,19 @@ public class SearchEngine {
         String body = SourceReader.readRange(cls.filePath(), cls.startLine(), cls.endLine());
         if (body == null) body = cls.body();
 
-        // All method documents for this class from Lucene
+        // All method documents for this class from Lucene.
+        // F_QUALIFIED_CLASS is a TextField (analyzed), so TermQuery on a dotted FQN never matches.
+        // Instead, use PrefixQuery on the StringField F_ID ("project:FQN#") which is exact.
         List<String> projects = resolveProjects(SearchRequest.keyword("", null, 100));
         IndexReader reader = luceneIndexer.openMultiReader(projects);
         IndexSearcher searcher = new IndexSearcher(reader);
+        BooleanQuery.Builder idPrefixes = new BooleanQuery.Builder().setMinimumNumberShouldMatch(1);
+        for (String proj : projects) {
+            idPrefixes.add(new PrefixQuery(new Term(DocumentMapper.F_ID, proj + ":" + classFqn + "#")),
+                    BooleanClause.Occur.SHOULD);
+        }
         BooleanQuery methodsQuery = new BooleanQuery.Builder()
-                .add(new TermQuery(new Term(DocumentMapper.F_QUALIFIED_CLASS, classFqn)),
-                        BooleanClause.Occur.MUST)
+                .add(idPrefixes.build(), BooleanClause.Occur.MUST)
                 .add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, "method")),
                         BooleanClause.Occur.MUST)
                 .build();
