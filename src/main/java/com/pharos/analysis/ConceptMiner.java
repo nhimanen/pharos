@@ -371,89 +371,97 @@ public class ConceptMiner {
     }
 
     /** Variant that exposes the bigram percentile for tuning. */
+    /** Bitmask constants for per-source selection in {@link #mineAll(IndexReader, double, int)}. */
+    public static final int SRC_CLASS_NAMES     = 0b0001;  // Source 1
+    public static final int SRC_JAVADOC_BIGRAMS = 0b0010;  // Source 2
+    public static final int SRC_ACRONYMS        = 0b0100;  // Source 3
+    public static final int SRC_WORMHOLE        = 0b1000;  // Source 4
+    public static final int SRC_ALL             = 0b1111;
+
     public Map<String, Set<String>> mineAll(IndexReader reader, double bigramTopPct)
+            throws IOException {
+        return mineAll(reader, bigramTopPct, SRC_ALL);
+    }
+
+    /**
+     * Mines synonym candidates from selected sources (bitmask of {@code SRC_*} constants).
+     * Used for ablation testing — pass {@link #SRC_ALL} for normal operation.
+     */
+    public Map<String, Set<String>> mineAll(IndexReader reader, double bigramTopPct, int sources)
             throws IOException {
         List<ClassDoc> docs = loadClassDocs(reader);
         Map<String, Set<String>> result = new HashMap<>();
 
         // ── Source 1: class name tokens + bigrams + trigrams ──────────────────
-        for (ClassDoc d : docs) {
-            String[] toks = splitIdentifier(d.className).split("\\s+");
-            for (String t : toks)
-                if (normalize(t) != null) addRule(result, t, d.className);
-            for (int i = 0; i < toks.length - 1; i++) {
-                String bi = toks[i] + toks[i + 1];
-                if (bi.length() >= 4) addRule(result, bi, d.className);
-            }
-            for (int i = 0; i < toks.length - 2; i++) {
-                String tri = toks[i] + toks[i + 1] + toks[i + 2];
-                if (tri.length() >= 6) addRule(result, tri, d.className);
+        if ((sources & SRC_CLASS_NAMES) != 0) {
+            for (ClassDoc d : docs) {
+                String[] toks = splitIdentifier(d.className).split("\\s+");
+                for (String t : toks)
+                    if (normalize(t) != null) addRule(result, t, d.className);
+                for (int i = 0; i < toks.length - 1; i++) {
+                    String bi = toks[i] + toks[i + 1];
+                    if (bi.length() >= 4) addRule(result, bi, d.className);
+                }
+                for (int i = 0; i < toks.length - 2; i++) {
+                    String tri = toks[i] + toks[i + 1] + toks[i + 2];
+                    if (tri.length() >= 6) addRule(result, tri, d.className);
+                }
             }
         }
 
         // ── Source 3: acronym / initialism expansion ──────────────────────────
-        // Three sub-strategies:
-        //   a) "finite state machine (FST)" → expansion (ABBREV)
-        //   b) "WAND (Weak AND)"            → ABBREV (expansion)
-        //   c) vowel-free camelCase tokens  → "HnswGraph" [Hnsw] scanned for
-        //      "hierarchical navigable small world" → "smallworld" → HnswGraph
-        for (ClassDoc d : docs) {
-            String sent = firstSentenceOf(d.javadoc);
-            if (sent.isBlank()) continue;
-
-            // a) & b): parenthetical patterns (≥3-char acronyms only)
-            Matcher m1 = PAT_EXPANSION_ABBREV.matcher(sent);
-            while (m1.find()) emitExpansionNgrams(m1.group(1), d.className, result);
-            Matcher m2 = PAT_ABBREV_EXPANSION.matcher(sent);
-            while (m2.find()) emitExpansionNgrams(m2.group(2), d.className, result);
-
-            // c): CamelCase tokens with zero vowels → treat as acronyms
-            for (String tok : CAMEL_SPLIT.split(d.className)) {
-                if (tok.length() < 3 || tok.length() > 6) continue;
-                if (tok.toLowerCase().matches(".*[aeiou].*")) continue;
-                String acronym = tok.toUpperCase();
-                for (String phrase : findInitialismInText(acronym, sent))
-                    emitExpansionNgrams(phrase, d.className, result);
+        if ((sources & SRC_ACRONYMS) != 0) {
+            for (ClassDoc d : docs) {
+                String sent = firstSentenceOf(d.javadoc);
+                if (sent.isBlank()) continue;
+                Matcher m1 = PAT_EXPANSION_ABBREV.matcher(sent);
+                while (m1.find()) emitExpansionNgrams(m1.group(1), d.className, result);
+                Matcher m2 = PAT_ABBREV_EXPANSION.matcher(sent);
+                while (m2.find()) emitExpansionNgrams(m2.group(2), d.className, result);
+                for (String tok : CAMEL_SPLIT.split(d.className)) {
+                    if (tok.length() < 3 || tok.length() > 6) continue;
+                    if (tok.toLowerCase().matches(".*[aeiou].*")) continue;
+                    String acronym = tok.toUpperCase();
+                    for (String phrase : findInitialismInText(acronym, sent))
+                        emitExpansionNgrams(phrase, d.className, result);
+                }
             }
         }
 
         // ── Source 4: per-class method wormhole (cross-class fanout filter) ─────
-        // Two-pass: first collect all per-class PPMI candidates, then count how
-        // many classes each term tops.  Terms shared across many class wormholes
-        // (e.g. "init", "call") are generic Java idioms — drop them.
-        // Only terms specific to ≤ WORMHOLE_MAX_CLASS_FANOUT classes are kept.
-        mineWormhole(reader, docs).forEach(
-                (className, terms) -> terms.forEach(t -> addRule(result, t, className)));
+        if ((sources & SRC_WORMHOLE) != 0) {
+            mineWormhole(reader, docs).forEach(
+                    (className, terms) -> terms.forEach(t -> addRule(result, t, className)));
+        }
 
         // ── Source 2: javadoc prose bigrams (top-P% PPMI per class) ──────────
-        // Percentile mode: rank bigrams by PPMI within each class, keep top-P%.
-        // This is corpus-agnostic — a class with 20 bigrams keeps 2 at P=10%,
-        // a class with 200 keeps 20; the absolute PPMI scale doesn't matter.
-        Map<String, Integer> bigramDf = new HashMap<>();
-        for (ClassDoc d : docs)
-            for (String b : new HashSet<>(hybridBigrams(d.text)))
-                bigramDf.merge(b, 1, Integer::sum);
-        int totalDocs = docs.size();
+        if ((sources & SRC_JAVADOC_BIGRAMS) != 0) {
+            Map<String, Integer> bigramDf = new HashMap<>();
+            for (ClassDoc d : docs)
+                for (String b : new HashSet<>(hybridBigrams(d.text)))
+                    bigramDf.merge(b, 1, Integer::sum);
+            int totalDocs = docs.size();
 
-        for (ClassDoc d : docs) {
-            List<String> bigrams = hybridBigrams(d.text);
-            Map<String, Integer> tf = new HashMap<>();
-            for (String b : bigrams) tf.merge(b, 1, Integer::sum);
-            int docLen = bigrams.size();
-            if (docLen == 0) continue;
+            for (ClassDoc d : docs) {
+                List<String> bigrams = hybridBigrams(d.text);
+                Map<String, Integer> tf = new HashMap<>();
+                for (String b : bigrams) tf.merge(b, 1, Integer::sum);
+                int docLen = bigrams.size();
+                if (docLen == 0) continue;
 
-            List<Map.Entry<String, Double>> scored = new ArrayList<>();
-            for (Map.Entry<String, Integer> e : tf.entrySet()) {
-                int df = bigramDf.getOrDefault(e.getKey(), 1);
-                double ppmi = Math.log(((double) e.getValue() / docLen)
-                                       / ((double) df / totalDocs));
-                if (ppmi > 0) scored.add(Map.entry(e.getKey(), ppmi));
+                List<Map.Entry<String, Double>> scored = new ArrayList<>();
+                for (Map.Entry<String, Integer> e : tf.entrySet()) {
+                    int df = bigramDf.getOrDefault(e.getKey(), 1);
+                    double ppmi = Math.log(((double) e.getValue() / docLen)
+                                           / ((double) df / totalDocs));
+                    if (ppmi > 0) scored.add(Map.entry(e.getKey(), ppmi));
+                }
+                if (scored.isEmpty()) continue;
+                scored.sort(Map.Entry.<String, Double>comparingByValue().reversed());
+                int keep = Math.max(1, (int) Math.ceil(scored.size() * bigramTopPct / 100.0));
+                scored.subList(0, Math.min(keep, scored.size()))
+                      .forEach(e -> addRule(result, e.getKey(), d.className));
             }
-            if (scored.isEmpty()) continue;
-            scored.sort(Map.Entry.<String, Double>comparingByValue().reversed());
-            int keep = Math.max(1, (int) Math.ceil(scored.size() * bigramTopPct / 100.0));
-            scored.subList(0, Math.min(keep, scored.size()))
-                  .forEach(e -> addRule(result, e.getKey(), d.className));
         }
 
         // Drop terms too long to be useful queries or starting with a digit
@@ -692,10 +700,15 @@ public class ConceptMiner {
      */
     public int appendNewSynonyms(IndexReader reader, Path synonymFile,
                                   String projectName) throws IOException {
+        return appendNewSynonyms(reader, synonymFile, projectName, SRC_ALL);
+    }
+
+    public int appendNewSynonyms(IndexReader reader, Path synonymFile,
+                                  String projectName, int sources) throws IOException {
         Set<String> existingLhs = loadExistingLhs(synonymFile);
 
         // Mine using all sources with default configuration
-        Map<String, Set<String>> allRules = mineAll(reader);
+        Map<String, Set<String>> allRules = mineAll(reader, DEFAULT_BIGRAM_PCT, sources);
 
         // Drop rules that BM25 already handles without synonyms — keeps only
         // genuine vocabulary-gap bridges where the trigger would fail to find
