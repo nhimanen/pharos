@@ -49,7 +49,9 @@ public record SearchRequest(
         /** Borda-merge followed by doc-type diversity reranking. Always available. */
         HYBRID_DIVERSE,
         /** Borda-merge → cross-encoder reranking → doc-type diversity reranking. */
-        HYBRID_RERANKED_DIVERSE;
+        HYBRID_RERANKED_DIVERSE,
+        /** Reciprocal Rank Fusion of keyword and vector results with agreement bonus. */
+        HYBRID_RRF;
 
         public static SearchType from(String s) {
             return switch (s.toLowerCase()) {
@@ -64,6 +66,7 @@ public record SearchRequest(
                 case "hybrid-diverse", "hybrid_diverse"               -> HYBRID_DIVERSE;
                 case "hybrid-reranked-diverse",
                      "hybrid_reranked_diverse"                        -> HYBRID_RERANKED_DIVERSE;
+                case "hybrid-rrf", "hybrid_rrf"                       -> HYBRID_RRF;
                 default -> AUTO;
             };
         }

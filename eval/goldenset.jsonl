@@ -1,0 +1,39 @@
+{"query":"distributing queries vespa class","project":"","pipeline":"auto","result_id":"solr:SOLR-17775-speed up function queries in -fl- param","rank":29,"rating":"bad","ts":"2026-05-21T17:31:19.646426702Z"}
+{"query":"distributing queries vespa class","project":"","pipeline":"auto","result_id":"solr:SOLR-17678-rerank queries can now return the originalscore","rank":30,"rating":"bad","ts":"2026-05-21T17:31:26.369061679Z"}
+{"query":"distributing queries vespa class","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.search.yql.YqlParserTestCase","rank":22,"rating":"bad","ts":"2026-05-21T17:31:32.956707709Z"}
+{"query":"distributing queries vespa class","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.search.predicate.utils.VespaQueryParser","rank":2,"rating":"bad","ts":"2026-05-21T17:31:54.717620632Z"}
+{"query":"distributing queries vespa class","project":"","pipeline":"auto","result_id":"vespa:ai.vespa.client.dsl.Q","rank":1,"rating":"bad","ts":"2026-05-21T17:32:03.006684321Z"}
+{"query":"distributed queries vespa class","project":"","pipeline":"auto","result_id":"solr:solrcloud-distributed-requests","rank":1,"rating":"bad","ts":"2026-05-21T17:32:30.360254266Z"}
+{"query":"distributed queries vespa class","project":"","pipeline":"auto","result_id":"solr:function-queries","rank":2,"rating":"bad","ts":"2026-05-21T17:32:32.904096843Z"}
+{"query":"distributed queries vespa class","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.BaseDistributedSearchTestCase","rank":3,"rating":"bad","ts":"2026-05-21T17:32:35.750691435Z"}
+{"query":"vespa where does the query get distributed","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.prelude.fastsearch.VespaBackend","rank":30,"rating":"good","ts":"2026-05-21T17:36:07.796068846Z"}
+{"query":"hello","project":"","pipeline":"auto","result_id":"vespa:HelloWorld","rank":3,"rating":"good","ts":"2026-05-21T17:36:42.088996602Z"}
+{"query":"hello","project":"","pipeline":"auto","result_id":"hello-world-app:com.example.helloworld.HelloWorldApplication","rank":2,"rating":"good","ts":"2026-05-21T17:36:45.587056907Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.gradle.plugins.LuceneGradlePlugin","rank":1,"rating":"bad","ts":"2026-05-21T17:37:39.154888150Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.search.spell.LuceneDictionary","rank":2,"rating":"bad","ts":"2026-05-21T17:37:45.881600877Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.MergePolicy.OneMergeProgress","rank":3,"rating":"good","ts":"2026-05-21T17:37:50.969944017Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.client.api.model.NodeSystemResponse.Lucene","rank":4,"rating":"bad","ts":"2026-05-21T17:37:54.467700661Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.ConcurrentMergeScheduler.MergeThread","rank":5,"rating":"good","ts":"2026-05-21T17:37:58.883440559Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"pharos:com.pharos.indexer.LuceneIndexer","rank":6,"rating":"bad","ts":"2026-05-21T17:38:03.285482041Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.util.RandomMergePolicy","rank":12,"rating":"good","ts":"2026-05-21T17:38:12.127994400Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.index.LatestVersionMergePolicy","rank":11,"rating":"bad","ts":"2026-05-21T17:38:14.232316504Z"}
+{"query":"lucene sergment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.index.LatestVersionMergePolicy","rank":11,"rating":"good","ts":"2026-05-21T17:38:15.531331815Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.MergePolicy.OneMerge","rank":1,"rating":"good","ts":"2026-05-21T17:40:11.003445549Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.SegmentMerger","rank":2,"rating":"good","ts":"2026-05-21T17:40:12.833157408Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.UpgradeIndexMergePolicy","rank":3,"rating":"good","ts":"2026-05-21T17:40:15.403837848Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.index.SegmentInfos","rank":4,"rating":"good","ts":"2026-05-21T17:40:19.936095427Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.tests.util.LuceneTestCase","rank":5,"rating":"bad","ts":"2026-05-21T17:40:25.022796246Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.index.LatestVersionMergePolicy","rank":8,"rating":"good","ts":"2026-05-21T17:40:31.063284532Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.util.RandomMergePolicy","rank":10,"rating":"good","ts":"2026-05-21T17:40:34.467881365Z"}
+{"query":"lucene segment merge","project":"","pipeline":"auto","result_id":"lucene:org.apache.lucene.tests.index.BaseDocValuesFormatTestCase#testSortedMergeAwayAllValuesLargeSegmentWithSkipper()","rank":9,"rating":"bad","ts":"2026-05-21T17:40:36.123191064Z"}
+{"query":"code search","project":"","pipeline":"auto","result_id":"pharos:com.pharos.cli.CodeSearchCommand","rank":1,"rating":"good","ts":"2026-05-21T19:24:06.486982489Z"}
+{"query":"code search","project":"","pipeline":"auto","result_id":"pharos:com.pharos.search.SearchRequest","rank":2,"rating":"good","ts":"2026-05-21T19:24:12.569459438Z"}
+{"query":"code search","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.search.searchchain.SearchChain","rank":3,"rating":"bad","ts":"2026-05-21T19:24:20.308232784Z"}
+{"query":"code search","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.search.SolrCoreParser","rank":9,"rating":"bad","ts":"2026-05-21T19:24:30.890195081Z"}
+{"query":"mypal cli","project":"","pipeline":"auto","result_id":"mypal:mypal_cli","rank":1,"rating":"good","ts":"2026-05-21T19:25:12.277707395Z"}
+{"query":"mypal cli","project":"","pipeline":"auto","result_id":"mypal:test_mypal_cli","rank":3,"rating":"good","ts":"2026-05-21T19:25:29.975092944Z"}
+{"query":"zookeeper model","project":"","pipeline":"auto","result_id":"solr:zookeeper-ensemble","rank":1,"rating":"good","ts":"2026-05-22T15:05:27.804162768Z"}
+{"query":"zookeeper model","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.vespa.model.ml.OnnxModelInfo","rank":2,"rating":"bad","ts":"2026-05-22T15:05:29.820932302Z"}
+{"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:how-to-contribute","rank":2,"rating":"bad","ts":"2026-05-22T15:06:08.741290174Z"}
+{"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:zookeeper-ensemble","rank":1,"rating":"good","ts":"2026-05-22T15:06:14.125652455Z"}
+{"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:zookeeper-file-management","rank":4,"rating":"good","ts":"2026-05-22T15:06:22.103098587Z"}

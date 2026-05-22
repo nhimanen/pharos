@@ -15,14 +15,14 @@ import java.util.*;
  * detected intent, rather than the legacy binary CamelCase switch:
  *
  * <pre>
- *   KEYWORD            0.85 / 0.15  — single identifier, exact match
- *   KEYWORD_TECHNICAL  0.75 / 0.25  — multi-word tech phrase (Cat B)
- *   CONFIG             0.70 / 0.30  — config setter / tuning
- *   LIFECYCLE          0.65 / 0.35  — error/lifecycle class names
- *   JAVADOC            0.60 / 0.40  — doc-style description
- *   HYBRID             0.45 / 0.55  — NL with stop words
- *   INTERFACE          0.35 / 0.65  — abstract type queries (Cat G)
- *   BEHAVIORAL         0.30 / 0.70  — behavioral intent (Cat D)
+ *   KEYWORD_TECHNICAL  0.90 / 0.10  — multi-word tech phrase, BM25 dominant
+ *   CONFIG             0.80 / 0.20  — config setter names, exact BM25 match
+ *   BEHAVIORAL         0.70 / 0.30  — "find code that…", BM25 still needed
+ *   INTERFACE          0.60 / 0.40  — abstract types
+ *   JAVADOC/LIFECYCLE  0.50 / 0.50  — balanced
+ *   KEYWORD (fallback) 0.80 / 0.20  — CamelCase single-token, keyword dominant
+ *   HYBRID             0.50 / 0.50  — NL with stop words; vector needed to bridge
+ *                                      vocabulary gap (e.g. "how X connects to Y" → SolrZkClient)
  * </pre>
  *
  * <h3>Legacy fallback (no classification)</h3>
@@ -106,32 +106,16 @@ public final class BordaMerger implements MergeStage {
      * Resolves the (kwWeight, vecWeight) pair from the request's classification.
      * Falls back to the legacy CamelCase heuristic when no classification is present.
      */
-    /**
-     * Resolves (kwWeight, vecWeight) from the query's intent classification.
-     *
-     * <p>Weights are calibrated by grid search over cached keyword/vector results
-     * (eval/weight_search.py), measuring MRR@10 improvement vs the 0.5/0.5 baseline:
-     * <pre>
-     *   KEYWORD_TECHNICAL  0.9 / 0.1  — multi-word tech phrases, BM25 dominant (+0.065)
-     *   HYBRID             0.9 / 0.1  — NL with stop words, BM25 still primary  (+0.032)
-     *   CONFIG             0.8 / 0.2  — config setter names, exact BM25 match   (+0.021)
-     *   BEHAVIORAL         0.7 / 0.3  — "find code that…", BM25 still needed    (+0.022)
-     *   INTERFACE          0.6 / 0.4  — abstract types                           (~0)
-     *   JAVADOC/LIFECYCLE  0.5 / 0.5  — balanced, no gain from change
-     *   KEYWORD (fallback) 0.8 / 0.2  — CamelCase single-token, keyword dominant
-     * </pre>
-     */
     private static double[] resolveWeights(SearchRequest req) {
         QueryClassification c = req.classification();
         if (c != null && c.intent() != null) {
             return switch (c.intent()) {
                 case "KEYWORD_TECHNICAL"        -> new double[]{0.90, 0.10};
-                case "HYBRID"                   -> new double[]{0.90, 0.10};
                 case "CONFIG"                   -> new double[]{0.80, 0.20};
                 case "BEHAVIORAL"               -> new double[]{0.70, 0.30};
                 case "INTERFACE"                -> new double[]{0.60, 0.40};
                 case "JAVADOC", "LIFECYCLE",
-                     "KEYWORD"                  -> new double[]{0.50, 0.50};
+                     "KEYWORD", "HYBRID"        -> new double[]{0.50, 0.50};
                 default                         -> new double[]{0.50, 0.50};
             };
         }

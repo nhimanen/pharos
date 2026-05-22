@@ -15,7 +15,7 @@ LIMIT = 10
 # Cache lives next to this script so results persist across sessions
 CACHE_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_cache.json")
 GOLDENSET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldenset.jsonl")
-PIPELINES = ["keyword", "auto", "vector", "unified", "hybrid", "hybrid-diverse", "hybrid-reranked", "hybrid-reranked-diverse"]
+PIPELINES = ["keyword", "auto", "vector", "unified", "hybrid", "hybrid-rrf", "hybrid-diverse", "hybrid-reranked", "hybrid-reranked-diverse"]
 
 CAT_LABELS = {
     "A": "Exact name (single term)",
@@ -518,7 +518,7 @@ def main():
             pk_cat, _, _ndcg, n = metrics(subset)
             vals = [pk_cat[k][pl] for pl in PIPELINES]
             best_pl = PIPELINES[vals.index(max(vals))]
-            best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
+            best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-rrf": "rr", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
             cells = ' | '.join(f'{v:.2f}' for v in vals)
             lines.append(f"| {cat}: {CAT_LABELS[cat][:26]} | {n} | {cells} | **{best_abbr}** |")
         lines.append("")
@@ -532,7 +532,7 @@ def main():
         pk_cat, mrr_cat, _ndcg, n = metrics(subset)
         vals = [mrr_cat[pl] for pl in PIPELINES]
         best_pl = PIPELINES[vals.index(max(vals))]
-        best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
+        best_abbr = {"keyword": "kw", "auto": "au", "vector": "ve", "unified": "un", "hybrid": "hy", "hybrid-rrf": "rr", "hybrid-diverse": "hd", "hybrid-reranked": "hr", "hybrid-reranked-diverse": "rd"}[best_pl]
         cells = ' | '.join(f'{v:.3f}' for v in vals)
         lines.append(f"| {cat}: {CAT_LABELS[cat][:26]} | {n} | {cells} | **{best_abbr}** |")
     lines.append("")

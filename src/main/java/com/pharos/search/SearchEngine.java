@@ -8,6 +8,7 @@ import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.search.pipeline.BordaMerger;
+import com.pharos.search.pipeline.RrfMerger;
 import com.pharos.search.pipeline.UnifiedRetrievalStage;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderMerger;
@@ -151,28 +152,29 @@ public class SearchEngine {
         VectorRetrievalStage   vecStage      = new VectorRetrievalStage(vec);
         UnifiedRetrievalStage  unifiedStage  = new UnifiedRetrievalStage(kw, embedder);
         BordaMerger            borda         = new BordaMerger();
+        RrfMerger              rrf           = new RrfMerger();
         CrossEncoderMerger     ceMerger      = new CrossEncoderMerger(crossEncoder);
         CrossEncoderReranker   ceReranker    = new CrossEncoderReranker(crossEncoder);
         DiversityReranker      diversityReranker = new DiversityReranker(0.5f);
 
         // Child pipelines for the auto dispatcher (no router — classification already on req)
-        SearchPipeline kwPipeline = SearchPipeline.builder().retriever(kwStage).build();
-        SearchPipeline hyPipeline = SearchPipeline.builder()
-                .retriever(kwStage).retriever(vecStage).merger(borda).build();
-        SearchPipeline hyRePipeline = SearchPipeline.builder()
-                .retriever(kwStage).retriever(vecStage).merger(borda).reranker(ceReranker).build();
+        SearchPipeline kwPipeline    = SearchPipeline.builder().retriever(kwStage).build();
+        SearchPipeline hyRrfPipeline = SearchPipeline.builder()
+                .retriever(kwStage).retriever(vecStage).merger(rrf).build();
+        SearchPipeline hyRrfRePipeline = SearchPipeline.builder()
+                .retriever(kwStage).retriever(vecStage).merger(rrf).reranker(ceReranker).build();
 
         Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
 
         // AUTO: QueryRouter classifies once, RouterDispatcher picks the right child pipeline.
-        // CONFIG intent → hybrid-reranked: CE bridges vocabulary gaps ("configure" ↔ "set", etc.)
+        // KEYWORD intent → pure BM25; HYBRID intent → RRF fusion; CONFIG → RRF + cross-encoder.
         map.put(SearchRequest.SearchType.AUTO,
                 SearchPipeline.builder()
                         .router(queryRouter)
                         .retriever(new RouterDispatcher(
                                 Map.of(SearchRequest.SearchType.KEYWORD,         kwPipeline,
-                                       SearchRequest.SearchType.HYBRID,          hyPipeline,
-                                       SearchRequest.SearchType.HYBRID_RERANKED, hyRePipeline),
+                                       SearchRequest.SearchType.HYBRID,          hyRrfPipeline,
+                                       SearchRequest.SearchType.HYBRID_RERANKED, hyRrfRePipeline),
                                 SearchRequest.SearchType.HYBRID))
                         .build());
 
@@ -194,13 +196,15 @@ public class SearchEngine {
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).build());
         map.put(SearchRequest.SearchType.HYBRID_RERANKED_DIVERSE,
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).reranker(ceReranker).build());
+        map.put(SearchRequest.SearchType.HYBRID_RRF,
+                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(rrf).build());
         this.pipelines = Map.copyOf(map);
 
         boolean vecAvailable = embedder.isAvailable();
         boolean ceAvailable  = crossEncoder.isAvailable();
         this.pipelineDescriptors = List.of(
             new PipelineDescriptor("auto",           "Auto",
-                    "Automatically selects Keyword or Hybrid based on query shape", true),
+                    "Automatically selects Keyword or Hybrid-RRF based on query shape", true),
             new PipelineDescriptor("keyword",        "Keyword (BM25)",
                     "BM25 keyword search with field boosts and graph in-degree scoring", true),
             new PipelineDescriptor("vector",         "Semantic (Vector)",
@@ -216,7 +220,9 @@ public class SearchEngine {
             new PipelineDescriptor("hybrid-diverse",           "Hybrid + Diversity",
                     "Hybrid fusion with doc-type diversity reranking to balance method/class/chunk results", true),
             new PipelineDescriptor("hybrid-reranked-diverse",  "Hybrid + CE + Diversity",
-                    "Cross-encoder reranking followed by doc-type diversity reranking", ceAvailable)
+                    "Cross-encoder reranking followed by doc-type diversity reranking", ceAvailable),
+            new PipelineDescriptor("hybrid-rrf",               "Hybrid RRF",
+                    "Reciprocal Rank Fusion (k=60) of keyword and vector results with agreement bonus", true)
         );
     }
 
