@@ -7,20 +7,14 @@ import com.pharos.search.SourceReader;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
-import com.pharos.search.pipeline.BordaMerger;
-import com.pharos.search.pipeline.RrfMerger;
-import com.pharos.search.pipeline.UnifiedRetrievalStage;
 import com.pharos.search.pipeline.CrossEncoder;
-import com.pharos.search.pipeline.CrossEncoderMerger;
-import com.pharos.search.pipeline.CrossEncoderReranker;
-import com.pharos.search.pipeline.DiversityReranker;
-import com.pharos.search.pipeline.MmrClassDiversifier;
-import com.pharos.search.pipeline.KeywordRetrievalStage;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
+import com.pharos.search.pipeline.PipelineConfig;
 import com.pharos.search.pipeline.PipelineDescriptor;
-import com.pharos.search.pipeline.RouterDispatcher;
+import com.pharos.search.pipeline.PipelineFactory;
 import com.pharos.search.pipeline.SearchPipeline;
-import com.pharos.search.pipeline.VectorRetrievalStage;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.StoredFields;
@@ -124,7 +118,6 @@ public class SearchEngine {
     private final ZeroResultAdvisor zeroResultAdvisor;
     private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
     private final List<PipelineDescriptor> pipelineDescriptors;
-    private final MmrClassDiversifier mmrDiversifier;
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
@@ -150,84 +143,10 @@ public class SearchEngine {
         this.vectorStrategy  = vec;
         this.zeroResultAdvisor = new ZeroResultAdvisor(luceneIndexer, registry, kw);
 
-        KeywordRetrievalStage  kwStage       = new KeywordRetrievalStage(kw);
-        VectorRetrievalStage   vecStage      = new VectorRetrievalStage(vec);
-        UnifiedRetrievalStage  unifiedStage  = new UnifiedRetrievalStage(kw, embedder);
-        BordaMerger            borda         = new BordaMerger();
-        RrfMerger              rrf           = new RrfMerger();
-        CrossEncoderMerger     ceMerger      = new CrossEncoderMerger(crossEncoder);
-        CrossEncoderReranker   ceReranker    = new CrossEncoderReranker(crossEncoder);
-        DiversityReranker      diversityReranker = new DiversityReranker(0.5f);
-        MmrClassDiversifier    mmrDiversifier    = new MmrClassDiversifier(0.5f);
-
-        // Child pipelines for the auto dispatcher (no router — classification already on req)
-        SearchPipeline kwPipeline    = SearchPipeline.builder().retriever(kwStage).build();
-        SearchPipeline hyRrfPipeline = SearchPipeline.builder()
-                .retriever(kwStage).retriever(vecStage).merger(rrf).build();
-        SearchPipeline hyRrfRePipeline = SearchPipeline.builder()
-                .retriever(kwStage).retriever(vecStage).merger(rrf).reranker(ceReranker).build();
-
-        Map<SearchRequest.SearchType, SearchPipeline> map = new EnumMap<>(SearchRequest.SearchType.class);
-
-        // AUTO: QueryRouter classifies once, RouterDispatcher picks the right child pipeline.
-        // KEYWORD intent → pure BM25; HYBRID intent → RRF fusion; CONFIG → RRF + cross-encoder.
-        map.put(SearchRequest.SearchType.AUTO,
-                SearchPipeline.builder()
-                        .router(queryRouter)
-                        .retriever(new RouterDispatcher(
-                                Map.of(SearchRequest.SearchType.KEYWORD,         kwPipeline,
-                                       SearchRequest.SearchType.HYBRID,          hyRrfPipeline,
-                                       SearchRequest.SearchType.HYBRID_RERANKED, hyRrfRePipeline),
-                                SearchRequest.SearchType.HYBRID))
-                        .build());
-
-        // UNIFIED: QueryRouter classifies once, UnifiedRetrievalStage reads intent for adaptive weights
-        map.put(SearchRequest.SearchType.UNIFIED,
-                SearchPipeline.builder().router(queryRouter).retriever(unifiedStage).build());
-
-        map.put(SearchRequest.SearchType.KEYWORD,
-                SearchPipeline.builder().retriever(kwStage).build());
-        map.put(SearchRequest.SearchType.VECTOR,
-                SearchPipeline.builder().retriever(vecStage).build());
-        map.put(SearchRequest.SearchType.HYBRID,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(borda).build());
-        map.put(SearchRequest.SearchType.HYBRID_RERANKED,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(borda).reranker(ceReranker).build());
-        map.put(SearchRequest.SearchType.HYBRID_CROSS_ENCODER_MERGE,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(ceMerger).build());
-        map.put(SearchRequest.SearchType.HYBRID_DIVERSE,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).build());
-        map.put(SearchRequest.SearchType.HYBRID_RERANKED_DIVERSE,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).reranker(ceReranker).build());
-        map.put(SearchRequest.SearchType.HYBRID_RRF,
-                SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(rrf).build());
-        this.pipelines       = Map.copyOf(map);
-        this.mmrDiversifier  = mmrDiversifier;
-
-        boolean vecAvailable = embedder.isAvailable();
-        boolean ceAvailable  = crossEncoder.isAvailable();
-        this.pipelineDescriptors = List.of(
-            new PipelineDescriptor("auto",           "Auto",
-                    "Automatically selects Keyword or Hybrid-RRF based on query shape", true),
-            new PipelineDescriptor("keyword",        "Keyword (BM25)",
-                    "BM25 keyword search with field boosts and graph in-degree scoring", true),
-            new PipelineDescriptor("vector",         "Semantic (Vector)",
-                    "HNSW nearest-neighbor search over embedded method/class bodies", vecAvailable),
-            new PipelineDescriptor("hybrid",         "Hybrid",
-                    "Borda-count fusion of keyword and vector results with agreement bonus", true),
-            new PipelineDescriptor("unified",        "Unified",
-                    "Single BM25 pass with vector similarity as a score boost; no separate merge step", vecAvailable),
-            new PipelineDescriptor("hybrid-reranked","Hybrid + Reranker",
-                    "Hybrid fusion followed by cross-encoder reranking over the merged list", ceAvailable),
-            new PipelineDescriptor("hybrid-ce-merge",          "CE Merge",
-                    "Cross-encoder scores all deduplicated candidates and acts as the merge step", ceAvailable),
-            new PipelineDescriptor("hybrid-diverse",           "Hybrid + Diversity",
-                    "Hybrid fusion with doc-type diversity reranking to balance method/class/chunk results", true),
-            new PipelineDescriptor("hybrid-reranked-diverse",  "Hybrid + CE + Diversity",
-                    "Cross-encoder reranking followed by doc-type diversity reranking", ceAvailable),
-            new PipelineDescriptor("hybrid-rrf",               "Hybrid RRF",
-                    "Reciprocal Rank Fusion (k=60) of keyword and vector results with agreement bonus", true)
-        );
+        PipelineFactory factory = new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter);
+        PipelineFactory.Result built = factory.build(loadPipelineConfigs());
+        this.pipelines           = built.pipelines();
+        this.pipelineDescriptors = built.descriptors();
     }
 
     /** Returns the ordered list of available pipelines for UI display. */
@@ -319,13 +238,6 @@ public class SearchEngine {
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
-
-        // MMR class diversity: penalise repeated hits from the same qualifiedClassName
-        // so conceptual queries don't fill the result list with overloads of one method.
-        // Skipped for pure keyword/identifier queries where seeing all overloads is useful.
-        if (shouldApplyMmr(resolvedType, trace)) {
-            primary = mmrDiversifier.rerank(primary, req, reader, req.limit(), trace);
-        }
 
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
@@ -822,20 +734,29 @@ public class SearchEngine {
      * </ul>
      */
     /**
-     * Returns true when MMR class diversity should run for this request.
-     *
-     * MMR is skipped for pure KEYWORD searches and for AUTO requests classified
-     * as KEYWORD or KEYWORD_TECHNICAL intent — in those cases the user is doing
-     * an identifier lookup and wants to see all overloads of the target method.
+     * Loads pipeline configuration from {@code ~/.pharos/pipelines.yaml} if it exists,
+     * otherwise falls back to the bundled {@code pipelines.yaml} on the classpath.
+     * This lets operators customise or extend the pipeline set without recompiling.
      */
-    private static boolean shouldApplyMmr(SearchRequest.SearchType resolvedType, SearchTrace trace) {
-        if (resolvedType == SearchRequest.SearchType.KEYWORD) return false;
-        QueryClassification cls = trace.getClassification();
-        if (cls != null) {
-            String intent = cls.intent();
-            if ("KEYWORD".equals(intent) || "KEYWORD_TECHNICAL".equals(intent)) return false;
+    private static List<PipelineConfig> loadPipelineConfigs() {
+        ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
+        try {
+            java.nio.file.Path external = java.nio.file.Path.of(
+                    System.getProperty("user.home"), ".pharos", "pipelines.yaml");
+            java.io.InputStream in;
+            if (java.nio.file.Files.isReadable(external)) {
+                log.info("Loading pipeline config from {}", external);
+                in = java.nio.file.Files.newInputStream(external);
+            } else {
+                in = SearchEngine.class.getClassLoader().getResourceAsStream("pipelines.yaml");
+                if (in == null) throw new IllegalStateException("pipelines.yaml not found on classpath");
+            }
+            try (in) {
+                return yaml.readValue(in, PipelineConfig.Root.class).pipelines();
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load pipeline configuration", e);
         }
-        return true;
     }
 
     private static int adaptiveOversample(SearchRequest.SearchType resolvedType, String query) {

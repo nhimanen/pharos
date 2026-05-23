@@ -1,0 +1,108 @@
+pipelines:
+
+  # ── Pure keyword ────────────────────────────────────────────────────────────
+  - name: keyword
+    label: "Keyword (BM25)"
+    description: "BM25 keyword search with field boosts and graph in-degree scoring"
+    retrievers: [keyword]
+
+  # ── Semantic vector ──────────────────────────────────────────────────────────
+  - name: vector
+    label: "Semantic (Vector)"
+    description: "HNSW nearest-neighbor search over embedded method/class bodies"
+    requires: [embeddings]
+    retrievers: [vector]
+    rerankers: [mmr]
+
+  # ── Unified ──────────────────────────────────────────────────────────────────
+  - name: unified
+    label: "Unified"
+    description: "Single BM25 pass with vector similarity as a score boost; no separate merge step"
+    requires: [embeddings]
+    router: query-classifier
+    retrievers: [unified]
+    rerankers: [mmr]
+
+  # ── Hybrid Borda ─────────────────────────────────────────────────────────────
+  - name: hybrid
+    label: "Hybrid"
+    description: "Borda-count fusion of keyword and vector results with agreement bonus"
+    retrievers: [keyword, vector]
+    merger: borda
+    rerankers: [mmr]
+
+  # ── Hybrid RRF ───────────────────────────────────────────────────────────────
+  - name: hybrid-rrf
+    label: "Hybrid RRF"
+    description: "Reciprocal Rank Fusion (k=60) of keyword and vector results with agreement bonus"
+    retrievers: [keyword, vector]
+    merger: rrf
+    rerankers: [mmr]
+
+  # ── Hybrid + cross-encoder reranker ──────────────────────────────────────────
+  - name: hybrid-reranked
+    label: "Hybrid + Reranker"
+    description: "Hybrid fusion followed by cross-encoder reranking over the merged list"
+    requires: [cross-encoder]
+    retrievers: [keyword, vector]
+    merger: borda
+    rerankers: [cross-encoder, mmr]
+
+  # ── Hybrid + cross-encoder as merge step ─────────────────────────────────────
+  - name: hybrid-ce-merge
+    label: "CE Merge"
+    description: "Cross-encoder scores all deduplicated candidates and acts as the merge step"
+    requires: [cross-encoder]
+    retrievers: [keyword, vector]
+    merger: cross-encoder-merge
+    rerankers: [mmr]
+
+  # ── Hybrid + doc-type diversity ───────────────────────────────────────────────
+  - name: hybrid-diverse
+    label: "Hybrid + Diversity"
+    description: "Hybrid fusion with doc-type diversity reranking to balance method/class/chunk results"
+    retrievers: [keyword, vector]
+    oversample: 3
+    premerge: [diversity]
+    merger: borda
+    rerankers: [mmr]
+
+  # ── Hybrid + CE + doc-type diversity ─────────────────────────────────────────
+  - name: hybrid-reranked-diverse
+    label: "Hybrid + CE + Diversity"
+    description: "Cross-encoder reranking followed by doc-type diversity reranking"
+    requires: [cross-encoder]
+    retrievers: [keyword, vector]
+    oversample: 3
+    premerge: [diversity]
+    merger: borda
+    rerankers: [cross-encoder, mmr]
+
+  # ── Auto child pipelines (not shown in UI) ───────────────────────────────────
+  - name: _auto-keyword
+    visible: false
+    retrievers: [keyword]
+
+  - name: _auto-hybrid-rrf
+    visible: false
+    retrievers: [keyword, vector]
+    merger: rrf
+    rerankers: [mmr]
+
+  - name: _auto-hybrid-rrf-reranked
+    visible: false
+    requires: [cross-encoder]
+    retrievers: [keyword, vector]
+    merger: rrf
+    rerankers: [cross-encoder, mmr]
+
+  # ── Auto (router-dispatched) ──────────────────────────────────────────────────
+  - name: auto
+    label: "Auto"
+    description: "Automatically selects Keyword or Hybrid-RRF based on query shape"
+    router: query-classifier
+    dispatch:
+      KEYWORD: _auto-keyword
+      HYBRID: _auto-hybrid-rrf
+      HYBRID_RERANKED: _auto-hybrid-rrf-reranked
+      default: _auto-hybrid-rrf
