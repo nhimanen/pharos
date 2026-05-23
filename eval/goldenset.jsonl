@@ -37,3 +37,7 @@
 {"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:how-to-contribute","rank":2,"rating":"bad","ts":"2026-05-22T15:06:08.741290174Z"}
 {"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:zookeeper-ensemble","rank":1,"rating":"good","ts":"2026-05-22T15:06:14.125652455Z"}
 {"query":"how solr connects to zookeeper","project":"","pipeline":"auto","result_id":"solr:zookeeper-file-management","rank":4,"rating":"good","ts":"2026-05-22T15:06:22.103098587Z"}
+{"query":"distributed query","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.BaseDistributedSearchTestCase#query(Object)","rank":1,"rating":"bad","ts":"2026-05-23T10:11:38.017035731Z"}
+{"query":"distributed query","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.TestDistributedGrouping#variantQuery(SolrParams,SolrParams)","rank":2,"rating":"bad","ts":"2026-05-23T10:11:42.134156239Z"}
+{"query":"distributed query","project":"","pipeline":"auto","result_id":"solr:org.apache.solr.handler.component.QueryComponent#distributedProcess(ResponseBuilder)","rank":6,"rating":"good","ts":"2026-05-23T10:11:57.665019423Z"}
+{"query":"distributed query","project":"","pipeline":"auto","result_id":"vespa:com.yahoo.prelude.cluster.ClusterSearcher#processResult(Query,FutureTask<Result>,Result)","rank":15,"rating":"good","ts":"2026-05-23T10:12:13.428158911Z"}
