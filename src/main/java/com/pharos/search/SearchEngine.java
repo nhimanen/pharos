@@ -14,6 +14,7 @@ import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderMerger;
 import com.pharos.search.pipeline.CrossEncoderReranker;
 import com.pharos.search.pipeline.DiversityReranker;
+import com.pharos.search.pipeline.MmrClassDiversifier;
 import com.pharos.search.pipeline.KeywordRetrievalStage;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import com.pharos.search.pipeline.PipelineDescriptor;
@@ -123,6 +124,7 @@ public class SearchEngine {
     private final ZeroResultAdvisor zeroResultAdvisor;
     private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
     private final List<PipelineDescriptor> pipelineDescriptors;
+    private final MmrClassDiversifier mmrDiversifier;
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
@@ -156,6 +158,7 @@ public class SearchEngine {
         CrossEncoderMerger     ceMerger      = new CrossEncoderMerger(crossEncoder);
         CrossEncoderReranker   ceReranker    = new CrossEncoderReranker(crossEncoder);
         DiversityReranker      diversityReranker = new DiversityReranker(0.5f);
+        MmrClassDiversifier    mmrDiversifier    = new MmrClassDiversifier(0.5f);
 
         // Child pipelines for the auto dispatcher (no router — classification already on req)
         SearchPipeline kwPipeline    = SearchPipeline.builder().retriever(kwStage).build();
@@ -198,7 +201,8 @@ public class SearchEngine {
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).oversample(3).premerge(diversityReranker).merger(borda).reranker(ceReranker).build());
         map.put(SearchRequest.SearchType.HYBRID_RRF,
                 SearchPipeline.builder().retriever(kwStage).retriever(vecStage).merger(rrf).build());
-        this.pipelines = Map.copyOf(map);
+        this.pipelines       = Map.copyOf(map);
+        this.mmrDiversifier  = mmrDiversifier;
 
         boolean vecAvailable = embedder.isAvailable();
         boolean ceAvailable  = crossEncoder.isAvailable();
@@ -315,6 +319,13 @@ public class SearchEngine {
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
+
+        // MMR class diversity: penalise repeated hits from the same qualifiedClassName
+        // so conceptual queries don't fill the result list with overloads of one method.
+        // Skipped for pure keyword/identifier queries where seeing all overloads is useful.
+        if (shouldApplyMmr(resolvedType, trace)) {
+            primary = mmrDiversifier.rerank(primary, req, reader, req.limit(), trace);
+        }
 
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
@@ -810,6 +821,23 @@ public class SearchEngine {
      *       internally; return 0 to leave them untouched.</li>
      * </ul>
      */
+    /**
+     * Returns true when MMR class diversity should run for this request.
+     *
+     * MMR is skipped for pure KEYWORD searches and for AUTO requests classified
+     * as KEYWORD or KEYWORD_TECHNICAL intent — in those cases the user is doing
+     * an identifier lookup and wants to see all overloads of the target method.
+     */
+    private static boolean shouldApplyMmr(SearchRequest.SearchType resolvedType, SearchTrace trace) {
+        if (resolvedType == SearchRequest.SearchType.KEYWORD) return false;
+        QueryClassification cls = trace.getClassification();
+        if (cls != null) {
+            String intent = cls.intent();
+            if ("KEYWORD".equals(intent) || "KEYWORD_TECHNICAL".equals(intent)) return false;
+        }
+        return true;
+    }
+
     private static int adaptiveOversample(SearchRequest.SearchType resolvedType, String query) {
         return switch (resolvedType) {
             case KEYWORD -> 1;
