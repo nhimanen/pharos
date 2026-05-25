@@ -4,11 +4,9 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.LuceneIndexer;
-import com.pharos.search.HapaxStats;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResult;
-import org.apache.lucene.index.IndexReader;
 import org.junit.jupiter.api.*;
 
 import java.io.IOException;
@@ -353,13 +351,6 @@ class LuceneSearchQualityTest {
 
         luceneIndexer = new LuceneIndexer(config);
         searchEngine  = new SearchEngine(luceneIndexer, EmbeddingProvider.create(config), registry);
-
-        // Compute and persist hapax stats for q-log IDF (overwrites stale values).
-        System.out.println();
-        System.out.println("  [hapax scan] Computing q-IDF parameters for project 'lucene'...");
-        IndexReader reader = luceneIndexer.openReader("lucene");
-        HapaxStats.computeAndSave(reader, config.getIndexDir(), "lucene");
-        System.out.println();
     }
 
     @AfterAll

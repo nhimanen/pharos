@@ -34,8 +34,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalDouble;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -118,64 +116,36 @@ public class KeywordSearchStrategy {
     };
 
     /**
-     * Tsallis q-log IDF for identifier fields (methodName, className, signature).
-     *
-     * Replaces the standard log with the q-logarithm:
-     *   qlog(x) = (x^(1−q) − 1) / (1−q)   [reduces to log(x) when q → 1]
-     *
-     * For q < 1 (typical for code corpora with many rare identifiers), the power
-     * x^(1−q) grows faster than log(x) for large x = N/df, amplifying the signal
-     * from hapax-like method and class names that generic tokenization under-separates.
-     *
-     * q is estimated per-project from hapax density (see HapaxStats).
-     * Term frequency and field length are still ignored — presence is what matters.
-     *
-     * Reference: Radha & Goktas, "Improving BM25 Code Retrieval Under Fixed Generic
-     * Tokenization", arXiv:2605.18561 (2026).
+     * IDF-only similarity for identifier fields (methodName, className).
+     * Score = log((N+1)/(df+1)) + 1 — purely how rare/specific the term is in the corpus.
+     * Term frequency and field length are ignored: one occurrence is as good as ten,
+     * and a short class name is not penalized against a long one.
      */
-    static final class QLogIdfSimilarity extends SimilarityBase {
-        private final double q;
-
-        QLogIdfSimilarity(double q) { this.q = q; }
-
-        double q() { return q; }
-
+    private static final class IdfOnlySimilarity extends SimilarityBase {
         @Override
         public double score(BasicStats stats, double freq, double docLen) {
-            double x = (stats.getNumberOfDocuments() + 1.0) / (stats.getDocFreq() + 1.0);
-            return qlog(x) + 1.0;
+            return Math.log((stats.getNumberOfDocuments() + 1.0) / (stats.getDocFreq() + 1.0)) + 1.0;
         }
-
-        private double qlog(double x) {
-            if (Math.abs(q - 1.0) < 1e-8) return Math.log(x);
-            return (Math.pow(x, 1.0 - q) - 1.0) / (1.0 - q);
-        }
-
-        @Override public String toString() { return "qIDF(q=" + q + ")"; }
+        @Override public String toString() { return "IDF"; }
     }
 
-    /** Fallback similarity used when no project q-stats are available (q=1 → standard log IDF). */
-    private static final Similarity PER_FIELD_SIMILARITY = buildSimilarity(1.0);
+    private static final Similarity PER_FIELD_SIMILARITY = new PerFieldSimilarityWrapper() {
+        private final Similarity     idSim   = new IdfOnlySimilarity();
+        private final BM25Similarity textSim = new BM25Similarity(1.0f, 0.5f);
+        private final BM25Similarity bodySim = new BM25Similarity(1.2f, 0.9f);
 
-    /** Builds a per-field similarity wrapper with QLogIdfSimilarity(q) on identifier fields. */
-    static Similarity buildSimilarity(double q) {
-        Similarity     idSim   = new QLogIdfSimilarity(q);
-        BM25Similarity textSim = new BM25Similarity(1.0f, 0.5f);
-        BM25Similarity bodySim = new BM25Similarity(1.2f, 0.9f);
-        return new PerFieldSimilarityWrapper() {
-            @Override
-            public Similarity get(String field) {
-                return switch (field) {
-                    case DocumentMapper.F_METHOD_NAME,
-                         DocumentMapper.F_CLASS_NAME,
-                         DocumentMapper.F_SIGNATURE     -> idSim;
-                    case DocumentMapper.F_JAVADOC,
-                         DocumentMapper.F_CALLER_CONTEXT -> textSim;
-                    default                            -> bodySim;
-                };
-            }
-        };
-    }
+        @Override
+        public Similarity get(String field) {
+            return switch (field) {
+                case DocumentMapper.F_METHOD_NAME,
+                     DocumentMapper.F_CLASS_NAME,
+                     DocumentMapper.F_SIGNATURE     -> idSim;
+                case DocumentMapper.F_JAVADOC,
+                     DocumentMapper.F_CALLER_CONTEXT -> textSim;
+                default                            -> bodySim;
+            };
+        }
+    };
 
     private static final String[] SEARCH_FIELDS = {
             DocumentMapper.F_METHOD_NAME,
@@ -204,52 +174,18 @@ public class KeywordSearchStrategy {
      */
     private final Path synonymFile;
 
-    /** Directory under which per-project search-params.json files are stored. */
-    private final Path indexDir;
-
-    /** Per-project similarity cache keyed by project name. Thread-safe. */
-    private final Map<String, Similarity> similarityCache = new ConcurrentHashMap<>();
-
     private Analyzer analyzer;
     /** Last-modified timestamp of synonyms.txt at the time the analyzer was built. */
     private long synonymFileLastModified = -1;
 
     public KeywordSearchStrategy() {
-        this(IndexConfig.DEFAULT_BASE.resolve("synonyms.txt"),
-             IndexConfig.DEFAULT_BASE.resolve("indexes"));
+        this(IndexConfig.DEFAULT_BASE.resolve("synonyms.txt"));
     }
 
     /** Package-private constructor for tests that need a custom synonym file path. */
     KeywordSearchStrategy(Path synonymFile) {
-        this(synonymFile, IndexConfig.DEFAULT_BASE.resolve("indexes"));
-    }
-
-    KeywordSearchStrategy(Path synonymFile, Path indexDir) {
         this.synonymFile = synonymFile;
-        this.indexDir    = indexDir;
         reloadAnalyzer();
-    }
-
-    /**
-     * Returns the per-field similarity to use for {@code project}.
-     * Loads q from the project's search-params.json if present; falls back to q=1.0.
-     */
-    private Similarity getSimilarity(String project) {
-        if (project == null || project.isBlank()) return PER_FIELD_SIMILARITY;
-        return similarityCache.computeIfAbsent(project, p -> {
-            OptionalDouble q = HapaxStats.load(indexDir, p);
-            if (q.isEmpty()) {
-                log.debug("No q-IDF stats for project '{}', using standard IDF (q=1)", p);
-                return PER_FIELD_SIMILARITY;
-            }
-            log.debug("q-IDF for project '{}': q={}", p, q.getAsDouble());
-            return buildSimilarity(q.getAsDouble());
-        });
-    }
-
-    /** Clears the cached similarity for a project (call after saving new hapax stats). */
-    public void invalidateSimilarityCache(String project) {
-        similarityCache.remove(project);
     }
 
     /**
@@ -287,7 +223,7 @@ public class KeywordSearchStrategy {
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
         reloadIfChanged();
         IndexSearcher searcher = new IndexSearcher(reader);
-        searcher.setSimilarity(getSimilarity(req.project()));
+        searcher.setSimilarity(PER_FIELD_SIMILARITY);
 
         Query query = buildQuery(req);
         if (query == null) return List.of();
