@@ -497,11 +497,14 @@ public class ProjectIndexManager {
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
 
-        progress.onProgress("Done", meta.getFileCount(), meta.getFileCount());
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
 
-        if (buildSynonyms && anyChanges[0]) expandSynonyms(projectName);
+        if (buildSynonyms && anyChanges[0]) {
+            progress.onProgress("Mining synonyms", 0, 0);
+            expandSynonyms(projectName);
+        }
+        progress.onProgress("Done", meta.getFileCount(), meta.getFileCount());
         return meta;
     }
 
@@ -763,14 +766,15 @@ public class ProjectIndexManager {
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
 
-        progress.onProgress("Done", dirtyFiles.size(), dirtyFiles.size());
         log.info("Incremental index complete for '{}': {} files updated", projectName, dirtyFiles.size());
 
         // Only re-mine synonyms when content actually changed — synonym expansion does a full
         // Lucene scan + TF-IDF computation which is expensive to run for deletion-only updates.
         if (buildSynonyms && !dirtyFiles.isEmpty()) {
+            progress.onProgress("Mining synonyms", 0, 0);
             expandSynonyms(projectName);
         }
+        progress.onProgress("Done", dirtyFiles.size(), dirtyFiles.size());
         return meta;
     }
 

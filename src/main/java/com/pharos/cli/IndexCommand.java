@@ -180,7 +180,8 @@ public class IndexCommand implements Callable<Integer> {
     }
 
     private void autoLinkAll(List<String> projectNames) {
-        System.out.printf("%nLinking %d projects...%n", projectNames.size());
+        System.out.printf("%nLinking %d projects and building cross-project graph...%n", projectNames.size());
+        long start = System.currentTimeMillis();
         try {
             // Register all pairs as linked in the registry
             for (int i = 0; i < projectNames.size(); i++) {
@@ -190,7 +191,8 @@ public class IndexCommand implements Callable<Integer> {
             }
             // Build the merged cross-project graph in one pass
             crossProjectLinker.buildCrossProjectGraph(projectNames);
-            System.out.println("Cross-project graph built.");
+            System.out.printf("Cross-project graph built (%.1fs).%n",
+                    (System.currentTimeMillis() - start) / 1000.0);
         } catch (Exception e) {
             System.err.printf("Warning: cross-project linking failed: %s%n", e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
@@ -243,9 +245,12 @@ public class IndexCommand implements Callable<Integer> {
         List<String> all = new ArrayList<>();
         all.add(projectName);
         all.addAll(linked);
+        System.out.printf("Refreshing cross-project graph (%d projects)...%n", all.size());
+        long start = System.currentTimeMillis();
         try {
             crossProjectLinker.buildCrossProjectGraph(all);
-            System.out.println("Refreshed cross-project graph.");
+            System.out.printf("Refreshed cross-project graph (%.1fs).%n",
+                    (System.currentTimeMillis() - start) / 1000.0);
         } catch (Exception e) {
             System.err.printf("Warning: cross-project graph refresh failed: %s%n", e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
