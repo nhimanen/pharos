@@ -311,8 +311,8 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
                 float[][] result = postEmbeddings(List.of(truncated));
                 inputTruncations.increment();
                 log.warn("Provider '{}': text truncated from {} → {} chars to fit context " +
-                        "(likely matrix-dense input; preserved meaning where possible). Original server reject: {}",
-                        cfg.getModelId(), originalLen, currentLen, originalOe.serverBody);
+                        "(likely matrix-dense input). Head: \"{}\"",
+                        cfg.getModelId(), originalLen, currentLen, headSummary(text));
                 return result;
             } catch (OverflowException oe) {
                 lastOe = oe;
@@ -324,9 +324,25 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
         // Even MIN_TRUNCATED_CHARS overflowed — pathological case.
         singleInputOverflows.increment();
         log.error("Provider '{}': could not embed text (original {} chars); still overflowed at {} chars. " +
-                "Leaving slot unembedded. Server: {}",
-                cfg.getModelId(), originalLen, MIN_TRUNCATED_CHARS, lastOe.serverBody);
+                "Leaving slot unembedded. Head: \"{}\"  Server: {}",
+                cfg.getModelId(), originalLen, MIN_TRUNCATED_CHARS, headSummary(text), lastOe.serverBody);
         return new float[][] { null };
+    }
+
+    /**
+     * Builds a one-line excerpt from the start of an embedding text — enough
+     * to identify what file/class/method produced it. Chunker outputs typically
+     * begin with a breadcrumb (FQN + signature), so the first ~160 chars carry
+     * the identifying information. Newlines and tabs collapsed to single spaces;
+     * truncated mid-token if needed. Use this in WARN/ERROR logs about
+     * over-long inputs so the operator can grep the source file.
+     */
+    private static String headSummary(String text) {
+        if (text == null) return "(null)";
+        String trimmed = text.length() > 160 ? text.substring(0, 160) : text;
+        // Replace runs of whitespace (incl. newlines, tabs) with single spaces
+        // so the log line stays one row and is easily grep-able.
+        return trimmed.replaceAll("\\s+", " ").trim();
     }
 
     /**
@@ -494,9 +510,8 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
         ArrayNode inputs = root.putArray("input");
         for (String t : texts) {
             if (t != null && t.length() > MAX_INPUT_CHARS) {
-                log.warn("Provider '{}': truncating input from {} chars to {} chars " +
-                        "(upstream chunker/builder produced over-long text — see DocumentMapper)",
-                        cfg.getModelId(), t.length(), MAX_INPUT_CHARS);
+                log.warn("Provider '{}': truncating input from {} chars to {} chars. Head: \"{}\"",
+                        cfg.getModelId(), t.length(), MAX_INPUT_CHARS, headSummary(t));
                 t = t.substring(0, MAX_INPUT_CHARS);
             }
             inputs.add(t);
