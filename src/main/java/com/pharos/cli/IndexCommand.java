@@ -271,6 +271,8 @@ public class IndexCommand implements Callable<Integer> {
 
         private final int total;
         private final String[] lines;
+        private final String[] slotStages;
+        private final long[]   slotStageStartMs;
         /** True when we're on a real TTY and progress is enabled. */
         private final boolean active;
         private boolean initialized = false;
@@ -278,9 +280,13 @@ public class IndexCommand implements Callable<Integer> {
         MultiProjectDisplay(List<String> names, boolean isTty, boolean noProgress) {
             this.total = names.size();
             this.lines = new String[total];
+            this.slotStages = new String[total];
+            this.slotStageStartMs = new long[total];
             this.active = isTty && !noProgress;
             for (int i = 0; i < total; i++) {
                 lines[i] = String.format("  %-28s pending", "[" + names.get(i) + "]");
+                slotStages[i] = "";
+                slotStageStartMs[i] = 0L;
             }
             if (active) {
                 for (String l : lines) System.err.println(l);
@@ -332,11 +338,21 @@ public class IndexCommand implements Callable<Integer> {
          */
         ProgressListener listenerFor(int slot, String name, long startMs) {
             if (!active) return ProgressListener.SILENT;
-            return (stage, current, total2) ->
-                    update(slot, buildLine(name, stage, current, total2, startMs));
+            return (stage, current, total2) -> {
+                long stageAnchor;
+                synchronized (this) {
+                    if (!stage.equals(slotStages[slot])) {
+                        slotStageStartMs[slot] = System.currentTimeMillis();
+                        slotStages[slot]       = stage;
+                    }
+                    stageAnchor = slotStageStartMs[slot];
+                }
+                update(slot, buildLine(name, stage, current, total2, startMs, stageAnchor));
+            };
         }
 
-        private static String buildLine(String name, String stage, int current, int total, long startMs) {
+        private static String buildLine(String name, String stage, int current, int total,
+                                         long startMs, long stageStartMs) {
             if ("Done".equals(stage)) {
                 return String.format("  [%s] Done.", name);
             }
@@ -348,7 +364,8 @@ public class IndexCommand implements Callable<Integer> {
             int filled = (int) ((long) barLen * current / total);
             String bar = "#".repeat(filled) + "-".repeat(barLen - filled);
             return String.format("  [%s] %-10s [%s] %d/%d (%d%%)  %s",
-                    name, stage, bar, current, total, pct, etaString(current, total, startMs));
+                    name, stage, bar, current, total, pct,
+                    etaString(current, total, startMs, stageStartMs));
         }
 
         private static String elapsed(long startMs) {
@@ -358,10 +375,11 @@ public class IndexCommand implements Callable<Integer> {
             return hrs > 0 ? (hrs + "h " + (mins % 60) + "m") : mins + "m " + (secs % 60) + "s";
         }
 
-        private static String etaString(int current, int total, long startMs) {
-            long elapsedMs = System.currentTimeMillis() - startMs;
-            if (current <= 0) return "elapsed " + elapsed(startMs);
-            long etaMs = elapsedMs * (total - current) / current;
+        private static String etaString(int current, int total, long startMs, long stageStartMs) {
+            // ETA from within-stage elapsed; total elapsed reported alongside.
+            long stageElapsedMs = System.currentTimeMillis() - stageStartMs;
+            if (current <= 0 || stageElapsedMs < 1_000) return "elapsed " + elapsed(startMs);
+            long etaMs = stageElapsedMs * (total - current) / current;
             long etaSecs = etaMs / 1000;
             if (etaSecs < 1) return "elapsed " + elapsed(startMs);
             long etaMins = etaSecs / 60; long etaHrs = etaMins / 60;
@@ -382,10 +400,24 @@ public class IndexCommand implements Callable<Integer> {
      */
     private static class CliProgressPrinter implements ProgressListener {
 
+        /** Min interval between log lines for the non-TTY (piped/teed) path. */
+        private static final long NON_TTY_THROTTLE_MS = 3_000L;
+
         private final String projectName;
         private final boolean isTty;
         private final long startMs = System.currentTimeMillis();
+        // Mutable state read/written from many embed workers — must be guarded.
+        private final Object lock = new Object();
         private String lastStage = "";
+        private long lastWriteMs = 0L;
+        /**
+         * Wall-clock at which the current stage started. Reset every time the
+         * stage name changes. ETA is computed against this so prior stages'
+         * elapsed time doesn't poison the projection (the symptom was "1/204801
+         * → ETA ~37 717 h" — the elapsed was the indexing run's total, but
+         * `current=1` was only this stage's first batch).
+         */
+        private long stageStartMs = System.currentTimeMillis();
 
         CliProgressPrinter(String projectName) {
             this.projectName = projectName;
@@ -394,13 +426,28 @@ public class IndexCommand implements Callable<Integer> {
 
         @Override
         public void onProgress(String stage, int current, int total) {
-            String line = buildLine(stage, current, total);
-            if (isTty) {
-                System.err.printf("\r%-89s", line);
-            } else {
+            synchronized (lock) {
+                long now = System.currentTimeMillis();
                 if (!stage.equals(lastStage)) {
-                    System.err.println(line);
-                    lastStage = stage;
+                    stageStartMs = now;
+                    lastStage    = stage;
+                }
+                String line = buildLine(stage, current, total);
+                if (isTty) {
+                    // Single-writer print — interleaved \r-overwrites from
+                    // concurrent workers otherwise produce torn lines.
+                    System.err.printf("\r%-89s", line);
+                } else {
+                    // Non-TTY (log file / piped) path. Print on stage entry,
+                    // on completion, and otherwise throttled so the log doesn't
+                    // spam but doesn't go silent between stages either.
+                    boolean justEnteredStage = lastWriteMs == 0 || stageStartMs == now;
+                    boolean isComplete       = total > 0 && current >= total;
+                    boolean throttledOk      = now - lastWriteMs >= NON_TTY_THROTTLE_MS;
+                    if (justEnteredStage || isComplete || throttledOk) {
+                        System.err.println(line);
+                        lastWriteMs = now;
+                    }
                 }
             }
         }
@@ -410,7 +457,7 @@ public class IndexCommand implements Callable<Integer> {
                 return "[" + projectName + "] Done.";
             }
             if (total <= 0) {
-                return String.format("[%s] %s...  elapsed %s", projectName, stage, elapsed());
+                return String.format("[%s] %s...  elapsed %s", projectName, stage, elapsed(startMs));
             }
             int pct = (int) (100L * current / total);
             int barLen = 20;
@@ -421,24 +468,28 @@ public class IndexCommand implements Callable<Integer> {
                     projectName, stage, bar, current, total, pct, eta);
         }
 
-        private String elapsed() {
-            long secs = (System.currentTimeMillis() - startMs) / 1000;
+        private static String elapsed(long anchorMs) {
+            long secs = (System.currentTimeMillis() - anchorMs) / 1000;
             if (secs < 60) return secs + "s";
             long mins = secs / 60; long hrs = mins / 60;
             return hrs > 0 ? (hrs + "h " + (mins % 60) + "m") : mins + "m " + (secs % 60) + "s";
         }
 
         private String etaString(int current, int total) {
-            long elapsedMs = System.currentTimeMillis() - startMs;
-            if (current <= 0) return "elapsed " + elapsed();
-            long etaMs = (long) elapsedMs * (total - current) / current;
+            // ETA uses elapsed-in-this-stage; total-elapsed is reported separately
+            // so the projection isn't poisoned by prior stages' wall time.
+            long stageElapsedMs = System.currentTimeMillis() - stageStartMs;
+            if (current <= 0 || stageElapsedMs < 1_000) {
+                return "elapsed " + elapsed(startMs);
+            }
+            long etaMs = stageElapsedMs * (total - current) / current;
             long etaSecs = etaMs / 1000;
-            if (etaSecs < 1) return "elapsed " + elapsed();
+            if (etaSecs < 1) return "elapsed " + elapsed(startMs);
             long etaMins = etaSecs / 60; long etaHrs = etaMins / 60;
             String etaStr = etaHrs > 0
                     ? (etaHrs + "h " + (etaMins % 60) + "m")
                     : (etaMins > 0 ? etaMins + "m " + (etaSecs % 60) + "s" : etaSecs + "s");
-            return "ETA ~" + etaStr + "  elapsed " + elapsed();
+            return "ETA ~" + etaStr + "  elapsed " + elapsed(startMs);
         }
     }
 }
