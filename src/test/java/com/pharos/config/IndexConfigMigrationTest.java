@@ -132,6 +132,81 @@ class IndexConfigMigrationTest {
     }
 
     @Test
+    void searchEmbeddingProvider_overridesEmbeddingProvidersAtSearchTime() throws Exception {
+        // The use case: index via fast remote runtime, embed search queries via
+        // a different (local, slow but offline-capable) runtime for the same
+        // logical model.
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(Map.of(
+                        "type", "openai",
+                        "modelId", "jina-code-v2",
+                        "url", "http://remote/v1",
+                        "model", "jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768
+                )),
+                "searchEmbeddingProvider", Map.of(
+                        "type", "djl",
+                        "modelId", "jina-code-v2",
+                        "url", "hf://jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768
+                )
+        ));
+
+        IndexConfig config = loadFromOrThrow(configFile);
+        EmbeddingProviderConfig resolved = config.resolveSearchProvider().orElseThrow();
+
+        assertThat(resolved.getType()).isEqualTo("djl");
+        assertThat(resolved.getModelId()).isEqualTo("jina-code-v2");
+        assertThat(resolved.getUrl()).isEqualTo("hf://jinaai/jina-embeddings-v2-base-code");
+    }
+
+    @Test
+    void searchEmbeddingProvider_rejectsModelIdMismatch() throws Exception {
+        // Catch the foot-gun where the user wires up a search-time runtime
+        // pointing at a modelId no project has vectors for. Without this
+        // check, vector queries silently return zero hits.
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(Map.of(
+                        "type", "openai",
+                        "modelId", "jina-code-v2",
+                        "url", "http://remote/v1",
+                        "model", "jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768
+                )),
+                "searchEmbeddingProvider", Map.of(
+                        "type", "djl",
+                        "modelId", "qwen3-emb-1024",
+                        "url", "hf://qwen/qwen3-embedding-4b",
+                        "dimensions", 1024
+                )
+        ));
+
+        assertThatThrownBy(() -> loadFromOrThrow(configFile))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("searchEmbeddingProvider.modelId='qwen3-emb-1024'")
+                .hasMessageContaining("does not match");
+    }
+
+    @Test
+    void resolveSearchProvider_fallsBackToEmbeddingProviders_whenSearchProviderUnset() throws Exception {
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(
+                        Map.of("type", "djl", "modelId", "alpha", "url", "hf://a", "dimensions", 64),
+                        Map.of("type", "djl", "modelId", "beta",  "url", "hf://b", "dimensions", 128)
+                ),
+                "searchEmbeddingModel", "beta"
+        ));
+        IndexConfig config = loadFromOrThrow(configFile);
+
+        EmbeddingProviderConfig resolved = config.resolveSearchProvider().orElseThrow();
+        assertThat(resolved.getModelId()).isEqualTo("beta");
+        assertThat(resolved.getType()).isEqualTo("djl");
+    }
+
+    @Test
     void findProviderConfig_returnsTheRightOne() throws Exception {
         Path configFile = tempDir.resolve("config.json");
         json.writeValue(configFile.toFile(), Map.of(
@@ -169,6 +244,17 @@ class IndexConfigMigrationTest {
     private static IndexConfig loadFromOrThrow(Path configFile) throws Exception {
         IndexConfig config = loadFrom(configFile);
         for (EmbeddingProviderConfig p : config.getEmbeddingProviders()) p.validate();
+        if (config.getSearchEmbeddingProvider() != null) {
+            config.getSearchEmbeddingProvider().validate();
+            boolean matches = config.getEmbeddingProviders().stream()
+                    .anyMatch(p -> p.getModelId().equals(config.getSearchEmbeddingProvider().getModelId()));
+            if (!matches) {
+                throw new IllegalArgumentException(String.format(
+                        "searchEmbeddingProvider.modelId='%s' does not match any " +
+                        "embeddingProviders entry. Vectors would not be queryable.",
+                        config.getSearchEmbeddingProvider().getModelId()));
+            }
+        }
         return config;
     }
 

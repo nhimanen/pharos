@@ -41,8 +41,32 @@ public class IndexConfig {
      * {@code modelId} of one of the configured {@link #embeddingProviders}. When
      * null, the first provider in the list is used. When no providers are
      * configured, vector/hybrid search degrades to keyword-only.
+     *
+     * <p>Ignored when {@link #searchEmbeddingProvider} is set — the latter is
+     * the strict winner.
      */
     private String searchEmbeddingModel;
+
+    /**
+     * Dedicated provider config used <b>only at query time</b>. Lets you run a
+     * different <i>runtime</i> for the same logical model than was used to
+     * build the index — e.g. embed with a fast remote llama-server endpoint at
+     * index time, but embed individual search queries with a local DJL model
+     * so queries still work offline.
+     *
+     * <p>The {@code modelId} on this entry must match one of the
+     * {@link #embeddingProviders}' modelIds — that's how pharos routes search
+     * queries to the right {@code vec.<modelId>} Lucene field. The {@code type}
+     * and {@code url} can differ.
+     *
+     * <p>When null, search uses {@link #searchEmbeddingModel} against
+     * {@link #embeddingProviders}.
+     *
+     * <p>The user is on the hook for ensuring both runtimes produce vectors
+     * in the same space — typically by serving the same underlying model
+     * (same architecture + weights) under both runtimes.
+     */
+    private EmbeddingProviderConfig searchEmbeddingProvider;
 
     // ── Legacy single-provider fields (pre-multi-provider config) ─────────────
     // Read from old config.json shapes via Jackson, then migrated into the
@@ -129,6 +153,21 @@ public class IndexConfig {
             if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
             config.migrateLegacyEmbeddingConfig();
             for (EmbeddingProviderConfig p : config.embeddingProviders) p.validate();
+            if (config.searchEmbeddingProvider != null) {
+                config.searchEmbeddingProvider.validate();
+                // Routing safety: the search-time runtime must target a modelId
+                // that was actually written to the index. Otherwise vec.<id>
+                // queries hit a missing field and return empty.
+                boolean matches = config.embeddingProviders.stream()
+                        .anyMatch(p -> p.getModelId().equals(config.searchEmbeddingProvider.getModelId()));
+                if (!matches) {
+                    throw new IllegalArgumentException(String.format(
+                            "searchEmbeddingProvider.modelId='%s' does not match any " +
+                            "embeddingProviders entry. Vectors would not be queryable. " +
+                            "Either fix the modelId or remove the searchEmbeddingProvider entry.",
+                            config.searchEmbeddingProvider.getModelId()));
+                }
+            }
             return config;
         } catch (IOException e) {
             log.warn("Could not read config file {}, using defaults: {}", configFile, e.getMessage());
@@ -236,16 +275,27 @@ public class IndexConfig {
     }
 
     /**
-     * Resolves the search-time embedding provider. Returns the configured
-     * {@link #searchEmbeddingModel} if set, otherwise the first provider in the
-     * list, otherwise empty.
+     * Resolves the search-time embedding provider.
+     * <ol>
+     *   <li>If a dedicated {@link #searchEmbeddingProvider} is set, return it.</li>
+     *   <li>Otherwise, if {@link #searchEmbeddingModel} matches an entry in
+     *       {@link #embeddingProviders}, return that.</li>
+     *   <li>Otherwise return the first entry in {@link #embeddingProviders}.</li>
+     *   <li>If there are no providers, return empty.</li>
+     * </ol>
      */
     public Optional<EmbeddingProviderConfig> resolveSearchProvider() {
+        if (searchEmbeddingProvider != null) return Optional.of(searchEmbeddingProvider);
         if (embeddingProviders.isEmpty()) return Optional.empty();
         if (searchEmbeddingModel == null || searchEmbeddingModel.isBlank()) {
             return Optional.of(embeddingProviders.get(0));
         }
         return findProviderConfig(searchEmbeddingModel);
+    }
+
+    public EmbeddingProviderConfig getSearchEmbeddingProvider() { return searchEmbeddingProvider; }
+    public void setSearchEmbeddingProvider(EmbeddingProviderConfig searchEmbeddingProvider) {
+        this.searchEmbeddingProvider = searchEmbeddingProvider;
     }
 
     /** Look up a provider config by its {@code modelId}. */
