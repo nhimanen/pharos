@@ -517,9 +517,14 @@ public class DocumentMapper {
      */
     private static String buildChunkEmbeddingText(ParsedMethod chunk) {
         StringBuilder sb = new StringBuilder();
-        // File-level description as outer context
+        // File-level description as outer context. Cap at 4k chars to keep
+        // breadcrumb a breadcrumb; the chunk's own body carries the real
+        // content. Documents with massive preambles (whole-file READMEs
+        // pinned in javadoc) were the source of 1.3 MB inputs.
         if (chunk.javadoc() != null && !chunk.javadoc().isBlank()) {
-            sb.append("Document: ").append(chunk.javadoc().trim()).append("\n");
+            String preamble = chunk.javadoc().trim();
+            if (preamble.length() > 4_000) preamble = preamble.substring(0, 4_000) + "...";
+            sb.append("Document: ").append(preamble).append("\n");
         }
         // Heading breadcrumb (stored in signature field)
         if (chunk.signature() != null && !chunk.signature().isBlank()) {

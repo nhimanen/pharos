@@ -66,15 +66,23 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final int MAX_RETRIES = 3;
     /**
-     * Hard ceiling on individual input length. Anything longer is truncated at
-     * request-build time (with a WARN log). This is a safety net for upstream
-     * bugs in the embedding-text builders — chunker output is normally ≤ 8000
-     * chars, but document-kind classes with huge javadocs or preambles have
-     * been observed at 300k+ chars, which permanently overflows any server
-     * regardless of batch sizing. 24 000 chars ≈ 20 000 tokens for code, which
-     * fits a single slot in a 24k-token batch-size server config.
+     * Hard ceiling on individual input length, applied at request-build time.
+     * Safety net for upstream bugs in the embedding-text builders (observed
+     * inputs of 300k–1.3 MB chars when a document-kind class's javadoc bypassed
+     * chunking). Anything longer is truncated upfront with a WARN log.
+     *
+     * <p>For normal code at ~2.88 chars/token, 24k chars ≈ 8333 tokens — right
+     * at jina-v2-base-code's 8192 ceiling. For matrix-dense inputs (long arrays
+     * of literals where the tokenizer falls to ~1 char/token), 24k chars can
+     * hit ~24k tokens. Those cases are handled by per-text adaptive truncation
+     * inside {@link #postEmbeddingsAdaptive} (try → halve on overflow → retry
+     * → keep halving), so we keep this cap at 24k to preserve full meaning for
+     * normal-density inputs that would otherwise be needlessly clipped.
      */
     private static final int MAX_INPUT_CHARS = 24_000;
+
+    /** Floor for adaptive per-text truncation. Below this size, give up. */
+    private static final int MIN_TRUNCATED_CHARS = 512;
 
     private final EmbeddingProviderConfig cfg;
     private final URI endpoint;
@@ -99,6 +107,14 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
     private final LongAdder requests4xx    = new LongAdder();
     private final LongAdder requests5xx    = new LongAdder();
     private final LongAdder overflowSplits = new LongAdder();
+    /** Inputs that got truncated by the adaptive per-text loop (succeeded after shortening). */
+    private final LongAdder inputTruncations = new LongAdder();
+    /**
+     * Slots dropped because a single input exceeded the server's context even
+     * at MIN_TRUNCATED_CHARS. These produce null rows; downstream writes
+     * Float.NaN to the cache and the doc gets no vector for that slot.
+     */
+    private final LongAdder singleInputOverflows = new LongAdder();
     private final LongAdder totalLatencyMs = new LongAdder();
 
     public OpenAiHttpEmbeddingProvider(EmbeddingProviderConfig cfg) {
@@ -244,20 +260,23 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
             return postEmbeddings(texts);
         } catch (OverflowException oe) {
             if (texts.size() == 1) {
-                // A single text overflows the server's ctx — can't split further.
-                // Surface as a hard failure with diagnostic info.
-                log.error("Provider '{}': single text ({} chars) overflows server context; " +
-                        "skipping this slot. Body excerpt: {}",
-                        cfg.getModelId(), texts.get(0).length(), oe.serverBody);
-                throw new IOException("Single-input overflow (text=" + texts.get(0).length() +
-                        " chars) — server says: " + oe.serverBody, oe);
+                // A single text overflows. Don't pre-truncate everything to a
+                // safe-but-meaning-losing length — only this text is the
+                // problem. Halve its length and retry; keep halving on repeat
+                // overflows. Matrix-dense inputs (where the BPE tokenizer
+                // falls toward 1 char/token) may take 2-3 iterations to fit
+                // jina-v2's 8192 token limit; normal-density inputs never
+                // enter this path because preemptive MAX_INPUT_CHARS=24k
+                // already keeps them safe.
+                return truncateAndRetrySingle(texts.get(0), oe);
             }
             overflowSplits.increment();
             int newBatch = Math.max(1, texts.size() / 2);
-            int prev = effectiveBatchSize.getAndUpdate(cur -> Math.min(cur, newBatch));
+            int prev = effectiveBatchSize.get();
+            int updated = effectiveBatchSize.updateAndGet(cur -> Math.min(cur, newBatch));
             log.warn("Provider '{}': batch of {} overflowed server (HTTP {}); splitting and " +
-                    "downsizing effective batch from {} → {}. Server: {}",
-                    cfg.getModelId(), texts.size(), oe.status, prev, newBatch, oe.serverBody);
+                    "downsizing effective batch (was {}, now {}). Server: {}",
+                    cfg.getModelId(), texts.size(), oe.status, prev, updated, oe.serverBody);
 
             int mid = texts.size() / 2;
             float[][] left  = postEmbeddingsAdaptive(texts.subList(0, mid));
@@ -267,6 +286,47 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
             System.arraycopy(right, 0, merged, left.length, right.length);
             return merged;
         }
+    }
+
+    /**
+     * Per-text adaptive truncation: a single input has exceeded the server's
+     * context window. Halve its length and retry; keep halving until it fits
+     * or hits {@link #MIN_TRUNCATED_CHARS}. Returns a single-element array
+     * (either with the resulting embedding, or null if even MIN_TRUNCATED_CHARS
+     * was too long — extremely degenerate input).
+     *
+     * <p>Tries up to ~6 halvings: 24k → 12k → 6k → 3k → 1.5k → 750 → 512.
+     * Matrix-dense inputs at ~1 char/token need 2-3 halvings to fit the 8192
+     * jina-v2 window; everything else fits the first time.
+     */
+    private float[][] truncateAndRetrySingle(String text, OverflowException originalOe)
+            throws IOException, InterruptedException {
+        int originalLen = text.length();
+        int currentLen  = Math.max(MIN_TRUNCATED_CHARS, originalLen / 2);
+        OverflowException lastOe = originalOe;
+
+        while (currentLen >= MIN_TRUNCATED_CHARS) {
+            String truncated = text.substring(0, Math.min(currentLen, text.length()));
+            try {
+                float[][] result = postEmbeddings(List.of(truncated));
+                inputTruncations.increment();
+                log.warn("Provider '{}': text truncated from {} → {} chars to fit context " +
+                        "(likely matrix-dense input; preserved meaning where possible). Original server reject: {}",
+                        cfg.getModelId(), originalLen, currentLen, originalOe.serverBody);
+                return result;
+            } catch (OverflowException oe) {
+                lastOe = oe;
+                if (currentLen == MIN_TRUNCATED_CHARS) break;
+                currentLen = Math.max(MIN_TRUNCATED_CHARS, currentLen / 2);
+            }
+        }
+
+        // Even MIN_TRUNCATED_CHARS overflowed — pathological case.
+        singleInputOverflows.increment();
+        log.error("Provider '{}': could not embed text (original {} chars); still overflowed at {} chars. " +
+                "Leaving slot unembedded. Server: {}",
+                cfg.getModelId(), originalLen, MIN_TRUNCATED_CHARS, lastOe.serverBody);
+        return new float[][] { null };
     }
 
     /**
