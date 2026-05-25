@@ -310,7 +310,10 @@ public class DocumentMapper {
         }
         StringBuilder sb = new StringBuilder();
         if (method.javadoc() != null && !method.javadoc().isBlank()) {
-            sb.append("/** ").append(method.javadoc().trim()).append(" */\n");
+            // Cap javadoc — generated/copied javadoc can be huge.
+            String jd = method.javadoc().trim();
+            if (jd.length() > 4_000) jd = jd.substring(0, 4_000) + "...";
+            sb.append("/** ").append(jd).append(" */\n");
         } else {
             // No javadoc — synthesize a natural-language description from the parsed structure
             // so the embedding captures semantics even for undocumented methods.
@@ -336,7 +339,11 @@ public class DocumentMapper {
         }
         if (body != null) sb.append(body);
         sb.append("\n}");
-        return sb.toString();
+        String result = sb.toString();
+        if (result.length() > 16_000) {
+            result = result.substring(0, 16_000) + "\n// ... (truncated)\n}";
+        }
+        return result;
     }
 
     /**
@@ -894,7 +901,11 @@ public class DocumentMapper {
     public static String buildClassEmbeddingText(ParsedClass cls, String synthesizedBody) {
         StringBuilder sb = new StringBuilder();
         if (cls.javadoc() != null && !cls.javadoc().isBlank()) {
-            sb.append("/** ").append(cls.javadoc().trim()).append(" */\n");
+            // Cap javadoc independently — document-kind classes can carry huge
+            // preambles (entire markdown headers, license blocks, etc.).
+            String jd = cls.javadoc().trim();
+            if (jd.length() > 4_000) jd = jd.substring(0, 4_000) + "...";
+            sb.append("/** ").append(jd).append(" */\n");
         }
         // Include split class name for natural-language embedding
         // e.g. "UserSessionManager" → "user session manager"
@@ -910,6 +921,12 @@ public class DocumentMapper {
         }
         if (body != null) sb.append(body);
         sb.append("\n}");
-        return sb.toString();
+        // Final hard cap. Catches any combination of huge javadoc + body + name
+        // that could still exceed what an embedding model can consume.
+        String result = sb.toString();
+        if (result.length() > 20_000) {
+            result = result.substring(0, 20_000) + "\n// ... (truncated)\n}";
+        }
+        return result;
     }
 }
