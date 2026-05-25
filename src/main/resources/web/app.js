@@ -79,6 +79,9 @@ let minimapState = { scale: 1, ox: 0, oy: 0 };
 // Canvas interaction state
 let canvasDragNode = null, canvasDragActive = false, canvasHoverNode = null;
 
+// Last data object rendered in the detail panel (used by "Full view" button)
+let lastDetailData = null;
+
 // ── Boot ─────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initGraph();
@@ -302,6 +305,7 @@ function initControls() {
     if (action === 'drill-class')  loadMethodGraph(S.selectedProject, cls);
     if (action === 'focus-node')   focusNode(fqn);
     if (action === 'locate-file')  locateFileInTree(filepath, project);
+    if (action === 'open-viewer' && lastDetailData) openDocViewer(lastDetailData, true);
   });
 
   // Focus mode
@@ -1249,6 +1253,7 @@ async function showDetail(d) {
 
 function renderMethodDetail(m, d) {
   const fqn = extractFqn(d.id), kind = m.docType || d.kind || 'method';
+  lastDetailData = m;
   document.getElementById('detail-content').innerHTML = `
     <div class="d-header">
       <span class="badge badge-${esc(kind)}">${esc(kind)}</span>
@@ -1264,6 +1269,7 @@ function renderMethodDetail(m, d) {
       <button data-action="callers" data-fqn="${esc(fqn)}">Callers</button>
       <button data-action="callees" data-fqn="${esc(fqn)}">Callees</button>
       ${m.filePath ? `<button data-action="locate-file" data-filepath="${esc(m.filePath)}" data-project="${esc(m.project || '')}">Locate File</button>` : ''}
+      <button data-action="open-viewer">Full view →</button>
     </div>
     <div id="related-area"></div>`;
 }
@@ -1282,6 +1288,8 @@ function renderFqnDetail(d) {
 }
 
 function renderClassDetail(d) {
+  lastDetailData = { docType: 'class', qualifiedClassName: d.id, id: d.id,
+                     project: S.selectedProject, label: d.label || d.id.split('.').pop() };
   document.getElementById('detail-content').innerHTML = `
     <div class="d-header">
       <span class="badge badge-class">class</span>
@@ -1295,11 +1303,15 @@ function renderClassDetail(d) {
     </div>
     <div class="d-actions">
       <button data-action="drill-class" data-cls="${esc(d.id)}">Methods →</button>
+      <button data-action="open-viewer">Full view →</button>
     </div>`;
 }
 
 function renderModuleDetail(d) {
   const proj = S.projects.find(p => p.name === d.projectName);
+  lastDetailData = { docType: 'module', id: d.id, label: d.label || d.id,
+                     project: d.projectName || null, version: d.version || null,
+                     status: d.status, _proj: proj || null };
   document.getElementById('detail-content').innerHTML = `
     <div class="d-header">
       <span class="badge badge-${esc(d.status)}">${esc(d.status)}</span>
@@ -1312,10 +1324,10 @@ function renderModuleDetail(d) {
       <div><b>${proj.classCount.toLocaleString()}</b> classes</div>
       <div><b>${proj.fileCount.toLocaleString()}</b> files</div>
     </div>` : ''}
-    ${d.status === 'indexed' && d.projectName ? `
     <div class="d-actions">
-      <button data-action="drill-proj" data-project="${esc(d.projectName)}">Classes →</button>
-    </div>` : ''}`;
+      ${d.status === 'indexed' && d.projectName ? `<button data-action="drill-proj" data-project="${esc(d.projectName)}">Classes →</button>` : ''}
+      <button data-action="open-viewer">Full view →</button>
+    </div>`;
 }
 
 async function loadRelated(fqn, type) {
@@ -1651,73 +1663,104 @@ document.getElementById('dv-close').addEventListener('click', closeDocViewer);
 docViewer.addEventListener('click', e => { if (e.target === docViewer) closeDocViewer(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDocViewer(); });
 
-function openDocViewer(r) {
-  const label = r.docType === 'class' || r.docType === 'document'
-    ? (r.qualifiedClassName || r.id)
-    : r.docType === 'chunk'
-      ? (r.qualifiedClassName || '') + ' § ' + (r.methodName || '')
-      : (r.qualifiedClassName || '') + '#' + (r.methodName || '');
+function openDocViewer(r, fromGraph = false) {
+  const isModule = r.docType === 'module';
+
+  const label = isModule
+    ? (r.label || r.id)
+    : r.docType === 'class' || r.docType === 'document'
+      ? (r.qualifiedClassName || r.id)
+      : r.docType === 'chunk'
+        ? (r.qualifiedClassName || '') + ' § ' + (r.methodName || '')
+        : (r.qualifiedClassName || '') + '#' + (r.methodName || '');
 
   document.getElementById('dv-title').textContent = label;
 
   const isChunk   = r.docType === 'chunk' || r.docType === 'document';
-  const isDocFile = !isChunk && r.filePath && !/\.java$/.test(r.filePath);
-  const isClass   = !isChunk && !isDocFile && (r.docType === 'class' || r.docType === 'doc');
-  const isDoc     = !isChunk && isDocFile  && (r.docType === 'class' || r.docType === 'doc');
+  const isDocFile = !isChunk && !isModule && r.filePath && !/\.java$/.test(r.filePath);
+  const isClass   = !isChunk && !isDocFile && !isModule && (r.docType === 'class' || r.docType === 'doc');
+  const isDoc     = !isChunk && isDocFile  && !isModule && (r.docType === 'class' || r.docType === 'doc');
 
-  const badgeType  = isDoc ? 'doc' : (r.docType || 'method');
+  const badgeType  = isModule ? 'module' : isDoc ? 'doc' : (r.docType || 'method');
   const docTypeCls = `dv-badge-${esc(badgeType)}`;
   const fileLine = r.filePath
     ? `${r.filePath}${r.startLine ? `:${r.startLine}–${r.endLine}` : ''}`
     : '';
+
+  const navBtn = fromGraph
+    ? `<button class="dv-nav-btn" id="dv-nav-btn">Focus in graph →</button>`
+    : `<button class="dv-nav-btn" id="dv-nav-btn">Locate in graph →</button>`;
+
   document.getElementById('dv-meta').innerHTML = `
     <span class="dv-badge dv-badge-project">${esc(r.project || '')}</span>
     <span class="dv-badge ${docTypeCls}">${esc(badgeType)}</span>
     ${r.searchType ? `<span class="dv-badge dv-badge-type">${esc(r.searchType)}</span>` : ''}
     ${r.score != null ? `<span class="dv-score">score ${r.score.toFixed(3)}</span>` : ''}
-    <button class="dv-nav-btn" id="dv-nav-btn">Locate in graph →</button>
+    ${!isModule ? navBtn : ''}
+    ${r.version ? `<span class="dv-badge dv-badge-type">v${esc(r.version)}</span>` : ''}
     ${fileLine ? `<div class="dv-filepath">${esc(fileLine)}</div>` : ''}
   `;
 
-  document.getElementById('dv-nav-btn').addEventListener('click', () => {
-    closeDocViewer();
-    navigateToResult(r);
-  });
-
-  const sections = [];
-
-  // Matched excerpt (snippet) — always first when available
-  if (r.snippet && r.snippet.text) {
-    const lineRange = r.snippet.startLine
-      ? ` · lines ${r.snippet.startLine}–${r.snippet.endLine}`
-      : '';
-    sections.push({
-      label: `Matched Excerpt${lineRange}`,
-      html: `<pre class="dv-code dv-snippet">${esc(r.snippet.text)}</pre>`
+  if (!isModule) {
+    document.getElementById('dv-nav-btn').addEventListener('click', () => {
+      closeDocViewer();
+      navigateToResult(r);
     });
   }
 
-  if (!isChunk && !isDoc && (r.accessModifier || r.returnType || r.signature)) {
-    const sig = [r.accessModifier, r.returnType, r.signature].filter(Boolean).join(' ');
-    sections.push({ label: 'Signature', html: `<div class="dv-sig">${esc(sig)}</div>` });
-  }
-  if (r.javadoc) {
-    const javadocLabel = isChunk ? 'Document' : 'Javadoc';
-    sections.push({ label: javadocLabel, html: `<div class="dv-javadoc">${esc(r.javadoc.trim())}</div>` });
-  }
-  if (isDoc) {
-    sections.push({ label: 'Content', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-doc-body' });
-  } else if (isClass) {
-    sections.push({ label: 'Methods', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-methods-body' });
-  } else if (r.body) {
-    const bodyLabel = isChunk ? 'Content' : 'Body';
-    const bodyHtml  = isChunk
-      ? `<div class="dv-javadoc">${esc(r.body)}</div>`
-      : `<pre class="dv-code">${esc(r.body)}</pre>`;
-    sections.push({ label: bodyLabel, html: bodyHtml });
-  }
-  if (!sections.length) {
-    sections.push({ label: 'Info', html: `<div class="dv-javadoc">No additional content stored for this result.</div>` });
+  const sections = [];
+
+  if (isModule) {
+    // ── Module view ──────────────────────────────────────────
+    const proj = r._proj || S.projects.find(p => p.name === r.project);
+    if (proj) {
+      sections.push({
+        label: 'Stats',
+        html: `<div class="dv-javadoc">
+          <b>${proj.methodCount.toLocaleString()}</b> methods &nbsp;·&nbsp;
+          <b>${proj.classCount.toLocaleString()}</b> classes &nbsp;·&nbsp;
+          <b>${proj.fileCount.toLocaleString()}</b> files
+        </div>`
+      });
+    }
+    sections.push({ label: 'Dependencies', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-deps-body' });
+    if (r.project) {
+      sections.push({ label: 'Public API', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-boundary-body' });
+    }
+  } else {
+    // ── Standard method / class / doc view ───────────────────
+    if (r.snippet && r.snippet.text) {
+      const lineRange = r.snippet.startLine
+        ? ` · lines ${r.snippet.startLine}–${r.snippet.endLine}`
+        : '';
+      sections.push({
+        label: `Matched Excerpt${lineRange}`,
+        html: `<pre class="dv-code dv-snippet">${esc(r.snippet.text)}</pre>`
+      });
+    }
+
+    if (!isChunk && !isDoc && (r.accessModifier || r.returnType || r.signature)) {
+      const sig = [r.accessModifier, r.returnType, r.signature].filter(Boolean).join(' ');
+      sections.push({ label: 'Signature', html: `<div class="dv-sig">${esc(sig)}</div>` });
+    }
+    if (r.javadoc) {
+      const javadocLabel = isChunk ? 'Document' : 'Javadoc';
+      sections.push({ label: javadocLabel, html: `<div class="dv-javadoc">${esc(r.javadoc.trim())}</div>` });
+    }
+    if (isDoc) {
+      sections.push({ label: 'Content', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-doc-body' });
+    } else if (isClass) {
+      sections.push({ label: 'Methods', html: '<div class="dv-javadoc dv-loading">Loading…</div>', id: 'dv-methods-body' });
+    } else if (r.body) {
+      const bodyLabel = isChunk ? 'Content' : 'Body';
+      const bodyHtml  = isChunk
+        ? `<div class="dv-javadoc">${esc(r.body)}</div>`
+        : `<pre class="dv-code">${esc(r.body)}</pre>`;
+      sections.push({ label: bodyLabel, html: bodyHtml });
+    }
+    if (!sections.length) {
+      sections.push({ label: 'Info', html: `<div class="dv-javadoc">No additional content stored for this result.</div>` });
+    }
   }
 
   document.getElementById('dv-sections').innerHTML = sections.map(s => `
@@ -1769,6 +1812,43 @@ function openDocViewer(r) {
         const el = document.getElementById('dv-methods-body');
         if (el) el.innerHTML = '<div class="dv-javadoc">Could not load methods.</div>';
       });
+  }
+
+  // For module nodes: lazy-fetch dependencies and public boundary
+  if (isModule) {
+    fetch(`/api/deps?module=${encodeURIComponent(r.id)}`)
+      .then(res => res.ok ? res.json() : null)
+      .then(deps => {
+        const el = document.getElementById('dv-deps-body');
+        if (!el) return;
+        if (!deps || !deps.length) { el.innerHTML = '<div class="dv-javadoc">No dependencies.</div>'; return; }
+        el.innerHTML = `<ul class="dv-list">${deps.map(d =>
+          `<li><span class="dv-sig">${esc(d.id || d)}</span>${d.version ? ` <span class="dv-method-doc">v${esc(d.version)}</span>` : ''}</li>`
+        ).join('')}</ul>`;
+      })
+      .catch(() => {
+        const el = document.getElementById('dv-deps-body');
+        if (el) el.innerHTML = '<div class="dv-javadoc">Could not load dependencies.</div>';
+      });
+
+    if (r.project) {
+      fetch(`/api/boundary?project=${encodeURIComponent(r.project)}&limit=30`)
+        .then(res => res.ok ? res.json() : null)
+        .then(items => {
+          const el = document.getElementById('dv-boundary-body');
+          if (!el) return;
+          if (!items || !items.length) { el.innerHTML = '<div class="dv-javadoc">No public API data.</div>'; return; }
+          el.innerHTML = items.map(m => `
+            <div class="dv-method-entry">
+              <div class="dv-sig">${esc(m.signature || m.id || '')}</div>
+              ${m.javadoc ? `<div class="dv-method-doc">${esc(m.javadoc.split('\n')[0].trim())}</div>` : ''}
+            </div>`).join('');
+        })
+        .catch(() => {
+          const el = document.getElementById('dv-boundary-body');
+          if (el) el.innerHTML = '<div class="dv-javadoc">Could not load public API.</div>';
+        });
+    }
   }
 }
 

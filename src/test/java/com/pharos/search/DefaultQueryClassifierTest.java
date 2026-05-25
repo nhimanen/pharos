@@ -22,17 +22,17 @@ class DefaultQueryClassifierTest {
 
         @Test
         void singleCamelCaseIdentifier_isKeyword() {
-            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("getUserById"));
+            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("getUserById").type());
         }
 
         @Test
         void PascalCaseIdentifier_isKeyword() {
-            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("ConnectionPool"));
+            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("ConnectionPool").type());
         }
 
         @Test
         void shortMethodName_isKeyword() {
-            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("findById"));
+            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("findById").type());
         }
     }
 
@@ -45,13 +45,13 @@ class DefaultQueryClassifierTest {
 
         @Test
         void fqnWithHash_isKeyword() {
-            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("MyClass#myMethod"));
+            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("MyClass#myMethod").type());
         }
 
         @Test
         void fqnWithHashAndSpaces_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("com.example.MyClass#myMethod"));
+                    classifier.classify("com.example.MyClass#myMethod").type());
         }
     }
 
@@ -64,13 +64,13 @@ class DefaultQueryClassifierTest {
 
         @Test
         void atTransactional_isKeyword() {
-            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("@Transactional"));
+            assertEquals(SearchRequest.SearchType.KEYWORD, classifier.classify("@Transactional").type());
         }
 
         @Test
         void atAnnotationWithSpace_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("@Override methods"));
+                    classifier.classify("@Override methods").type());
         }
     }
 
@@ -84,19 +84,19 @@ class DefaultQueryClassifierTest {
         @Test
         void throwsClause_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("throws IOException"));
+                    classifier.classify("throws IOException").type());
         }
 
         @Test
         void implementsClause_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("implements Runnable"));
+                    classifier.classify("implements Runnable").type());
         }
 
         @Test
         void extendsClause_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("extends AbstractService"));
+                    classifier.classify("extends AbstractService").type());
         }
     }
 
@@ -109,27 +109,27 @@ class DefaultQueryClassifierTest {
 
         @Test
         void queryWithThe_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("find the user"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("find the user").type());
         }
 
         @Test
         void queryWithHow_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("how to authenticate"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("how to authenticate").type());
         }
 
         @Test
         void commandWordGet_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("get all users"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("get all users").type());
         }
 
         @Test
         void commandWordFind_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("find authentication"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("find authentication").type());
         }
 
         @Test
         void commandWordList_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("list endpoints"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("list endpoints").type());
         }
     }
 
@@ -143,13 +143,13 @@ class DefaultQueryClassifierTest {
         @Test
         void fourTokenNaturalLanguage_isHybrid() {
             assertEquals(SearchRequest.SearchType.HYBRID,
-                    classifier.classify("connection pool initialization logic"));
+                    classifier.classify("connection pool initialization logic").type());
         }
 
         @Test
         void fiveTokenPhrase_isHybrid() {
             assertEquals(SearchRequest.SearchType.HYBRID,
-                    classifier.classify("retry logic with exponential backoff"));
+                    classifier.classify("retry logic with exponential backoff").type());
         }
     }
 
@@ -163,23 +163,23 @@ class DefaultQueryClassifierTest {
         @Test
         void twoTokensAllUppercase_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("ConnectionPool Manager"));
+                    classifier.classify("ConnectionPool Manager").type());
         }
 
         @Test
         void twoTokensMixedCase_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("connection pool"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("connection pool").type());
         }
 
         @Test
         void twoTokensAllLowercase_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("retry logic"));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("retry logic").type());
         }
 
         @Test
         void threeTokensAllUppercase_isKeyword() {
             assertEquals(SearchRequest.SearchType.KEYWORD,
-                    classifier.classify("User Session Manager"));
+                    classifier.classify("User Session Manager").type());
         }
     }
 
@@ -192,17 +192,17 @@ class DefaultQueryClassifierTest {
 
         @Test
         void nullQuery_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify(null));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify(null).type());
         }
 
         @Test
         void emptyString_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify(""));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("").type());
         }
 
         @Test
         void blankWhitespace_isHybrid() {
-            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("   "));
+            assertEquals(SearchRequest.SearchType.HYBRID, classifier.classify("   ").type());
         }
     }
 

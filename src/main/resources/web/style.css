@@ -475,6 +475,7 @@ line.link { transition: stroke-opacity .1s; }
 .dv-badge-chunk, .dv-badge-document { background: #006064; color: #80deea; }
 .dv-badge-doc      { background: #1b5e20; color: #a5d6a7; }
 .dv-badge-type     { background: #1a3a2a; color: var(--accent2); }
+.dv-badge-module   { background: #3e2700; color: #ffcc80; }
 .dv-filepath {
   font-family: var(--mono); font-size: 10px; color: var(--text-xdim);
   flex: 1 1 100%; margin-top: 2px;
@@ -529,6 +530,12 @@ line.link { transition: stroke-opacity .1s; }
 .dv-method-doc {
   font-size: 11px; color: var(--text-xdim); margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dv-list {
+  margin: 0; padding: 0 0 0 16px; list-style: disc;
+}
+.dv-list li {
+  padding: 3px 0; font-size: 12px; color: var(--text-dim);
 }
 
 /* ── Search trace banner ─────────────────────────────────── */
