@@ -116,10 +116,14 @@ public class IndexConfig {
         this.indexThreads = 0;
     }
 
-    /** Resolved parse thread count — substitutes auto value when parseThreads == 0. */
+    /** Resolved parse thread count — substitutes auto value when parseThreads == 0.
+     * Defaults to the available core count: script-based parsers (JS/TS/Python)
+     * fork a subprocess per file, so they're IO-bound on fork+exec and scale
+     * near-linearly with concurrency up to the core count. Override via
+     * {@code parseThreads} in {@code ~/.pharos/config.json}. */
     public int resolvedParseThreads() {
         if (parseThreads > 0) return parseThreads;
-        return Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() / 2));
+        return Math.max(1, Runtime.getRuntime().availableProcessors());
     }
 
     /** Resolved index thread count — substitutes auto value when indexThreads == 0. */

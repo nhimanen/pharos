@@ -17,6 +17,10 @@ public class PythonCodeParser extends ScriptBasedCodeParser {
 
     private static final List<String> EXTENSIONS = List.of(".py");
 
+    public PythonCodeParser() { super(); }
+
+    public PythonCodeParser(int parseThreads) { super(parseThreads); }
+
     @Override
     protected String scriptResourceName() {
         return "python-extractor.py";

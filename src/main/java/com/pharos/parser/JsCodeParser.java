@@ -16,6 +16,10 @@ public class JsCodeParser extends ScriptBasedCodeParser {
     private static final List<String> EXTENSIONS =
             List.of(".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs");
 
+    public JsCodeParser() { super(); }
+
+    public JsCodeParser(int parseThreads) { super(parseThreads); }
+
     @Override
     protected String scriptResourceName() {
         return "js-ts-extractor.js";

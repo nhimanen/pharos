@@ -57,8 +57,8 @@ public class Main {
 
         List<CodeParser> parsers = new java.util.ArrayList<>();
         parsers.add(new JavaCodeParser(List.of(), List.of(), parseThreads));
-        parsers.add(new PythonCodeParser());
-        parsers.add(new JsCodeParser());
+        parsers.add(new PythonCodeParser(parseThreads));
+        parsers.add(new JsCodeParser(parseThreads));
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
