@@ -39,6 +39,7 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
 /**
@@ -49,7 +50,12 @@ import java.util.stream.Collectors;
 public class ProjectIndexManager {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexManager.class);
-    /** Number of embedding texts per ONNX forward pass during global batching. */
+    /**
+     * Fallback batch size when no provider config is present (only the
+     * synthesized legacy provider path with no config entry hits this).
+     * Real callers configure {@code batchSize} per provider in
+     * {@link com.pharos.config.EmbeddingProviderConfig}.
+     */
     private static final int EMBED_CHUNK_SIZE = 8;
 
     private final IndexConfig config;
@@ -155,14 +161,17 @@ public class ProjectIndexManager {
         final Path cachePath;
         final int dims;
         final int chunkSize;
+        /** Number of concurrent worker threads to use for this provider's Phase 2 pass. */
+        final int threads;
 
         EmbedRuntime(EmbeddingProvider provider, PersistentEmbeddingCache cache,
-                     Path cachePath, int chunkSize) {
+                     Path cachePath, int chunkSize, int threads) {
             this.provider = provider;
             this.cache = cache;
             this.cachePath = cachePath;
             this.dims = provider.dimensions();
             this.chunkSize = chunkSize;
+            this.threads = threads;
         }
 
         String modelId() { return provider.modelId(); }
@@ -196,7 +205,10 @@ public class ProjectIndexManager {
             int chunkSize = config.findProviderConfig(e.modelId())
                     .map(com.pharos.config.EmbeddingProviderConfig::resolvedBatchSize)
                     .orElse(EMBED_CHUNK_SIZE);
-            out.add(new EmbedRuntime(e, cache, cachePath, chunkSize));
+            int threads = config.findProviderConfig(e.modelId())
+                    .map(com.pharos.config.EmbeddingProviderConfig::resolvedEmbeddingThreads)
+                    .orElse(1);
+            out.add(new EmbedRuntime(e, cache, cachePath, chunkSize, threads));
         }
         return out;
     }
@@ -655,36 +667,11 @@ public class ProjectIndexManager {
                 }
 
                 // Pass 2: stream spool through each available provider — one cache
-                // file per model. Spool is read from the start for every provider so
-                // they see the same texts in the same slot order.
+                // file per model. Each provider's pass runs in parallel internally
+                // if rt.threads > 1.
                 if (doEmbed && totalSlots > 0) {
                     for (EmbedRuntime rt : runtimes) {
-                        int chunkSize = rt.chunkSize;
-                        int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
-                        int[] cacheStats = {0, 0}; // [hits, misses]
-                        try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
-                                     Files.newInputStream(spoolPath), 1 << 16));
-                             DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
-                                     Files.newOutputStream(rt.cachePath), 1 << 16))) {
-                            int chunksDone = 0;
-                            int slot = 0;
-                            while (slot < totalSlots) {
-                                int end = Math.min(slot + chunkSize, totalSlots);
-                                List<String> texts = new ArrayList<>(end - slot);
-                                for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
-                                float[][] embeddings = embedBatchWithCache(
-                                        rt.provider, texts, rt.cache, cacheStats);
-                                for (float[] e : embeddings) cacheWrite(cache, e, rt.dims);
-                                slot = end;
-                                progress.onProgress("Embedding[" + rt.modelId() + "]",
-                                        ++chunksDone, totalChunks);
-                            }
-                        }
-                        if (rt.cache != null) rt.cache.save();
-                        if (cacheStats[0] > 0 || cacheStats[1] > 0) {
-                            log.info("Embedding cache[{}]: {} hit(s), {} miss(es) for '{}'",
-                                    rt.modelId(), cacheStats[0], cacheStats[1], projectName);
-                        }
+                        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName);
                     }
                 }
 
@@ -901,35 +888,11 @@ public class ProjectIndexManager {
             }
 
             // Phase 2: stream spool through each available provider — one cache file
-            // per model so search-time can pick which to query.
+            // per model so search-time can pick which to query. Each provider's pass
+            // runs in parallel internally if rt.threads > 1.
             if (doEmbed && totalSlots > 0) {
                 for (EmbedRuntime rt : runtimes) {
-                    int chunkSize = rt.chunkSize;
-                    int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
-                    int[] cacheStats = {0, 0}; // [hits, misses]
-                    try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
-                                 Files.newInputStream(spoolPath), 1 << 16));
-                         DataOutputStream cache = new DataOutputStream(new BufferedOutputStream(
-                                 Files.newOutputStream(rt.cachePath), 1 << 16))) {
-                        int chunksDone = 0;
-                        int slot = 0;
-                        while (slot < totalSlots) {
-                            int end = Math.min(slot + chunkSize, totalSlots);
-                            List<String> texts = new ArrayList<>(end - slot);
-                            for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
-                            float[][] embeddings = embedBatchWithCache(
-                                    rt.provider, texts, rt.cache, cacheStats);
-                            for (float[] e : embeddings) cacheWrite(cache, e, rt.dims);
-                            slot = end;
-                            progress.onProgress("Embedding[" + rt.modelId() + "]",
-                                    ++chunksDone, totalChunks);
-                        }
-                    }
-                    if (rt.cache != null) rt.cache.save();
-                    if (cacheStats[0] > 0 || cacheStats[1] > 0) {
-                        log.info("Embedding cache[{}]: {} hit(s), {} miss(es)",
-                                rt.modelId(), cacheStats[0], cacheStats[1]);
-                    }
+                    runEmbedPass(spoolPath, totalSlots, rt, progress, project.projectName());
                 }
             }
 
@@ -1104,7 +1067,7 @@ public class ProjectIndexManager {
      */
     private float[][] embedBatchWithCache(EmbeddingProvider provider, List<String> texts,
                                            PersistentEmbeddingCache embeddingCache,
-                                           int[] stats) {
+                                           LongAdder hits, LongAdder misses) {
         if (embeddingCache == null) {
             return provider.embedBatch(texts);
         }
@@ -1117,11 +1080,11 @@ public class ProjectIndexManager {
                     ? embeddingCache.get(PersistentEmbeddingCache.sha256Hex(text)) : null;
             if (cached != null) {
                 results[i] = cached;
-                stats[0]++;
+                hits.increment();
             } else {
                 missIdx.add(i);
                 missText.add(text);
-                stats[1]++;
+                misses.increment();
             }
         }
         if (!missText.isEmpty()) {
@@ -1134,6 +1097,116 @@ public class ProjectIndexManager {
             }
         }
         return results;
+    }
+
+    /**
+     * Runs Phase 2 of the embedding pipeline for a single provider with
+     * optional parallelism. Sequentially reads all chunks from the spool into
+     * memory (the spool is on disk and bounded; this is a controlled memory
+     * spend), then dispatches per-chunk embed work to a fixed-size worker
+     * pool. Workers write their results into the per-model cache file at the
+     * slot's known byte offset via {@link FileChannel} positional writes,
+     * which are thread-safe.
+     *
+     * <p>Threads count is from {@code rt.threads}; 1 collapses to a single
+     * worker, equivalent to the previous serial pass.
+     */
+    private void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                               ProgressListener progress, String projectName) throws IOException {
+        if (totalSlots == 0) return;
+        int chunkSize = rt.chunkSize;
+        int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
+        int threads = Math.max(1, rt.threads);
+
+        // Pre-allocate the cache file so workers can write to known offsets in
+        // parallel. Truncate to the exact size; the last byte write extends the
+        // file to the right length atomically on most file systems.
+        long fileSize = (long) totalSlots * rt.dims * 4;
+        try (FileChannel pre = FileChannel.open(rt.cachePath,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            // Stretch via positional write at the last byte
+            ByteBuffer one = ByteBuffer.allocate(1);
+            pre.write(one, fileSize - 1);
+        }
+
+        // Read all chunks from the spool sequentially — DataInputStream isn't
+        // thread-safe and randomly seeking the spool would require a different
+        // on-disk format. The chunks list peaks at totalSlots × avgTextSize.
+        List<int[]> chunkRanges = new ArrayList<>(totalChunks);
+        List<List<String>> chunkTexts = new ArrayList<>(totalChunks);
+        try (DataInputStream spool = new DataInputStream(new BufferedInputStream(
+                     Files.newInputStream(spoolPath), 1 << 16))) {
+            int slot = 0;
+            while (slot < totalSlots) {
+                int end = Math.min(slot + chunkSize, totalSlots);
+                List<String> texts = new ArrayList<>(end - slot);
+                for (int i = slot; i < end; i++) texts.add(spoolRead(spool));
+                chunkRanges.add(new int[]{slot, end});
+                chunkTexts.add(texts);
+                slot = end;
+            }
+        }
+
+        LongAdder hits   = new LongAdder();
+        LongAdder misses = new LongAdder();
+        AtomicInteger chunksDone = new AtomicInteger(0);
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "embed-" + rt.modelId());
+            t.setDaemon(true);
+            return t;
+        });
+        try (FileChannel cacheChannel = FileChannel.open(rt.cachePath,
+                StandardOpenOption.WRITE)) {
+            List<Future<?>> futures = new ArrayList<>(totalChunks);
+            for (int i = 0; i < totalChunks; i++) {
+                final int chunkIdx = i;
+                futures.add(pool.submit(() -> {
+                    int[] range = chunkRanges.get(chunkIdx);
+                    List<String> texts = chunkTexts.get(chunkIdx);
+                    float[][] embeddings = embedBatchWithCache(
+                            rt.provider, texts, rt.cache, hits, misses);
+                    ByteBuffer buf = ByteBuffer.allocate((range[1] - range[0]) * rt.dims * 4);
+                    for (float[] e : embeddings) {
+                        if (e != null) {
+                            for (float f : e) buf.putFloat(f);
+                        } else {
+                            buf.putFloat(Float.NaN);
+                            for (int d = 1; d < rt.dims; d++) buf.putFloat(0f);
+                        }
+                    }
+                    buf.flip();
+                    long pos = (long) range[0] * rt.dims * 4;
+                    while (buf.hasRemaining()) {
+                        cacheChannel.write(buf, pos + buf.position());
+                    }
+                    progress.onProgress("Embedding[" + rt.modelId() + "]",
+                            chunksDone.incrementAndGet(), totalChunks);
+                    return null;
+                }));
+            }
+            for (Future<?> f : futures) {
+                try { f.get(); }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Embedding interrupted", e);
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof IOException io) throw io;
+                    if (cause instanceof RuntimeException re) throw re;
+                    throw new IOException("Embed task failed: " + cause.getMessage(), cause);
+                }
+            }
+        } finally {
+            pool.shutdown();
+        }
+
+        if (rt.cache != null) rt.cache.save();
+        if (hits.sum() > 0 || misses.sum() > 0) {
+            log.info("Embedding cache[{}]: {} hit(s), {} miss(es) for '{}' ({} thread(s))",
+                    rt.modelId(), hits.sum(), misses.sum(), projectName, threads);
+        }
     }
 
     /**

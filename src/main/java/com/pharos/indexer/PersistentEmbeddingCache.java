@@ -11,6 +11,8 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Persistent, project-scoped cache mapping SHA-256(embeddingText) → float[] vector.
@@ -39,23 +41,28 @@ public class PersistentEmbeddingCache {
     private final Path metaFile;
     private final String fingerprint;
     private final int dims;
+    /**
+     * Concurrent so {@link #get} and {@link #put} can be called from worker
+     * threads in the parallel embedding pipeline without external locking.
+     */
     private final Map<String, float[]> cache;
 
-    private int hits;
-    private int misses;
+    private final LongAdder hits   = new LongAdder();
+    private final LongAdder misses = new LongAdder();
 
     public PersistentEmbeddingCache(Path projectIndexDir, String fingerprint, int dims) {
         this.dataFile    = projectIndexDir.resolve("embed-cache.bin");
         this.metaFile    = projectIndexDir.resolve("embed-cache.meta");
         this.fingerprint = fingerprint;
         this.dims        = dims;
-        this.cache       = load();
+        // Load into a ConcurrentHashMap so subsequent reads/writes are thread-safe.
+        this.cache       = new ConcurrentHashMap<>(load());
     }
 
     /** Returns the cached embedding for the given text hash, or {@code null} on a miss. */
     public float[] get(String textHash) {
         float[] v = cache.get(textHash);
-        if (v != null) hits++; else misses++;
+        if (v != null) hits.increment(); else misses.increment();
         return v;
     }
 
@@ -64,8 +71,8 @@ public class PersistentEmbeddingCache {
         cache.put(textHash, embedding);
     }
 
-    public int hits()   { return hits; }
-    public int misses() { return misses; }
+    public int hits()   { return (int) hits.sum(); }
+    public int misses() { return (int) misses.sum(); }
     public int size()   { return cache.size(); }
 
     /** Atomically persists the in-memory cache to disk. */

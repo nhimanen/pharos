@@ -101,6 +101,21 @@ public class EmbeddingProviderConfig {
     /** OpenAI-only: per-request timeout in milliseconds (default 60s). */
     private long timeoutMillis = 60_000L;
 
+    /**
+     * Number of concurrent worker threads processing embedding batches.
+     * <ul>
+     *   <li>DJL local: typically 1 — ONNX Runtime's intra-op parallelism already
+     *       uses every CPU core for one inference. Extra threads contend for the
+     *       same cores. Bump to 2-3 if you have many cores AND the model is
+     *       small (jina-small etc).</li>
+     *   <li>OpenAI HTTP: typically 3-8 — concurrent requests keep the remote
+     *       GPU's batching window full and overlap network round-trip with
+     *       compute. Tune to what the server can absorb without queueing.</li>
+     * </ul>
+     * Default 0 → resolved to 1 (DJL) or 4 (OpenAI).
+     */
+    private int embeddingThreads;
+
     public EmbeddingProviderConfig() {}
 
     /**
@@ -171,7 +186,13 @@ public class EmbeddingProviderConfig {
     public int getBatchSize() { return batchSize; }
     public void setBatchSize(int batchSize) { this.batchSize = batchSize; }
 
-    /** Resolved batch size — substitutes a sensible default when batchSize == 0. */
+    /**
+     * Resolved batch size — substitutes a sensible default when {@code batchSize}
+     * is zero (unset). Override per provider in {@code config.json} when you
+     * want to push throughput: jina on a fast CPU does fine at 32+, an OpenAI-
+     * compatible endpoint over localhost can take 128+ depending on the
+     * server's batching window.
+     */
     public int resolvedBatchSize() {
         if (batchSize > 0) return batchSize;
         return "openai".equals(type) ? 64 : 8;
@@ -179,4 +200,13 @@ public class EmbeddingProviderConfig {
 
     public long getTimeoutMillis() { return timeoutMillis; }
     public void setTimeoutMillis(long timeoutMillis) { this.timeoutMillis = timeoutMillis; }
+
+    public int getEmbeddingThreads() { return embeddingThreads; }
+    public void setEmbeddingThreads(int embeddingThreads) { this.embeddingThreads = embeddingThreads; }
+
+    /** Resolved thread count — substitutes a sensible default when unset. */
+    public int resolvedEmbeddingThreads() {
+        if (embeddingThreads > 0) return embeddingThreads;
+        return "openai".equals(type) ? 4 : 1;
+    }
 }
