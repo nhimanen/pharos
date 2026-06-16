@@ -162,6 +162,54 @@ All MCP tools return structured JSON. Key tools:
 | `find_module_path` | Shortest dependency path between modules |
 | `get_module_boundary` | Entry/exit points for a module |
 
+## Embedding configuration
+
+Vector search is **disabled by default**. To enable it, set `embeddingModelUrl` in `~/.pharos/config.json`.
+
+### Recommended: Jina v2 Code via DJL (local, no API key)
+
+```json
+{
+  "embeddingModelUrl": "hf://jinaai/jina-embeddings-v2-base-code",
+  "embeddingDimensions": 768,
+  "embeddingMaxTokens": 512
+}
+```
+
+On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches it in `~/.djl.ai/pharos/`. Subsequent runs load from cache. This is the recommended setup for code search — 768-dim, 8 192-token context window.
+
+### Alternative: MiniLM via DJL model zoo
+
+```json
+{
+  "embeddingModelUrl": "ai.djl.huggingface.onnxruntime:sentence-transformers/all-MiniLM-L6-v2",
+  "embeddingDimensions": 384,
+  "embeddingMaxTokens": 512
+}
+```
+
+Lighter model (384-dim), good for general text, lower RAM use.
+
+### Alternative: OpenAI-compatible HTTP server
+
+If you run a local embedding server (e.g. llama.cpp, Ollama, text-embeddings-inference):
+
+```json
+{
+  "embeddingModelUrl": "http://localhost:8083/v1",
+  "embeddingDimensions": 768,
+  "embeddingMaxTokens": 512
+}
+```
+
+### Skipping embeddings
+
+```bash
+pharos index /path/to/project --no-embed     # skip embedding this run
+```
+
+Keyword search (`--type keyword`) and call graph features work without embeddings. Only `vector`, `hybrid`, and `unified` search types require them.
+
 ## How it works
 
 1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers extract methods, classes, call references, field declarations, inheritance, annotations, and type references
