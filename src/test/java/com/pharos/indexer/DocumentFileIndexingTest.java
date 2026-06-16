@@ -199,7 +199,7 @@ class DocumentFileIndexingTest {
                     // synthesized body = raw file content.
                     String body = DocumentMapper.readBodyFromFile(
                             cls.filePath(), cls.startLine(), cls.endLine());
-                    writer.addDocument(DocumentMapper.toClassDocument(cls, body, null));
+                    writer.addDocument(DocumentMapper.toClassDocument(cls, body, (float[]) null));
                 }
             }
         }

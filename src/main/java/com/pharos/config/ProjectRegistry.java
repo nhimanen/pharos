@@ -239,6 +239,8 @@ public class ProjectRegistry {
                 ? new ArrayList<>(meta.getKnownPackages()) : new ArrayList<>());
         slim.setLinkedProjects(meta.getLinkedProjects() != null
                 ? new ArrayList<>(meta.getLinkedProjects()) : new ArrayList<>());
+        slim.setEmbeddedModels(meta.getEmbeddedModels() != null
+                ? new ArrayList<>(meta.getEmbeddedModels()) : new ArrayList<>());
         slim.setGroupId(meta.getGroupId());
         slim.setArtifactId(meta.getArtifactId());
         slim.setMavenVersion(meta.getMavenVersion());

@@ -129,7 +129,7 @@ public class EmbeddingCacheBackfiller {
         IndexReader reader = luceneIndexer.openReader(projectName);
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
-            FloatVectorValues fvv = leaf.getFloatVectorValues(DocumentMapper.F_VECTOR);
+            FloatVectorValues fvv = leaf.getFloatVectorValues(DocumentMapper.F_VECTOR_LEGACY);
             if (fvv == null) continue;
             StoredFields sf = leaf.storedFields();
 

@@ -293,6 +293,9 @@ class SelectiveIndexUpdateTest {
         CountingEmbeddingProvider(int dims) { this.dims = dims; }
 
         @Override
+        public String modelId() { return "test-counting"; }
+
+        @Override
         public float[] embed(String text) {
             if (text == null) return null;
             count.incrementAndGet();

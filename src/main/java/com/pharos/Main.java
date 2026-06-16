@@ -43,7 +43,10 @@ public class Main {
 
         // Core components
         ProjectRegistry registry = new ProjectRegistry(config);
-        EmbeddingProvider embedder = EmbeddingProvider.create(config);
+        // Build all configured embedding providers — indexing writes one vector
+        // field per model; search picks one provider via config.searchEmbeddingModel.
+        List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
+        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config);
         LuceneIndexer luceneIndexer = new LuceneIndexer(config);
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
@@ -54,14 +57,14 @@ public class Main {
 
         List<CodeParser> parsers = new java.util.ArrayList<>();
         parsers.add(new JavaCodeParser(List.of(), List.of(), parseThreads));
-        parsers.add(new PythonCodeParser());
-        parsers.add(new JsCodeParser());
+        parsers.add(new PythonCodeParser(parseThreads));
+        parsers.add(new JsCodeParser(parseThreads));
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
-                config, luceneIndexer, registry, embedder, moduleGraphBuilder, parsers);
+                config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers);
         CrossEncoder crossEncoder = buildCrossEncoder(config);
-        SearchEngine searchEngine = new SearchEngine(luceneIndexer, embedder, registry, crossEncoder);
+        SearchEngine searchEngine = new SearchEngine(luceneIndexer, searchEmbedder, registry, crossEncoder);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);
         CrossProjectLinker crossProjectLinker = new CrossProjectLinker(config, registry);
 
@@ -162,6 +165,10 @@ public class Main {
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry));
             if (cls == MineCommand.class)
                 return (K) new MineCommand(registry, luceneIndexer);
+            if (cls == EmbedCommand.class)
+                return (K) new EmbedCommand(
+                        new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry),
+                        registry);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

@@ -937,6 +937,7 @@ public class WebServer {
         m.put("groupId", p.getGroupId());
         m.put("artifactId", p.getArtifactId());
         m.put("indexed", luceneIndexer.indexExists(p.getName()));
+        m.put("embeddedModels", p.getEmbeddedModels());
         return m;
     }
 

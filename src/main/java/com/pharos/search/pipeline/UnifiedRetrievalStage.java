@@ -83,11 +83,15 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
     private final KeywordSearchStrategy keywordStrategy;
     private final EmbeddingProvider     embedder;
+    private final String vectorField;
+    private final String chunkVectorField;
 
     public UnifiedRetrievalStage(KeywordSearchStrategy keywordStrategy,
                                   EmbeddingProvider embedder) {
-        this.keywordStrategy = keywordStrategy;
-        this.embedder        = embedder;
+        this.keywordStrategy  = keywordStrategy;
+        this.embedder         = embedder;
+        this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
+        this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
 
     @Override
@@ -128,8 +132,8 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         // ── KNN recall pass ───────────────────────────────────────────────────
         Query filter = buildFilter(req);
         Query knnQuery = filter != null
-                ? new KnnFloatVectorQuery(DocumentMapper.F_VECTOR, queryVec, candidateSize, filter)
-                : new KnnFloatVectorQuery(DocumentMapper.F_VECTOR, queryVec, candidateSize);
+                ? new KnnFloatVectorQuery(vectorField, queryVec, candidateSize, filter)
+                : new KnnFloatVectorQuery(vectorField, queryVec, candidateSize);
         TopDocs knnDocs = searcher.search(knnQuery, candidateSize);
 
         // ── Union (BM25 ∪ KNN) ────────────────────────────────────────────────
@@ -157,7 +161,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         float bm25Bonus = adaptiveBm25Bonus(req.classification());
         String intentLabel = req.classification() != null ? req.classification().intent() : "default";
 
-        TopDocs reranked = new UnifiedRescorer(queryMultiVec, bm25Bonus)
+        TopDocs reranked = new UnifiedRescorer(chunkVectorField, queryMultiVec, bm25Bonus)
                 .rescore(searcher, unionDocs, req.limit());
 
         trace.record("unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
@@ -205,9 +209,9 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
         private final float bm25Bonus;
 
-        UnifiedRescorer(float[][] queryMultiVec, float bm25Bonus) {
+        UnifiedRescorer(String chunkVectorField, float[][] queryMultiVec, float bm25Bonus) {
             super(new LateInteractionFloatValuesSource(
-                    DocumentMapper.F_CHUNK_VECTORS, queryMultiVec,
+                    chunkVectorField, queryMultiVec,
                     VectorSimilarityFunction.COSINE));
             this.bm25Bonus = bm25Bonus;
         }

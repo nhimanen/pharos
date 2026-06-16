@@ -829,6 +829,24 @@ def cmd_backfill_embedding_cache(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
+def cmd_embed(args):
+    """Add one embedding model's vectors to an existing index, no re-parse.
+
+    Spawns its own JVM (holds the Lucene write lock) — the daemon is not used.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "embed",
+                                     "--model=" + args.model]
+    if args.force:
+        cmd.append("--force")
+    if args.all:
+        cmd.append("--all")
+    else:
+        cmd.append(args.project)
+    sys.exit(subprocess.run(cmd).returncode)
+
+
 def _resolve_index_dir() -> Path:
     """Read indexDir from ~/.pharos/config.json, falling back to the default."""
     config_file = PHAROS_DIR / "config.json"
@@ -1358,6 +1376,41 @@ EXAMPLES
     p_backfill.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
     p_backfill.add_argument("--all", action="store_true", help="Backfill every registered project")
     p_backfill.set_defaults(func=cmd_backfill_embedding_cache)
+
+    # embed
+    p_embed = sub.add_parser(
+        "embed",
+        help="Add vectors for one embedding model against an existing index (no re-parse)",
+        description="""\
+Add (or refresh) one embedding model's vectors against an existing Lucene
+index without re-running parsing or the call-graph build. Used to A/B compare
+embedding models cheaply: index once with model A, drop in model B via this
+command instead of paying the full parse + graph cost again.
+
+Idempotent: re-running with the same --model for a project that already
+carries that field is a no-op. Use --force to recompute and overwrite.
+
+EXAMPLES
+  pharos embed --model=qwen3-emb-1024 myproject
+  pharos embed --model=text-embedding-3-small --all
+  pharos embed --model=qwen3-emb-1024 myproject --force
+
+NOTES
+  v1 processes single-chunk docs only. Multi-chunk docs (long methods that
+  the chunker split during indexing) are skipped with a count in the summary
+  — for those, 'pharos index --full' is the supported path.
+
+  Currently re-parses Java sources only.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_embed.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
+    p_embed.add_argument("--model", required=True,
+                         help="modelId of the embedding provider (must match config.embeddingProviders[].modelId)")
+    p_embed.add_argument("--all", action="store_true", help="Embed every registered project")
+    p_embed.add_argument("--force", action="store_true",
+                         help="Overwrite vectors even when the field is already present on a doc")
+    p_embed.set_defaults(func=cmd_embed)
 
     # invalidate-embeddings
     p_inv = sub.add_parser(

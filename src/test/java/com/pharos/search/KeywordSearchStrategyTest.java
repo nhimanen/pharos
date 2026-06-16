@@ -434,7 +434,7 @@ class KeywordSearchStrategyTest {
                 "public", false, false, null,
                 "/src/" + className + ".java", 1, 50
         );
-        writeDoc(DocumentMapper.toClassDocument(cls, synthesizedBody, null));
+        writeDoc(DocumentMapper.toClassDocument(cls, synthesizedBody, (float[]) null));
     }
 
     private void writeDoc(Document doc) throws IOException {

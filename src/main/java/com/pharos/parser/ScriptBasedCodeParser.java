@@ -11,7 +11,12 @@ import java.io.InputStream;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Abstract base for language parsers that delegate analysis to an external script
@@ -53,6 +58,23 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
      * Cleared at the start of each {@link #parsedFilesFromJson} invocation.
      */
     private final List<ParsedRelationships.FieldDecl> collectedFields = new ArrayList<>();
+
+    /**
+     * Number of concurrent extractor subprocesses launched by {@link #parseFiles}.
+     * Each file currently requires its own {@code node} / {@code python3} process
+     * (Babel/V8 startup ≈ 300 ms cold), so the wall-clock bottleneck is subprocess
+     * fork overhead, not the parse itself — parallelising scales near-linearly
+     * with core count. Default 1 (sequential, back-compat for old call sites).
+     */
+    protected final int parseThreads;
+
+    protected ScriptBasedCodeParser() {
+        this(1);
+    }
+
+    protected ScriptBasedCodeParser(int parseThreads) {
+        this.parseThreads = Math.max(1, parseThreads);
+    }
 
     // -------------------------------------------------------------------------
     // Abstract contract
@@ -106,6 +128,72 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
         if (json == null) return emptyFile(file);
         List<ParsedFile> files = mapJson(json, projectName);
         return files.isEmpty() ? emptyFile(file) : files.get(0);
+    }
+
+    /**
+     * Parallel parse of a pre-collected file list.
+     *
+     * <p>Each file still spawns its own extractor subprocess (the per-file fork
+     * cost is the dominant overhead — Babel/V8 cold-start, Python interpreter
+     * boot). With {@link #parseThreads} workers, N forks run concurrently and
+     * wall-clock time scales near-linearly with the worker count up to roughly
+     * available cores.
+     *
+     * <p>Failures on individual files are logged at DEBUG and skipped — one bad
+     * file doesn't fail the batch.
+     */
+    @Override
+    public ParsedProject parseFiles(List<Path> files, Path projectRoot,
+                                     String projectName) throws IOException {
+        if (files.isEmpty()) {
+            return new ParsedProject(projectName, projectRoot.toString(), List.of());
+        }
+        if (parseThreads <= 1) {
+            return CodeParser.super.parseFiles(files, projectRoot, projectName);
+        }
+
+        List<ParsedFile> results = Collections.synchronizedList(new ArrayList<>(files.size()));
+        AtomicInteger ok  = new AtomicInteger(0);
+        AtomicInteger err = new AtomicInteger(0);
+
+        ExecutorService pool = Executors.newFixedThreadPool(parseThreads, r -> {
+            Thread t = new Thread(r, "script-parser-" + scriptResourceName().replace('.', '-'));
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<Future<ParsedFile>> futures = new ArrayList<>(files.size());
+            for (Path file : files) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        ParsedFile pf = parseFile(file, projectName);
+                        ok.incrementAndGet();
+                        return pf;
+                    } catch (Exception e) {
+                        log.debug("Parse error in {}: {}", file, e.getMessage());
+                        err.incrementAndGet();
+                        return null;
+                    }
+                }));
+            }
+            for (Future<ParsedFile> f : futures) {
+                try {
+                    ParsedFile pf = f.get();
+                    if (pf != null) results.add(pf);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Parsing interrupted", e);
+                } catch (ExecutionException e) {
+                    log.debug("Unexpected parse failure: {}", e.getCause().getMessage());
+                    err.incrementAndGet();
+                }
+            }
+        } finally {
+            pool.shutdown();
+        }
+        log.info("{}: parsed {} files ({} errors) in project '{}' with {} threads",
+                getClass().getSimpleName(), ok.get(), err.get(), projectName, parseThreads);
+        return new ParsedProject(projectName, projectRoot.toString(), results);
     }
 
     @Override

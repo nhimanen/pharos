@@ -1,5 +1,6 @@
 package com.pharos.indexer;
 
+import com.pharos.config.EmbeddingProviderConfig;
 import com.pharos.config.IndexConfig;
 
 /**
@@ -35,11 +36,35 @@ public final class IndexVersions {
     public static final int CHUNKING_VERSION = 1;
 
     /**
-     * Fingerprint derived from the configured embedding model URL and output dimensions.
-     * Changes automatically when the model is swapped in {@code ~/.pharos/config.json}.
+     * Fingerprint for a single embedding provider — includes everything that
+     * influences the resulting float[] so two providers can't share a cache by
+     * accident. Used both as the {@link PersistentEmbeddingCache} key and as
+     * the per-file embed marker in {@link FileStateTracker}.
      */
+    public static String modelFingerprint(EmbeddingProviderConfig cfg) {
+        if (cfg == null) return "none";
+        return cfg.getModelId() + ":" + cfg.getDimensions()
+                + ":" + nvl(cfg.getUrl())
+                + ":" + nvl(cfg.getModel());
+    }
+
+    /**
+     * Legacy variant — returns the fingerprint of the first configured provider,
+     * or the synthesized legacy provider if the user is mid-upgrade. Existing
+     * callers that haven't been refactored to the multi-provider API still get
+     * a meaningful per-config value.
+     *
+     * @deprecated pass an explicit {@link EmbeddingProviderConfig} instead.
+     */
+    @Deprecated
     public static String modelFingerprint(IndexConfig config) {
+        if (config == null) return "none";
+        if (!config.getEmbeddingProviders().isEmpty()) {
+            return modelFingerprint(config.getEmbeddingProviders().get(0));
+        }
         String url = config.getEmbeddingModelUrl() != null ? config.getEmbeddingModelUrl() : "none";
         return url + ":" + config.getEmbeddingDimensions();
     }
+
+    private static String nvl(String s) { return s == null ? "" : s; }
 }

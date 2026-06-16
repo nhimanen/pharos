@@ -7,6 +7,7 @@ import org.apache.lucene.document.*;
 import org.apache.lucene.index.VectorSimilarityFunction;
 
 import java.util.Arrays;
+import java.util.Map;
 
 import java.util.List;
 
@@ -42,14 +43,36 @@ public class DocumentMapper {
     public static final String F_FILE_PATH         = "filePath";
     public static final String F_START_LINE        = "startLine";
     public static final String F_END_LINE          = "endLine";
-    public static final String F_VECTOR            = "vectorEmbedding";
+    /**
+     * Legacy single-vector Lucene field, written by pharos versions before
+     * multi-provider embeddings landed. New documents use per-model field names
+     * derived from {@link #vectorFieldName(String)} instead. Search-side readers
+     * fall back to this field when the queried project's {@code embeddedModels}
+     * list is empty (i.e. it was indexed by an older pharos).
+     *
+     * <p>Value is intentionally still {@code "vectorEmbedding"} so existing
+     * Lucene segments can be read without migration.
+     *
+     * @deprecated use {@link #vectorFieldName(String)} for new code; this constant
+     *             remains only for read-side backward compatibility.
+     */
+    @Deprecated
+    public static final String F_VECTOR_LEGACY     = "vectorEmbedding";
+    /**
+     * Legacy chunk-vectors field (LateInteractionField), same backward-compat
+     * story as {@link #F_VECTOR_LEGACY}.
+     *
+     * @deprecated use {@link #chunkVectorFieldName(String)} for new code.
+     */
+    @Deprecated
+    public static final String F_CHUNK_VECTORS_LEGACY = "chunkVectors";
     /**
      * Multi-vector field for late-interaction rescoring.
      * Stores one embedding vector per logical chunk of the document (via
      * {@link LateInteractionField}) alongside the single representative vector
-     * in {@link #F_VECTOR} used for HNSW approximate retrieval.
+     * (per-model KNN field) used for HNSW approximate retrieval.
      */
-    public static final String F_CHUNK_VECTORS     = "chunkVectors";
+    public static final String F_CHUNK_VECTORS     = F_CHUNK_VECTORS_LEGACY;
     /**
      * Compact binary stored field: {@code [N:int32][start0:int32][end0:int32]...[startN-1][endN-1]}.
      * Parallel to {@link #F_CHUNK_VECTORS} — entry i gives the source line range of chunk i.
@@ -207,7 +230,7 @@ public class DocumentMapper {
 
         // --- Vector embedding (only when available) ---
         if (embedding != null && embedding.length > 0) {
-            doc.add(new KnnFloatVectorField(F_VECTOR, embedding, VectorSimilarityFunction.COSINE));
+            doc.add(new KnnFloatVectorField(F_VECTOR_LEGACY, embedding, VectorSimilarityFunction.COSINE));
         }
 
         return doc;
@@ -287,7 +310,10 @@ public class DocumentMapper {
         }
         StringBuilder sb = new StringBuilder();
         if (method.javadoc() != null && !method.javadoc().isBlank()) {
-            sb.append("/** ").append(method.javadoc().trim()).append(" */\n");
+            // Cap javadoc — generated/copied javadoc can be huge.
+            String jd = method.javadoc().trim();
+            if (jd.length() > 4_000) jd = jd.substring(0, 4_000) + "...";
+            sb.append("/** ").append(jd).append(" */\n");
         } else {
             // No javadoc — synthesize a natural-language description from the parsed structure
             // so the embedding captures semantics even for undocumented methods.
@@ -313,7 +339,11 @@ public class DocumentMapper {
         }
         if (body != null) sb.append(body);
         sb.append("\n}");
-        return sb.toString();
+        String result = sb.toString();
+        if (result.length() > 16_000) {
+            result = result.substring(0, 16_000) + "\n// ... (truncated)\n}";
+        }
+        return result;
     }
 
     /**
@@ -487,9 +517,14 @@ public class DocumentMapper {
      */
     private static String buildChunkEmbeddingText(ParsedMethod chunk) {
         StringBuilder sb = new StringBuilder();
-        // File-level description as outer context
+        // File-level description as outer context. Cap at 4k chars to keep
+        // breadcrumb a breadcrumb; the chunk's own body carries the real
+        // content. Documents with massive preambles (whole-file READMEs
+        // pinned in javadoc) were the source of 1.3 MB inputs.
         if (chunk.javadoc() != null && !chunk.javadoc().isBlank()) {
-            sb.append("Document: ").append(chunk.javadoc().trim()).append("\n");
+            String preamble = chunk.javadoc().trim();
+            if (preamble.length() > 4_000) preamble = preamble.substring(0, 4_000) + "...";
+            sb.append("Document: ").append(preamble).append("\n");
         }
         // Heading breadcrumb (stored in signature field)
         if (chunk.signature() != null && !chunk.signature().isBlank()) {
@@ -625,7 +660,7 @@ public class DocumentMapper {
 
         // --- Vector embedding ---
         if (embedding != null && embedding.length > 0) {
-            doc.add(new KnnFloatVectorField(F_VECTOR, embedding, VectorSimilarityFunction.COSINE));
+            doc.add(new KnnFloatVectorField(F_VECTOR_LEGACY, embedding, VectorSimilarityFunction.COSINE));
         }
 
         return doc;
@@ -651,6 +686,154 @@ public class DocumentMapper {
             doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
         }
         return doc;
+    }
+
+    // ── Multi-model vector field naming ──────────────────────────────────────
+
+    /**
+     * Maps an embedding {@code modelId} to its Lucene KNN field name.
+     * The mapping is deterministic and stable: lowercase, replace anything
+     * outside {@code [a-z0-9._-]} with {@code _}, collapse runs of {@code _},
+     * cap at 96 chars. Same {@code modelId} always yields the same field name.
+     *
+     * <p>Examples:
+     * <pre>
+     *   "jina-code-v2"                      → "vec.jina-code-v2"
+     *   "Qwen/Qwen3-Embedding-4B@1024"      → "vec.qwen_qwen3-embedding-4b_1024"
+     * </pre>
+     */
+    public static String vectorFieldName(String modelId) {
+        return "vec." + sanitizeModelId(modelId);
+    }
+
+    /** Per-model chunk-vectors (LateInteractionField) name; same sanitization. */
+    public static String chunkVectorFieldName(String modelId) {
+        return "chunkVec." + sanitizeModelId(modelId);
+    }
+
+    /**
+     * Resolves the Lucene KNN field to read for a given model id, handling the
+     * legacy-alias fallback. Pre-upgrade indexes carry the old {@code vectorEmbedding}
+     * field with no model identity; we treat them as belonging to the synthetic
+     * {@link com.pharos.config.IndexConfig#LEGACY_MODEL_ID} so search code can route
+     * a single legacy-config query to either the old field name or a new per-model
+     * field uniformly.
+     */
+    public static String vectorFieldFor(String modelId) {
+        if (com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId)) return F_VECTOR_LEGACY;
+        return vectorFieldName(modelId);
+    }
+
+    /** Counterpart of {@link #vectorFieldFor(String)} for the chunk-vectors field. */
+    public static String chunkVectorFieldFor(String modelId) {
+        if (com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId)) return F_CHUNK_VECTORS_LEGACY;
+        return chunkVectorFieldName(modelId);
+    }
+
+    private static String sanitizeModelId(String modelId) {
+        if (modelId == null || modelId.isBlank()) {
+            throw new IllegalArgumentException("modelId must be non-blank for field naming");
+        }
+        String s = modelId.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9._-]", "_")
+                .replaceAll("_+", "_");
+        if (s.length() > 96) s = s.substring(0, 96);
+        return s;
+    }
+
+    // ── Multi-model document overloads ───────────────────────────────────────
+    // Each new overload delegates to the corresponding legacy overload with a
+    // null embedding (which suppresses the legacy F_VECTOR_LEGACY field), then
+    // attaches one KnnFloatVectorField per (modelId, vector) entry under the
+    // per-model field name from vectorFieldName(modelId). Same pattern for
+    // chunk-vector LateInteractionFields. Chunk line ranges remain a single
+    // model-independent field — the chunk decomposition is shared.
+
+    /**
+     * Multi-model variant of {@link #toDocument(ParsedMethod, float[], int, List, List)}.
+     * Writes one {@link KnnFloatVectorField} per non-null vector in
+     * {@code vectorsByModel}, keyed by per-model field names. Pass an empty map
+     * to skip vector storage entirely (keyword-only indexing).
+     */
+    public static Document toDocument(ParsedMethod method,
+                                       Map<String, float[]> vectorsByModel,
+                                       int inDegree, List<String> callerNames,
+                                       List<String> preloadedLines) {
+        Document doc = toDocument(method, (float[]) null, inDegree, callerNames, preloadedLines);
+        attachVectorFields(doc, vectorsByModel);
+        return doc;
+    }
+
+    /** Multi-model variant of {@link #toClassDocument(ParsedClass, String, float[])}. */
+    public static Document toClassDocument(ParsedClass cls, String synthesizedBody,
+                                            Map<String, float[]> vectorsByModel) {
+        Document doc = toClassDocument(cls, synthesizedBody, (float[]) null);
+        attachVectorFields(doc, vectorsByModel);
+        return doc;
+    }
+
+    /**
+     * Multi-model variant of {@link #toDocumentMultiVec(ParsedMethod, float[][], int[][], int, List, List)}.
+     * For each model in {@code chunkVectorsByModel}, mean-pools the chunk vectors as the
+     * KNN representative and attaches the full chunk array as the per-model
+     * {@link LateInteractionField}. Chunk line ranges are model-independent.
+     */
+    public static Document toDocumentMultiVec(ParsedMethod method,
+                                               Map<String, float[][]> chunkVectorsByModel,
+                                               int[][] chunkLineRanges,
+                                               int inDegree, List<String> callerNames,
+                                               List<String> preloadedLines) {
+        Map<String, float[]> reps = meanPoolPerModel(chunkVectorsByModel);
+        Document doc = toDocument(method, reps, inDegree, callerNames, preloadedLines);
+        attachChunkVectorFields(doc, chunkVectorsByModel);
+        if (chunkLineRanges != null && chunkLineRanges.length > 0) {
+            doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
+        }
+        return doc;
+    }
+
+    /** Multi-model variant of {@link #toClassDocumentMultiVec(ParsedClass, String, float[][], int[][])}. */
+    public static Document toClassDocumentMultiVec(ParsedClass cls, String synthesizedBody,
+                                                    Map<String, float[][]> chunkVectorsByModel,
+                                                    int[][] chunkLineRanges) {
+        Map<String, float[]> reps = meanPoolPerModel(chunkVectorsByModel);
+        Document doc = toClassDocument(cls, synthesizedBody, reps);
+        attachChunkVectorFields(doc, chunkVectorsByModel);
+        if (chunkLineRanges != null && chunkLineRanges.length > 0) {
+            doc.add(new StoredField(F_CHUNK_LINE_RANGES, encodeLineRanges(chunkLineRanges)));
+        }
+        return doc;
+    }
+
+    private static void attachVectorFields(Document doc, Map<String, float[]> vectorsByModel) {
+        if (vectorsByModel == null) return;
+        for (Map.Entry<String, float[]> e : vectorsByModel.entrySet()) {
+            float[] v = e.getValue();
+            if (v == null || v.length == 0) continue;
+            doc.add(new KnnFloatVectorField(
+                    vectorFieldName(e.getKey()), v, VectorSimilarityFunction.COSINE));
+        }
+    }
+
+    private static void attachChunkVectorFields(Document doc,
+                                                 Map<String, float[][]> chunkVectorsByModel) {
+        if (chunkVectorsByModel == null) return;
+        for (Map.Entry<String, float[][]> e : chunkVectorsByModel.entrySet()) {
+            float[][] cv = e.getValue();
+            if (cv == null || cv.length == 0) continue;
+            doc.add(new LateInteractionField(chunkVectorFieldName(e.getKey()), cv));
+        }
+    }
+
+    private static Map<String, float[]> meanPoolPerModel(Map<String, float[][]> chunkVectorsByModel) {
+        if (chunkVectorsByModel == null || chunkVectorsByModel.isEmpty()) return Map.of();
+        Map<String, float[]> out = new java.util.LinkedHashMap<>(chunkVectorsByModel.size());
+        for (Map.Entry<String, float[][]> e : chunkVectorsByModel.entrySet()) {
+            float[][] cv = e.getValue();
+            if (cv == null || cv.length == 0) continue;
+            out.put(e.getKey(), meanPool(cv));
+        }
+        return out;
     }
 
     /**
@@ -723,7 +906,11 @@ public class DocumentMapper {
     public static String buildClassEmbeddingText(ParsedClass cls, String synthesizedBody) {
         StringBuilder sb = new StringBuilder();
         if (cls.javadoc() != null && !cls.javadoc().isBlank()) {
-            sb.append("/** ").append(cls.javadoc().trim()).append(" */\n");
+            // Cap javadoc independently — document-kind classes can carry huge
+            // preambles (entire markdown headers, license blocks, etc.).
+            String jd = cls.javadoc().trim();
+            if (jd.length() > 4_000) jd = jd.substring(0, 4_000) + "...";
+            sb.append("/** ").append(jd).append(" */\n");
         }
         // Include split class name for natural-language embedding
         // e.g. "UserSessionManager" → "user session manager"
@@ -739,6 +926,12 @@ public class DocumentMapper {
         }
         if (body != null) sb.append(body);
         sb.append("\n}");
-        return sb.toString();
+        // Final hard cap. Catches any combination of huge javadoc + body + name
+        // that could still exceed what an embedding model can consume.
+        String result = sb.toString();
+        if (result.length() > 20_000) {
+            result = result.substring(0, 20_000) + "\n// ... (truncated)\n}";
+        }
+        return result;
     }
 }

@@ -132,7 +132,7 @@ class DocumentMapperMultiVecTest {
 
             // F_VECTOR is a KnnFloatVectorField — stored as binary DocValues under the hood,
             // but the field name must appear in the document
-            assertThat(doc.getField(DocumentMapper.F_VECTOR)).isNotNull();
+            assertThat(doc.getField(DocumentMapper.F_VECTOR_LEGACY)).isNotNull();
         }
 
         @Test
@@ -145,7 +145,7 @@ class DocumentMapperMultiVecTest {
                     testMethod(), embeddings, 0, List.of());
 
             // Verify the representative (mean-pooled) vector is present and not null
-            assertThat(doc.getField(DocumentMapper.F_VECTOR)).isNotNull();
+            assertThat(doc.getField(DocumentMapper.F_VECTOR_LEGACY)).isNotNull();
             assertThat(doc.getBinaryValue(DocumentMapper.F_CHUNK_VECTORS)).isNotNull();
         }
 
@@ -174,7 +174,7 @@ class DocumentMapperMultiVecTest {
             Document doc = DocumentMapper.toDocumentMultiVec(
                     testMethod(), embeddings, 0, List.of());
 
-            assertThat(doc.getField(DocumentMapper.F_VECTOR)).isNotNull();
+            assertThat(doc.getField(DocumentMapper.F_VECTOR_LEGACY)).isNotNull();
             assertThat(doc.getBinaryValue(DocumentMapper.F_CHUNK_VECTORS)).isNotNull();
         }
 
@@ -220,7 +220,7 @@ class DocumentMapperMultiVecTest {
             Document doc = DocumentMapper.toClassDocumentMultiVec(
                     testClass(), "body", embeddings);
 
-            assertThat(doc.getField(DocumentMapper.F_VECTOR)).isNotNull();
+            assertThat(doc.getField(DocumentMapper.F_VECTOR_LEGACY)).isNotNull();
         }
 
         @Test
@@ -243,7 +243,7 @@ class DocumentMapperMultiVecTest {
             Document doc = DocumentMapper.toClassDocumentMultiVec(
                     testClass(), "body", embeddings);
 
-            assertThat(doc.getField(DocumentMapper.F_VECTOR)).isNotNull();
+            assertThat(doc.getField(DocumentMapper.F_VECTOR_LEGACY)).isNotNull();
             assertThat(doc.getBinaryValue(DocumentMapper.F_CHUNK_VECTORS)).isNotNull();
         }
     }
