@@ -133,10 +133,10 @@ class GradleBuildReaderTest {
 
     @Test
     void parseVersionCatalog_inlineStringForm() throws Exception {
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
 
         Map<String, String> catalog = reader.parseVersionCatalog(tempDir);
-        assertThat(catalog).containsEntry("yeast", "fi.relex:yeast:5.14.0");
+        assertThat(catalog).containsEntry("yeast", "com.example:acme:1.0.0");
     }
 
     @Test
@@ -200,7 +200,7 @@ class GradleBuildReaderTest {
                 "[bundles]\n" +
                 "test = [\"junit\", \"mockito\"]\n\n" +
                 "[libraries]\n" +
-                "yeast = \"fi.relex:yeast:5.14.0\"\n");
+                "yeast = \"com.example:acme:1.0.0\"\n");
 
         Map<String, String> catalog = reader.parseVersionCatalog(tempDir);
         assertThat(catalog).containsOnlyKeys("yeast");
@@ -212,7 +212,7 @@ class GradleBuildReaderTest {
     void read_resolvesCatalogReferencesIntoDependencies() throws Exception {
         writeCatalog("[versions]\njackson = \"2.18.0\"\n\n" +
                 "[libraries]\n" +
-                "yeast       = \"fi.relex:yeast:5.14.0\"\n" +
+                "yeast       = \"com.example:acme:1.0.0\"\n" +
                 "jackson-bom = { module = \"com.fasterxml.jackson:jackson-bom\", version.ref = \"jackson\" }\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"my-app\"");
         Files.writeString(tempDir.resolve("build.gradle.kts"),
@@ -227,7 +227,7 @@ class GradleBuildReaderTest {
         assertThat(info.dependencies())
                 .extracting(d -> d.groupId() + ":" + d.artifactId() + ":" + d.version())
                 .containsExactlyInAnyOrder(
-                        "fi.relex:yeast:5.14.0",
+                        "com.example:acme:1.0.0",
                         "com.fasterxml.jackson:jackson-bom:2.18.0");
     }
 
@@ -253,7 +253,7 @@ class GradleBuildReaderTest {
     @Test
     void read_mixedStyles_allExtracted() throws Exception {
         // Literal coordinates + catalog ref + project ref — all in one build.gradle.kts.
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"my-app\"");
         Files.writeString(tempDir.resolve("build.gradle.kts"),
                 "group = \"com.example\"\nversion = \"1.0.0\"\n\n" +
@@ -300,7 +300,7 @@ class GradleBuildReaderTest {
 
     @Test
     void parseBundles_multiLineForm() throws Exception {
-        // Real-world catalogs (incl. planning-cloud) format bundles across many lines.
+        // Real-world catalogs format bundles across many lines.
         writeCatalog("[bundles]\n" +
                 "core = [\n" +
                 "    \"spring-boot\",\n" +
@@ -320,7 +320,7 @@ class GradleBuildReaderTest {
 
     @Test
     void parseBundles_noBundlesSection_returnsEmpty() throws Exception {
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
         assertThat(reader.parseBundles(tempDir)).isEmpty();
     }
 
@@ -328,7 +328,7 @@ class GradleBuildReaderTest {
     void read_expandsBundleReferenceIntoMemberDeps() throws Exception {
         // Bundle membership should produce one dep per constituent library.
         writeCatalog("[libraries]\n" +
-                "yeast       = \"fi.relex:yeast:5.14.0\"\n" +
+                "yeast       = \"com.example:acme:1.0.0\"\n" +
                 "spring-core = { module = \"org.springframework:spring-core\", version = \"6.2.0\" }\n\n" +
                 "[bundles]\n" +
                 "core = [\"yeast\", \"spring-core\"]\n");
@@ -343,13 +343,13 @@ class GradleBuildReaderTest {
         assertThat(info.dependencies())
                 .extracting(d -> d.groupId() + ":" + d.artifactId() + ":" + d.version())
                 .containsExactlyInAnyOrder(
-                        "fi.relex:yeast:5.14.0",
+                        "com.example:acme:1.0.0",
                         "org.springframework:spring-core:6.2.0");
     }
 
     @Test
     void read_bundleRefWithUnknownBundle_isIgnoredQuietly() throws Exception {
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"my-app\"");
         Files.writeString(tempDir.resolve("build.gradle.kts"),
                 "group = \"com.example\"\nversion = \"1.0\"\n" +
@@ -363,10 +363,10 @@ class GradleBuildReaderTest {
 
     @Test
     void read_walksSubProjectsAndAggregatesDeps() throws Exception {
-        // planning-cloud-shaped layout: root build file with NO real deps, but the
+        // Multi-module Gradle layout: root build file with NO real deps, but the
         // real deps live in nested sub-project build files. Pharos should aggregate
         // them all into the parent project node.
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"workspace\"");
         // Root build file: only project metadata, no implementation lines.
         Files.writeString(tempDir.resolve("build.gradle.kts"),
@@ -394,7 +394,7 @@ class GradleBuildReaderTest {
     void read_dedupesSameDepDeclaredInMultipleSubprojects() throws Exception {
         // Two sub-projects each declare implementation(libs.yeast). We should record
         // ONE yeast dep, not two — the module graph keys on group:artifact.
-        writeCatalog("[libraries]\nyeast = \"fi.relex:yeast:5.14.0\"\n");
+        writeCatalog("[libraries]\nyeast = \"com.example:acme:1.0.0\"\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"workspace\"");
         Files.writeString(tempDir.resolve("build.gradle.kts"), "group = \"com.example\"\n");
 
@@ -416,7 +416,7 @@ class GradleBuildReaderTest {
         // buildSrc holds Gradle convention-plugin code — its deps are plugin
         // tooling, not application deps. They must not leak into the project graph.
         writeCatalog("[libraries]\n" +
-                "yeast        = \"fi.relex:yeast:5.14.0\"\n" +
+                "yeast        = \"com.example:acme:1.0.0\"\n" +
                 "kotlin-plugin = \"org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.0\"\n");
         Files.writeString(tempDir.resolve("settings.gradle.kts"), "rootProject.name = \"workspace\"");
         Files.writeString(tempDir.resolve("build.gradle.kts"), "group = \"com.example\"\n");
