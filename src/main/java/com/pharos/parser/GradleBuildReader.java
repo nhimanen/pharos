@@ -323,7 +323,7 @@ public class GradleBuildReader {
      *
      * <p>Supports the two standard inline forms:
      * <pre>
-     *   yeast       = "fi.relex:yeast:5.14.0"
+     *   acme        = "com.example:acme:1.0.0"
      *   spring-boot = { module = "org.springframework.boot:spring-boot-starter", version = "3.2.0" }
      *   jackson-bom = { module = "com.fasterxml.jackson:jackson-bom", version.ref = "jackson" }
      * </pre>
