@@ -6,8 +6,12 @@ The Pharos of Alexandria was one of the Seven Wonders of the Ancient World — a
 
 Pharos indexes multi-language projects and gives you multiple ways to navigate them:
 
-- **Hybrid search** — BM25 keyword + semantic vector search with automatic query classification (`auto` default picks the right strategy per query)
+- **Hybrid search** — BM25 keyword + semantic vector search with automatic query classification (`auto` default picks the right pipeline per query)
+- **Named pipelines** — keyword / vector / unified / hybrid (Borda or RRF) / cross-encoder reranked / doc-type diversified, all defined in `pipelines.yaml` and selectable via `--pipeline`
+- **MMR class diversity** — default last-stage reranker that surfaces hits from more classes before repeating overloads of the same one
+- **Cross-encoder reranking** — optional second-stage rerank for hybrid pipelines when higher precision matters more than latency
 - **Multi-vector indexing** — classes split into semantic chunks (header, method groups) and stored as `LateInteractionField` for ColBERT-style rescoring
+- **Multi-provider embeddings** — index against several embedding models side-by-side and A/B compare them with `pharos embed`; query-time provider can differ from index-time runtime
 - **Knowledge graph** — inheritance, field access, annotations, and type references stored as typed edges in ArcadeDB alongside the call graph
 - **Call graph exploration** — who calls what, multi-hop traversal with bodies, transitive impact analysis
 - **Smart snippets** — Lucene Highlighter + vector chunk positioning, both combined for precise source location
@@ -18,7 +22,7 @@ Pharos indexes multi-language projects and gives you multiple ways to navigate t
 
 ## Requirements
 
-- Java 21+
+- Java 25+
 - Python 3.8+ (for the `pharos` CLI client)
 - Maven (to build)
 - Node.js 14+ (optional — enables JavaScript/TypeScript indexing)
@@ -63,12 +67,15 @@ pharos index /path/to/project                    # incremental
 pharos index /path/to/project --force --no-embed # clean re-index, skip embedding
 pharos index /path/to/workspace --project-threads 4  # parallel workspace indexing
 
-# Search — auto-classifies the query and picks the best strategy
+# Search — auto-classifies the query and picks the best pipeline
 pharos search "connection pool initialization"         # natural language → hybrid
 pharos search "ConnectionPool"                         # identifier → keyword automatically
 pharos search "validate token" --type unified          # single-pass BM25 + vector boost
 pharos search "JWT expiry" --trace                     # show resolved type + timings
 pharos search "authenticate" --snippet-lines 20        # control snippet size
+pharos search "rate limit" --pipeline hybrid-reranked  # named pipeline (overrides --type)
+pharos search "rate limit" --oversample 3              # fetch 3× candidates before rerank
+pharos pipelines                                       # list available pipelines
 
 # Get full method or class body
 pharos method "com.pharos.indexer.LuceneIndexer#index(ParsedMethod)"
@@ -105,25 +112,41 @@ pharos web
 pharos projects
 ```
 
-### Search types
+### Pipelines
 
-| Type | When to use |
+Pipelines are defined in `src/main/resources/pipelines.yaml` and selected with `--pipeline ID` (overrides `--type`). The five legacy `--type` values still work and map onto the same pipelines.
+
+| Pipeline | When to use |
 |---|---|
-| `auto` (default) | Let pharos decide: identifiers → keyword, natural language → hybrid |
+| `auto` (default) | FST-backed intent classifier dispatches to a child pipeline based on query shape |
 | `keyword` | Exact name or FQN lookup; highest BM25 precision |
 | `vector` | Semantic / concept search when you don't know the exact name |
-| `hybrid` | Natural language query; fuses keyword and vector results |
 | `unified` | Single BM25 pass with vector similarity as a multiplicative boost |
+| `hybrid` | Borda-count fusion of keyword + vector with agreement bonus |
+| `hybrid-rrf` | Reciprocal Rank Fusion (k=60) — the auto default for hybrid intents |
+| `hybrid-reranked` | `hybrid` + cross-encoder rerank for higher precision (requires cross-encoder) |
+| `hybrid-ce-merge` | Cross-encoder scores all candidates and acts as the merge step |
+| `hybrid-diverse` | `hybrid` + doc-type diversity rerank (balances method/class/chunk hits) |
+| `hybrid-reranked-diverse` | Cross-encoder rerank followed by doc-type diversity |
+
+MMR class diversity runs as the default last-stage reranker on every pipeline except `keyword`.
 
 ### Daemon
 
-`pharos` keeps a background JVM running to avoid cold-start latency (port 7171, `PHAROS_PORT` to override):
+`pharos` keeps a background JVM running to avoid cold-start latency:
 
 ```bash
 pharos daemon status
 pharos daemon stop
 pharos daemon logs
 ```
+
+Environment overrides honored on every JVM launch (daemon and `index`):
+
+| Var | Purpose |
+|---|---|
+| `PHAROS_PORT` | Daemon HTTP port (default 7171) |
+| `PHAROS_HEAP` | Passed as `-Xmx<value>` (e.g. `PHAROS_HEAP=16g pharos index ...`) |
 
 ## Claude Code integration
 
@@ -164,15 +187,22 @@ All MCP tools return structured JSON. Key tools:
 
 ## Embedding configuration
 
-Vector search is **disabled by default**. To enable it, set `embeddingModelUrl` in `~/.pharos/config.json`.
+Vector search is **disabled by default**. To enable it, add at least one provider to `embeddingProviders[]` in `~/.pharos/config.json`. The list is the new shape — legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
 
 ### Recommended: Jina v2 Code via DJL (local, no API key)
 
 ```json
 {
-  "embeddingModelUrl": "hf://jinaai/jina-embeddings-v2-base-code",
-  "embeddingDimensions": 768,
-  "embeddingMaxTokens": 512
+  "embeddingProviders": [
+    {
+      "modelId": "jina-v2-code",
+      "type": "djl",
+      "url": "hf://jinaai/jina-embeddings-v2-base-code",
+      "dimensions": 768,
+      "maxTokens": 512
+    }
+  ],
+  "searchEmbeddingModel": "jina-v2-code"
 }
 ```
 
@@ -182,9 +212,16 @@ On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches
 
 ```json
 {
-  "embeddingModelUrl": "ai.djl.huggingface.onnxruntime:sentence-transformers/all-MiniLM-L6-v2",
-  "embeddingDimensions": 384,
-  "embeddingMaxTokens": 512
+  "embeddingProviders": [
+    {
+      "modelId": "minilm",
+      "type": "djl",
+      "url": "ai.djl.huggingface.onnxruntime:sentence-transformers/all-MiniLM-L6-v2",
+      "dimensions": 384,
+      "maxTokens": 512
+    }
+  ],
+  "searchEmbeddingModel": "minilm"
 }
 ```
 
@@ -192,15 +229,67 @@ Lighter model (384-dim), good for general text, lower RAM use.
 
 ### Alternative: OpenAI-compatible HTTP server
 
-If you run a local embedding server (e.g. llama.cpp, Ollama, text-embeddings-inference):
+If you run a local embedding server (e.g. llama.cpp, Ollama, text-embeddings-inference), set `type: openai`:
 
 ```json
 {
-  "embeddingModelUrl": "http://localhost:8083/v1",
-  "embeddingDimensions": 768,
-  "embeddingMaxTokens": 512
+  "embeddingProviders": [
+    {
+      "modelId": "qwen3-emb",
+      "type": "openai",
+      "url": "http://localhost:8083/v1",
+      "dimensions": 768,
+      "maxTokens": 512
+    }
+  ],
+  "searchEmbeddingModel": "qwen3-emb"
 }
 ```
+
+### Multiple providers side-by-side
+
+`embeddingProviders` is a list. Pharos can index against several models in parallel and store one vector field per model (`vec.<modelId>`) on each Lucene document. `searchEmbeddingModel` selects which one is queried; the others stay on disk for cheap A/B comparison via `pharos embed --model=<other>`.
+
+### Split index/search runtimes
+
+For setups where the index-time runtime differs from the query-time runtime (e.g. embed at index time via a fast remote `openai` server, embed queries offline via local DJL), add `searchEmbeddingProvider`:
+
+```json
+{
+  "embeddingProviders": [
+    { "modelId": "qwen3-emb", "type": "openai", "url": "http://prod-emb:8083/v1", ... }
+  ],
+  "searchEmbeddingProvider": {
+    "modelId": "qwen3-emb",
+    "type": "djl",
+    "url": "hf://Qwen/Qwen3-Embedding-0.6B",
+    "dimensions": 1024,
+    "maxTokens": 512
+  }
+}
+```
+
+The `modelId` must match one of the `embeddingProviders` entries (that's how pharos routes the query to the right `vec.<modelId>` field). You are on the hook for ensuring both runtimes produce vectors in the same space — typically by serving the same underlying weights under both runtimes.
+
+### Embedding cache & re-embedding
+
+Embedding vectors are cached on disk at `<index-dir>/<project>/embed-cache.bin`, keyed by `SHA-256(embeddingText)`. Three commands manage it:
+
+```bash
+pharos backfill-embedding-cache myproject              # seed cache from existing HNSW vectors (no ONNX)
+pharos backfill-embedding-cache --all                  # all projects
+
+pharos embed --model=qwen3-emb myproject               # add a model's vectors to an existing index
+pharos embed --model=qwen3-emb --all                   # all projects
+pharos embed --model=qwen3-emb myproject --force       # overwrite existing vectors
+
+pharos invalidate-embeddings myproject                 # docs only (default scope)
+pharos invalidate-embeddings myproject --scope java    # Java files only
+pharos invalidate-embeddings myproject --scope all     # everything
+pharos invalidate-embeddings --all                     # docs in every project
+```
+
+Use `embed` when adding a new model without re-parsing. Use `invalidate-embeddings` after changing chunking logic to force selective re-embedding on the next incremental index run.
 
 ### Skipping embeddings
 
@@ -220,6 +309,6 @@ Keyword search (`--type keyword`) and call graph features work without embedding
 
 4. **Index** — Lucene stores all fields with per-field BM25; `KnnFloatVectorField` (mean of chunk vectors) for HNSW retrieval; `LateInteractionField` for late-interaction rescoring
 
-5. **Search** — auto-classifier picks keyword vs hybrid; query-type-adaptive candidate pool sizes; rVSM camelCase expansion; unified single-pass BM25+vector mode; Highlighter-based snippet positioning
+5. **Search** — pipelines defined in `pipelines.yaml` compose retrievers (keyword / vector / unified), a merger (Borda / RRF / cross-encoder-merge), and rerankers (cross-encoder, doc-type diversity, MMR class diversity). The FST-backed `auto` router classifies query intent and dispatches to a child pipeline; `--pipeline` overrides it explicitly
 
 Config and indexes are stored in `~/.pharos/`.

@@ -12,7 +12,7 @@ mvn test -Dtest=ClassName   # Run a single test class
 mvn clean compile           # Compile only
 ```
 
-**Java 21+ required.** The shade plugin produces a single executable JAR.
+**Java 25+ required.** The shade plugin produces a single executable JAR.
 
 ## Running the Tool
 
