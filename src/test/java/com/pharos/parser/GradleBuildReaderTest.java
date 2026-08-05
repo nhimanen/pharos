@@ -266,7 +266,7 @@ class GradleBuildReaderTest {
         MavenPomReader.PomInfo info = reader.read(tempDir).orElseThrow();
         assertThat(info.dependencies())
                 .extracting(MavenPomReader.MavenDependency::artifactId)
-                .containsExactlyInAnyOrder("commons-lang3", "yeast", "sub");
+                .containsExactlyInAnyOrder("commons-lang3", "acme", "sub");
     }
 
     @Test
@@ -387,7 +387,7 @@ class GradleBuildReaderTest {
         MavenPomReader.PomInfo info = reader.read(tempDir).orElseThrow();
         assertThat(info.dependencies())
                 .extracting(MavenPomReader.MavenDependency::artifactId)
-                .containsExactlyInAnyOrder("yeast", "commons-lang3");
+                .containsExactlyInAnyOrder("acme", "commons-lang3");
     }
 
     @Test
@@ -407,7 +407,7 @@ class GradleBuildReaderTest {
 
         MavenPomReader.PomInfo info = reader.read(tempDir).orElseThrow();
         assertThat(info.dependencies())
-                .filteredOn(d -> "yeast".equals(d.artifactId()))
+                .filteredOn(d -> "acme".equals(d.artifactId()))
                 .hasSize(1);
     }
 
@@ -436,7 +436,7 @@ class GradleBuildReaderTest {
         MavenPomReader.PomInfo info = reader.read(tempDir).orElseThrow();
         assertThat(info.dependencies())
                 .extracting(MavenPomReader.MavenDependency::artifactId)
-                .containsExactly("yeast")
+                .containsExactly("acme")
                 .doesNotContain("kotlin-gradle-plugin");
     }
 
