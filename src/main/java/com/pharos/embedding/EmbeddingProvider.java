@@ -114,32 +114,70 @@ public interface EmbeddingProvider {
     boolean isAvailable();
 
     /**
-     * Build one provider from a single config entry. Errors during construction
-     * are logged and converted to a {@link NoOpEmbeddingProvider} so the daemon
-     * stays up even when one configured model is temporarily unreachable.
-     * Indexing/embedding commands should check {@link #isAvailable()} on each
-     * provider and fail loud rather than silently writing no vectors.
+     * Build one provider from a single config entry, with no fallback handling.
+     * Throws on construction failure — callers that want graceful degradation
+     * should use {@link #create(EmbeddingProviderConfig)}.
+     */
+    private static EmbeddingProvider createOne(EmbeddingProviderConfig cfg) throws Exception {
+        switch (cfg.getType()) {
+            case "djl":
+                return new DjlEmbeddingProvider(
+                        cfg.getModelId(), cfg.getUrl(),
+                        cfg.getDimensions(), cfg.getMaxTokens());
+            case "openai":
+                return new OpenAiHttpEmbeddingProvider(cfg);
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown embedding provider type '" + cfg.getType() + "'");
+        }
+    }
+
+    /**
+     * Build one provider from a single config entry, trying {@code cfg} first
+     * and then each of {@code cfg.getFallbacks()} in order — alternate runtimes
+     * for the same logical model (e.g. a remote llama.cpp-style server with a
+     * local DJL/ONNX backup). The first candidate that constructs successfully
+     * wins; its {@code modelId()} always reports {@code cfg.getModelId()}
+     * because fallback modelIds were validated to match the parent at
+     * {@link IndexConfig#load()} time.
+     *
+     * <p>Errors during construction of every candidate are logged and
+     * converted to a {@link NoOpEmbeddingProvider} so the daemon stays up
+     * even when all configured runtimes for a model are temporarily
+     * unreachable. Indexing/embedding commands should check
+     * {@link #isAvailable()} on each provider and fail loud rather than
+     * silently writing no vectors.
      */
     static EmbeddingProvider create(EmbeddingProviderConfig cfg) {
-        try {
-            switch (cfg.getType()) {
-                case "djl":
-                    return new DjlEmbeddingProvider(
-                            cfg.getModelId(), cfg.getUrl(),
-                            cfg.getDimensions(), cfg.getMaxTokens());
-                case "openai":
-                    return new OpenAiHttpEmbeddingProvider(cfg);
-                default:
-                    log.warn("Unknown embedding provider type '{}' for modelId='{}', falling back to NoOp.",
-                            cfg.getType(), cfg.getModelId());
-                    return new NoOpEmbeddingProvider(cfg.getModelId());
+        List<EmbeddingProviderConfig> candidates = new ArrayList<>();
+        candidates.add(cfg);
+        candidates.addAll(cfg.getFallbacks());
+
+        List<String> failures = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            EmbeddingProviderConfig candidate = candidates.get(i);
+            try {
+                EmbeddingProvider provider = createOne(candidate);
+                if (i == 0) {
+                    log.debug("Embedding provider '{}' resolved via primary runtime ({} @ {}).",
+                            cfg.getModelId(), candidate.getType(), candidate.getUrl());
+                } else {
+                    log.warn("Embedding provider '{}' primary runtime unavailable — resolved via " +
+                            "fallback[{}] ({} @ {}).",
+                            cfg.getModelId(), i - 1, candidate.getType(), candidate.getUrl());
+                }
+                return provider;
+            } catch (Throwable e) {
+                failures.add(String.format("%s (%s @ %s): %s: %s",
+                        i == 0 ? "primary" : "fallback[" + (i - 1) + "]",
+                        candidate.getType(), candidate.getUrl(),
+                        e.getClass().getSimpleName(), e.getMessage()));
             }
-        } catch (Throwable e) {
-            log.warn("Embedding provider '{}' unavailable ({}: {}), falling back to NoOp. " +
-                    "Keyword search will still work.",
-                    cfg.getModelId(), e.getClass().getSimpleName(), e.getMessage());
-            return new NoOpEmbeddingProvider(cfg.getModelId());
         }
+        log.warn("Embedding provider '{}' unavailable on all {} candidate(s), falling back to NoOp. " +
+                "Keyword search will still work. Attempts: {}",
+                cfg.getModelId(), candidates.size(), String.join("; ", failures));
+        return new NoOpEmbeddingProvider(cfg.getModelId());
     }
 
     /**

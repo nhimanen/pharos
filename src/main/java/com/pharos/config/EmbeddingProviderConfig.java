@@ -2,6 +2,9 @@ package com.pharos.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Configuration for a single embedding provider. Pharos supports running several
  * providers side-by-side so a project can carry vectors from multiple models in the
@@ -116,6 +119,26 @@ public class EmbeddingProviderConfig {
      */
     private int embeddingThreads;
 
+    /**
+     * Alternate runtimes for this same logical model, tried in order at
+     * index time when the primary (this config) fails to construct — e.g. a
+     * remote llama.cpp-style server that isn't always reachable, with a
+     * local DJL/ONNX runtime as backup. Each entry is a normal
+     * {@link EmbeddingProviderConfig} (own type/url/model/etc.) but must
+     * represent the <b>same</b> logical model: {@code modelId} and
+     * {@code dimensions} are optional here and default to the parent's when
+     * unset, but if given explicitly must match the parent's — mismatched
+     * values would corrupt the shared Lucene vector field or defeat the
+     * many-to-one routing entirely. The user is on the hook for verifying
+     * fallback runtimes produce vectors close enough to be interchangeable
+     * in the same space (same disclaimer as {@link IndexConfig#getSearchEmbeddingProvider()}).
+     *
+     * <p>Not used at search time — search always uses whatever runtime
+     * {@link IndexConfig#resolveSearchProvider()} resolves to, with no
+     * fallback chain.
+     */
+    private List<EmbeddingProviderConfig> fallbacks = new ArrayList<>();
+
     public EmbeddingProviderConfig() {}
 
     /**
@@ -208,5 +231,10 @@ public class EmbeddingProviderConfig {
     public int resolvedEmbeddingThreads() {
         if (embeddingThreads > 0) return embeddingThreads;
         return "openai".equals(type) ? 4 : 1;
+    }
+
+    public List<EmbeddingProviderConfig> getFallbacks() { return fallbacks; }
+    public void setFallbacks(List<EmbeddingProviderConfig> fallbacks) {
+        this.fallbacks = fallbacks == null ? new ArrayList<>() : fallbacks;
     }
 }

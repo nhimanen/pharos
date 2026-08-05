@@ -156,7 +156,10 @@ public class IndexConfig {
             if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
             if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
             config.migrateLegacyEmbeddingConfig();
-            for (EmbeddingProviderConfig p : config.embeddingProviders) p.validate();
+            for (EmbeddingProviderConfig p : config.embeddingProviders) {
+                p.validate();
+                validateFallbacks(p);
+            }
             if (config.searchEmbeddingProvider != null) {
                 config.searchEmbeddingProvider.validate();
                 // Routing safety: the search-time runtime must target a modelId
@@ -211,6 +214,42 @@ public class IndexConfig {
         }
         log.info("Migrated legacy embeddingModelUrl='{}' into provider '{}'.",
                 embeddingModelUrl, LEGACY_MODEL_ID);
+    }
+
+    /**
+     * Defaults and validates a top-level provider's {@code fallbacks}. Each
+     * fallback represents an alternate runtime for the same logical model:
+     * {@code modelId}/{@code dimensions} inherit the parent when unset, but
+     * if given explicitly must equal the parent's — mismatched values would
+     * corrupt the shared Lucene vector field or silently defeat many-to-one
+     * routing.
+     */
+    private static void validateFallbacks(EmbeddingProviderConfig parent) {
+        List<EmbeddingProviderConfig> fallbacks = parent.getFallbacks();
+        for (int i = 0; i < fallbacks.size(); i++) {
+            EmbeddingProviderConfig fb = fallbacks.get(i);
+            if (fb.getModelId() == null || fb.getModelId().isBlank()) {
+                fb.setModelId(parent.getModelId());
+            }
+            if (fb.getDimensions() <= 0) {
+                fb.setDimensions(parent.getDimensions());
+            }
+            fb.validate();
+            if (!fb.getModelId().equals(parent.getModelId())) {
+                throw new IllegalArgumentException(String.format(
+                        "embeddingProvider['%s'].fallbacks[%d].modelId='%s' does not match " +
+                        "the parent modelId. Fallbacks must be alternate runtimes for the " +
+                        "same logical model — omit modelId to inherit the parent's.",
+                        parent.getModelId(), i, fb.getModelId()));
+            }
+            if (fb.getDimensions() != parent.getDimensions()) {
+                throw new IllegalArgumentException(String.format(
+                        "embeddingProvider['%s'].fallbacks[%d].dimensions=%d does not match " +
+                        "the parent's dimensions=%d. Mismatched dimensions would corrupt the " +
+                        "shared Lucene vector field — omit dimensions to inherit the parent's.",
+                        parent.getModelId(), i, fb.getDimensions(), parent.getDimensions()));
+            }
+        }
     }
 
     public void save() throws IOException {
