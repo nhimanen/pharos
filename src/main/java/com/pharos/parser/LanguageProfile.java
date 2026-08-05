@@ -36,8 +36,16 @@ public record LanguageProfile(
         DO_END,
         /** Balanced parentheses {@code ( ... )} (Clojure). */
         PARENS,
-        /** Indentation-based (Haskell, F#). */
+        /** Indentation-based, body strictly deeper than the declaration line (F#). */
         INDENT,
+        /**
+         * Haskell-style: {@code methodPattern} anchors on the {@code name :: Type} signature
+         * line, but the actual equation ({@code name pat = expr}) is a sibling at the SAME
+         * indentation, not a deeper-indented child. The body extractor has to walk past the
+         * signature to find the equation clause(s) sharing that name before it can apply
+         * indent-deeper-than-base logic.
+         */
+        HASKELL_EQUATIONS,
     }
 
     // -------------------------------------------------------------------------
@@ -145,13 +153,15 @@ public record LanguageProfile(
             "--",
             Pattern.compile("^module\\s+([\\w.]+)"),
             Pattern.compile("^import\\s+(?:qualified\\s+)?([\\w.]+)"),
-            // data Foo / newtype Foo / class ... Foo where
+            // data Foo / newtype Foo / class ... Foo where / instance ... Foo where
             Pattern.compile(
                     "^(?:data|newtype)\\s+(\\w+)" +
-                    "|^class\\s+(?:[\\w()\\s]+\\s+)?(\\w+)(?:\\s+\\w+)*\\s+where"),
-            // Type signatures: foo :: ...  (used as method discovery hook)
+                    "|^class\\s+(?:[\\w()\\s]+\\s+)?(\\w+)(?:\\s+\\w+)*\\s+where" +
+                    "|^instance\\s+(?:.*\\s)?(\\w+)\\s+where\\b"),
+            // Type signatures: foo :: ...  (used as method discovery hook — the actual
+            // equation is a sibling line at the same indentation, see HASKELL_EQUATIONS)
             Pattern.compile("^(\\w+)\\s*::"),
-            BodyStyle.INDENT
+            BodyStyle.HASKELL_EQUATIONS
     );
 
     public static final LanguageProfile ELIXIR = new LanguageProfile(

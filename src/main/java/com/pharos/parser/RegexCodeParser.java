@@ -179,7 +179,7 @@ public class RegexCodeParser implements CodeParser {
                 modulePseudoClassUsed = true;
             }
 
-            String body = extractBody(lines, i);
+            String body = extractBody(lines, i, methodName);
             List<String> params = parseParams(rawParams);
             List<CallReference> calls = extractCalls(body,
                     containingClass.qualifiedClassName() + "#" + methodName + "()");
@@ -240,20 +240,26 @@ public class RegexCodeParser implements CodeParser {
     private String matchClassName(String line) {
         Matcher m = profile.classPattern().matcher(line);
         if (!m.find()) return null;
-        // Try group 1 then group 2 (some patterns have two alternatives)
-        return firstNonNull(m, 1, 2);
+        // Alternation patterns may have more than two branches (e.g. Haskell's
+        // data/newtype | class...where | instance...where) — only one group populates.
+        for (int g = 1; g <= m.groupCount(); g++) {
+            String v = groupSafe(m, g);
+            if (v != null && !v.isBlank()) return v.trim();
+        }
+        return null;
     }
 
     // -------------------------------------------------------------------------
     // Body extraction
     // -------------------------------------------------------------------------
 
-    private String extractBody(List<String> lines, int startLine) {
+    private String extractBody(List<String> lines, int startLine, String methodName) {
         return switch (profile.bodyStyle()) {
-            case BRACES  -> extractBracedBody(lines, startLine);
-            case DO_END  -> extractDoEndBody(lines, startLine);
-            case PARENS  -> extractParenBody(lines, startLine);
-            case INDENT  -> extractIndentBody(lines, startLine);
+            case BRACES             -> extractBracedBody(lines, startLine);
+            case DO_END             -> extractDoEndBody(lines, startLine);
+            case PARENS             -> extractParenBody(lines, startLine);
+            case INDENT             -> extractIndentBody(lines, startLine);
+            case HASKELL_EQUATIONS  -> extractHaskellBody(lines, startLine, methodName);
         };
     }
 
@@ -319,6 +325,44 @@ public class RegexCodeParser implements CodeParser {
             if (line.isBlank()) { sb.append('\n'); continue; }
             if (indentation(line) <= baseIndent) break;
             sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Haskell layout: {@code startLine} is the {@code name :: Type} signature. The real
+     * implementation is one or more equation clauses ({@code name pat1 pat2 = expr}, possibly
+     * repeated for different patterns) that sit at the SAME column as the signature, not
+     * nested under it. Walk: consume the signature (and any wrapped continuation lines, which
+     * — unlike the equations — genuinely are deeper-indented), then keep consuming clauses
+     * for {@code methodName} at the base column plus their deeper-indented bodies (guards,
+     * {@code where} blocks, multi-line expressions) until a dedent or an unrelated declaration
+     * at the base column is hit.
+     */
+    private String extractHaskellBody(List<String> lines, int startLine, String methodName) {
+        StringBuilder sb = new StringBuilder();
+        int baseIndent = indentation(lines.get(startLine));
+        sb.append(lines.get(startLine)).append('\n');
+        int limit = Math.min(lines.size(), startLine + MAX_BODY_LINES);
+        Pattern namePattern = Pattern.compile("^\\s*" + Pattern.quote(methodName) + "\\b");
+
+        int i = startLine + 1;
+        for (; i < limit; i++) {
+            String line = lines.get(i);
+            if (line.isBlank()) { sb.append('\n'); continue; }
+            if (indentation(line) > baseIndent) { sb.append(line).append('\n'); continue; }
+            break;
+        }
+        for (; i < limit; i++) {
+            String line = lines.get(i);
+            if (line.isBlank()) { sb.append('\n'); continue; }
+            int indent = indentation(line);
+            if (indent > baseIndent) { sb.append(line).append('\n'); continue; }
+            if (indent == baseIndent && namePattern.matcher(line).find()) {
+                sb.append(line).append('\n');
+                continue;
+            }
+            break;
         }
         return sb.toString();
     }
