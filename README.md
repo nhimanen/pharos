@@ -271,6 +271,37 @@ For setups where the index-time runtime differs from the query-time runtime (e.g
 
 The `modelId` must match one of the `embeddingProviders` entries (that's how pharos routes the query to the right `vec.<modelId>` field). You are on the hook for ensuring both runtimes produce vectors in the same space — typically by serving the same underlying weights under both runtimes.
 
+### Fallback: remote-with-local-backup
+
+An `embeddingProviders` entry can list `fallbacks` — alternate runtimes for the *same* logical model, tried in order at index time when the primary runtime is unreachable. Handy when the primary is a not-always-up remote box:
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "jina-code-v2",
+      "type": "openai",
+      "url": "http://192.168.1.100:8083/v1",
+      "model": "jinaai/jina-embeddings-v2-base-code",
+      "dimensions": 768,
+      "fallbacks": [
+        { "type": "djl", "url": "hf://jinaai/jina-embeddings-v2-base-code" }
+      ]
+    }
+  ],
+  "searchEmbeddingProvider": {
+    "modelId": "jina-code-v2",
+    "type": "djl",
+    "url": "hf://jinaai/jina-embeddings-v2-base-code",
+    "dimensions": 768
+  }
+}
+```
+
+A `fallbacks` entry inherits the parent's `modelId`/`dimensions` when omitted; if given explicitly they must match the parent's — mismatched dimensions would corrupt the shared `vec.jina-code-v2` field, and a mismatched `modelId` would defeat the whole point. As with `searchEmbeddingProvider`, you're on the hook for verifying the fallback runtime produces vectors close enough to the primary's to be usable interchangeably in the same vector space.
+
+`pharos index` and `pharos embed` each spawn a fresh JVM per invocation, so index-time fallback resolution re-probes the primary's reachability on every run — no daemon restart needed to pick up a remote server coming back online. The Lucene field and embedding cache key are always derived from the parent config, so vectors written via the fallback one day and the primary the next land in the same `vec.<modelId>` field/cache namespace — no forced re-embed when the runtime flips.
+
 ### Embedding cache & re-embedding
 
 Embedding vectors are cached on disk at `<index-dir>/<project>/embed-cache.bin`, keyed by `SHA-256(embeddingText)`. Three commands manage it:

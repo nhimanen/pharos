@@ -243,7 +243,10 @@ class IndexConfigMigrationTest {
 
     private static IndexConfig loadFromOrThrow(Path configFile) throws Exception {
         IndexConfig config = loadFrom(configFile);
-        for (EmbeddingProviderConfig p : config.getEmbeddingProviders()) p.validate();
+        for (EmbeddingProviderConfig p : config.getEmbeddingProviders()) {
+            p.validate();
+            invokeValidateFallbacks(p);
+        }
         if (config.getSearchEmbeddingProvider() != null) {
             config.getSearchEmbeddingProvider().validate();
             boolean matches = config.getEmbeddingProviders().stream()
@@ -266,5 +269,90 @@ class IndexConfigMigrationTest {
         var m = IndexConfig.class.getDeclaredMethod("migrateLegacyEmbeddingConfig");
         m.setAccessible(true);
         m.invoke(config);
+    }
+
+    private static void invokeValidateFallbacks(EmbeddingProviderConfig parent) throws Exception {
+        var m = IndexConfig.class.getDeclaredMethod("validateFallbacks", EmbeddingProviderConfig.class);
+        m.setAccessible(true);
+        try {
+            m.invoke(null, parent);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException re) throw re;
+            throw e;
+        }
+    }
+
+    @Test
+    void fallback_inheritsParentModelIdAndDimensions_whenUnset() throws Exception {
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(Map.of(
+                        "type", "openai",
+                        "modelId", "jina-code-v2",
+                        "url", "http://192.168.1.100:8083/v1",
+                        "model", "jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768,
+                        "fallbacks", List.of(Map.of(
+                                "type", "djl",
+                                "url", "hf://jinaai/jina-embeddings-v2-base-code"
+                        ))
+                ))
+        ));
+
+        IndexConfig config = loadFromOrThrow(configFile);
+        EmbeddingProviderConfig parent = config.getEmbeddingProviders().get(0);
+        EmbeddingProviderConfig fallback = parent.getFallbacks().get(0);
+
+        assertThat(fallback.getModelId()).isEqualTo("jina-code-v2");
+        assertThat(fallback.getDimensions()).isEqualTo(768);
+    }
+
+    @Test
+    void fallback_rejectsMismatchedModelId() throws Exception {
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(Map.of(
+                        "type", "openai",
+                        "modelId", "jina-code-v2",
+                        "url", "http://192.168.1.100:8083/v1",
+                        "model", "jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768,
+                        "fallbacks", List.of(Map.of(
+                                "type", "djl",
+                                "modelId", "some-other-model",
+                                "url", "hf://jinaai/jina-embeddings-v2-base-code",
+                                "dimensions", 768
+                        ))
+                ))
+        ));
+
+        assertThatThrownBy(() -> loadFromOrThrow(configFile))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("fallbacks[0].modelId='some-other-model'")
+                .hasMessageContaining("does not match");
+    }
+
+    @Test
+    void fallback_rejectsMismatchedDimensions() throws Exception {
+        Path configFile = tempDir.resolve("config.json");
+        json.writeValue(configFile.toFile(), Map.of(
+                "embeddingProviders", List.of(Map.of(
+                        "type", "openai",
+                        "modelId", "jina-code-v2",
+                        "url", "http://192.168.1.100:8083/v1",
+                        "model", "jinaai/jina-embeddings-v2-base-code",
+                        "dimensions", 768,
+                        "fallbacks", List.of(Map.of(
+                                "type", "djl",
+                                "url", "hf://jinaai/jina-embeddings-v2-base-code",
+                                "dimensions", 1024
+                        ))
+                ))
+        ));
+
+        assertThatThrownBy(() -> loadFromOrThrow(configFile))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("fallbacks[0].dimensions=1024")
+                .hasMessageContaining("768");
     }
 }
