@@ -770,6 +770,7 @@ def cmd_index(args):
     if args.full:         base_flags.append("--full")
     if args.force:        base_flags.append("--force")
     if args.no_embed:     base_flags.append("--no-embed")
+    if args.no_synonyms:  base_flags.append("--no-synonyms")
     if args.single:       base_flags.append("--single")
     if args.depth != 3:   base_flags += ["--depth", str(args.depth)]
     if args.project_threads != 1:
@@ -1082,6 +1083,8 @@ EXAMPLES
                          help="Delete existing index before re-indexing")
     p_index.add_argument("--no-embed", dest="no_embed", action="store_true",
                          help="Skip vector embedding generation")
+    p_index.add_argument("--no-synonyms", dest="no_synonyms", action="store_true",
+                         help="Skip auto-mining of synonym rules after indexing")
     p_index.add_argument("--single", action="store_true",
                          help="Treat path as a single project even if sub-projects are detected")
     p_index.add_argument("--depth", type=int, default=3, metavar="N",
