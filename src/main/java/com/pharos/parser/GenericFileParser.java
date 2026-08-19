@@ -50,7 +50,7 @@ public class GenericFileParser implements CodeParser {
     private static final Set<String> SKIP_DIRS = Set.of(
             ".git", ".svn", "node_modules", "target", "build",
             "__pycache__", ".gradle", "dist", ".idea", ".vscode",
-            "venv", ".venv"
+            "venv", ".venv", ".terraform", ".terragrunt-cache"
     );
 
     /** Max chunk body length before truncation for embeddings. */

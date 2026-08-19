@@ -17,6 +17,7 @@ import com.pharos.parser.JsCodeParser;
 import com.pharos.parser.LanguageProfile;
 import com.pharos.parser.PythonCodeParser;
 import com.pharos.parser.RegexCodeParser;
+import com.pharos.parser.TerraformCodeParser;
 import com.pharos.embedding.CrossEncoderProvider;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.pipeline.CrossEncoder;
@@ -59,6 +60,7 @@ public class Main {
         parsers.add(new JavaCodeParser(List.of(), List.of(), parseThreads));
         parsers.add(new PythonCodeParser(parseThreads));
         parsers.add(new JsCodeParser(parseThreads));
+        parsers.add(new TerraformCodeParser(parseThreads));
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(

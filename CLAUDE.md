@@ -14,6 +14,11 @@ mvn clean compile           # Compile only
 
 **Java 25+ required.** The shade plugin produces a single executable JAR.
 
+**Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
+(`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency
+(Python/JS extractors otherwise only use stdlib). Without it, `TerraformCodeParser`
+degrades gracefully to an empty result for `.tf` files, same as `JsCodeParser` without `node`.
+
 ## Running the Tool
 
 ```bash
