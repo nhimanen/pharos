@@ -42,10 +42,20 @@ Pharos indexes multi-language projects and gives you multiple ways to navigate t
 | Language | Parser | Call graph | Knowledge graph |
 |---|---|---|---|
 | Java | JavaParser (full symbol resolution) | ✓ resolved FQNs | ✓ fields, inheritance, annotations, type refs |
+| Go | Native Java parser (no toolchain needed) | ✓ resolved FQNs | ✓ struct fields, embedding, param/result type refs |
 | Python | AST via `python3` subprocess | unresolved | ✓ inheritance, decorators, instance fields |
 | JavaScript / TypeScript | AST via `node` subprocess | unresolved | ✓ extends, implements, decorators, class fields |
-| Kotlin, Scala, Rust, Go, Swift, C#, and more | Regex-based | partial | — |
+| Terraform | HCL via `python3` + `python-hcl2` | unresolved | — |
+| Kotlin, Scala, Rust, Swift, C#, F#, Haskell, Elixir, Clojure, Ruby, VB.NET | Regex-based | — | — |
 | Markdown, YAML, shell scripts | Generic chunker | — | — |
+
+Go needs no `go` toolchain on PATH: `GoCodeParser` is pure Java. Methods are bound by
+their **receiver** (`func (s *Server) Handle(...)`), and because Go has no function
+overloading a method's identity is exactly `(receiver type, name)` — so parameter types
+are omitted from the FQN and call resolution is exact rather than heuristic. Resolved
+edges come from receiver calls, same-package functions, imported project packages, and
+`v := &T{}` / `v := NewT()` local inference; anything else is left unresolved rather
+than guessed.
 
 ## Module graph support
 
@@ -58,6 +68,7 @@ The module dependency graph is populated automatically during indexing from whic
 | Python | `pyproject.toml` / `setup.py` | `python:package` |
 | Node.js | `package.json` | `npm:name` or `scope:name` |
 | CMake | `CMakeLists.txt` | `cmake:projectname` |
+| Go | `go.mod` / `go.work` | `go:module/path` |
 
 ## Usage
 

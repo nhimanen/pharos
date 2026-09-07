@@ -19,6 +19,11 @@ mvn clean compile           # Compile only
 (Python/JS extractors otherwise only use stdlib). Without it, `TerraformCodeParser`
 degrades gracefully to an empty result for `.tf` files, same as `JsCodeParser` without `node`.
 
+**Go (.go) indexing needs no external runtime.** `GoCodeParser` is a native Java parser,
+deliberately *not* a `ScriptBasedCodeParser`: a `go/ast` extractor would need the Go
+toolchain, and script-based parsers degrade to an *empty* result when their runtime is
+missing — Go files would be silently dropped on hosts and CI without `go` installed.
+
 ## Running the Tool
 
 ```bash
@@ -43,9 +48,26 @@ Config is stored in `~/.pharos/config.json`; project registry in `~/.pharos/regi
 
 Source files flow through four sequential stages:
 
-1. **Parse** (`parser/`) — `JavaCodeParser` uses JavaParser with `CombinedTypeSolver` (JDK + source roots + JARs) to produce `ParsedMethod` and `ParsedClass` objects with fully resolved symbol information.
+1. **Parse** (`parser/`) — every parser implements `CodeParser` and declares the extensions it
+   handles. `ProjectIndexManager` does one `walkFileTree` and dispatches each file to the
+   **first** parser claiming its extension, so the registration order in `Main.main` matters
+   (`GenericFileParser` stays last). There are four tiers:
 
-2. **Graph** (`graph/`) — `CallGraphBuilder` turns parsed call references into a JGraphT `DefaultDirectedGraph` stored as `<index-dir>/<project>/graph.graphml`. `ModuleGraphBuilder` reads `pom.xml` for Maven coordinates and maintains `~/.pharos/module-graph.graphml`.
+   | Tier | Parsers | Notes |
+   |---|---|---|
+   | AST, in-process | `JavaCodeParser` (JavaParser + `CombinedTypeSolver` over JDK + source roots + JARs), `GoCodeParser` | Fully resolved symbols; no external runtime |
+   | AST, subprocess | `PythonCodeParser`, `JsCodeParser`, `TerraformCodeParser` (all extend `ScriptBasedCodeParser`) | Bundled extractor script + a runtime on PATH; **degrade to an empty result** when it's missing |
+   | Regex | `RegexCodeParser` × the 11 `LanguageProfile.ALL` entries | No runtime; no call graph |
+   | Chunker | `GenericFileParser` | Markdown/YAML/JSON/etc., not code |
+
+   **Adding a language:** pick a tier, register it in the `parsers` list in `Main.main`, bump
+   `IndexVersions.CHUNKING_VERSION`, and add a build-file reader (below) if the language has one.
+
+   **Only `resolved()` call references become graph edges** (`CallGraphBuilder`) — a parser
+   that emits solely unresolved references contributes no call graph at all. That is why the
+   regex tier has none.
+
+2. **Graph** (`graph/`) — `CallGraphBuilder` turns parsed call references into a JGraphT `DefaultDirectedGraph` stored as `<index-dir>/<project>/graph.graphml`. `ModuleGraphBuilder` maintains `~/.pharos/module-graph.graphml`; `ProjectIndexManager.updateModuleGraph` detects the build system (first match wins: Maven → Gradle → Python → Node.js → CMake → Go) and every reader returns the shared `MavenPomReader.PomInfo` shape, so a new language's reader (e.g. `GoModReader` for `go.mod`) just joins that chain.
 
 3. **Embed** (`embedding/`) — Optional DJL + ONNX Runtime step that produces 384-dim float vectors. Falls back to `NoOpEmbeddingProvider` when unavailable.
 

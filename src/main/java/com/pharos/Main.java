@@ -12,6 +12,7 @@ import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProjectIndexManager;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.GenericFileParser;
+import com.pharos.parser.GoCodeParser;
 import com.pharos.parser.JavaCodeParser;
 import com.pharos.parser.JsCodeParser;
 import com.pharos.parser.LanguageProfile;
@@ -61,6 +62,7 @@ public class Main {
         parsers.add(new PythonCodeParser(parseThreads));
         parsers.add(new JsCodeParser(parseThreads));
         parsers.add(new TerraformCodeParser(parseThreads));
+        parsers.add(new GoCodeParser(parseThreads));
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(

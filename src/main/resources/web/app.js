@@ -1587,7 +1587,7 @@ function renderTestFilter() {
 // ── Language filter ───────────────────────────────────────────
 const LANG_LABELS = {
   java: 'Java', kt: 'Kotlin', py: 'Python', js: 'JS', ts: 'TS',
-  scala: 'Scala', groovy: 'Groovy', xml: 'XML', json: 'JSON',
+  go: 'Go', scala: 'Scala', groovy: 'Groovy', xml: 'XML', json: 'JSON',
   yaml: 'YAML', yml: 'YAML', md: 'Markdown', sql: 'SQL', other: 'Other',
 };
 

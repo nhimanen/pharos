@@ -34,9 +34,10 @@ public final class IndexVersions {
      *   <li>2 — Haskell body extraction now walks past the {@code name :: Type} signature
      *       to the sibling equation clause(s) instead of stopping at the signature line</li>
      *   <li>3 — added Terraform (.tf) parsing via TerraformCodeParser</li>
+     *   <li>4 — added Go (.go) parsing via GoCodeParser</li>
      * </ul>
      */
-    public static final int CHUNKING_VERSION = 3;
+    public static final int CHUNKING_VERSION = 4;
 
     /**
      * Fingerprint for a single embedding provider — includes everything that
