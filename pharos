@@ -873,11 +873,13 @@ def _invalidate_project_embeddings(index_dir: Path, project: str, scope: str) ->
 
     DOC_EXTS  = {".md", ".txt", ".yml", ".yaml", ".sh", ".xml"}
     JAVA_EXTS = {".java"}
+    GO_EXTS   = {".go"}
 
     def is_target(path: str) -> bool:
         ext = Path(path).suffix.lower()
         if scope == "docs": return ext in DOC_EXTS
         if scope == "java": return ext in JAVA_EXTS
+        if scope == "go":   return ext in GO_EXTS
         return True
 
     state = json.loads(state_file.read_text())
@@ -1440,9 +1442,9 @@ EXAMPLES
     p_inv.add_argument("--all", action="store_true", help="Invalidate every registered project")
     p_inv.add_argument(
         "--scope",
-        choices=["docs", "java", "all"],
+        choices=["docs", "java", "go", "all"],
         default="docs",
-        help="Which files to invalidate: docs (.md/.yml/etc), java (.java), or all (default: docs)",
+        help="Which files to invalidate: docs (.md/.yml/etc), java (.java), go (.go), or all (default: docs)",
     )
     p_inv.set_defaults(func=cmd_invalidate_embeddings)
 

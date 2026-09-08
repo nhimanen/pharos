@@ -14,6 +14,7 @@ import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.parser.CodeParser;
 import com.pharos.parser.JavaCodeParser;
 import com.pharos.parser.CMakeReader;
+import com.pharos.parser.GoModReader;
 import com.pharos.parser.GradleBuildReader;
 import com.pharos.parser.MavenPomReader;
 import com.pharos.parser.PackageJsonReader;
@@ -1391,10 +1392,12 @@ public class ProjectIndexManager {
      * project into the module-level dependency graph.
      *
      * Detection order (first match wins):
-     *   1. Maven  — pom.xml
-     *   2. Gradle — settings.gradle / build.gradle
-     *   3. Python — pyproject.toml / setup.py / setup.cfg
-     *   4. CMake  — CMakeLists.txt
+     *   1. Maven   — pom.xml
+     *   2. Gradle  — settings.gradle / build.gradle
+     *   3. Python  — pyproject.toml / setup.py / setup.cfg
+     *   4. Node.js — package.json
+     *   5. CMake   — CMakeLists.txt
+     *   6. Go      — go.mod / go.work
      *
      * For each newly auto-linked project, also triggers cross-project call graph linking.
      */
@@ -1413,6 +1416,9 @@ public class ProjectIndexManager {
         }
         if (pomInfoOpt.isEmpty() && CMakeReader.isCMakeProject(projectRoot)) {
             pomInfoOpt = new CMakeReader().read(projectRoot);
+        }
+        if (pomInfoOpt.isEmpty() && GoModReader.isGoProject(projectRoot)) {
+            pomInfoOpt = new GoModReader().read(projectRoot);
         }
 
         pomInfoOpt.ifPresentOrElse(
