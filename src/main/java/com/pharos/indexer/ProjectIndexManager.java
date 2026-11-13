@@ -148,6 +148,18 @@ public class ProjectIndexManager {
     }
 
     /**
+     * Older-format equivalents of {@link #compositeModelFingerprint()}. Only a single provider
+     * can have been recorded in the pre-multi-provider format, so this is empty otherwise.
+     */
+    private List<String> legacyCompositeModelFingerprints() {
+        List<EmbeddingProvider> avail = availableEmbedders();
+        if (avail.size() != 1) return List.of();
+        return config.findProviderConfig(avail.get(0).modelId())
+                .map(IndexVersions::legacyFingerprints)
+                .orElse(List.of());
+    }
+
+    /**
      * Per-model runtime state for the indexing pipeline: the provider itself,
      * its persistent cache, the on-disk path where Phase 2 spills decoded float[]
      * arrays, and the embedding batch size to use. One {@code EmbedRuntime}
@@ -199,8 +211,12 @@ public class ProjectIndexManager {
                         return e.modelId() + ":" + e.dimensions()
                                 + ":" + (url == null ? "" : url);
                     });
-            PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
-                    projectIndexDir, fp, e.dimensions());
+            // One cache file per model (shared files let models invalidate each other's
+            // caches) that also accepts the pre-multi-provider fingerprint format.
+            PersistentEmbeddingCache cache = PersistentEmbeddingCache.forModel(
+                    projectIndexDir, e.modelId(), fp,
+                    config.findProviderConfig(e.modelId()).map(IndexVersions::legacyFingerprints).orElse(List.of()),
+                    e.dimensions());
             String fileName = cacheFilePrefix + "." + sanitizeForFilename(e.modelId()) + ".cache";
             Path cachePath = projectIndexDir.resolve(fileName);
             int chunkSize = config.findProviderConfig(e.modelId())
@@ -367,7 +383,7 @@ public class ProjectIndexManager {
 
         String modelFp = compositeModelFingerprint();
         FileStateTracker stateTracker = new FileStateTracker(
-                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp);
+                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyCompositeModelFingerprints());
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per
         // available provider. Full and incremental paths use slightly different
         // cache-file prefixes so a parallel re-index can't clobber an in-progress

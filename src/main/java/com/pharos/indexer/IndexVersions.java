@@ -70,5 +70,22 @@ public final class IndexVersions {
         return url + ":" + config.getEmbeddingDimensions();
     }
 
+    /**
+     * Fingerprints that earlier pharos versions wrote for the <em>same</em> model as {@code cfg}.
+     *
+     * <p>Before multi-provider embeddings (commit 1715a31) the fingerprint was
+     * {@code embeddingModelUrl + ":" + dimensions}; it is now
+     * {@code modelId:dims:url:model}. Same weights, same dims, different string — so every
+     * existing embedding cache and file-state entry looked stale after upgrading, and the
+     * next re-index re-embedded the whole project. Caches and trackers accept these aliases
+     * and rewrite them in the current format on the next save.
+     */
+    public static java.util.List<String> legacyFingerprints(EmbeddingProviderConfig cfg) {
+        if (cfg == null || cfg.getUrl() == null || cfg.getUrl().isBlank() || cfg.getDimensions() <= 0) {
+            return java.util.List.of();
+        }
+        return java.util.List.of(cfg.getUrl() + ":" + cfg.getDimensions());
+    }
+
     private static String nvl(String s) { return s == null ? "" : s; }
 }
