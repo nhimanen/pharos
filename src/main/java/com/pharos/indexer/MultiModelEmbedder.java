@@ -92,8 +92,11 @@ public class MultiModelEmbedder {
 
         String targetField = DocumentMapper.vectorFieldFor(modelId);
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
-        PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
-                projectIndexDir, IndexVersions.modelFingerprint(cfg), provider.dimensions());
+        // Per-model file: sharing embed-cache.bin with the indexing model meant this command
+        // invalidated (and deleted) that model's cache.
+        PersistentEmbeddingCache cache = PersistentEmbeddingCache.forModel(
+                projectIndexDir, modelId, IndexVersions.modelFingerprint(cfg),
+                IndexVersions.legacyFingerprints(cfg), provider.dimensions());
 
         // ── Phase 1: collect per-doc info from the existing index ─────────────
         // For each docId in each segment: its FQN, file path, chunk count, and
