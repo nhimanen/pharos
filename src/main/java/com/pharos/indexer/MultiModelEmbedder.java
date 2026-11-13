@@ -11,7 +11,12 @@ import com.pharos.parser.model.ParsedFile;
 import com.pharos.parser.model.ParsedMethod;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.*;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.util.BytesRef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,17 +94,27 @@ public class MultiModelEmbedder {
             throw new IllegalStateException(
                     "Provider '" + modelId + "' is unavailable (failed to load). Aborting.");
         }
+        return embed(meta, provider, IndexVersions.modelFingerprint(cfg), force);
+    }
 
+    /** Core of {@link #embed(String, String, boolean)} with an already-resolved provider. */
+    int embed(ProjectMeta meta, EmbeddingProvider provider, String fingerprint,
+              boolean force) throws IOException {
+        String projectName = meta.getName();
+        String modelId = provider.modelId();
         String targetField = DocumentMapper.vectorFieldFor(modelId);
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
-                projectIndexDir, IndexVersions.modelFingerprint(cfg), provider.dimensions());
+                projectIndexDir, fingerprint, provider.dimensions());
 
         // ── Phase 1: collect per-doc info from the existing index ─────────────
         // For each docId in each segment: its FQN, file path, chunk count, and
         // every per-model vector currently attached. Per-model chunkVec.* values
         // are kept too so we can re-attach them in the rebuilt doc.
-        Map<String, DocSnapshot> snapshots = new LinkedHashMap<>();
+        // One snapshot per Lucene document. Do NOT key by id: pharos ids are not unique
+        // (same simple-named types in different files, doc files sharing a stem, …), and
+        // keying by id silently collapsed those docs into one.
+        List<DocSnapshot> snapshots = new ArrayList<>();
         IndexReader reader = luceneIndexer.openReader(projectName);
         Set<String> vecFieldNames = collectVectorFieldNames(reader);
 
@@ -134,6 +149,13 @@ public class MultiModelEmbedder {
                 snap.filePath  = doc.get(DocumentMapper.F_FILE_PATH);
                 snap.docType   = doc.get(DocumentMapper.F_DOC_TYPE);
                 snap.scope     = doc.get(DocumentMapper.F_SCOPE);
+                IndexableField sl = doc.getField(DocumentMapper.F_START_LINE);
+                snap.startLine = sl != null && sl.numericValue() != null ? sl.numericValue().intValue() : -1;
+                IndexableField deg = doc.getField(DocumentMapper.F_IN_DEGREE);
+                snap.inDegree  = deg != null && deg.numericValue() != null ? deg.numericValue().intValue() : 0;
+                String callers = doc.get(DocumentMapper.F_CALLER_CONTEXT);
+                snap.callerNames = callers == null || callers.isBlank()
+                        ? List.of() : List.of(callers.trim().split("\\s+"));
 
                 // Detect multi-chunk docs via the chunk-line-ranges marker.
                 BytesRef rangesRef = doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES);
@@ -165,7 +187,7 @@ public class MultiModelEmbedder {
                         if (br != null) snap.chunkVecsByField.put(name, br.bytes.clone());
                     }
                 }
-                snapshots.put(id, snap);
+                snapshots.add(snap);
             }
         }
 
@@ -173,7 +195,7 @@ public class MultiModelEmbedder {
 
         // ── Phase 2: group by file, parse, embed, updateDocument ─────────────
         Map<String, List<DocSnapshot>> byFile = new LinkedHashMap<>();
-        for (DocSnapshot s : snapshots.values()) {
+        for (DocSnapshot s : snapshots) {
             if (s.filePath == null) continue;
             byFile.computeIfAbsent(s.filePath, k -> new ArrayList<>()).add(s);
         }
@@ -200,10 +222,13 @@ public class MultiModelEmbedder {
                     log.debug("Parse failed for {}: {}", filePath.getFileName(), e.getMessage());
                     continue;
                 }
-                Map<String, ParsedMethod> byFqn = parsedFile.methods().stream()
-                        .collect(Collectors.toMap(ParsedMethod::fqn, m -> m, (a, b) -> a));
-                Map<String, ParsedClass> byQcn = parsedFile.classes().stream()
-                        .collect(Collectors.toMap(ParsedClass::qualifiedClassName, c -> c, (a, b) -> a));
+                // Keyed by the same "project:fqn" form as the stored id (the old fqn()/qcn keys
+                // never matched, so every doc was skipped). Lists, because one file can still
+                // hold several members with the same id; startLine picks the right one.
+                Map<String, List<ParsedMethod>> byId = parsedFile.methods().stream()
+                        .collect(Collectors.groupingBy(ParsedMethod::id));
+                Map<String, List<ParsedClass>> byClassId = parsedFile.classes().stream()
+                        .collect(Collectors.groupingBy(c -> projectName + ":" + c.qualifiedClassName()));
                 List<String> fileLines;
                 try { fileLines = Files.readAllLines(filePath); }
                 catch (IOException e) { fileLines = List.of(); }
@@ -217,10 +242,12 @@ public class MultiModelEmbedder {
                         continue;
                     }
 
-                    Document fresh = buildUpdatedDoc(snap, byFqn, byQcn, fileLines,
+                    Document fresh = buildUpdatedDoc(snap, byId, byClassId, fileLines,
                             provider, targetField, cache, projectName);
                     if (fresh == null) { skippedNoMatch++; continue; }
-                    writer.updateDocument(new Term(DocumentMapper.F_ID, snap.id), fresh);
+                    // Replace exactly this document. updateDocument(Term(id)) would delete every
+                    // doc sharing the id and write back only one of them.
+                    writer.updateDocuments(docKeyQuery(snap), List.of(fresh));
                     updated++;
                 }
             }
@@ -250,8 +277,8 @@ public class MultiModelEmbedder {
      * from the snapshot. Returns null when the FQN can't be matched in the
      * freshly parsed file (e.g. the source moved or was renamed).
      */
-    private Document buildUpdatedDoc(DocSnapshot snap, Map<String, ParsedMethod> byFqn,
-                                      Map<String, ParsedClass> byQcn, List<String> fileLines,
+    private Document buildUpdatedDoc(DocSnapshot snap, Map<String, List<ParsedMethod>> byId,
+                                      Map<String, List<ParsedClass>> byClassId, List<String> fileLines,
                                       EmbeddingProvider provider, String targetField,
                                       PersistentEmbeddingCache cache,
                                       String projectName) {
@@ -268,20 +295,17 @@ public class MultiModelEmbedder {
         }
 
         if ("method".equals(snap.docType) || "chunk".equals(snap.docType)) {
-            ParsedMethod method = byFqn.get(snap.id);
+            ParsedMethod method = pick(byId.get(snap.id), snap.startLine, ParsedMethod::startLine);
             if (method == null) return null;
             String text = DocumentMapper.buildEmbeddingText(method);
             float[] vec = embedWithCache(provider, text, cache);
             if (vec == null) return null;
             vectorsByModel.put(provider.modelId(), vec);
-            // Read inDegree + callerNames from the existing index. We're not
-            // re-building the graph, so these stay as recorded at the last
-            // full/incremental index.
-            int inDegree = 0;  // best-effort: graph data isn't on the snapshot path
-            List<String> callerNames = List.of();
-            return DocumentMapper.toDocument(method, vectorsByModel, inDegree, callerNames, fileLines);
+            // Graph-derived fields are carried over from the existing doc (the graph is not
+            // rebuilt here); previously they were reset to 0 / empty on every rewrite.
+            return DocumentMapper.toDocument(method, vectorsByModel, snap.inDegree, snap.callerNames, fileLines);
         } else if ("class".equals(snap.docType) || "document".equals(snap.docType)) {
-            ParsedClass cls = byQcn.get(snap.id);
+            ParsedClass cls = pick(byClassId.get(snap.id), snap.startLine, ParsedClass::startLine);
             if (cls == null) return null;
             String synthBody = synthesizedBody(cls);
             String text = DocumentMapper.buildClassEmbeddingText(cls, synthBody);
@@ -291,6 +315,32 @@ public class MultiModelEmbedder {
             return DocumentMapper.toClassDocument(cls, synthBody, vectorsByModel);
         }
         return null;
+    }
+
+    /**
+     * Chooses the parsed member that produced {@code snap}: the candidate declared on the
+     * same start line, or the only candidate when the line moved. Null when ambiguous.
+     */
+    static <T> T pick(List<T> candidates, int startLine, java.util.function.ToIntFunction<T> line) {
+        if (candidates == null || candidates.isEmpty()) return null;
+        for (T c : candidates) if (line.applyAsInt(c) == startLine) return c;
+        return candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    /**
+     * Matches exactly one document: (docType, filePath, startLine) is unique within a project
+     * index, unlike the id. All three are indexed in every existing index, so this needs no
+     * re-index or schema change.
+     */
+    static Query docKeyQuery(DocSnapshot snap) {
+        BooleanQuery.Builder b = new BooleanQuery.Builder()
+                .add(new TermQuery(new Term(DocumentMapper.F_ID, snap.id)), BooleanClause.Occur.FILTER)
+                .add(new TermQuery(new Term(DocumentMapper.F_FILE_PATH, snap.filePath)), BooleanClause.Occur.FILTER)
+                .add(IntPoint.newExactQuery(DocumentMapper.F_START_LINE, snap.startLine), BooleanClause.Occur.FILTER);
+        if (snap.docType != null) {
+            b.add(new TermQuery(new Term(DocumentMapper.F_DOC_TYPE, snap.docType)), BooleanClause.Occur.FILTER);
+        }
+        return b.build();
     }
 
     /** Persistent-cache wrapper around a single embed() call. */
@@ -348,11 +398,14 @@ public class MultiModelEmbedder {
     }
 
     /** Snapshot of one doc as it exists in the source Lucene index. */
-    private static final class DocSnapshot {
+    static final class DocSnapshot {
         String id;
         String filePath;
         String docType;
         String scope;
+        int startLine;
+        int inDegree;
+        List<String> callerNames = List.of();
         int chunkCount;
         /** fieldName → float[] (existing per-model KNN vectors). */
         final Map<String, float[]>  vectorsByField   = new LinkedHashMap<>();
