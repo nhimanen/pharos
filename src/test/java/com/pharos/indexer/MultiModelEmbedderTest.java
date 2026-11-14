@@ -119,6 +119,47 @@ class MultiModelEmbedderTest {
         assertThat(after.get(DocumentMapper.F_CALLER_CONTEXT)).isEqualTo(callersBefore);
     }
 
+    @Test
+    void staleMisOwnedDocFromAnOldIndex_isNotRewrittenAsADuplicate() throws Exception {
+        Path outer = projectRoot.resolve("src/main/java/com/example/Outer.java");
+        Files.writeString(outer, """
+                package com.example;
+                public class Outer {
+                  public Outer() { int o = 1; }
+                  public static class Inner {
+                    public Inner() { int i = 2; }
+                  }
+                }
+                """);
+        new ProjectIndexManager(config, luceneIndexer, registry,
+                new SelectiveIndexUpdateTest.CountingEmbeddingProvider(4),
+                new ModuleGraphBuilder(registry) {
+                    @Override public synchronized List<String> incorporate(Path r, ProjectMeta m,
+                            com.pharos.parser.MavenPomReader.PomInfo p) { return List.of(); }
+                }).index(projectRoot, "test", false, true);
+
+        // What the pre-fix parser also wrote: Inner() indexed under the outer class's id.
+        var innerCtor = new com.pharos.parser.JavaCodeParser().parseFile(outer, "test").methods().stream()
+                .filter(m -> m.id().equals("test:com.example.Outer.Inner#<init>()")).findFirst().orElseThrow();
+        var stale = new com.pharos.parser.model.ParsedMethod("test:com.example.Outer#<init>()", "test",
+                innerCtor.packageName(), "Outer", "com.example.Outer", innerCtor.methodName(), innerCtor.signature(),
+                innerCtor.returnType(), innerCtor.paramTypes(), innerCtor.paramNames(), "public Inner() { int i = 2; }",
+                null, innerCtor.annotations(), innerCtor.accessModifier(), false, true, false, false,
+                List.of(), List.of(), innerCtor.filePath(), innerCtor.startLine(), innerCtor.endLine());
+        try (var w = luceneIndexer.openWriter("test")) {
+            w.addDocument(DocumentMapper.toDocument(stale, new float[]{1, 0, 0, 0}));
+        }
+        assertThat(docs("test:com.example.Outer#<init>()")).hasSize(2);
+
+        new MultiModelEmbedder(config, luceneIndexer, registry)
+                .embed(registry.find("test").orElseThrow(), new NamedProvider("model-b", 4), "fp-b", false);
+
+        List<Document> outerCtors = docs("test:com.example.Outer#<init>()");
+        assertThat(outerCtors).extracting(d -> d.getField(DocumentMapper.F_START_LINE).numericValue().intValue())
+                .as("no second copy of Outer() at line 3").doesNotHaveDuplicates();
+        assertThat(outerCtors).anySatisfy(d -> assertThat(d.get(DocumentMapper.F_BODY)).contains("int o = 1"));
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     private DirectoryReader open() throws Exception {

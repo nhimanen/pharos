@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
+import java.util.function.ToIntFunction;
 import java.util.stream.Collectors;
 
 /**
@@ -233,9 +234,19 @@ public class MultiModelEmbedder {
                 try { fileLines = Files.readAllLines(filePath); }
                 catch (IOException e) { fileLines = List.of(); }
 
+                // An id that occurs more than once in this file (e.g. stale mis-owned docs from an
+                // index built before nested-type ownership was fixed) must match by line exactly:
+                // falling back to "the only parsed candidate" would rewrite the stale doc as a
+                // second copy of the real one.
+                Map<String, Long> idsInFile = entry.getValue().stream()
+                        .collect(Collectors.groupingBy(sn -> sn.id, Collectors.counting()));
                 for (DocSnapshot snap : entry.getValue()) {
                     // v1 limitation: skip multi-chunk docs.
                     if (snap.chunkCount > 1) { skippedMultiChunk++; continue; }
+                    // Without a start line the doc can't be addressed uniquely (see docKeyQuery);
+                    // updateDocuments would only add, duplicating it.
+                    if (snap.startLine < 0) { skippedNoMatch++; continue; }
+                    snap.idUniqueInFile = idsInFile.getOrDefault(snap.id, 0L) == 1;
                     // Idempotency: skip if the target field is already present and !force.
                     if (!force && snap.vectorsByField.containsKey(targetField)) {
                         skippedExisting++;
@@ -295,7 +306,7 @@ public class MultiModelEmbedder {
         }
 
         if ("method".equals(snap.docType) || "chunk".equals(snap.docType)) {
-            ParsedMethod method = pick(byId.get(snap.id), snap.startLine, ParsedMethod::startLine);
+            ParsedMethod method = pick(byId.get(snap.id), snap.startLine, ParsedMethod::startLine, snap.idUniqueInFile);
             if (method == null) return null;
             String text = DocumentMapper.buildEmbeddingText(method);
             float[] vec = embedWithCache(provider, text, cache);
@@ -305,7 +316,7 @@ public class MultiModelEmbedder {
             // rebuilt here); previously they were reset to 0 / empty on every rewrite.
             return DocumentMapper.toDocument(method, vectorsByModel, snap.inDegree, snap.callerNames, fileLines);
         } else if ("class".equals(snap.docType) || "document".equals(snap.docType)) {
-            ParsedClass cls = pick(byClassId.get(snap.id), snap.startLine, ParsedClass::startLine);
+            ParsedClass cls = pick(byClassId.get(snap.id), snap.startLine, ParsedClass::startLine, snap.idUniqueInFile);
             if (cls == null) return null;
             String synthBody = synthesizedBody(cls);
             String text = DocumentMapper.buildClassEmbeddingText(cls, synthBody);
@@ -318,13 +329,14 @@ public class MultiModelEmbedder {
     }
 
     /**
-     * Chooses the parsed member that produced {@code snap}: the candidate declared on the
-     * same start line, or the only candidate when the line moved. Null when ambiguous.
+     * Chooses the parsed member that produced a doc: the candidate declared on the same start
+     * line or — when {@code allowLineMoved} (the doc's id is unique in its file) — the only
+     * candidate. Null when ambiguous or stale.
      */
-    static <T> T pick(List<T> candidates, int startLine, java.util.function.ToIntFunction<T> line) {
+    static <T> T pick(List<T> candidates, int startLine, ToIntFunction<T> line, boolean allowLineMoved) {
         if (candidates == null || candidates.isEmpty()) return null;
         for (T c : candidates) if (line.applyAsInt(c) == startLine) return c;
-        return candidates.size() == 1 ? candidates.get(0) : null;
+        return allowLineMoved && candidates.size() == 1 ? candidates.get(0) : null;
     }
 
     /**
@@ -404,6 +416,8 @@ public class MultiModelEmbedder {
         String docType;
         String scope;
         int startLine;
+        /** True when no other snapshot in the same file has this id. */
+        boolean idUniqueInFile;
         int inDegree;
         List<String> callerNames = List.of();
         int chunkCount;
