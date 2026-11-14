@@ -108,15 +108,43 @@ DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate at daemon start once the log 
 DAEMON_LOG_KEEP = 2                        # daemon.log.1 … daemon.log.N are kept
 
 
+def _read_daemon_pid():
+    """PID recorded in daemon.pid, or None."""
+    try:
+        return int(DAEMON_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid):
+    """True if a process with this PID exists (signal 0 probes without sending anything)."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, owned by someone else
+    except OSError:
+        return False
+
+
 def _rotate_daemon_log():
     """Rotate daemon.log when it has grown past DAEMON_LOG_MAX_BYTES.
 
     The daemon appends to one file across restarts and nothing ever trimmed it (one install
-    reached 246 MB). Rotation happens only here, before a new daemon opens the file, so a
-    running daemon never has its log moved underneath it.
+    reached 246 MB). Rotation happens only here, before a new daemon opens the file, and is
+    skipped while the PID in daemon.pid is still alive — so a running daemon (even one too
+    slow to answer the /health probe) never has its log moved underneath it.
     """
     try:
         if not DAEMON_LOG_FILE.exists() or DAEMON_LOG_FILE.stat().st_size <= DAEMON_LOG_MAX_BYTES:
+            return
+        if _pid_alive(_read_daemon_pid()):
+            # A daemon is still alive (e.g. too busy to answer /health in time, or still
+            # shutting down after SIGTERM): it is writing to this file — leave it alone.
             return
         name = DAEMON_LOG_FILE.name
         # daemon.log.(N-1) → .N, …, daemon.log → .1 (the oldest is overwritten)
