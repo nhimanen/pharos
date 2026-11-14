@@ -222,6 +222,9 @@ public interface EmbeddingProvider {
      * ({@link DjlEmbeddingProvider} keeps one predictor per thread over a single model).
      * A dedicated {@link IndexConfig#getSearchEmbeddingProvider() searchEmbeddingProvider} is
      * a deliberately separate runtime and is still created on its own.
+     *
+     * <p>The returned instance may therefore be one of {@code indexingProviders}: it is shared,
+     * and owned by whoever built that list — don't close it on behalf of search.
      */
     static EmbeddingProvider searchProvider(IndexConfig config, List<EmbeddingProvider> indexingProviders) {
         Optional<EmbeddingProviderConfig> chosen = config.resolveSearchProvider();
