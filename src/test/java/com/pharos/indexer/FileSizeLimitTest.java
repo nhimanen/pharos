@@ -95,9 +95,9 @@ class FileSizeLimitTest {
     @Test
     void config_defaultsAndJsonRoundTrip() throws Exception {
         IndexConfig defaults = IndexConfig.defaults();
-        assertThat(defaults.getMaxDocumentFileSizeKb()).isEqualTo(1024);
-        assertThat(defaults.getMaxSourceFileSizeKb()).isEqualTo(10 * 1024);
-        assertThat(defaults.maxFileSizeBytes(true)).isEqualTo(1024L * 1024);
+        assertThat(defaults.getMaxDocumentFileSizeKb()).isEqualTo(10 * 1024);
+        assertThat(defaults.getMaxSourceFileSizeKb()).isEqualTo(100 * 1024);
+        assertThat(defaults.maxFileSizeBytes(true)).isEqualTo(10L * 1024 * 1024);
 
         IndexConfig parsed = new ObjectMapper().readValue(
                 "{\"maxDocumentFileSizeKb\": 64, \"maxSourceFileSizeKb\": 0}", IndexConfig.class);

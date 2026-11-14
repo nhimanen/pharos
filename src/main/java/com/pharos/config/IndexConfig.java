@@ -110,14 +110,14 @@ public class IndexConfig {
      * one embedding of its first few hundred tokens. A 457 MB file of this kind ran the
      * indexer out of memory. 0 = no limit.
      */
-    private long maxDocumentFileSizeKb = 1024;
+    private long maxDocumentFileSizeKb = 10 * 1024;
 
     /**
      * Safety cap for files handled by a language parser (Java, Go, Python, …). Code is split
      * into per-method documents, so large sources are fine; this only stops pathological
      * generated files. 0 = no limit.
      */
-    private long maxSourceFileSizeKb = 10 * 1024;
+    private long maxSourceFileSizeKb = 100 * 1024;
 
     // Jackson requires no-arg constructor
     public IndexConfig() {

@@ -347,8 +347,8 @@ Non-code files (Markdown, text, JSON, YAML, …) are indexed as a single documen
 
 ```json
 {
-  "maxDocumentFileSizeKb": 1024,
-  "maxSourceFileSizeKb": 10240
+  "maxDocumentFileSizeKb": 10240,
+  "maxSourceFileSizeKb": 102400
 }
 ```
 

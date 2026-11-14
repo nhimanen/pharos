@@ -64,7 +64,7 @@ public class GenericFileParser implements CodeParser {
     }
 
     /** Files larger than this are skipped (see IndexConfig#maxDocumentFileSizeKb). */
-    private long maxFileSizeBytes = 1024L * 1024;
+    private long maxFileSizeBytes = 10L * 1024 * 1024;
 
     /** @param maxFileSizeBytes files larger than this produce an empty result; ≤ 0 = no limit */
     public GenericFileParser(int parseThreads, long maxFileSizeBytes) {
