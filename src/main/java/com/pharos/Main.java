@@ -78,6 +78,9 @@ public class Main {
                         moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker));
 
         int exitCode = cmd.execute(args);
+        // Let background model calls (e.g. a server's warm-up) finish before exit runs ORT's
+        // shutdown hook, which frees the native environment under any call still running.
+        com.pharos.embedding.NativeInferenceGuard.beginShutdown();
         System.exit(exitCode);
     }
 
