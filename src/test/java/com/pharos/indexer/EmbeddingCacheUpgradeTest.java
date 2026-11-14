@@ -166,9 +166,10 @@ class EmbeddingCacheUpgradeTest {
             Path dir = config.getIndexDir().resolve("test");
             assertThat(dir.resolve("embed-cache.bin")).as("legacy model keeps the unsuffixed cache file").exists();
 
-            downgradeToPreUpgradeFingerprints(dir, "test-model:4");
+            downgradeToPreUpgradeFingerprints(dir, "test-model:4", true);
 
             embedder.reset();
+            // realistic: a pre-upgrade index also carries an older chunking version (1)
             manager.index(projectRoot, "test", false, true);   // full re-index
             assertThat(embedder.callCount()).as("all embeddings served from the old cache").isZero();
         }
@@ -177,7 +178,7 @@ class EmbeddingCacheUpgradeTest {
         void incrementalAfterUpgrade_doesNotMarkUnchangedFilesStale() throws Exception {
             manager.index(projectRoot, "test", false, true);
             Path dir = config.getIndexDir().resolve("test");
-            downgradeToPreUpgradeFingerprints(dir, "test-model:4");
+            downgradeToPreUpgradeFingerprints(dir, "test-model:4", false);
 
             FileStateTracker tracker = new FileStateTracker(dir, IndexVersions.CHUNKING_VERSION,
                     "legacy:4:test-model:", IndexVersions.legacyFingerprints(legacyProvider("test-model", 4)));
@@ -189,7 +190,7 @@ class EmbeddingCacheUpgradeTest {
         }
 
         /** Rewrites cache meta + file-state.json as a pre-multi-provider pharos left them. */
-        private void downgradeToPreUpgradeFingerprints(Path dir, String oldFp) throws Exception {
+        private void downgradeToPreUpgradeFingerprints(Path dir, String oldFp, boolean oldChunkingVersion) throws Exception {
             Path meta = dir.resolve("embed-cache.meta");
             ObjectNode m = (ObjectNode) JSON.readTree(meta.toFile());
             m.put("fingerprint", oldFp);
@@ -198,7 +199,9 @@ class EmbeddingCacheUpgradeTest {
             Path state = dir.resolve("file-state.json");
             String s = Files.readString(state);
             assertThat(s).contains("legacy:4:test-model:");
-            Files.writeString(state, s.replace("legacy:4:test-model:", oldFp));
+            s = s.replace("legacy:4:test-model:", oldFp);
+            if (oldChunkingVersion) s = s.replaceAll("\"chunkingVersion\"\\s*:\\s*\\d+", "\"chunkingVersion\" : 1");
+            Files.writeString(state, s);
         }
     }
 

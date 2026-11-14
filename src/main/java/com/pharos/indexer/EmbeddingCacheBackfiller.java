@@ -106,8 +106,10 @@ public class EmbeddingCacheBackfiller {
             return 0;
         }
 
-        // Fill the same per-model cache file the indexer reads (first configured provider).
+        // Fill the same per-model cache file the indexer reads (first configured provider), with
+        // that provider's dims — the cache is ignored on load if they differ from the model's.
         var primary = config.getEmbeddingProviders().isEmpty() ? null : config.getEmbeddingProviders().get(0);
+        if (primary != null && primary.getDimensions() > 0) dims = primary.getDimensions();
         PersistentEmbeddingCache cache = primary == null
                 ? new PersistentEmbeddingCache(projectIndexDir, modelFp, dims)
                 : PersistentEmbeddingCache.forModel(projectIndexDir, primary.getModelId(), modelFp,
