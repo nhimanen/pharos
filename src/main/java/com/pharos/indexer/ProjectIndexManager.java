@@ -365,7 +365,11 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        String modelFp = compositeModelFingerprint();
+        // Without embeddings no model is involved: stamp "none" rather than the configured
+        // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
+        // were embedded, so a later normal `index` never embedded unchanged files — and
+        // computing it forced the models to load for `index --no-embed`.
+        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
         FileStateTracker stateTracker = new FileStateTracker(
                 projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp);
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per

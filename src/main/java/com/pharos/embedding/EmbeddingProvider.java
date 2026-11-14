@@ -193,9 +193,11 @@ public interface EmbeddingProvider {
                     "Add an entry to 'embeddingProviders' in ~/.pharos/config.json to enable.");
             return List.of();
         }
+        // Lazy: the model is loaded the first time something embeds (or asks isAvailable()),
+        // so commands that never embed don't pay ~1.1 GB and a multi-second load per model.
         List<EmbeddingProvider> out = new ArrayList<>(cfgs.size());
         for (EmbeddingProviderConfig cfg : cfgs) {
-            out.add(create(cfg));
+            out.add(new LazyEmbeddingProvider(cfg.getModelId(), cfg.getDimensions(), () -> create(cfg)));
         }
         return out;
     }
@@ -230,7 +232,8 @@ public interface EmbeddingProvider {
                 if (modelId != null && modelId.equals(p.modelId())) return p;
             }
         }
-        return create(chosen.get());
+        EmbeddingProviderConfig cfg = chosen.get();
+        return new LazyEmbeddingProvider(cfg.getModelId(), cfg.getDimensions(), () -> create(cfg));
     }
 
     /**

@@ -116,8 +116,12 @@ public class SearchEngine {
     private final EmbeddingProvider     embedder;
     private final QueryRouter queryRouter;
     private final ZeroResultAdvisor zeroResultAdvisor;
-    private final Map<SearchRequest.SearchType, SearchPipeline> pipelines;
-    private final List<PipelineDescriptor> pipelineDescriptors;
+    /**
+     * Built on first use: pipeline selection asks the embedder / cross-encoder whether they are
+     * available, which loads their models. Building in the constructor loaded both models in
+     * every pharos process, including ones that only do graph lookups.
+     */
+    private final java.util.function.Supplier<PipelineFactory.Result> builtPipelines;
 
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
@@ -143,15 +147,13 @@ public class SearchEngine {
         this.vectorStrategy  = vec;
         this.zeroResultAdvisor = new ZeroResultAdvisor(luceneIndexer, registry, kw);
 
-        PipelineFactory factory = new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter);
-        PipelineFactory.Result built = factory.build(loadPipelineConfigs());
-        this.pipelines           = built.pipelines();
-        this.pipelineDescriptors = built.descriptors();
+        this.builtPipelines = memoize(() ->
+                new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs()));
     }
 
     /** Returns the ordered list of available pipelines for UI display. */
     public List<PipelineDescriptor> listPipelines() {
-        return pipelineDescriptors;
+        return builtPipelines.get().descriptors();
     }
 
     /**
@@ -218,7 +220,7 @@ public class SearchEngine {
         // a clear exception beats silently returning empty results, which is the
         // failure mode an unsuspecting user would otherwise see after swapping
         // searchEmbeddingModel without re-indexing.
-        if (embedder.isAvailable() && requiresVectors(req.type())) {
+        if (requiresVectors(req.type()) && embedder.isAvailable()) {
             validateSearchModelAvailable(projects);
         }
 
@@ -244,6 +246,7 @@ public class SearchEngine {
             }
         }
 
+        Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
@@ -261,9 +264,26 @@ public class SearchEngine {
                 keywordStrategy.buildQuery(new SearchRequest(
                         hints.cleanedQuery(), resolvedType, req.project(), req.projects(),
                         req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())));
-        SnippetResolver vecResolver = embedder.isAvailable()
-                ? vectorStrategy.buildVectorResolver(reader, embedder.embed(hints.cleanedQuery()))
-                : SnippetResolver.none();
+        // Deferred: the query is embedded (and the model loaded) only when a snippet is actually
+        // resolved — not for undecorated or empty responses.
+        String snippetQuery = hints.cleanedQuery();
+        SnippetResolver vecResolver = new SnippetResolver() {
+            private volatile SnippetResolver inner;
+            @Override public Snippet resolve(SearchResult r) {
+                SnippetResolver i = inner;
+                if (i == null) {
+                    synchronized (this) {
+                        i = inner;
+                        if (i == null) {
+                            inner = i = embedder.isAvailable()
+                                    ? vectorStrategy.buildVectorResolver(reader, embedder.embed(snippetQuery))
+                                    : SnippetResolver.none();
+                        }
+                    }
+                }
+                return i.resolve(r);
+            }
+        };
 
         if (!expand) {
             return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver);
@@ -742,6 +762,46 @@ public class SearchEngine {
      *       internally; return 0 to leave them untouched.</li>
      * </ul>
      */
+    /**
+     * Loads the search-time models (query embedder, cross-encoder) on a background daemon
+     * thread, so a long-running server answers health and graph requests immediately and its
+     * first search does not wait for the multi-second model load. One-shot CLI commands don't
+     * call this and never load models they don't use. A search arriving mid-warm-up waits for
+     * the same one-time load rather than starting a second one.
+     */
+    public Thread warmUpInBackground() {
+        Thread t = new Thread(() -> {
+            long t0 = System.nanoTime();
+            try {
+                builtPipelines.get();                       // isAvailable() → loads embedder + cross-encoder
+                if (embedder.isAvailable()) embedder.embed("warm up");   // first ONNX run initialises the session
+                log.info("Search models ready ({} ms)", (System.nanoTime() - t0) / 1_000_000);
+            } catch (RuntimeException e) {
+                log.warn("Model warm-up failed: {}", e.getMessage());
+            }
+        }, "pharos-model-warmup");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    /** Thread-safe, compute-once supplier. */
+    private static <T> java.util.function.Supplier<T> memoize(java.util.function.Supplier<T> s) {
+        return new java.util.function.Supplier<>() {
+            private volatile T value;
+            @Override public T get() {
+                T v = value;
+                if (v == null) {
+                    synchronized (this) {
+                        v = value;
+                        if (v == null) value = v = s.get();
+                    }
+                }
+                return v;
+            }
+        };
+    }
+
     /**
      * Loads pipeline configuration from {@code ~/.pharos/pipelines.yaml} if it exists,
      * otherwise falls back to the bundled {@code pipelines.yaml} on the classpath.
