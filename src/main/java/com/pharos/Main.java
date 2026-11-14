@@ -23,6 +23,7 @@ import com.pharos.embedding.CrossEncoderProvider;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderProviderAdapter;
+import com.pharos.search.pipeline.LazyCrossEncoder;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,12 +85,15 @@ public class Main {
 
     private static CrossEncoder buildCrossEncoder(IndexConfig config) {
         if (!config.isCrossEncoderEnabled()) return new NoOpCrossEncoder();
-        try {
-            return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
-        } catch (Exception e) {
-            log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
-            return new NoOpCrossEncoder();
-        }
+        // Loaded on first rerank, not at startup — most commands never rerank.
+        return new LazyCrossEncoder(() -> {
+            try {
+                return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
+            } catch (Exception e) {
+                log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
+                return new NoOpCrossEncoder();
+            }
+        });
     }
 
     /**
@@ -162,7 +166,7 @@ public class Main {
                 return (K) new ModulePathCommand(moduleGraphBuilder);
             if (cls == WebCommand.class)
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
-                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer));
+                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer), searchEngine);
             if (cls == RemoveIndexCommand.class)
                 return (K) new RemoveIndexCommand(registry, indexManager);
             if (cls == BackfillEmbeddingCacheCommand.class)
