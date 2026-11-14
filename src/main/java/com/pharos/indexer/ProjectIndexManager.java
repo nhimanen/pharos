@@ -1479,8 +1479,10 @@ public class ProjectIndexManager {
      * Patches the persisted call graph for an incremental run:
      * <ol>
      *   <li>Open the existing ArcadeDB call graph (created if absent).</li>
-     *   <li>Evict all vertices for dirty and deleted files' class prefixes.</li>
+     *   <li>Detach the outgoing edges of the dirty and deleted files' classes (their vertices,
+     *       and the edges from unchanged files into them, are kept).</li>
      *   <li>Splice in new vertices/edges for each freshly-parsed dirty file.</li>
+     *   <li>{@link CallGraph#completeEviction()}: delete the members that are gone from the source.</li>
      * </ol>
      * This avoids a full project re-parse just to rebuild the graph on every incremental run.
      */
@@ -1489,7 +1491,7 @@ public class ProjectIndexManager {
                              List<Path> deletedFiles,
                              FileStateTracker stateTracker) {
         Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
-        try (CallGraph graph = CallGraph.open(dbDir)) {
+        try (CallGraph graph = CallGraph.open(dbDir, true)) {
             log.debug("Opened call graph for patching: {} methods", graph.methodCount());
 
             // Collect class prefixes to evict (deleted files + dirty files)
@@ -1520,6 +1522,11 @@ public class ProjectIndexManager {
                                .orElse(com.pharos.parser.model.ParsedRelationships.empty("incremental"));
                 new com.pharos.graph.KnowledgeGraphBuilder().build(graph, rel);
             }
+            // The dirty files' classes still exist even if nothing above re-added their CodeType
+            // (e.g. an edited interface with no supertypes or fields).
+            List<String> presentClasses = new ArrayList<>();
+            for (ParsedFile pf : parsedDirtyFiles) pf.classes().forEach(c -> presentClasses.add(c.qualifiedClassName()));
+            graph.keep(presentClasses);
             // Delete only the evicted members that are gone from the source; edges from
             // unchanged files into the patched classes are kept.
             graph.completeEviction();
@@ -1567,7 +1574,7 @@ public class ProjectIndexManager {
                                               com.pharos.parser.model.ParsedRelationships relationships,
                                               Path projectIndexDir) {
         Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
-        try (CallGraph graph = CallGraph.open(dbDir)) {
+        try (CallGraph graph = CallGraph.open(dbDir, true)) {
             graph.clear();
             new CallGraphBuilder().build(graph, project);
             new KnowledgeGraphBuilder().build(graph, relationships);

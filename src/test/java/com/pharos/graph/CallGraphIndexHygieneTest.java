@@ -52,22 +52,28 @@ class CallGraphIndexHygieneTest {
     }
 
     @Test
-    void repeatedIncrementalPatches_keepIndexesBounded() {
+    void repeatedIncrementalPatches_keepIndexesBounded() throws Exception {
         Path dbDir = tmp.resolve("cg");
         try (CallGraph g = CallGraph.open(dbDir)) {
             for (int c = 0; c < 50; c++) addClass(g, "C" + c, 10);
             g.flush();
         }
-        for (int cycle = 0; cycle < 300; cycle++) {           // 300 × 10 = 3,000 deletions > 2,000 threshold
-            try (CallGraph g = CallGraph.open(dbDir)) {
+        Path churn = dbDir.resolveSibling(dbDir.getFileName() + ".index-churn");
+        boolean rebuilt = false;
+        for (int cycle = 0; cycle < 300; cycle++) {
+            try (CallGraph g = CallGraph.open(dbDir, true)) {
                 g.evictClasses(List.of("C7"));
-                addClass(g, "C7", 10);
+                // every edit renames C7's methods, so the old ones are really deleted
+                for (int m = 0; m < 10; m++) g.addMethod("C7#v" + cycle + "_" + m + "()", "C7");
                 g.flush();
-                assertThat(g.callers("C7#m0()")).isNotNull();
+                g.completeEviction();
             }
+            long c = Long.parseLong(Files.readString(churn).trim());
+            if (cycle > 0 && c < 10) rebuilt = true;          // counter reset → rebuild ran
         }
-        // Without rebuilds this grows superlinearly (2,437 classPrefix entries after only 5 cycles).
-        assertThat(indexEntries(dbDir, "Method[fqn]")).isLessThan(2 * 500 + 2_000);
+        assertThat(rebuilt).as("churn past the threshold triggered a rebuild").isTrue();
+        // 3,000 real deletions; without rebuilds stale entries grow superlinearly
+        assertThat(indexEntries(dbDir, "Method[fqn]")).isLessThan(500 + 2_000 + 500);
         assertThat(indexEntries(dbDir, "Method[classPrefix]")).isLessThan(10 * 500);
     }
 
@@ -91,8 +97,13 @@ class CallGraphIndexHygieneTest {
         Files.deleteIfExists(dbDir.resolveSibling(dbDir.getFileName() + ".index-v2"));
         assertThat(indexEntries(dbDir, "Method[fqn]")).isGreaterThan(500);    // corrupted
 
-        try (CallGraph g = CallGraph.open(dbDir)) {
-            assertThat(g.methodCount()).isEqualTo(500);
+        try (CallGraph reader = CallGraph.open(dbDir)) {
+            assertThat(reader.methodCount()).isEqualTo(500);
+        }
+        assertThat(indexEntries(dbDir, "Method[fqn]")).as("readers never rebuild").isGreaterThan(500);
+
+        try (CallGraph writer = CallGraph.open(dbDir, true)) {
+            assertThat(writer.methodCount()).isEqualTo(500);
         }
 
         assertThat(indexEntries(dbDir, "Method[fqn]")).isEqualTo(500);

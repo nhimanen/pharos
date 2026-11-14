@@ -88,12 +88,23 @@ public class CallGraph implements AutoCloseable {
      * Schema is auto-created on first open.
      */
     public static CallGraph open(Path dbDir) {
+        return open(dbDir, false);
+    }
+
+    /**
+     * @param repairIndexes when true (indexing / linking — the writers), a graph written by an
+     *                      earlier pharos version gets its indexes rebuilt once. Readers pass
+     *                      false so a search or lookup never pays for, or blocks on, a rebuild.
+     */
+    public static CallGraph open(Path dbDir, boolean repairIndexes) {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
-        Database db = factory.exists() ? factory.open() : factory.create();
+        boolean created = !factory.exists();
+        Database db = created ? factory.create() : factory.open();
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);
-        graph.repairIndexesOnce();
+        if (created) graph.markFreshDatabase();
+        else if (repairIndexes) graph.repairIndexesOnce();
         return graph;
     }
 
@@ -126,19 +137,53 @@ public class CallGraph implements AutoCloseable {
         log.debug("Rebuilt call-graph indexes in {} ms", (System.nanoTime() - t0) / 1_000_000);
     }
 
+    /** Rebuilds the non-unique indexes of {@code type} (Method[classPrefix], CodeField[ownerFqn]). */
+    private void rebuildNonUniqueIndexes(String type) {
+        if (!db.getSchema().existsType(type)) return;
+        // Collect names first: REBUILD drops and recreates the index in the type's collection.
+        List<String> names = new ArrayList<>();
+        for (var ix : db.getSchema().getType(type).getAllIndexes(false)) {
+            if (!ix.isUnique()) names.add(ix.getName());
+        }
+        for (String name : names) {
+            try {
+                db.command("sql", "REBUILD INDEX `" + name + "`");
+            } catch (Exception e) {
+                log.warn("Could not rebuild index {} of {}: {}", name, dbDir, e.getMessage());
+            }
+        }
+    }
+
     /** One-time repair of graphs written by earlier versions (which grew stale entries). */
     private void repairIndexesOnce() {
         if (dbDir == null) return;
         Path marker = sibling(INDEX_REPAIRED_SUFFIX);
         if (Files.exists(marker)) return;
+        long t0 = System.nanoTime();
         try {
-            long t0 = System.nanoTime();
             rebuildIndexes();
-            Files.writeString(marker, "rebuilt\n");
-            log.info("Repaired call-graph indexes of {} ({} ms)", dbDir.getFileName(),
-                    (System.nanoTime() - t0) / 1_000_000);
         } catch (Exception e) {
             log.warn("Could not rebuild call-graph indexes of {}: {}", dbDir, e.getMessage());
+            return;
+        }
+        log.info("Repaired call-graph indexes of {} ({} ms)", dbDir.getFileName(),
+                (System.nanoTime() - t0) / 1_000_000);
+        writeMarker(marker);
+    }
+
+    /** A database created by this version has clean indexes: mark it and reset any old churn. */
+    private void markFreshDatabase() {
+        if (dbDir == null) return;
+        writeChurn(0);
+        writeMarker(sibling(INDEX_REPAIRED_SUFFIX));
+    }
+
+    private void writeMarker(Path marker) {
+        try {
+            Files.writeString(marker, "rebuilt\n");
+        } catch (Exception e) {
+            log.warn("Could not write {} (the index repair will run again next time): {}",
+                    marker, e.getMessage());
         }
     }
 
@@ -171,7 +216,13 @@ public class CallGraph implements AutoCloseable {
         long churn = readChurn() + deleted;
         long live = db.countType("Method", false);
         if (churn > Math.max(CHURN_REBUILD_MIN, (long) (live * CHURN_REBUILD_RATIO))) {
-            rebuildIndexes();
+            try {
+                rebuildIndexes();
+            } catch (Exception e) {
+                // the patch itself succeeded; retry the rebuild on a later run
+                log.warn("Could not rebuild call-graph indexes of {}: {}", dbDir, e.getMessage());
+                writeChurn(churn);
+            }
         } else {
             writeChurn(churn);
         }
@@ -354,6 +405,15 @@ public class CallGraph implements AutoCloseable {
     }
 
     /**
+     * Marks vertices as still present in the source during a patch, so {@link #completeEviction}
+     * keeps them even when the re-parse added nothing for them — e.g. an edited interface's own
+     * CodeType, whose implementers in unchanged files point at it.
+     */
+    public void keep(Collection<String> fqns) {
+        if (!pendingEviction.isEmpty()) readdedSinceEviction.addAll(fqns);
+    }
+
+    /**
      * Finishes an incremental patch started by {@link #evictClasses}: deletes the evicted
      * classes' vertices that were not re-added (and with them any edges into them).
      */
@@ -362,16 +422,23 @@ public class CallGraph implements AutoCloseable {
         flush();
         flushKnowledge();
         long deleted = 0;
+        Set<String> typesWithDeletions = new LinkedHashSet<>();
         db.begin();
         for (Map.Entry<String, Set<String>> e : pendingEviction.entrySet()) {
             for (String fqn : e.getValue()) {
                 if (readdedSinceEviction.contains(fqn)) continue;
-                deleted += deletedCount(db.command("sql", "DELETE VERTEX FROM " + e.getKey() + " WHERE fqn = ?", fqn));
+                long n = deletedCount(db.command("sql", "DELETE VERTEX FROM " + e.getKey() + " WHERE fqn = ?", fqn));
+                if (n > 0) typesWithDeletions.add(e.getKey());
+                deleted += n;
             }
         }
         db.commit();
         pendingEviction.clear();
         readdedSinceEviction.clear();
+        // Non-unique indexes accumulate stale entries per key quadratically (one class whose
+        // methods keep changing grew Method[classPrefix] to 540k entries in ~100 edits), so a
+        // count threshold can't bound them: rebuild them whenever members were really removed.
+        for (String type : typesWithDeletions) rebuildNonUniqueIndexes(type);
         recordDeletions(deleted);
         log.debug("Patch complete: removed {} vertex(es) no longer in the source", deleted);
     }
@@ -608,7 +675,18 @@ public class CallGraph implements AutoCloseable {
                 // Fast path: use in-memory set — O(1), handles intra- and inter-batch duplicates.
                 if (!insertedMethodFqns.add(m[0])) continue;
             } else {
-                if (db.query("sql", "SELECT @rid FROM Method WHERE fqn = ?", m[0]).hasNext()) continue;
+                ResultSet existing = db.query("sql", "SELECT FROM Method WHERE fqn = ?", m[0]);
+                if (existing.hasNext()) {
+                    // A call from another file of the same patch may have created this method as
+                    // an external stub (empty classPrefix): give it its class, or it stays out of
+                    // allFqns() and eviction, and its outgoing edges duplicate on later patches.
+                    Vertex v = existing.next().getVertex().orElse(null);
+                    Object prefix = v != null ? v.get("classPrefix") : null;
+                    if (v != null && !m[1].isEmpty() && (prefix == null || prefix.toString().isEmpty())) {
+                        v.modify().set("classPrefix", m[1]).save();
+                    }
+                    continue;
+                }
             }
             MutableVertex v = db.newVertex("Method");
             v.set("fqn", m[0]);
@@ -756,8 +834,16 @@ public class CallGraph implements AutoCloseable {
 
     @Override
     public void close() {
-        if (db.isOpen()) {
-            completeEviction();   // a patch that wasn't completed explicitly still finishes cleanly
+        if (!db.isOpen()) return;
+        try {
+            flush();
+            flushKnowledge();
+        } finally {
+            // A patch that wasn't completed explicitly (e.g. it failed half-way) is abandoned,
+            // not completed: stale vertices are safer than deleting members — and edges from
+            // unchanged files — that the failed patch never got to re-add.
+            pendingEviction.clear();
+            readdedSinceEviction.clear();
             db.close();
         }
     }

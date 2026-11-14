@@ -107,4 +107,68 @@ class IncrementalGraphPatchTest {
         }
         assertThat(callers("com.example.B#b()")).containsExactly("com.example.A#a()");
     }
+
+    @Test
+    void editingAnInterface_keepsImplementersInUnchangedFiles() throws Exception {
+        Files.writeString(pkg.resolve("Shape.java"), "package com.example;\npublic interface Shape { double area(); }\n");
+        Files.writeString(pkg.resolve("Square.java"),
+                "package com.example;\npublic class Square implements Shape { public double area() { return 1; } }\n");
+        manager.index(root, "test", false, false);
+        Path db = config.getIndexDir().resolve("test").resolve("callgraph.arcadedb");
+        try (CallGraph g = CallGraph.open(db)) {
+            assertThat(g.directSubclasses("com.example.Shape")).contains("com.example.Square");
+        }
+
+        Files.writeString(pkg.resolve("Shape.java"),
+                "package com.example;\npublic interface Shape { double area(); double perimeter(); }\n");
+        manager.index(root, "test", true, false);
+
+        try (CallGraph g = CallGraph.open(db)) {
+            assertThat(g.directSubclasses("com.example.Shape")).as("Square.java was not edited")
+                    .contains("com.example.Square");
+        }
+    }
+
+    @Test
+    void newMethodCalledFromAnotherEditedFile_isARealMemberNotAStub() throws Exception {
+        manager.index(root, "test", false, false);
+
+        Files.writeString(pkg.resolve("A.java"), """
+                package com.example;
+                public class A { public void a() { new B().b(); new B().d(); } }
+                """);
+        Files.writeString(pkg.resolve("B.java"), """
+                package com.example;
+                public class B { public void b() { c(); } public void c() {} public void d() {} }
+                """);
+        manager.index(root, "test", true, false);
+
+        try (CallGraph g = CallGraph.open(config.getIndexDir().resolve("test").resolve("callgraph.arcadedb"))) {
+            assertThat(g.allFqns()).as("B#d() owned by class B").contains("com.example.B#d()");
+            assertThat(g.callers("com.example.B#d()")).containsExactly("com.example.A#a()");
+        }
+    }
+
+    @Test
+    void methodFirstSeenAsACallTarget_getsItsClassWhenAddedLater() {
+        Path db = tmp.resolve("direct-stub").resolve("callgraph.arcadedb");
+        try (CallGraph g = CallGraph.open(db, true)) {
+            g.addMethod("com.example.B#b()", "com.example.B");
+            g.flush();
+        }
+        try (CallGraph g = CallGraph.open(db, true)) {
+            g.evictClasses(List.of("com.example.A", "com.example.B"));
+            // A.java processed first: its call creates B#d() as an external stub
+            g.addMethod("com.example.A#a()", "com.example.A");
+            g.addCall("com.example.A#a()", "com.example.B#d()");
+            g.flush();
+            // then B.java declares it
+            g.addMethod("com.example.B#b()", "com.example.B");
+            g.addMethod("com.example.B#d()", "com.example.B");
+            g.flush();
+            g.completeEviction();
+            assertThat(g.allFqns()).contains("com.example.B#d()");
+            assertThat(g.callers("com.example.B#d()")).containsExactly("com.example.A#a()");
+        }
+    }
 }
