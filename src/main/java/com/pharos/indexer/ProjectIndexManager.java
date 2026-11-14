@@ -757,11 +757,11 @@ public class ProjectIndexManager {
         meta.setEmbeddedModels(runtimes.stream()
                 .map(EmbedRuntime::modelId)
                 .collect(Collectors.toList()));
-        // Inherit known packages and unresolved refs from the previous registry entry so
-        // cross-project linking can still work without a full parse
+        // Inherit known packages and the refs hash from the previous registry entry. The refs
+        // themselves stay in unresolved-refs.json (written by the last full parse); the meta
+        // carries none, so register() leaves that file untouched and linking reads it.
         registry.find(projectName).ifPresent(prev -> {
             meta.setKnownPackages(prev.getKnownPackages());
-            meta.setUnresolvedRefs(prev.getUnresolvedRefs());
             meta.setUnresolvedRefsHash(prev.getUnresolvedRefsHash());
         });
         registry.register(meta);
