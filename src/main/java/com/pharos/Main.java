@@ -48,7 +48,8 @@ public class Main {
         // Build all configured embedding providers — indexing writes one vector
         // field per model; search picks one provider via config.searchEmbeddingModel.
         List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
-        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config);
+        // Same instance as the matching indexing provider — not a second copy of the model.
+        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config, embedders);
         LuceneIndexer luceneIndexer = new LuceneIndexer(config);
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();

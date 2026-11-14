@@ -207,8 +207,29 @@ public interface EmbeddingProvider {
      * nothing is configured.
      */
     static EmbeddingProvider searchProvider(IndexConfig config) {
+        return searchProvider(config, List.of());
+    }
+
+    /**
+     * Like {@link #searchProvider(IndexConfig)}, but reuses the instance already built for
+     * indexing (by {@link #createAll}) when search uses one of the indexing models.
+     *
+     * <p>Without this, the search model was loaded a second time — for a local ONNX model that
+     * is a second copy of the weights and runtime arenas (~1.1 GB for jina-v2-base-code) in
+     * every pharos process, whatever the command. Sharing is safe: providers are thread-safe
+     * ({@link DjlEmbeddingProvider} keeps one predictor per thread over a single model).
+     * A dedicated {@link IndexConfig#getSearchEmbeddingProvider() searchEmbeddingProvider} is
+     * a deliberately separate runtime and is still created on its own.
+     */
+    static EmbeddingProvider searchProvider(IndexConfig config, List<EmbeddingProvider> indexingProviders) {
         Optional<EmbeddingProviderConfig> chosen = config.resolveSearchProvider();
         if (chosen.isEmpty()) return new NoOpEmbeddingProvider();
+        if (config.getSearchEmbeddingProvider() == null) {
+            String modelId = chosen.get().getModelId();
+            for (EmbeddingProvider p : indexingProviders) {
+                if (modelId != null && modelId.equals(p.modelId())) return p;
+            }
+        }
         return create(chosen.get());
     }
 
