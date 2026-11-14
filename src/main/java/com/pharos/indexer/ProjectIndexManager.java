@@ -12,6 +12,7 @@ import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.parser.CodeParser;
+import com.pharos.parser.GenericFileParser;
 import com.pharos.parser.JavaCodeParser;
 import com.pharos.parser.CMakeReader;
 import com.pharos.parser.GoModReader;
@@ -229,6 +230,34 @@ public class ProjectIndexManager {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * Applies the per-kind file-size limits during one discovery walk and remembers what it
+     * skipped, so a run logs one summary line instead of one line per file.
+     */
+    private final class OversizedFiles {
+        private int count;
+        private long largest;
+        private Path largestPath;
+
+        /** True when {@code file} (handled by {@code parser}) exceeds its limit and must be skipped. */
+        boolean skip(Path file, long size, CodeParser parser) {
+            boolean document = parser instanceof GenericFileParser;
+            if (size <= config.maxFileSizeBytes(document)) return false;
+            count++;
+            if (size > largest) { largest = size; largestPath = file; }
+            log.debug("Not indexing {} ({} KB exceeds the {} limit)", file, size / 1024,
+                    document ? "maxDocumentFileSizeKb" : "maxSourceFileSizeKb");
+            return true;
+        }
+
+        void report(String projectName) {
+            if (count == 0) return;
+            log.info("Skipped {} file(s) over the size limit in '{}' (largest: {}, {} KB). "
+                            + "Raise maxDocumentFileSizeKb / maxSourceFileSizeKb in config.json to include them.",
+                    count, projectName, largestPath, largest / 1024);
+        }
+    }
+
     /** Returns the parser that handles the given file, or null if none match. */
     private CodeParser parserFor(Path file) {
         String name = file.getFileName().toString();
@@ -409,6 +438,7 @@ public class ProjectIndexManager {
                 ".idea", ".vscode",
                 "logs", "log", "tmp", "temp", ".cache"
         );
+        OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
@@ -421,6 +451,7 @@ public class ProjectIndexManager {
                 String name = file.getFileName().toString();
                 for (CodeParser p : parsers) {
                     if (p.supportedExtensions().stream().anyMatch(name::endsWith)) {
+                        if (oversized.skip(file, attrs.size(), p)) break;
                         filesByParser.get(p).add(file);
                         if (!anyChanges[0] && stateTracker.isDirty(file)) anyChanges[0] = true;
                         break;
@@ -429,6 +460,8 @@ public class ProjectIndexManager {
                 return FileVisitResult.CONTINUE;
             }
         });
+
+        oversized.report(projectName);
 
         // Also treat removed files as a change.
         if (!anyChanges[0]) {
@@ -532,6 +565,7 @@ public class ProjectIndexManager {
                 "logs", "log", "tmp", "temp", ".cache"
         );
         Set<Path> currentFiles = new java.util.HashSet<>();
+        OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
@@ -546,6 +580,9 @@ public class ProjectIndexManager {
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                 String name = file.getFileName().toString();
                 boolean supported = supportedExts.stream().anyMatch(name::endsWith);
+                // A file over the size limit is not "current": if it was indexed before it grew,
+                // the deletion pass below removes its old documents.
+                if (supported && oversized.skip(file, attrs.size(), parserFor(file))) supported = false;
                 if (supported) {
                     currentFiles.add(file.toAbsolutePath());
                     if (stateTracker.isDirty(file)) {
@@ -555,6 +592,8 @@ public class ProjectIndexManager {
                 return FileVisitResult.CONTINUE;
             }
         });
+
+        oversized.report(projectName);
 
         // Detect files that were tracked but no longer exist on disk.
         // Only consider files that the scanner *would* discover: under projectRoot and not in a
