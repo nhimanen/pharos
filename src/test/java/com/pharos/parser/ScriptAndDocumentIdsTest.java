@@ -89,6 +89,26 @@ class ScriptAndDocumentIdsTest {
     }
 
     @Test
+    void ts_typeAnnotationsTernariesAndInitializersAreNotFunctions() throws Exception {
+        assumeTrue(has("node"), "node not installed");
+        Path f = write("web/types.ts", """
+                export function run(cb: (a: number) => void, opts = (y) => y) { cb(1); }
+                type Handler = (x: number) => void;
+                interface Props { onClick: (e: Event) => void; size: number }
+                class Btn { handler: (e: Event) => void; click = (e: Event) => { this.handler(e); }; }
+                const v = cond ? a : (b) => b;
+                const w = flag ? one : function () { return 2; };
+                const api = { save: (doc) => put(doc) };
+                const vis = nodes.filter(n => !n.hidden);
+                register({ onLoad: (e) => init(e) });
+                """);
+        List<String> names = names(new JsCodeParser().parseFile(f, "p", root));
+
+        assertThat(names).doesNotContain("cb", "opts", "Handler", "onClick", "handler", "a", "one", "api", "vis", "v");
+        assertThat(names).contains("run", "click", "save", "onLoad");
+    }
+
+    @Test
     void js_topLevelFunctionsBelongToTheirFile() throws Exception {
         assumeTrue(has("node"), "node not installed");
         Path a = write("pkg/a/index.js", "export function init() { return 1; }\n");

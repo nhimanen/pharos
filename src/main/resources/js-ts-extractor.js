@@ -197,6 +197,24 @@ function extractClassFields(srcLines, startLine, endLine) {
     return fields;
 }
 
+/**
+ * For every offset of `src` (comments and strings already blanked), the offset of the innermost
+ * unclosed '(' / '{' / '[' before it, or -1 at top level.
+ */
+function innermostOpenBracket(src) {
+    const n = src.length;
+    const open = new Int32Array(n + 1);
+    const stack = [];
+    for (let i = 0; i < n; i++) {
+        open[i] = stack.length ? stack[stack.length - 1] : -1;
+        const c = src[i];
+        if (c === '(' || c === '{' || c === '[') stack.push(i);
+        else if ((c === ')' || c === '}' || c === ']') && stack.length) stack.pop();
+    }
+    open[n] = stack.length ? stack[stack.length - 1] : -1;
+    return open;
+}
+
 /** Extract simple call names from a function body text. */
 function extractCalls(body) {
     const calls = new Set();
@@ -315,19 +333,42 @@ function extractFile(filePath, rootDir) {
         // `Math.exp(hull.map(([x, y]) …) {` are calls, not declarations.
         /(?:static\s+)?(?:async\s+)?(?:(?:get|set)\s+)?([A-Za-z$_][A-Za-z0-9$_]*)\s*\(([^()]*)\)\s*(?::\s*\S+\s*)?\{/g,
         // Arrow function: [export] const foo = [async] (params) =>
-        /(?:export\s+)?(?:const|let|var)\s+([A-Za-z$_][A-Za-z0-9$_]*)\s*=\s*(?:async\s+)?\(?([^)=]*)\)?\s*=>/g,
+        // (params can't contain parentheses: `const api = { save: (doc) =>` is an object, not a function)
+        /(?:export\s+)?(?:const|let|var)\s+([A-Za-z$_][A-Za-z0-9$_]*)\s*=\s*(?:async\s+)?\(?([^()=]*)\)?\s*=>/g,
         // Function assigned to a property or member, or an object-literal entry:
         //   $scope.refresh = function (a) {   exports.foo = function () {   foo: function (a) {
         // (Angular / CommonJS / prototype style — the only declarations in such files.)
-        /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(?::|=(?![=>]))\s*(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z$_][A-Za-z0-9$_]*\s*)?\(([^()]*)\)/g,
+        { assigned: true, re: /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(:|=(?![=>]))\s*(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z$_][A-Za-z0-9$_]*\s*)?\(([^()]*)\)/g },
         // Arrow function assigned to a member or object-literal entry:
         //   this.onClick = (e) => {   handlers.save = async (x) =>   save: (x) =>
-        /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(?::|=(?![=>]))\s*(?:async\s+)?\(([^()]*)\)\s*=>/g,
+        { assigned: true, re: /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(:|=(?![=>]))\s*(?:async\s+)?\(([^()]*)\)\s*=>/g },
     ];
+
+    // For the member/property-assignment forms, rule out TypeScript look-alikes:
+    //   run(cb: (a: number) => void, opts = (y) => y)   → parameter types / defaults
+    //   type Handler = (x: number) => void               → type alias
+    //   interface P { onClick: (e: Event) => void }      → interface member
+    //   class C { handler: (e: Event) => void; }         → typed class field (a value uses `=`)
+    //   const v = cond ? a : (b) => b                    → ternary branch
+    const openAt = innermostOpenBracket(clean);
+    const typeBodies = new Set(Object.values(classMap).map(c => c.openPos));
+    function isAssignedFunction(matchStart, sep) {
+        const open = openAt[matchStart];
+        if (open >= 0 && clean[open] === '(') return false;          // inside a parameter list
+        if (/\btype\s+$/.test(clean.slice(Math.max(0, matchStart - 40), matchStart))) return false;
+        if (sep === ':') {
+            if (open >= 0 && typeBodies.has(open)) return false;      // class / interface member annotation
+            let b = matchStart - 1;
+            while (b >= 0 && /\s/.test(clean[b])) b--;
+            if (b >= 0 && clean[b] !== '{' && clean[b] !== ',') return false;   // not an object-literal entry (e.g. `? a :`)
+        }
+        return true;
+    }
 
     // Collect all function candidates from clean source
     const funcCandidates = [];
-    for (const re of FUNC_PATTERNS) {
+    for (const pattern of FUNC_PATTERNS) {
+        const re = pattern.re || pattern;
         let fm;
         while ((fm = re.exec(clean)) !== null) {
             if (NOT_A_DECLARATION.has(fm[1])) continue;
@@ -335,7 +376,9 @@ function extractFile(filePath, rootDir) {
             let b = fm.index - 1;
             while (b >= 0 && /\s/.test(clean[b])) b--;
             if (b >= 0 && clean[b] === '.') continue;
-            funcCandidates.push({ name: fm[1], rawParams: fm[2] || '', pos: fm.index });
+            if (pattern.assigned && !isAssignedFunction(fm.index, fm[2])) continue;
+            const params = pattern.assigned ? fm[3] : fm[2];
+            funcCandidates.push({ name: fm[1], rawParams: params || '', pos: fm.index });
         }
     }
 
