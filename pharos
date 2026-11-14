@@ -104,6 +104,30 @@ def _is_daemon_running() -> bool:
         return False
 
 
+DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate at daemon start once the log exceeds this
+DAEMON_LOG_KEEP = 2                        # daemon.log.1 … daemon.log.N are kept
+
+
+def _rotate_daemon_log():
+    """Rotate daemon.log when it has grown past DAEMON_LOG_MAX_BYTES.
+
+    The daemon appends to one file across restarts and nothing ever trimmed it (one install
+    reached 246 MB). Rotation happens only here, before a new daemon opens the file, so a
+    running daemon never has its log moved underneath it.
+    """
+    try:
+        if not DAEMON_LOG_FILE.exists() or DAEMON_LOG_FILE.stat().st_size <= DAEMON_LOG_MAX_BYTES:
+            return
+        name = DAEMON_LOG_FILE.name
+        # daemon.log.(N-1) → .N, …, daemon.log → .1 (the oldest is overwritten)
+        for i in range(DAEMON_LOG_KEEP, 0, -1):
+            src = DAEMON_LOG_FILE if i == 1 else DAEMON_LOG_FILE.with_name(f"{name}.{i - 1}")
+            if src.exists():
+                src.replace(DAEMON_LOG_FILE.with_name(f"{name}.{i}"))
+    except OSError:
+        pass  # logging must never stop the daemon from starting
+
+
 def _start_daemon():
     """Start the pharos web server as a background daemon."""
     if not JAR.exists():
@@ -111,6 +135,7 @@ def _start_daemon():
             f"Run: mvn clean package -DskipTests")
 
     PHAROS_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_daemon_log()
     log_fh = open(DAEMON_LOG_FILE, "a")
     proc = subprocess.Popen(
         ["java"] + _jvm_flags() + [
