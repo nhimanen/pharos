@@ -24,6 +24,16 @@ public interface CodeParser {
     ParsedFile parseFile(Path file, String projectName) throws IOException;
 
     /**
+     * Parse a single source file of a project rooted at {@code projectRoot}. Parsers whose
+     * identifiers depend on the file's location in the project (package / module names derived
+     * from the relative path) must override this; the full and incremental index paths both call
+     * it, so they produce the same ids. Defaults to {@link #parseFile(Path, String)}.
+     */
+    default ParsedFile parseFile(Path file, String projectName, Path projectRoot) throws IOException {
+        return parseFile(file, projectName);
+    }
+
+    /**
      * Parse all source files in a project directory tree.
      *
      * @param projectRoot root directory of the project (e.g., src/main/java or the repo root)
@@ -47,7 +57,7 @@ public interface CodeParser {
         List<ParsedFile> results = new java.util.ArrayList<>();
         for (Path file : files) {
             try {
-                results.add(parseFile(file, projectName));
+                results.add(parseFile(file, projectName, projectRoot));
             } catch (Exception e) {
                 // log via the implementation's own logger; we can't log here without a field
             }

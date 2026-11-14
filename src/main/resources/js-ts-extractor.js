@@ -5,6 +5,8 @@
  * Usage:
  *   node js-ts-extractor.js --root <dir>    # extract all .js/.ts/.jsx/.tsx under dir
  *   node js-ts-extractor.js --file <path>   # extract a single file
+ *   node js-ts-extractor.js --file <path> --root <dir>
+ *                                           # single file, package derived relative to <dir>
  *
  * Output: same JSON schema as python-extractor.py (written to stdout).
  * Requires: Node.js 14+ (no npm packages needed).
@@ -18,9 +20,9 @@ const path = require('path');
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
-let mode = null, target = null;
+let mode = null, target = null, rootArg = null;
 for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--root')  { mode = 'root'; target = args[++i]; }
+    if (args[i] === '--root')  { rootArg = args[++i]; if (mode !== 'file') { mode = 'root'; target = rootArg; } }
     if (args[i] === '--file')  { mode = 'file'; target = args[++i]; }
 }
 if (!mode || !target) {
@@ -207,6 +209,16 @@ function extractCalls(body) {
     return [...calls];
 }
 
+/**
+ * Keywords that the method-shorthand pattern (`name(args) {`) also matches as statements:
+ * `if (x) {`, `for (…) {`, `} catch (e) {`, anonymous `function () {`, … These are never
+ * declarations and used to be indexed as methods (`module#if()`, thousands per project).
+ */
+const NOT_A_DECLARATION = new Set([
+    'if','for','while','switch','catch','with','return','typeof','function','do','else',
+    'try','finally','await','yield','new','delete','void','super','import','require',
+]);
+
 const BUILTIN_CALLS = new Set([
     'if','for','while','switch','catch','typeof','instanceof','return','throw',
     'new','delete','void','await','yield','require','import','super','console',
@@ -228,8 +240,12 @@ function extractFile(filePath, rootDir) {
 
     // Derive package from relative path
     const rel    = rootDir ? path.relative(rootDir, filePath) : filePath;
-    const dirParts = path.dirname(rel).split(path.sep).filter(p => p && p !== '.');
+    const dirParts = path.dirname(rel).split(path.sep).filter(p => p && p !== '.' && p !== '..');
     const pkg    = dirParts.join('.');
+    // A JS/TS file is a module: top-level functions belong to it, not to the directory.
+    // (Keyed by directory only, every index.js — and in --file mode every file — collided.)
+    const stem   = path.basename(filePath).replace(/\.[^.]+$/, '');
+    const moduleName = pkg ? pkg + '.' + stem : stem;
 
     const classes   = [];
     const functions = [];
@@ -295,9 +311,18 @@ function extractFile(filePath, rootDir) {
         // Named function declaration: [export] [async] function foo(params)
         /(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z$_][A-Za-z0-9$_]*)\s*\(([^)]*)\)/g,
         // Method shorthand in class: [static] [async] [get|set] foo(params)
-        /(?:static\s+)?(?:async\s+)?(?:(?:get|set)\s+)?([A-Za-z$_][A-Za-z0-9$_]*)\s*\(([^)]*)\)\s*(?::\s*\S+\s*)?\{/g,
+        // Params may not contain parentheses: `.finally(function () {` and
+        // `Math.exp(hull.map(([x, y]) …) {` are calls, not declarations.
+        /(?:static\s+)?(?:async\s+)?(?:(?:get|set)\s+)?([A-Za-z$_][A-Za-z0-9$_]*)\s*\(([^()]*)\)\s*(?::\s*\S+\s*)?\{/g,
         // Arrow function: [export] const foo = [async] (params) =>
         /(?:export\s+)?(?:const|let|var)\s+([A-Za-z$_][A-Za-z0-9$_]*)\s*=\s*(?:async\s+)?\(?([^)=]*)\)?\s*=>/g,
+        // Function assigned to a property or member, or an object-literal entry:
+        //   $scope.refresh = function (a) {   exports.foo = function () {   foo: function (a) {
+        // (Angular / CommonJS / prototype style — the only declarations in such files.)
+        /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(?::|=(?![=>]))\s*(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z$_][A-Za-z0-9$_]*\s*)?\(([^()]*)\)/g,
+        // Arrow function assigned to a member or object-literal entry:
+        //   this.onClick = (e) => {   handlers.save = async (x) =>   save: (x) =>
+        /(?:[A-Za-z$_][A-Za-z0-9$_]*\s*\.\s*)*([A-Za-z$_][A-Za-z0-9$_]*)\s*(?::|=(?![=>]))\s*(?:async\s+)?\(([^()]*)\)\s*=>/g,
     ];
 
     // Collect all function candidates from clean source
@@ -305,6 +330,11 @@ function extractFile(filePath, rootDir) {
     for (const re of FUNC_PATTERNS) {
         let fm;
         while ((fm = re.exec(clean)) !== null) {
+            if (NOT_A_DECLARATION.has(fm[1])) continue;
+            // `obj.name(args) {` is a member call followed by a block, never a declaration
+            let b = fm.index - 1;
+            while (b >= 0 && /\s/.test(clean[b])) b--;
+            if (b >= 0 && clean[b] === '.') continue;
             funcCandidates.push({ name: fm[1], rawParams: fm[2] || '', pos: fm.index });
         }
     }
@@ -320,10 +350,6 @@ function extractFile(filePath, rootDir) {
         seen.add(key);
 
         const name    = fc.name;
-        // Skip keywords captured by patterns
-        if (BUILTIN_CALLS.has(name) || name === 'constructor') {
-            // constructor handled separately
-        }
         const lineNo  = lineOf(src, fc.pos);
         const params  = fc.rawParams.split(',').map(p => p.trim().replace(/[=:][^,]*/,'').trim())
                           .filter(p => p && p !== '...');
@@ -370,6 +396,7 @@ function extractFile(filePath, rootDir) {
     return {
         file: filePath,
         package: pkg,
+        module: moduleName,
         classes,
         functions: dedupedFunctions,
     };
@@ -379,7 +406,7 @@ function extractFile(filePath, rootDir) {
 
 let results;
 if (mode === 'file') {
-    const r = extractFile(target, path.dirname(target));
+    const r = extractFile(target, rootArg || path.dirname(target));
     results = r ? [r] : [];
 } else {
     const files = collectFiles(target);
