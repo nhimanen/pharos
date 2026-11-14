@@ -42,7 +42,7 @@ public class ProjectRegistry {
 
     /**
      * In-memory cache of the registry.  {@code null} means "not yet loaded from disk".
-     * All entries carry their full {@link ProjectMeta#getUnresolvedRefs()} once hydrated.
+     * Entries are slim: they never carry {@link ProjectMeta#getUnresolvedRefs()} (see {@link #refsOf}).
      * Protected by {@code synchronized} on {@code this}.
      */
     private Map<String, ProjectMeta> cache = null;
@@ -95,8 +95,9 @@ public class ProjectRegistry {
     }
 
     /**
-     * Unresolved refs of {@code meta}: the in-memory list when the meta carries one (a meta
-     * that was just built by the indexer), otherwise read from
+     * Unresolved refs of {@code meta}: the in-memory list when the meta carries one (only a
+     * meta built directly by the indexer or a test does — registry lookups are slim),
+     * otherwise read from
      * {@code <indexPath>/unresolved-refs.json}. Not cached — callers hold them only as long as
      * they need them.
      */
@@ -164,8 +165,7 @@ public class ProjectRegistry {
 
     /**
      * Loads unresolved refs from {@code <indexPath>/unresolved-refs.json}.
-     * Falls back to the inline list in the cached meta when the separate file is absent
-     * (supports indexes built before this optimization was introduced).
+     * Returns an empty list when the file is absent or unreadable.
      */
     public List<ProjectMeta.UnresolvedRef> loadRefs(String projectName, String indexPath) {
         if (indexPath == null) return List.of();
