@@ -1520,6 +1520,9 @@ public class ProjectIndexManager {
                                .orElse(com.pharos.parser.model.ParsedRelationships.empty("incremental"));
                 new com.pharos.graph.KnowledgeGraphBuilder().build(graph, rel);
             }
+            // Delete only the evicted members that are gone from the source; edges from
+            // unchanged files into the patched classes are kept.
+            graph.completeEviction();
 
             CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             log.debug("Patched call graph: {} methods after update", graph.methodCount());
