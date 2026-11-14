@@ -130,7 +130,7 @@ public class CrossProjectLinker {
             if (tgtIdx == null) continue;
             futures.add(pool.submit(() -> {
                 List<String[]> edges = new ArrayList<>();
-                for (ProjectMeta.UnresolvedRef ref : srcMeta.getUnresolvedRefs()) {
+                for (ProjectMeta.UnresolvedRef ref : registry.refsOf(srcMeta)) {
                     String candidate = findInIndex(ref, tgtIdx);
                     if (candidate != null) {
                         edges.add(new String[]{ref.callerFqn, candidate});

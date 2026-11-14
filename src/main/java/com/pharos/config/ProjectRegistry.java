@@ -25,10 +25,12 @@ import java.util.*;
  *       CLI register projects concurrently.  The stat call is cheap; a reload only
  *       happens when the file actually changed.</li>
  *   <li><b>Separate refs storage</b> — {@link ProjectMeta#getUnresolvedRefs()} can be
- *       thousands of entries.  They are persisted to
- *       {@code <indexPath>/unresolved-refs.json} so {@code registry.json} stays small.
- *       Refs are hydrated lazily the first time {@link #find(String)} is called for a
- *       project within a process run.</li>
+ *       hundreds of thousands of entries (vespa: 74 MB of JSON).  They are persisted to
+ *       {@code <indexPath>/unresolved-refs.json} and are <em>never</em> held in this cache:
+ *       the few consumers (cross-project linking, module boundaries, stats) load them with
+ *       {@link #refsOf(ProjectMeta)} for the duration of the call.  Hydrating them in
+ *       {@link #find(String)} — which every search calls — kept them in a long-running
+ *       daemon's heap forever (≈180 MB of live heap for lucene + solr + vespa).</li>
  * </ul>
  */
 public class ProjectRegistry {
@@ -79,26 +81,30 @@ public class ProjectRegistry {
             saveRefs(meta.getName(), meta.getIndexPath(), meta.getUnresolvedRefs());
         }
 
-        // Update cache with the full (refs-bearing) meta
-        ensureCache().put(meta.getName(), meta);
+        // Cache the slim meta: refs live on disk only (see refsOf)
+        ensureCache().put(meta.getName(), buildSlim(meta));
 
         // Write slim registry to disk (refs excluded)
         flushToDisk();
         log.debug("Registered project '{}' in registry", meta.getName());
     }
 
+    /** The registered project, without its unresolved refs — use {@link #refsOf} for those. */
     public synchronized Optional<ProjectMeta> find(String name) {
-        ProjectMeta meta = ensureCache().get(name);
-        if (meta == null) return Optional.empty();
+        return Optional.ofNullable(ensureCache().get(name));
+    }
 
-        // Hydrate refs lazily — only on first access per process run
-        if (meta.getUnresolvedRefs() == null || meta.getUnresolvedRefs().isEmpty()) {
-            List<ProjectMeta.UnresolvedRef> refs = loadRefs(name, meta.getIndexPath());
-            if (!refs.isEmpty()) {
-                meta.setUnresolvedRefs(refs);  // mutate in-cache copy — hydrated once, reused thereafter
-            }
-        }
-        return Optional.of(meta);
+    /**
+     * Unresolved refs of {@code meta}: the in-memory list when the meta carries one (a meta
+     * that was just built by the indexer), otherwise read from
+     * {@code <indexPath>/unresolved-refs.json}. Not cached — callers hold them only as long as
+     * they need them.
+     */
+    public List<ProjectMeta.UnresolvedRef> refsOf(ProjectMeta meta) {
+        if (meta == null) return List.of();
+        List<ProjectMeta.UnresolvedRef> inMemory = meta.getUnresolvedRefs();
+        if (inMemory != null && !inMemory.isEmpty()) return inMemory;
+        return loadRefs(meta.getName(), meta.getIndexPath());
     }
 
     public synchronized List<ProjectMeta> listAll() {
