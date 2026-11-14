@@ -64,7 +64,7 @@ public class Main {
         parsers.add(new TerraformCodeParser(parseThreads));
         parsers.add(new GoCodeParser(parseThreads));
         parsers.addAll(regexParsers);
-        parsers.add(new GenericFileParser(parseThreads)); // must be last (catch-all)
+        parsers.add(new GenericFileParser(parseThreads, config.maxFileSizeBytes(true))); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
                 config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers);
         CrossEncoder crossEncoder = buildCrossEncoder(config);

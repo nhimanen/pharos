@@ -63,6 +63,15 @@ public class GenericFileParser implements CodeParser {
         this(1);
     }
 
+    /** Files larger than this are skipped (see IndexConfig#maxDocumentFileSizeKb). */
+    private long maxFileSizeBytes = 10L * 1024 * 1024;
+
+    /** @param maxFileSizeBytes files larger than this produce an empty result; ≤ 0 = no limit */
+    public GenericFileParser(int parseThreads, long maxFileSizeBytes) {
+        this(parseThreads);
+        this.maxFileSizeBytes = maxFileSizeBytes <= 0 ? Long.MAX_VALUE : maxFileSizeBytes;
+    }
+
     public GenericFileParser(int parseThreads) {
         this.parseThreads = Math.max(1, parseThreads);
     }
@@ -132,6 +141,13 @@ public class GenericFileParser implements CodeParser {
     }
 
     private ParsedFile parseFile(Path file, String projectName, Path root) throws IOException {
+        // Backstop for callers that bypass ProjectIndexManager's discovery filter: never read
+        // a huge non-code file into memory just to index it as one giant document.
+        long size = Files.size(file);
+        if (size > maxFileSizeBytes) {
+            log.debug("Skipping {} ({} KB > {} KB limit)", file, size / 1024, maxFileSizeBytes / 1024);
+            return new ParsedFile(file.toAbsolutePath().toString(), "", List.of(), List.of(), List.of());
+        }
         String content = Files.readString(file);
         String fileName = file.getFileName().toString();
         String fileStem = stem(fileName);

@@ -102,6 +102,23 @@ public class IndexConfig {
      */
     private boolean crossEncoderEnabled = true;
 
+    /**
+     * Non-code files (Markdown, text, JSON, YAML, … — everything {@code GenericFileParser}
+     * handles) larger than this are not indexed. Such a file becomes a single document whose
+     * body is the whole file, so a data dump (word lists, tokenizer vocabularies, cached JSON)
+     * adds megabytes to the heap and the index while matching almost every query and getting
+     * one embedding of its first few hundred tokens. A 457 MB file of this kind ran the
+     * indexer out of memory. 0 = no limit.
+     */
+    private long maxDocumentFileSizeKb = 10 * 1024;
+
+    /**
+     * Safety cap for files handled by a language parser (Java, Go, Python, …). Code is split
+     * into per-method documents, so large sources are fine; this only stops pathological
+     * generated files. 0 = no limit.
+     */
+    private long maxSourceFileSizeKb = 100 * 1024;
+
     // Jackson requires no-arg constructor
     public IndexConfig() {
         this.indexDir    = DEFAULT_BASE.resolve("indexes");
@@ -366,4 +383,16 @@ public class IndexConfig {
 
     public boolean isCrossEncoderEnabled() { return crossEncoderEnabled; }
     public void setCrossEncoderEnabled(boolean crossEncoderEnabled) { this.crossEncoderEnabled = crossEncoderEnabled; }
+
+    public long getMaxDocumentFileSizeKb() { return maxDocumentFileSizeKb; }
+    public void setMaxDocumentFileSizeKb(long kb) { this.maxDocumentFileSizeKb = kb; }
+
+    public long getMaxSourceFileSizeKb() { return maxSourceFileSizeKb; }
+    public void setMaxSourceFileSizeKb(long kb) { this.maxSourceFileSizeKb = kb; }
+
+    /** Byte limit for a file of the given kind, or {@link Long#MAX_VALUE} when unlimited. */
+    public long maxFileSizeBytes(boolean documentFile) {
+        long kb = documentFile ? maxDocumentFileSizeKb : maxSourceFileSizeKb;
+        return kb <= 0 ? Long.MAX_VALUE : kb * 1024;
+    }
 }
