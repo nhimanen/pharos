@@ -63,7 +63,9 @@ class FileSizeLimitTest {
         assertThat(indexedFiles()).contains("data.json");
 
         Files.writeString(projectRoot.resolve("data.json"), "{\"k\": \"" + "x".repeat(20_000) + "\"}");
-        manager().index(projectRoot, "test", true, false);
+        // Unlimited parser: only the incremental discovery walk can keep data.json out
+        // (otherwise the parser backstop would hide a missing walk-level check).
+        managerWith(new GenericFileParser(1, 0)).index(projectRoot, "test", true, false);
 
         assertThat(indexedFiles()).contains("A.java", "README.md").doesNotContain("data.json");
     }
@@ -108,6 +110,10 @@ class FileSizeLimitTest {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private ProjectIndexManager manager() {
+        return managerWith(new GenericFileParser(1, config.maxFileSizeBytes(true)));
+    }
+
+    private ProjectIndexManager managerWith(GenericFileParser genericParser) {
         SelectiveIndexUpdateTest.TestRegistry registry = new SelectiveIndexUpdateTest.TestRegistry();
         ModuleGraphBuilder noopGraph = new ModuleGraphBuilder(registry) {
             @Override
@@ -116,8 +122,7 @@ class FileSizeLimitTest {
                 return List.of();
             }
         };
-        List<CodeParser> parsers = List.of(new JavaCodeParser(),
-                new GenericFileParser(1, config.maxFileSizeBytes(true)));
+        List<CodeParser> parsers = List.of(new JavaCodeParser(), genericParser);
         return new ProjectIndexManager(config, luceneIndexer, registry, List.of(), noopGraph, parsers);
     }
 
