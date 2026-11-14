@@ -27,22 +27,25 @@ public final class NativeInferenceGuard {
 
     private static final Logger log = LoggerFactory.getLogger(NativeInferenceGuard.class);
 
-    /** Longest a shutdown waits for in-flight native calls (one embedding batch takes ~1–2 s). */
+    /** Longest a shutdown waits for in-flight native calls (an embedding batch on CPU takes ~5–9 s). */
     static final long DRAIN_TIMEOUT_MS = 15_000;
 
     private static final AtomicInteger inFlight = new AtomicInteger();
+    private static final AtomicInteger signalsReceived = new AtomicInteger();
+    /** 128 + signo of the signal that started shutdown, or 0. */
+    private static volatile int signalExitCode;
     private static final AtomicBoolean handlersInstalled = new AtomicBoolean();
     private static final Object drained = new Object();
     private static volatile boolean closing;
-
-    private static final Ticket TICKET = new Ticket();
 
     private NativeInferenceGuard() {}
 
     /** Held for the duration of one native model call; close it in a try-with-resources. */
     public static final class Ticket implements AutoCloseable {
+        private final AtomicBoolean closed = new AtomicBoolean();
         private Ticket() {}
-        @Override public void close() { leave(); }
+        /** Idempotent: closing twice never under-counts in-flight calls. */
+        @Override public void close() { if (closed.compareAndSet(false, true)) leave(); }
     }
 
     /**
@@ -57,7 +60,7 @@ public final class NativeInferenceGuard {
             leave();
             throw new IllegalStateException("pharos is shutting down; not starting a model call");
         }
-        return TICKET;
+        return new Ticket();
     }
 
     private static void leave() {
@@ -107,7 +110,8 @@ public final class NativeInferenceGuard {
 
     private static void installSignalHandlersOnce() {
         if (!handlersInstalled.compareAndSet(false, true)) return;
-        for (String name : new String[]{"TERM", "INT"}) {
+        // HUP too: closing the terminal of a foreground `pharos index` is a JVM shutdown signal
+        for (String name : new String[]{"TERM", "INT", "HUP"}) {
             try {
                 Signal.handle(new Signal(name), NativeInferenceGuard::onSignal);
             } catch (IllegalArgumentException e) {
@@ -117,7 +121,29 @@ public final class NativeInferenceGuard {
         }
     }
 
+    /**
+     * The process exit code to use: {@code 128 + signo} when a signal started the shutdown
+     * (so a main thread that finishes — or fails on the closed guard — after the signal doesn't
+     * replace 143/130 with its own code), otherwise {@code normalExitCode}.
+     */
+    public static int exitCode(int normalExitCode) {
+        int s = signalExitCode;
+        return s != 0 ? s : normalExitCode;
+    }
+
     private static void onSignal(Signal signal) {
+        signalExitCode = 128 + signal.getNumber();
+        if (signalsReceived.incrementAndGet() > 1) {
+            // Second signal (e.g. Ctrl+C again): exit now. halt() runs no shutdown hooks, so
+            // ORT's environment closer can't free anything under the running call either.
+            Runtime.getRuntime().halt(128 + signal.getNumber());
+        }
+        int running = inFlight.get();
+        if (running > 0) {
+            System.err.printf("pharos: finishing %d running model call(s) before exiting "
+                    + "(up to %d s; send the signal again — e.g. Ctrl+C — to exit immediately)%n",
+                    running, DRAIN_TIMEOUT_MS / 1000);
+        }
         // Don't block the JVM's signal-dispatch thread; drain and exit on a dedicated thread.
         Thread t = new Thread(() -> {
             beginShutdown(DRAIN_TIMEOUT_MS);

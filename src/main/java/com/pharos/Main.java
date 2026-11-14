@@ -81,7 +81,7 @@ public class Main {
         // Let background model calls (e.g. a server's warm-up) finish before exit runs ORT's
         // shutdown hook, which frees the native environment under any call still running.
         com.pharos.embedding.NativeInferenceGuard.beginShutdown();
-        System.exit(exitCode);
+        System.exit(com.pharos.embedding.NativeInferenceGuard.exitCode(exitCode));
     }
 
     private static CrossEncoder buildCrossEncoder(IndexConfig config) {

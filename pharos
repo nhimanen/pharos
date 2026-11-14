@@ -932,6 +932,38 @@ def cmd_invalidate_embeddings(args):
     print("Run './pharos index <path>' to re-embed only those files.")
 
 
+DAEMON_STOP_TIMEOUT_S = 20   # the daemon finishes running model calls (≤ 15 s) before exiting
+
+
+def _terminate_daemon(pid):
+    """SIGTERM the daemon and wait until the process is gone.
+
+    The daemon finishes in-flight model calls before exiting (otherwise ONNX Runtime can
+    crash on shutdown), which takes several seconds when it is embedding. Returning early let
+    `restart` start a second JVM that lost the port race and exited, leaving no daemon.
+    Falls back to SIGKILL — which runs no shutdown hooks, so it is crash-safe — after the timeout.
+    Returns False if the process was not running.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.monotonic() + DAEMON_STOP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.2)
+    print(f"pharos daemon (pid={pid}) did not exit within {DAEMON_STOP_TIMEOUT_S}s; killing it.",
+          file=sys.stderr)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
 def cmd_daemon(args):
     """Manage the background daemon."""
     action = args.action
@@ -952,7 +984,8 @@ def cmd_daemon(args):
         if DAEMON_PID_FILE.exists():
             try:
                 pid = int(DAEMON_PID_FILE.read_text().strip())
-                os.kill(pid, signal.SIGTERM)
+                if not _terminate_daemon(pid):
+                    raise ProcessLookupError
                 DAEMON_PID_FILE.unlink(missing_ok=True)
                 print(f"pharos daemon (pid={pid}) stopped.")
             except (ProcessLookupError, ValueError):
@@ -964,9 +997,8 @@ def cmd_daemon(args):
         if DAEMON_PID_FILE.exists():
             try:
                 pid = int(DAEMON_PID_FILE.read_text().strip())
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(1)
-            except (ProcessLookupError, ValueError):
+                _terminate_daemon(pid)
+            except ValueError:
                 pass
             DAEMON_PID_FILE.unlink(missing_ok=True)
         print("Starting pharos daemon...", flush=True)
