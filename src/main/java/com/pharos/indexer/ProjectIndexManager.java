@@ -641,7 +641,8 @@ public class ProjectIndexManager {
                             continue;
                         }
                         try {
-                            ParsedFile parsedFile = fileParser.parseFile(file, projectName);
+                            // Same root as the full index, so incremental runs produce the same ids
+                            ParsedFile parsedFile = fileParser.parseFile(file, projectName, projectRoot);
                             parsedDirtyFiles.add(parsedFile);
 
                             Map<String, List<ParsedMethod>> methodsByClass = parsedFile.methods().stream()

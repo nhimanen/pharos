@@ -124,7 +124,24 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
 
     @Override
     public ParsedFile parseFile(Path file, String projectName) throws IOException {
-        String json = runExtractor("--file", file.toAbsolutePath().toString());
+        return parseFile(file, projectName, null);
+    }
+
+    /**
+     * Whether the extractor accepts {@code --file <f> --root <dir>} and derives the package
+     * relative to {@code <dir>}. Without a root, a single-file run treats the file's own
+     * directory as the root, so packages are empty and ids of same-named modules collide.
+     */
+    protected boolean extractorAcceptsRoot() {
+        return false;
+    }
+
+    @Override
+    public ParsedFile parseFile(Path file, String projectName, Path projectRoot) throws IOException {
+        String json = projectRoot != null && extractorAcceptsRoot()
+                ? runExtractor("--file", file.toAbsolutePath().toString(),
+                               "--root", projectRoot.toAbsolutePath().toString())
+                : runExtractor("--file", file.toAbsolutePath().toString());
         if (json == null) return emptyFile(file);
         List<ParsedFile> files = mapJson(json, projectName);
         return files.isEmpty() ? emptyFile(file) : files.get(0);
@@ -166,7 +183,7 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
             for (Path file : files) {
                 futures.add(pool.submit(() -> {
                     try {
-                        ParsedFile pf = parseFile(file, projectName);
+                        ParsedFile pf = parseFile(file, projectName, projectRoot);
                         ok.incrementAndGet();
                         return pf;
                     } catch (Exception e) {
@@ -253,9 +270,16 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
             }
         }
 
-        String moduleName = pkg.contains(".") ? pkg.substring(pkg.lastIndexOf('.') + 1) : pkg;
+        // Extractors that know the file's module identity report it ("module": "dir.path.stem");
+        // otherwise the package doubles as the module (Python's package already ends with the
+        // module stem). A JS/TS package is only the directory, so without "module" every file
+        // in a directory shared one pseudo-class.
+        String moduleQualified = fileNode.path("module").asText("");
+        if (moduleQualified.isEmpty()) moduleQualified = pkg;
+        String moduleName = moduleQualified.contains(".")
+                ? moduleQualified.substring(moduleQualified.lastIndexOf('.') + 1) : moduleQualified;
         if (moduleName.isEmpty()) moduleName = "module";
-        String moduleQualified = pkg.isEmpty() ? moduleName : pkg;
+        if (moduleQualified.isEmpty()) moduleQualified = moduleName;
 
         ParsedClass modulePseudoClass = null;
         if (hasTopLevel) {

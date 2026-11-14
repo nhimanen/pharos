@@ -240,8 +240,11 @@ def extract_dir(root_dir):
     return results
 
 
-def extract_single(filepath):
-    root_dir = os.path.dirname(os.path.abspath(filepath))
+def extract_single(filepath, root=None):
+    # With --root, the package is derived relative to the project root, exactly as in a
+    # --root walk. Without it the file's own directory is the root, so every module was
+    # named by its stem alone and same-named modules in different directories collided.
+    root_dir = os.path.abspath(root) if root else os.path.dirname(os.path.abspath(filepath))
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             source_lines = f.readlines()
@@ -254,15 +257,17 @@ def extract_single(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description="Extract Python AST info for codesearch")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--root", metavar="DIR", help="Root directory to walk")
-    group.add_argument("--file", metavar="FILE", help="Single file to extract")
+    parser.add_argument("--root", metavar="DIR",
+                        help="Root directory to walk, or (with --file) to derive the package from")
+    parser.add_argument("--file", metavar="FILE", help="Single file to extract")
     args = parser.parse_args()
+    if not args.root and not args.file:
+        parser.error("one of --root or --file is required")
 
-    if args.root:
-        results = extract_dir(os.path.abspath(args.root))
+    if args.file:
+        results = extract_single(args.file, args.root)
     else:
-        results = extract_single(args.file)
+        results = extract_dir(os.path.abspath(args.root))
 
     json.dump(results, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
