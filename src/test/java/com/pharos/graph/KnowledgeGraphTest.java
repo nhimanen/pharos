@@ -531,6 +531,7 @@ class KnowledgeGraphTest {
             g.flush();
 
             g.evictClasses(List.of("com.example.Cls"));
+            g.completeEviction();   // nothing re-added → the evicted class's methods are removed
 
             // Only com.example.Cls methods are evicted; com.other.Other survives
             assertThat(g.allFqns().anyMatch("com.example.Cls#foo()"::equals)).isFalse();
