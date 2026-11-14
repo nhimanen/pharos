@@ -84,7 +84,7 @@ class NoEmbedThenEmbedTest {
         manager.index(projectRoot, "test", true, true);         // later: index (incremental)
 
         assertThat(counting.callCount()).as("unchanged files must still get embedded").isGreaterThan(0);
-        assertThat(docsWithAnyVector()).isGreaterThan(0);
+        assertThat(docsWithAnyVector()).as("every document has a vector").isEqualTo(totalDocs());
     }
 
     @Test
@@ -94,6 +94,12 @@ class NoEmbedThenEmbedTest {
                 registry, new LazyCrossEncoder(() -> { ceLoads.incrementAndGet(); return new NoOpCrossEncoder(); }));
         assertThat(loads).hasValue(0);
         assertThat(ceLoads).hasValue(0);
+    }
+
+    private int totalDocs() throws Exception {
+        try (DirectoryReader r = DirectoryReader.open(new NIOFSDirectory(luceneIndexer.getLucenePath("test")))) {
+            return r.numDocs();
+        }
     }
 
     private int docsWithAnyVector() throws Exception {

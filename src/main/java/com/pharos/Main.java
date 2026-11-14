@@ -89,7 +89,7 @@ public class Main {
         return new LazyCrossEncoder(() -> {
             try {
                 return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
-            } catch (Exception e) {
+            } catch (Throwable e) {   // incl. UnsatisfiedLinkError: memoized as no-op, not retried per search
                 log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
                 return new NoOpCrossEncoder();
             }

@@ -275,9 +275,16 @@ public class SearchEngine {
                     synchronized (this) {
                         i = inner;
                         if (i == null) {
-                            inner = i = embedder.isAvailable()
-                                    ? vectorStrategy.buildVectorResolver(reader, embedder.embed(snippetQuery))
-                                    : SnippetResolver.none();
+                            try {
+                                i = embedder.isAvailable()
+                                        ? vectorStrategy.buildVectorResolver(reader, embedder.embed(snippetQuery))
+                                        : SnippetResolver.none();
+                            } catch (RuntimeException e) {
+                                // keyword snippets still work; don't re-embed and fail for every result
+                                log.warn("Vector snippet hints unavailable for this search: {}", e.getMessage());
+                                i = SnippetResolver.none();
+                            }
+                            inner = i;
                         }
                     }
                 }
@@ -776,8 +783,8 @@ public class SearchEngine {
                 builtPipelines.get();                       // isAvailable() → loads embedder + cross-encoder
                 if (embedder.isAvailable()) embedder.embed("warm up");   // first ONNX run initialises the session
                 log.info("Search models ready ({} ms)", (System.nanoTime() - t0) / 1_000_000);
-            } catch (RuntimeException e) {
-                log.warn("Model warm-up failed: {}", e.getMessage());
+            } catch (Throwable e) {
+                log.warn("Model warm-up failed: {}", e.toString());
             }
         }, "pharos-model-warmup");
         t.setDaemon(true);
