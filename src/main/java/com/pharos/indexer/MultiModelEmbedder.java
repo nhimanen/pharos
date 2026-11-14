@@ -66,13 +66,33 @@ public class MultiModelEmbedder {
     private final JavaCodeParser parser;
     private final Chunker chunker;
 
+    /** Providers already built by the process (Main's indexing providers), by modelId. */
+    private final java.util.Map<String, EmbeddingProvider> providers = new java.util.concurrent.ConcurrentHashMap<>();
+
     public MultiModelEmbedder(IndexConfig config, LuceneIndexer luceneIndexer,
                                ProjectRegistry registry) {
+        this(config, luceneIndexer, registry, List.of());
+    }
+
+    /**
+     * @param loadedProviders providers the process already built; the one matching the
+     *                        requested model is reused instead of loading the model again
+     *                        (and a model created here is reused for every project of an
+     *                        {@code --all} run)
+     */
+    public MultiModelEmbedder(IndexConfig config, LuceneIndexer luceneIndexer,
+                               ProjectRegistry registry, List<EmbeddingProvider> loadedProviders) {
+        for (EmbeddingProvider p : loadedProviders) providers.putIfAbsent(p.modelId(), p);
         this.config = config;
         this.luceneIndexer = luceneIndexer;
         this.registry = registry;
         this.parser = new JavaCodeParser();
         this.chunker = new DefaultChunker();
+    }
+
+    /** The process's provider for {@code cfg}'s model, created (once) only if none was loaded. */
+    EmbeddingProvider providerFor(EmbeddingProviderConfig cfg) {
+        return providers.computeIfAbsent(cfg.getModelId(), id -> EmbeddingProvider.create(cfg));
     }
 
     /** Returns the count of documents updated (excluding skips). */
@@ -84,7 +104,9 @@ public class MultiModelEmbedder {
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Embedding model '" + modelId + "' not declared in config.embeddingProviders. " +
                         "Add an entry to ~/.pharos/config.json first."));
-        EmbeddingProvider provider = EmbeddingProvider.create(cfg);
+        // Reuse the process's instance of this model (or one created by an earlier project of
+        // this run): every create() loads another copy of the weights (~1.1 GB for ONNX).
+        EmbeddingProvider provider = providerFor(cfg);
         if (!provider.isAvailable()) {
             throw new IllegalStateException(
                     "Provider '" + modelId + "' is unavailable (failed to load). Aborting.");
