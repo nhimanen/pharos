@@ -26,6 +26,8 @@
         <logback.version>1.5.8</logback.version>
         <junit.version>5.11.0</junit.version>
         <assertj.version>3.26.3</assertj.version>
+        <awssdk.version>2.59.1</awssdk.version>
+        <testcontainers.version>1.21.3</testcontainers.version>
         <!-- Exclude slow/integration/quality tests by default; override with -DexcludedGroups= to run all -->
         <excludedGroups>perf,integration,quality,validation</excludedGroups>
     </properties>
@@ -36,6 +38,13 @@
                 <groupId>ai.djl</groupId>
                 <artifactId>bom</artifactId>
                 <version>${djl.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${awssdk.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -144,7 +153,43 @@
             <version>6.3.0</version>
         </dependency>
 
+        <!-- ===== S3-compatible object storage (cluster replication) ===== -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+        </dependency>
+
         <!-- ===== Testing ===== -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>minio</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
