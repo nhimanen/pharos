@@ -95,18 +95,27 @@ public class MultiModelEmbedder {
             throw new IllegalStateException(
                     "Provider '" + modelId + "' is unavailable (failed to load). Aborting.");
         }
-        return embed(meta, provider, IndexVersions.modelFingerprint(cfg), force);
+        return embed(meta, provider, IndexVersions.modelFingerprint(cfg),
+                IndexVersions.legacyFingerprints(cfg), force);
+    }
+
+    /** {@link #embed(ProjectMeta, EmbeddingProvider, String, List, boolean)} with no legacy fingerprints. */
+    int embed(ProjectMeta meta, EmbeddingProvider provider, String fingerprint,
+              boolean force) throws IOException {
+        return embed(meta, provider, fingerprint, List.of(), force);
     }
 
     /** Core of {@link #embed(String, String, boolean)} with an already-resolved provider. */
     int embed(ProjectMeta meta, EmbeddingProvider provider, String fingerprint,
-              boolean force) throws IOException {
+              List<String> legacyFingerprints, boolean force) throws IOException {
         String projectName = meta.getName();
         String modelId = provider.modelId();
         String targetField = DocumentMapper.vectorFieldFor(modelId);
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
-        PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
-                projectIndexDir, fingerprint, provider.dimensions());
+        // Per-model file: sharing embed-cache.bin with the indexing model meant this command
+        // invalidated (and deleted) that model's cache.
+        PersistentEmbeddingCache cache = PersistentEmbeddingCache.forModel(
+                projectIndexDir, modelId, fingerprint, legacyFingerprints, provider.dimensions());
 
         // ── Phase 1: collect per-doc info from the existing index ─────────────
         // For each docId in each segment: its FQN, file path, chunk count, and

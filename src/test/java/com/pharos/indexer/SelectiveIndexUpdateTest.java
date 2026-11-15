@@ -61,8 +61,9 @@ class SelectiveIndexUpdateTest {
 
         indexManager.index(projectRoot, "test", false, true);
 
-        assertThat(indexDir.resolve("test/embed-cache.bin")).exists();
-        assertThat(indexDir.resolve("test/embed-cache.meta")).exists();
+        // one cache file pair per embedding model (the stub's modelId is "test-counting")
+        assertThat(indexDir.resolve("test/embed-cache.test-counting.bin")).exists();
+        assertThat(indexDir.resolve("test/embed-cache.test-counting.meta")).exists();
         assertThat(embedder.callCount()).isGreaterThan(0);
     }
 

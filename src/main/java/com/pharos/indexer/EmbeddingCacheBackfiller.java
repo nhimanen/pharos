@@ -106,7 +106,14 @@ public class EmbeddingCacheBackfiller {
             return 0;
         }
 
-        PersistentEmbeddingCache cache = new PersistentEmbeddingCache(projectIndexDir, modelFp, dims);
+        // Fill the same per-model cache file the indexer reads (first configured provider), with
+        // that provider's dims — the cache is ignored on load if they differ from the model's.
+        var primary = config.getEmbeddingProviders().isEmpty() ? null : config.getEmbeddingProviders().get(0);
+        if (primary != null && primary.getDimensions() > 0) dims = primary.getDimensions();
+        PersistentEmbeddingCache cache = primary == null
+                ? new PersistentEmbeddingCache(projectIndexDir, modelFp, dims)
+                : PersistentEmbeddingCache.forModel(projectIndexDir, primary.getModelId(), modelFp,
+                        IndexVersions.legacyFingerprints(primary), dims);
         FileStateTracker tracker = new FileStateTracker(projectIndexDir);
 
         // Pre-build the set of non-dirty Java files so Phase 1 can skip them eagerly,

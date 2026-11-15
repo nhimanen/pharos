@@ -53,6 +53,8 @@ public class FileStateTracker {
     /** Current index-version constants to stamp into every {@link #track} call. */
     private final int currentChunkingVersion;
     private final String currentModelFingerprint;
+    /** Older-format fingerprints for the same model(s), treated as current. */
+    private final java.util.Set<String> legacyModelFingerprints;
 
     public FileStateTracker(Path projectIndexDir) {
         this(projectIndexDir, 0, null);
@@ -65,10 +67,28 @@ public class FileStateTracker {
      */
     public FileStateTracker(Path projectIndexDir, int currentChunkingVersion,
                              String currentModelFingerprint) {
+        this(projectIndexDir, currentChunkingVersion, currentModelFingerprint, List.of());
+    }
+
+    /**
+     * @param legacyModelFingerprints fingerprints older pharos versions recorded for the same
+     *                                model(s); a file stamped with one is not considered stale
+     *                                (see {@link IndexVersions#legacyFingerprints})
+     */
+    public FileStateTracker(Path projectIndexDir, int currentChunkingVersion,
+                             String currentModelFingerprint, java.util.Collection<String> legacyModelFingerprints) {
         this.stateFile = projectIndexDir.resolve("file-state.json");
         this.currentChunkingVersion   = currentChunkingVersion;
         this.currentModelFingerprint  = currentModelFingerprint;
+        this.legacyModelFingerprints  = java.util.Set.copyOf(legacyModelFingerprints);
         this.state = load();
+    }
+
+    /** True when {@code recorded} names the current model, in the current or a legacy format. */
+    private boolean sameModel(String recorded) {
+        return currentModelFingerprint == null
+                || currentModelFingerprint.equals(recorded)
+                || legacyModelFingerprints.contains(recorded);
     }
 
     /** Returns true if the file has changed since last tracking (or is new). */
@@ -119,7 +139,7 @@ public class FileStateTracker {
         if (state.isEmpty()) return false;
         for (FileState s : state.values()) {
             if (s.chunkingVersion != currentChunkingVersion) return true;
-            if (currentModelFingerprint != null && !currentModelFingerprint.equals(s.modelFingerprint)) return true;
+            if (!sameModel(s.modelFingerprint)) return true;
         }
         return false;
     }
@@ -133,7 +153,7 @@ public class FileStateTracker {
         FileState s = state.get(file.toAbsolutePath().toString());
         if (s == null) return true;
         if (s.chunkingVersion != currentChunkingVersion) return true;
-        if (currentModelFingerprint != null && !currentModelFingerprint.equals(s.modelFingerprint)) return true;
+        if (!sameModel(s.modelFingerprint)) return true;
         return false;
     }
 
