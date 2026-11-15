@@ -95,7 +95,7 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 
 #### Selective re-embedding and the embedding cache
 
-`PersistentEmbeddingCache` stores `SHA-256(embeddingText) → float[]` on disk at `<index-dir>/<project>/embed-cache.bin`. Both full and incremental index runs check this cache before calling the ONNX provider; unchanged embedding texts are served from cache at zero cost. The cache is invalidated automatically when the embedding model URL or dimensions change.
+`PersistentEmbeddingCache` stores `SHA-256(embeddingText) → float[]` on disk, one file pair per embedding model: `<index-dir>/<project>/embed-cache.<model>.{bin,meta}` (the migrated `legacy` model keeps the unsuffixed `embed-cache.{bin,meta}`). Both full and incremental index runs check this cache before calling the provider; unchanged embedding texts are served from cache at zero cost. A cache whose meta names a different model or dims is ignored — never deleted — and overwritten on the next save; fingerprints in the pre-multi-provider format (`url:dims`) are accepted for the same model (`IndexVersions.legacyFingerprints`).
 
 `IndexVersions.CHUNKING_VERSION` is an `int` constant in `indexer/IndexVersions.java`. **Bump it whenever chunking logic changes** (e.g. `DefaultChunker`, `chunkDocument`, `chunkMethodWithLines`). On the next incremental run, `FileStateTracker.hasOutdatedEmbeddings()` detects the mismatch, adds all tracked files to the dirty set, and re-embeds them. Single-chunk methods whose embedding text hasn't changed will be served from the persistent cache with no ONNX call.
 
