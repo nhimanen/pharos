@@ -341,6 +341,19 @@ pharos index /path/to/project --no-embed     # skip embedding this run
 
 Keyword search (`--type keyword`) and call graph features work without embeddings. Only `vector`, `hybrid`, and `unified` search types require them.
 
+## File size limits
+
+Non-code files (Markdown, text, JSON, YAML, …) are indexed as a single document holding the whole file, so large data files (word lists, tokenizer vocabularies, cached JSON) are skipped rather than loaded into memory. Code is split into per-method documents and has a much higher safety cap. Both are set in `~/.pharos/config.json`, in KB; `0` disables a limit:
+
+```json
+{
+  "maxDocumentFileSizeKb": 10240,
+  "maxSourceFileSizeKb": 102400
+}
+```
+
+A file that grows past its limit is removed from the index on the next incremental run.
+
 ## How it works
 
 1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers extract methods, classes, call references, field declarations, inheritance, annotations, and type references
