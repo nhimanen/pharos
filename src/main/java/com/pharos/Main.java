@@ -8,6 +8,8 @@ import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraphBuilder;
+import com.pharos.cluster.Backends;
+import com.pharos.cluster.ReplicationBackend;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProjectIndexManager;
 import com.pharos.parser.CodeParser;
@@ -51,7 +53,8 @@ public class Main {
         List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
         // Same instance as the matching indexing provider — not a second copy of the model.
         EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config, embedders);
-        LuceneIndexer luceneIndexer = new LuceneIndexer(config);
+        ReplicationBackend backend = Backends.create(config);
+        LuceneIndexer luceneIndexer = new LuceneIndexer(config, backend.localCache());
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
         // Tier-2 regex-based parsers — no external runtime needed
@@ -68,7 +71,7 @@ public class Main {
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads, config.maxFileSizeBytes(true))); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
-                config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers);
+                config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers, backend.publisher());
         CrossEncoder crossEncoder = buildCrossEncoder(config);
         SearchEngine searchEngine = new SearchEngine(luceneIndexer, searchEmbedder, registry, crossEncoder);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);

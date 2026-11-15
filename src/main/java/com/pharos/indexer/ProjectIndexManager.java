@@ -1,6 +1,10 @@
 package com.pharos.indexer;
 
 import com.pharos.analysis.ConceptMiner;
+import com.pharos.cluster.IndexPublisher;
+import com.pharos.cluster.LocalSnapshot;
+import com.pharos.cluster.NoOpPublisher;
+import com.pharos.cluster.ShardId;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -74,6 +78,7 @@ public class ProjectIndexManager {
     private final ModuleGraphBuilder moduleGraphBuilder;
     /** Ordered list of language parsers; first match by extension wins. */
     private final List<CodeParser> parsers;
+    private final IndexPublisher publisher;
 
     /**
      * Legacy single-provider constructor. Equivalent to passing
@@ -115,12 +120,21 @@ public class ProjectIndexManager {
                                 ProjectRegistry registry, List<EmbeddingProvider> embedders,
                                 ModuleGraphBuilder moduleGraphBuilder,
                                 List<CodeParser> parsers) {
+        this(config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers,
+                NoOpPublisher.INSTANCE);
+    }
+
+    public ProjectIndexManager(IndexConfig config, LuceneIndexer luceneIndexer,
+                                ProjectRegistry registry, List<EmbeddingProvider> embedders,
+                                ModuleGraphBuilder moduleGraphBuilder,
+                                List<CodeParser> parsers, IndexPublisher publisher) {
         this.config = config;
         this.luceneIndexer = luceneIndexer;
         this.registry = registry;
         this.embedders = List.copyOf(embedders);
         this.moduleGraphBuilder = moduleGraphBuilder;
         this.parsers = List.copyOf(parsers);
+        this.publisher = publisher;
     }
 
     /** Providers whose construction succeeded — the ones we actually embed with. */
@@ -423,6 +437,18 @@ public class ProjectIndexManager {
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
         ProjectNames.validate(projectName, config.getIndexDir());
+        ProjectMeta meta = indexLocally(projectRoot, projectName, incremental, force,
+                generateEmbeddings, buildSynonyms, progress);
+        // Same rule as the file-state fingerprint: never load models for --no-embed.
+        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
+        publisher.publish(new LocalSnapshot(ShardId.ofProject(projectName),
+                luceneIndexer.getProjectIndexDir(projectName), meta, modelFp));
+        return meta;
+    }
+
+    private ProjectMeta indexLocally(Path projectRoot, String projectName,
+                              boolean incremental, boolean force, boolean generateEmbeddings,
+                              boolean buildSynonyms, ProgressListener progress) throws IOException {
         if (incremental) {
             // An index written by another format can't be updated in place: rebuild it fully.
             // A project with no index dir yet is just a normal first full index.
