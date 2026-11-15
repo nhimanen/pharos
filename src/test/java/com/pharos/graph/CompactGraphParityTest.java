@@ -208,6 +208,26 @@ class CompactGraphParityTest {
     }
 
     @Test
+    void corruptCountsGiveIOExceptionNotError() throws Exception {
+        for (String what : List.of("vertexCount", "stringLength", "edgeCount")) {
+            Path f = tempDir.resolve("corrupt-" + what + ".gz");
+            try (var out = new java.io.DataOutputStream(new java.util.zip.GZIPOutputStream(Files.newOutputStream(f)))) {
+                out.write("PHGR".getBytes());
+                out.writeInt(1);
+                switch (what) {
+                    case "vertexCount" -> out.writeInt(Integer.MAX_VALUE);
+                    case "stringLength" -> { out.writeInt(1); out.writeByte(0); out.writeInt(Integer.MAX_VALUE); }
+                    default -> { // zero vertices, then a huge calls edge count with no data
+                        out.writeInt(0);
+                        out.writeInt(Integer.MAX_VALUE);
+                    }
+                }
+            }
+            assertThatThrownBy(() -> CompactGraph.read(f)).as(what).isInstanceOf(IOException.class);
+        }
+    }
+
+    @Test
     void graphViewsOpensCompactFileAndSurfacesCorruption() throws Exception {
         Path shard = Files.createDirectory(tempDir.resolve("shard-compact"));
         Files.copy(compactFile, shard.resolve(GraphViews.COMPACT_FILE));

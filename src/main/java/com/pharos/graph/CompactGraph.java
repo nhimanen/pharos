@@ -37,6 +37,11 @@ public final class CompactGraph implements GraphView {
     private static final int CALLS = 0, INHERITS = 1, IMPLEMENTS = 2, DECLARES = 3, READS = 4,
             WRITES = 5, RETURNS = 6, TAKES = 7, ANNOTATED = 8;
 
+    /** Sanity limits: counts / string sizes above these mean a corrupt file, not a big graph. */
+    private static final int MAX_COUNT = 50_000_000;
+    private static final int MAX_STRING_BYTES = 64 * 1024;
+    private static final int INITIAL_CAPACITY = 1 << 16;
+
     private final String[] fqns;
     private final byte[] kinds;
     /** Per vertex: classPrefix is non-empty (only meaningful for methods). */
@@ -94,15 +99,27 @@ public final class CompactGraph implements GraphView {
         }
         int n = in.readInt();
         if (n < 0) throw new IOException("corrupt compact graph: negative vertex count");
-        String[] fqns = new String[n];
-        byte[] kinds = new byte[n];
-        boolean[] owned = new boolean[n];
-        String[] fieldType = new String[n];
-        String[] accessMod = new String[n];
+        if (n > MAX_COUNT) throw new IOException("corrupt compact graph: vertex count " + n);
+        // Allocate in growing steps: a corrupt count then hits EOF on the short stream instead of
+        // allocating gigabytes up front (gzip only verifies its CRC at the very end).
+        int cap = Math.min(n, INITIAL_CAPACITY);
+        String[] fqns = new String[cap];
+        byte[] kinds = new byte[cap];
+        boolean[] owned = new boolean[cap];
+        String[] fieldType = new String[cap];
+        String[] accessMod = new String[cap];
         List<Map<String, Integer>> idByKind = List.of(new HashMap<>(), new HashMap<>(), new HashMap<>());
         Map<String, List<Integer>> byOwner = new LinkedHashMap<>();
         Map<String, String> pool = new HashMap<>(); // dedups fqn-less strings (types, modifiers, owners)
         for (int i = 0; i < n; i++) {
+            if (i == fqns.length) {
+                int grown = (int) Math.min(n, (long) fqns.length * 2);
+                fqns = Arrays.copyOf(fqns, grown);
+                kinds = Arrays.copyOf(kinds, grown);
+                owned = Arrays.copyOf(owned, grown);
+                fieldType = Arrays.copyOf(fieldType, grown);
+                accessMod = Arrays.copyOf(accessMod, grown);
+            }
             int kind = in.readByte();
             if (kind < 0 || kind >= CompactGraphWriter.KINDS.length) {
                 throw new IOException("corrupt compact graph: bad vertex kind " + kind);
@@ -134,9 +151,8 @@ public final class CompactGraph implements GraphView {
             if (m < 0) throw new IOException("corrupt compact graph: negative edge count");
             edgeCount[t] = m;
             if (m == 0) continue;
-            int[] from = new int[m], to = new int[m];
-            for (int i = 0; i < m; i++) from[i] = checkId(in.readInt(), n);
-            for (int i = 0; i < m; i++) to[i] = checkId(in.readInt(), n);
+            if (m > MAX_COUNT) throw new IOException("corrupt compact graph: edge count " + m);
+            int[] from = readIds(in, m, n), to = readIds(in, m, n);
             csr(from, to, n, offsets[t][0] = new int[n + 1], targets[t][0] = new int[m], false);
             csr(to, from, n, offsets[t][1] = new int[n + 1], targets[t][1] = new int[m], true);
         }
@@ -146,8 +162,9 @@ public final class CompactGraph implements GraphView {
 
     /**
      * Counting sort of (key, value) pairs by key into CSR form. Forward lists keep the file order
-     * (ArcadeDB's out-edge order); reverse lists are written newest first, which is how ArcadeDB
-     * lists a vertex's in-edges (most recently linked edge first).
+     * (ArcadeDB's out-edge order); reverse lists are filled from the end of the file order backwards, i.e. grouped by
+     * target with the highest from-id first (an approximation of ArcadeDB's newest-first in-edge
+     * list, exact only when vertex order equals edge-insertion order).
      */
     private static void csr(int[] key, int[] value, int n, int[] off, int[] out, boolean newestFirst) {
         for (int k : key) off[k + 1]++;
@@ -158,6 +175,16 @@ public final class CompactGraph implements GraphView {
         } else {
             for (int i = 0; i < key.length; i++) out[pos[key[i]]++] = value[i];
         }
+    }
+
+    /** Reads {@code m} vertex indexes, growing the array as data arrives (see read()). */
+    private static int[] readIds(DataInputStream in, int m, int n) throws IOException {
+        int[] a = new int[Math.min(m, INITIAL_CAPACITY)];
+        for (int i = 0; i < m; i++) {
+            if (i == a.length) a = Arrays.copyOf(a, (int) Math.min(m, (long) a.length * 2));
+            a[i] = checkId(in.readInt(), n);
+        }
+        return a;
     }
 
     private static int checkId(int id, int n) throws IOException {
@@ -174,7 +201,7 @@ public final class CompactGraph implements GraphView {
     private static String readString(DataInputStream in) throws IOException {
         int len = in.readInt();
         if (len == -1) return null;
-        if (len < 0) throw new IOException("corrupt compact graph: string length " + len);
+        if (len < 0 || len > MAX_STRING_BYTES) throw new IOException("corrupt compact graph: string length " + len);
         byte[] b = new byte[len];
         in.readFully(b);
         return new String(b, StandardCharsets.UTF_8);
