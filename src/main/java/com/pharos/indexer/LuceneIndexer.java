@@ -1,6 +1,8 @@
 package com.pharos.indexer;
 
 import com.pharos.analysis.SynonymProvider;
+import com.pharos.cluster.LocalCache;
+import com.pharos.cluster.LocalFsCache;
 import com.pharos.config.IndexConfig;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
@@ -36,8 +38,15 @@ public class LuceneIndexer implements Closeable {
     private final IndexConfig config;
     private final Map<String, DirectoryReader> openReaders = new HashMap<>();
 
+    private final LocalCache cache;
+
     public LuceneIndexer(IndexConfig config) {
+        this(config, new LocalFsCache(config));
+    }
+
+    public LuceneIndexer(IndexConfig config, LocalCache cache) {
         this.config = config;
+        this.cache = cache;
     }
 
     /**
@@ -149,11 +158,11 @@ public class LuceneIndexer implements Closeable {
     }
 
     public Path getLucenePath(String projectName) {
-        return config.getIndexDir().resolve(projectName).resolve("lucene");
+        return getProjectIndexDir(projectName).resolve("lucene");
     }
 
     public Path getProjectIndexDir(String projectName) {
-        return config.getIndexDir().resolve(projectName);
+        return cache.shardDir(projectName);
     }
 
     /**
