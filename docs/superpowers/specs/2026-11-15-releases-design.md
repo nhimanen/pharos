@@ -130,6 +130,24 @@ The user picked 1.
 - `INDEX_FORMAT` and `CHUNKING_VERSION` are independent. A `CHUNKING_VERSION` bump keeps its current automatic selective re-embed and does not trigger the read-time check.
 - The multi-node work (branch `feat/cluster-phase-0-1`) is changing `LuceneIndexer` and the graph read sites in parallel. Whichever lands second calls `IndexFormat.check` from the new `GraphViews` choke point, if the cluster branch has introduced it.
 
+## Compatibility policy: N-1 (decided 2026-11-15, after approval)
+
+**Decided:** a pharos release whose `INDEX_FORMAT` is N must read and serve indexes of format **N and N-1**. A live system can then keep serving the old indexes while they are re-indexed, instead of breaking until each project is rebuilt. This refines §2 (option A): only indexes of format ≤ N-2, or newer than N, are refused.
+
+- **Statuses** become `ok` (N), `upgrade-available` (N-1, searchable), `outdated` (≤ N-2, refused), `newer` (> N, refused) and `missing`.
+- **Read paths** serve `upgrade-available` projects normally, with no per-query warning. `pharos projects`, `index-status`, `/api/projects` and the `setup.sh` warning show them as "upgrade available (still searchable)".
+- **`setup.sh` warning:** projects listed as `outdated` become unsearchable after the upgrade. `upgrade-available` projects are listed separately as "searchable now; re-index when convenient". The prompt is only required when something would become unsearchable.
+- **`upgrade-indexes`** includes `upgrade-available` projects. Write-time behaviour is unchanged: an incremental run on any non-`ok` format becomes a full run.
+- **Serving during the re-index:**
+  - A full re-index must not disturb readers. Lucene already keeps the previous commit visible until the new one lands.
+  - The call graph is rebuilt in a sibling directory (`callgraph.arcadedb.new`) and swapped in with directory renames at the end. Readers therefore see either the old graph or the new one, never a half-built one.
+  - The stamp is written last.
+- **Obligation on every format bump:**
+  - The code keeps a working read path for the previous format.
+  - The previous-format fixture under `src/test/resources/compat/format-<N-1>/` is kept, and a fixture for the new format is added.
+  - `IndexCompatTest` searches every fixture whose format is ≥ N-1 and asserts results. CI enforces this through the release workflow's test run.
+- **For v1.4.0:** format 1 reads format 0. Format 0 is the existing on-disk layout, and serving it shows the pre-fix behaviour (for example duplicate ids) until it is re-indexed.
+
 ## Settled during review (designer's calls unless noted)
 
 - **Base and scope.** PRs #18–#29 are all merged into `main`, and this branch starts from that. The `INDEX_FORMAT` 1 history entry names #18 (Java ids), #23 (script/doc ids), #24 (graph index repair) and #19 (per-model caches). The plan includes the pom bump to 1.4.0, `CHANGELOG.md` and `UPGRADING.md`. It **stops before pushing the tag**: publishing a release is the maintainer's action.
