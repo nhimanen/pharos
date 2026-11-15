@@ -41,7 +41,12 @@ class S3ObjectStoreMinioTest extends ObjectStoreContract {
         String endpoint = System.getenv("PHAROS_TEST_S3_ENDPOINT");
         String ak = System.getenv("PHAROS_TEST_S3_ACCESS_KEY");
         String sk = System.getenv("PHAROS_TEST_S3_SECRET_KEY");
-        if (endpoint == null || ak == null || sk == null) {
+        int set = (endpoint != null ? 1 : 0) + (ak != null ? 1 : 0) + (sk != null ? 1 : 0);
+        if (set > 0 && set < 3) {
+            throw new IllegalStateException("Set all of PHAROS_TEST_S3_ENDPOINT, PHAROS_TEST_S3_ACCESS_KEY, "
+                    + "PHAROS_TEST_S3_SECRET_KEY or none of them");
+        }
+        if (set == 0) {
             assumeTrue(DockerClientFactory.instance().isDockerAvailable(),
                     "no external S3 endpoint configured and Docker is unavailable");
             container = new MinIOContainer("minio/minio:latest");
@@ -71,6 +76,14 @@ class S3ObjectStoreMinioTest extends ObjectStoreContract {
 
     @AfterAll
     static void tearDown() throws Exception {
+        if (store != null && admin != null && bucket != null) {
+            try {
+                for (ObjectInfo o : store.list("")) admin.deleteObject(b -> b.bucket(bucket).key(o.key()));
+                admin.deleteBucket(b -> b.bucket(bucket));
+            } catch (Exception ignored) {
+                // best-effort cleanup
+            }
+        }
         if (store != null) store.close();
         if (admin != null) admin.close();
         if (container != null) container.stop();

@@ -75,7 +75,7 @@ public class S3ObjectStore implements ObjectStore {
         } catch (NoSuchKeyException e) {
             return Optional.empty();
         } catch (S3Exception e) {
-            if (e.statusCode() == 404) return Optional.empty();
+            if (isMissingKey(e)) return Optional.empty();
             throw wrap("get", key, e);
         } catch (SdkException e) {
             throw wrap("get", key, e);
@@ -96,7 +96,7 @@ public class S3ObjectStore implements ObjectStore {
         } catch (NoSuchKeyException e) {
             throw missing(key);
         } catch (S3Exception e) {
-            if (e.statusCode() == 404) throw missing(key);
+            if (isMissingKey(e)) throw missing(key);
             throw wrap("download", key, e);
         } catch (SdkException e) {
             throw wrap("download", key, e);
@@ -142,7 +142,7 @@ public class S3ObjectStore implements ObjectStore {
         } catch (S3Exception e) {
             // 412 PreconditionFailed; 409 ConditionalRequestConflict (concurrent conditional writers)
             if (e.statusCode() == 412 || e.statusCode() == 409) return Optional.empty();
-            if (missingIsEmpty && e.statusCode() == 404) return Optional.empty();
+            if (missingIsEmpty && isMissingKey(e)) return Optional.empty();
             throw wrap("conditional put", key, e);
         } catch (SdkException e) {
             throw wrap("conditional put", key, e);
@@ -173,7 +173,7 @@ public class S3ObjectStore implements ObjectStore {
         try {
             s3.deleteObject(b -> b.bucket(bucket).key(key));
         } catch (S3Exception e) {
-            if (e.statusCode() == 404) return;
+            if (isMissingKey(e)) return;
             throw wrap("delete", key, e);
         } catch (SdkException e) {
             throw wrap("delete", key, e);
@@ -197,7 +197,17 @@ public class S3ObjectStore implements ObjectStore {
         return new NoSuchFileException(key, null, "object not found: " + key);
     }
 
-    private static IOException wrap(String op, String key, SdkException e) {
-        return new IOException("S3 " + op + " failed for key '" + key + "': " + e.getMessage(), e);
+    /** True only for a missing object (NoSuchKey); a 404 for NoSuchBucket etc. is a real error. */
+    static boolean isMissingKey(S3Exception e) {
+        if (e instanceof NoSuchKeyException) return true;
+        if (e.awsErrorDetails() != null && e.awsErrorDetails().errorCode() != null) {
+            return "NoSuchKey".equals(e.awsErrorDetails().errorCode());
+        }
+        return false;
+    }
+
+    private IOException wrap(String op, String key, SdkException e) {
+        return new IOException("S3 " + op + " failed for key '" + key + "' in bucket '" + bucket + "': "
+                + e.getMessage(), e);
     }
 }
