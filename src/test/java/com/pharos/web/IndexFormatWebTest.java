@@ -56,13 +56,25 @@ class IndexFormatWebTest {
                 new NoOpEmbeddingProvider(), noopGraph);
         manager.index(copy("sample-app", "sample-app-a"), "a", false, false, false, false, ProgressListener.SILENT);
         manager.index(copy("sample-app", "sample-app-b"), "b", false, false, false, false, ProgressListener.SILENT);
-        Files.delete(luceneIndexer.getProjectIndexDir("b").resolve("index-format.json"));
+        // Two formats behind: below the N-1 read window, so refused.
+        stamp(luceneIndexer.getProjectIndexDir("b"), com.pharos.indexer.IndexVersions.INDEX_FORMAT - 2);
+        indexDirA = luceneIndexer.getProjectIndexDir("a");
 
         SearchEngine engine = new SearchEngine(luceneIndexer, new NoOpEmbeddingProvider(), registry);
         WebServer server = new WebServer(engine, registry, noopGraph, luceneIndexer,
                 new ModuleBoundaryAnalyzer(registry, engine));
         try (ServerSocket s = new ServerSocket(0)) { port = s.getLocalPort(); }
         app = server.start(port, tmp.resolve("pharos-home"));
+    }
+
+    private Path indexDirA;
+
+    private static void stamp(Path indexDir, int format) throws Exception {
+        Path f = indexDir.resolve("index-format.json");
+        Files.writeString(f, "{\"format\":" + format
+                + ",\"pharosVersion\":\"0.9.0\",\"writtenAt\":\"2026-01-01T00:00:00Z\"}");
+        Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.from(
+                java.time.Instant.parse("2026-01-01T00:00:00Z")));
     }
 
     @AfterEach
@@ -117,6 +129,20 @@ class IndexFormatWebTest {
         }
         assertThat(statusA).isEqualTo("ok");
         assertThat(statusB).isEqualTo("outdated");
+    }
+
+    @Test
+    void projectsListShowsUpgradeAvailableForPreviousFormat() throws Exception {
+        stamp(indexDirA, com.pharos.indexer.IndexVersions.INDEX_FORMAT - 1);
+        JsonNode arr = mapper.readTree(get("/api/projects").body());
+        String statusA = null;
+        for (JsonNode p : arr) {
+            if (p.get("name").asText().equals("a")) statusA = p.get("indexFormat").get("status").asText();
+        }
+        assertThat(statusA).isEqualTo("upgrade-available");
+        HttpResponse<String> r = get("/api/search?q=email&type=keyword&project=a");
+        assertThat(r.statusCode()).isEqualTo(200);
+        assertThat(r.headers().firstValue("X-Pharos-Warnings")).isEmpty();
     }
 
     @Test

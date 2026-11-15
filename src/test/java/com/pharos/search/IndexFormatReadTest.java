@@ -7,6 +7,7 @@ import com.pharos.embedding.NoOpEmbeddingProvider;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.IndexVersions;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProgressListener;
 import com.pharos.indexer.ProjectIndexManager;
@@ -71,8 +72,19 @@ class IndexFormatReadTest {
         manager.index(root, name, false, false, false, false, ProgressListener.SILENT);
     }
 
+    /** Stamps {@code project} with {@code format} by hand, as an older or newer pharos would. */
+    private void stamp(String project, int format) throws Exception {
+        Path f = luceneIndexer.getProjectIndexDir(project).resolve("index-format.json");
+        Files.writeString(f, "{\"format\":" + format
+                + ",\"pharosVersion\":\"0.9.0\",\"writtenAt\":\"2026-01-01T00:00:00Z\"}");
+        // A distinct mtime, so the per-dir status cache never serves the previous stamp.
+        Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.from(
+                java.time.Instant.parse("2026-01-01T00:00:00Z")));
+    }
+
+    /** Two formats behind: below the N-1 read window, so refused. */
     private void unstamp(String project) throws Exception {
-        Files.delete(luceneIndexer.getProjectIndexDir(project).resolve("index-format.json"));
+        stamp(project, IndexVersions.INDEX_FORMAT - 2);
     }
 
     private SearchRequest kw(String q, String project) {
@@ -100,6 +112,22 @@ class IndexFormatReadTest {
         assertThat(r.results()).isNotEmpty().allMatch(x -> x.id().startsWith("a:"));
         assertThat(r.warnings()).hasSize(1);
         assertThat(r.warnings().get(0)).contains("'b'");
+    }
+
+    @Test
+    void previousFormatIsServedDuringCrossProjectSearch() throws Exception {
+        stamp("b", IndexVersions.INDEX_FORMAT - 1);
+        assertThat(IndexFormat.status(luceneIndexer.getProjectIndexDir("b")))
+                .isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+
+        SearchResponse r = engine.searchWithTrace(kw(TERM, null), false);
+        assertThat(r.results()).anyMatch(x -> x.id().startsWith("b:"));
+        assertThat(r.warnings()).isEmpty();
+        // scoped search and graph tools serve it too
+        assertThat(engine.searchWithTrace(kw(TERM, "b"), false).results()).isNotEmpty();
+        List<String> w = new java.util.ArrayList<>();
+        assertThat(engine.findUsages(A_FQN, "callers", "b", w).callers()).isNotEmpty();
+        assertThat(w).isEmpty();
     }
 
     @Test

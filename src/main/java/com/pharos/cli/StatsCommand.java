@@ -71,7 +71,7 @@ public class StatsCommand implements Callable<Integer> {
                     System.out.printf("  Graph calls:   %d%n", graph.callCount());
                 }
             } catch (IncompatibleIndexException e) {
-                System.out.printf("  Graph:         (index format incompatible: %s)%n", e.status().name().toLowerCase());
+                System.out.printf("  Graph:         (index format incompatible: %s)%n", e.status().wireName());
             } catch (Exception e) {
                 System.out.printf("  Graph:         (unavailable)%n");
             }

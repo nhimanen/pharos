@@ -53,6 +53,7 @@ public class ProjectsCommand implements Callable<Integer> {
     private static String formatLabel(IndexFormat.Status s) {
         return switch (s) {
             case OK -> "ok";
+            case UPGRADE_AVAILABLE -> "upgrade available";
             case OUTDATED -> "needs upgrade";
             case NEWER -> "newer";
             case MISSING -> "-";

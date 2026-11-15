@@ -25,8 +25,10 @@ public final class IndexVersions {
     private IndexVersions() {}
 
     /**
-     * On-disk index format, stamped per project in {@code index-format.json}; a project whose
-     * stamp differs is refused until re-indexed. A missing stamp means format 0. Bump this when
+     * On-disk index format, stamped per project in {@code index-format.json}. This build serves
+     * format N and N-1 ({@link IndexFormat#MIN_READABLE_FORMAT}); older or newer stamps are
+     * refused until re-indexed. A missing stamp means format 0. On a bump, keep the N-1 read path
+     * working and add the {@code compat/format-<N>.zip} fixture ({@code IndexCompatTest}). Bump this when
      * a change makes existing indexes unreadable or wrong (ids, schema, graph, cache layout);
      * bump {@link #CHUNKING_VERSION} instead when only embedding text changes and the
      * incremental run can re-embed in place.

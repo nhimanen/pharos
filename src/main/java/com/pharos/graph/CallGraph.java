@@ -121,9 +121,9 @@ public class CallGraph implements AutoCloseable {
     // lookup took 150 ms instead of 3–5 ms. REBUILD INDEX restores exact indexes.
 
     /** Marker written next to the database once its indexes have been rebuilt by this version. */
-    private static final String INDEX_REPAIRED_SUFFIX = ".index-v2";
+    public static final String INDEX_REPAIRED_SUFFIX = ".index-v2";
     /** Sidecar holding the number of vertices deleted since the last index rebuild. */
-    private static final String CHURN_SUFFIX = ".index-churn";
+    public static final String CHURN_SUFFIX = ".index-churn";
     /** Rebuild once deletions since the last rebuild exceed this share of the graph … */
     private static final double CHURN_REBUILD_RATIO = 0.10;
     /** … but not for fewer than this many deletions. */

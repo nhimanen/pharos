@@ -17,10 +17,40 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Per-project index format stamp ({@code <project index dir>/index-format.json}) and the
  * compatibility check against {@link IndexVersions#INDEX_FORMAT}.
+ *
+ * <p>N-1 policy: this build serves indexes of its own format and of the previous one
+ * ({@link #MIN_READABLE_FORMAT}), so a live system keeps answering while projects are re-indexed.
+ * Older or newer formats are refused.
  */
 public final class IndexFormat {
 
-    public enum Status { OK, OUTDATED, NEWER, MISSING }
+    public enum Status {
+        /** Written in this build's format. */
+        OK("ok"),
+        /** One format behind (N-1): still served; the next {@code pharos index} rebuilds it. */
+        UPGRADE_AVAILABLE("upgrade-available"),
+        /** Older than N-1: refused until re-indexed. */
+        OUTDATED("outdated"),
+        /** Written by a newer pharos: refused. */
+        NEWER("newer"),
+        /** No index dir. */
+        MISSING("missing");
+
+        private final String wireName;
+
+        Status(String wireName) { this.wireName = wireName; }
+
+        /** The status as shown in JSON and the CLI ({@code upgrade-available}, …). */
+        public String wireName() { return wireName; }
+    }
+
+    /** The oldest format this build still reads and serves (N-1). */
+    public static final int MIN_READABLE_FORMAT = IndexVersions.INDEX_FORMAT - 1;
+
+    /** Whether a project with this status may be searched and its graph read. */
+    public static boolean servable(Status s) {
+        return s == Status.OK || s == Status.UPGRADE_AVAILABLE;
+    }
 
     public record Stamp(int format, String pharosVersion, Instant writtenAt) {}
 
@@ -74,20 +104,20 @@ public final class IndexFormat {
 
     public static void check(String project, Path projectIndexDir) {
         Cached c = cached(projectIndexDir);
-        if (c.status() != Status.OUTDATED && c.status() != Status.NEWER) return;
+        if (servable(c.status()) || c.status() == Status.MISSING) return;
         String me = PharosVersion.get();
         Stamp s = c.stamp();
         String msg;
         if (c.status() == Status.OUTDATED) {
             msg = "Project '" + project + "' was indexed by pharos " + s.pharosVersion()
                     + " (index format " + s.format() + "); this pharos (" + me
-                    + ") needs index format " + IndexVersions.INDEX_FORMAT
+                    + ") reads index formats " + MIN_READABLE_FORMAT + "–" + IndexVersions.INDEX_FORMAT
                     + ". Run: pharos index --full " + project
                     + "   (or upgrade all: ./setup.sh --upgrade-indexes)";
         } else {
             msg = "Project '" + project + "' was indexed by a newer pharos " + s.pharosVersion()
                     + " (index format " + s.format() + "); this pharos (" + me
-                    + ") only supports index format " + IndexVersions.INDEX_FORMAT
+                    + ") reads index formats " + MIN_READABLE_FORMAT + "–" + IndexVersions.INDEX_FORMAT
                     + ". Re-index with this version (pharos index --full " + project
                     + ") or reinstall the newer pharos.";
         }
@@ -111,7 +141,8 @@ public final class IndexFormat {
         if (c != null && c.mtime() == key) return c;
         Stamp s = read(dir);
         Status st = s.format() == IndexVersions.INDEX_FORMAT ? Status.OK
-                : s.format() < IndexVersions.INDEX_FORMAT ? Status.OUTDATED : Status.NEWER;
+                : s.format() > IndexVersions.INDEX_FORMAT ? Status.NEWER
+                : s.format() >= MIN_READABLE_FORMAT ? Status.UPGRADE_AVAILABLE : Status.OUTDATED;
         Cached n = new Cached(key, st, s);
         CACHE.put(k, n);
         return n;

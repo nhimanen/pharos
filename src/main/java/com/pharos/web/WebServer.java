@@ -106,7 +106,7 @@ public class WebServer {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("error", e.getMessage());
             body.put("project", e.project());
-            body.put("status", e.status().name().toLowerCase());
+            body.put("status", e.status().wireName());
             ctx.status(409).json(body);
         });
 
@@ -1012,7 +1012,7 @@ public class WebServer {
         Path indexDir = Path.of(p.getIndexPath());
         IndexFormat.Stamp stamp = IndexFormat.read(indexDir);
         Map<String, Object> fmt = new LinkedHashMap<>();
-        fmt.put("status", IndexFormat.status(indexDir).name().toLowerCase());
+        fmt.put("status", IndexFormat.status(indexDir).wireName());
         fmt.put("format", stamp.format());
         fmt.put("pharosVersion", stamp.pharosVersion());
         m.put("indexFormat", fmt);

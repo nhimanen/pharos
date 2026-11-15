@@ -24,12 +24,14 @@ class IndexFormatTest {
     }
 
     @Test
-    void missingStampIsFormatZeroAndOutdated() {
+    void missingStampIsFormatZero() {
         IndexFormat.Stamp s = IndexFormat.read(dir);
         assertThat(s.format()).isZero();
         assertThat(s.pharosVersion()).isEqualTo("unknown");
         assertThat(s.writtenAt()).isNull();
-        assertThat(IndexFormat.status(dir)).isEqualTo(IndexFormat.Status.OUTDATED);
+        // Format 0 is the unstamped layout: servable while it is N-1, refused once it is older.
+        assertThat(IndexFormat.status(dir)).isEqualTo(IndexFormat.MIN_READABLE_FORMAT <= 0
+                ? IndexFormat.Status.UPGRADE_AVAILABLE : IndexFormat.Status.OUTDATED);
     }
 
     @Test
@@ -44,12 +46,33 @@ class IndexFormatTest {
 
     @Test
     void olderStampIsOutdatedWithFixInMessage() throws Exception {
-        stamp(IndexVersions.INDEX_FORMAT - 1);
+        stamp(IndexVersions.INDEX_FORMAT - 2);
         assertThatThrownBy(() -> IndexFormat.check("p", dir))
                 .isInstanceOf(IncompatibleIndexException.class)
                 .hasMessageContaining("pharos index --full p")
                 .hasMessageContaining("./setup.sh --upgrade-indexes")
                 .hasMessageContaining("0.9.0");
+    }
+
+    @Test
+    void previousFormatIsUpgradeAvailableAndServable() throws Exception {
+        assertThat(IndexFormat.MIN_READABLE_FORMAT).isEqualTo(IndexVersions.INDEX_FORMAT - 1);
+        stamp(IndexVersions.INDEX_FORMAT - 1);
+        assertThat(IndexFormat.status(dir)).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+        assertThat(IndexFormat.servable(IndexFormat.Status.UPGRADE_AVAILABLE)).isTrue();
+        assertThat(IndexFormat.Status.UPGRADE_AVAILABLE.wireName()).isEqualTo("upgrade-available");
+        assertThatCode(() -> IndexFormat.check("p", dir)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void twoBehindIsOutdatedAndRefused() throws Exception {
+        stamp(IndexVersions.INDEX_FORMAT - 2);
+        assertThat(IndexFormat.status(dir)).isEqualTo(IndexFormat.Status.OUTDATED);
+        assertThat(IndexFormat.servable(IndexFormat.Status.OUTDATED)).isFalse();
+        assertThat(IndexFormat.servable(IndexFormat.Status.NEWER)).isFalse();
+        assertThat(IndexFormat.servable(IndexFormat.Status.OK)).isTrue();
+        assertThatThrownBy(() -> IndexFormat.check("p", dir))
+                .isInstanceOf(IncompatibleIndexException.class);
     }
 
     @Test
@@ -63,7 +86,7 @@ class IndexFormatTest {
 
     @Test
     void rewrittenStampClearsCachedFailure() throws Exception {
-        stamp(IndexVersions.INDEX_FORMAT - 1);
+        stamp(IndexVersions.INDEX_FORMAT - 2);
         assertThatThrownBy(() -> IndexFormat.check("p", dir)).isInstanceOf(IncompatibleIndexException.class);
         IndexFormat.write(dir);
         Path f = dir.resolve("index-format.json");

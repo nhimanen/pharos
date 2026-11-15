@@ -433,7 +433,9 @@ def fmt_projects(projects: list, limit: int = 0) -> str:
         classes = p.get("classCount", 0)
         last = p.get("lastIndexed", "")
         fmt_status = (p.get("indexFormat") or {}).get("status", "ok")
-        flag = {"ok": "", "outdated": " [needs upgrade: pharos index --full]",
+        flag = {"ok": "",
+                "upgrade-available": " [upgrade available (still searchable): pharos index --full]",
+                "outdated": " [needs upgrade: pharos index --full]",
                 "newer": " [index from a newer pharos]"}.get(fmt_status, "")
         lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last}){flag}")
     if hidden:

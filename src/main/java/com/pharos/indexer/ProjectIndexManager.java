@@ -421,6 +421,7 @@ public class ProjectIndexManager {
 
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
+        recoverInterruptedGraphSwap(projectIndexDir);
 
         // Without embeddings no model is involved: stamp "none" rather than the configured
         // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
@@ -537,9 +538,13 @@ public class ProjectIndexManager {
         }
         com.pharos.parser.model.ParsedRelationships relationships = mergeRelationships(projectName, allRelationships);
 
-        // Pass 1: build call graph + knowledge graph — needed to compute in-degrees and caller contexts
+        // Pass 1: build call graph + knowledge graph — needed to compute in-degrees and caller contexts.
+        // Built beside the live graph (callgraph.arcadedb.new), which readers keep using until the
+        // swap after the Lucene commit below.
         progress.onProgress("Building call graph", 0, 0);
-        GraphIndexData graphData = buildAndSaveGraph(project, relationships, projectIndexDir);
+        removeGraphLeftovers(projectIndexDir);
+        Path newGraph = projectIndexDir.resolve(GRAPH_DIR + NEW_SUFFIX);
+        GraphIndexData graphData = buildAndSaveGraph(project, relationships, newGraph);
 
         // Release relationships and intermediate lists before embedding starts.
         // For large projects the relationship lists (returns, takes, etc.) can be
@@ -553,6 +558,10 @@ public class ProjectIndexManager {
                     projectIndexDir, runtimes);
             writer.commit();
         }
+
+        // Swap the rebuilt graph in now that the matching Lucene commit is visible.
+        if (graphData.built()) swapInGraph(projectIndexDir);
+        else removeGraphLeftovers(projectIndexDir);
 
         // Save file state
         stateTracker.save();
@@ -1648,15 +1657,101 @@ public class ProjectIndexManager {
         return meta;
     }
 
+    private static final String GRAPH_DIR = "callgraph.arcadedb";
+    private static final String NEW_SUFFIX = ".new";
+    private static final String OLD_SUFFIX = ".old";
+
+    /**
+     * Deletes {@code callgraph.arcadedb.new} / {@code .old} (and their sidecar files) left by an
+     * interrupted full run. A reader that still has an {@code .old} graph open keeps its open
+     * files on POSIX systems.
+     */
+    private static void removeGraphLeftovers(Path projectIndexDir) {
+        try (var s = Files.list(projectIndexDir)) {
+            for (Path p : s.toList()) {
+                String n = p.getFileName().toString();
+                if (n.startsWith(GRAPH_DIR + NEW_SUFFIX) || n.startsWith(GRAPH_DIR + OLD_SUFFIX)) {
+                    deleteRecursively(p);
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Could not remove leftover call graph in {}: {}", projectIndexDir, e.getMessage());
+        }
+    }
+
+    /**
+     * A run killed between the two renames of {@link #swapInGraph} leaves no live graph but a
+     * complete {@code .old} one: put it back, so readers and an incremental patch find a graph.
+     */
+    private static void recoverInterruptedGraphSwap(Path projectIndexDir) {
+        Path live = projectIndexDir.resolve(GRAPH_DIR);
+        Path old = projectIndexDir.resolve(GRAPH_DIR + OLD_SUFFIX);
+        if (Files.exists(live) || !Files.isDirectory(old)) return;
+        try {
+            Files.move(old, live, StandardCopyOption.ATOMIC_MOVE);
+            log.warn("Restored call graph {} left by an interrupted re-index", live);
+        } catch (IOException e) {
+            log.warn("Could not restore call graph at {}: {}", live, e.getMessage());
+        }
+    }
+
+    private static void deleteRecursively(Path p) throws IOException {
+        if (!Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return;
+        try (var w = Files.walk(p)) {
+            for (Path q : w.sorted(java.util.Comparator.reverseOrder()).toList()) Files.deleteIfExists(q);
+        }
+    }
+
+    /**
+     * Replaces the live call graph with the one built in {@code callgraph.arcadedb.new}:
+     * live → {@code .old}, {@code .new} → live, then {@code .old} is deleted. Readers that open the
+     * graph see the old one or the new one; only for the instant between the two renames is there
+     * none (readers skip a project without a graph dir). Sidecar files
+     * ({@code callgraph.arcadedb.index-v2}, {@code .index-churn}) move with the graph.
+     */
+    private static void swapInGraph(Path projectIndexDir) {
+        Path live = projectIndexDir.resolve(GRAPH_DIR);
+        Path fresh = projectIndexDir.resolve(GRAPH_DIR + NEW_SUFFIX);
+        Path old = projectIndexDir.resolve(GRAPH_DIR + OLD_SUFFIX);
+        try {
+            if (Files.exists(live)) Files.move(live, old, StandardCopyOption.ATOMIC_MOVE);
+            try {
+                Files.move(fresh, live, StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.FileAlreadyExistsException | java.nio.file.DirectoryNotEmptyException e) {
+                // A reader opened the graph in the gap between the renames and so created an
+                // empty one at the live path: it holds nothing, so replace it.
+                log.debug("Replacing graph created during the swap at {}", live);
+                deleteRecursively(live);
+                Files.move(fresh, live, StandardCopyOption.ATOMIC_MOVE);
+            }
+            // The fresh graph's sidecars describe it; the old graph's no longer apply.
+            for (String suffix : List.of(CallGraph.INDEX_REPAIRED_SUFFIX, CallGraph.CHURN_SUFFIX)) {
+                Path from = projectIndexDir.resolve(GRAPH_DIR + NEW_SUFFIX + suffix);
+                Path to = projectIndexDir.resolve(GRAPH_DIR + suffix);
+                if (Files.exists(from)) Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
+                else Files.deleteIfExists(to);
+            }
+            // The cross-project graph is rebuilt when this is newer than its own stamp.
+            CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
+            log.debug("Swapped in rebuilt call graph at {}", live);
+        } catch (IOException e) {
+            log.warn("Could not swap in the rebuilt call graph at {}: {}", live, e.getMessage());
+            // Never leave the project without a graph when the old one is still around.
+            if (!Files.exists(live) && Files.exists(old)) {
+                try { Files.move(old, live, StandardCopyOption.ATOMIC_MOVE); }
+                catch (IOException e2) { log.warn("Could not restore call graph at {}: {}", live, e2.getMessage()); }
+            }
+        }
+        removeGraphLeftovers(projectIndexDir);
+    }
+
     private GraphIndexData buildAndSaveGraph(ParsedProject project,
                                               com.pharos.parser.model.ParsedRelationships relationships,
-                                              Path projectIndexDir) {
-        Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
+                                              Path dbDir) {
         try (CallGraph graph = CallGraph.open(dbDir, true)) {
             graph.clear();
             new CallGraphBuilder().build(graph, project);
             new KnowledgeGraphBuilder().build(graph, relationships);
-            CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             log.debug("Call graph built: {} methods, {} calls",
                     graph.methodCount(), graph.callCount());
             return GraphIndexData.build(graph, project);
@@ -1783,11 +1878,14 @@ public class ProjectIndexManager {
         private final java.util.Map<String, Integer> inDegrees;
         // fqn → simple method names of callers (for callerContext text field)
         private final java.util.Map<String, List<String>> callerNames;
+        // false when the graph build failed: the result is empty and no graph was written
+        private final boolean built;
 
         private GraphIndexData(java.util.Map<String, Integer> inDegrees,
-                               java.util.Map<String, List<String>> callerNames) {
+                               java.util.Map<String, List<String>> callerNames, boolean built) {
             this.inDegrees = inDegrees;
             this.callerNames = callerNames;
+            this.built = built;
         }
 
         static GraphIndexData build(CallGraph graph, ParsedProject project) {
@@ -1813,11 +1911,15 @@ public class ProjectIndexManager {
                         .collect(Collectors.toList());
                 names.put(fqn, simpleCallerNames);
             }
-            return new GraphIndexData(deg, names);
+            return new GraphIndexData(deg, names, true);
         }
 
         static GraphIndexData empty() {
-            return new GraphIndexData(new java.util.HashMap<>(), new java.util.HashMap<>());
+            return new GraphIndexData(new java.util.HashMap<>(), new java.util.HashMap<>(), false);
+        }
+
+        boolean built() {
+            return built;
         }
 
         int inDegree(String fqn) {

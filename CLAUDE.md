@@ -104,6 +104,16 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 2. Increment `CHUNKING_VERSION` in `indexer/IndexVersions.java`.
 3. Run `./pharos index <project>` — changed files re-embed via ONNX; unchanged single-chunk methods use cache.
 
+#### Index format (`INDEX_FORMAT`) and the N-1 rule
+
+`IndexVersions.INDEX_FORMAT` is stamped per project in `<index-dir>/<project>/index-format.json`. **Bump it when a change makes existing indexes unreadable or wrong** (document ids, Lucene schema, call-graph layout, cache layout) — not for embedding-text changes, which `CHUNKING_VERSION` covers. A release with format N must keep **reading and serving format N-1** (`IndexFormat.MIN_READABLE_FORMAT`, status `upgrade-available`) so a live system keeps answering while projects are re-indexed; only ≤ N-2 and newer formats are refused.
+
+**Workflow when bumping `INDEX_FORMAT`:**
+1. Increment `INDEX_FORMAT` and add a history entry in its javadoc.
+2. Keep a working read path for the previous format (N-1).
+3. Add the fixture for the new format: `mvn test -Dtest=IndexCompatTest -Dpharos.regenerateCompat=true` writes `src/test/resources/compat/format-<new N>.zip`. **Keep `compat/format-<N-1>.zip`**; older fixtures may stay (`refusesFixturesBelowMinimum` checks they are refused).
+4. `IndexCompatTest` must pass: it searches every fixture whose format is ≥ N-1.
+
 ### MCP Server
 
 `McpServerCommand` starts a JSON-RPC 2.0 server over stdio. Tools are registered in `McpToolRegistry` and map directly to `SearchEngine` / `ProjectIndexManager` operations. Configure in Claude Desktop via:
