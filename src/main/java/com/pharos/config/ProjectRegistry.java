@@ -60,7 +60,7 @@ public class ProjectRegistry {
         this(IndexConfig.DEFAULT_BASE.resolve("registry.json"));
     }
 
-    /** Registry backed by an explicit file, e.g. an isolated location for tests. */
+    /** Registry backed by an explicit file (isolated from {@code ~/.pharos}); for tests and embedding. */
     public static ProjectRegistry at(Path registryFile) {
         return new ProjectRegistry(registryFile);
     }
