@@ -74,19 +74,22 @@ public class CrossEncoderProvider implements AutoCloseable {
         tokenizerFile = ensureFile(modelId, "tokenizer.json", "tokenizer.json");
         Path onnxFile = ensureFile(modelId, onnxFilename, "model.onnx");
 
-        model = Model.newInstance("cross-encoder-" + label, "OnnxRuntime");
-        model.load(onnxFile.getParent(), onnxFile.getFileName().toString()
-                .replace(".onnx", ""));
+        boolean useTokenTypes;
+        try (var t = NativeInferenceGuard.enter()) {
+            model = Model.newInstance("cross-encoder-" + label, "OnnxRuntime");
+            model.load(onnxFile.getParent(), onnxFile.getFileName().toString()
+                    .replace(".onnx", ""));
 
-        // Auto-detect whether model needs token_type_ids: try a dummy pair,
-        // fall back to false if ONNX reports an input mismatch.
-        boolean useTokenTypes = probeTokenTypeIds(tokenizerFile, includeTokenTypeIds);
-        predictor = model.newPredictor(
-                new CrossEncoderTranslator(
-                        tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
-        batchPredictor = model.newPredictor(
-                new CrossEncoderBatchTranslator(
-                        tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
+            // Auto-detect whether model needs token_type_ids: try a dummy pair,
+            // fall back to false if ONNX reports an input mismatch.
+            useTokenTypes = probeTokenTypeIds(tokenizerFile, includeTokenTypeIds);
+            predictor = model.newPredictor(
+                    new CrossEncoderTranslator(
+                            tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
+            batchPredictor = model.newPredictor(
+                    new CrossEncoderBatchTranslator(
+                            tokenizerFile.toAbsolutePath(), MAX_LENGTH, useTokenTypes));
+        }
         log.info("Cross-encoder [{}] loaded (token_type_ids={}).", label, useTokenTypes);
     }
 
@@ -165,7 +168,7 @@ public class CrossEncoderProvider implements AutoCloseable {
      * Higher = more relevant.
      */
     public float score(String query, String document) {
-        try {
+        try (var t = NativeInferenceGuard.enter()) {
             return predictor.predict(new String[]{query, document});
         } catch (TranslateException e) {
             log.warn("Cross-encoder scoring failed: {}", e.getMessage());
@@ -183,7 +186,7 @@ public class CrossEncoderProvider implements AutoCloseable {
      */
     public float[] scoreBatch(String query, List<String> documents) {
         if (documents.isEmpty()) return new float[0];
-        try {
+        try (var t = NativeInferenceGuard.enter()) {
             List<String[]> pairs = documents.stream()
                     .map(doc -> new String[]{query, doc})
                     .toList();
@@ -196,9 +199,11 @@ public class CrossEncoderProvider implements AutoCloseable {
 
     @Override
     public void close() {
-        predictor.close();
-        batchPredictor.close();
-        model.close();
+        try (var t = NativeInferenceGuard.enter()) {
+            predictor.close();
+            batchPredictor.close();
+            model.close();
+        }
     }
 
     // ── Token type ID probe ───────────────────────────────────────────────────

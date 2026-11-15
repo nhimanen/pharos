@@ -80,7 +80,10 @@ public class Main {
                         moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker, embedders));
 
         int exitCode = cmd.execute(args);
-        System.exit(exitCode);
+        // Let background model calls (e.g. a server's warm-up) finish before exit runs ORT's
+        // shutdown hook, which frees the native environment under any call still running.
+        com.pharos.embedding.NativeInferenceGuard.beginShutdown();
+        System.exit(com.pharos.embedding.NativeInferenceGuard.exitCode(exitCode));
     }
 
     private static CrossEncoder buildCrossEncoder(IndexConfig config) {

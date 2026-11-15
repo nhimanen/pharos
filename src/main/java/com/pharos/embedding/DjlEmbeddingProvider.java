@@ -85,12 +85,16 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
 
         if (modelUrl.startsWith("hf://")) {
             this.tokenizerFile = prepareHuggingFaceFiles(modelUrl.substring("hf://".length()));
-            this.hfModel = loadHuggingFaceModel(tokenizerFile.getParent());
+            try (var t = NativeInferenceGuard.enter()) {
+                this.hfModel = loadHuggingFaceModel(tokenizerFile.getParent());
+            }
             this.zooModel = null;
         } else {
             this.tokenizerFile = null;
             this.hfModel = null;
-            this.zooModel = loadZooModel(modelUrl);
+            try (var t = NativeInferenceGuard.enter()) {
+                this.zooModel = loadZooModel(modelUrl);
+            }
         }
 
         log.info("Embedding model '{}' loaded ({} dimensions)", modelId, dimensions);
@@ -236,7 +240,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     public float[] embed(String text) {
         if (text == null || text.isBlank()) return null;
         String input = text.length() > MAX_INPUT_LENGTH ? text.substring(0, MAX_INPUT_LENGTH) : text;
-        try {
+        try (var t = NativeInferenceGuard.enter()) {
             maybeResetThreadPredictor();
             return threadPredictor.get().predict(input);
         } catch (TranslateException e) {
@@ -272,17 +276,16 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     public float[][] embedBatch(List<String> texts) {
         if (texts == null || texts.isEmpty()) return new float[0][];
 
-        Predictor<List<String>, float[][]> batchPred = threadBatchPredictor.get();
-        if (batchPred == null) {
-            // Zoo model path — sequential fallback
-            return EmbeddingProvider.super.embedBatch(texts);
-        }
-
         List<String> sanitised = texts.stream()
                 .map(t -> (t == null || t.isBlank()) ? ""
                         : t.length() > MAX_INPUT_LENGTH ? t.substring(0, MAX_INPUT_LENGTH) : t)
                 .collect(Collectors.toList());
-        try {
+        try (var ticket = NativeInferenceGuard.enter()) {
+            Predictor<List<String>, float[][]> batchPred = threadBatchPredictor.get();
+            if (batchPred == null) {
+                // Zoo model path — sequential fallback
+                return EmbeddingProvider.super.embedBatch(texts);
+            }
             return batchPred.predict(sanitised);
         } catch (TranslateException e) {
             log.debug("Batch embedding failed, falling back to sequential: {}", e.getMessage());
