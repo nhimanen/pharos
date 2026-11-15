@@ -35,6 +35,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>Each fixture is a zip of a project index dir (Lucene dir, call graph and stamp). Zipped
  * because ArcadeDB preallocates 2 MB index pages: unzipped one fixture is ~12 MB, zipped ~30 KB.
  *
+ * <p>Graph layouts: {@code format-0} has the legacy {@code callgraph.arcadedb} dir and no
+ * {@code callgraph.current} pointer, so it exercises the reader fallback; {@code format-1} has the
+ * pointer and a {@code callgraph-<gen>.arcadedb} generation dir, as this build writes.
+ *
  * <p>On an {@link IndexVersions#INDEX_FORMAT} bump, regenerate the fixture for the new format:
  * {@code mvn test -Dtest=IndexCompatTest -Dpharos.regenerateCompat=true}, and keep the previous one.
  */
@@ -160,7 +164,8 @@ class IndexCompatTest {
         luceneIndexer.close();
 
         Path built = luceneIndexer.getProjectIndexDir(PROJECT);
-        assertThat(built.resolve("callgraph.arcadedb/database.lck")).as("graph closed cleanly").doesNotExist();
+        assertThat(com.pharos.graph.CallGraph.projectGraphDir(built).resolve("database.lck"))
+                .as("graph closed cleanly").doesNotExist();
         Path out = FIXTURES.resolve("format-" + IndexVersions.INDEX_FORMAT + ".zip");
         Files.createDirectories(FIXTURES);
         List<Path> files;
@@ -172,7 +177,7 @@ class IndexCompatTest {
                 String rel = built.relativize(p).toString().replace('\\', '/');
                 String top = rel.contains("/") ? rel.substring(0, rel.indexOf('/')) : rel;
                 boolean keep = top.equals("lucene") || top.equals(IndexFormat.FILE_NAME)
-                        || top.startsWith("callgraph.arcadedb");
+                        || top.startsWith("callgraph");  // pointer, generation dir, sidecars
                 // Lock files are recreated on open.
                 if (!keep || rel.endsWith("write.lock")) continue;
                 zip.putNextEntry(new ZipEntry(rel));

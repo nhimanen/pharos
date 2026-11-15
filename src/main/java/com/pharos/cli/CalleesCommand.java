@@ -69,14 +69,14 @@ public class CalleesCommand implements Callable<Integer> {
 
         Set<String> allCallees = new LinkedHashSet<>();
         for (ProjectMeta meta : projects) {
-            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
                 if (project != null) throw e;  // explicitly requested: surface it
                 continue;                       // all-project: skip the incompatible one
             }
-            try (CallGraph graph = CallGraph.open(dbDir)) {
+            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
                 allCallees.addAll(graph.callees(callerFqn));
             } catch (Exception e) {
                 // Graph not available for this project

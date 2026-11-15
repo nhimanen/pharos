@@ -713,10 +713,9 @@ public class SearchEngine {
                 warnings.add(e.getMessage());
                 continue;
             }
-            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-            if (Files.isDirectory(dbDir)) {
-                try { graphs.add(CallGraph.open(dbDir)); } catch (Exception ignored) {}
-            }
+            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
+            // openExisting: a project without a graph is skipped, and nothing is created.
+            try { graphs.add(CallGraph.openExisting(dbDir)); } catch (Exception ignored) {}
         }
         return graphs;
     }

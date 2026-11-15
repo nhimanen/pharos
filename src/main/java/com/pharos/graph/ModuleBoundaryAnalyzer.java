@@ -8,7 +8,6 @@ import com.pharos.search.SearchEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -74,10 +73,10 @@ public class ModuleBoundaryAnalyzer {
                         "Project not found: " + projectName));
 
         // Load this project's method set
-        Path ownDbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+        Path ownDbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
         Set<String> ownMethods;
         IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-        try (CallGraph ownGraph = CallGraph.open(ownDbDir)) {
+        try (CallGraph ownGraph = CallGraph.openExisting(ownDbDir)) {
             ownMethods = ownGraph.allFqns().collect(Collectors.toSet());
         } catch (Exception e) {
             log.debug("Could not load call graph for '{}': {}", projectName, e.getMessage());
@@ -91,15 +90,14 @@ public class ModuleBoundaryAnalyzer {
             for (String linkedName : meta.getLinkedProjects()) {
                 ProjectMeta linkedMeta = registry.find(linkedName).orElse(null);
                 if (linkedMeta == null) continue;
-                Path linkedDb = Path.of(linkedMeta.getIndexPath()).resolve("callgraph.arcadedb");
-                if (!Files.isDirectory(linkedDb)) continue;
+                Path linkedDb = CallGraph.projectGraphDir(Path.of(linkedMeta.getIndexPath()));
                 try {
                     IndexFormat.check(linkedMeta.getName(), Path.of(linkedMeta.getIndexPath()));
                 } catch (IncompatibleIndexException e) {
                     log.warn("Skipping linked project '{}' in module boundary: {}", linkedName, e.getMessage());
                     continue;
                 }
-                try (CallGraph linkedGraph = CallGraph.open(linkedDb)) {
+                try (CallGraph linkedGraph = CallGraph.openExisting(linkedDb)) {
                     entryPointSet.addAll(linkedGraph.calledTargets(ownMethods));
                 } catch (Exception e) {
                     log.debug("Could not load call graph for linked project '{}': {}",

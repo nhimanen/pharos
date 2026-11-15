@@ -110,6 +110,10 @@ public class WebServer {
             ctx.status(409).json(body);
         });
 
+        // Project without a call graph (never indexed with one, or a failed build) → 404
+        app.exception(com.pharos.graph.GraphNotFoundException.class, (e, ctx) ->
+                ctx.status(404).json(Map.of("error", e.getMessage())));
+
         // Root → index.html
         app.get("/", ctx -> {
             try (InputStream is = WebServer.class.getResourceAsStream("/web/index.html")) {
@@ -669,8 +673,8 @@ public class WebServer {
     /** Open the ArcadeDB call graph for the given project. Caller must close. */
     private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
         IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-        Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-        return CallGraph.open(dbDir);
+        Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
+        return CallGraph.openExisting(dbDir);
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {

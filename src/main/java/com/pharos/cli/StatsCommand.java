@@ -66,7 +66,7 @@ public class StatsCommand implements Callable<Integer> {
             // Graph stats
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-                try (CallGraph graph = CallGraph.open(Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb"))) {
+                try (CallGraph graph = CallGraph.openExisting(CallGraph.projectGraphDir(Path.of(meta.getIndexPath())))) {
                     System.out.printf("  Graph methods: %d%n", graph.methodCount());
                     System.out.printf("  Graph calls:   %d%n", graph.callCount());
                 }
