@@ -141,4 +141,35 @@ class IndexFormatWebTest {
         assertThat(j.get("warnings")).hasSize(1);
         assertThat(j.get("warnings").get(0).asText()).contains("'b'");
     }
+
+    private JsonNode warningsHeader(HttpResponse<String> r) throws Exception {
+        String h = r.headers().firstValue("X-Pharos-Warnings").orElse(null);
+        assertThat(h).as("X-Pharos-Warnings").isNotNull();
+        assertThat(h.chars().allMatch(c -> c < 128)).as("ASCII-safe header").isTrue();
+        return mapper.readTree(h);
+    }
+
+    @Test
+    void unscopedCallersKeepsBodyAndSetsWarningsHeader() throws Exception {
+        HttpResponse<String> r = get("/api/callers?fqn=com.example.model.User%23getName()");
+        assertThat(r.statusCode()).isEqualTo(200);
+        assertThat(mapper.readTree(r.body()).isArray()).isTrue();   // body shape unchanged
+        JsonNode w = warningsHeader(r);
+        assertThat(w).hasSize(1);
+        assertThat(w.get(0).asText()).contains("'b'");
+    }
+
+    @Test
+    void unscopedClassContextSetsWarningsHeader() throws Exception {
+        HttpResponse<String> r = get("/api/class?fqn=com.example.model.User&context=true");
+        assertThat(r.statusCode()).isEqualTo(200);
+        assertThat(mapper.readTree(r.body()).has("body") || mapper.readTree(r.body()).size() > 0).isTrue();
+        assertThat(warningsHeader(r).get(0).asText()).contains("'b'");
+    }
+
+    @Test
+    void noHeaderWhenNothingSkipped() throws Exception {
+        HttpResponse<String> r = get("/api/callers?fqn=x.Y%23z()&project=a");
+        assertThat(r.headers().firstValue("X-Pharos-Warnings")).isEmpty();
+    }
 }

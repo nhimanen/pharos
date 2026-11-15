@@ -1164,7 +1164,12 @@ public class SearchEngine {
      * @return fully assembled context, or null if the class is not indexed
      */
     public ClassContext getClassContext(String classFqn) throws IOException {
-        SearchResult cls = getClassByFqn(classFqn);
+        return getClassContext(classFqn, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public ClassContext getClassContext(String classFqn, List<String> warnings) throws IOException {
+        SearchResult cls = getClassByFqn(classFqn, warnings);
         if (cls == null) return null;
 
         // Full body from source file (same logic as MCP get_class)
@@ -1174,7 +1179,7 @@ public class SearchEngine {
         // All method documents for this class from Lucene.
         // F_QUALIFIED_CLASS is a TextField (analyzed), so TermQuery on a dotted FQN never matches.
         // Instead, use PrefixQuery on the StringField F_ID ("project:FQN#") which is exact.
-        List<String> projects = allUsable();
+        List<String> projects = allUsable(warnings);
         IndexReader reader = luceneIndexer.openMultiReader(projects);
         IndexSearcher searcher = new IndexSearcher(reader);
         BooleanQuery.Builder idPrefixes = new BooleanQuery.Builder().setMinimumNumberShouldMatch(1);
@@ -1199,7 +1204,7 @@ public class SearchEngine {
 
         // Fields from knowledge graph
         List<CallGraph.FieldInfo> fields = new ArrayList<>();
-        List<CallGraph> kgGraphs = openAllGraphs();
+        List<CallGraph> kgGraphs = openAllGraphs(null, warnings);
         try {
             for (CallGraph g : kgGraphs) fields.addAll(g.getFieldsOf(classFqn));
         } finally {

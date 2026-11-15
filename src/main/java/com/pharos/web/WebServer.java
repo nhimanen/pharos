@@ -255,10 +255,13 @@ public class WebServer {
         app.get("/api/method", ctx -> {
             String fqn = ctx.queryParam("fqn");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
-            SearchResult r = searchEngine.getMethodByFqn(fqn);
+            List<String> warnings = new ArrayList<>();
+            SearchResult r = searchEngine.getMethodByFqn(fqn, warnings);
+            warningsHeader(ctx, warnings);
             if (r == null && fqn.contains("#") && !fqn.contains("(")) {
                 // Partial FQN — parameter types omitted. Try name-only lookup.
-                List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
+                List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn, warnings);
+                warningsHeader(ctx, warnings);
                 if (candidates.isEmpty()) {
                     recordSingle(ctx, null);
                     ctx.status(404).result("Not found"); return;
@@ -286,14 +289,17 @@ public class WebServer {
             String fqn     = ctx.queryParam("fqn");
             boolean withCtx = "true".equalsIgnoreCase(ctx.queryParam("context"));
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
                 if (withCtx) {
-                    SearchEngine.ClassContext context = searchEngine.getClassContext(fqn);
+                    SearchEngine.ClassContext context = searchEngine.getClassContext(fqn, warnings);
+                    warningsHeader(ctx, warnings);
                     if (context == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
                     recordSingle(ctx, fqn);
                     ctx.json(classContextToMap(context));
                 } else {
-                    SearchResult r = searchEngine.getClassByFqn(fqn);
+                    SearchResult r = searchEngine.getClassByFqn(fqn, warnings);
+                    warningsHeader(ctx, warnings);
                     if (r == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
                     recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
@@ -311,8 +317,10 @@ public class WebServer {
             String fqn = ctx.queryParam("fqn");
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
-                List<SearchResult> callers = searchEngine.findCallers(fqn, project);
+                List<SearchResult> callers = searchEngine.findCallers(fqn, project, warnings);
+                warningsHeader(ctx, warnings);
                 recordResults(ctx, callers.size(),
                         callers.stream().map(SearchResult::id).collect(Collectors.toList()));
                 ctx.json(callers.stream().map(this::refToMap).collect(Collectors.toList()));
@@ -327,8 +335,10 @@ public class WebServer {
             String fqn = ctx.queryParam("fqn");
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
-                List<SearchResult> callees = searchEngine.findCallees(fqn, project);
+                List<SearchResult> callees = searchEngine.findCallees(fqn, project, warnings);
+                warningsHeader(ctx, warnings);
                 recordResults(ctx, callees.size(),
                         callees.stream().map(SearchResult::id).collect(Collectors.toList()));
                 ctx.json(callees.stream().map(this::refToMap).collect(Collectors.toList()));
@@ -345,7 +355,10 @@ public class WebServer {
             int depth      = Math.min(10, ctx.queryParamAsClass("depth",      Integer.class).getOrDefault(5));
             int maxCallers = ctx.queryParamAsClass("maxCallers", Integer.class).getOrDefault(2000);
             try {
-                ctx.json(searchEngine.findTransitiveCallers(fqn, depth, maxCallers));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.findTransitiveCallers(fqn, depth, maxCallers, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
             } catch (IncompatibleIndexException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -360,7 +373,10 @@ public class WebServer {
             if (fqn == null || fqn.isBlank()) { ctx.status(400).result("fqn required"); return; }
             String kind = ctx.queryParamAsClass("kind", String.class).getOrDefault("all");
             try {
-                ctx.json(searchEngine.findUsages(fqn, kind));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.findUsages(fqn, kind, null, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
             } catch (IncompatibleIndexException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -377,7 +393,10 @@ public class WebServer {
             String direction    = ctx.queryParamAsClass("direction", String.class).getOrDefault("callees");
             int    maxBodyChars = ctx.queryParamAsClass("maxBodyChars", Integer.class).getOrDefault(500);
             try {
-                ctx.json(searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
             } catch (IncompatibleIndexException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -544,6 +563,22 @@ public class WebServer {
         System.out.printf("Web UI available at http://localhost:%d%n", port);
         log.info("Web server started on port {}", port);
         return app;
+    }
+
+    private static final com.fasterxml.jackson.databind.ObjectWriter ASCII_JSON = new ObjectMapper()
+            .writer().with(com.fasterxml.jackson.core.JsonGenerator.Feature.ESCAPE_NON_ASCII);
+
+    /**
+     * Surfaces skipped-project notices without changing the JSON body: header
+     * {@code X-Pharos-Warnings} holds a JSON array of strings, non-ASCII escaped as backslash-u sequences.
+     */
+    private static void warningsHeader(io.javalin.http.Context ctx, List<String> warnings) {
+        if (warnings.isEmpty()) return;
+        try {
+            ctx.header("X-Pharos-Warnings", ASCII_JSON.writeValueAsString(warnings.stream().distinct().toList()));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.warn("Could not encode warnings header: {}", e.getMessage());
+        }
     }
 
     // ── Usage logging helpers ──────────────────────────────────────────────────

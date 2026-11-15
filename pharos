@@ -195,6 +195,18 @@ def ensure_daemon():
     _start_daemon()
 
 
+def _print_header_warnings(value):
+    """Print skipped-project notices the daemon sends in X-Pharos-Warnings (a JSON array)."""
+    if not value:
+        return
+    try:
+        warnings = json.loads(value)
+    except ValueError:
+        return
+    for w in warnings:
+        print(f"\u26a0 {w}", file=sys.stderr)
+
+
 def _api_get(path: str, params: dict = None) -> object:
     """Make a GET request to the daemon API. Returns parsed JSON."""
     url = f"{BASE_URL}{path}"
@@ -204,9 +216,11 @@ def _api_get(path: str, params: dict = None) -> object:
             url += "?" + urllib.parse.urlencode(filtered)
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
+            _print_header_warnings(resp.headers.get("X-Pharos-Warnings"))
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
+        _print_header_warnings(e.headers.get("X-Pharos-Warnings"))
         if e.code == 409:
             # Index format incompatible with this pharos version — exit code 4
             try:
