@@ -118,4 +118,27 @@ class IndexFormatWebTest {
         assertThat(statusA).isEqualTo("ok");
         assertThat(statusB).isEqualTo("outdated");
     }
+
+    @Test
+    void graphEndpointsOnOutdatedAre409NotRetried500() throws Exception {
+        for (String path : List.of("/api/boundary?project=b",
+                "/api/class?fqn=x.Y&context=true",  // unscoped: skipped, not 409
+                "/api/usages?fqn=x.Y")) {
+            int code = get(path).statusCode();
+            if (path.startsWith("/api/boundary")) {
+                HttpResponse<String> r = get(path);
+                assertThat(r.statusCode()).isEqualTo(409);
+                assertThat(mapper.readTree(r.body()).get("status").asText()).isEqualTo("outdated");
+            } else {
+                assertThat(code).isNotEqualTo(500);
+            }
+        }
+    }
+
+    @Test
+    void unscopedPathIncludesWarning() throws Exception {
+        JsonNode j = mapper.readTree(get("/api/path?from=x.A%23a()&to=x.B%23b()").body());
+        assertThat(j.get("warnings")).hasSize(1);
+        assertThat(j.get("warnings").get(0).asText()).contains("'b'");
+    }
 }

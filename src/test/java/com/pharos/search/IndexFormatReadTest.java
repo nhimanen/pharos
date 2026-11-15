@@ -29,6 +29,8 @@ class IndexFormatReadTest {
     private LuceneIndexer luceneIndexer;
     private ProjectIndexManager manager;
     private SearchEngine engine;
+    private ProjectRegistry registry;
+    private ModuleGraphBuilder noopGraph;
     private Path rootB;
 
     @BeforeEach
@@ -36,8 +38,8 @@ class IndexFormatReadTest {
         IndexConfig config = IndexConfig.defaults();
         config.setIndexDir(tmp.resolve("indexes"));
         luceneIndexer = new LuceneIndexer(config);
-        ProjectRegistry registry = ProjectRegistry.at(tmp.resolve("registry.json"));
-        ModuleGraphBuilder noopGraph = new ModuleGraphBuilder(registry) {
+        registry = ProjectRegistry.at(tmp.resolve("registry.json"));
+        noopGraph = new ModuleGraphBuilder(registry) {
             @Override
             public synchronized List<String> incorporate(Path root, ProjectMeta meta,
                     com.pharos.parser.MavenPomReader.PomInfo pomInfo) {
@@ -129,5 +131,36 @@ class IndexFormatReadTest {
                 .isInstanceOf(IncompatibleIndexException.class);
         // unscoped: skipped, not thrown
         assertThat(engine.findUsages("pkg.Foo#bar()", "callers").callers()).isEmpty();
+    }
+
+    private static final String A_FQN = "com.example.model.User#getName()";
+
+    @Test
+    void unscopedLookupExposesSkippedProjectWarning() throws Exception {
+        unstamp("b");
+        List<String> warnings = new java.util.ArrayList<>();
+        assertThat(engine.getByFqns(List.of(A_FQN), warnings)).containsKey(A_FQN);
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0)).contains("'b'");
+
+        List<String> w2 = new java.util.ArrayList<>();
+        assertThat(engine.getMethodByFqn(A_FQN, w2)).isNotNull();
+        assertThat(w2).hasSize(1);
+    }
+
+    @Test
+    void unscopedMcpGraphAndLookupToolsPrefixWarnings() throws Exception {
+        unstamp("b");
+        var mcp = new com.pharos.mcp.McpToolRegistry(engine, registry, noopGraph,
+                new com.pharos.graph.ModuleBoundaryAnalyzer(registry, engine));
+        var args = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode().put("fqn", A_FQN);
+
+        for (String tool : List.of("get_callers", "get_callees", "get_method", "find_usages")) {
+            String out = mcp.call(tool, args);
+            assertThat(out).as(tool).startsWith("\u26a0 ").contains("'b'");
+        }
+        // after the stamp is restored the notice disappears
+        indexFull(rootB, "b");
+        assertThat(mcp.call("get_callers", args)).doesNotContain("\u26a0");
     }
 }

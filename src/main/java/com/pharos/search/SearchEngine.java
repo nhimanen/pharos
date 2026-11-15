@@ -502,7 +502,12 @@ public class SearchEngine {
 
     /** Look up a method by its exact FQN (e.g., "com.example.MyClass#myMethod(String,int)"). */
     public SearchResult getMethodByFqn(String fqn) throws IOException {
-        return getByFqn(fqn);
+        return getByFqn(fqn, new ArrayList<>());
+    }
+
+    /** As {@link #getMethodByFqn(String)}; skipped incompatible projects are explained in {@code warnings}. */
+    public SearchResult getMethodByFqn(String fqn, List<String> warnings) throws IOException {
+        return getByFqn(fqn, warnings);
     }
 
     /**
@@ -515,13 +520,18 @@ public class SearchEngine {
      * fully-qualified class name is matched exactly.
      */
     public List<SearchResult> findMethodsByPartialFqn(String partialFqn) throws IOException {
+        return findMethodsByPartialFqn(partialFqn, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public List<SearchResult> findMethodsByPartialFqn(String partialFqn, List<String> warnings) throws IOException {
         int hash = partialFqn.indexOf('#');
         if (hash < 0) return List.of();
         String className  = partialFqn.substring(0, hash);
         String methodName = partialFqn.substring(hash + 1);
         if (className.isEmpty() || methodName.isEmpty()) return List.of();
 
-        List<String> projects = allUsable();
+        List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -549,13 +559,18 @@ public class SearchEngine {
      * that aren't individually indexed) should read the file slice themselves.
      */
     public SearchResult getClassByFqn(String qualifiedClassName) throws IOException {
-        SearchResult r = getByFqn(qualifiedClassName);
+        return getClassByFqn(qualifiedClassName, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public SearchResult getClassByFqn(String qualifiedClassName, List<String> warnings) throws IOException {
+        SearchResult r = getByFqn(qualifiedClassName, warnings);
         if (r == null || !"class".equals(r.docType())) return null;
         return r;
     }
 
-    private SearchResult getByFqn(String fqn) throws IOException {
-        List<String> projects = allUsable();
+    private SearchResult getByFqn(String fqn, List<String> warnings) throws IOException {
+        List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return null;
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -582,9 +597,14 @@ public class SearchEngine {
      * @return map from FQN to result; FQNs not found are absent from the map
      */
     public Map<String, SearchResult> getByFqns(List<String> fqns) throws IOException {
+        return getByFqns(fqns, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public Map<String, SearchResult> getByFqns(List<String> fqns, List<String> warnings) throws IOException {
         if (fqns.isEmpty()) return Map.of();
 
-        List<String> projects = allUsable();
+        List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return Map.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -622,12 +642,18 @@ public class SearchEngine {
      */
     public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
                                           int maxBodyChars) throws IOException {
-        List<CallGraph> graphs = openAllGraphs();
+        return traceCallChain(rootFqn, depth, direction, maxBodyChars, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
+                                          int maxBodyChars, List<String> warnings) throws IOException {
+        List<CallGraph> graphs = openAllGraphs(null, warnings);
         try {
             BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, direction, 50);
 
             // Bulk-fetch bodies — one Lucene query for all visited FQNs.
-            Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()));
+            Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()), warnings);
 
             List<CallChainResult.ChainNode> nodes = bfs.fqnDepth().entrySet().stream()
                     .sorted(Comparator.comparingInt(Map.Entry::getValue))
@@ -668,14 +694,14 @@ public class SearchEngine {
 
     /** Opens an ArcadeDB call graph for every indexed project. Caller must close all returned graphs. */
     private List<CallGraph> openAllGraphs() {
-        return openAllGraphs(null);
+        return openAllGraphs(null, new ArrayList<>());
     }
 
     /**
      * As {@link #openAllGraphs()}, optionally scoped to one project. Projects whose index format
      * is incompatible are skipped (logged) when searching all; a scoped one rethrows.
      */
-    private List<CallGraph> openAllGraphs(String onlyProject) {
+    private List<CallGraph> openAllGraphs(String onlyProject, List<String> warnings) {
         List<CallGraph> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll()) {
             if (onlyProject != null && !onlyProject.equals(meta.getName())) continue;
@@ -684,6 +710,7 @@ public class SearchEngine {
             } catch (IncompatibleIndexException e) {
                 if (onlyProject != null) throw e;
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                warnings.add(e.getMessage());
                 continue;
             }
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
@@ -752,7 +779,13 @@ public class SearchEngine {
 
     public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
                                                           int maxCallers) throws IOException {
-        List<CallGraph> graphs = openAllGraphs();
+        return findTransitiveCallers(rootFqn, depth, maxCallers, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
+                                                          int maxCallers, List<String> warnings) throws IOException {
+        List<CallGraph> graphs = openAllGraphs(null, warnings);
         try {
             // +1 to include root in the cap budget, then exclude it from results
             BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, "callers",
@@ -880,8 +913,13 @@ public class SearchEngine {
 
     /** Find all methods that call the given FQN (reverse lookup via calledMethods field). */
     public List<SearchResult> findCallers(String calleeFqn, String project) throws IOException {
+        return findCallers(calleeFqn, project, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public List<SearchResult> findCallers(String calleeFqn, String project, List<String> warnings) throws IOException {
         SearchRequest req = SearchRequest.keyword("", project, 100);
-        List<String> projects = resolveUsable(req, new ArrayList<>());
+        List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -894,12 +932,17 @@ public class SearchEngine {
 
     /** Find all methods that the given FQN calls (forward lookup via calledMethods field). */
     public List<SearchResult> findCallees(String callerFqn, String project) throws IOException {
-        SearchResult caller = getMethodByFqn(callerFqn);
+        return findCallees(callerFqn, project, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public List<SearchResult> findCallees(String callerFqn, String project, List<String> warnings) throws IOException {
+        SearchResult caller = getMethodByFqn(callerFqn, warnings);
         if (caller == null) return List.of();
 
         // The calledMethods field stores FQNs; we look them up directly
         // For now return the caller with its callees via a direct document lookup
-        List<String> projects = resolveUsable(SearchRequest.keyword("", project, 100), new ArrayList<>());
+        List<String> projects = resolveUsable(SearchRequest.keyword("", project, 100), warnings);
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -993,10 +1036,14 @@ public class SearchEngine {
         return usable(projects, explicit && projects.size() == 1, warnings);
     }
 
-    /** Every registered project with a compatible index (incompatible ones are skipped silently). */
-    private List<String> allUsable() {
+    /** Every registered project with a compatible index; skipped ones are explained in {@code warnings}. */
+    private List<String> allUsable(List<String> warnings) {
         return usable(registry.listAll().stream().map(ProjectMeta::getName).collect(Collectors.toList()),
-                false, new ArrayList<>());
+                false, warnings);
+    }
+
+    private List<String> allUsable() {
+        return allUsable(new ArrayList<>());
     }
 
     private List<String> resolveProjects(SearchRequest req) {
@@ -1049,6 +1096,11 @@ public class SearchEngine {
 
     /** As {@link #findUsages(String, String)}, scoped to one project when {@code project} is non-null. */
     public UsageResult findUsages(String fqn, String kind, String project) throws IOException {
+        return findUsages(fqn, kind, project, new ArrayList<>());
+    }
+
+    /** As above; skipped incompatible projects are explained in {@code warnings}. */
+    public UsageResult findUsages(String fqn, String kind, String project, List<String> warnings) throws IOException {
         boolean all = "all".equals(kind);
         List<String> callers        = new ArrayList<>();
         List<String> subclasses     = new ArrayList<>();
@@ -1059,7 +1111,7 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
-        List<CallGraph> graphs = openAllGraphs(project);
+        List<CallGraph> graphs = openAllGraphs(project, warnings);
         try {
             for (CallGraph g : graphs) {
                 if (all || "callers".equals(kind))

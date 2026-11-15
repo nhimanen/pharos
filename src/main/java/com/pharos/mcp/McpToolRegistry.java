@@ -186,7 +186,24 @@ public class McpToolRegistry {
         );
     }
 
+    /** Notices about projects skipped by the current tool call (incompatible index format). */
+    private final ThreadLocal<List<String>> skipped = ThreadLocal.withInitial(ArrayList::new);
+
     public String call(String toolName, JsonNode args) throws Exception {
+        List<String> warnings = skipped.get();
+        warnings.clear();
+        try {
+            String out = dispatch(toolName, args);
+            if (warnings.isEmpty()) return out;
+            StringBuilder sb = new StringBuilder();
+            for (String w : warnings.stream().distinct().toList()) sb.append("\u26a0 ").append(w).append('\n');
+            return sb.append(out).toString();
+        } finally {
+            warnings.clear();
+        }
+    }
+
+    private String dispatch(String toolName, JsonNode args) throws Exception {
         return switch (toolName) {
             case "search_code"       -> callSearchCode(args);
             case "find_transitive_callers" -> callFindTransitiveCallers(args);
@@ -311,7 +328,7 @@ public class McpToolRegistry {
         int    maxCallers = args.path("max_callers").asInt(2000);
 
         SearchEngine.TransitiveCallersResult result =
-                searchEngine.findTransitiveCallers(fqn, depth, maxCallers);
+                searchEngine.findTransitiveCallers(fqn, depth, maxCallers, skipped.get());
 
         // Group callers by depth for easy agent consumption
         Map<Integer, List<String>> byDepth = new java.util.TreeMap<>();
@@ -340,7 +357,7 @@ public class McpToolRegistry {
         String fqn  = args.path("fqn").asText();
         String kind = args.path("kind").asText("all");
 
-        SearchEngine.UsageResult u = searchEngine.findUsages(fqn, kind);
+        SearchEngine.UsageResult u = searchEngine.findUsages(fqn, kind, null, skipped.get());
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("fqn",             u.fqn());
@@ -361,7 +378,7 @@ public class McpToolRegistry {
         String direction   = args.path("direction").asText("callees");
         int    maxBodyChars = args.path("max_body_chars").asInt(500);
 
-        CallChainResult chain = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars);
+        CallChainResult chain = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars, skipped.get());
 
         List<Map<String, Object>> nodeList = chain.nodes().stream().map(n -> {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -389,7 +406,7 @@ public class McpToolRegistry {
 
     private String callGetCallers(JsonNode args) throws Exception {
         String fqn = args.path("fqn").asText();
-        List<SearchResult> results = searchEngine.findCallers(fqn, null);
+        List<SearchResult> results = searchEngine.findCallers(fqn, null, skipped.get());
 
         List<Map<String, Object>> callerList = new ArrayList<>();
         if (results.isEmpty()) {
@@ -443,6 +460,7 @@ public class McpToolRegistry {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                skipped.get().add(e.getMessage());
                 continue;
             }
             try (CallGraph g = CallGraph.open(dbDir)) {
@@ -484,11 +502,11 @@ public class McpToolRegistry {
 
     private String callGetMethod(JsonNode args) throws Exception {
         String fqn = args.path("fqn").asText();
-        Map<String, SearchResult> found = searchEngine.getByFqns(List.of(fqn));
+        Map<String, SearchResult> found = searchEngine.getByFqns(List.of(fqn), skipped.get());
         SearchResult r = found.get(fqn);
         if (r == null && fqn.contains("#") && !fqn.contains("(")) {
             // Partial FQN — parameter types omitted. Try name-only lookup.
-            List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
+            List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn, skipped.get());
             if (candidates.isEmpty()) return "Method not found: " + fqn;
             if (candidates.size() == 1) return mapper.writeValueAsString(resultToMap(candidates.get(0)));
             String list = candidates.stream()
@@ -507,7 +525,7 @@ public class McpToolRegistry {
         List<String> fqns = new ArrayList<>();
         fqnsNode.forEach(n -> { if (!n.asText().isBlank()) fqns.add(n.asText()); });
 
-        Map<String, SearchResult> found = searchEngine.getByFqns(fqns);
+        Map<String, SearchResult> found = searchEngine.getByFqns(fqns, skipped.get());
 
         List<Map<String, Object>> results = new ArrayList<>();
         List<String> notFound = new ArrayList<>();
@@ -588,7 +606,7 @@ public class McpToolRegistry {
         }
 
         // Default: body only
-        SearchResult result = searchEngine.getClassByFqn(fqn);
+        SearchResult result = searchEngine.getClassByFqn(fqn, skipped.get());
         if (result == null) return "Class not found: " + fqn;
         String body = SourceReader.readRange(result.filePath(), result.startLine(), result.endLine());
         if (body == null) {
@@ -788,6 +806,7 @@ public class McpToolRegistry {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                skipped.get().add(e.getMessage());
                 continue;
             }
             try (CallGraph graph = CallGraph.open(dbDir)) {

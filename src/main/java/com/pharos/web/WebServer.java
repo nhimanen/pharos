@@ -298,6 +298,8 @@ public class WebServer {
                     recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
                 }
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -344,6 +346,8 @@ public class WebServer {
             int maxCallers = ctx.queryParamAsClass("maxCallers", Integer.class).getOrDefault(2000);
             try {
                 ctx.json(searchEngine.findTransitiveCallers(fqn, depth, maxCallers));
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -357,6 +361,8 @@ public class WebServer {
             String kind = ctx.queryParamAsClass("kind", String.class).getOrDefault("all");
             try {
                 ctx.json(searchEngine.findUsages(fqn, kind));
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -372,6 +378,8 @@ public class WebServer {
             int    maxBodyChars = ctx.queryParamAsClass("maxBodyChars", Integer.class).getOrDefault(500);
             try {
                 ctx.json(searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars));
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -384,16 +392,20 @@ public class WebServer {
             String to = ctx.queryParam("to");
             if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
             List<String> path = List.of();
+            List<String> warnings = new ArrayList<>();
             for (ProjectMeta meta : registry.listAll()) {
                 try (CallGraph g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
+                } catch (IncompatibleIndexException e) {
+                    warnings.add(e.getMessage());
                 } catch (Exception ignored) {}
             }
             recordResults(ctx, path.size(), path);
             Map<String, Object> res = new LinkedHashMap<>();
             res.put("path", path);
             res.put("hops", path.isEmpty() ? 0 : path.size() - 1);
+            if (!warnings.isEmpty()) res.put("warnings", warnings);
             ctx.json(res);
         });
 
@@ -500,6 +512,8 @@ public class WebServer {
                 res.put("exitPoints", exits);
                 res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());
             }
