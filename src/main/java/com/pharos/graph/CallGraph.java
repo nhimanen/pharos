@@ -37,7 +37,7 @@ import java.util.stream.Stream;
  *       g.flush();  // commit pending batch
  *   }
  */
-public class CallGraph implements AutoCloseable {
+public class CallGraph implements GraphView {
 
     private static final Logger log = LoggerFactory.getLogger(CallGraph.class);
 

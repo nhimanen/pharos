@@ -6,6 +6,8 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchResult;
 import picocli.CommandLine.*;
@@ -74,14 +76,13 @@ public class CallersCommand implements Callable<Integer> {
 
         Set<String> allCallers = new LinkedHashSet<>();
         for (ProjectMeta meta : projects) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
                 if (project != null) throw e;  // explicitly requested: surface it
                 continue;                       // all-project: skip the incompatible one
             }
-            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
+            try (GraphView graph = GraphViews.open(meta)) {
                 allCallers.addAll(graph.callers(targetFqn));
             } catch (Exception e) {
                 // Graph not available for this project

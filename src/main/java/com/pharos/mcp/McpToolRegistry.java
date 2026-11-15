@@ -5,6 +5,8 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
@@ -453,7 +455,6 @@ public class McpToolRegistry {
         String to = args.path("to_fqn").asText();
 
         for (ProjectMeta meta : registry.listAll()) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
@@ -461,7 +462,7 @@ public class McpToolRegistry {
                 skipped.get().add(e.getMessage());
                 continue;
             }
-            try (CallGraph g = CallGraph.openExisting(dbDir)) {
+            try (GraphView g = GraphViews.open(meta)) {
                 List<String> path = g.shortestPath(from, to);
                 if (!path.isEmpty()) {
                     List<Map<String, Object>> steps = path.stream()
@@ -798,7 +799,6 @@ public class McpToolRegistry {
     private Set<String> getFromGraph(String fqn, boolean callers) {
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
@@ -806,7 +806,7 @@ public class McpToolRegistry {
                 skipped.get().add(e.getMessage());
                 continue;
             }
-            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
+            try (GraphView graph = GraphViews.open(meta)) {
                 result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (Exception ignored) {}
         }

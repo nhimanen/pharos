@@ -6,7 +6,8 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.embedding.EmbeddingProvider;
-import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.graph.ModuleGraphBuilder;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProjectIndexManager;
@@ -180,43 +181,44 @@ class SingleNodeGoldenTest {
             "com.example.service.GreetingService", "com.example.model.User");
 
     /** Single seam for opening call graphs; fails loudly if a registered project has none. */
-    private static List<CallGraph> openGraphs(ProjectRegistry registry) {
-        List<CallGraph> graphs = new ArrayList<>();
+    private static List<GraphView> openGraphs(ProjectRegistry registry) {
+        List<GraphView> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll().stream()
                 .sorted(Comparator.comparing(ProjectMeta::getName)).toList()) {
-            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-            if (!Files.isDirectory(dbDir)) {
-                graphs.forEach(CallGraph::close);
+            Path shardDir = Path.of(meta.getIndexPath());
+            if (!Files.exists(shardDir.resolve(GraphViews.ARCADE_DIR))
+                    && !Files.exists(shardDir.resolve(GraphViews.COMPACT_FILE))) {
+                graphs.forEach(GraphView::close);
                 throw new IllegalStateException("No call graph for project '" + meta.getName()
-                        + "' at " + dbDir);
+                        + "' at " + shardDir);
             }
-            graphs.add(CallGraph.open(dbDir));
+            graphs.add(GraphViews.open(shardDir));
         }
         if (graphs.isEmpty()) throw new IllegalStateException("No registered projects with call graphs");
         return graphs;
     }
 
     private static List<String> graphLookup(ProjectRegistry registry, String fqn, boolean callers) {
-        List<CallGraph> graphs = openGraphs(registry);
+        List<GraphView> graphs = openGraphs(registry);
         try {
             List<String> out = new ArrayList<>();
-            for (CallGraph g : graphs) out.addAll(callers ? g.callers(fqn) : g.callees(fqn));
+            for (GraphView g : graphs) out.addAll(callers ? g.callers(fqn) : g.callees(fqn));
             return out;
         } finally {
-            graphs.forEach(CallGraph::close);
+            graphs.forEach(GraphView::close);
         }
     }
 
     private static List<String> shortestPath(ProjectRegistry registry, String from, String to) {
-        List<CallGraph> graphs = openGraphs(registry);
+        List<GraphView> graphs = openGraphs(registry);
         try {
-            for (CallGraph g : graphs) {
+            for (GraphView g : graphs) {
                 List<String> p = g.shortestPath(from, to);
                 if (p != null && !p.isEmpty()) return p;
             }
             return List.of();
         } finally {
-            graphs.forEach(CallGraph::close);
+            graphs.forEach(GraphView::close);
         }
     }
 }

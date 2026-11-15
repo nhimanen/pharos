@@ -6,6 +6,8 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.graph.CrossProjectLinker;
 import picocli.CommandLine.*;
 
@@ -58,14 +60,13 @@ public class PathCommand implements Callable<Integer> {
     private List<String> findPath() throws Exception {
         // Search each per-project graph individually
         for (ProjectMeta meta : registry.listAll()) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
             try {
                 IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
             } catch (IncompatibleIndexException e) {
                 System.err.println("Skipping '" + meta.getName() + "': " + e.getMessage());
                 continue;
             }
-            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
+            try (GraphView graph = GraphViews.open(meta)) {
                 List<String> path = graph.shortestPath(fromFqn, toFqn);
                 if (!path.isEmpty()) return path;
             } catch (Exception e) {

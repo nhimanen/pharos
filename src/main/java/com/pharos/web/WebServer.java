@@ -417,7 +417,7 @@ public class WebServer {
             List<String> path = List.of();
             List<String> warnings = new ArrayList<>();
             for (ProjectMeta meta : registry.listAll()) {
-                try (CallGraph g = loadCallGraphCached(meta)) {
+                try (GraphView g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
                 } catch (IncompatibleIndexException e) {
@@ -670,15 +670,14 @@ public class WebServer {
         }
     }
 
-    /** Open the ArcadeDB call graph for the given project. Caller must close. */
-    private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
+    /** Open the read-only call graph for the given project. Caller must close. */
+    private GraphView loadCallGraphCached(ProjectMeta meta) throws Exception {
         IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-        Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-        return CallGraph.openExisting(dbDir);
+        return GraphViews.open(meta);
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {
-        try (CallGraph graph = loadCallGraphCached(meta)) {
+        try (GraphView graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
         // Map class FQN → filePath (use first method's path as representative)
@@ -745,7 +744,7 @@ public class WebServer {
     }
 
     private Map<String, Object> buildCallGraphData(ProjectMeta meta, int limit, String pkg, String className) throws Exception {
-        try (CallGraph graph = loadCallGraphCached(meta)) {
+        try (GraphView graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
 
