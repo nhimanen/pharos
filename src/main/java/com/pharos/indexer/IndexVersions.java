@@ -25,6 +25,21 @@ public final class IndexVersions {
     private IndexVersions() {}
 
     /**
+     * On-disk index format, stamped per project in {@code index-format.json}; a project whose
+     * stamp differs is refused until re-indexed. A missing stamp means format 0. Bump this when
+     * a change makes existing indexes unreadable or wrong (ids, schema, graph, cache layout);
+     * bump {@link #CHUNKING_VERSION} instead when only embedding text changes and the
+     * incremental run can re-embed in place.
+     *
+     * <p>History:
+     * <ul>
+     *   <li>1 — #18 Java ids, #23 script/doc ids, #24 call-graph index repair,
+     *       #19 per-model embedding caches</li>
+     * </ul>
+     */
+    public static final int INDEX_FORMAT = 1;
+
+    /**
      * Bump whenever {@link DefaultChunker}, {@link Chunker}, or any method that builds
      * per-chunk embedding texts changes in a way that affects the resulting float[].
      *

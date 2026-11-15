@@ -35,7 +35,7 @@ import picocli.CommandLine.*;
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,
-        version = "pharos 1.0.0"
+        versionProvider = PharosVersionProvider.class
 )
 public class CodeSearchCommand implements Runnable {
 
