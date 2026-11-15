@@ -33,8 +33,7 @@ public class ClassVisitor extends VoidVisitorAdapter<List<ParsedClass>> {
 
     @Override
     public void visit(EnumDeclaration n, List<ParsedClass> collector) {
-        String qualifiedName = packageName.isEmpty() ? n.getNameAsString()
-                : packageName + "." + n.getNameAsString();
+        String qualifiedName = qualifiedName(packageName, n);
         List<String> ifaces = n.getImplementedTypes().stream()
                 .map(t -> t.asString())
                 .toList();
@@ -57,8 +56,7 @@ public class ClassVisitor extends VoidVisitorAdapter<List<ParsedClass>> {
 
     @Override
     public void visit(RecordDeclaration n, List<ParsedClass> collector) {
-        String qualifiedName = packageName.isEmpty() ? n.getNameAsString()
-                : packageName + "." + n.getNameAsString();
+        String qualifiedName = qualifiedName(packageName, n);
         List<String> ifaces = n.getImplementedTypes().stream()
                 .map(t -> t.asString())
                 .toList();
@@ -80,8 +78,7 @@ public class ClassVisitor extends VoidVisitorAdapter<List<ParsedClass>> {
 
     @Override
     public void visit(AnnotationDeclaration n, List<ParsedClass> collector) {
-        String qualifiedName = packageName.isEmpty() ? n.getNameAsString()
-                : packageName + "." + n.getNameAsString();
+        String qualifiedName = qualifiedName(packageName, n);
         List<String> annotations = n.getAnnotations().stream()
                 .map(AnnotationExpr::getNameAsString)
                 .toList();
@@ -102,7 +99,7 @@ public class ClassVisitor extends VoidVisitorAdapter<List<ParsedClass>> {
     private ParsedClass buildClass(ClassOrInterfaceDeclaration n, String kind) {
         String simpleName = n.getNameAsString();
         // Build qualified name including enclosing classes for nested types
-        String qualifiedName = buildQualifiedName(n);
+        String qualifiedName = qualifiedName(packageName, n);
 
         String superclass = n.getExtendedTypes().isEmpty() ? null
                 : n.getExtendedTypes().get(0).asString();
@@ -132,17 +129,22 @@ public class ClassVisitor extends VoidVisitorAdapter<List<ParsedClass>> {
                 .orElse(null);
     }
 
-    private String buildQualifiedName(ClassOrInterfaceDeclaration n) {
-        // Walk up the AST to handle nested classes
+    /**
+     * Binary-style qualified name of a type, including every enclosing type
+     * (class, interface, enum, record or annotation): {@code pkg.Outer.Inner}.
+     * Matches what JavaParser's symbol solver reports for nested types, so method
+     * ids line up with resolved call targets.
+     */
+    public static String qualifiedName(String packageName, TypeDeclaration<?> n) {
         List<String> parts = new ArrayList<>();
         parts.add(n.getNameAsString());
         com.github.javaparser.ast.Node parent = n.getParentNode().orElse(null);
-        while (parent instanceof ClassOrInterfaceDeclaration enclosing) {
+        while (parent instanceof TypeDeclaration<?> enclosing) {
             parts.add(0, enclosing.getNameAsString());
             parent = enclosing.getParentNode().orElse(null);
         }
         String classPath = String.join(".", parts);
-        return packageName.isEmpty() ? classPath : packageName + "." + classPath;
+        return packageName == null || packageName.isEmpty() ? classPath : packageName + "." + classPath;
     }
 
     private String extractAccess(String accessSpec) {
