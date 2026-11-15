@@ -31,6 +31,9 @@ public class IndexConfig {
     private Path indexDir;
     private Path synonymsFile;
 
+    /** Multi-node settings; defaults describe a single-node setup. Never null. */
+    private ClusterConfig cluster = new ClusterConfig();
+
     /**
      * One or more embedding providers. Pharos can run several in parallel at
      * index time and store one vector field per model in each Lucene document.
@@ -175,6 +178,8 @@ public class IndexConfig {
             if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
             if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
             config.migrateLegacyEmbeddingConfig();
+            if (config.cluster == null) config.cluster = new ClusterConfig();
+            config.cluster.validate();
             for (EmbeddingProviderConfig p : config.embeddingProviders) {
                 p.validate();
                 validateFallbacks(p);
@@ -287,6 +292,9 @@ public class IndexConfig {
     // Getters and setters
     public Path getIndexDir() { return indexDir; }
     public void setIndexDir(Path indexDir) { this.indexDir = indexDir; }
+
+    public ClusterConfig getCluster() { return cluster; }
+    public void setCluster(ClusterConfig cluster) { this.cluster = cluster != null ? cluster : new ClusterConfig(); }
 
     public Path getSynonymsFile() { return synonymsFile; }
     public void setSynonymsFile(Path synonymsFile) { this.synonymsFile = synonymsFile; }
