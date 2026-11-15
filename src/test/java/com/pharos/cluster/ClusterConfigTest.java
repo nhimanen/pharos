@@ -36,6 +36,13 @@ class ClusterConfigTest {
     }
 
     @Test
+    void writerNeedsObjectStore() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"writer\"}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.backend");
+    }
+
+    @Test
     void allNeedsLocal() {
         assertThatThrownBy(() -> parse(
                 "{\"cluster\":{\"role\":\"all\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"}}}"))

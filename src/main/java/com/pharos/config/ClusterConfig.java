@@ -30,8 +30,8 @@ public class ClusterConfig {
 
     /** @throws IllegalStateException when the combination of settings is unusable */
     public void validate() {
-        if (role == NodeRole.READER && backend != BackendKind.OBJECT_STORE) {
-            throw new IllegalStateException("cluster.role 'reader' requires cluster.backend 'object-store'");
+        if (role != NodeRole.ALL && backend != BackendKind.OBJECT_STORE) {
+            throw new IllegalStateException("cluster.role '" + role.json() + "' requires cluster.backend 'object-store'");
         }
         if (role == NodeRole.ALL && backend != BackendKind.LOCAL) {
             throw new IllegalStateException("cluster.role 'all' requires cluster.backend 'local'");
