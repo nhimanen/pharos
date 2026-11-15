@@ -61,10 +61,14 @@ class ObjectStorePublisherTest {
     static final class SpyStore implements ObjectStore {
         final InMemoryObjectStore delegate = new InMemoryObjectStore();
         final List<String> putKeys = new ArrayList<>();
+        /** Keys whose next {@code get} returns empty once (a stale read). */
+        final Set<String> hideOnce = new HashSet<>();
         Consumer<String> beforePut = k -> {};
         Consumer<String> beforeConditionalPut = k -> {};
 
-        @Override public Optional<StoredObject> get(String key) { return delegate.get(key); }
+        @Override public Optional<StoredObject> get(String key) {
+            return hideOnce.remove(key) ? Optional.empty() : delegate.get(key);
+        }
         @Override public void download(String key, Path target) throws IOException { delegate.download(key, target); }
         @Override public String put(String key, Path src) throws IOException {
             beforePut.accept(key);
@@ -242,8 +246,104 @@ class ObjectStorePublisherTest {
         assertThat(luceneEntries(m3)).isEqualTo(luceneEntries(m2));
         Set<String> expectedNew3 = keys(m3);
         expectedNew3.removeAll(gen2);
-        assertThat(expectedNew3).containsExactly(layout.graphKey(SHARD, new Generation(3)));
+        assertThat(expectedNew3).singleElement().asString()
+                .startsWith("pharos/shards/sample-app/graph/gen-3@").endsWith(".cgf.gz");
         assertThat(new HashSet<>(store.putKeys)).isEqualTo(expectedNew3);
+    }
+
+    private static JsonNode fileWithRole(JsonNode manifest, String role) {
+        for (JsonNode f : manifest.get("files")) {
+            if (f.get("role").asText().equals(role)) return f;
+        }
+        throw new AssertionError("no " + role + " file in manifest");
+    }
+
+    private static String crc32Hex(byte[] data) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(data);
+        return Long.toHexString(crc.getValue());
+    }
+
+    @Test
+    void orphanManifestIsReplacedWhenLatestDidNotMove() throws Exception {
+        ProjectIndexManager m = manager(publisher);
+        indexFull(m);
+        String orphanKey = layout.manifestKey(SHARD, new Generation(2));
+        store.delegate.put(orphanKey, "{\"orphan\": true}".getBytes(StandardCharsets.UTF_8));
+
+        touchOneFileAndReindex(m);
+
+        JsonNode latest = json(layout.latestKey(SHARD));
+        assertThat(latest.get("generation").asLong()).isEqualTo(2);
+        JsonNode m2 = manifest(2);
+        assertThat(m2.has("orphan")).isFalse();
+        assertThat(m2.get("generation").asLong()).isEqualTo(2);
+        assertThat(m2.get("parentGeneration").asLong()).isEqualTo(1);
+        assertThat(m2.get("writerNode").asText()).isEqualTo("node-a");
+        for (String key : keys(m2)) assertThat(store.get(key)).as(key).isPresent();
+    }
+
+    @Test
+    void orphanFirstManifestIsReplacedWhenLatestAbsent() throws Exception {
+        store.delegate.put(layout.manifestKey(SHARD, Generation.FIRST), "{}".getBytes(StandardCharsets.UTF_8));
+        indexFull(manager(publisher));
+        assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(1);
+        assertThat(manifest(1).get("shard").asText()).isEqualTo(PROJECT);
+    }
+
+    @Test
+    void existingManifestWithMovedLatestIsAConflict() throws Exception {
+        ProjectIndexManager m = manager(publisher);
+        indexFull(m);
+        String manifest2 = layout.manifestKey(SHARD, new Generation(2));
+        byte[] foreignManifest = "{\"foreign\": true}".getBytes(StandardCharsets.UTF_8);
+        byte[] foreignLatest = "{\"generation\": 2, \"manifest\": \"gen-2.json\"}".getBytes(StandardCharsets.UTF_8);
+        store.beforeConditionalPut = key -> {
+            if (key.equals(manifest2) && store.delegate.get(manifest2).isEmpty()) {
+                // another writer commits gen 2 right before this run's manifest put
+                store.delegate.put(manifest2, foreignManifest);
+                store.delegate.put(layout.latestKey(SHARD), foreignLatest);
+            }
+        };
+
+        assertThatThrownBy(() -> touchOneFileAndReindex(m))
+                .isInstanceOf(PublishConflictException.class)
+                .hasMessageContaining("LATEST moved");
+        assertThat(store.get(manifest2).orElseThrow().data()).isEqualTo(foreignManifest);
+        assertThat(store.get(layout.latestKey(SHARD)).orElseThrow().data()).isEqualTo(foreignLatest);
+    }
+
+    @Test
+    void racingRunCannotOverwriteCommittedGraph() throws Exception {
+        // Run A commits gen 1.
+        ProjectIndexManager mA = manager(publisher);
+        indexFull(mA);
+        JsonNode graphA = fileWithRole(manifest(1), "graph");
+        byte[] bytesA = store.get(graphA.get("key").asText()).orElseThrow().data();
+
+        // The local graph changes; run B read LATEST before A committed (stale: absent), so it
+        // also targets gen 1 and uploads a different graph for it before losing at the manifest.
+        ProjectIndexManager mLocal = manager(snapshot -> Optional.empty());
+        touchOneFileAndReindex(mLocal);
+        store.hideOnce.add(layout.latestKey(SHARD));
+        store.putKeys.clear();
+        ObjectStorePublisher runB = new ObjectStorePublisher(store, layout, catalog, null, "node-b", synonyms);
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+
+        assertThatThrownBy(() -> runB.publish(new LocalSnapshot(SHARD, shardDir, meta, "none")))
+                .isInstanceOf(PublishConflictException.class);
+
+        List<String> graphPutsB = store.putKeys.stream().filter(k -> k.contains("/graph/gen-1@")).toList();
+        assertThat(graphPutsB).hasSize(1).doesNotContain(graphA.get("key").asText());
+        assertThat(store.get(graphPutsB.get(0)).orElseThrow().data()).isNotEqualTo(bytesA);
+        // A's committed generation still resolves to A's graph bytes
+        JsonNode stillA = fileWithRole(manifest(1), "graph");
+        assertThat(stillA.get("key").asText()).isEqualTo(graphA.get("key").asText());
+        byte[] now = store.get(stillA.get("key").asText()).orElseThrow().data();
+        assertThat(now).isEqualTo(bytesA);
+        assertThat(crc32Hex(now)).isEqualTo(stillA.get("checksum").asText());
+        assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(1);
     }
 
     private static Set<String> luceneEntries(JsonNode manifest) {
@@ -319,7 +419,11 @@ class ObjectStorePublisherTest {
 
         publisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
 
-        String refsKey = layout.refsKey(SHARD, Generation.FIRST);
+        JsonNode refsEntry = fileWithRole(manifest(1), "refs");
+        String refsKey = refsEntry.get("key").asText();
+        assertThat(refsKey).isEqualTo(layout.refsKey(SHARD, Generation.FIRST, refsEntry.get("checksum").asText()));
+        assertThat(refsEntry.get("checksum").asText())
+                .isEqualTo(crc32Hex(store.get(refsKey).orElseThrow().data()));
         try (var in = new java.util.zip.GZIPInputStream(
                 new java.io.ByteArrayInputStream(store.get(refsKey).orElseThrow().data()))) {
             assertThat(in.readAllBytes()).isEqualTo(refs);

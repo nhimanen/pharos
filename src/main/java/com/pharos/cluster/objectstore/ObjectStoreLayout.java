@@ -35,11 +35,16 @@ public final class ObjectStoreLayout {
         return shardPrefix(shard) + "lucene/" + fileName + "@" + checksumHex;
     }
 
-    public String graphKey(ShardId shard, Generation gen) {
-        return shardPrefix(shard) + "graph/gen-" + gen.value() + ".cgf.gz";
+    /**
+     * Content-named per-generation graph: two runs racing for the same generation never overwrite
+     * each other's bytes. The manifest's {@code key} is the source of truth for readers.
+     */
+    public String graphKey(ShardId shard, Generation gen, String checksumHex) {
+        return shardPrefix(shard) + "graph/gen-" + gen.value() + "@" + checksumHex + ".cgf.gz";
     }
 
-    public String refsKey(ShardId shard, Generation gen) {
-        return shardPrefix(shard) + "refs/gen-" + gen.value() + ".json.gz";
+    /** Content-named per-generation unresolved refs; see {@link #graphKey}. */
+    public String refsKey(ShardId shard, Generation gen, String checksumHex) {
+        return shardPrefix(shard) + "refs/gen-" + gen.value() + "@" + checksumHex + ".json.gz";
     }
 }

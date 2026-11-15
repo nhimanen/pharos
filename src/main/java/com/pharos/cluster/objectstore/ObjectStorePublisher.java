@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -39,16 +40,25 @@ import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedInputStream;
+import java.util.zip.CheckedOutputStream;
 import java.util.zip.GZIPOutputStream;
 
 /**
  * Publishes a committed local shard as a new generation in an object store.
  *
  * <p>Protocol: read {@code LATEST} (P and its ETag) → upload Lucene commit files whose
- * content-addressed key is not in manifest P → upload this generation's graph and refs →
- * ship synonyms → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N →
- * register the shard in the catalog → GC. Nothing becomes visible to readers until the
- * {@code LATEST} CAS succeeds; every failure before it leaves {@code LATEST} untouched.
+ * content-addressed key is not in manifest P → upload this generation's graph and refs under
+ * content-named keys ({@code graph/gen-N@<crc32>.cgf.gz}, {@code refs/gen-N@<crc32>.json.gz}), so
+ * a racing run for the same N cannot overwrite bytes a committed manifest references → ship
+ * synonyms → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N → register
+ * the shard in the catalog → GC.
+ *
+ * <p>The commit point is the {@code LATEST} CAS alone. If manifest gen-N already exists while
+ * {@code LATEST} still carries the ETag read in step 1, nobody committed N: the manifest is an
+ * orphan of a run that died before its CAS, and is replaced by an ETag-conditional put (losing
+ * that race, or {@code LATEST} having moved, is a {@link PublishConflictException}). Nothing
+ * becomes visible to readers until the {@code LATEST} CAS succeeds; every failure before it
+ * leaves {@code LATEST} untouched.
  */
 public final class ObjectStorePublisher implements IndexPublisher {
 
@@ -127,7 +137,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 files.add(new ManifestFile(ManifestFile.LUCENE, f.name(), f.key(), f.length(), f.checksum()));
             }
 
-            // 3. Per-generation graph and refs snapshots.
+            // 3. Per-generation graph and refs snapshots, content-named (gen-N@crc) so a racing
+            //    run for the same N can never overwrite the bytes a committed manifest points at.
             tempDir = Files.createTempDirectory("pharos-publish-");
             Path arcade = snapshot.shardDir().resolve(GraphViews.ARCADE_DIR);
             if (Files.isDirectory(arcade)) {
@@ -135,8 +146,9 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 try (CallGraph graph = CallGraph.open(arcade)) {
                     CompactGraphWriter.export(graph, graphFile);
                 }
+                String crc = crc32Hex(graphFile);
                 ManifestFile mf = upload(ManifestFile.GRAPH, GraphViews.COMPACT_FILE,
-                        layout.graphKey(shard, gen), graphFile);
+                        layout.graphKey(shard, gen, crc), graphFile, crc);
                 files.add(mf);
                 uploaded++;
                 bytesUploaded += mf.length();
@@ -144,10 +156,14 @@ public final class ObjectStorePublisher implements IndexPublisher {
             Path refs = snapshot.shardDir().resolve(REFS_FILE);
             if (Files.isRegularFile(refs)) {
                 Path refsGz = tempDir.resolve(REFS_FILE + ".gz");
-                try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(refsGz))) {
+                CRC32 refsCrc = new CRC32();
+                try (OutputStream out = new GZIPOutputStream(
+                        new CheckedOutputStream(Files.newOutputStream(refsGz), refsCrc))) {
                     Files.copy(refs, out);
                 }
-                ManifestFile mf = upload(ManifestFile.REFS, REFS_FILE + ".gz", layout.refsKey(shard, gen), refsGz);
+                String crc = Long.toHexString(refsCrc.getValue());
+                ManifestFile mf = upload(ManifestFile.REFS, REFS_FILE + ".gz",
+                        layout.refsKey(shard, gen, crc), refsGz, crc);
                 files.add(mf);
                 uploaded++;
                 bytesUploaded += mf.length();
@@ -158,15 +174,17 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 store.put(layout.synonymsKey(), synonymsFile);
             }
 
-            // 5. Manifest gen-N, create-only.
+            // 5. Manifest gen-N, create-only; an orphan left by a run that never committed N is replaced.
             long sizeBytes = files.stream().mapToLong(ManifestFile::length).sum();
             ShardManifest manifest = new ShardManifest(ShardManifest.FORMAT_VERSION, shard.value(), gen.value(),
                     previous.map(p -> p.generation().value()).orElse(null), Instant.now(), nodeId,
                     docCount, sizeBytes, snapshot.modelFingerprint(), files,
                     ShardManifest.stripRefs(snapshot.meta()));
-            if (store.putIfAbsent(layout.manifestKey(shard, gen), manifest.toJson()).isEmpty()) {
-                throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
-                        + " already exists; another writer published shard " + shard);
+            byte[] manifestJson = manifest.toJson();
+            String manifestKey = layout.manifestKey(shard, gen);
+            if (store.putIfAbsent(manifestKey, manifestJson).isEmpty()) {
+                replaceOrphanManifest(shard, gen, manifestKey, manifestJson,
+                        previous.map(Latest::etag).orElse(null));
             }
 
             // 6. Commit point: CAS LATEST from P to N.
@@ -239,13 +257,42 @@ public final class ObjectStorePublisher implements IndexPublisher {
         }
     }
 
-    private ManifestFile upload(String role, String name, String key, Path file) throws IOException {
+    /**
+     * Manifest N already exists. The commit point is the {@code LATEST} CAS only, so if
+     * {@code LATEST} is still exactly what step 1 read (ETag unchanged, or still absent), nobody
+     * committed N: the existing manifest is an orphan of a run that crashed (or got an ambiguous
+     * error) between writing it and the CAS, and is replaced by ETag-conditional put. Otherwise
+     * another writer committed, and this run conflicts.
+     */
+    private void replaceOrphanManifest(ShardId shard, Generation gen, String manifestKey, byte[] json,
+                                       String previousLatestEtag) throws IOException {
+        Optional<StoredObject> orphan = store.get(manifestKey);
+        String currentLatestEtag = store.get(layout.latestKey(shard)).map(StoredObject::etag).orElse(null);
+        if (!Objects.equals(currentLatestEtag, previousLatestEtag)) {
+            throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
+        }
+        boolean replaced = orphan.isPresent()
+                ? store.putIfMatch(manifestKey, json, orphan.get().etag()).isPresent()
+                : store.putIfAbsent(manifestKey, json).isPresent();
+        if (!replaced) {
+            throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
+                    + " changed while replacing an orphan; another writer is publishing shard " + shard);
+        }
+        log.warn("Replaced orphan manifest {} of shard {} (LATEST never moved to it)", manifestKey, shard);
+    }
+
+    /** CRC32 of a whole file as lower-case hex. */
+    private static String crc32Hex(Path file) throws IOException {
         CRC32 crc = new CRC32();
         try (InputStream in = new CheckedInputStream(Files.newInputStream(file), crc)) {
             in.transferTo(OutputStream.nullOutputStream());
         }
+        return Long.toHexString(crc.getValue());
+    }
+
+    private ManifestFile upload(String role, String name, String key, Path file, String crcHex) throws IOException {
         store.put(key, file);
-        return new ManifestFile(role, name, key, Files.size(file), Long.toHexString(crc.getValue()));
+        return new ManifestFile(role, name, key, Files.size(file), crcHex);
     }
 
     private void runGc(ShardId shard) {
