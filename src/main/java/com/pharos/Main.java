@@ -179,6 +179,10 @@ public class Main {
             if (cls == BackfillEmbeddingCacheCommand.class)
                 return (K) new BackfillEmbeddingCacheCommand(
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry));
+            if (cls == IndexStatusCommand.class)
+                return (K) new IndexStatusCommand(registry);
+            if (cls == UpgradeIndexesCommand.class)
+                return (K) new UpgradeIndexesCommand(indexManager, registry, config);
             if (cls == MineCommand.class)
                 return (K) new MineCommand(registry, luceneIndexer);
             if (cls == EmbedCommand.class)

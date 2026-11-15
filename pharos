@@ -913,6 +913,35 @@ def cmd_backfill_embedding_cache(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
+def cmd_index_status(args):
+    """Show per-project index format status (read-only; spawns the jar, no daemon)."""
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index-status"]
+    if args.json:
+        cmd.append("--json")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+def cmd_upgrade_indexes(args):
+    """Re-index projects whose index format is not current.
+
+    Spawns its own JVM (holds the Lucene write locks) and inherits stdin/stdout so the
+    confirmation prompt works.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "upgrade-indexes"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.yes:
+        cmd.append("--yes")
+    if args.no_embed:
+        cmd.append("--no-embed")
+    cmd.extend(args.projects)
+    sys.exit(subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr).returncode)
+
+
 def cmd_embed(args):
     """Add one embedding model's vectors to an existing index, no re-parse.
 
@@ -1119,6 +1148,8 @@ COMMANDS
   boundary    Show entry/exit points of a module
   skeleton              Show public/protected class and method signatures of a project
   pipelines             List available search pipelines and their ids
+  index-status    Show each project's index format status (--json for machines)
+  upgrade-indexes Re-index projects whose index format is not current
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
@@ -1496,6 +1527,25 @@ EXAMPLES
     p_backfill.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
     p_backfill.add_argument("--all", action="store_true", help="Backfill every registered project")
     p_backfill.set_defaults(func=cmd_backfill_embedding_cache)
+
+    # index-status
+    p_istatus = sub.add_parser(
+        "index-status",
+        help="Show each project's index format status (read-only)",
+    )
+    p_istatus.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_istatus.set_defaults(func=cmd_index_status)
+
+    # upgrade-indexes
+    p_upgrade = sub.add_parser(
+        "upgrade-indexes",
+        help="Re-index projects whose index format is not current",
+    )
+    p_upgrade.add_argument("projects", nargs="*", help="Only these projects (default: all that need it)")
+    p_upgrade.add_argument("--dry-run", action="store_true", help="Print the plan and stop")
+    p_upgrade.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
+    p_upgrade.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
+    p_upgrade.set_defaults(func=cmd_upgrade_indexes)
 
     # embed
     p_embed = sub.add_parser(
