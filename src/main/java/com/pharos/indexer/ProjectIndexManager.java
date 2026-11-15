@@ -399,6 +399,18 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
+        if (incremental) {
+            // An index written by another format can't be updated in place: rebuild it fully.
+            // A project with no index dir yet is just a normal first full index.
+            Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
+            if (Files.isDirectory(existingDir) && IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
+                String msg = "index format changed (" + IndexFormat.read(existingDir).format()
+                        + " → " + IndexVersions.INDEX_FORMAT + "): running a full re-index";
+                log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -553,6 +565,9 @@ public class ProjectIndexManager {
                 .collect(Collectors.toList()));
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
+
+        // Stamp last: only a fully committed full run marks the index as this format.
+        IndexFormat.write(projectIndexDir);
 
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
