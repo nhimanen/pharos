@@ -48,7 +48,8 @@ public class Main {
         // Build all configured embedding providers — indexing writes one vector
         // field per model; search picks one provider via config.searchEmbeddingModel.
         List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
-        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config);
+        // Same instance as the matching indexing provider — not a second copy of the model.
+        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config, embedders);
         LuceneIndexer luceneIndexer = new LuceneIndexer(config);
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
@@ -75,7 +76,7 @@ public class Main {
         // Build picocli CommandLine with injected dependencies via factory
         CommandLine cmd = new CommandLine(new CodeSearchCommand(),
                 new DependencyFactory(config, registry, luceneIndexer, indexManager, searchEngine,
-                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker));
+                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker, embedders));
 
         int exitCode = cmd.execute(args);
         System.exit(exitCode);
@@ -105,12 +106,16 @@ public class Main {
         private final ModuleGraphBuilder moduleGraphBuilder;
         private final ModuleBoundaryAnalyzer boundaryAnalyzer;
         private final CrossProjectLinker crossProjectLinker;
+        /** The process's embedding providers — shared so no command loads a model twice. */
+        private final List<EmbeddingProvider> embedders;
 
         DependencyFactory(IndexConfig config, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer, ProjectIndexManager indexManager,
                           SearchEngine searchEngine, ModuleGraphBuilder moduleGraphBuilder,
                           ModuleBoundaryAnalyzer boundaryAnalyzer,
-                          CrossProjectLinker crossProjectLinker) {
+                          CrossProjectLinker crossProjectLinker,
+                          List<EmbeddingProvider> embedders) {
+            this.embedders = embedders;
             this.config = config;
             this.registry = registry;
             this.luceneIndexer = luceneIndexer;
@@ -171,7 +176,7 @@ public class Main {
                 return (K) new MineCommand(registry, luceneIndexer);
             if (cls == EmbedCommand.class)
                 return (K) new EmbedCommand(
-                        new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry),
+                        new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry, embedders),
                         registry);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
