@@ -151,6 +151,20 @@ class UpgradeIndexesCommandTest {
     }
 
     @Test
+    void eofOnPromptExits2() throws Exception {
+        indexProject("b", true);
+        int rc = run(new UpgradeIndexesCommand(manager, registry, config, p -> null, true));
+        assertThat(rc).isEqualTo(2);
+        assertThat(err.toString()).contains("use --yes to run non-interactively");
+        assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+    }
+
+    @Test
+    void defaultInteractivityIsFalseWithoutTerminal() {
+        assertThat(UpgradeIndexesCommand.interactiveConsole()).isFalse();
+    }
+
+    @Test
     void interactiveYesProceeds() throws Exception {
         indexProject("b", true);
         int rc = run(new UpgradeIndexesCommand(manager, registry, config, p -> "y", true));

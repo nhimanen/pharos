@@ -52,7 +52,13 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
     public UpgradeIndexesCommand(ProjectIndexManager indexManager, ProjectRegistry registry,
                                  IndexConfig config) {
         this(indexManager, registry, config, UpgradeIndexesCommand::consolePrompt,
-                System.console() != null);
+                interactiveConsole());
+    }
+
+    /** True only on a real terminal; since JDK 22 System.console() is non-null even when redirected. */
+    static boolean interactiveConsole() {
+        var c = System.console();
+        return c != null && c.isTerminal();
     }
 
     /** Test seam: injectable prompt source and interactivity. */
@@ -123,7 +129,11 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
                 return 2;
             }
             String answer = prompter.apply("Re-index " + todo.size() + " projects? [y/N] ");
-            if (answer == null || !(answer.trim().equalsIgnoreCase("y")
+            if (answer == null) { // EOF: no one to ask
+                System.err.println("use --yes to run non-interactively");
+                return 2;
+            }
+            if (!(answer.trim().equalsIgnoreCase("y")
                     || answer.trim().equalsIgnoreCase("yes"))) {
                 System.out.println("Aborted.");
                 return 0;
