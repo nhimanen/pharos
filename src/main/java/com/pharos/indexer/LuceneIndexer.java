@@ -66,6 +66,7 @@ public class LuceneIndexer implements Closeable {
 
     /** Open a DirectoryReader for a single project. Caches and refreshes automatically. */
     public DirectoryReader openReader(String projectName) throws IOException {
+        IndexFormat.check(projectName, getProjectIndexDir(projectName));
         Path luceneDir = getLucenePath(projectName);
         if (!Files.exists(luceneDir) || !indexExists(projectName)) {
             throw new IOException("No valid index found for project: " + projectName

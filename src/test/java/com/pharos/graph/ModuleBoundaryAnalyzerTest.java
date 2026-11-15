@@ -80,6 +80,7 @@ class ModuleBoundaryAnalyzerTest {
 
         // proj-b's call graph has an edge caller() → doWork()
         Files.createDirectories(indexB);
+        com.pharos.indexer.IndexFormat.write(indexB);
         try (CallGraph g = CallGraph.open(indexB.resolve("callgraph.arcadedb"))) {
             g.addCall("com.example.B#caller()", "com.example.A#doWork()");
             g.flush();
@@ -121,6 +122,7 @@ class ModuleBoundaryAnalyzerTest {
 
         Path indexB = tempDir.resolve("proj-b");
         Files.createDirectories(indexB);
+        com.pharos.indexer.IndexFormat.write(indexB);
         try (CallGraph g = CallGraph.open(indexB.resolve("callgraph.arcadedb"))) {
             g.addCall("com.example.B#x()", "com.example.A#beta()");
             g.addCall("com.example.B#y()", "com.example.A#alpha()");
@@ -161,6 +163,7 @@ class ModuleBoundaryAnalyzerTest {
     /** Create an ArcadeDB call graph at {@code indexPath/callgraph.arcadedb} with the given FQNs. */
     private static void createGraph(Path indexPath, String... fqns) throws IOException {
         Files.createDirectories(indexPath);
+        com.pharos.indexer.IndexFormat.write(indexPath);  // hand-built index: stamp it as current
         try (CallGraph g = CallGraph.open(indexPath.resolve("callgraph.arcadedb"))) {
             for (String fqn : fqns) {
                 g.addMethod(fqn, classOf(fqn));

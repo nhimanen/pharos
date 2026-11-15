@@ -1,5 +1,7 @@
 package com.pharos.graph;
 
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.search.SearchEngine;
@@ -74,6 +76,7 @@ public class ModuleBoundaryAnalyzer {
         // Load this project's method set
         Path ownDbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
         Set<String> ownMethods;
+        IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
         try (CallGraph ownGraph = CallGraph.open(ownDbDir)) {
             ownMethods = ownGraph.allFqns().collect(Collectors.toSet());
         } catch (Exception e) {
@@ -90,6 +93,12 @@ public class ModuleBoundaryAnalyzer {
                 if (linkedMeta == null) continue;
                 Path linkedDb = Path.of(linkedMeta.getIndexPath()).resolve("callgraph.arcadedb");
                 if (!Files.isDirectory(linkedDb)) continue;
+                try {
+                    IndexFormat.check(linkedMeta.getName(), Path.of(linkedMeta.getIndexPath()));
+                } catch (IncompatibleIndexException e) {
+                    log.warn("Skipping linked project '{}' in module boundary: {}", linkedName, e.getMessage());
+                    continue;
+                }
                 try (CallGraph linkedGraph = CallGraph.open(linkedDb)) {
                     entryPointSet.addAll(linkedGraph.calledTargets(ownMethods));
                 } catch (Exception e) {

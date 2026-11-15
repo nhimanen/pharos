@@ -3,6 +3,8 @@ package com.pharos.mcp;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
@@ -296,7 +298,11 @@ public class McpToolRegistry {
             out.put("suggestions", sugg);
         }
 
-        return mapper.writeValueAsString(out);
+        String json = mapper.writeValueAsString(out);
+        if (response.warnings().isEmpty()) return json;
+        StringBuilder sb = new StringBuilder();
+        for (String w : response.warnings()) sb.append("\u26a0 ").append(w).append('\n');
+        return sb.append(json).toString();
     }
 
     private String callFindTransitiveCallers(JsonNode args) throws Exception {
@@ -433,6 +439,12 @@ public class McpToolRegistry {
         for (ProjectMeta meta : registry.listAll()) {
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
             if (!Files.isDirectory(dbDir)) continue;
+            try {
+                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            } catch (IncompatibleIndexException e) {
+                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                continue;
+            }
             try (CallGraph g = CallGraph.open(dbDir)) {
                 List<String> path = g.shortestPath(from, to);
                 if (!path.isEmpty()) {
@@ -772,6 +784,12 @@ public class McpToolRegistry {
         for (ProjectMeta meta : registry.listAll()) {
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
             if (!Files.isDirectory(dbDir)) continue;
+            try {
+                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            } catch (IncompatibleIndexException e) {
+                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                continue;
+            }
             try (CallGraph graph = CallGraph.open(dbDir)) {
                 result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (Exception ignored) {}

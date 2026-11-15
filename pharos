@@ -207,6 +207,14 @@ def _api_get(path: str, params: dict = None) -> object:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
+        if e.code == 409:
+            # Index format incompatible with this pharos version — exit code 4
+            try:
+                msg = json.loads(body).get("error", body)
+            except ValueError:
+                msg = body
+            print(msg, file=sys.stderr)
+            sys.exit(4)
         die(f"API error {e.code}: {body}")
     except urllib.error.URLError as e:
         die(f"Cannot reach pharos daemon: {e.reason}\n"
@@ -410,7 +418,10 @@ def fmt_projects(projects: list, limit: int = 0) -> str:
         methods = p.get("methodCount", 0)
         classes = p.get("classCount", 0)
         last = p.get("lastIndexed", "")
-        lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last})")
+        fmt_status = (p.get("indexFormat") or {}).get("status", "ok")
+        flag = {"ok": "", "outdated": " [needs upgrade: pharos index --full]",
+                "newer": " [index from a newer pharos]"}.get(fmt_status, "")
+        lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last}){flag}")
     if hidden:
         lines.append(f"- *... and {hidden} more*")
     return "\n".join(lines)
@@ -640,6 +651,9 @@ def cmd_search(args):
     else:
         results = raw
         meta = None
+
+    for w in (raw.get("warnings") or []) if isinstance(raw, dict) else []:
+        print(f"warning: {w}", file=sys.stderr)
 
     print(fmt_search(results))
 

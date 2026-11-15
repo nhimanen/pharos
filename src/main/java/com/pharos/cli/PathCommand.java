@@ -1,5 +1,7 @@
 package com.pharos.cli;
 
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -59,6 +61,12 @@ public class PathCommand implements Callable<Integer> {
         for (ProjectMeta meta : registry.listAll()) {
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
             if (!Files.isDirectory(dbDir)) continue;
+            try {
+                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            } catch (IncompatibleIndexException e) {
+                System.err.println("Skipping '" + meta.getName() + "': " + e.getMessage());
+                continue;
+            }
             try (CallGraph graph = CallGraph.open(dbDir)) {
                 List<String> path = graph.shortestPath(fromFqn, toFqn);
                 if (!path.isEmpty()) return path;

@@ -1,5 +1,7 @@
 package com.pharos.cli;
 
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -68,6 +70,12 @@ public class CalleesCommand implements Callable<Integer> {
         Set<String> allCallees = new LinkedHashSet<>();
         for (ProjectMeta meta : projects) {
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
+            try {
+                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            } catch (IncompatibleIndexException e) {
+                if (project != null) throw e;  // explicitly requested: surface it
+                continue;                       // all-project: skip the incompatible one
+            }
             try (CallGraph graph = CallGraph.open(dbDir)) {
                 allCallees.addAll(graph.callees(callerFqn));
             } catch (Exception e) {

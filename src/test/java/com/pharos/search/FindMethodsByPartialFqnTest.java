@@ -59,6 +59,8 @@ class FindMethodsByPartialFqnTest {
                     method("overloaded", List.of("String", "int"), List.of("s", "n")), null, 0, List.of()));
             writer.commit();
         }
+        // Hand-built index: stamp it as current
+        com.pharos.indexer.IndexFormat.write(luceneIndexer.getProjectIndexDir(PROJECT));
     }
 
     @Test

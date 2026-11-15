@@ -80,6 +80,7 @@ public class SearchCommand implements Callable<Integer> {
                     project, null, limit, format, resolvedDocType, resolvedScope, 0);
 
             SearchResponse response = searchEngine.searchWithTrace(req, expand);
+            for (String w : response.warnings()) System.err.println("warning: " + w);
             List<SearchResult> results = searchEngine
                     .newSnippetDecorator(snippetLines, response)
                     .decorate(response.results(), query);
@@ -105,6 +106,9 @@ public class SearchCommand implements Callable<Integer> {
                 }
             }
             return 0;
+        } catch (com.pharos.indexer.IncompatibleIndexException e) {
+            System.err.println(e.getMessage());
+            return 4;
         } catch (Exception e) {
             System.err.println("Search error: " + e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();

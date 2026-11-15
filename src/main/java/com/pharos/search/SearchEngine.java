@@ -5,6 +5,8 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
 import com.pharos.search.SourceReader;
 import com.pharos.embedding.EmbeddingProvider;
+import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.search.pipeline.CrossEncoder;
@@ -209,10 +211,14 @@ public class SearchEngine {
                     hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
         }
 
-        List<String> projects = resolveProjects(req);
+        List<String> warnings = new ArrayList<>();
+        List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) {
-            log.warn("No indexed projects found. Run 'pharos index <path>' first.");
-            return new SearchResponse(List.of(), trace, req.type().name().toLowerCase(), null);
+            if (warnings.isEmpty()) {
+                log.warn("No indexed projects found. Run 'pharos index <path>' first.");
+            }
+            return new SearchResponse(List.of(), trace, req.type().name().toLowerCase(),
+                    null, null, null, List.copyOf(warnings));
         }
 
         // Refuse vector-shaped queries when the configured search model has no
@@ -256,7 +262,7 @@ public class SearchEngine {
 
         if (primary.isEmpty()) {
             ZeroResultAdvisor.Suggestions suggestions = zeroResultAdvisor.advise(req, projects);
-            return new SearchResponse(List.of(), trace, resolvedTypeName, suggestions, null, null);
+            return new SearchResponse(List.of(), trace, resolvedTypeName, suggestions, null, null, List.copyOf(warnings));
         }
 
         // Build snippet resolvers lazily — called only for final results, not all candidates.
@@ -293,13 +299,13 @@ public class SearchEngine {
         };
 
         if (!expand) {
-            return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver);
+            return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver, List.copyOf(warnings));
         }
 
         long tExpand = System.currentTimeMillis();
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
-        return new SearchResponse(expanded, trace, resolvedTypeName, null, kwResolver, vecResolver);
+        return new SearchResponse(expanded, trace, resolvedTypeName, null, kwResolver, vecResolver, List.copyOf(warnings));
     }
 
     /**
@@ -515,8 +521,7 @@ public class SearchEngine {
         String methodName = partialFqn.substring(hash + 1);
         if (className.isEmpty() || methodName.isEmpty()) return List.of();
 
-        List<String> projects = registry.listAll().stream()
-                .map(ProjectMeta::getName).collect(Collectors.toList());
+        List<String> projects = allUsable();
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -550,9 +555,7 @@ public class SearchEngine {
     }
 
     private SearchResult getByFqn(String fqn) throws IOException {
-        List<String> projects = registry.listAll().stream()
-                .map(ProjectMeta::getName)
-                .collect(Collectors.toList());
+        List<String> projects = allUsable();
         if (projects.isEmpty()) return null;
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -581,8 +584,7 @@ public class SearchEngine {
     public Map<String, SearchResult> getByFqns(List<String> fqns) throws IOException {
         if (fqns.isEmpty()) return Map.of();
 
-        List<String> projects = registry.listAll().stream()
-                .map(ProjectMeta::getName).collect(Collectors.toList());
+        List<String> projects = allUsable();
         if (projects.isEmpty()) return Map.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -666,8 +668,24 @@ public class SearchEngine {
 
     /** Opens an ArcadeDB call graph for every indexed project. Caller must close all returned graphs. */
     private List<CallGraph> openAllGraphs() {
+        return openAllGraphs(null);
+    }
+
+    /**
+     * As {@link #openAllGraphs()}, optionally scoped to one project. Projects whose index format
+     * is incompatible are skipped (logged) when searching all; a scoped one rethrows.
+     */
+    private List<CallGraph> openAllGraphs(String onlyProject) {
         List<CallGraph> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll()) {
+            if (onlyProject != null && !onlyProject.equals(meta.getName())) continue;
+            try {
+                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            } catch (IncompatibleIndexException e) {
+                if (onlyProject != null) throw e;
+                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                continue;
+            }
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
             if (Files.isDirectory(dbDir)) {
                 try { graphs.add(CallGraph.open(dbDir)); } catch (Exception ignored) {}
@@ -863,7 +881,7 @@ public class SearchEngine {
     /** Find all methods that call the given FQN (reverse lookup via calledMethods field). */
     public List<SearchResult> findCallers(String calleeFqn, String project) throws IOException {
         SearchRequest req = SearchRequest.keyword("", project, 100);
-        List<String> projects = resolveProjects(req);
+        List<String> projects = resolveUsable(req, new ArrayList<>());
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -881,7 +899,7 @@ public class SearchEngine {
 
         // The calledMethods field stores FQNs; we look them up directly
         // For now return the caller with its callees via a direct document lookup
-        List<String> projects = resolveProjects(SearchRequest.keyword("", project, 100));
+        List<String> projects = resolveUsable(SearchRequest.keyword("", project, 100), new ArrayList<>());
         if (projects.isEmpty()) return List.of();
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -950,6 +968,37 @@ public class SearchEngine {
         }
     }
 
+    /**
+     * Drops projects whose index format is incompatible, appending the explanation of each to
+     * {@code warnings}. An explicitly requested single project that is incompatible rethrows.
+     */
+    private List<String> usable(List<String> projects, boolean explicitSingle, List<String> warnings) {
+        List<String> ok = new ArrayList<>(projects.size());
+        for (String p : projects) {
+            try {
+                IndexFormat.check(p, luceneIndexer.getProjectIndexDir(p));
+                ok.add(p);
+            } catch (IncompatibleIndexException e) {
+                if (explicitSingle) throw e;
+                warnings.add(e.getMessage());
+            }
+        }
+        return ok;
+    }
+
+    private List<String> resolveUsable(SearchRequest req, List<String> warnings) {
+        boolean explicit = (req.project() != null && !req.project().isEmpty())
+                || (req.projects() != null && !req.projects().isEmpty());
+        List<String> projects = resolveProjects(req);
+        return usable(projects, explicit && projects.size() == 1, warnings);
+    }
+
+    /** Every registered project with a compatible index (incompatible ones are skipped silently). */
+    private List<String> allUsable() {
+        return usable(registry.listAll().stream().map(ProjectMeta::getName).collect(Collectors.toList()),
+                false, new ArrayList<>());
+    }
+
     private List<String> resolveProjects(SearchRequest req) {
         if (req.project() != null && !req.project().isEmpty()) {
             return List.of(req.project());
@@ -995,6 +1044,11 @@ public class SearchEngine {
      *              {@code "annotated"} | {@code "type_refs"}
      */
     public UsageResult findUsages(String fqn, String kind) throws IOException {
+        return findUsages(fqn, kind, null);
+    }
+
+    /** As {@link #findUsages(String, String)}, scoped to one project when {@code project} is non-null. */
+    public UsageResult findUsages(String fqn, String kind, String project) throws IOException {
         boolean all = "all".equals(kind);
         List<String> callers        = new ArrayList<>();
         List<String> subclasses     = new ArrayList<>();
@@ -1005,7 +1059,7 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
-        List<CallGraph> graphs = openAllGraphs();
+        List<CallGraph> graphs = openAllGraphs(project);
         try {
             for (CallGraph g : graphs) {
                 if (all || "callers".equals(kind))
@@ -1068,7 +1122,7 @@ public class SearchEngine {
         // All method documents for this class from Lucene.
         // F_QUALIFIED_CLASS is a TextField (analyzed), so TermQuery on a dotted FQN never matches.
         // Instead, use PrefixQuery on the StringField F_ID ("project:FQN#") which is exact.
-        List<String> projects = resolveProjects(SearchRequest.keyword("", null, 100));
+        List<String> projects = allUsable();
         IndexReader reader = luceneIndexer.openMultiReader(projects);
         IndexSearcher searcher = new IndexSearcher(reader);
         BooleanQuery.Builder idPrefixes = new BooleanQuery.Builder().setMinimumNumberShouldMatch(1);

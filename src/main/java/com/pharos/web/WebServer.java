@@ -1,5 +1,7 @@
 package com.pharos.web;
 
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -57,14 +59,19 @@ public class WebServer {
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     }
 
-    public void start(int port) {
+    public Javalin start(int port) {
+        return start(port, IndexConfig.DEFAULT_BASE);
+    }
+
+    /** @param pharosDir directory that receives the usage log ({@code logs/usage.jsonl}) */
+    public Javalin start(int port, Path pharosDir) {
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
-        UsageLogger usage = new UsageLogger(IndexConfig.DEFAULT_BASE);
+        UsageLogger usage = new UsageLogger(pharosDir);
         app.before(ctx -> {
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
@@ -92,6 +99,15 @@ public class WebServer {
                     resultIds,
                     ctx.userAgent()
             ));
+        });
+
+        // Incompatible index format → 409 with a machine-readable body
+        app.exception(IncompatibleIndexException.class, (e, ctx) -> {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("error", e.getMessage());
+            body.put("project", e.project());
+            body.put("status", e.status().name().toLowerCase());
+            ctx.status(409).json(body);
         });
 
         // Root → index.html
@@ -171,10 +187,12 @@ public class WebServer {
                         decorated.stream().map(SearchResult::id).collect(Collectors.toList()));
                 List<Map<String, Object>> results = decorated.stream()
                         .map(this::resultToMap).collect(Collectors.toList());
-                boolean needsEnvelope = trace || (resp.suggestions() != null && !resp.suggestions().isEmpty());
+                boolean needsEnvelope = trace || !resp.warnings().isEmpty()
+                        || (resp.suggestions() != null && !resp.suggestions().isEmpty());
                 if (needsEnvelope) {
                     Map<String, Object> out = new LinkedHashMap<>();
                     out.put("results", results);
+                    out.put("warnings", resp.warnings());
                     if (trace) {
                         Map<String, Object> meta = new LinkedHashMap<>();
                         meta.put("requestedType", type);
@@ -204,6 +222,8 @@ public class WebServer {
                 } else {
                     ctx.json(results);
                 }
+            } catch (IncompatibleIndexException e) {
+                throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -509,6 +529,7 @@ public class WebServer {
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
         log.info("Web server started on port {}", port);
+        return app;
     }
 
     // ── Usage logging helpers ──────────────────────────────────────────────────
@@ -598,6 +619,7 @@ public class WebServer {
 
     /** Open the ArcadeDB call graph for the given project. Caller must close. */
     private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
+        IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
         Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
         return CallGraph.open(dbDir);
     }
@@ -938,6 +960,13 @@ public class WebServer {
         m.put("artifactId", p.getArtifactId());
         m.put("indexed", luceneIndexer.indexExists(p.getName()));
         m.put("embeddedModels", p.getEmbeddedModels());
+        Path indexDir = Path.of(p.getIndexPath());
+        IndexFormat.Stamp stamp = IndexFormat.read(indexDir);
+        Map<String, Object> fmt = new LinkedHashMap<>();
+        fmt.put("status", IndexFormat.status(indexDir).name().toLowerCase());
+        fmt.put("format", stamp.format());
+        fmt.put("pharosVersion", stamp.pharosVersion());
+        m.put("indexFormat", fmt);
         return m;
     }
 
