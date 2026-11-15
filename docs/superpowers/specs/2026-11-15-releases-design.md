@@ -140,8 +140,10 @@ The user picked 1.
 - **`upgrade-indexes`** includes `upgrade-available` projects. Write-time behaviour is unchanged: an incremental run on any non-`ok` format becomes a full run.
 - **Serving during the re-index:**
   - A full re-index must not disturb readers. Lucene already keeps the previous commit visible until the new one lands.
-  - The call graph is rebuilt in a sibling directory (`callgraph.arcadedb.new`) and swapped in with directory renames at the end. Readers therefore see either the old graph or the new one, never a half-built one.
-  - The stamp is written last.
+  - The call graph is built into a new generation dir, `callgraph-<gen>.arcadedb`, and published by atomically replacing the pointer file `callgraph.current`. The live dir is never renamed under a reader. That matters because ArcadeDB writes `cached-count.json` and deletes WAL and lock files by the path it opened, so a rename would let a late-closing reader corrupt the new graph.
+  - Readers resolve the pointer through `CallGraph.projectGraphDir`, which falls back to `callgraph.arcadedb` for the format-0 layout, and open the graph with the non-creating `CallGraph.openExisting`.
+  - Unused generations are deleted only while the project's Lucene write lock is held.
+  - The stamp is written last. (The original rename-into-place plan was replaced after review, 2026-11-15.)
 - **Obligation on every format bump:**
   - The code keeps a working read path for the previous format.
   - The previous-format fixture under `src/test/resources/compat/format-<N-1>/` is kept, and a fixture for the new format is added.
