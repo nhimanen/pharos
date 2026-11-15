@@ -716,7 +716,11 @@ public class SearchEngine {
                 continue;
             }
             // GraphViews opens existing graphs only: a project without one is skipped, nothing is created.
-            try { graphs.add(GraphViews.open(meta)); } catch (Exception ignored) {}
+            try {
+                graphs.add(GraphViews.open(meta));
+            } catch (Exception e) {
+                log.warn("Skipping unreadable graph of project {}: {}", meta.getName(), e.toString());
+            }
         }
         return graphs;
     }

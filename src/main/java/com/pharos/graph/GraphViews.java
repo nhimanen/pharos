@@ -2,6 +2,8 @@ package com.pharos.graph;
 
 import com.pharos.config.ProjectMeta;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -19,8 +21,14 @@ public final class GraphViews {
         if (Files.isDirectory(arcade)) {
             return CallGraph.openExisting(arcade);
         }
-        if (Files.exists(shardDir.resolve(COMPACT_FILE))) {
-            throw new UnsupportedOperationException("Compact graph files are not supported yet");
+        Path compact = shardDir.resolve(COMPACT_FILE);
+        if (Files.exists(compact)) {
+            try {
+                return CompactGraph.read(compact);
+            } catch (IOException e) {
+                // surfaced, not swallowed: an unreadable graph must not look like "no graph"
+                throw new UncheckedIOException("Cannot read compact graph " + compact, e);
+            }
         }
         return EmptyGraphView.INSTANCE;
     }

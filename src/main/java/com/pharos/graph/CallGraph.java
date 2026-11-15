@@ -839,6 +839,59 @@ public class CallGraph implements GraphView {
     }
 
     // -------------------------------------------------------------------------
+    // Export (compact graph file)
+    // -------------------------------------------------------------------------
+
+    /** Edge types of the graph, in the order they are written to the compact file. */
+    public static final List<String> EDGE_TYPES = List.of("calls", "inherits", "implements_iface",
+            "declares_field", "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by");
+
+    /** One vertex of the graph. {@code kind} is Method, CodeType or CodeField; unused fields are null. */
+    public record VertexRecord(String kind, String fqn, String classPrefix, String ownerFqn,
+                               String fieldType, String accessMod) {}
+
+    /** One edge with the vertex type of each endpoint (an fqn is only unique within its type). */
+    public record EdgeRecord(String fromKind, String fromFqn, String toKind, String toFqn) {}
+
+    /** Visits every vertex of every type. Pending batches must be flushed by the caller. */
+    public void forEachVertex(java.util.function.Consumer<VertexRecord> visitor) {
+        for (String type : new String[]{"Method", "CodeType", "CodeField"}) {
+            if (!db.getSchema().existsType(type)) continue;
+            var it = db.iterateType(type, false);
+            while (it.hasNext()) {
+                Vertex v = it.next().asVertex();
+                String fqn = v.getString("fqn");
+                if (fqn == null) continue;
+                visitor.accept(new VertexRecord(type, fqn, v.getString("classPrefix"),
+                        v.getString("ownerFqn"), v.getString("fieldType"), v.getString("accessMod")));
+            }
+        }
+    }
+
+    /** Visits every edge of {@code edgeType} as (from fqn, to fqn). */
+    public void forEachEdge(String edgeType, java.util.function.BiConsumer<String, String> fromTo) {
+        forEachEdgeRecord(edgeType, e -> fromTo.accept(e.fromFqn(), e.toFqn()));
+    }
+
+    /** Visits every edge of {@code edgeType}, including the vertex type of both endpoints. */
+    public void forEachEdgeRecord(String edgeType, java.util.function.Consumer<EdgeRecord> visitor) {
+        if (!db.getSchema().existsType(edgeType)) return;
+        for (String type : new String[]{"Method", "CodeType", "CodeField"}) {
+            if (!db.getSchema().existsType(type)) continue;
+            var it = db.iterateType(type, false);
+            while (it.hasNext()) {
+                Vertex from = it.next().asVertex();
+                String fromFqn = from.getString("fqn");
+                if (fromFqn == null) continue;
+                for (Vertex to : from.getVertices(Vertex.DIRECTION.OUT, edgeType)) {
+                    String toFqn = to.getString("fqn");
+                    if (toFqn != null) visitor.accept(new EdgeRecord(type, fromFqn, to.getTypeName(), toFqn));
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
