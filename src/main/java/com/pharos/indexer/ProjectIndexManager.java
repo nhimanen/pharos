@@ -414,9 +414,12 @@ public class ProjectIndexManager {
         // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
         // were embedded, so a later normal `index` never embedded unchanged files — and
         // computing it forced the models to load for `index --no-embed`.
+        // The legacy aliases are model fingerprints too: resolving them checks provider
+        // availability, which loads the model, so skip them as well when not embedding.
         String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
+        List<String> legacyFps = generateEmbeddings ? legacyCompositeModelFingerprints() : List.of();
         FileStateTracker stateTracker = new FileStateTracker(
-                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyCompositeModelFingerprints());
+                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyFps);
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per
         // available provider. Full and incremental paths use slightly different
         // cache-file prefixes so a parallel re-index can't clobber an in-progress
