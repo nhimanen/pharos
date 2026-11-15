@@ -21,6 +21,12 @@ public class PythonCodeParser extends ScriptBasedCodeParser {
 
     public PythonCodeParser(int parseThreads) { super(parseThreads); }
 
+    /** The extractor derives packages relative to {@code --root} in single-file mode too. */
+    @Override
+    protected boolean extractorAcceptsRoot() {
+        return true;
+    }
+
     @Override
     protected String scriptResourceName() {
         return "python-extractor.py";

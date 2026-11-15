@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.search.SearchEngine;
 import com.pharos.web.WebServer;
 import picocli.CommandLine.*;
 
@@ -22,15 +23,23 @@ public class WebCommand implements Callable<Integer> {
     private boolean noOpen;
 
     private final WebServer webServer;
+    /** Null in tests; when set, its models are warmed up after the server starts. */
+    private final SearchEngine searchEngine;
 
     public WebCommand(WebServer webServer) {
+        this(webServer, null);
+    }
+
+    public WebCommand(WebServer webServer, SearchEngine searchEngine) {
         this.webServer = webServer;
+        this.searchEngine = searchEngine;
     }
 
     @Override
     public Integer call() {
         try {
             webServer.start(port);
+            if (searchEngine != null) searchEngine.warmUpInBackground();
             if (!noOpen) {
                 tryOpenBrowser("http://localhost:" + port);
             }

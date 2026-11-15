@@ -23,6 +23,7 @@ import com.pharos.embedding.CrossEncoderProvider;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.CrossEncoderProviderAdapter;
+import com.pharos.search.pipeline.LazyCrossEncoder;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,7 +49,8 @@ public class Main {
         // Build all configured embedding providers — indexing writes one vector
         // field per model; search picks one provider via config.searchEmbeddingModel.
         List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
-        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config);
+        // Same instance as the matching indexing provider — not a second copy of the model.
+        EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config, embedders);
         LuceneIndexer luceneIndexer = new LuceneIndexer(config);
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
@@ -75,7 +77,7 @@ public class Main {
         // Build picocli CommandLine with injected dependencies via factory
         CommandLine cmd = new CommandLine(new CodeSearchCommand(),
                 new DependencyFactory(config, registry, luceneIndexer, indexManager, searchEngine,
-                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker));
+                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker, embedders));
 
         int exitCode = cmd.execute(args);
         System.exit(exitCode);
@@ -83,12 +85,15 @@ public class Main {
 
     private static CrossEncoder buildCrossEncoder(IndexConfig config) {
         if (!config.isCrossEncoderEnabled()) return new NoOpCrossEncoder();
-        try {
-            return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
-        } catch (Exception e) {
-            log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
-            return new NoOpCrossEncoder();
-        }
+        // Loaded on first rerank, not at startup — most commands never rerank.
+        return new LazyCrossEncoder(() -> {
+            try {
+                return new CrossEncoderProviderAdapter(new CrossEncoderProvider());
+            } catch (Throwable e) {   // incl. UnsatisfiedLinkError: memoized as no-op, not retried per search
+                log.warn("Cross-encoder unavailable ({}), falling back to no-op.", e.getMessage());
+                return new NoOpCrossEncoder();
+            }
+        });
     }
 
     /**
@@ -105,12 +110,16 @@ public class Main {
         private final ModuleGraphBuilder moduleGraphBuilder;
         private final ModuleBoundaryAnalyzer boundaryAnalyzer;
         private final CrossProjectLinker crossProjectLinker;
+        /** The process's embedding providers — shared so no command loads a model twice. */
+        private final List<EmbeddingProvider> embedders;
 
         DependencyFactory(IndexConfig config, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer, ProjectIndexManager indexManager,
                           SearchEngine searchEngine, ModuleGraphBuilder moduleGraphBuilder,
                           ModuleBoundaryAnalyzer boundaryAnalyzer,
-                          CrossProjectLinker crossProjectLinker) {
+                          CrossProjectLinker crossProjectLinker,
+                          List<EmbeddingProvider> embedders) {
+            this.embedders = embedders;
             this.config = config;
             this.registry = registry;
             this.luceneIndexer = luceneIndexer;
@@ -161,7 +170,7 @@ public class Main {
                 return (K) new ModulePathCommand(moduleGraphBuilder);
             if (cls == WebCommand.class)
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
-                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer));
+                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer), searchEngine);
             if (cls == RemoveIndexCommand.class)
                 return (K) new RemoveIndexCommand(registry, indexManager);
             if (cls == BackfillEmbeddingCacheCommand.class)
@@ -171,7 +180,7 @@ public class Main {
                 return (K) new MineCommand(registry, luceneIndexer);
             if (cls == EmbedCommand.class)
                 return (K) new EmbedCommand(
-                        new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry),
+                        new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry, embedders),
                         registry);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);

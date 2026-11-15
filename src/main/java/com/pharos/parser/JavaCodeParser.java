@@ -286,9 +286,15 @@ public class JavaCodeParser implements CodeParser {
         ParsedClass ctx = findClassContext(classes, type, packageName);
         if (ctx == null) return;
 
-        // Use accept() to dispatch via double-dispatch (bypasses wildcard type restriction)
+        // Only the type's own members. Visiting the whole type subtree (type.accept) used to
+        // descend into nested types and anonymous / enum-constant bodies too, indexing their
+        // methods a second time under this (outer) type's FQN — duplicate, mis-owned ids.
+        // Nested types are handled by the recursion below with their own context.
         MethodVisitor methodVisitor = new MethodVisitor(projectName, filePath, ctx);
-        type.accept(methodVisitor, methods);
+        for (BodyDeclaration<?> member : type.getMembers()) {
+            if (member instanceof MethodDeclaration md) methodVisitor.visit(md, methods);
+            else if (member instanceof ConstructorDeclaration cd) methodVisitor.visit(cd, methods);
+        }
 
         // Recurse into nested types
         type.getMembers().stream()
@@ -299,12 +305,13 @@ public class JavaCodeParser implements CodeParser {
 
     private ParsedClass findClassContext(List<ParsedClass> classes, TypeDeclaration<?> type, String packageName) {
         String simpleName = type.getNameAsString();
+        String qualifiedName = ClassVisitor.qualifiedName(packageName, type);
         return classes.stream()
-                .filter(c -> c.className().equals(simpleName))
+                .filter(c -> c.qualifiedClassName().equals(qualifiedName))
                 .findFirst()
                 .orElseGet(() -> {
                     // Fallback: create minimal context
-                    String qualified = packageName.isEmpty() ? simpleName : packageName + "." + simpleName;
+                    String qualified = qualifiedName;
                     return new com.pharos.parser.model.ParsedClass(
                             "", packageName, simpleName, qualified,
                             "class", null, List.of(), List.of(),
@@ -561,7 +568,7 @@ public class JavaCodeParser implements CodeParser {
             // Pass 2: field accesses — explicit this.field + heuristic bare-name detection.
             cu.findAll(MethodDeclaration.class).forEach(md -> {
                 md.getBody().ifPresent(body -> {
-                    String ownerQual = md.findAncestor(ClassOrInterfaceDeclaration.class)
+                    String ownerQual = md.findAncestor(TypeDeclaration.class)
                             .map(c -> buildQualifiedNameFromCu(file.packageName(), c))
                             .orElse(null);
                     if (ownerQual == null) return;
@@ -576,7 +583,7 @@ public class JavaCodeParser implements CodeParser {
             });
             // Also handle constructors
             cu.findAll(ConstructorDeclaration.class).forEach(cd -> {
-                String ownerQual = cd.findAncestor(ClassOrInterfaceDeclaration.class)
+                String ownerQual = cd.findAncestor(TypeDeclaration.class)
                         .map(c -> buildQualifiedNameFromCu(file.packageName(), c))
                         .orElse(null);
                 if (ownerQual == null) return;
@@ -631,16 +638,8 @@ public class JavaCodeParser implements CodeParser {
         return parent instanceof AssignExpr ae && ae.getTarget() == expr;
     }
 
-    private static String buildQualifiedNameFromCu(String packageName, ClassOrInterfaceDeclaration n) {
-        List<String> parts = new ArrayList<>();
-        parts.add(n.getNameAsString());
-        com.github.javaparser.ast.Node parent = n.getParentNode().orElse(null);
-        while (parent instanceof ClassOrInterfaceDeclaration enclosing) {
-            parts.add(0, enclosing.getNameAsString());
-            parent = enclosing.getParentNode().orElse(null);
-        }
-        String classPath = String.join(".", parts);
-        return packageName == null || packageName.isEmpty() ? classPath : packageName + "." + classPath;
+    private static String buildQualifiedNameFromCu(String packageName, TypeDeclaration<?> n) {
+        return ClassVisitor.qualifiedName(packageName, n);
     }
 
     private static Map<String, String> buildImportMap(List<String> imports) {

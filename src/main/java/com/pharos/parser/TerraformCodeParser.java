@@ -21,6 +21,12 @@ public class TerraformCodeParser extends ScriptBasedCodeParser {
 
     public TerraformCodeParser(int parseThreads) { super(parseThreads); }
 
+    /** The extractor derives packages relative to {@code --root} in single-file mode too. */
+    @Override
+    protected boolean extractorAcceptsRoot() {
+        return true;
+    }
+
     @Override
     protected String scriptResourceName() {
         return "terraform-extractor.py";

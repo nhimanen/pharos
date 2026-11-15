@@ -193,9 +193,11 @@ public interface EmbeddingProvider {
                     "Add an entry to 'embeddingProviders' in ~/.pharos/config.json to enable.");
             return List.of();
         }
+        // Lazy: the model is loaded the first time something embeds (or asks isAvailable()),
+        // so commands that never embed don't pay ~1.1 GB and a multi-second load per model.
         List<EmbeddingProvider> out = new ArrayList<>(cfgs.size());
         for (EmbeddingProviderConfig cfg : cfgs) {
-            out.add(create(cfg));
+            out.add(new LazyEmbeddingProvider(cfg.getModelId(), cfg.getDimensions(), () -> create(cfg)));
         }
         return out;
     }
@@ -207,9 +209,34 @@ public interface EmbeddingProvider {
      * nothing is configured.
      */
     static EmbeddingProvider searchProvider(IndexConfig config) {
+        return searchProvider(config, List.of());
+    }
+
+    /**
+     * Like {@link #searchProvider(IndexConfig)}, but reuses the instance already built for
+     * indexing (by {@link #createAll}) when search uses one of the indexing models.
+     *
+     * <p>Without this, the search model was loaded a second time — for a local ONNX model that
+     * is a second copy of the weights and runtime arenas (~1.1 GB for jina-v2-base-code) in
+     * every pharos process, whatever the command. Sharing is safe: providers are thread-safe
+     * ({@link DjlEmbeddingProvider} keeps one predictor per thread over a single model).
+     * A dedicated {@link IndexConfig#getSearchEmbeddingProvider() searchEmbeddingProvider} is
+     * a deliberately separate runtime and is still created on its own.
+     *
+     * <p>The returned instance may therefore be one of {@code indexingProviders}: it is shared,
+     * and owned by whoever built that list — don't close it on behalf of search.
+     */
+    static EmbeddingProvider searchProvider(IndexConfig config, List<EmbeddingProvider> indexingProviders) {
         Optional<EmbeddingProviderConfig> chosen = config.resolveSearchProvider();
         if (chosen.isEmpty()) return new NoOpEmbeddingProvider();
-        return create(chosen.get());
+        if (config.getSearchEmbeddingProvider() == null) {
+            String modelId = chosen.get().getModelId();
+            for (EmbeddingProvider p : indexingProviders) {
+                if (modelId != null && modelId.equals(p.modelId())) return p;
+            }
+        }
+        EmbeddingProviderConfig cfg = chosen.get();
+        return new LazyEmbeddingProvider(cfg.getModelId(), cfg.getDimensions(), () -> create(cfg));
     }
 
     /**

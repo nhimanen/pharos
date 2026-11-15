@@ -140,7 +140,14 @@ public class GenericFileParser implements CodeParser {
         return parseFile(file, projectName, file.getParent());
     }
 
-    private ParsedFile parseFile(Path file, String projectName, Path root) throws IOException {
+    /**
+     * Parses {@code file} with its package derived relative to {@code root}. The 2-arg overload
+     * uses the file's own directory, which leaves the package empty — every README.md,
+     * stopwords.txt, … in a project then had the same id. Indexing passes the project root.
+     */
+    @Override
+    public ParsedFile parseFile(Path file, String projectName, Path root) throws IOException {
+        if (root == null) root = file.getParent();
         // Backstop for callers that bypass ProjectIndexManager's discovery filter: never read
         // a huge non-code file into memory just to index it as one giant document.
         long size = Files.size(file);

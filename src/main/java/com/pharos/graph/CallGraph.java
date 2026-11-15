@@ -10,6 +10,7 @@ import com.arcadedb.schema.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Stream;
@@ -70,8 +71,12 @@ public class CallGraph implements AutoCloseable {
     private final Set<String> insertedCodeTypeFqns = new LinkedHashSet<>();
     private final Set<String> insertedCodeFieldFqns = new LinkedHashSet<>();
 
-    private CallGraph(Database db) {
+    /** Database directory; null for graphs not opened from disk. */
+    private final Path dbDir;
+
+    private CallGraph(Database db, Path dbDir) {
         this.db = db;
+        this.dbDir = dbDir;
     }
 
     // -------------------------------------------------------------------------
@@ -83,11 +88,144 @@ public class CallGraph implements AutoCloseable {
      * Schema is auto-created on first open.
      */
     public static CallGraph open(Path dbDir) {
+        return open(dbDir, false);
+    }
+
+    /**
+     * @param repairIndexes when true (indexing / linking — the writers), a graph written by an
+     *                      earlier pharos version gets its indexes rebuilt once. Readers pass
+     *                      false so a search or lookup never pays for, or blocks on, a rebuild.
+     */
+    public static CallGraph open(Path dbDir, boolean repairIndexes) {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
-        Database db = factory.exists() ? factory.open() : factory.create();
+        boolean created = !factory.exists();
+        Database db = created ? factory.create() : factory.open();
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
-        return new CallGraph(db);
+        CallGraph graph = new CallGraph(db, dbDir);
+        if (created) graph.markFreshDatabase();
+        else if (repairIndexes) graph.repairIndexesOnce();
+        return graph;
+    }
+
+    // -------------------------------------------------------------------------
+    // Index hygiene
+    // -------------------------------------------------------------------------
+    //
+    // ArcadeDB's LSM-tree indexes keep the entries of deleted records: after TRUNCATE TYPE …
+    // UNSAFE they reappear on the next insert, and DELETE VERTEX + re-insert of the same keys
+    // adds more stale entries each time (no compaction happens at pharos' sizes). Every full
+    // index (clear) and incremental patch (evictClasses + re-insert) grew them; a real pharos
+    // graph had 1,909,818 Method[classPrefix] entries for 3,968 methods. Lookups skip each stale
+    // entry with a WARN "Record #… not found" — 96% of a 246 MB daemon.log — and a class
+    // lookup took 150 ms instead of 3–5 ms. REBUILD INDEX restores exact indexes.
+
+    /** Marker written next to the database once its indexes have been rebuilt by this version. */
+    private static final String INDEX_REPAIRED_SUFFIX = ".index-v2";
+    /** Sidecar holding the number of vertices deleted since the last index rebuild. */
+    private static final String CHURN_SUFFIX = ".index-churn";
+    /** Rebuild once deletions since the last rebuild exceed this share of the graph … */
+    private static final double CHURN_REBUILD_RATIO = 0.10;
+    /** … but not for fewer than this many deletions. */
+    private static final long CHURN_REBUILD_MIN = 2_000;
+
+    /** Rebuilds every index of the graph so it holds exactly the live records. */
+    public void rebuildIndexes() {
+        long t0 = System.nanoTime();
+        db.command("sql", "REBUILD INDEX *");
+        writeChurn(0);
+        log.debug("Rebuilt call-graph indexes in {} ms", (System.nanoTime() - t0) / 1_000_000);
+    }
+
+    /** Rebuilds the non-unique indexes of {@code type} (Method[classPrefix], CodeField[ownerFqn]). */
+    private void rebuildNonUniqueIndexes(String type) {
+        if (!db.getSchema().existsType(type)) return;
+        // Collect names first: REBUILD drops and recreates the index in the type's collection.
+        List<String> names = new ArrayList<>();
+        for (var ix : db.getSchema().getType(type).getAllIndexes(false)) {
+            if (!ix.isUnique()) names.add(ix.getName());
+        }
+        for (String name : names) {
+            try {
+                db.command("sql", "REBUILD INDEX `" + name + "`");
+            } catch (Exception e) {
+                log.warn("Could not rebuild index {} of {}: {}", name, dbDir, e.getMessage());
+            }
+        }
+    }
+
+    /** One-time repair of graphs written by earlier versions (which grew stale entries). */
+    private void repairIndexesOnce() {
+        if (dbDir == null) return;
+        Path marker = sibling(INDEX_REPAIRED_SUFFIX);
+        if (Files.exists(marker)) return;
+        long t0 = System.nanoTime();
+        try {
+            rebuildIndexes();
+        } catch (Exception e) {
+            log.warn("Could not rebuild call-graph indexes of {}: {}", dbDir, e.getMessage());
+            return;
+        }
+        log.info("Repaired call-graph indexes of {} ({} ms)", dbDir.getFileName(),
+                (System.nanoTime() - t0) / 1_000_000);
+        writeMarker(marker);
+    }
+
+    /** A database created by this version has clean indexes: mark it and reset any old churn. */
+    private void markFreshDatabase() {
+        if (dbDir == null) return;
+        writeChurn(0);
+        writeMarker(sibling(INDEX_REPAIRED_SUFFIX));
+    }
+
+    private void writeMarker(Path marker) {
+        try {
+            Files.writeString(marker, "rebuilt\n");
+        } catch (Exception e) {
+            log.warn("Could not write {} (the index repair will run again next time): {}",
+                    marker, e.getMessage());
+        }
+    }
+
+    private Path sibling(String suffix) {
+        return dbDir.resolveSibling(dbDir.getFileName() + suffix);
+    }
+
+    private long readChurn() {
+        if (dbDir == null) return 0;
+        try {
+            Path f = sibling(CHURN_SUFFIX);
+            return Files.exists(f) ? Long.parseLong(Files.readString(f).trim()) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private void writeChurn(long value) {
+        if (dbDir == null) return;
+        try {
+            Files.writeString(sibling(CHURN_SUFFIX), Long.toString(value));
+        } catch (Exception e) {
+            log.debug("Could not record index churn for {}: {}", dbDir, e.getMessage());
+        }
+    }
+
+    /** Records {@code deleted} vertex deletions and rebuilds the indexes once churn is large. */
+    private void recordDeletions(long deleted) {
+        if (deleted <= 0) return;
+        long churn = readChurn() + deleted;
+        long live = db.countType("Method", false);
+        if (churn > Math.max(CHURN_REBUILD_MIN, (long) (live * CHURN_REBUILD_RATIO))) {
+            try {
+                rebuildIndexes();
+            } catch (Exception e) {
+                // the patch itself succeeded; retry the rebuild on a later run
+                log.warn("Could not rebuild call-graph indexes of {}: {}", dbDir, e.getMessage());
+                writeChurn(churn);
+            }
+        } else {
+            writeChurn(churn);
+        }
     }
 
     private static void initSchema(Database db) {
@@ -130,6 +268,7 @@ public class CallGraph implements AutoCloseable {
      * @param classPrefix the qualified class name; must be non-empty for project-owned methods.
      */
     public void addMethod(String fqn, String classPrefix) {
+        if (!pendingEviction.isEmpty()) readdedSinceEviction.add(fqn);
         methodBatch.add(new String[]{fqn, classPrefix != null ? classPrefix : ""});
         if (methodBatch.size() >= BATCH_SIZE) flushMethods();
     }
@@ -159,11 +298,13 @@ public class CallGraph implements AutoCloseable {
     private final List<String[]>  kgEdgeBatch    = new ArrayList<>(BATCH_SIZE); // [edgeType, fromFqn, fromVType, toFqn, toVType]
 
     public void addCodeType(String fqn, String classPrefix) {
+        if (!pendingEviction.isEmpty()) readdedSinceEviction.add(fqn);
         codeTypeBatch.add(new String[]{fqn, classPrefix != null ? classPrefix : ""});
         if (codeTypeBatch.size() >= BATCH_SIZE) flushCodeTypes();
     }
 
     public void addCodeField(String fieldFqn, String ownerFqn, String fieldType, String accessMod) {
+        if (!pendingEviction.isEmpty()) readdedSinceEviction.add(fieldFqn);
         codeFieldBatch.add(new String[]{fieldFqn, ownerFqn, fieldType, accessMod});
         if (codeFieldBatch.size() >= BATCH_SIZE) flushCodeFields();
     }
@@ -205,30 +346,109 @@ public class CallGraph implements AutoCloseable {
         if (db.getSchema().existsType("CodeType"))  db.command("sql", "TRUNCATE TYPE CodeType UNSAFE");
         if (db.getSchema().existsType("CodeField")) db.command("sql", "TRUNCATE TYPE CodeField UNSAFE");
         db.commit();
+        // TRUNCATE leaves the old index entries behind (they resurface on the next insert);
+        // rebuilding the now-empty indexes is instant and drops them.
+        rebuildIndexes();
     }
 
     // -------------------------------------------------------------------------
     // Eviction
     // -------------------------------------------------------------------------
 
+    /** Vertices of evicted classes, by type → fqns; deleted by {@link #completeEviction} unless re-added. */
+    private final Map<String, Set<String>> pendingEviction = new LinkedHashMap<>();
+    /** Fqns (re-)added since {@link #evictClasses} — these vertices are kept. */
+    private final Set<String> readdedSinceEviction = new HashSet<>();
+
     /**
-     * Remove all vertices (and their edges) for the given class prefixes.
-     * Uses the classPrefix index for O(log N + M_class) cost — no full scan.
-     * ArcadeDB's DELETE VERTEX auto-removes all connected edges.
+     * Starts replacing the given classes (an incremental patch of their files).
+     *
+     * <p>Their vertices are kept and only their <em>outgoing</em> edges (calls they make, types
+     * they extend, fields they read, …) are removed; the caller then re-adds the classes'
+     * methods, types, fields and edges and calls {@link #completeEviction()}, which deletes the
+     * vertices that were not re-added (members removed from the source).
+     *
+     * <p>Deleting the vertices up front — as before — also deleted every edge from
+     * <em>unchanged</em> files into them, which the patch never re-created: editing B.java lost
+     * all of B's callers in other files until the next full index. It also re-inserted the same
+     * index keys on every edit, which grows ArcadeDB's LSM indexes quadratically.
      */
     public void evictClasses(Collection<String> classPrefixes) {
         if (classPrefixes == null || classPrefixes.isEmpty()) return;
+        flush();
+        flushKnowledge();
         db.begin();
         for (String cls : classPrefixes) {
             if (cls == null || cls.isEmpty()) continue;
-            db.command("sql", "DELETE VERTEX FROM Method WHERE classPrefix = ?", cls);
-            if (db.getSchema().existsType("CodeType"))
-                db.command("sql", "DELETE VERTEX FROM CodeType WHERE classPrefix = ?", cls);
-            if (db.getSchema().existsType("CodeField"))
-                db.command("sql", "DELETE VERTEX FROM CodeField WHERE ownerFqn = ?", cls);
+            detachOutgoing("Method", "classPrefix", cls);
+            if (db.getSchema().existsType("CodeType")) detachOutgoing("CodeType", "classPrefix", cls);
+            if (db.getSchema().existsType("CodeField")) detachOutgoing("CodeField", "ownerFqn", cls);
         }
         db.commit();
-        log.debug("Evicted {} class(es) from call graph", classPrefixes.size());
+        log.debug("Detached {} class(es) for patching", classPrefixes.size());
+    }
+
+    /** Removes the outgoing edges of every {@code type} vertex with {@code property = value}. */
+    private void detachOutgoing(String type, String property, String value) {
+        Set<String> pending = pendingEviction.computeIfAbsent(type, k -> new LinkedHashSet<>());
+        try (ResultSet rs = db.query("sql", "SELECT FROM " + type + " WHERE " + property + " = ?", value)) {
+            while (rs.hasNext()) {
+                Vertex v = rs.next().getVertex().orElse(null);
+                if (v == null) continue;
+                Object fqn = v.get("fqn");
+                if (fqn != null) pending.add(fqn.toString());
+                List<com.arcadedb.graph.Edge> out = new ArrayList<>();
+                v.getEdges(Vertex.DIRECTION.OUT).forEach(out::add);
+                for (com.arcadedb.graph.Edge e : out) e.delete();
+            }
+        }
+    }
+
+    /**
+     * Marks vertices as still present in the source during a patch, so {@link #completeEviction}
+     * keeps them even when the re-parse added nothing for them — e.g. an edited interface's own
+     * CodeType, whose implementers in unchanged files point at it.
+     */
+    public void keep(Collection<String> fqns) {
+        if (!pendingEviction.isEmpty()) readdedSinceEviction.addAll(fqns);
+    }
+
+    /**
+     * Finishes an incremental patch started by {@link #evictClasses}: deletes the evicted
+     * classes' vertices that were not re-added (and with them any edges into them).
+     */
+    public void completeEviction() {
+        if (pendingEviction.isEmpty()) return;
+        flush();
+        flushKnowledge();
+        long deleted = 0;
+        Set<String> typesWithDeletions = new LinkedHashSet<>();
+        db.begin();
+        for (Map.Entry<String, Set<String>> e : pendingEviction.entrySet()) {
+            for (String fqn : e.getValue()) {
+                if (readdedSinceEviction.contains(fqn)) continue;
+                long n = deletedCount(db.command("sql", "DELETE VERTEX FROM " + e.getKey() + " WHERE fqn = ?", fqn));
+                if (n > 0) typesWithDeletions.add(e.getKey());
+                deleted += n;
+            }
+        }
+        db.commit();
+        pendingEviction.clear();
+        readdedSinceEviction.clear();
+        // Non-unique indexes accumulate stale entries per key quadratically (one class whose
+        // methods keep changing grew Method[classPrefix] to 540k entries in ~100 edits), so a
+        // count threshold can't bound them: rebuild them whenever members were really removed.
+        for (String type : typesWithDeletions) rebuildNonUniqueIndexes(type);
+        recordDeletions(deleted);
+        log.debug("Patch complete: removed {} vertex(es) no longer in the source", deleted);
+    }
+
+    private static long deletedCount(com.arcadedb.query.sql.executor.ResultSet rs) {
+        try (rs) {
+            if (!rs.hasNext()) return 0;
+            Object n = rs.next().getProperty("count");
+            return n instanceof Number num ? num.longValue() : 0;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -455,7 +675,18 @@ public class CallGraph implements AutoCloseable {
                 // Fast path: use in-memory set — O(1), handles intra- and inter-batch duplicates.
                 if (!insertedMethodFqns.add(m[0])) continue;
             } else {
-                if (db.query("sql", "SELECT @rid FROM Method WHERE fqn = ?", m[0]).hasNext()) continue;
+                ResultSet existing = db.query("sql", "SELECT FROM Method WHERE fqn = ?", m[0]);
+                if (existing.hasNext()) {
+                    // A call from another file of the same patch may have created this method as
+                    // an external stub (empty classPrefix): give it its class, or it stays out of
+                    // allFqns() and eviction, and its outgoing edges duplicate on later patches.
+                    Vertex v = existing.next().getVertex().orElse(null);
+                    Object prefix = v != null ? v.get("classPrefix") : null;
+                    if (v != null && !m[1].isEmpty() && (prefix == null || prefix.toString().isEmpty())) {
+                        v.modify().set("classPrefix", m[1]).save();
+                    }
+                    continue;
+                }
             }
             MutableVertex v = db.newVertex("Method");
             v.set("fqn", m[0]);
@@ -603,7 +834,16 @@ public class CallGraph implements AutoCloseable {
 
     @Override
     public void close() {
-        if (db.isOpen()) {
+        if (!db.isOpen()) return;
+        try {
+            flush();
+            flushKnowledge();
+        } finally {
+            // A patch that wasn't completed explicitly (e.g. it failed half-way) is abandoned,
+            // not completed: stale vertices are safer than deleting members — and edges from
+            // unchanged files — that the failed patch never got to re-add.
+            pendingEviction.clear();
+            readdedSinceEviction.clear();
             db.close();
         }
     }

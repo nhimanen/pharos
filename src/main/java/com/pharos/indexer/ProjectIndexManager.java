@@ -149,6 +149,18 @@ public class ProjectIndexManager {
     }
 
     /**
+     * Older-format equivalents of {@link #compositeModelFingerprint()}. Only a single provider
+     * can have been recorded in the pre-multi-provider format, so this is empty otherwise.
+     */
+    private List<String> legacyCompositeModelFingerprints() {
+        List<EmbeddingProvider> avail = availableEmbedders();
+        if (avail.size() != 1) return List.of();
+        return config.findProviderConfig(avail.get(0).modelId())
+                .map(IndexVersions::legacyFingerprints)
+                .orElse(List.of());
+    }
+
+    /**
      * Per-model runtime state for the indexing pipeline: the provider itself,
      * its persistent cache, the on-disk path where Phase 2 spills decoded float[]
      * arrays, and the embedding batch size to use. One {@code EmbedRuntime}
@@ -200,8 +212,12 @@ public class ProjectIndexManager {
                         return e.modelId() + ":" + e.dimensions()
                                 + ":" + (url == null ? "" : url);
                     });
-            PersistentEmbeddingCache cache = new PersistentEmbeddingCache(
-                    projectIndexDir, fp, e.dimensions());
+            // One cache file per model (shared files let models invalidate each other's
+            // caches) that also accepts the pre-multi-provider fingerprint format.
+            PersistentEmbeddingCache cache = PersistentEmbeddingCache.forModel(
+                    projectIndexDir, e.modelId(), fp,
+                    config.findProviderConfig(e.modelId()).map(IndexVersions::legacyFingerprints).orElse(List.of()),
+                    e.dimensions());
             String fileName = cacheFilePrefix + "." + sanitizeForFilename(e.modelId()) + ".cache";
             Path cachePath = projectIndexDir.resolve(fileName);
             int chunkSize = config.findProviderConfig(e.modelId())
@@ -394,9 +410,13 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        String modelFp = compositeModelFingerprint();
+        // Without embeddings no model is involved: stamp "none" rather than the configured
+        // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
+        // were embedded, so a later normal `index` never embedded unchanged files — and
+        // computing it forced the models to load for `index --no-embed`.
+        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
         FileStateTracker stateTracker = new FileStateTracker(
-                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp);
+                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyCompositeModelFingerprints());
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per
         // available provider. Full and incremental paths use slightly different
         // cache-file prefixes so a parallel re-index can't clobber an in-progress
@@ -680,7 +700,8 @@ public class ProjectIndexManager {
                             continue;
                         }
                         try {
-                            ParsedFile parsedFile = fileParser.parseFile(file, projectName);
+                            // Same root as the full index, so incremental runs produce the same ids
+                            ParsedFile parsedFile = fileParser.parseFile(file, projectName, projectRoot);
                             parsedDirtyFiles.add(parsedFile);
 
                             Map<String, List<ParsedMethod>> methodsByClass = parsedFile.methods().stream()
@@ -1518,8 +1539,10 @@ public class ProjectIndexManager {
      * Patches the persisted call graph for an incremental run:
      * <ol>
      *   <li>Open the existing ArcadeDB call graph (created if absent).</li>
-     *   <li>Evict all vertices for dirty and deleted files' class prefixes.</li>
+     *   <li>Detach the outgoing edges of the dirty and deleted files' classes (their vertices,
+     *       and the edges from unchanged files into them, are kept).</li>
      *   <li>Splice in new vertices/edges for each freshly-parsed dirty file.</li>
+     *   <li>{@link CallGraph#completeEviction()}: delete the members that are gone from the source.</li>
      * </ol>
      * This avoids a full project re-parse just to rebuild the graph on every incremental run.
      */
@@ -1528,7 +1551,7 @@ public class ProjectIndexManager {
                              List<Path> deletedFiles,
                              FileStateTracker stateTracker) {
         Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
-        try (CallGraph graph = CallGraph.open(dbDir)) {
+        try (CallGraph graph = CallGraph.open(dbDir, true)) {
             log.debug("Opened call graph for patching: {} methods", graph.methodCount());
 
             // Collect class prefixes to evict (deleted files + dirty files)
@@ -1559,6 +1582,14 @@ public class ProjectIndexManager {
                                .orElse(com.pharos.parser.model.ParsedRelationships.empty("incremental"));
                 new com.pharos.graph.KnowledgeGraphBuilder().build(graph, rel);
             }
+            // The dirty files' classes still exist even if nothing above re-added their CodeType
+            // (e.g. an edited interface with no supertypes or fields).
+            List<String> presentClasses = new ArrayList<>();
+            for (ParsedFile pf : parsedDirtyFiles) pf.classes().forEach(c -> presentClasses.add(c.qualifiedClassName()));
+            graph.keep(presentClasses);
+            // Delete only the evicted members that are gone from the source; edges from
+            // unchanged files into the patched classes are kept.
+            graph.completeEviction();
 
             CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             log.debug("Patched call graph: {} methods after update", graph.methodCount());
@@ -1603,7 +1634,7 @@ public class ProjectIndexManager {
                                               com.pharos.parser.model.ParsedRelationships relationships,
                                               Path projectIndexDir) {
         Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
-        try (CallGraph graph = CallGraph.open(dbDir)) {
+        try (CallGraph graph = CallGraph.open(dbDir, true)) {
             graph.clear();
             new CallGraphBuilder().build(graph, project);
             new KnowledgeGraphBuilder().build(graph, relationships);
