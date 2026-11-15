@@ -110,31 +110,32 @@ public class CrossProjectLinker {
             }
         }
 
-        // Parallel (i,j) pair resolution
-        List<int[]> pairs = new ArrayList<>();
-        for (int i = 0; i < metas.size(); i++) {
-            for (int j = 0; j < metas.size(); j++) {
-                if (i != j) pairs.add(new int[]{i, j});
-            }
-        }
-
-        int threads = Math.min(pairs.size(), Math.max(1,
+        // Parallel resolution: one task per source project. Its refs are read from disk once
+        // (they are not cached in the registry) and resolved against every other project, so
+        // at most `threads` ref lists are live at a time — not one copy per (source, target) pair.
+        int threads = Math.min(metas.size(), Math.max(1,
                 Runtime.getRuntime().availableProcessors()));
         ExecutorService pool = Executors.newFixedThreadPool(threads,
                 r -> { Thread t = new Thread(r, "cross-linker"); t.setDaemon(true); return t; });
 
-        List<Future<List<String[]>>> futures = new ArrayList<>(pairs.size());
-        for (int[] pair : pairs) {
-            final ProjectMeta srcMeta = metas.get(pair[0]);
-            final GraphIndex  tgtIdx  = indices.get(metas.get(pair[1]).getName());
-            if (tgtIdx == null) continue;
+        List<Future<List<String[]>>> futures = new ArrayList<>(metas.size());
+        for (int i = 0; i < metas.size(); i++) {
+            final int src = i;
+            final ProjectMeta srcMeta = metas.get(i);
             futures.add(pool.submit(() -> {
                 List<String[]> edges = new ArrayList<>();
-                for (ProjectMeta.UnresolvedRef ref : srcMeta.getUnresolvedRefs()) {
-                    String candidate = findInIndex(ref, tgtIdx);
-                    if (candidate != null) {
-                        edges.add(new String[]{ref.callerFqn, candidate});
-                        log.debug("Cross-project link: {} → {}", ref.callerFqn, candidate);
+                List<ProjectMeta.UnresolvedRef> refs = null;
+                for (int j = 0; j < metas.size(); j++) {
+                    if (j == src) continue;
+                    GraphIndex tgtIdx = indices.get(metas.get(j).getName());
+                    if (tgtIdx == null) continue;
+                    if (refs == null) refs = registry.refsOf(srcMeta);
+                    for (ProjectMeta.UnresolvedRef ref : refs) {
+                        String candidate = findInIndex(ref, tgtIdx);
+                        if (candidate != null) {
+                            edges.add(new String[]{ref.callerFqn, candidate});
+                            log.debug("Cross-project link: {} → {}", ref.callerFqn, candidate);
+                        }
                     }
                 }
                 return edges;

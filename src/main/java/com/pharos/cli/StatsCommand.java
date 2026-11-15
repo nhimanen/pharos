@@ -70,7 +70,7 @@ public class StatsCommand implements Callable<Integer> {
             }
 
             System.out.printf("  Unresolved:   %d call refs (for cross-project linking)%n",
-                    meta.getUnresolvedRefs().size());
+                    registry.refsOf(meta).size());
             System.out.println();
         }
         return 0;

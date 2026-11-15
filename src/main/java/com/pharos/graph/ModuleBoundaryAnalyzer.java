@@ -100,7 +100,7 @@ public class ModuleBoundaryAnalyzer {
         }
 
         // Exit points: unresolved refs recorded during indexing (apply cap)
-        List<ProjectMeta.UnresolvedRef> allRefs = meta.getUnresolvedRefs();
+        List<ProjectMeta.UnresolvedRef> allRefs = registry.refsOf(meta);
         int total = allRefs.size();
         List<ExitPoint> exitPoints = allRefs.stream()
                 .limit(exitPointLimit)
