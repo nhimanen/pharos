@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.*;
 
 /**
  * Tests the incremental indexing pipeline — especially deleted-file cleanup.
- * Uses real filesystem and real Lucene NIOFSDirectory inside a temp dir.
+ * Uses real filesystem and real Lucene FSDirectory (MMapDirectory) inside a temp dir.
  */
 class IncrementalIndexingTest {
 

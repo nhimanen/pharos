@@ -13,7 +13,8 @@ import org.apache.lucene.analysis.synonym.SynonymGraphFilter;
 import org.apache.lucene.analysis.synonym.SynonymMap;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
-import org.apache.lucene.store.NIOFSDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,7 +44,7 @@ public class LuceneIndexer implements Closeable {
     public IndexWriter openWriter(String projectName) throws IOException {
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
-        NIOFSDirectory dir = new NIOFSDirectory(luceneDir);
+        Directory dir = openDirectory(luceneDir);
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
@@ -55,7 +56,7 @@ public class LuceneIndexer implements Closeable {
     public IndexWriter openWriterFresh(String projectName) throws IOException {
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
-        NIOFSDirectory dir = new NIOFSDirectory(luceneDir);
+        Directory dir = openDirectory(luceneDir);
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
@@ -80,7 +81,7 @@ public class LuceneIndexer implements Closeable {
             }
             return cached;
         }
-        DirectoryReader reader = DirectoryReader.open(new NIOFSDirectory(luceneDir));
+        DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
         openReaders.put(projectName, reader);
         return reader;
     }
@@ -108,11 +109,21 @@ public class LuceneIndexer implements Closeable {
     public boolean indexExists(String projectName) {
         Path luceneDir = getLucenePath(projectName);
         if (!Files.exists(luceneDir)) return false;
-        try (NIOFSDirectory dir = new NIOFSDirectory(luceneDir)) {
+        try (Directory dir = openDirectory(luceneDir)) {
             return DirectoryReader.indexExists(dir);
         } catch (IOException e) {
             return false;
         }
+    }
+
+    /**
+     * Lucene's platform default — {@code MMapDirectory} on 64-bit JVMs. Index files are read
+     * through the OS page cache instead of being copied into per-input heap buffers (as
+     * {@code NIOFSDirectory} did), which was a large share of search-time heap allocation.
+     * Mapped pages count as shared, reclaimable file-backed RSS, not anonymous memory.
+     */
+    static Directory openDirectory(Path luceneDir) throws IOException {
+        return FSDirectory.open(luceneDir);
     }
 
     public Path getLucenePath(String projectName) {
