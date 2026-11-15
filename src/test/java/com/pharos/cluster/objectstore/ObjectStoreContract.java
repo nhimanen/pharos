@@ -75,6 +75,12 @@ public abstract class ObjectStoreContract {
     }
 
     @Test
+    void putIfMatchOnMissingKeyIsEmpty() throws IOException {
+        assertThat(store().putIfMatch("cas/missing", b("v"), "\"deadbeef\"")).isEmpty();
+        assertThat(store().get("cas/missing")).isEmpty();
+    }
+
+    @Test
     void listByPrefixIncludesSizes() throws IOException {
         store().put("list/a", b("12345"));
         store().put("list/sub/b", b("123"));

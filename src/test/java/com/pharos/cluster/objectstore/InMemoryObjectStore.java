@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -83,6 +84,7 @@ public class InMemoryObjectStore implements ObjectStore {
 
     @Override
     public Optional<String> putIfMatch(String key, byte[] data, String etag) {
+        Objects.requireNonNull(etag, "etag");
         Entry next = newEntry(data);
         boolean[] ok = {false};
         map.computeIfPresent(key, (k, cur) -> {

@@ -30,6 +30,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /** {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given. */
@@ -124,20 +125,24 @@ public class S3ObjectStore implements ObjectStore {
 
     @Override
     public Optional<String> putIfAbsent(String key, byte[] data) throws IOException {
-        return conditionalPut(key, data, putReq(key).ifNoneMatch("*").build());
+        return conditionalPut(key, data, putReq(key).ifNoneMatch("*").build(), false);
     }
 
     @Override
     public Optional<String> putIfMatch(String key, byte[] data, String etag) throws IOException {
-        return conditionalPut(key, data, putReq(key).ifMatch(etag).build());
+        Objects.requireNonNull(etag, "etag");
+        // AWS answers If-Match on a nonexistent key with 404 NoSuchKey: treat as "etag changed".
+        return conditionalPut(key, data, putReq(key).ifMatch(etag).build(), true);
     }
 
-    private Optional<String> conditionalPut(String key, byte[] data, PutObjectRequest req) throws IOException {
+    private Optional<String> conditionalPut(String key, byte[] data, PutObjectRequest req,
+                                          boolean missingIsEmpty) throws IOException {
         try {
             return Optional.ofNullable(s3.putObject(req, RequestBody.fromBytes(data)).eTag());
         } catch (S3Exception e) {
             // 412 PreconditionFailed; 409 ConditionalRequestConflict (concurrent conditional writers)
             if (e.statusCode() == 412 || e.statusCode() == 409) return Optional.empty();
+            if (missingIsEmpty && e.statusCode() == 404) return Optional.empty();
             throw wrap("conditional put", key, e);
         } catch (SdkException e) {
             throw wrap("conditional put", key, e);
