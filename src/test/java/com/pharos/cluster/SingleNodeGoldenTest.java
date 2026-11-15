@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeSet;
 
@@ -42,18 +43,18 @@ class SingleNodeGoldenTest {
     private static final String PY = "sample-python-app";
 
     private static final List<String[]> QUERIES = List.of(
-            // {project, query}
-            new String[]{JAVA, "GreetingService"},
-            new String[]{JAVA, "Calculator"},
-            new String[]{JAVA, "User"},
-            new String[]{JAVA, "generate a greeting message for a user"},
-            new String[]{JAVA, "farewell"},
-            new String[]{JAVA, "formal greeting email domain"},
-            new String[]{JAVA, "divide two numbers"},
-            new String[]{JAVA, "absolute value"},
+            // {project, query}; letters are the eval/benchmark.py categories, as far as sample-app allows
+            new String[]{JAVA, "Calculator"},                                  // A exact name
+            new String[]{JAVA, "greeting service"},                            // B named concept
+            new String[]{JAVA, "Computes the absolute value of an integer"},   // C javadoc phrasing
+            new String[]{JAVA, "generate a greeting message for a user"},      // D behavioural / intent
+            new String[]{JAVA, "division by zero is not allowed"},             // E error handling
+            new String[]{JAVA, "user display name and email address"},         // F config-like state (no real config in sample-app)
+            new String[]{JAVA, "checks whether user has a valid email"},       // G contract
+            new String[]{JAVA, "methods that call getName"},                   // H cross-cutting usage pattern
             new String[]{PY, "abs_value"},
             new String[]{PY, "has_valid_email"},
-            new String[]{PY, "greet user"},
+            new String[]{PY, "formal_greet"},
             new String[]{PY, "multiply"});
 
     private static final List<String> CALLERS_OF = List.of(
@@ -114,15 +115,21 @@ class SingleNodeGoldenTest {
                         "text", null, null, 0);
                 List<SearchResult> results = new ArrayList<>(
                         engine.newSnippetDecorator(15).decorate(engine.search(req), pq[1]));
-                // Deterministic tie-break: score desc (as formatted), then id.
-                results.sort(Comparator
-                        .comparingDouble((SearchResult r) -> -Double.parseDouble(String.format("%.6f", r.score())))
-                        .thenComparing(SearchResult::id));
+                // Engine order is kept except inside runs of equal formatted score, where Lucene's
+                // tie order flaps between runs: those runs are ordered by id (stable elsewhere).
+                for (int i = 0; i < results.size(); ) {
+                    int j = i + 1;
+                    String sc = String.format(Locale.ROOT, "%.6f", results.get(i).score());
+                    while (j < results.size()
+                            && sc.equals(String.format(Locale.ROOT, "%.6f", results.get(j).score()))) j++;
+                    results.subList(i, j).sort(Comparator.comparing(SearchResult::id));
+                    i = j;
+                }
                 List<Map<String, Object>> rows = new ArrayList<>();
                 for (SearchResult r : results) {
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("id", r.id());
-                    row.put("score", String.format("%.6f", r.score()));
+                    row.put("score", String.format(Locale.ROOT, "%.6f", r.score()));
                     row.put("snippetStartLine", r.snippet() == null ? -1 : r.snippet().startLine());
                     rows.add(row);
                 }
@@ -172,13 +179,20 @@ class SingleNodeGoldenTest {
     private static final List<String> CLASS_FQNS = List.of(
             "com.example.service.GreetingService", "com.example.model.User");
 
+    /** Single seam for opening call graphs; fails loudly if a registered project has none. */
     private static List<CallGraph> openGraphs(ProjectRegistry registry) {
         List<CallGraph> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll().stream()
                 .sorted(Comparator.comparing(ProjectMeta::getName)).toList()) {
             Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-            if (Files.isDirectory(dbDir)) graphs.add(CallGraph.open(dbDir));
+            if (!Files.isDirectory(dbDir)) {
+                graphs.forEach(CallGraph::close);
+                throw new IllegalStateException("No call graph for project '" + meta.getName()
+                        + "' at " + dbDir);
+            }
+            graphs.add(CallGraph.open(dbDir));
         }
+        if (graphs.isEmpty()) throw new IllegalStateException("No registered projects with call graphs");
         return graphs;
     }
 
