@@ -47,7 +47,10 @@ import java.util.regex.Pattern;
  * materialises them again).
  *
  * <p>{@link #close} stops the syncer, releases the lock, closes the block cache and the backend
- * (object-store clients); it is idempotent.
+ * (object-store clients); it is idempotent. Shutdown order: close it only once nothing searches
+ * any more ({@code Main} does so when the command returns). Once the block cache is closed, a read
+ * of a lazy generation fails with "block cache ... is closed"; on a signal the JVM shutdown hook may
+ * close it while a query is still running, and that query fails as the process exits.
  */
 public final class ClusterRuntime implements Closeable {
 
