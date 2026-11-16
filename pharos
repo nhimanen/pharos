@@ -87,6 +87,9 @@ def _jvm_flags() -> list:
         "--add-modules", "jdk.incubator.vector",
         "-XX:+HeapDumpOnOutOfMemoryError",
         f"-XX:HeapDumpPath={PHAROS_DUMPS}",
+        # The JVM resolves user.home from the passwd entry, not $HOME: pin the pharos dir to
+        # the one this client uses, so both always read the same registry and indexes.
+        f"-Dpharos.home={PHAROS_DIR}",
         # Suppress ArcadeDB/GraalVM Truffle warning about missing JVMCI (not needed
         # for pharos — ArcadeDB queries are I/O-bound, not CPU-bound).
         "-Dpolyglot.engine.WarnInterpreterOnly=false",
@@ -195,6 +198,18 @@ def ensure_daemon():
     _start_daemon()
 
 
+def _print_header_warnings(value):
+    """Print skipped-project notices the daemon sends in X-Pharos-Warnings (a JSON array)."""
+    if not value:
+        return
+    try:
+        warnings = json.loads(value)
+    except ValueError:
+        return
+    for w in warnings:
+        print(f"\u26a0 {w}", file=sys.stderr)
+
+
 def _api_get(path: str, params: dict = None) -> object:
     """Make a GET request to the daemon API. Returns parsed JSON."""
     url = f"{BASE_URL}{path}"
@@ -204,9 +219,19 @@ def _api_get(path: str, params: dict = None) -> object:
             url += "?" + urllib.parse.urlencode(filtered)
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
+            _print_header_warnings(resp.headers.get("X-Pharos-Warnings"))
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
+        _print_header_warnings(e.headers.get("X-Pharos-Warnings"))
+        if e.code == 409:
+            # Index format incompatible with this pharos version — exit code 4
+            try:
+                msg = json.loads(body).get("error", body)
+            except ValueError:
+                msg = body
+            print(msg, file=sys.stderr)
+            sys.exit(4)
         die(f"API error {e.code}: {body}")
     except urllib.error.URLError as e:
         die(f"Cannot reach pharos daemon: {e.reason}\n"
@@ -410,7 +435,12 @@ def fmt_projects(projects: list, limit: int = 0) -> str:
         methods = p.get("methodCount", 0)
         classes = p.get("classCount", 0)
         last = p.get("lastIndexed", "")
-        lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last})")
+        fmt_status = (p.get("indexFormat") or {}).get("status", "ok")
+        flag = {"ok": "",
+                "upgrade-available": " [upgrade available (still searchable): pharos index --full]",
+                "outdated": " [needs upgrade: pharos index --full]",
+                "newer": " [index from a newer pharos]"}.get(fmt_status, "")
+        lines.append(f"- **{name}**: {methods} methods, {classes} classes (last indexed: {last}){flag}")
     if hidden:
         lines.append(f"- *... and {hidden} more*")
     return "\n".join(lines)
@@ -640,6 +670,9 @@ def cmd_search(args):
     else:
         results = raw
         meta = None
+
+    for w in (raw.get("warnings") or []) if isinstance(raw, dict) else []:
+        print(f"warning: {w}", file=sys.stderr)
 
     print(fmt_search(results))
 
@@ -883,6 +916,35 @@ def cmd_backfill_embedding_cache(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
+def cmd_index_status(args):
+    """Show per-project index format status (read-only; spawns the jar, no daemon)."""
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index-status"]
+    if args.json:
+        cmd.append("--json")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+def cmd_upgrade_indexes(args):
+    """Re-index projects whose index format is not current.
+
+    Spawns its own JVM (holds the Lucene write locks) and inherits stdin/stdout so the
+    confirmation prompt works.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "upgrade-indexes"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.yes:
+        cmd.append("--yes")
+    if args.no_embed:
+        cmd.append("--no-embed")
+    cmd.extend(args.projects)
+    sys.exit(subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr).returncode)
+
+
 def cmd_embed(args):
     """Add one embedding model's vectors to an existing index, no re-parse.
 
@@ -1089,6 +1151,8 @@ COMMANDS
   boundary    Show entry/exit points of a module
   skeleton              Show public/protected class and method signatures of a project
   pipelines             List available search pipelines and their ids
+  index-status    Show each project's index format status (--json for machines)
+  upgrade-indexes Re-index projects whose index format is not current
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
@@ -1466,6 +1530,25 @@ EXAMPLES
     p_backfill.add_argument("project", nargs="?", help="Project name (omit when --all is set)")
     p_backfill.add_argument("--all", action="store_true", help="Backfill every registered project")
     p_backfill.set_defaults(func=cmd_backfill_embedding_cache)
+
+    # index-status
+    p_istatus = sub.add_parser(
+        "index-status",
+        help="Show each project's index format status (read-only)",
+    )
+    p_istatus.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_istatus.set_defaults(func=cmd_index_status)
+
+    # upgrade-indexes
+    p_upgrade = sub.add_parser(
+        "upgrade-indexes",
+        help="Re-index projects whose index format is not current",
+    )
+    p_upgrade.add_argument("projects", nargs="*", help="Only these projects (default: all that need it)")
+    p_upgrade.add_argument("--dry-run", action="store_true", help="Print the plan and stop")
+    p_upgrade.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
+    p_upgrade.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
+    p_upgrade.set_defaults(func=cmd_upgrade_indexes)
 
     # embed
     p_embed = sub.add_parser(

@@ -60,6 +60,11 @@ public class ProjectRegistry {
         this(IndexConfig.DEFAULT_BASE.resolve("registry.json"));
     }
 
+    /** Registry backed by an explicit file, e.g. an isolated location for tests. */
+    public static ProjectRegistry at(Path registryFile) {
+        return new ProjectRegistry(registryFile);
+    }
+
     /** Package-private: explicit registry path, used by tests that need an isolated location. */
     ProjectRegistry(Path registryFile) {
         this.registryFile = registryFile;

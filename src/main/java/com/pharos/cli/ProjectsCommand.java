@@ -1,5 +1,7 @@
 package com.pharos.cli;
 
+import java.nio.file.Path;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import picocli.CommandLine.*;
@@ -33,17 +35,28 @@ public class ProjectsCommand implements Callable<Integer> {
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
                 .withZone(ZoneId.systemDefault());
 
-        System.out.printf("%-25s  %7s  %7s  %6s  %s%n",
-                "PROJECT", "METHODS", "CLASSES", "FILES", "LAST INDEXED");
-        System.out.println("-".repeat(75));
+        System.out.printf("%-25s  %7s  %7s  %6s  %-16s  %s%n",
+                "PROJECT", "METHODS", "CLASSES", "FILES", "LAST INDEXED", "FORMAT");
+        System.out.println("-".repeat(92));
         for (ProjectMeta p : projects) {
             String lastIndexed = p.getLastIndexed() != null ? fmt.format(p.getLastIndexed()) : "never";
-            System.out.printf("%-25s  %7d  %7d  %6d  %s%n",
-                    p.getName(), p.getMethodCount(), p.getClassCount(), p.getFileCount(), lastIndexed);
+            System.out.printf("%-25s  %7d  %7d  %6d  %-16s  %s%n",
+                    p.getName(), p.getMethodCount(), p.getClassCount(), p.getFileCount(), lastIndexed,
+                    formatLabel(IndexFormat.status(IndexFormat.dir(p.getIndexPath()))));
             if (!p.getLinkedProjects().isEmpty()) {
                 System.out.printf("  → linked: %s%n", String.join(", ", p.getLinkedProjects()));
             }
         }
         return 0;
+    }
+
+    private static String formatLabel(IndexFormat.Status s) {
+        return switch (s) {
+            case OK -> "ok";
+            case UPGRADE_AVAILABLE -> "upgrade available";
+            case OUTDATED -> "needs upgrade";
+            case NEWER -> "newer";
+            case MISSING -> "-";
+        };
     }
 }

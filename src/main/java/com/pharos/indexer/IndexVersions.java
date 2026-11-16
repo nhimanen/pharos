@@ -25,6 +25,23 @@ public final class IndexVersions {
     private IndexVersions() {}
 
     /**
+     * On-disk index format, stamped per project in {@code index-format.json}. This build serves
+     * format N and N-1 ({@link IndexFormat#MIN_READABLE_FORMAT}); older or newer stamps are
+     * refused until re-indexed. A missing stamp means format 0. On a bump, keep the N-1 read path
+     * working and add the {@code compat/format-<N>.zip} fixture ({@code IndexCompatTest}). Bump this when
+     * a change makes existing indexes unreadable or wrong (ids, schema, graph, cache layout);
+     * bump {@link #CHUNKING_VERSION} instead when only embedding text changes and the
+     * incremental run can re-embed in place.
+     *
+     * <p>History:
+     * <ul>
+     *   <li>1 — #18 Java ids, #23 script/doc ids, #24 call-graph index repair,
+     *       #19 per-model embedding caches</li>
+     * </ul>
+     */
+    public static final int INDEX_FORMAT = 1;
+
+    /**
      * Bump whenever {@link DefaultChunker}, {@link Chunker}, or any method that builds
      * per-chunk embedding texts changes in a way that affects the resulting float[].
      *

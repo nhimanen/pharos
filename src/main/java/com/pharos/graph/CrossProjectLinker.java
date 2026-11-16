@@ -102,11 +102,11 @@ public class CrossProjectLinker {
             ProjectMeta meta = registry.find(name)
                     .orElseThrow(() -> new IllegalArgumentException("Project not found: " + name));
             metas.add(meta);
-            Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-            if (Files.isDirectory(dbDir)) {
-                try (CallGraph g = CallGraph.open(dbDir)) {
-                    indices.put(name, new GraphIndex(g));
-                }
+            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
+            try (CallGraph g = CallGraph.openExisting(dbDir)) {
+                indices.put(name, new GraphIndex(g));
+            } catch (GraphNotFoundException e) {
+                // project without a call graph: nothing to resolve against
             }
         }
 
@@ -174,14 +174,13 @@ public class CrossProjectLinker {
             try (CallGraph crossGraph = CallGraph.open(crossDbDir)) {
                 // Seed all project-owned methods from each per-project graph
                 for (String name : projectNames) {
-                    Path dbDir = Path.of(
-                            registry.find(name).map(ProjectMeta::getIndexPath).orElse(""))
-                            .resolve("callgraph.arcadedb");
-                    if (Files.isDirectory(dbDir)) {
-                        try (CallGraph g = CallGraph.open(dbDir)) {
-                            g.allFqns().forEach(fqn -> crossGraph.addMethod(fqn, fqn));
-                            crossGraph.flush();
-                        }
+                    Path dbDir = CallGraph.projectGraphDir(Path.of(
+                            registry.find(name).map(ProjectMeta::getIndexPath).orElse("")));
+                    try (CallGraph g = CallGraph.openExisting(dbDir)) {
+                        g.allFqns().forEach(fqn -> crossGraph.addMethod(fqn, fqn));
+                        crossGraph.flush();
+                    } catch (GraphNotFoundException e) {
+                        // project without a call graph
                     }
                 }
                 // Add resolved cross-project edges

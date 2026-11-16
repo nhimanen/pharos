@@ -137,6 +137,14 @@ public class McpServer {
             textContent.put("type", "text");
             textContent.put("text", toolResult);
             return successResponse(id, result);
+        } catch (com.pharos.indexer.IncompatibleIndexException e) {
+            long ms = System.currentTimeMillis() - start;
+            log.warn("tool={} args={} status=incompatible-index latency_ms={} error={}",
+                    toolName, arguments, ms, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text").put("text", e.getMessage());
+            result.put("isError", true);
+            return successResponse(id, result);
         } catch (Exception e) {
             long ms = System.currentTimeMillis() - start;
             log.warn("tool={} args={} status=error latency_ms={} error={}",

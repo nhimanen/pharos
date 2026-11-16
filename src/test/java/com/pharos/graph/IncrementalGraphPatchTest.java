@@ -63,13 +63,13 @@ class IncrementalGraphPatchTest {
     }
 
     private Set<String> callers(String fqn) {
-        try (CallGraph g = CallGraph.open(config.getIndexDir().resolve("test").resolve("callgraph.arcadedb"))) {
+        try (CallGraph g = CallGraph.open(CallGraph.projectGraphDir(config.getIndexDir().resolve("test")))) {
             return g.callers(fqn);
         }
     }
 
     private Set<String> callees(String fqn) {
-        try (CallGraph g = CallGraph.open(config.getIndexDir().resolve("test").resolve("callgraph.arcadedb"))) {
+        try (CallGraph g = CallGraph.open(CallGraph.projectGraphDir(config.getIndexDir().resolve("test")))) {
             return g.callees(fqn);
         }
     }
@@ -101,7 +101,7 @@ class IncrementalGraphPatchTest {
 
         assertThat(callees("com.example.B#b()")).as("b() no longer calls c()").isEmpty();
         assertThat(callers("com.example.B#c()")).isEmpty();
-        try (CallGraph g = CallGraph.open(config.getIndexDir().resolve("test").resolve("callgraph.arcadedb"))) {
+        try (CallGraph g = CallGraph.open(CallGraph.projectGraphDir(config.getIndexDir().resolve("test")))) {
             assertThat(g.allFqns()).contains("com.example.A#a()", "com.example.B#b()")
                     .doesNotContain("com.example.B#c()");
         }
@@ -114,7 +114,7 @@ class IncrementalGraphPatchTest {
         Files.writeString(pkg.resolve("Square.java"),
                 "package com.example;\npublic class Square implements Shape { public double area() { return 1; } }\n");
         manager.index(root, "test", false, false);
-        Path db = config.getIndexDir().resolve("test").resolve("callgraph.arcadedb");
+        Path db = CallGraph.projectGraphDir(config.getIndexDir().resolve("test"));
         try (CallGraph g = CallGraph.open(db)) {
             assertThat(g.directSubclasses("com.example.Shape")).contains("com.example.Square");
         }
@@ -143,7 +143,7 @@ class IncrementalGraphPatchTest {
                 """);
         manager.index(root, "test", true, false);
 
-        try (CallGraph g = CallGraph.open(config.getIndexDir().resolve("test").resolve("callgraph.arcadedb"))) {
+        try (CallGraph g = CallGraph.open(CallGraph.projectGraphDir(config.getIndexDir().resolve("test")))) {
             assertThat(g.allFqns()).as("B#d() owned by class B").contains("com.example.B#d()");
             assertThat(g.callers("com.example.B#d()")).containsExactly("com.example.A#a()");
         }

@@ -1,0 +1,71 @@
+# Upgrading
+
+## Upgrading to 1.4.0 (index format 1)
+
+### What changed
+
+1.4.0 stamps every project index with a format number (`index-format.json`). Indexes built by
+earlier versions have no stamp and count as format 0. Document ids, the call-graph layout and the
+embedding caches changed, so format 1 is what new indexing produces.
+
+**Who is affected:** everyone with existing indexes.
+
+**Compatibility (N-1):** a release serves its own format and the one before it. After upgrading,
+your format 0 indexes keep working: search, callers and callees all still answer, and
+`pharos projects` / `pharos index-status` show them as "upgrade available (still searchable)".
+Nothing breaks, but you should re-index when convenient to get the fixes that depend on format 1.
+Indexes more than one format behind (or newer than the installed release) are refused until they
+are re-indexed.
+
+### Steps
+
+1. Pull and install the release:
+   ```bash
+   git pull && ./setup.sh --release v1.4.0
+   ```
+   (From a checkout older than 1.4.0 the `git pull` is what brings in the `--release` option.)
+2. Review the warning `setup.sh` prints. Projects listed as "searchable now" keep working; projects
+   listed as unsearchable need a re-index and the script asks before continuing.
+3. Re-index:
+   ```bash
+   ./setup.sh --upgrade-indexes      # or: pharos upgrade-indexes
+   ```
+   You can check progress any time with `pharos index-status`.
+
+### Time and cost
+
+Re-indexing is a full run per project. Parsing dominates for large projects; embeddings are cheap
+because the persistent embedding caches are reused, so unchanged text is not sent to the model
+again. Projects stay searchable during the re-index (the old data is served until the new one is
+published).
+
+### Rolling back
+
+1.4.0 is the first release, so there is no earlier release to install with `--release`: roll back
+by building the older commit from source.
+
+```bash
+git checkout <older-commit> && ./setup.sh
+```
+
+A build older than 1.4.0 only knows the legacy graph dir `callgraph.arcadedb`. A 1.4.0 full re-index
+removes that dir, and an older build then silently creates an **empty** graph in its place. It also
+knows nothing about `index-format.json` or `callgraph.current`, so if you later upgrade again those
+leftovers would make 1.4.0 serve the older build's data as current. So, for **every** project you
+re-indexed with 1.4.0, after installing the older build:
+
+1. Delete these entries in the project's index dir (`~/.pharos/indexes/<name>/`):
+   `index-format.json`, `callgraph.current` and every `callgraph-*.arcadedb` (plus their sidecar
+   files `callgraph-*.arcadedb.*`).
+   ```bash
+   cd ~/.pharos/indexes/<name> && rm -rf index-format.json callgraph.current callgraph-*.arcadedb*
+   ```
+2. Re-index it with the older build:
+   ```bash
+   pharos index --full <name> <path>
+   ```
+
+Do **not** use `--force` for this: it deletes the whole project index dir, including the
+embedding caches, so every text is sent to the embedding model again.
+
+Projects you never re-indexed with 1.4.0 (still format 0) are untouched and work as before.

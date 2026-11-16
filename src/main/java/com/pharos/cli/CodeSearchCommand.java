@@ -32,10 +32,12 @@ import picocli.CommandLine.*;
                 BackfillEmbeddingCacheCommand.class,
                 MineCommand.class,
                 EmbedCommand.class,
+                IndexStatusCommand.class,
+                UpgradeIndexesCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,
-        version = "pharos 1.0.0"
+        versionProvider = PharosVersionProvider.class
 )
 public class CodeSearchCommand implements Runnable {
 

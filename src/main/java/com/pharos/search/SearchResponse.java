@@ -21,21 +21,33 @@ public record SearchResponse(
         String                         resolvedType,
         ZeroResultAdvisor.Suggestions  suggestions,
         SnippetResolver                keywordResolver,
-        SnippetResolver                vectorResolver
+        SnippetResolver                vectorResolver,
+        List<String>                   warnings
 ) {
+    public SearchResponse {
+        warnings = warnings == null ? List.of() : warnings;
+    }
+
+    /** Backward-compatible constructor — no warnings. */
+    public SearchResponse(List<SearchResult> results, SearchTrace trace, String resolvedType,
+                          ZeroResultAdvisor.Suggestions suggestions,
+                          SnippetResolver keywordResolver, SnippetResolver vectorResolver) {
+        this(results, trace, resolvedType, suggestions, keywordResolver, vectorResolver, List.of());
+    }
+
     /** Backward-compatible constructor — no suggestions, no resolvers. */
     public SearchResponse(List<SearchResult> results, SearchTrace trace) {
-        this(results, trace, null, null, null, null);
+        this(results, trace, null, null, null, null, List.of());
     }
 
     /** Backward-compatible constructor — no resolvers. */
     public SearchResponse(List<SearchResult> results, SearchTrace trace, String resolvedType) {
-        this(results, trace, resolvedType, null, null, null);
+        this(results, trace, resolvedType, null, null, null, List.of());
     }
 
     /** Backward-compatible constructor — no resolvers. */
     public SearchResponse(List<SearchResult> results, SearchTrace trace,
                           String resolvedType, ZeroResultAdvisor.Suggestions suggestions) {
-        this(results, trace, resolvedType, suggestions, null, null);
+        this(results, trace, resolvedType, suggestions, null, null, List.of());
     }
 }

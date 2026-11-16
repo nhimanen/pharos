@@ -40,7 +40,13 @@ public class LuceneIndexer implements Closeable {
         this.config = config;
     }
 
-    /** Open an IndexWriter for a project (CREATE_OR_APPEND mode). */
+    /**
+     * Open an IndexWriter for a project (CREATE_OR_APPEND mode).
+     *
+     * <p>The writer does not commit on close: callers must {@code commit()} explicitly once their
+     * work is complete. Closing without a commit (e.g. on an exception) discards everything since
+     * the last commit, so a failed run never publishes half-done changes.
+     */
     public IndexWriter openWriter(String projectName) throws IOException {
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
@@ -48,11 +54,18 @@ public class LuceneIndexer implements Closeable {
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        iwc.setCommitOnClose(false);
         iwc.setRAMBufferSizeMB(128);
         return new IndexWriter(dir, iwc);
     }
 
-    /** Open an IndexWriter for a project, deleting all existing documents first (full re-index). */
+    /**
+     * Open an IndexWriter for a project, deleting all existing documents first (full re-index).
+     *
+     * <p>Like {@link #openWriter}, it does not commit on close: until the caller commits, readers
+     * keep seeing the previous commit, and closing without a commit (a failed run) leaves that
+     * previous commit in place instead of publishing a partial or empty index.
+     */
     public IndexWriter openWriterFresh(String projectName) throws IOException {
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
@@ -60,12 +73,14 @@ public class LuceneIndexer implements Closeable {
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
+        iwc.setCommitOnClose(false);
         iwc.setRAMBufferSizeMB(128);
         return new IndexWriter(dir, iwc);
     }
 
     /** Open a DirectoryReader for a single project. Caches and refreshes automatically. */
     public DirectoryReader openReader(String projectName) throws IOException {
+        IndexFormat.check(projectName, getProjectIndexDir(projectName));
         Path luceneDir = getLucenePath(projectName);
         if (!Files.exists(luceneDir) || !indexExists(projectName)) {
             throw new IOException("No valid index found for project: " + projectName

@@ -97,8 +97,23 @@ public class CallGraph implements AutoCloseable {
      *                      false so a search or lookup never pays for, or blocks on, a rebuild.
      */
     public static CallGraph open(Path dbDir, boolean repairIndexes) {
+        return open(dbDir, repairIndexes, true);
+    }
+
+    /**
+     * Opens an existing graph for reading; never creates one. Readers use this so a lookup on a
+     * project without a graph (or one being swapped) cannot leave an empty database behind.
+     *
+     * @throws GraphNotFoundException when no database exists at {@code dbDir}
+     */
+    public static CallGraph openExisting(Path dbDir) {
+        return open(dbDir, false, false);
+    }
+
+    private static CallGraph open(Path dbDir, boolean repairIndexes, boolean allowCreate) {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
         boolean created = !factory.exists();
+        if (created && !allowCreate) throw new GraphNotFoundException(dbDir);
         Database db = created ? factory.create() : factory.open();
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
@@ -106,6 +121,166 @@ public class CallGraph implements AutoCloseable {
         if (created) graph.markFreshDatabase();
         else if (repairIndexes) graph.repairIndexesOnce();
         return graph;
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-project graph layout
+    // -------------------------------------------------------------------------
+    //
+    // A full re-index builds a new generation dir (callgraph-<gen>.arcadedb) and then publishes
+    // it by atomically replacing the pointer file callgraph.current. The live graph is never
+    // renamed: ArcadeDB writes cached-count.json and deletes its WAL and lock files by the path
+    // captured at open, so a reader closing after a rename would write into, or delete from,
+    // whatever graph then sits at that path. Old generations are deleted instead, which is safe
+    // on POSIX for readers that still have them open (they keep their file handles, and
+    // ArcadeDB skips cached-count.json when its dir is gone). Indexes without a pointer (format 0,
+    // and anything indexed before the pointer existed) use the legacy callgraph.arcadedb.
+
+    /** Legacy per-project graph dir, used while there is no {@link #POINTER_FILE}. */
+    public static final String LEGACY_DIR = "callgraph.arcadedb";
+    /** Names the live generation dir of a project's graph. */
+    public static final String POINTER_FILE = "callgraph.current";
+    /** At most 18 digits, so the generation number always fits a long. */
+    private static final java.util.regex.Pattern GENERATION =
+            java.util.regex.Pattern.compile("callgraph-(\\d{1,18})\\.arcadedb");
+    /** A graph dir name (legacy or generation) followed by an optional sidecar suffix. */
+    private static final java.util.regex.Pattern GRAPH_ENTRY =
+            java.util.regex.Pattern.compile("(callgraph(?:-\\d+)?\\.arcadedb)(\\..*)?");
+
+    /** The live graph dir of the project whose index dir is {@code projectIndexDir}. */
+    public static Path projectGraphDir(Path projectIndexDir) {
+        String target = readPointer(projectIndexDir);
+        return projectIndexDir.resolve(target != null ? target : LEGACY_DIR);
+    }
+
+    /**
+     * The live graph dir for a writer (incremental patch). Unlike {@link #projectGraphDir}, a
+     * pointer that exists but is malformed, unreadable, or names a generation dir that is gone is
+     * an error: falling back to the legacy dir would create and patch an empty legacy graph.
+     *
+     * @throws java.io.IOException when the pointer is present but unusable
+     */
+    public static Path writerGraphDir(Path projectIndexDir) throws java.io.IOException {
+        String problem = pointerProblem(projectIndexDir);
+        if (problem != null) throw new java.io.IOException(problem);
+        return projectGraphDir(projectIndexDir);
+    }
+
+    /**
+     * Why the project's {@link #POINTER_FILE} cannot be used, or null when it is fine or absent
+     * (absent = legacy layout).
+     */
+    public static String pointerProblem(Path projectIndexDir) {
+        Path f = projectIndexDir.resolve(POINTER_FILE);
+        if (!Files.exists(f, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return null;
+        String name;
+        try {
+            name = Files.readString(f).trim();
+        } catch (java.io.IOException e) {
+            return "Call graph pointer " + f + " is unreadable: " + e.getMessage();
+        }
+        if (!GENERATION.matcher(name).matches()) {
+            return "Call graph pointer " + f + " is malformed: '" + name + "'";
+        }
+        if (!Files.isDirectory(projectIndexDir.resolve(name))) {
+            return "Call graph pointer " + f + " names " + name + ", which does not exist";
+        }
+        return null;
+    }
+
+    private static String readPointer(Path projectIndexDir) {
+        Path f = projectIndexDir.resolve(POINTER_FILE);
+        if (!Files.isRegularFile(f)) return null;
+        try {
+            String name = Files.readString(f).trim();
+            if (GENERATION.matcher(name).matches()) return name;
+            log.warn("Ignoring malformed {}: '{}'", f, name);
+        } catch (java.io.IOException e) {
+            log.warn("Could not read {}: {}", f, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * A fresh, not yet existing generation dir for a full rebuild: newer than every generation
+     * present, so a name is never reused while an old reader may still hold it.
+     */
+    public static Path newGenerationDir(Path projectIndexDir) throws java.io.IOException {
+        long gen = System.currentTimeMillis();
+        try (var s = Files.list(projectIndexDir)) {
+            for (Path p : s.toList()) {
+                var m = GRAPH_ENTRY.matcher(p.getFileName().toString());
+                if (!m.matches()) continue;
+                var g = GENERATION.matcher(m.group(1));
+                if (g.matches()) gen = Math.max(gen, Long.parseLong(g.group(1)) + 1);
+            }
+        }
+        String current = readPointer(projectIndexDir);
+        if (current != null) {
+            var g = GENERATION.matcher(current);
+            if (g.matches()) gen = Math.max(gen, Long.parseLong(g.group(1)) + 1);
+        }
+        return projectIndexDir.resolve("callgraph-" + gen + ".arcadedb");
+    }
+
+    /** Makes {@code generationDir} the project's live graph (atomic pointer replace). */
+    public static void publish(Path projectIndexDir, Path generationDir) throws java.io.IOException {
+        String name = generationDir.getFileName().toString();
+        if (!GENERATION.matcher(name).matches()) throw new IllegalArgumentException(name);
+        Path tmp = Files.createTempFile(projectIndexDir, POINTER_FILE + ".", ".tmp");
+        try {
+            // Durable before it becomes visible: after a crash the pointer names a complete
+            // generation, never an empty or truncated file.
+            try (var ch = java.nio.channels.FileChannel.open(tmp,
+                    java.nio.file.StandardOpenOption.WRITE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+                ch.write(java.nio.ByteBuffer.wrap((name + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                ch.force(true);
+            }
+            Files.move(tmp, projectIndexDir.resolve(POINTER_FILE),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            fsyncDirectory(projectIndexDir);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Best effort: persists a rename in {@code dir}. Not every platform can open a directory. */
+    private static void fsyncDirectory(Path dir) {
+        try (var ch = java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ)) {
+            ch.force(true);
+        } catch (java.io.IOException | UnsupportedOperationException e) {
+            log.debug("Could not fsync {}: {}", dir, e.getMessage());
+        }
+    }
+
+    /**
+     * Deletes every graph dir (and sidecar) of the project except the live one, plus stray
+     * pointer temp files. Only call while holding the project's Lucene write lock: then no other
+     * full run can have a generation in progress.
+     */
+    public static void removeUnusedGraphs(Path projectIndexDir) {
+        if (!Files.isDirectory(projectIndexDir)) return;
+        String live = projectGraphDir(projectIndexDir).getFileName().toString();
+        try (var s = Files.list(projectIndexDir)) {
+            for (Path p : s.toList()) {
+                String n = p.getFileName().toString();
+                var m = GRAPH_ENTRY.matcher(n);
+                boolean unusedGraph = m.matches() && !m.group(1).equals(live);
+                boolean strayTmp = n.startsWith(POINTER_FILE + ".") && n.endsWith(".tmp");
+                if (unusedGraph || strayTmp) deleteRecursively(p);
+            }
+        } catch (java.io.IOException e) {
+            log.warn("Could not remove old call graphs in {}: {}", projectIndexDir, e.getMessage());
+        }
+    }
+
+    private static void deleteRecursively(Path p) throws java.io.IOException {
+        if (!Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return;
+        try (var w = Files.walk(p)) {
+            for (Path q : w.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(q);
+        }
     }
 
     // -------------------------------------------------------------------------

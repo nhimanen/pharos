@@ -20,9 +20,9 @@
     </appender>
 
     <appender name="MCP_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>${user.home}/.pharos/logs/mcp.log</file>
+        <file>${pharos.home:-${user.home}/.pharos}/logs/mcp.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
-            <fileNamePattern>${user.home}/.pharos/logs/mcp.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <fileNamePattern>${pharos.home:-${user.home}/.pharos}/logs/mcp.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
             <maxFileSize>10MB</maxFileSize>
             <maxHistory>7</maxHistory>
         </rollingPolicy>

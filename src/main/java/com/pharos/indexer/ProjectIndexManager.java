@@ -399,6 +399,29 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
+        if (incremental) {
+            // An index written by another format can't be updated in place: rebuild it fully.
+            // A project with no index dir yet is just a normal first full index.
+            Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
+            if (Files.isDirectory(existingDir) && IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
+                String msg = "index format changed (" + IndexFormat.read(existingDir).format()
+                        + " → " + IndexVersions.INDEX_FORMAT + "): running a full re-index";
+                log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+            // A broken graph pointer (malformed, or naming a generation that is gone — e.g. left
+            // behind by an older pharos) can't be patched: patching would need a fresh, empty
+            // graph. A full run rebuilds the graph and replaces the pointer.
+            String pointerProblem = incremental && Files.isDirectory(existingDir)
+                    ? CallGraph.pointerProblem(existingDir) : null;
+            if (pointerProblem != null) {
+                String msg = pointerProblem + ": running a full re-index";
+                log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -525,21 +548,42 @@ public class ProjectIndexManager {
         }
         com.pharos.parser.model.ParsedRelationships relationships = mergeRelationships(projectName, allRelationships);
 
-        // Pass 1: build call graph + knowledge graph — needed to compute in-degrees and caller contexts
-        progress.onProgress("Building call graph", 0, 0);
-        GraphIndexData graphData = buildAndSaveGraph(project, relationships, projectIndexDir);
-
-        // Release relationships and intermediate lists before embedding starts.
-        // For large projects the relationship lists (returns, takes, etc.) can be
-        // tens of MBs; holding them through embedding causes OOM under heap pressure.
-        relationships = null;
-        allRelationships = null;
-
-        // Pass 2: write Lucene index with graph-derived fields
+        // The Lucene write lock is held from here on: a second concurrent run of this project
+        // fails to get it before it can touch this run's graph generation. Lucene keeps the
+        // previous commit visible to readers until the commit below.
+        GraphIndexData graphData;
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
+            // No other run is in progress, so every graph dir but the live one is a leftover.
+            CallGraph.removeUnusedGraphs(projectIndexDir);
+
+            // Pass 1: build call graph + knowledge graph — needed to compute in-degrees and caller
+            // contexts. Built into a new generation dir; readers keep using the live one until the
+            // pointer is replaced after the Lucene commit.
+            progress.onProgress("Building call graph", 0, 0);
+            Path newGraph = CallGraph.newGenerationDir(projectIndexDir);
+            graphData = buildAndSaveGraph(project, relationships, newGraph);
+
+            // Release relationships and intermediate lists before embedding starts.
+            // For large projects the relationship lists (returns, takes, etc.) can be
+            // tens of MBs; holding them through embedding causes OOM under heap pressure.
+            relationships = null;
+            allRelationships = null;
+
+            // Pass 2: write Lucene index with graph-derived fields
+            // The writer does not commit on close: an exception before this commit leaves the
+            // previous commit (and the previous graph) live instead of a partial index.
             indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress,
                     projectIndexDir, runtimes);
             writer.commit();
+
+            // Publish the rebuilt graph now that the matching Lucene commit is visible. A failed
+            // build keeps the previous graph live (stale rather than empty).
+            if (graphData.built()) {
+                CallGraph.publish(projectIndexDir, newGraph);
+                // The cross-project graph is rebuilt when this is newer than its own stamp.
+                CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
+            }
+            CallGraph.removeUnusedGraphs(projectIndexDir);
         }
 
         // Save file state
@@ -553,6 +597,20 @@ public class ProjectIndexManager {
                 .collect(Collectors.toList()));
         registry.register(meta);
         updateModuleGraph(projectRoot, meta);
+
+        // A failed graph build left the previous graph live (on an upgrade: the old-format graph).
+        // Don't stamp the index as current over it, and make the caller see the failure.
+        if (!graphData.built()) {
+            Throwable cause = graphData.failure();
+            throw new IOException("Call graph build failed for '" + projectName + "' ("
+                    + (cause == null ? "unknown error" : cause.getClass().getSimpleName() + ": " + cause.getMessage())
+                    + "); the search index was rebuilt but the previous call graph is still in use and "
+                    + "the index format was not updated. Fix the cause (e.g. raise -Xmx) and run: "
+                    + "pharos index --full " + projectName, cause);
+        }
+
+        // Stamp last: only a fully committed full run marks the index as this format.
+        IndexFormat.write(projectIndexDir);
 
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
                 meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
@@ -1552,8 +1610,10 @@ public class ProjectIndexManager {
     private void patchGraph(Path projectIndexDir,
                              List<ParsedFile> parsedDirtyFiles,
                              List<Path> deletedFiles,
-                             FileStateTracker stateTracker) {
-        Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
+                             FileStateTracker stateTracker) throws IOException {
+        // Strict: a pointer that went bad since index() checked it fails the run rather than
+        // falling back to (and creating) an empty legacy graph.
+        Path dbDir = CallGraph.writerGraphDir(projectIndexDir);
         try (CallGraph graph = CallGraph.open(dbDir, true)) {
             log.debug("Opened call graph for patching: {} methods", graph.methodCount());
 
@@ -1635,23 +1695,28 @@ public class ProjectIndexManager {
 
     private GraphIndexData buildAndSaveGraph(ParsedProject project,
                                               com.pharos.parser.model.ParsedRelationships relationships,
-                                              Path projectIndexDir) {
-        Path dbDir = projectIndexDir.resolve("callgraph.arcadedb");
+                                              Path dbDir) {
         try (CallGraph graph = CallGraph.open(dbDir, true)) {
             graph.clear();
-            new CallGraphBuilder().build(graph, project);
-            new KnowledgeGraphBuilder().build(graph, relationships);
-            CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
+            populateGraph(graph, project, relationships);
             log.debug("Call graph built: {} methods, {} calls",
                     graph.methodCount(), graph.callCount());
             return GraphIndexData.build(graph, project);
         } catch (Throwable e) {
-            // Catch Throwable (including OutOfMemoryError) so a large project cannot
-            // propagate through the ExecutorService and kill other queued projects.
-            log.warn("Failed to build call graph for '{}' ({}): {}",
+            // Catch Throwable (including OutOfMemoryError) so the Lucene index and registry can
+            // still be written; indexFull then refuses to stamp the index and rethrows the
+            // failure, so the caller (pharos index, upgrade-indexes) reports it.
+            log.error("Failed to build call graph for '{}' ({}): {}",
                     project.projectName(), e.getClass().getSimpleName(), e.getMessage());
-            return GraphIndexData.empty();
+            return GraphIndexData.failed(e);
         }
+    }
+
+    /** Fills a cleared call graph from the parsed project. Overridden by tests to inject failures. */
+    protected void populateGraph(CallGraph graph, ParsedProject project,
+                       com.pharos.parser.model.ParsedRelationships relationships) {
+        new CallGraphBuilder().build(graph, project);
+        new KnowledgeGraphBuilder().build(graph, relationships);
     }
 
     private static com.pharos.parser.model.ParsedRelationships mergeRelationships(
@@ -1768,11 +1833,18 @@ public class ProjectIndexManager {
         private final java.util.Map<String, Integer> inDegrees;
         // fqn → simple method names of callers (for callerContext text field)
         private final java.util.Map<String, List<String>> callerNames;
+        // false when the graph build failed: the result is empty and no graph was written
+        private final boolean built;
+        // why the build failed (null when built)
+        private final Throwable failure;
 
         private GraphIndexData(java.util.Map<String, Integer> inDegrees,
-                               java.util.Map<String, List<String>> callerNames) {
+                               java.util.Map<String, List<String>> callerNames, boolean built,
+                               Throwable failure) {
             this.inDegrees = inDegrees;
             this.callerNames = callerNames;
+            this.built = built;
+            this.failure = failure;
         }
 
         static GraphIndexData build(CallGraph graph, ParsedProject project) {
@@ -1798,11 +1870,19 @@ public class ProjectIndexManager {
                         .collect(Collectors.toList());
                 names.put(fqn, simpleCallerNames);
             }
-            return new GraphIndexData(deg, names);
+            return new GraphIndexData(deg, names, true, null);
         }
 
-        static GraphIndexData empty() {
-            return new GraphIndexData(new java.util.HashMap<>(), new java.util.HashMap<>());
+        static GraphIndexData failed(Throwable cause) {
+            return new GraphIndexData(new java.util.HashMap<>(), new java.util.HashMap<>(), false, cause);
+        }
+
+        boolean built() {
+            return built;
+        }
+
+        Throwable failure() {
+            return failure;
         }
 
         int inDegree(String fqn) {

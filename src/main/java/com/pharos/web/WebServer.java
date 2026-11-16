@@ -1,5 +1,7 @@
 package com.pharos.web;
 
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -57,14 +59,19 @@ public class WebServer {
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     }
 
-    public void start(int port) {
+    public Javalin start(int port) {
+        return start(port, IndexConfig.DEFAULT_BASE);
+    }
+
+    /** @param pharosDir directory that receives the usage log ({@code logs/usage.jsonl}) */
+    public Javalin start(int port, Path pharosDir) {
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
-        UsageLogger usage = new UsageLogger(IndexConfig.DEFAULT_BASE);
+        UsageLogger usage = new UsageLogger(pharosDir);
         app.before(ctx -> {
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
@@ -93,6 +100,19 @@ public class WebServer {
                     ctx.userAgent()
             ));
         });
+
+        // Incompatible index format → 409 with a machine-readable body
+        app.exception(IncompatibleIndexException.class, (e, ctx) -> {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("error", e.getMessage());
+            body.put("project", e.project());
+            body.put("status", e.status().wireName());
+            ctx.status(409).json(body);
+        });
+
+        // Project without a call graph (never indexed with one, or a failed build) → 404
+        app.exception(com.pharos.graph.GraphNotFoundException.class, (e, ctx) ->
+                ctx.status(404).json(Map.of("error", e.getMessage())));
 
         // Root → index.html
         app.get("/", ctx -> {
@@ -171,10 +191,12 @@ public class WebServer {
                         decorated.stream().map(SearchResult::id).collect(Collectors.toList()));
                 List<Map<String, Object>> results = decorated.stream()
                         .map(this::resultToMap).collect(Collectors.toList());
-                boolean needsEnvelope = trace || (resp.suggestions() != null && !resp.suggestions().isEmpty());
+                boolean needsEnvelope = trace || !resp.warnings().isEmpty()
+                        || (resp.suggestions() != null && !resp.suggestions().isEmpty());
                 if (needsEnvelope) {
                     Map<String, Object> out = new LinkedHashMap<>();
                     out.put("results", results);
+                    out.put("warnings", resp.warnings());
                     if (trace) {
                         Map<String, Object> meta = new LinkedHashMap<>();
                         meta.put("requestedType", type);
@@ -204,6 +226,8 @@ public class WebServer {
                 } else {
                     ctx.json(results);
                 }
+            } catch (IncompatibleIndexException e) {
+                throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -235,10 +259,13 @@ public class WebServer {
         app.get("/api/method", ctx -> {
             String fqn = ctx.queryParam("fqn");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
-            SearchResult r = searchEngine.getMethodByFqn(fqn);
+            List<String> warnings = new ArrayList<>();
+            SearchResult r = searchEngine.getMethodByFqn(fqn, warnings);
+            warningsHeader(ctx, warnings);
             if (r == null && fqn.contains("#") && !fqn.contains("(")) {
                 // Partial FQN — parameter types omitted. Try name-only lookup.
-                List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn);
+                List<SearchResult> candidates = searchEngine.findMethodsByPartialFqn(fqn, warnings);
+                warningsHeader(ctx, warnings);
                 if (candidates.isEmpty()) {
                     recordSingle(ctx, null);
                     ctx.status(404).result("Not found"); return;
@@ -266,18 +293,23 @@ public class WebServer {
             String fqn     = ctx.queryParam("fqn");
             boolean withCtx = "true".equalsIgnoreCase(ctx.queryParam("context"));
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
                 if (withCtx) {
-                    SearchEngine.ClassContext context = searchEngine.getClassContext(fqn);
+                    SearchEngine.ClassContext context = searchEngine.getClassContext(fqn, warnings);
+                    warningsHeader(ctx, warnings);
                     if (context == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
                     recordSingle(ctx, fqn);
                     ctx.json(classContextToMap(context));
                 } else {
-                    SearchResult r = searchEngine.getClassByFqn(fqn);
+                    SearchResult r = searchEngine.getClassByFqn(fqn, warnings);
+                    warningsHeader(ctx, warnings);
                     if (r == null) { recordSingle(ctx, null); ctx.status(404).result("Not found"); return; }
                     recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
                 }
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -289,8 +321,10 @@ public class WebServer {
             String fqn = ctx.queryParam("fqn");
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
-                List<SearchResult> callers = searchEngine.findCallers(fqn, project);
+                List<SearchResult> callers = searchEngine.findCallers(fqn, project, warnings);
+                warningsHeader(ctx, warnings);
                 recordResults(ctx, callers.size(),
                         callers.stream().map(SearchResult::id).collect(Collectors.toList()));
                 ctx.json(callers.stream().map(this::refToMap).collect(Collectors.toList()));
@@ -305,8 +339,10 @@ public class WebServer {
             String fqn = ctx.queryParam("fqn");
             String project = ctx.queryParam("project");
             if (fqn == null) { ctx.status(400).result("fqn required"); return; }
+            List<String> warnings = new ArrayList<>();
             try {
-                List<SearchResult> callees = searchEngine.findCallees(fqn, project);
+                List<SearchResult> callees = searchEngine.findCallees(fqn, project, warnings);
+                warningsHeader(ctx, warnings);
                 recordResults(ctx, callees.size(),
                         callees.stream().map(SearchResult::id).collect(Collectors.toList()));
                 ctx.json(callees.stream().map(this::refToMap).collect(Collectors.toList()));
@@ -323,7 +359,12 @@ public class WebServer {
             int depth      = Math.min(10, ctx.queryParamAsClass("depth",      Integer.class).getOrDefault(5));
             int maxCallers = ctx.queryParamAsClass("maxCallers", Integer.class).getOrDefault(2000);
             try {
-                ctx.json(searchEngine.findTransitiveCallers(fqn, depth, maxCallers));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.findTransitiveCallers(fqn, depth, maxCallers, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -336,7 +377,12 @@ public class WebServer {
             if (fqn == null || fqn.isBlank()) { ctx.status(400).result("fqn required"); return; }
             String kind = ctx.queryParamAsClass("kind", String.class).getOrDefault("all");
             try {
-                ctx.json(searchEngine.findUsages(fqn, kind));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.findUsages(fqn, kind, null, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -351,7 +397,12 @@ public class WebServer {
             String direction    = ctx.queryParamAsClass("direction", String.class).getOrDefault("callees");
             int    maxBodyChars = ctx.queryParamAsClass("maxBodyChars", Integer.class).getOrDefault(500);
             try {
-                ctx.json(searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars));
+                List<String> warnings = new ArrayList<>();
+                var res = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars, warnings);
+                warningsHeader(ctx, warnings);
+                ctx.json(res);
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -364,16 +415,20 @@ public class WebServer {
             String to = ctx.queryParam("to");
             if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
             List<String> path = List.of();
+            List<String> warnings = new ArrayList<>();
             for (ProjectMeta meta : registry.listAll()) {
                 try (CallGraph g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
+                } catch (IncompatibleIndexException e) {
+                    warnings.add(e.getMessage());
                 } catch (Exception ignored) {}
             }
             recordResults(ctx, path.size(), path);
             Map<String, Object> res = new LinkedHashMap<>();
             res.put("path", path);
             res.put("hops", path.isEmpty() ? 0 : path.size() - 1);
+            if (!warnings.isEmpty()) res.put("warnings", warnings);
             ctx.json(res);
         });
 
@@ -480,6 +535,8 @@ public class WebServer {
                 res.put("exitPoints", exits);
                 res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
+            } catch (IncompatibleIndexException e) {
+                throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());
             }
@@ -509,6 +566,23 @@ public class WebServer {
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
         log.info("Web server started on port {}", port);
+        return app;
+    }
+
+    private static final com.fasterxml.jackson.databind.ObjectWriter ASCII_JSON = new ObjectMapper()
+            .writer().with(com.fasterxml.jackson.core.JsonGenerator.Feature.ESCAPE_NON_ASCII);
+
+    /**
+     * Surfaces skipped-project notices without changing the JSON body: header
+     * {@code X-Pharos-Warnings} holds a JSON array of strings, non-ASCII escaped as backslash-u sequences.
+     */
+    private static void warningsHeader(io.javalin.http.Context ctx, List<String> warnings) {
+        if (warnings.isEmpty()) return;
+        try {
+            ctx.header("X-Pharos-Warnings", ASCII_JSON.writeValueAsString(warnings.stream().distinct().toList()));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.warn("Could not encode warnings header: {}", e.getMessage());
+        }
     }
 
     // ── Usage logging helpers ──────────────────────────────────────────────────
@@ -598,8 +672,9 @@ public class WebServer {
 
     /** Open the ArcadeDB call graph for the given project. Caller must close. */
     private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
-        Path dbDir = Path.of(meta.getIndexPath()).resolve("callgraph.arcadedb");
-        return CallGraph.open(dbDir);
+        IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+        Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
+        return CallGraph.openExisting(dbDir);
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {
@@ -938,6 +1013,13 @@ public class WebServer {
         m.put("artifactId", p.getArtifactId());
         m.put("indexed", luceneIndexer.indexExists(p.getName()));
         m.put("embeddedModels", p.getEmbeddedModels());
+        Path indexDir = IndexFormat.dir(p.getIndexPath());
+        IndexFormat.Stamp stamp = IndexFormat.read(indexDir);
+        Map<String, Object> fmt = new LinkedHashMap<>();
+        fmt.put("status", IndexFormat.status(indexDir).wireName());
+        fmt.put("format", stamp.format());
+        fmt.put("pharosVersion", stamp.pharosVersion());
+        m.put("indexFormat", fmt);
         return m;
     }
 
