@@ -643,32 +643,48 @@ class RemoteDirectoryTest {
     /** An eager copy of the wrong size (a torn download, tampering) is replaced, not fatal. */
     @Test
     void eagerFileOfTheWrongSizeIsDownloadedAgain() throws Exception {
-        Blob b = blob("_e.bin", 2 * KIB);
+        ManifestFile f = luceneFiles(manifest).stream()
+                .max(java.util.Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+        byte[] real = Files.readAllBytes(fullCopy.resolve(f.name()));
         Path eager = tmp.resolve("eager-wrong");
         Files.createDirectories(eager);
-        Files.write(eager.resolve("_e.bin"), java.util.Arrays.copyOf(b.data(), 100)); // truncated
-        RemoteDirectory dir = remote(cache(KIB), eager, source, b.manifest());
-        try (IndexInput in = dir.openInput("_e.bin", IOContext.DEFAULT)) {
+        Path local = eager.resolve(f.name());
+        Files.write(local, java.util.Arrays.copyOf(real, 100)); // truncated
+        RemoteDirectory dir = remote(cache(KIB), eager, source, manifest);
+        try (IndexInput in = dir.openInput(f.name(), IOContext.DEFAULT)) {
             assertThat(in).isNotInstanceOf(CachingRemoteIndexInput.class);
-            byte[] all = new byte[2 * KIB];
+            byte[] all = new byte[real.length];
             in.readBytes(all, 0, all.length);
-            assertThat(all).isEqualTo(b.data());
+            assertThat(all).isEqualTo(real);
         }
-        assertThat(eager.resolve("_e.bin")).hasBinaryContent(b.data());
+        assertThat(local).hasBinaryContent(real);
+
+        // A download whose checksum is not the manifest's is never moved in.
+        long crc = Long.parseUnsignedLong(f.checksum(), 16);
+        List<ManifestFile> lying = new ArrayList<>(luceneFiles(manifest));
+        lying.replaceAll(x -> x == f ? new ManifestFile(x.role(), x.name(), x.key(), x.length(),
+                Long.toHexString(crc ^ 1)) : x);
+        Files.write(local, java.util.Arrays.copyOf(real, 100));
+        RemoteDirectory checked = remote(cache(KIB), eager, source, manifestOf(7, lying));
+        assertThatThrownBy(() -> checked.openInput(f.name(), IOContext.DEFAULT))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("checksum")
+                .hasMessageContaining("shard " + PROJECT)
+                .hasMessageContaining("generation 7")
+                .hasMessageContaining(f.key());
+        assertThat(local).hasSize(100);
 
         // When the object can't be fetched either, the error names shard, generation and key.
-        Files.write(eager.resolve("_e.bin"), new byte[5]);
-        String key = b.manifest().files().get(0).key();
-        store.delete(key);
+        store.delete(f.key());
         try {
-            RemoteDirectory again = remote(cache(KIB), eager, source, b.manifest());
-            assertThatThrownBy(() -> again.openInput("_e.bin", IOContext.DEFAULT))
+            RemoteDirectory again = remote(cache(KIB), eager, source, manifestOf(7, luceneFiles(manifest)));
+            assertThatThrownBy(() -> again.openInput(f.name(), IOContext.DEFAULT))
                     .isInstanceOf(IOException.class)
                     .hasMessageContaining("shard " + PROJECT)
                     .hasMessageContaining("generation 7")
-                    .hasMessageContaining(key);
+                    .hasMessageContaining(f.key());
         } finally {
-            store.put(key, b.data());
+            store.put(f.key(), real);
         }
     }
 

@@ -4,6 +4,7 @@ import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.objectstore.ManifestFile;
 import com.pharos.cluster.objectstore.ShardManifest;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.BaseDirectory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
@@ -29,7 +30,8 @@ import java.util.TreeMap;
  * generation. The file list and lengths come from the manifest. A file present in {@code eagerDir}
  * (the small files downloaded when the generation was opened) is read from there; every other file
  * is a {@link CachingRemoteIndexInput} reading blocks through the shared {@link BlockCache}. An eager
- * copy whose size is not the manifest's is downloaded again (with a WARN) before it is opened.
+ * copy whose size is not the manifest's is downloaded again (with a WARN) before it is opened; the
+ * download replaces it only once its whole-file checksum matches the manifest.
  *
  * <p>The directory owns neither the cache nor the source: closing it only closes the eager files'
  * {@link FSDirectory}. Every write, delete, sync or rename throws {@link UnsupportedOperationException}.
@@ -129,6 +131,7 @@ public final class RemoteDirectory extends BaseDirectory {
             if (got != f.length()) {
                 throw new IOException("downloaded " + got + " bytes, the manifest says " + f.length());
             }
+            verifyChecksum(tmp, f);
             Files.move(tmp, local, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException | RuntimeException e) {
             throw new IOException("cannot repair the eager copy " + local + " of " + where + ": " + e.getMessage(), e);
@@ -156,6 +159,27 @@ public final class RemoteDirectory extends BaseDirectory {
             return Files.readAllBytes(p);
         } catch (IOException e) {
             return null; // read through the cache instead
+        }
+    }
+
+    /** The whole file is checksummed against its footer, and the footer's checksum must be the manifest's. */
+    private static void verifyChecksum(Path file, ManifestFile f) throws IOException {
+        long actual;
+        try (FSDirectory dir = FSDirectory.open(file.getParent());
+             IndexInput in = dir.openInput(file.getFileName().toString(), IOContext.READONCE)) {
+            actual = CodecUtil.checksumEntireFile(in);
+        } catch (org.apache.lucene.index.CorruptIndexException e) {
+            throw new IOException("the downloaded copy fails its checksum: " + e.getMessage(), e);
+        }
+        long expected;
+        try {
+            expected = Long.parseUnsignedLong(Objects.requireNonNull(f.checksum(), "checksum"), 16);
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new IOException("invalid checksum '" + f.checksum() + "' in the manifest");
+        }
+        if (actual != expected) {
+            throw new IOException("the downloaded copy has checksum " + Long.toHexString(actual)
+                    + ", the manifest says " + f.checksum());
         }
     }
 
