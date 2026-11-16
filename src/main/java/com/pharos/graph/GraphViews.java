@@ -1,6 +1,8 @@
 package com.pharos.graph;
 
 import com.pharos.config.ProjectMeta;
+import com.pharos.indexer.IncompatibleIndexException;
+import com.pharos.indexer.IndexFormat;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -13,7 +15,18 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Opens the read-only {@link GraphView} for a project's shard directory.
+ * Opens the read-only {@link GraphView} for a project's shard directory. This is the one graph
+ * read path for every role:
+ * <ul>
+ *   <li>the shard's {@code index-format.json} is checked first, exactly as {@code LuceneIndexer}
+ *       does before opening a Lucene reader: a refused format ({@code outdated}/{@code newer})
+ *       throws {@link IncompatibleIndexException}; {@code upgrade-available} (N-1) is served;</li>
+ *   <li>on a writer or {@code all} node the live ArcadeDB generation is resolved through
+ *       {@link CallGraph#POINTER_FILE} (legacy {@code callgraph.arcadedb} without a pointer) and
+ *       opened with {@link CallGraph#openExisting}, which never creates a graph;</li>
+ *   <li>on a reader the shard dir is the active generation dir, and its compact graph
+ *       ({@value #COMPACT_FILE}) is served.</li>
+ * </ul>
  *
  * <p>Compact graphs (reader generation dirs) are immutable and parsed once: the parsed
  * {@link CompactGraph} is cached per shard directory and shared by every caller (its
@@ -35,7 +48,22 @@ public final class GraphViews {
 
     private GraphViews() {}
 
+    /** As {@link #open(String, Path)}, naming the project after the directory. */
     public static GraphView open(Path shardDir) {
+        Path name = shardDir.toAbsolutePath().normalize().getFileName();
+        return open(name == null ? shardDir.toString() : name.toString(), shardDir);
+    }
+
+    public static GraphView open(ProjectMeta meta) {
+        return open(meta.getName(), Path.of(meta.getIndexPath()));
+    }
+
+    /**
+     * @throws IncompatibleIndexException when the shard's index format is not servable
+     * @throws UncheckedIOException       when a compact graph exists but cannot be read
+     */
+    public static GraphView open(String project, Path shardDir) {
+        IndexFormat.check(project, shardDir);
         // the writer's live generation (callgraph.current), or the legacy dir without a pointer
         Path arcade = CallGraph.projectGraphDir(shardDir);
         if (Files.isDirectory(arcade)) {
@@ -51,10 +79,6 @@ public final class GraphViews {
             }
         }
         return EmptyGraphView.INSTANCE;
-    }
-
-    public static GraphView open(ProjectMeta meta) {
-        return open(Path.of(meta.getIndexPath()));
     }
 
     /** Drops the cached graph of {@code shardDir}, if any (generation deactivated or deleted). */

@@ -93,4 +93,74 @@ class GraphViewsTest {
         assertNotSame(before, GraphViews.open(gen));
         GraphViews.evict(gen);
     }
+
+    // ── Adaptation 2: pointer resolution and the index format check ──────────────────────────
+
+    private static void stamp(Path dir, int format) throws Exception {
+        Files.createDirectories(dir);
+        Files.writeString(dir.resolve("index-format.json"),
+                "{\"format\": " + format + ", \"pharosVersion\": \"test\", \"writtenAt\": \"2026-01-01T00:00:00Z\"}");
+    }
+
+    /** A writer shard dir whose live graph is a generation dir behind callgraph.current. */
+    private Path writerShard(String name) throws Exception {
+        Path shard = Files.createDirectories(tmp.resolve(name));
+        Path gen = CallGraph.newGenerationDir(shard);
+        try (CallGraph g = CallGraph.open(gen, true)) {
+            g.addMethod("a.A#caller()", "a.A");
+            g.addMethod("a.A#callee()", "a.A");
+            g.addCall("a.A#caller()", "a.A#callee()");
+            g.flush();
+        }
+        CallGraph.publish(shard, gen);
+        return shard;
+    }
+
+    @Test
+    void writerGraphIsResolvedThroughThePointer() throws Exception {
+        Path shard = writerShard("w");
+        stamp(shard, com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+        try (GraphView v = GraphViews.open("w", shard)) {
+            assertEquals(Set.of("a.A#caller()"), v.callers("a.A#callee()"));
+        }
+        assertFalse(Files.exists(shard.resolve(GraphViews.ARCADE_DIR)), "no legacy graph created");
+    }
+
+    @Test
+    void newerFormatIsRefusedWithIncompatibleIndexException() throws Exception {
+        Path shard = writerShard("n");
+        stamp(shard, com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1);
+        var e = assertThrows(com.pharos.indexer.IncompatibleIndexException.class, () -> GraphViews.open("n", shard));
+        assertEquals(com.pharos.indexer.IndexFormat.Status.NEWER, e.status());
+    }
+
+    @Test
+    void outdatedFormatIsRefused() throws Exception {
+        Path shard = writerShard("o");
+        stamp(shard, com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT - 1);
+        var e = assertThrows(com.pharos.indexer.IncompatibleIndexException.class, () -> GraphViews.open("o", shard));
+        assertEquals(com.pharos.indexer.IndexFormat.Status.OUTDATED, e.status());
+    }
+
+    @Test
+    void previousFormatIsServed() throws Exception {
+        Path shard = writerShard("p");
+        stamp(shard, com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT);
+        try (GraphView v = GraphViews.open("p", shard)) {
+            assertEquals(Set.of("a.A#caller()"), v.callers("a.A#callee()"));
+        }
+    }
+
+    @Test
+    void readerGenerationDirIsCheckedAndServesItsCompactGraph() throws Exception {
+        Path gen = generationDir("gen-3", "a.A#callee()");
+        stamp(gen, com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+        assertEquals(Set.of("a.A#caller()"), GraphViews.open("p", gen).callers("a.A#callee()"));
+        stamp(gen, com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1);
+        // IndexFormat caches by the stamp's mtime: make the rewrite visible within the same millisecond
+        Files.setLastModifiedTime(gen.resolve("index-format.json"),
+                java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 60_000));
+        assertThrows(com.pharos.indexer.IncompatibleIndexException.class, () -> GraphViews.open("p", gen));
+        GraphViews.evict(gen);
+    }
 }
