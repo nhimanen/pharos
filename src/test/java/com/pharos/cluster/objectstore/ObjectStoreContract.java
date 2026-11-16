@@ -192,4 +192,53 @@ public abstract class ObjectStoreContract {
                 .hasMessageContaining("overflow");
         assertThat(t).doesNotExist();
     }
+
+    private byte[] readRange(String key, long offset, long length) throws IOException {
+        try (java.io.InputStream in = store().openRange(key, offset, length)) {
+            return in.readAllBytes();
+        }
+    }
+
+    @Test
+    void openRangeStreamsExactBytes() throws IOException {
+        byte[] data = putRangeObject("orange/blob");
+        long[][] ranges = {{0, 1}, {4095, 2}, {9990, 10}, {0, 10_000}};
+        for (long[] r : ranges) {
+            assertThat(readRange("orange/blob", r[0], r[1]))
+                    .isEqualTo(java.util.Arrays.copyOfRange(data, (int) r[0], (int) (r[0] + r[1])));
+        }
+    }
+
+    @Test
+    void openRangePastEndIsEof() throws IOException {
+        putRangeObject("orange/short");
+        assertThatThrownBy(() -> readRange("orange/short", 9990, 11)).isInstanceOf(EOFException.class);
+        assertThatThrownBy(() -> readRange("orange/short", 10_001, 1)).isInstanceOf(EOFException.class);
+    }
+
+    @Test
+    void openRangeOfMissingKeyIsNoSuchFile() {
+        assertThatThrownBy(() -> readRange("orange/nope", 0, 10))
+                .isInstanceOf(NoSuchFileException.class)
+                .hasMessageContaining("orange/nope");
+    }
+
+    @Test
+    void zeroLengthOpenRangeIsEmptyButChecksTheObject() throws IOException {
+        putRangeObject("orange/zero");
+        assertThat(readRange("orange/zero", 5, 0)).isEmpty();
+        assertThat(readRange("orange/zero", 10_000, 0)).isEmpty();
+        assertThatThrownBy(() -> readRange("orange/zero", 10_001, 0)).isInstanceOf(EOFException.class);
+        assertThatThrownBy(() -> readRange("orange/nope-zero", 0, 0)).isInstanceOf(NoSuchFileException.class);
+    }
+
+    @Test
+    void openRangeOverflowIsIllegalArgument() throws IOException {
+        putRangeObject("orange/overflow");
+        assertThatThrownBy(() -> store().openRange("orange/overflow", Long.MAX_VALUE - 5, 10))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("overflow");
+        assertThatThrownBy(() -> store().openRange("orange/overflow", -1, 10))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

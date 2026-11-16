@@ -4,6 +4,7 @@ import com.pharos.cluster.objectstore.ManifestFile;
 import com.pharos.cluster.objectstore.ShardManifest;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.Optional;
 
@@ -21,6 +22,13 @@ public interface ReplicaSource {
 
     /** Downloads {@code length} bytes at {@code offset} of one manifest file to {@code target}. */
     void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException;
+
+    /**
+     * Opens a stream over {@code length} bytes at {@code offset} of one manifest file (see
+     * {@link com.pharos.cluster.objectstore.ObjectStore#openRange}); the caller checks it read exactly
+     * {@code length} bytes.
+     */
+    InputStream openRange(ManifestFile file, long offset, long length) throws IOException;
 
     /** The cluster-wide synonyms file; empty when none was shipped. */
     Optional<byte[]> synonyms() throws IOException;

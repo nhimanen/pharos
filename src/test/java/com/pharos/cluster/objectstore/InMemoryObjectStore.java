@@ -96,6 +96,17 @@ public class InMemoryObjectStore implements ObjectStore {
     }
 
     @Override
+    public java.io.InputStream openRange(String key, long offset, long length) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
+        Entry e = map.get(key);
+        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (end > e.data().length) {
+            throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
+        }
+        return new java.io.ByteArrayInputStream(e.data(), (int) offset, (int) length);
+    }
+
+    @Override
     public String put(String key, Path source) throws IOException {
         return put(key, Files.readAllBytes(source));
     }

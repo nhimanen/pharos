@@ -147,11 +147,28 @@ public class S3ObjectStore implements ObjectStore {
 
     @Override
     public void downloadRange(String key, long offset, long length, Path target) throws IOException {
-        long end = ObjectStore.checkRange(offset, length);
+        ObjectStore.checkRange(offset, length);
         Path abs = target.toAbsolutePath();
         Path dir = abs.getParent();
         Files.createDirectories(dir);
         Path tmp = Files.createTempFile(dir, abs.getFileName().toString(), ".part");
+        try {
+            try (InputStream in = openRange(key, offset, length)) {
+                long copied = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+                if (copied != length) {
+                    throw new IOException("short range body for '" + key + "': expected " + length
+                            + " bytes, got " + copied);
+                }
+            }
+            Files.move(tmp, abs, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Override
+    public InputStream openRange(String key, long offset, long length) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
         try {
             if (length == 0) {
                 // No ranged GET can express zero bytes; a HEAD gives the same missing-key / past-end answers.
@@ -166,24 +183,24 @@ public class S3ObjectStore implements ObjectStore {
                 if (offset > size) {
                     throw new EOFException("range " + offset + "+0 is past the end (size " + size + ") of " + key);
                 }
-            } else {
-                GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
-                        .range("bytes=" + offset + "-" + (end - 1)).build();
-                try (ResponseInputStream<GetObjectResponse> in = s3.getObject(req)) {
-                    checkContentRange(in.response().contentRange(), offset, key);
-                    long copied = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
-                    if (copied != length) {
-                        Long total = totalSize(in.response().contentRange());
-                        if (total != null && end > total) {
-                            throw new EOFException("range " + offset + "+" + length + " exceeds size " + total
-                                    + " of " + key);
-                        }
-                        throw new IOException("short range body for '" + key + "': expected " + length
-                                + " bytes, got " + copied);
-                    }
-                }
+                return InputStream.nullInputStream();
             }
-            Files.move(tmp, abs, StandardCopyOption.REPLACE_EXISTING);
+            GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
+                    .range("bytes=" + offset + "-" + (end - 1)).build();
+            ResponseInputStream<GetObjectResponse> in = s3.getObject(req);
+            try {
+                String contentRange = in.response().contentRange();
+                checkContentRange(contentRange, offset, key);
+                Long total = totalSize(contentRange);
+                if (total != null && end > total) {
+                    throw new EOFException("range " + offset + "+" + length + " exceeds size " + total + " of " + key);
+                }
+            } catch (IOException | RuntimeException e) {
+                in.abort();
+                closeQuietly(in);
+                throw e;
+            }
+            return new RangeStream(in, key);
         } catch (NoSuchKeyException e) {
             throw missing(key);
         } catch (S3Exception e) {
@@ -191,11 +208,63 @@ public class S3ObjectStore implements ObjectStore {
             if (e.statusCode() == 416) {
                 throw new EOFException("range " + offset + "+" + length + " is past the end of " + key);
             }
-            throw wrap("download range", key, e);
+            throw wrap("open range", key, e);
         } catch (SdkException e) {
-            throw wrap("download range", key, e);
-        } finally {
-            Files.deleteIfExists(tmp);
+            throw wrap("open range", key, e);
+        }
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException | RuntimeException ignored) {
+            // already failing
+        }
+    }
+
+    /** A ranged GET body that reports SDK failures while streaming as {@link IOException}s naming the key. */
+    private final class RangeStream extends java.io.FilterInputStream {
+        private final String key;
+
+        RangeStream(InputStream in, String key) {
+            super(in);
+            this.key = key;
+        }
+
+        @Override
+        public int read() throws IOException {
+            try {
+                return super.read();
+            } catch (SdkException e) {
+                throw wrap("read range", key, e);
+            }
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            try {
+                return in.read(b, off, len);
+            } catch (SdkException e) {
+                throw wrap("read range", key, e);
+            }
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            try {
+                return super.skip(n);
+            } catch (SdkException e) {
+                throw wrap("read range", key, e);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                super.close();
+            } catch (SdkException e) {
+                throw wrap("close range", key, e);
+            }
         }
     }
 
