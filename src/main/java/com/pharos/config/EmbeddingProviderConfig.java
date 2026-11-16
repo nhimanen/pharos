@@ -161,12 +161,6 @@ public class EmbeddingProviderConfig {
         @Override public int hashCode() { return 0; }
     }
 
-    /**
-     * Validates the config. Called by {@link IndexConfig#load()} so misconfiguration
-     * surfaces at startup instead of mid-index.
-     *
-     * @throws IllegalArgumentException on any invalid field combination
-     */
     private static final java.util.regex.Pattern HF_REPO_ID =
             java.util.regex.Pattern.compile("^[A-Za-z0-9][\\w.-]*/[\\w.-]+$");
 
@@ -180,6 +174,12 @@ public class EmbeddingProviderConfig {
         return true;
     }
 
+    /**
+     * Validates the config. Called by {@link IndexConfig#load()} so misconfiguration
+     * surfaces at startup instead of mid-index.
+     *
+     * @throws IllegalArgumentException on any invalid field combination
+     */
     public void validate() {
         if (modelId == null || modelId.isBlank()) {
             throw new IllegalArgumentException("embeddingProvider.modelId is required");
