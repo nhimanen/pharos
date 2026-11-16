@@ -39,8 +39,8 @@ import java.util.stream.Stream;
  *
  * <p><b>Lazy generation dir.</b> {@code <cacheDir>/<shard>/gen-N} holds {@code manifest.json},
  * {@code index-format.json}, the compact graph, the {@value #MARKER} marker and {@code lucene/} with
- * only the eager files: {@code segments_N}, {@code *.si}, {@code *.fnm}, {@code *.cfe}, and any Lucene
- * file of at most {@code eagerMaxBytes}. {@link #open} returns a {@link RemoteDirectory} for the
+ * only the eager files: {@code segments_N}, {@code *.si}, {@code *.fnm}, {@code *.cfe}, any Lucene
+ * file of at most {@code eagerMaxBytes} and any {@code .cfs} of at most one block. {@link #open} returns a {@link RemoteDirectory} for the
  * {@code lucene/} dir of such a generation (its manifest read from {@code manifest.json}), and an
  * {@link FSDirectory} for every other dir (full-mode generations, writer dirs).
  *
@@ -102,11 +102,16 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return genDir != null && Files.exists(genDir.resolve(MARKER));
     }
 
-    /** True when a lazy generation keeps this Lucene file on local disk. */
+    /**
+     * True when a lazy generation keeps this Lucene file on local disk: the always-eager names, any
+     * file of at most {@code eagerMaxBytes}, and a {@code .cfs} compound file of at most one block
+     * (the warm open would fetch that block anyway, and downloading it whole also checksums it).
+     */
     public boolean eager(ManifestFile f) {
         String name = f.name();
         return name.startsWith("segments_") || name.endsWith(".si") || name.endsWith(".fnm")
-                || name.endsWith(".cfe") || f.length() <= config.getEagerMaxBytes();
+                || name.endsWith(".cfe") || f.length() <= config.getEagerMaxBytes()
+                || (name.endsWith(".cfs") && f.length() <= config.getBlockSizeBytes());
     }
 
     /** How long a sync waits for {@link #prefetch} before activating the generation anyway. */
