@@ -37,6 +37,21 @@ Pharos indexes multi-language projects and gives you multiple ways to navigate t
 
 `setup.sh` also copies the Claude skill to `~/.claude/skills/pharos/` automatically.
 
+## Install from a release
+
+Tagged releases (GitHub Releases) ship the jar, its SHA-256, the Claude skill bundle, `pharos` and `setup.sh`:
+
+```bash
+./setup.sh --release latest     # or --release v1.4.0; downloads, verifies the checksum, installs
+```
+
+## Upgrading
+
+Upgrades may change the on-disk index format. A release serves its own format and the previous one,
+so existing indexes keep working; re-index when convenient with `./setup.sh --upgrade-indexes`
+(or `pharos upgrade-indexes`). Check status with `pharos index-status`. See [UPGRADING.md](UPGRADING.md)
+and [CHANGELOG.md](CHANGELOG.md).
+
 ## Supported languages
 
 | Language | Parser | Call graph | Knowledge graph |

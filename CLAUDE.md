@@ -124,6 +124,13 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 { "mcpServers": { "pharos": { "command": "java", "args": ["-jar", "codesearch.jar", "mcp-server"] } } }
 ```
 
+## Releasing (maintainers only)
+
+1. Bump the version in `pom.xml` (`X.Y.Z`).
+2. In `CHANGELOG.md`, move `Unreleased` into a new `## [X.Y.Z] - date` section. It must start with an `**Index format:**` line (`N (unchanged)` or `N → M (...)`; `scripts/release-notes.sh X.Y.Z` fails without it). If the format changed, add a section to `UPGRADING.md`.
+3. Run `bash scripts/test-setup.sh` and `mvn -B clean package`.
+4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` workflow checks the tag against the pom version, builds, and publishes the GitHub release (jar, `.sha256`, skill bundle, `pharos`, `setup.sh`).
+
 ## Critical: FAT JAR Gotchas
 
 - The shade plugin **must** include `ServicesResourceTransformer` for Lucene codec SPI discovery. Removing it breaks runtime with `ServiceConfigurationError`.

@@ -172,6 +172,36 @@ t_upgrade_indexes_without_yes_does_not_crash_on_empty_array() {
   check upgrade_indexes_without_yes_no_unbound_var $? "$(tail -4 "$h/out.txt")"
 }
 
+t_release_notes_extracts_and_validates() {
+  local d="$WORK/rn"; mkdir -p "$d/scripts"
+  cp "$REPO/scripts/release-notes.sh" "$d/scripts/" 2>/dev/null
+  cat > "$d/CHANGELOG.md" <<'CL'
+# Changelog
+
+## [Unreleased]
+
+## [1.0.0] - 2026-01-01
+
+**Index format:** 1 (unchanged)
+
+- Thing one
+- Thing two
+
+## [0.9.0] - 2025-12-01
+
+- No format line here
+CL
+  local out rc1 rc2 rc3
+  out="$(bash "$d/scripts/release-notes.sh" 1.0.0 2>/dev/null)"; rc1=$?
+  bash "$d/scripts/release-notes.sh" 0.9.0 >/dev/null 2>&1; rc2=$?
+  bash "$d/scripts/release-notes.sh" 7.7.7 >/dev/null 2>&1; rc3=$?
+  [ "$rc1" = 0 ] && [ "$rc2" = 1 ] && [ "$rc3" = 1 ] \
+    && printf '%s\n' "$out" | grep -q '^\*\*Index format:\*\* 1' \
+    && printf '%s\n' "$out" | grep -q 'Thing two' \
+    && ! printf '%s\n' "$out" | grep -q 'No format line\|^## '
+  check release_notes_extracts_and_validates $? "rc=$rc1/$rc2/$rc3 out=$out"
+}
+
 t_release_install_verifies_and_installs
 t_corrupt_checksum_aborts_without_touching_install
 t_warning_lists_outdated_projects_and_declines_noninteractive
@@ -181,4 +211,5 @@ t_upgrade_indexes_flag
 t_index_status_failure_fails_closed
 t_bad_skill_bundle_leaves_install_untouched
 t_upgrade_indexes_without_yes_does_not_crash_on_empty_array
+t_release_notes_extracts_and_validates
 exit "$FAILED"
