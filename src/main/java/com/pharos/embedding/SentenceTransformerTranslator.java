@@ -8,6 +8,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.translate.Batchifier;
 import ai.djl.translate.Translator;
 import ai.djl.translate.TranslatorContext;
+import com.pharos.config.Pooling;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -29,7 +30,7 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
 
     private final Path tokenizerJson;
     private final int maxLength;
-    private final com.pharos.config.Pooling pooling;
+    private final Pooling pooling;
     private HuggingFaceTokenizer tokenizer;
 
     /**
@@ -37,13 +38,13 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
      * @param maxLength     max token length passed to the tokenizer (e.g. 8192)
      */
     public SentenceTransformerTranslator(Path tokenizerJson, int maxLength) {
-        this(tokenizerJson, maxLength, com.pharos.config.Pooling.MEAN);
+        this(tokenizerJson, maxLength, Pooling.MEAN);
     }
 
-    public SentenceTransformerTranslator(Path tokenizerJson, int maxLength, com.pharos.config.Pooling pooling) {
+    public SentenceTransformerTranslator(Path tokenizerJson, int maxLength, Pooling pooling) {
         this.tokenizerJson = tokenizerJson;
         this.maxLength = maxLength;
-        this.pooling = pooling == null ? com.pharos.config.Pooling.MEAN : pooling;
+        this.pooling = pooling == null ? Pooling.MEAN : pooling;
     }
 
     @Override

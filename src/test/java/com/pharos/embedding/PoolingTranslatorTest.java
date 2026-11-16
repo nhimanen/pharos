@@ -70,6 +70,20 @@ class PoolingTranslatorTest {
     }
 
     @Test
+    void translatorsWithTwoDimensionalOutputAndCls_failClearly() {
+        NDArray pooled = manager.create(new float[][]{{1, 2, 3}, {4, 5, 6}});
+        NDList out = new NDList(pooled);
+        assertThatThrownBy(() -> new BatchSentenceTransformerTranslator(null, 8, Pooling.CLS)
+                .processOutput(ctx(mask(), 2), out))
+                .hasMessageContaining("pooling").hasMessageContaining("mean");
+        NDArray m1 = manager.create(new long[][]{{1, 1}});
+        NDList out1 = new NDList(manager.create(new float[][]{{1, 2, 3}}));
+        assertThatThrownBy(() -> new SentenceTransformerTranslator(null, 8, Pooling.CLS)
+                .processOutput(ctx(m1), out1))
+                .hasMessageContaining("pooling").hasMessageContaining("mean");
+    }
+
+    @Test
     void batchAndSingleAgree() throws Exception {
         for (Pooling p : Pooling.values()) {
             float[][] batch = EmbeddingPooling.pool(hidden(), mask(), p);

@@ -194,6 +194,11 @@ public class EmbeddingProviderConfig {
                     "embeddingProvider['" + modelId + "'].pooling='" + pooling.json() +
                     "' is not supported for type=openai (the remote server pools); remove it");
         }
+        if ("djl".equals(type) && pooling != Pooling.MEAN && !url.startsWith("hf://")) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].pooling='" + pooling.json() +
+                    "' is only supported for hf:// models (this url uses the model zoo's own pooling); remove it");
+        }
         if (dimensions <= 0) {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].dimensions must be > 0");

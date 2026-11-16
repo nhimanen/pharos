@@ -57,6 +57,31 @@ class EmbeddingProviderConfigTest {
     }
 
     @Test
+    void djlNonHfUrlWithCls_failsValidation() {
+        EmbeddingProviderConfig c = base("djl");
+        c.setUrl("djl://ai.djl.huggingface.pytorch/some-model");
+        c.setPooling(Pooling.CLS);
+        assertThatThrownBy(c::validate)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("my-model")
+                .hasMessageContaining("pooling")
+                .hasMessageContaining("hf://");
+    }
+
+    @Test
+    void djlNonHfFallback_underClsParent_isRejected() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getProperty("pharos.home") != null);
+        EmbeddingProviderConfig parent = base("djl");
+        parent.setPooling(Pooling.CLS);
+        EmbeddingProviderConfig fb = base("djl");
+        fb.setUrl("djl://ai.djl.huggingface.pytorch/some-model");
+        parent.getFallbacks().add(fb);
+        assertThatThrownBy(() -> loadWith(parent))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("my-model").hasMessageContaining("hf://");
+    }
+
+    @Test
     void openAiWithPrefixes_andDjlWithCls_validate() {
         EmbeddingProviderConfig o = base("openai");
         o.setQueryPrefix("q: ");
@@ -68,6 +93,8 @@ class EmbeddingProviderConfigTest {
 
     /** Drives the real IndexConfig.load() from config.json under the surefire-isolated pharos.home. */
     private IndexConfig loadWith(EmbeddingProviderConfig parent) throws Exception {
+        // Never write config.json unless surefire isolated the pharos home (e.g. IDE runs).
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getProperty("pharos.home") != null);
         java.nio.file.Path file = IndexConfig.DEFAULT_BASE.resolve("config.json");
         java.nio.file.Files.createDirectories(file.getParent());
         IndexConfig cfg = IndexConfig.defaults();

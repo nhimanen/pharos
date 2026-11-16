@@ -8,6 +8,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.translate.Batchifier;
 import ai.djl.translate.Translator;
 import ai.djl.translate.TranslatorContext;
+import com.pharos.config.Pooling;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -35,7 +36,7 @@ public class BatchSentenceTransformerTranslator implements Translator<List<Strin
 
     private final Path tokenizerJson;
     private final int maxLength;
-    private final com.pharos.config.Pooling pooling;
+    private final Pooling pooling;
     private HuggingFaceTokenizer tokenizer;
 
     /**
@@ -43,13 +44,13 @@ public class BatchSentenceTransformerTranslator implements Translator<List<Strin
      * @param maxLength     per-sequence token limit (same as the single-item translator)
      */
     public BatchSentenceTransformerTranslator(Path tokenizerJson, int maxLength) {
-        this(tokenizerJson, maxLength, com.pharos.config.Pooling.MEAN);
+        this(tokenizerJson, maxLength, Pooling.MEAN);
     }
 
-    public BatchSentenceTransformerTranslator(Path tokenizerJson, int maxLength, com.pharos.config.Pooling pooling) {
+    public BatchSentenceTransformerTranslator(Path tokenizerJson, int maxLength, Pooling pooling) {
         this.tokenizerJson = tokenizerJson;
         this.maxLength = maxLength;
-        this.pooling = pooling == null ? com.pharos.config.Pooling.MEAN : pooling;
+        this.pooling = pooling == null ? Pooling.MEAN : pooling;
     }
 
     @Override
