@@ -138,8 +138,13 @@ class LazyReaderTest {
             w.commit();
         }
         ProjectMeta meta = cluster.writerRegistry.find(JAVA).orElseThrow();
-        return cluster.writerRuntime.publisher().publish(new LocalSnapshot(JAVA, projectDir, meta, "none"))
+        long gen = cluster.writerRuntime.publisher().publish(new LocalSnapshot(JAVA, projectDir, meta, "none"))
                 .orElseThrow().value();
+        List<String> lucene = manifest(gen).files().stream().filter(f -> ManifestFile.LUCENE.equals(f.role()))
+                .map(ManifestFile::name).toList();
+        assertThat(lucene).as("fixture: terms dictionary in its own file").anyMatch(n -> n.endsWith(".tim"));
+        assertThat(lucene).as("fixture: no compound file").noneMatch(n -> n.endsWith(".cfs"));
+        return gen;
     }
 
     private void addMethodAndReindex(String method) throws IOException {
@@ -178,7 +183,8 @@ class LazyReaderTest {
     @Test
     void lazyGenerationHasOnlySmallFiles() throws Exception {
         long gen = publishWithoutCompoundFiles();
-        Node lazy = reader("lazy", LazyReaderTest::small);
+        // eagerMaxBytes 0: only the always-eager names (and empty files) are local, whatever the file sizes
+        Node lazy = reader("lazy", r -> { small(r); r.setEagerMaxBytes(0); });
         Node full = reader("full", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
         lazy.runtime().startServing();
         full.runtime().startServing();
@@ -193,7 +199,7 @@ class LazyReaderTest {
         for (ManifestFile f : m.files()) {
             if (!ManifestFile.LUCENE.equals(f.role())) continue;
             Path local = dir.resolve("lucene").resolve(f.name());
-            if (alwaysEager(f.name()) || f.length() <= EAGER) {
+            if (alwaysEager(f.name()) || f.length() == 0) {
                 assertThat(local).as(f.name()).isRegularFile().hasSize(f.length());
             } else {
                 assertThat(local).as(f.name()).doesNotExist();
