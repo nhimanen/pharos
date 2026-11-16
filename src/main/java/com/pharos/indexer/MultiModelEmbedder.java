@@ -133,6 +133,8 @@ public class MultiModelEmbedder {
         String projectName = meta.getName();
         String modelId = provider.modelId();
         String targetField = DocumentMapper.vectorFieldFor(modelId);
+        // Refuse names whose dir is not a direct child of the index root before any write.
+        ProjectNames.resolveProjectDir(luceneIndexer.getIndexDir(), projectName);
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         // Per-model file: sharing embed-cache.bin with the indexing model meant this command
         // invalidated (and deleted) that model's cache.

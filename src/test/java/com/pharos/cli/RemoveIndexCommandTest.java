@@ -322,4 +322,23 @@ class RemoveIndexCommandTest {
             }
         }
     }
+
+    @Test
+    void removeInvalidNameUnregistersOnlyAndDeletesNothing() throws Exception {
+        Path root = tempDir.resolve("idxroot");
+        Path sib = root.resolve("sibling");
+        java.nio.file.Files.createDirectories(sib);
+        java.nio.file.Files.writeString(sib.resolve("f"), "keep");
+        registry.register(new com.pharos.config.ProjectMeta(".", tempDir.toString(), root.toString()));
+        var buf = new java.io.ByteArrayOutputStream();
+        var old = System.out;
+        System.setOut(new java.io.PrintStream(buf, true));
+        int exit;
+        try { exit = new CommandLine(new RemoveIndexCommand(registry, indexManager)).execute("."); }
+        finally { System.setOut(old); }
+        org.assertj.core.api.Assertions.assertThat(exit).isZero();
+        org.assertj.core.api.Assertions.assertThat(registry.find(".")).isEmpty();
+        org.assertj.core.api.Assertions.assertThat(sib.resolve("f")).hasContent("keep");
+        org.assertj.core.api.Assertions.assertThat(buf.toString()).contains("Nothing was deleted");
+    }
 }

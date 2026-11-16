@@ -7,6 +7,9 @@ import java.nio.file.Path;
  * such as "." or ".." would make the project's index dir the index root itself (or its parent),
  * and deleting the project would delete every project's index.
  *
+ * <p>Enforced at index, remove, delete, writer-open, embed and backfill; the --all loops of the
+ * embed and backfill commands skip invalid registry entries.
+ *
  * <p>Deliberately lenient otherwise (spaces and punctuation are fine); this is not the stricter
  * cluster shard-id rule.
  */

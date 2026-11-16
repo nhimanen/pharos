@@ -358,6 +358,27 @@ public class ProjectIndexManager {
     }
 
     /**
+     * Unregisters a project without touching its files on disk. For registry entries whose name is
+     * invalid (e.g. "."), whose index dir may be the index root: removes the registry entry, its
+     * link back-references and auto-mined synonyms only.
+     */
+    public void unregisterOnly(String projectName) {
+        try (ModuleGraph moduleGraph = moduleGraphBuilder.open()) {
+            moduleGraph.findByProjectName(projectName)
+                    .ifPresent(node -> moduleGraph.downgradeToExternal(node.moduleKey()));
+        } catch (Exception e) {
+            log.warn("Could not update module graph for '{}': {}", projectName, e.getMessage());
+        }
+        try {
+            ConceptMiner.removeProjectSynonyms(config.getSynonymsFile(), projectName);
+        } catch (Exception e) {
+            log.warn("Could not clean synonyms for '{}': {}", projectName, e.getMessage());
+        }
+        registry.unlinkAll(projectName);
+        registry.unregister(projectName);
+    }
+
+    /**
      * Index a project.
      *
      * @param projectRoot        path to the project root directory

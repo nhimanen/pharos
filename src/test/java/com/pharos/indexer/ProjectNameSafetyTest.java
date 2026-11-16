@@ -77,4 +77,37 @@ class ProjectNameSafetyTest {
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("--project");
         assertUntouched();
     }
+
+    @Test
+    void writersRefuseDotAndCreateNothing() throws Exception {
+        assertThatThrownBy(() -> lucene.openWriter(".")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> lucene.openWriterFresh(".")).isInstanceOf(IllegalArgumentException.class);
+        assertThat(indexRoot.resolve("lucene")).doesNotExist();
+        assertThat(indexRoot.resolve("write.lock")).doesNotExist();
+        assertUntouched();
+    }
+
+    @Test
+    void backfillRefusesDot() {
+        var b = new EmbeddingCacheBackfiller(config, lucene, registry);
+        assertThatThrownBy(() -> b.backfill(".")).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--project");
+        assertThat(indexRoot.resolve("embed-cache.bin")).doesNotExist();
+    }
+
+    @Test
+    void embedderRefusesDot() {
+        var e = new MultiModelEmbedder(config, lucene, registry);
+        ProjectMeta meta = registry.find(".").orElseThrow();
+        assertThatThrownBy(() -> e.embed(meta, new NoOpEmbeddingProvider(), "fp", false))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertUntouched();
+    }
+
+    @Test
+    void backfillAllSkipsInvalidEntries() throws Exception {
+        var b = new EmbeddingCacheBackfiller(config, lucene, registry);
+        assertThat(b.backfillAll()).isZero(); // must not throw or touch the index root
+        assertUntouched();
+    }
 }

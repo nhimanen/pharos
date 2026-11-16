@@ -993,6 +993,15 @@ def _resolve_index_dir() -> Path:
     return index_dir
 
 
+def _valid_project_name(index_dir: Path, name) -> bool:
+    """Mirror of com.pharos.indexer.ProjectNames: the name must map to a strict direct child dir."""
+    if not name or not str(name).strip() or name in (".", ".."):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    return (index_dir / name).resolve().parent == index_dir.resolve()
+
+
 def _invalidate_project_embeddings(index_dir: Path, project: str, scope: str) -> int:
     """Set chunkingVersion=0 for files matching scope in a single project's file-state.json.
 
@@ -1046,6 +1055,9 @@ def cmd_invalidate_embeddings(args):
             return
         total = 0
         for project in projects:
+            if not _valid_project_name(index_dir, project):
+                print(f"  '{project}': invalid project name, skipped (see UPGRADING.md)")
+                continue
             n = _invalidate_project_embeddings(index_dir, project, args.scope)
             if n < 0:
                 print(f"  {project}: no file-state.json, skipped")
@@ -1054,6 +1066,9 @@ def cmd_invalidate_embeddings(args):
                 total += n
         print(f"\nDone: {total} {scope_label} file(s) invalidated across {len(projects)} project(s).")
     else:
+        if not _valid_project_name(index_dir, args.project):
+            die(f"Invalid project name '{args.project}': it must be a plain directory name directly "
+                f"under {index_dir}.")
         n = _invalidate_project_embeddings(index_dir, args.project, args.scope)
         if n < 0:
             die(f"No file-state.json found for project '{args.project}' at "

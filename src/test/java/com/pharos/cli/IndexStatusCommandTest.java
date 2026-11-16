@@ -121,4 +121,15 @@ class IndexStatusCommandTest {
         assertThat(buf.toString()).contains("\"name\" : \".\"").contains("\"status\" : \"invalid\"")
                 .contains("\"indexBytes\" : 0");
     }
+
+    @Test
+    void projectsCommandHandlesInvalidEntry() throws Exception {
+        registry.register(new ProjectMeta(".", tmp.toString(), tmp.resolve("indexes").toString()));
+        var buf = new java.io.ByteArrayOutputStream();
+        var old = System.out;
+        System.setOut(new java.io.PrintStream(buf, true));
+        try { assertThat(new picocli.CommandLine(new ProjectsCommand(registry)).execute()).isZero(); }
+        finally { System.setOut(old); }
+        assertThat(buf.toString()).contains("invalid name");
+    }
 }

@@ -76,6 +76,11 @@ public class EmbeddingCacheBackfiller {
         int total = 0;
         int failed = 0;
         for (var meta : projects) {
+            if (!ProjectNames.isValid(meta.getName())) {
+                System.err.printf("Skipping invalid project name '%s' (registry entry; see UPGRADING.md)%n",
+                        meta.getName());
+                continue;
+            }
             System.out.printf("%n=== Backfilling '%s' ===%n", meta.getName());
             try {
                 total += backfill(meta.getName());
@@ -98,6 +103,7 @@ public class EmbeddingCacheBackfiller {
         registry.find(projectName)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown project: " + projectName));
 
+        ProjectNames.resolveProjectDir(luceneIndexer.getIndexDir(), projectName);
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         String modelFp = IndexVersions.modelFingerprint(config);
         int dims = config.getEmbeddingDimensions();
