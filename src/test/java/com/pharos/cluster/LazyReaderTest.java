@@ -320,6 +320,64 @@ class LazyReaderTest {
                         "activating it anyway"));
     }
 
+    /**
+     * I1: a sync downloads each remote file's head and warm-opens the generation before activating
+     * it, so neither that open nor a query's later open fetches a block.
+     */
+    @Test
+    void freshLazyGenerationOpensWithoutFetching() throws Exception {
+        long gen = publishWithoutCompoundFiles();
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        rc.setEagerMaxBytes(0);
+        rc.setPrefetchExtensions(List.of());
+        Path cacheDir = tmp.resolve("edges-cache");
+        ReplicaSource source = new ObjectStoreReplicaSource(store, layout);
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ReplicaSyncer.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        try (LazyGenerations lazy = new LazyGenerations(cacheDir, rc, source);
+             ReplicaSyncer syncer = new ReplicaSyncer(new ObjectStoreCatalog(store, layout), source,
+                     new ReaderLocalCache(cacheDir), ProjectRegistry.at(tmp.resolve("edges-registry.json")),
+                     cacheDir, null, Duration.ofSeconds(10), lazy)) {
+            syncer.syncOnce();
+            assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(gen)));
+            Path lucene = cacheDir.resolve(JAVA).resolve("gen-" + gen).resolve("lucene");
+            for (ManifestFile f : manifest(gen).files()) {
+                if (ManifestFile.LUCENE.equals(f.role()) && !alwaysEager(f.name())) {
+                    assertThat(RemoteDirectory.headFile(lucene, f.name())).as(f.name())
+                            .hasSize(Math.min(f.length(), RemoteDirectory.HEAD_BYTES));
+                }
+            }
+            BlockCache blocks = lazy.blockCache();
+            assertThat(blocks.stats().bytesFetched()).as("the warm open fetched nothing").isZero();
+            try (Directory dir = lazy.open(lucene); DirectoryReader reader = DirectoryReader.open(dir)) {
+                assertThat(reader.maxDoc()).isPositive();
+            }
+            assertThat(blocks.stats().bytesFetched()).isZero();
+        } finally {
+            logger.detachAppender(log);
+        }
+        assertThat(log.list.stream().map(ILoggingEvent::getFormattedMessage))
+                .anySatisfy(m -> assertThat(m).contains("opened generation " + gen, "before activating"));
+    }
+
+    /** M8: the per-query existence check of a lazy generation reads its manifest, not the block cache. */
+    @Test
+    void indexExistsOnALazyGenerationBuildsNoRemoteDirectory() throws Exception {
+        long gen = publishWithoutCompoundFiles();
+        Node node = reader("exists", LazyReaderTest::small);
+        node.runtime().startServing();
+        Path lucene = node.genDir(gen).resolve("lucene");
+        try (LazyGenerations fresh = new LazyGenerations(tmp.resolve("other-cache"),
+                node.config().getCluster().getReader(), new ObjectStoreReplicaSource(store, layout))) {
+            assertThat(fresh.indexExists(lucene)).isTrue();
+            assertThat(fresh.blockCacheDir()).as("no remote directory, so no block cache").isNull();
+            assertThat(fresh.indexExists(tmp.resolve("nowhere").resolve("lucene"))).isFalse();
+        }
+    }
+
     @Test
     void singleNodeNeverBuildsRemoteClasses() throws Exception {
         IndexConfig config = IndexConfig.defaults();

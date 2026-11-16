@@ -195,8 +195,8 @@ public class LuceneIndexer implements Closeable {
 
     private boolean indexExists(Path luceneDir) {
         if (!Files.exists(luceneDir)) return false;
-        try (Directory dir = openDirectory(luceneDir)) {
-            return DirectoryReader.indexExists(dir);
+        try {
+            return directoryFactory.indexExists(luceneDir);
         } catch (IOException e) {
             return false;
         }

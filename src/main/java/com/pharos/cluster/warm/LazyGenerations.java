@@ -116,7 +116,21 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         Path genDir = luceneDir.toAbsolutePath().getParent();
         if (!isLazy(genDir)) return FSDirectory.open(luceneDir);
         ShardManifest manifest = manifest(genDir);
-        return new RemoteDirectory(new ShardId(manifest.shard()), manifest, luceneDir, blockCache(), source);
+        return new RemoteDirectory(new ShardId(manifest.shard()), manifest, luceneDir, blockCache(), source, true);
+    }
+
+    /** A lazy generation exists when its manifest names a commit whose {@code segments_N} is on disk. */
+    @Override
+    public boolean indexExists(Path luceneDir) throws IOException {
+        Path genDir = luceneDir.toAbsolutePath().getParent();
+        if (!isLazy(genDir)) return LuceneDirectoryFactory.super.indexExists(luceneDir);
+        for (ManifestFile f : manifest(genDir).files()) {
+            if (ManifestFile.LUCENE.equals(f.role()) && f.name().startsWith("segments_")
+                    && Files.isRegularFile(luceneDir.resolve(f.name()))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ShardManifest manifest(Path genDir) throws IOException {
@@ -146,32 +160,64 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     // ---------------------------------------------------------------- prefetch
 
     /**
-     * Starts fetching every block of the generation's remote (not eager) Lucene files whose
-     * extension is one of {@code prefetchExtensions}, on the cache's prefetch pool. The future
-     * completes when all are cached (or skipped), exceptionally when one fails.
-     *
-     * @return the future and the number of blocks requested
+     * Starts, on the cache's prefetch pool: the download of every remote (not eager) Lucene file's
+     * head sidecar into {@code luceneDir} (see {@link RemoteDirectory#headFile}), and the fetch of
+     * every block of the remote files whose extension is one of {@code prefetchExtensions}. The
+     * future completes when all are done (blocks cached or skipped), exceptionally when one fails.
+     * A head is written to a temp file and moved into place, so a sidecar is complete or absent.
      */
-    public Prefetch prefetch(ShardManifest manifest) throws IOException {
+    public Prefetch prefetch(ShardManifest manifest, Path luceneDir) throws IOException {
         ShardId shard = new ShardId(manifest.shard());
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         long bytes = 0;
+        int blocks = 0;
         BlockCache cache = null;
+        Path edges = luceneDir.resolve(RemoteDirectory.EDGES_DIR);
         for (ManifestFile f : manifest.files()) {
             if (!ManifestFile.LUCENE.equals(f.role()) || eager(f) || f.length() == 0) continue;
+            if (cache == null) {
+                cache = blockCache();
+                Files.createDirectories(edges); // tasks never create it: a moved partial dir stays gone
+            }
+            futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir)));
             String name = f.name();
             if (!prefetchExtensions.contains(name.substring(name.lastIndexOf('.') + 1))) continue;
-            if (cache == null) cache = blockCache();
             CachingRemoteIndexInput.RemoteFile remote =
                     new CachingRemoteIndexInput.RemoteFile(shard, manifest.generation(), f, cache, source);
-            futures.addAll(remote.prefetchAll());
+            List<CompletableFuture<Void>> fileBlocks = remote.prefetchAll();
+            futures.addAll(fileBlocks);
+            blocks += fileBlocks.size();
             bytes += f.length();
         }
-        return new Prefetch(CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)), futures.size(), bytes);
+        return new Prefetch(CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)),
+                futures.size() - blocks, blocks, bytes);
     }
 
-    /** A started prefetch: {@code done} completes when its {@code blocks} blocks ({@code bytes} bytes) are in. */
-    public record Prefetch(CompletableFuture<Void> done, int blocks, long bytes) {}
+    private void downloadHead(ManifestFile f, Path luceneDir) throws IOException {
+        Path target = RemoteDirectory.headFile(luceneDir, f.name());
+        int len = (int) Math.min(RemoteDirectory.HEAD_BYTES, f.length());
+        byte[] head;
+        try (java.io.InputStream in = source.openRange(f, 0, len)) {
+            head = in.readNBytes(len);
+        }
+        if (head.length != len) {
+            throw new IOException("short head of " + f.key() + ": " + head.length + " of " + len + " bytes");
+        }
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            Files.write(tmp, head);
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * A started prefetch: {@code done} completes when its {@code heads} head sidecars and its
+     * {@code blocks} blocks ({@code bytes} bytes of files) are in.
+     */
+    public record Prefetch(CompletableFuture<Void> done, int heads, int blocks, long bytes) {}
 
     // ---------------------------------------------------------------- block cache
 

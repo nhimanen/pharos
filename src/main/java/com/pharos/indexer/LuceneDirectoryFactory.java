@@ -21,4 +21,14 @@ public interface LuceneDirectoryFactory {
     LuceneDirectoryFactory DEFAULT = FSDirectory::open;
 
     Directory open(Path luceneDir) throws IOException;
+
+    /**
+     * True when {@code luceneDir} holds a commit. Called before every reader lookup, so a factory
+     * whose directories are costly to build should answer it without opening one.
+     */
+    default boolean indexExists(Path luceneDir) throws IOException {
+        try (Directory dir = open(luceneDir)) {
+            return org.apache.lucene.index.DirectoryReader.indexExists(dir);
+        }
+    }
 }

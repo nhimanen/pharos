@@ -328,6 +328,33 @@ public final class BlockCache implements Closeable {
         }
     }
 
+    /** Work that may throw an {@link IOException}. */
+    @FunctionalInterface
+    interface IoTask {
+        void run() throws IOException;
+    }
+
+    /**
+     * Runs {@code task} on the prefetch pool (speculative work that must never delay an acquire);
+     * the future fails when the task does or the cache is closed.
+     */
+    CompletableFuture<Void> runOnPrefetchPool(IoTask task) {
+        CompletableFuture<Void> f = new CompletableFuture<>();
+        try {
+            prefetchers.execute(() -> {
+                try {
+                    task.run();
+                    f.complete(null);
+                } catch (Throwable t) {
+                    f.completeExceptionally(t);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            f.completeExceptionally(new IllegalStateException("block cache " + dir + " is closed", e));
+        }
+        return f;
+    }
+
     private static IllegalArgumentException lengthMismatch(BlockKey key, long asked, long known) {
         return new IllegalArgumentException("block " + key.index() + " of '" + key.objectKey()
                 + "' requested with length " + asked + " but it is " + known + " bytes long");

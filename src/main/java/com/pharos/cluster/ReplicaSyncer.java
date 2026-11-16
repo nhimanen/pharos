@@ -9,6 +9,7 @@ import com.pharos.graph.GraphViews;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
@@ -36,6 +37,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -83,7 +85,9 @@ import java.util.zip.CheckedInputStream;
  * <p><b>Lazy mode</b> (a {@link LazyGenerations} is given): only the eager Lucene files
  * ({@link LazyGenerations#eager}) are downloaded (or hard-linked) and checksummed, the graph as
  * before; the stamp, the manifest and the {@value LazyGenerations#MARKER} marker are written; then
- * the blocks of the {@code prefetchExtensions} files are prefetched, waiting at most
+ * the first bytes of every remote file are downloaded as head sidecars, the blocks of the
+ * {@code prefetchExtensions} files are prefetched, and a reader is opened and closed on the
+ * generation (Lucene's per-file header and footer reads then cost no fetch), all within
  * {@code prefetchTimeoutSeconds} (after which a WARN is logged and the generation is activated
  * anyway, the prefetch going on in the background); only then is the dir moved to {@code gen-N},
  * registered and activated. The previous generation serves meanwhile. A lazy dir is adopted on
@@ -377,7 +381,7 @@ public class ReplicaSyncer implements Closeable {
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
         if (lazy != null) {
             Files.write(partial.resolve(LazyGenerations.MARKER), new byte[0]);
-            prefetch(shard, gen, manifest);
+            prefetch(shard, gen, manifest, lucene);
         }
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
         if (lazy == null) {
@@ -391,34 +395,70 @@ public class ReplicaSyncer implements Closeable {
     }
 
     /**
-     * Lazy mode: prefetches the generation's {@code prefetchExtensions} blocks, waiting at most the
-     * prefetch timeout. Neither a timeout nor a failed prefetch stops the activation: the blocks
-     * are fetched when a query first needs them.
+     * Lazy mode, before the generation is activated and all within one prefetch timeout: downloads
+     * the remote files' head sidecars and prefetches the {@code prefetchExtensions} blocks, then
+     * opens (and closes) a reader on the generation, so a query's first open costs no fetch. Neither a
+     * timeout nor a failure stops the activation: whatever is missing is fetched on first read.
      */
-    private void prefetch(ShardId shard, Generation gen, ShardManifest manifest) throws IOException {
+    private void prefetch(ShardId shard, Generation gen, ShardManifest manifest, Path lucene) throws IOException {
         Duration timeout = lazy.prefetchTimeout();
         long start = System.nanoTime();
-        LazyGenerations.Prefetch p = lazy.prefetch(manifest);
-        if (p.blocks() == 0) return;
+        long deadline = start + timeout.toNanos();
+        LazyGenerations.Prefetch p = lazy.prefetch(manifest, lucene);
+        if (p.heads() == 0 && p.blocks() == 0) return;
         if (timeout.isZero()) { // configured not to wait
-            log.info("Shard {}: prefetching {} blocks of generation {} in the background", shard, p.blocks(),
-                    gen.value());
+            log.info("Shard {}: prefetching {} heads and {} blocks of generation {} in the background", shard,
+                    p.heads(), p.blocks(), gen.value());
             return;
         }
         try {
-            p.done().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-            log.info("Shard {}: prefetched {} blocks ({} bytes) of generation {} in {} ms", shard, p.blocks(),
-                    p.bytes(), gen.value(), (System.nanoTime() - start) / 1_000_000);
+            p.done().get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            log.info("Shard {}: prefetched {} heads and {} blocks ({} bytes) of generation {} in {} ms", shard,
+                    p.heads(), p.blocks(), p.bytes(), gen.value(), (System.nanoTime() - start) / 1_000_000);
         } catch (java.util.concurrent.TimeoutException e) {
-            log.warn("Shard {}: the prefetch of generation {} ({} blocks, {} bytes) did not finish within {} s;"
-                    + " activating it anyway (the prefetch goes on in the background)", shard, gen.value(),
-                    p.blocks(), p.bytes(), timeout.toSeconds());
+            log.warn("Shard {}: the prefetch of generation {} ({} heads, {} blocks, {} bytes) did not finish within"
+                    + " {} s; activating it anyway (the prefetch goes on in the background)", shard, gen.value(),
+                    p.heads(), p.blocks(), p.bytes(), timeout.toSeconds());
+            return;
         } catch (java.util.concurrent.ExecutionException e) {
             log.warn("Shard {}: the prefetch of generation {} failed; activating it anyway (blocks are fetched"
                     + " when first read): {}", shard, gen.value(), String.valueOf(e.getCause()));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new java.io.InterruptedIOException("interrupted prefetching generation " + gen.value()
+                    + " of shard " + shard);
+        }
+        warmOpen(shard, gen, lucene, deadline, timeout);
+    }
+
+    /** Opens and closes a reader on the not yet activated generation, waiting until {@code deadline}. */
+    private void warmOpen(ShardId shard, Generation gen, Path lucene, long deadline, Duration timeout)
+            throws IOException {
+        long start = System.nanoTime();
+        CompletableFuture<Void> open = CompletableFuture.runAsync(() -> {
+            try (Directory dir = lazy.open(lucene); DirectoryReader reader = DirectoryReader.open(dir)) {
+                reader.maxDoc();
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }, r -> {
+            Thread t = new Thread(r, "pharos-warm-open-" + shard);
+            t.setDaemon(true);
+            t.start();
+        });
+        try {
+            open.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            log.info("Shard {}: opened generation {} before activating it in {} ms", shard, gen.value(),
+                    (System.nanoTime() - start) / 1_000_000);
+        } catch (java.util.concurrent.TimeoutException e) {
+            log.warn("Shard {}: opening generation {} did not finish within the prefetch timeout of {} s;"
+                    + " activating it anyway", shard, gen.value(), timeout.toSeconds());
+        } catch (java.util.concurrent.ExecutionException e) {
+            log.warn("Shard {}: opening generation {} before activating it failed; activating it anyway: {}",
+                    shard, gen.value(), String.valueOf(e.getCause()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new java.io.InterruptedIOException("interrupted opening generation " + gen.value()
                     + " of shard " + shard);
         }
     }
