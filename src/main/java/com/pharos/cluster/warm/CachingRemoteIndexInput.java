@@ -263,6 +263,8 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         final ReplicaSource source;
         final int blockSize;
         final long length;
+        /** {@link BlockCache#objectHash} of the file's key: hashed once, not on every buffer refill. */
+        final String objectHash;
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source) {
             this.shard = Objects.requireNonNull(shard, "shard");
@@ -272,6 +274,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             this.source = Objects.requireNonNull(source, "source");
             this.blockSize = cache.blockSize();
             this.length = file.length();
+            this.objectHash = BlockCache.objectHash(file.key());
         }
 
         /** "shard S generation N file F (object key K)", for every error this file reports. */
@@ -339,7 +342,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             long last = (abs + len - 1) / blockSize;
             for (long i = first; i <= last; i++) {
                 try {
-                    cache.prefetch(new BlockKey(file.key(), i), blockLength(i), this);
+                    cache.prefetch(new BlockKey(file.key(), i), objectHash, blockLength(i), this);
                 } catch (RuntimeException e) {
                     return; // advisory: the read that needs the block reports the problem
                 }
@@ -352,7 +355,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
 
         private BlockCache.Lease acquire(long index) throws IOException {
             try {
-                return cache.acquire(new BlockKey(file.key(), index), blockLength(index), this);
+                return cache.acquire(new BlockKey(file.key(), index), objectHash, blockLength(index), this);
             } catch (InterruptedIOException e) {
                 InterruptedIOException x = new InterruptedIOException("interrupted reading block " + index + " of "
                         + where());
