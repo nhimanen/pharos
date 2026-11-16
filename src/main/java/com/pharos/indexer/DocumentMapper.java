@@ -731,31 +731,35 @@ public class DocumentMapper {
     }
 
     /**
-     * Reader-aware {@link #vectorFieldFor(String)}. Indexes written by 1.4.0/1.4.1 with a
-     * {@code legacy}-model provider stored vectors under {@code vec.legacy}, not the
-     * {@code vectorEmbedding} field search reads. For the legacy model, when this reader has
-     * no {@code vectorEmbedding} field but does have {@code vec.legacy}, read that one, so
-     * those indexes keep serving vector search without a re-embed.
+     * Every KNN field that may hold this model's vectors. One entry except for the legacy model:
+     * indexes written by 1.4.0/1.4.1 stored its vectors under {@code vec.legacy}, newer ones (and
+     * incremental runs that rewrote only some docs) under {@code vectorEmbedding}, so one index,
+     * or one multi-project reader, can hold both. Each document carries at most one of them.
      */
-    public static String vectorFieldFor(String modelId, org.apache.lucene.index.IndexReader reader) {
-        return resolveLegacy(modelId, reader, vectorFieldFor(modelId), vectorFieldName(modelId));
+    public static List<String> vectorFieldCandidates(String modelId) {
+        return com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId)
+                ? List.of(F_VECTOR_LEGACY, vectorFieldName(modelId))
+                : List.of(vectorFieldFor(modelId));
     }
 
-    /** Reader-aware {@link #chunkVectorFieldFor(String)}; see {@link #vectorFieldFor(String, org.apache.lucene.index.IndexReader)}. */
-    public static String chunkVectorFieldFor(String modelId, org.apache.lucene.index.IndexReader reader) {
-        return resolveLegacy(modelId, reader, chunkVectorFieldFor(modelId), chunkVectorFieldName(modelId));
+    /** Counterpart of {@link #vectorFieldCandidates(String)} for the chunk-vectors field. */
+    public static List<String> chunkVectorFieldCandidates(String modelId) {
+        return com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId)
+                ? List.of(F_CHUNK_VECTORS_LEGACY, chunkVectorFieldName(modelId))
+                : List.of(chunkVectorFieldFor(modelId));
     }
 
-    private static String resolveLegacy(String modelId, org.apache.lucene.index.IndexReader reader,
-                                         String primary, String misnamed) {
-        if (!com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId) || reader == null) return primary;
-        boolean hasPrimary = false, hasMisnamed = false;
-        for (org.apache.lucene.index.LeafReaderContext ctx : reader.leaves()) {
-            var fis = ctx.reader().getFieldInfos();
-            hasPrimary |= fis.fieldInfo(primary) != null;
-            hasMisnamed |= fis.fieldInfo(misnamed) != null;
+    /** The {@link #vectorFieldCandidates} actually present in some leaf of {@code reader}; never empty. */
+    public static List<String> vectorFieldsPresent(String modelId, org.apache.lucene.index.IndexReader reader) {
+        List<String> cands = vectorFieldCandidates(modelId);
+        if (cands.size() == 1 || reader == null) return cands;
+        List<String> out = new java.util.ArrayList<>(2);
+        for (String f : cands) {
+            for (org.apache.lucene.index.LeafReaderContext ctx : reader.leaves()) {
+                if (ctx.reader().getFieldInfos().fieldInfo(f) != null) { out.add(f); break; }
+            }
         }
-        return !hasPrimary && hasMisnamed ? misnamed : primary;
+        return out.isEmpty() ? List.of(cands.get(0)) : out;
     }
 
     private static String sanitizeModelId(String modelId) {
