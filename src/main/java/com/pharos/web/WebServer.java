@@ -48,6 +48,8 @@ public class WebServer {
     /** Readers have no module graph yet (it is not replicated): module endpoints answer 501. */
     private final boolean readerNode;
     private final ObjectMapper mapper;
+    /** False while a reader's first sync is running; see {@link #setReadiness}. */
+    private volatile java.util.function.BooleanSupplier readiness = () -> true;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -68,6 +70,25 @@ public class WebServer {
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     }
+
+    /**
+     * Readiness reported by {@code /health} ({@code {"status":"syncing","ready":false}} until it
+     * turns true) and warned about on searches answered before it does.
+     */
+    public void setReadiness(java.util.function.BooleanSupplier readiness) {
+        this.readiness = java.util.Objects.requireNonNull(readiness, "readiness");
+    }
+
+    /** Health payload: HTTP 200 either way (liveness); {@code ready} tells whether the first sync is done. */
+    Map<String, Object> health() {
+        boolean ready = readiness.getAsBoolean();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", ready ? "ok" : "syncing");
+        out.put("ready", ready);
+        return out;
+    }
+
+    static final String SYNCING_WARNING = "reader is still running its first sync; results may be incomplete";
 
     /** Module endpoints need the module graph, which reader nodes do not have yet: 501. */
     private boolean refuseOnReader(io.javalin.http.Context ctx) {
@@ -202,6 +223,10 @@ public class WebServer {
             int snippetLines    = ctx.queryParamAsClass("snippetLines", Integer.class).getOrDefault(15);
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
                     project, null, limit, "text", docType, scope, oversample);
+            if (!readiness.getAsBoolean()) {
+                log.warn("Search '{}' answered before the first sync finished", q);
+                ctx.header("X-Pharos-Warning", SYNCING_WARNING);
+            }
             try {
                 SearchResponse resp = searchEngine.searchWithTrace(req, false);
                 List<SearchResult> decorated = searchEngine
@@ -585,7 +610,7 @@ public class WebServer {
         });
 
         // Health check (used by daemon client to detect readiness)
-        app.get("/health", ctx -> ctx.json(Map.of("status", "ok")));
+        app.get("/health", ctx -> ctx.json(health()));
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);

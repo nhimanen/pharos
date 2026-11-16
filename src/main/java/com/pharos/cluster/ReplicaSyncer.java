@@ -152,6 +152,11 @@ public class ReplicaSyncer implements Closeable {
 
     /** Runs {@link #syncOnce} now and then every {@code pollInterval} on one daemon thread. */
     public void start() {
+        start(Duration.ZERO);
+    }
+
+    /** Runs {@link #syncOnce} after {@code initialDelay}, then every {@code pollInterval}. */
+    public void start(Duration initialDelay) {
         synchronized (lifecycleLock) {
             if (closed) throw new IllegalStateException("syncer is closed");
             if (scheduler != null) return;
@@ -160,7 +165,8 @@ public class ReplicaSyncer implements Closeable {
                 t.setDaemon(true);
                 return t;
             });
-            scheduler.scheduleWithFixedDelay(this::syncQuietly, 0, pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+            scheduler.scheduleWithFixedDelay(this::syncQuietly, initialDelay.toMillis(), pollInterval.toMillis(),
+                    TimeUnit.MILLISECONDS);
         }
     }
 

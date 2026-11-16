@@ -41,7 +41,7 @@ public class McpServerCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         try {
-            clusterRuntime.startServing(); // readers: first sync before the first request
+            clusterRuntime.startServing(); // readers: wait for the first sync pass (failures are logged and retried)
         } catch (Exception e) {
             // stdout is the JSON-RPC channel: report on stderr only
             System.err.println("Cannot start serving: " + e.getMessage());
