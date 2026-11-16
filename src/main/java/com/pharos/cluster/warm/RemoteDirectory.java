@@ -46,6 +46,8 @@ public final class RemoteDirectory extends BaseDirectory {
     private final Path eagerDir;
     private final BlockCache cache;
     private final ReplicaSource source;
+    /** Serve heads from sidecars and footers from the manifest (lazy generations). */
+    private final boolean edges;
     private FSDirectory eager; // guarded by this; opened on first use
 
     /**
@@ -54,7 +56,19 @@ public final class RemoteDirectory extends BaseDirectory {
      */
     public RemoteDirectory(ShardId shard, ShardManifest manifest, Path eagerDir, BlockCache cache,
                            ReplicaSource source) {
+        this(shard, manifest, eagerDir, cache, source, false);
+    }
+
+    /**
+     * @param edges serve each remote file's first bytes from its head sidecar
+     *              ({@code <eagerDir>/}{@value #EDGES_DIR}{@code /<name>.head}, when present with the
+     *              right length) and its last 16 bytes from a footer built from the manifest checksum
+     *              (only for Lucene files: the manifest's checksum must be the footer's)
+     */
+    public RemoteDirectory(ShardId shard, ShardManifest manifest, Path eagerDir, BlockCache cache,
+                           ReplicaSource source, boolean edges) {
         super(NoLockFactory.INSTANCE);
+        this.edges = edges;
         this.shard = Objects.requireNonNull(shard, "shard");
         this.generation = manifest.generation();
         this.eagerDir = eagerDir;
@@ -90,8 +104,8 @@ public final class RemoteDirectory extends BaseDirectory {
             if (Files.size(local) != f.length()) redownload(local, f);
             return eager().openInput(name, context);
         }
-        CachingRemoteIndexInput.RemoteFile remote =
-                new CachingRemoteIndexInput.RemoteFile(shard, generation, f, cache, source);
+        CachingRemoteIndexInput.RemoteFile remote = new CachingRemoteIndexInput.RemoteFile(shard, generation, f,
+                cache, source, edges ? head(f) : null, edges);
         return new CachingRemoteIndexInput("CachingRemoteIndexInput(" + remote.where() + ")", remote);
     }
 
@@ -120,6 +134,28 @@ public final class RemoteDirectory extends BaseDirectory {
             throw new IOException("cannot repair the eager copy " + local + " of " + where + ": " + e.getMessage(), e);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Sidecar dir of the head files, inside the eager dir (invisible to Lucene: listAll is the manifest). */
+    public static final String EDGES_DIR = ".edges";
+    /** Bytes of a file kept in its head sidecar (Lucene's header is far shorter). */
+    public static final int HEAD_BYTES = 4096;
+
+    /** The head sidecar of file {@code name} in {@code eagerDir}. */
+    public static Path headFile(Path eagerDir, String name) {
+        return eagerDir.resolve(EDGES_DIR).resolve(name + ".head");
+    }
+
+    /** The head sidecar's bytes when it has exactly the expected length; null otherwise. */
+    private byte[] head(ManifestFile f) {
+        if (eagerDir == null) return null;
+        Path p = headFile(eagerDir, f.name());
+        try {
+            if (!Files.isRegularFile(p) || Files.size(p) != Math.min(HEAD_BYTES, f.length())) return null;
+            return Files.readAllBytes(p);
+        } catch (IOException e) {
+            return null; // read through the cache instead
         }
     }
 

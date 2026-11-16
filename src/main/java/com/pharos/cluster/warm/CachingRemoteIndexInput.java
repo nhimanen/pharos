@@ -3,6 +3,7 @@ package com.pharos.cluster.warm;
 import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.objectstore.ManifestFile;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.BitUtil;
@@ -32,6 +33,14 @@ import java.util.Objects;
  * copying the file. Lucene then scores vectors through its generic path, which sums in another
  * order than over an {@code MMapDirectory}, so a KNN score can differ from a full local copy's in
  * the last bit (it matches an {@code NIOFSDirectory} exactly).
+ *
+ * <p><b>Edges.</b> Opening a Lucene reader reads every file's header and its 16-byte footer. When the
+ * directory has a head sidecar for the file (its first bytes, downloaded with the generation), reads
+ * inside it are served from memory; with footer synthesis on, reads inside the last 16 bytes are
+ * served from a footer built from the manifest's checksum ({@link CodecUtil#writeFooter}'s layout).
+ * Neither touches the block cache. A block holding the real footer is compared with the synthesised
+ * one whenever it is acquired: on a mismatch the block is dropped from the cache and the read fails
+ * naming the object key (a corrupt object, or a corrupt cached block, which the next read refetches).
  *
  * <p>All multi-byte reads are little-endian, as everywhere in Lucene. A read past the end of the
  * input (or slice) throws {@link EOFException}. A failed fetch is rethrown as an {@link IOException}
@@ -316,8 +325,23 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         final long length;
         /** {@link BlockCache#objectHash} of the file's key: hashed once, not on every buffer refill. */
         final String objectHash;
+        /** The file's first {@code head.length} bytes (a sidecar); empty without one. */
+        final byte[] head;
+        /** The file's last 16 bytes, built from the manifest; null without footer synthesis. */
+        final byte[] footer;
+        final long footerStart;
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source) {
+            this(shard, generation, file, cache, source, null, false);
+        }
+
+        /**
+         * @param head        the file's first bytes, or null
+         * @param synthFooter serve the last 16 bytes from {@link #footerOf} (a Lucene file whose manifest
+         *                    checksum is its footer checksum)
+         */
+        RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source,
+                   byte[] head, boolean synthFooter) {
             this.shard = Objects.requireNonNull(shard, "shard");
             this.generation = generation;
             this.file = Objects.requireNonNull(file, "file");
@@ -326,6 +350,42 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             this.blockSize = cache.blockSize();
             this.length = file.length();
             this.objectHash = BlockCache.objectHash(file.key());
+            this.head = head == null || head.length > length ? new byte[0] : head;
+            this.footer = synthFooter ? footerOf(file) : null;
+            this.footerStart = length - FOOTER;
+        }
+
+        static final int FOOTER = 16;
+
+        /**
+         * The footer {@link CodecUtil#writeFooter} wrote: big-endian {@code FOOTER_MAGIC}, algorithm id
+         * 0, and the checksum; null when the file is too short or the checksum is not a CRC32 value.
+         */
+        static byte[] footerOf(ManifestFile f) {
+            if (f.length() < FOOTER || f.checksum() == null) return null;
+            long crc;
+            try {
+                crc = Long.parseUnsignedLong(f.checksum(), 16);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            if ((crc & 0xFFFFFFFF00000000L) != 0) return null;
+            return ByteBuffer.allocate(FOOTER).putInt(CodecUtil.FOOTER_MAGIC).putInt(0).putLong(crc).array();
+        }
+
+        /** Copies from {@code abs} out of the head or the footer when it lies there; -1 otherwise. */
+        private int copyEdge(long abs, byte[] dst, int off, int len) {
+            if (abs < head.length) {
+                int n = (int) Math.min(len, head.length - abs);
+                System.arraycopy(head, (int) abs, dst, off, n);
+                return n;
+            }
+            if (footer != null && abs >= footerStart) {
+                int n = (int) Math.min(len, length - abs);
+                System.arraycopy(footer, (int) (abs - footerStart), dst, off, n);
+                return n;
+            }
+            return -1;
         }
 
         /** "shard S generation N file F (object key K)", for every error this file reports. */
@@ -364,6 +424,13 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         /** Copies {@code len} bytes at {@code abs} into {@code dst}, one short lease per block. */
         void copy(long abs, byte[] dst, int off, int len) throws IOException {
             while (len > 0) {
+                int edge = copyEdge(abs, dst, off, len);
+                if (edge > 0) {
+                    abs += edge;
+                    off += edge;
+                    len -= edge;
+                    continue;
+                }
                 long index = abs / blockSize;
                 long inBlock = abs - index * blockSize;
                 try (BlockCache.Lease lease = acquire(index)) {
@@ -378,6 +445,8 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
 
         /** Copies from {@code abs} up to the end of its block or of {@code dst}; returns the count. */
         int copyWithinBlock(long abs, byte[] dst) throws IOException {
+            int edge = copyEdge(abs, dst, 0, dst.length);
+            if (edge > 0) return edge;
             long index = abs / blockSize;
             long inBlock = abs - index * blockSize;
             try (BlockCache.Lease lease = acquire(index)) {
@@ -415,8 +484,10 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         }
 
         private BlockCache.Lease acquire(long index) throws IOException {
+            BlockKey key = new BlockKey(file.key(), index);
+            BlockCache.Lease lease;
             try {
-                return cache.acquire(new BlockKey(file.key(), index), objectHash, blockLength(index), this);
+                lease = cache.acquire(key, objectHash, blockLength(index), this);
             } catch (InterruptedIOException e) {
                 InterruptedIOException x = new InterruptedIOException("interrupted reading block " + index + " of "
                         + where());
@@ -425,6 +496,23 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             } catch (IOException | RuntimeException e) {
                 throw new IOException("cannot read block " + index + " of " + where() + ": " + e.getMessage(), e);
             }
+            if (footer != null) checkFooter(key, index, lease);
+            return lease;
+        }
+
+        /** A block holding the whole footer must end with the synthesised one. */
+        private void checkFooter(BlockKey key, long index, BlockCache.Lease lease) throws IOException {
+            long inBlock = footerStart - index * blockSize;
+            if (inBlock < 0 || inBlock + FOOTER > lease.length()) return;
+            if (MemorySegment.mismatch(lease.segment(), inBlock, inBlock + FOOTER,
+                    MemorySegment.ofArray(footer), 0, FOOTER) < 0) {
+                return;
+            }
+            cache.invalidate(key, objectHash);
+            lease.close();
+            throw new IOException("block " + index + " of " + where() + " does not end with the footer that the"
+                    + " manifest's checksum " + file.checksum() + " implies (corrupt object or cached block);"
+                    + " dropped it from the cache");
         }
     }
 }

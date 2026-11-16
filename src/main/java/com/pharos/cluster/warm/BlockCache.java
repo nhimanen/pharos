@@ -815,6 +815,19 @@ public final class BlockCache implements Closeable {
         }
     }
 
+    /**
+     * Drops block {@code key} from the cache (its bytes failed a check by the reader); the next acquire
+     * fetches it again. Open leases keep their mapping until they close.
+     */
+    void invalidate(BlockKey key, String hash) {
+        Cleanup cleanup = new Cleanup();
+        synchronized (lock) {
+            Entry e = entries.get(hash + "/" + key.index());
+            if (e != null) drop(e, cleanup);
+        }
+        cleanup.run();
+    }
+
     /** True when block {@code key} is in the cache now (on disk); in-flight fetches don't count. */
     public boolean isCached(BlockKey key) {
         String id = objectHash(key.objectKey()) + "/" + key.index();

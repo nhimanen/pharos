@@ -672,6 +672,120 @@ class RemoteDirectoryTest {
         }
     }
 
+    // ---------------------------------------------------------------- edges: heads and synthesised footers
+
+    /** The fixture rewritten as one segment without compound files (the layout of a large shard), published. */
+    private record Flat(Path files, ShardManifest manifest) {}
+
+    private Flat flatFixture() throws IOException {
+        Path dir = tmp.resolve("flat");
+        Files.createDirectories(dir);
+        for (ManifestFile f : luceneFiles(manifest)) Files.copy(fullCopy.resolve(f.name()), dir.resolve(f.name()));
+        org.apache.lucene.index.TieredMergePolicy mp = new org.apache.lucene.index.TieredMergePolicy();
+        mp.setNoCFSRatio(0.0);
+        try (FSDirectory fs = FSDirectory.open(dir); IndexWriter w = new IndexWriter(fs,
+                new IndexWriterConfig(new StandardAnalyzer()).setUseCompoundFile(false).setMergePolicy(mp))) {
+            w.forceMerge(1);
+            w.commit();
+        }
+        List<ManifestFile> files = new ArrayList<>();
+        try (FSDirectory fs = FSDirectory.open(dir); Stream<Path> s = Files.list(dir)) {
+            for (Path p : s.sorted().toList()) {
+                String name = p.getFileName().toString();
+                if (name.equals("write.lock")) continue;
+                String key = "pharos/shards/" + PROJECT + "/objects/flat-" + name;
+                store.put(key, p);
+                long crc;
+                try (IndexInput in = fs.openInput(name, IOContext.READONCE)) {
+                    crc = org.apache.lucene.codecs.CodecUtil.retrieveChecksum(in);
+                }
+                files.add(new ManifestFile(ManifestFile.LUCENE, name, key, Files.size(p), Long.toHexString(crc)));
+            }
+        }
+        assertThat(files).anySatisfy(f -> assertThat(f.name()).endsWith(".tim"));
+        return new Flat(dir, manifestOf(11, files));
+    }
+
+    private static boolean alwaysEager(String name) {
+        return name.startsWith("segments_") || name.endsWith(".si") || name.endsWith(".fnm") || name.endsWith(".cfe");
+    }
+
+    /** The always-eager files plus a head sidecar ({@code .edges/<name>.head}) for every other file. */
+    private Path eagerWithHeads(Flat flat) throws IOException {
+        Path dir = tmp.resolve("eager-heads");
+        Files.createDirectories(dir.resolve(RemoteDirectory.EDGES_DIR));
+        for (ManifestFile f : luceneFiles(flat.manifest())) {
+            byte[] all = Files.readAllBytes(flat.files().resolve(f.name()));
+            if (alwaysEager(f.name())) {
+                Files.write(dir.resolve(f.name()), all);
+            } else {
+                Files.write(RemoteDirectory.headFile(dir, f.name()),
+                        java.util.Arrays.copyOf(all, (int) Math.min(all.length, RemoteDirectory.HEAD_BYTES)));
+            }
+        }
+        return dir;
+    }
+
+    /** Opening a reader reads each file's header and footer: the sidecars and the manifest serve both. */
+    @Test
+    void openingAReaderWithEdgesFetchesNothing() throws Exception {
+        Flat flat = flatFixture();
+        Path eager = eagerWithHeads(flat);
+        assertThat(luceneFiles(flat.manifest())).as("some files are longer than their head")
+                .anySatisfy(f -> assertThat(f.length()).isGreaterThan(RemoteDirectory.HEAD_BYTES));
+        for (int blockSize : new int[]{64 * KIB, KIB}) {
+            BlockCache cache = cache(blockSize);
+            RemoteDirectory dir = track(new RemoteDirectory(SHARD, flat.manifest(), eager, cache, source, true));
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                assertThat(reader.maxDoc()).isPositive();
+                assertThat(cache.stats().bytesFetched()).as("%d B blocks", blockSize).isZero();
+            }
+            // The synthesised footer is byte-identical to every real one.
+            for (ManifestFile f : luceneFiles(flat.manifest())) {
+                byte[] all = Files.readAllBytes(flat.files().resolve(f.name()));
+                try (IndexInput in = dir.openInput(f.name(), IOContext.DEFAULT)) {
+                    byte[] tail = new byte[16];
+                    in.seek(f.length() - 16);
+                    in.readBytes(tail, 0, 16);
+                    assertThat(tail).as(f.name()).isEqualTo(java.util.Arrays.copyOfRange(all, all.length - 16, all.length));
+                }
+            }
+            // Reading everything (CheckIndex) checks each fetched tail block against its footer.
+            try (CheckIndex check = new CheckIndex(dir)) {
+                check.setInfoStream(null);
+                assertThat(check.checkIndex().clean).isTrue();
+            }
+            assertThat(cache.stats().bytesFetched()).isPositive();
+        }
+    }
+
+    @Test
+    void corruptTailBlockIsDetectedAgainstTheFooter() throws Exception {
+        ManifestFile victim = luceneFiles(manifest).stream()
+                .filter(f -> !Files.exists(eagerCopy.resolve(f.name())))
+                .max(java.util.Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+        long wrong = Long.parseUnsignedLong(victim.checksum(), 16) ^ 0x5a5aL;
+        List<ManifestFile> files = new ArrayList<>(luceneFiles(manifest));
+        files.replaceAll(f -> f == victim ? new ManifestFile(f.role(), f.name(), f.key(), f.length(),
+                Long.toHexString(wrong)) : f);
+        BlockCache cache = cache(KIB);
+        RemoteDirectory dir = track(new RemoteDirectory(SHARD, manifestOf(9, files), null, cache, source, true));
+        try (IndexInput in = dir.openInput(victim.name(), IOContext.DEFAULT)) {
+            in.seek(victim.length() - 8);
+            assertThat(org.apache.lucene.codecs.CodecUtil.readBELong(in)).as("served from the manifest")
+                    .isEqualTo(wrong);
+            assertThat(cache.stats().bytesFetched()).isZero();
+            in.seek(0);
+            byte[] all = new byte[(int) victim.length()];
+            assertThatThrownBy(() -> in.readBytes(all, 0, all.length))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("footer")
+                    .hasMessageContaining(victim.key());
+        }
+        long last = (victim.length() - 1) / KIB;
+        assertThat(cache.isCached(new BlockKey(victim.key(), last))).as("dropped from the cache").isFalse();
+    }
+
     // ---------------------------------------------------------------- read-only
 
     @Test
