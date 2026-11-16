@@ -61,9 +61,14 @@ import java.util.stream.Stream;
  * {@link MemorySegment} over the block that stays valid until the lease is closed. Only leased
  * blocks are pinned. Every other block may be evicted, least recently used first, whenever the
  * on-disk bytes exceed {@code maxBytes}. The cap is exceeded only by leased blocks and by in-flight
- * fetches (at most {@code maxConcurrentFetches × blockSize} of temp files).
+ * fetches (at most {@code (maxConcurrentFetches + prefetchThreads) × blockSize} of temp files).
  *
- * <p><b>Fetching.</b> Concurrent acquires of one missing block share one fetch (single-flight). A
+ * <p><b>Fetching.</b> Concurrent acquires of one missing block share one fetch (single-flight).
+ * Acquires (a query's misses) run on a pool of {@code maxConcurrentFetches} threads; speculative
+ * {@link #prefetch}es on a separate pool of {@link #prefetchThreads} threads, so a burst of prefetches
+ * never queues a query's miss behind it. An acquire of a block whose prefetch is still queued
+ * submits the same fetch to the acquire pool; whichever pool starts it first runs it. A prefetch is
+ * skipped when the block could not be cached on disk (usable space below the block plus a margin). A
  * failed fetch fails every waiter and caches nothing; the next acquire retries. A block that can't
  * be written to the cache — the dir rejects writes, usable space is below the block plus a margin,
  * the fetch hits "no space left", or the fsync/move/map fails — is still served, from memory owned
@@ -127,6 +132,8 @@ public final class BlockCache implements Closeable {
     private final LongSupplier clock;
     private final LongSupplier usableSpace;
     private final ExecutorService fetchers;
+    /** Speculative prefetches only; never shared with acquires. */
+    private final ExecutorService prefetchers;
     /** Test seam: makes mapping a freshly moved block fail. */
     volatile boolean failMappingForTest;
 
@@ -173,9 +180,19 @@ public final class BlockCache implements Closeable {
         this.usableSpace = usableSpace != null ? usableSpace : this::fileStoreUsableSpace;
         Files.createDirectories(this.dir);
         recover();
+        this.fetchers = daemonPool(maxConcurrentFetches, "pharos-block-fetch-");
+        this.prefetchers = daemonPool(prefetchThreads(maxConcurrentFetches), "pharos-block-prefetch-");
+    }
+
+    /** Threads of the prefetch pool: a quarter of the fetch slots, at least 2, at most all of them. */
+    static int prefetchThreads(int maxConcurrentFetches) {
+        return Math.min(maxConcurrentFetches, Math.max(2, maxConcurrentFetches / 4));
+    }
+
+    private static ExecutorService daemonPool(int threads, String prefix) {
         AtomicInteger n = new AtomicInteger();
-        this.fetchers = Executors.newFixedThreadPool(maxConcurrentFetches, r -> {
-            Thread t = new Thread(r, "pharos-block-fetch-" + n.incrementAndGet());
+        return Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, prefix + n.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
@@ -195,13 +212,17 @@ public final class BlockCache implements Closeable {
      *         fetch keeps running for the other waiters
      */
     public Lease acquire(BlockKey key, long blockLength, BlockFetcher fetcher) throws IOException {
+        return acquire(key, objectHash(key.objectKey()), blockLength, fetcher);
+    }
+
+    /** {@link #acquire} with {@code hash} = {@link #objectHash} of the key's object, computed by the caller once. */
+    Lease acquire(BlockKey key, String hash, long blockLength, BlockFetcher fetcher) throws IOException {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(fetcher, "fetcher");
         if (blockLength <= 0 || blockLength > blockSize) {
             throw new IllegalArgumentException("block length " + blockLength + " of block " + key.index() + " of '"
                     + key.objectKey() + "' is outside (0, " + blockSize + "]");
         }
-        String hash = sha256(key.objectKey());
         String id = hash + "/" + key.index();
         Entry hit = null;
         boolean touch = false;
@@ -239,10 +260,14 @@ public final class BlockCache implements Closeable {
                     }
                     misses++;
                     if (flight == null) {
-                        flight = new Flight(blockLength);
+                        flight = new Flight(blockLength, key, hash, id, fetcher);
                         inflight.put(id, flight);
-                        Flight f = flight;
-                        fetchers.execute(() -> runFetch(f, key, hash, id, blockLength, fetcher));
+                        flight.submitted = true;
+                        fetchers.execute(flight::run);
+                    } else if (!flight.submitted) {
+                        // a queued prefetch: run it on the acquire pool too, whichever starts first wins
+                        flight.submitted = true;
+                        fetchers.execute(flight::run);
                     }
                     flight.waiters++;
                 }
@@ -263,18 +288,24 @@ public final class BlockCache implements Closeable {
      * was served by the fetch), immediately for a cached block, and exceptionally when the fetch fails
      * or the cache is closed; a failed prefetch caches nothing, so the next acquire retries. A
      * prefetch shares the single-flight fetch with concurrent acquires, takes no lease and does not
-     * count as a hit or a miss.
+     * count as a hit or a miss. It runs on the prefetch pool, never on the acquire pool. When the block
+     * could not be cached on disk (usable space below the block plus a margin) nothing is fetched and
+     * the returned future is already complete.
      *
      * @throws IllegalArgumentException as for {@link #acquire}
      */
     public CompletableFuture<Void> prefetch(BlockKey key, long blockLength, BlockFetcher fetcher) {
+        return prefetch(key, objectHash(key.objectKey()), blockLength, fetcher);
+    }
+
+    /** {@link #prefetch} with {@code hash} = {@link #objectHash} of the key's object, computed by the caller once. */
+    CompletableFuture<Void> prefetch(BlockKey key, String hash, long blockLength, BlockFetcher fetcher) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(fetcher, "fetcher");
         if (blockLength <= 0 || blockLength > blockSize) {
             throw new IllegalArgumentException("block length " + blockLength + " of block " + key.index() + " of '"
                     + key.objectKey() + "' is outside (0, " + blockSize + "]");
         }
-        String hash = sha256(key.objectKey());
         String id = hash + "/" + key.index();
         synchronized (lock) {
             if (closed) {
@@ -287,10 +318,11 @@ public final class BlockCache implements Closeable {
             Flight flight = inflight.get(id);
             if (flight != null && flight.length != blockLength) throw lengthMismatch(key, blockLength, flight.length);
             if (flight == null) {
-                flight = new Flight(blockLength);
+                // Speculative: never worth the uncached path, whose memory nobody would read.
+                if (lowOnSpace(blockLength)) return CompletableFuture.completedFuture(null);
+                flight = new Flight(blockLength, key, hash, id, fetcher);
                 inflight.put(id, flight);
-                Flight f = flight;
-                fetchers.execute(() -> runFetch(f, key, hash, id, blockLength, fetcher));
+                prefetchers.execute(flight::run);
             }
             return flight.done.thenApply(entry -> null);
         }
@@ -810,10 +842,16 @@ public final class BlockCache implements Closeable {
         }
         cleanup.run();
         fetchers.shutdownNow();
+        prefetchers.shutdownNow();
     }
 
     private Path blockFile(String hash, long index) {
         return dir.resolve(hash.substring(0, 2)).resolve(hash).resolve(index + ".blk");
+    }
+
+    /** The hash naming an object's block dir: lower-case hex SHA-256 of the object key. */
+    static String objectHash(String objectKey) {
+        return sha256(objectKey);
     }
 
     private static String sha256(String s) {
@@ -871,17 +909,38 @@ public final class BlockCache implements Closeable {
         }
     }
 
-    /** A fetch in progress; {@code waiters} (under the lock) is how many leases to reserve on success. */
-    private static final class Flight {
+    /**
+     * A fetch in progress; {@code waiters} (under the lock) is how many leases to reserve on success.
+     * It may be submitted to both pools (a queued prefetch that an acquire needs); {@link #run} fetches
+     * only on the first call.
+     */
+    private final class Flight {
         final CompletableFuture<Entry> done = new CompletableFuture<>();
         final long length;
+        final BlockKey key;
+        final String hash;
+        final String id;
+        final BlockFetcher fetcher;
+        private final AtomicBoolean started = new AtomicBoolean();
+        /** On the acquire pool (under the lock). */
+        boolean submitted;
         int waiters;
         /** Set when the fetch has finished (under the lock), before {@link #done} completes. */
         boolean settled;
         /** The fetched entry, holding one reserved lease per waiter; null until settled successfully. */
         Entry result;
 
-        Flight(long length) { this.length = length; }
+        Flight(long length, BlockKey key, String hash, String id, BlockFetcher fetcher) {
+            this.length = length;
+            this.key = key;
+            this.hash = hash;
+            this.id = id;
+            this.fetcher = fetcher;
+        }
+
+        void run() {
+            if (started.compareAndSet(false, true)) runFetch(this, key, hash, id, length, fetcher);
+        }
     }
 
     /** A pin on one block. {@link #segment()} is valid until {@link #close()}; close is idempotent. */

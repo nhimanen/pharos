@@ -652,6 +652,68 @@ class BlockCacheTest {
         assertThat(warns).hasSize(2);
     }
 
+    /**
+     * Speculative prefetches run on their own small pool: a burst of slow prefetches neither delays
+     * a query's miss on another block, nor one on a block whose prefetch is still queued.
+     */
+    @Test
+    void prefetchBurstDoesNotDelayForegroundAcquires() throws Exception {
+        BlockCache c = cache(64);
+        CountDownLatch gate = new CountDownLatch(1);
+        BlockCache.BlockFetcher slowForEarlyBlocks = (key, offset, length, target) -> {
+            if (key.objectKey().equals(OBJ) && key.index() < 8) {
+                try {
+                    if (!gate.await(30, TimeUnit.SECONDS)) throw new IOException("gate timeout");
+                } catch (InterruptedException e) {
+                    throw new InterruptedIOException();
+                }
+            }
+            byte[] b = new byte[(int) length];
+            for (int i = 0; i < b.length; i++) b[i] = expected(key, offset + i);
+            Files.write(target, b);
+        };
+        List<java.util.concurrent.CompletableFuture<Void>> burst = new ArrayList<>();
+        for (int i = 0; i < 16; i++) burst.add(c.prefetch(new BlockKey(OBJ, i), BS, slowForEarlyBlocks));
+        ExecutorService exec = Executors.newFixedThreadPool(2);
+        try {
+            BlockKey other = new BlockKey("shards/p/objects/other", 0);
+            Future<?> miss = exec.submit(() -> {
+                try (BlockCache.Lease l = c.acquire(other, BS, slowForEarlyBlocks)) {
+                    assertContent(l, other, BS);
+                }
+                return null;
+            });
+            miss.get(5, TimeUnit.SECONDS);
+
+            BlockKey queued = new BlockKey(OBJ, 15); // its prefetch waits behind the gated ones
+            Future<?> joined = exec.submit(() -> {
+                try (BlockCache.Lease l = c.acquire(queued, BS, slowForEarlyBlocks)) {
+                    assertContent(l, queued, BS);
+                }
+                return null;
+            });
+            joined.get(5, TimeUnit.SECONDS);
+        } finally {
+            gate.countDown();
+            exec.shutdownNow();
+        }
+        for (var f : burst) f.get(10, TimeUnit.SECONDS);
+        assertThat(c.stats().bytesFetched()).as("block 15 fetched once").isEqualTo(17L * BS);
+    }
+
+    @Test
+    void prefetchIsSkippedWhenTheBlockCouldNotBeCached() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        usable.set(BS); // below block + margin: a fetch would take the uncached path
+
+        java.util.concurrent.CompletableFuture<Void> p = c.prefetch(new BlockKey(OBJ, 0), BS, f);
+
+        assertThat(p).isDone();
+        assertThat(f.calls.get() + f.memCalls.get()).isZero();
+        assertThat(c.stats().bytesFetched()).isZero();
+    }
+
     @Test
     void closedCacheRefusesAcquire() throws Exception {
         BlockCache c = cache(4);
