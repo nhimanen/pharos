@@ -969,6 +969,8 @@ def cmd_index_status(args):
 def cmd_upgrade_indexes(args):
     """Re-index projects whose index format is not current.
 
+    Exit codes: 0 done/nothing to do, 1 skipped or failed, 2 needs --yes, 5 reader node.
+
     Spawns its own JVM (holds the Lucene write locks) and inherits stdin/stdout so the
     confirmation prompt works.
     """
@@ -1601,6 +1603,17 @@ EXAMPLES
     p_upgrade = sub.add_parser(
         "upgrade-indexes",
         help="Re-index projects whose index format is not current",
+        description="""\
+Re-index (full) every project whose index format is not current.
+
+EXIT CODES
+  0 nothing to upgrade, all upgraded, or aborted at the prompt
+  1 a project was skipped (unknown, missing index, root gone) or failed
+  2 confirmation needed but no terminal: re-run with --yes
+  5 refused on a reader node: readers receive upgrades by syncing;
+    upgrade (and re-publish) on the writer
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_upgrade.add_argument("projects", nargs="*", help="Only these projects (default: all that need it)")
     p_upgrade.add_argument("--dry-run", action="store_true", help="Print the plan and stop")

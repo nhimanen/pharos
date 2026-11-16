@@ -281,9 +281,16 @@ class UpgradeIndexesCommandTest {
 
         int rc = run(cmd(), "--yes");
 
-        assertThat(rc).isEqualTo(2);
+        assertThat(rc).isEqualTo(5); // its own code: 2 means "needs --yes"
         assertThat(err.toString()).contains("readers receive upgrades by syncing; upgrade the writer");
         assertThat(out.toString()).doesNotContain("Re-indexing");
         assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+    }
+
+    @Test
+    void helpListsEveryExitCode() {
+        String usage = new CommandLine(cmd()).getUsageMessage();
+        assertThat(usage).contains("Exit codes:").contains("0").contains("1").contains("2")
+                .contains("5").contains("reader node");
     }
 }

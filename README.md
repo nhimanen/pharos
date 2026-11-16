@@ -52,6 +52,11 @@ so existing indexes keep working; re-index when convenient with `./setup.sh --up
 (or `pharos upgrade-indexes`). Check status with `pharos index-status`. See [UPGRADING.md](UPGRADING.md)
 and [CHANGELOG.md](CHANGELOG.md).
 
+`pharos upgrade-indexes` exit codes: **0** nothing to upgrade, all upgraded, or aborted at the prompt;
+**1** a project was skipped (unknown, missing index, root gone) or failed; **2** confirmation needed but
+no terminal (re-run with `--yes`); **5** refused on a cluster reader node (upgrade and re-publish on the
+writer). `./setup.sh --upgrade-indexes` exits with the same code.
+
 ## Supported languages
 
 | Language | Parser | Call graph | Knowledge graph |

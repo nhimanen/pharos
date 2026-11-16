@@ -237,7 +237,7 @@ reader_config() {
     > "$1/.pharos/config.json"
 }
 
-# A reader refuses --upgrade-indexes (exit 2) with the writer hint, starts no upgrade JVM and
+# A reader refuses --upgrade-indexes (exit 5, its own code: 2 means "needs --yes") with the writer hint, starts no upgrade JVM and
 # leaves the index alone.
 t_upgrade_indexes_refused_on_reader() {
   local h; h="$(new_home)"
@@ -245,7 +245,7 @@ t_upgrade_indexes_refused_on_reader() {
   register_project "$h" oldish none
   reader_config "$h"
   JAVA_LOG="$h/java.log" PATH="$STUB_PATH" run_setup "$h" --upgrade-indexes --yes
-  [ "$(rc "$h")" = 2 ] \
+  [ "$(rc "$h")" = 5 ] \
     && grep -q 'readers receive upgrades by syncing; upgrade the writer' "$h/out.txt" \
     && ! grep -q 'upgrade-indexes' "$h/java.log" 2>/dev/null \
     && ! grep -q Traceback "$h/out.txt" \

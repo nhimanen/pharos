@@ -27,7 +27,8 @@
 #   PHAROS_NO_DAEMON=1       do not start/restart the daemon (used by tests)
 #
 # Exit codes: 2 = upgrade warning declined / needs --yes, 3 = checksum mismatch;
-# with --upgrade-indexes, the exit status of upgrade-indexes.
+# with --upgrade-indexes, the exit status of upgrade-indexes (0 done, 1 skipped/failed,
+# 2 needs --yes, 5 refused on a cluster reader node).
 
 set -euo pipefail
 
@@ -185,12 +186,12 @@ _run_upgrade_indexes() { # -> exit status of upgrade-indexes
     echo "Error: pharos is not installed in $PHAROS_BIN; run setup first." >&2
     return 1
   fi
-  # Same refusal as 'pharos upgrade-indexes' on a reader (exit 2), without starting a JVM.
+  # Same refusal as 'pharos upgrade-indexes' on a reader (exit 5), without starting a JVM.
   if [ "$(_cluster_role)" = reader ]; then
     echo "Error: this node has role reader; readers receive upgrades by syncing; upgrade the writer." >&2
     echo "  (cluster.role in $HOME/.pharos/config.json; on the writer: ./setup.sh --upgrade-indexes," >&2
     echo "   which re-indexes and re-publishes; this reader picks the new generations up on its next sync)" >&2
-    return 2
+    return 5
   fi
   local args=()
   [ "$ASSUME_YES" = true ] && args+=(--yes)
