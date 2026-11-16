@@ -120,7 +120,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
             return KeywordSearchStrategy.toResults(searcher, trimmed, "unified");
         }
 
-        float[] queryVec = embedder.embed(req.query());
+        float[] queryVec = embedder.embedQuery(req.query());
         if (queryVec == null) {
             trace.record("unified retrieval (embed failed)", t0);
             int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);

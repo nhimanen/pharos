@@ -399,11 +399,11 @@ public class MultiModelEmbedder {
             String key = PersistentEmbeddingCache.sha256Hex(text);
             float[] cached = cache.get(key);
             if (cached != null) return cached;
-            float[] fresh = provider.embed(text);
+            float[] fresh = provider.embedDocument(text);
             if (fresh != null) cache.put(key, fresh);
             return fresh;
         }
-        return provider.embed(text);
+        return provider.embedDocument(text);
     }
 
     /** Strip {@code vec.} prefix and return null for the legacy field. */

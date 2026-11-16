@@ -64,9 +64,28 @@ public final class IndexVersions {
      */
     public static String modelFingerprint(EmbeddingProviderConfig cfg) {
         if (cfg == null) return "none";
-        return cfg.getModelId() + ":" + cfg.getDimensions()
+        String fp = cfg.getModelId() + ":" + cfg.getDimensions()
                 + ":" + nvl(cfg.getUrl())
                 + ":" + nvl(cfg.getModel());
+        // Pooling/prefixes change the vectors, but default configs must keep their exact
+        // historic fingerprint (no cache invalidation on upgrade) — so append only when set.
+        com.pharos.config.Pooling pooling = cfg.getPooling();
+        String qp = nvl(cfg.getQueryPrefix());
+        String dp = nvl(cfg.getDocumentPrefix());
+        if (pooling != com.pharos.config.Pooling.MEAN || !qp.isEmpty() || !dp.isEmpty()) {
+            fp += ":pool=" + pooling.json() + ":qp=" + sha8(qp) + ":dp=" + sha8(dp);
+        }
+        return fp;
+    }
+
+    private static String sha8(String s) {
+        try {
+            byte[] h = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(h, 0, 4);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /**

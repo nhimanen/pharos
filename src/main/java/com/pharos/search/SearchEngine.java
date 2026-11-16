@@ -283,7 +283,7 @@ public class SearchEngine {
                         if (i == null) {
                             try {
                                 i = embedder.isAvailable()
-                                        ? vectorStrategy.buildVectorResolver(reader, embedder.embed(snippetQuery))
+                                        ? vectorStrategy.buildVectorResolver(reader, embedder.embedQuery(snippetQuery))
                                         : SnippetResolver.none();
                             } catch (RuntimeException e) {
                                 // keyword snippets still work; don't re-embed and fail for every result

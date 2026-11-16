@@ -75,8 +75,22 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     private final ThreadLocal<int[]> threadEmbedCount =
             ThreadLocal.withInitial(() -> new int[]{0});
 
+    // Pooling is consumed by the translators (Task 2); prefixes are applied here.
+    private final com.pharos.config.Pooling pooling;
+    private final String queryPrefix;
+    private final String documentPrefix;
+
     public DjlEmbeddingProvider(String modelId, String modelUrl, int dimensions, int maxTokens)
             throws ModelException, IOException {
+        this(modelId, modelUrl, dimensions, maxTokens, com.pharos.config.Pooling.MEAN, "", "");
+    }
+
+    public DjlEmbeddingProvider(String modelId, String modelUrl, int dimensions, int maxTokens,
+                                com.pharos.config.Pooling pooling, String queryPrefix, String documentPrefix)
+            throws ModelException, IOException {
+        this.pooling = pooling == null ? com.pharos.config.Pooling.MEAN : pooling;
+        this.queryPrefix = queryPrefix == null ? "" : queryPrefix;
+        this.documentPrefix = documentPrefix == null ? "" : documentPrefix;
         log.info("Loading embedding model '{}' from {} (maxTokens={})",
                 modelId, modelUrl, maxTokens);
         this.modelId = modelId;
@@ -237,6 +251,16 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     }
 
     @Override
+    public float[] embedQuery(String text) {
+        return embed(EmbeddingProvider.withPrefix(queryPrefix, text));
+    }
+
+    @Override
+    public float[] embedDocument(String text) {
+        return embed(EmbeddingProvider.withPrefix(documentPrefix, text));
+    }
+
+    @Override
     public float[] embed(String text) {
         if (text == null || text.isBlank()) return null;
         String input = text.length() > MAX_INPUT_LENGTH ? text.substring(0, MAX_INPUT_LENGTH) : text;
@@ -273,8 +297,10 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      * <p>Falls back to the sequential default for zoo models or on error.
      */
     @Override
-    public float[][] embedBatch(List<String> texts) {
-        if (texts == null || texts.isEmpty()) return new float[0][];
+    public float[][] embedBatch(List<String> rawTexts) {
+        if (rawTexts == null || rawTexts.isEmpty()) return new float[0][];
+        // Batch embedding is document-side.
+        List<String> texts = EmbeddingProvider.withPrefix(documentPrefix, rawTexts);
 
         List<String> sanitised = texts.stream()
                 .map(t -> (t == null || t.isBlank()) ? ""

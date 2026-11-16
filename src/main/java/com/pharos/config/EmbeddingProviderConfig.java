@@ -1,6 +1,7 @@
 package com.pharos.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -139,7 +140,26 @@ public class EmbeddingProviderConfig {
      */
     private List<EmbeddingProviderConfig> fallbacks = new ArrayList<>();
 
+    /**
+     * DJL-only: how token hidden states are pooled into one vector. {@code mean} (default,
+     * historic behaviour) or {@code cls}. Setting anything but {@code mean} on an
+     * {@code openai} provider is a validation error: the remote server pools.
+     */
+    private Pooling pooling = Pooling.MEAN;
+
+    /** Text prepended to every query before embedding (e.g. {@code "query: "}). Default empty. */
+    private String queryPrefix = "";
+
+    /** Text prepended to every document/chunk before embedding. Default empty. */
+    private String documentPrefix = "";
+
     public EmbeddingProviderConfig() {}
+
+    /** Jackson value filter: omit {@code pooling} from saved JSON when it is the default. */
+    static final class MeanPoolingFilter {
+        @Override public boolean equals(Object o) { return o == null || o == Pooling.MEAN; }
+        @Override public int hashCode() { return 0; }
+    }
 
     /**
      * Validates the config. Called by {@link IndexConfig#load()} so misconfiguration
@@ -168,6 +188,11 @@ public class EmbeddingProviderConfig {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].model is required for type=openai " +
                     "(the model name passed in the request body)");
+        }
+        if ("openai".equals(type) && pooling != Pooling.MEAN) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].pooling='" + pooling.json() +
+                    "' is not supported for type=openai (the remote server pools); remove it");
         }
         if (dimensions <= 0) {
             throw new IllegalArgumentException(
@@ -232,6 +257,18 @@ public class EmbeddingProviderConfig {
         if (embeddingThreads > 0) return embeddingThreads;
         return "openai".equals(type) ? 4 : 1;
     }
+
+    @JsonInclude(value = JsonInclude.Include.CUSTOM, valueFilter = MeanPoolingFilter.class)
+    public Pooling getPooling() { return pooling; }
+    public void setPooling(Pooling pooling) { this.pooling = pooling == null ? Pooling.MEAN : pooling; }
+
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String getQueryPrefix() { return queryPrefix; }
+    public void setQueryPrefix(String queryPrefix) { this.queryPrefix = queryPrefix == null ? "" : queryPrefix; }
+
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String getDocumentPrefix() { return documentPrefix; }
+    public void setDocumentPrefix(String documentPrefix) { this.documentPrefix = documentPrefix == null ? "" : documentPrefix; }
 
     public List<EmbeddingProviderConfig> getFallbacks() { return fallbacks; }
     public void setFallbacks(List<EmbeddingProviderConfig> fallbacks) {

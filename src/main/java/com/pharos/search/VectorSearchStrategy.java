@@ -55,7 +55,7 @@ public class VectorSearchStrategy {
             return List.of();
         }
 
-        float[] queryVector = embedder.embed(req.query());
+        float[] queryVector = embedder.embedQuery(req.query());
         if (queryVector == null) {
             log.warn("Embedding returned null for query: {}", req.query());
             return List.of();
