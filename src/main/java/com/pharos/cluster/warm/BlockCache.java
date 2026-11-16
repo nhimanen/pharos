@@ -328,6 +328,25 @@ public final class BlockCache implements Closeable {
         }
     }
 
+    /**
+     * Cancels the prefetch of block {@code key} when it is still queued and no acquire waits for it:
+     * it will never fetch, and its future fails with a {@link java.util.concurrent.CancellationException}.
+     *
+     * @return true when it was cancelled; false when it is running, awaited, done or unknown
+     */
+    boolean cancelQueued(BlockKey key, String hash) {
+        Flight f;
+        synchronized (lock) {
+            f = inflight.get(hash + "/" + key.index());
+            if (f == null || f.submitted || f.waiters > 0 || !f.started.compareAndSet(false, true)) return false;
+            inflight.remove(f.id);
+            f.settled = true;
+        }
+        f.done.completeExceptionally(new java.util.concurrent.CancellationException(
+                "prefetch of block " + key.index() + " of '" + key.objectKey() + "' cancelled"));
+        return true;
+    }
+
     /** Work that may throw an {@link IOException}. */
     @FunctionalInterface
     interface IoTask {

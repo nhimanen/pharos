@@ -202,7 +202,7 @@ class LazyReaderTest {
         }
         List<String> prefetch = lazy.config().getCluster().getReader().getPrefetchExtensions();
         List<ManifestFile> prefetched = remote.stream().filter(f -> prefetch.contains(extension(f.name()))).toList();
-        assertThat(prefetched).as("remote .tim/.tip files").isNotEmpty();
+        assertThat(prefetched).as("remote .tim/.tip files among %s", m.files()).isNotEmpty();
         assertThat(remote).hasSizeGreaterThan(prefetched.size());
 
         BlockCache blocks = lazy.runtime().lazyGenerations().blockCache();
@@ -376,6 +376,73 @@ class LazyReaderTest {
             assertThat(fresh.blockCacheDir()).as("no remote directory, so no block cache").isNull();
             assertThat(fresh.indexExists(tmp.resolve("nowhere").resolve("lucene"))).isFalse();
         }
+    }
+
+    /** A synthetic generation whose files are random objects of the given sizes, published to the store. */
+    private ShardManifest syntheticGeneration(long gen, Map<String, Integer> sizes) {
+        List<ManifestFile> files = new ArrayList<>();
+        java.util.Random rnd = new java.util.Random(gen);
+        for (var e : sizes.entrySet()) {
+            byte[] data = new byte[e.getValue()];
+            rnd.nextBytes(data);
+            String key = "pharos/shards/" + JAVA + "/objects/gen" + gen + "-" + e.getKey();
+            store.put(key, data);
+            files.add(new ManifestFile(ManifestFile.LUCENE, e.getKey(), key, data.length, "0"));
+        }
+        return new ShardManifest(ShardManifest.FORMAT_VERSION, JAVA, gen, null, java.time.Instant.now(), "writer", 0,
+                0, null, files, null, null);
+    }
+
+    /** M4: a generation's prefetch takes at most half the cache, most important extensions first. */
+    @Test
+    void prefetchIsCappedAtHalfTheCache() throws Exception {
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        rc.setCacheMaxBytes(4 * 64 * KIB); // half: 128 KiB
+        ShardManifest m = syntheticGeneration(5, new java.util.TreeMap<>(Map.of(
+                "_0.tim", 100 * 1024, "_0.tip", 60 * 1024, "_0.tmd", 50 * 1024, "_0.doc", 90 * 1024)));
+        Path lucene = Files.createDirectories(tmp.resolve("capped").resolve("lucene"));
+        try (LazyGenerations lazy = new LazyGenerations(tmp.resolve("capped-cache"), rc,
+                new ObjectStoreReplicaSource(store, layout))) {
+            LazyGenerations.Prefetch p = lazy.prefetch(m, lucene);
+            p.done().get(10, TimeUnit.SECONDS);
+            assertThat(p.bytes()).isLessThanOrEqualTo(128 * KIB);
+            BlockCache blocks = lazy.blockCache();
+            ManifestFile tip = m.files().stream().filter(f -> f.name().equals("_0.tip")).findFirst().orElseThrow();
+            ManifestFile tim = m.files().stream().filter(f -> f.name().equals("_0.tim")).findFirst().orElseThrow();
+            // default order tip, tmd, tim, vex, vem: tip (60 KiB) and tmd (50 KiB) fit, tim does not
+            assertThat(blocks.isCached(new BlockKey(tip.key(), 0))).isTrue();
+            assertThat(blocks.isCached(new BlockKey(tim.key(), 0))).isFalse();
+            assertThat(p.bytes()).isEqualTo(110 * KIB);
+        }
+    }
+
+    /** M4: a new generation's prefetch cancels what the previous one still has queued. */
+    @Test
+    void newPrefetchCancelsThePreviousGenerationsQueuedBlocks() throws Exception {
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        rc.setMaxConcurrentFetches(2); // a prefetch pool of 2 threads
+        CountDownLatch release = new CountDownLatch(1);
+        ReplicaSource slow = new SlowRanges(new ObjectStoreReplicaSource(store, layout), release);
+        Map<String, Integer> sizes = new java.util.TreeMap<>(Map.of("_0.tim", 600 * 1024, "_0.tip", 100 * 1024));
+        ShardManifest first = syntheticGeneration(6, sizes);
+        ShardManifest second = syntheticGeneration(7, sizes);
+        try (LazyGenerations lazy = new LazyGenerations(tmp.resolve("cancel-cache"), rc, slow)) {
+            LazyGenerations.Prefetch a = lazy.prefetch(first, Files.createDirectories(tmp.resolve("a").resolve("lucene")));
+            LazyGenerations.Prefetch b = lazy.prefetch(second, Files.createDirectories(tmp.resolve("b").resolve("lucene")));
+            assertThat(b.cancelledPrevious()).as("generation 6's queued blocks").isPositive();
+            release.countDown();
+            b.done().get(20, TimeUnit.SECONDS);
+            assertThatThrownByCancelled(a);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    private static void assertThatThrownByCancelled(LazyGenerations.Prefetch p) {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> p.done().get(20, TimeUnit.SECONDS))
+                .hasRootCauseInstanceOf(java.util.concurrent.CancellationException.class);
     }
 
     @Test

@@ -469,6 +469,14 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             }
         }
 
+        /** The keys of all the file's blocks, in order. */
+        java.util.List<BlockKey> blockKeys() {
+            long blocks = (length + blockSize - 1) / blockSize;
+            java.util.List<BlockKey> out = new java.util.ArrayList<>();
+            for (long i = 0; i < blocks; i++) out.add(new BlockKey(file.key(), i));
+            return out;
+        }
+
         /** Starts prefetching every block of the file; one future per block (see {@link BlockCache#prefetch}). */
         java.util.List<java.util.concurrent.CompletableFuture<Void>> prefetchAll() {
             long blocks = (length + blockSize - 1) / blockSize;

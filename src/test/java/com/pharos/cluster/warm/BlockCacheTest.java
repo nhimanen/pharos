@@ -701,6 +701,42 @@ class BlockCacheTest {
         assertThat(c.stats().bytesFetched()).as("block 15 fetched once").isEqualTo(17L * BS);
     }
 
+    /** M4: a queued prefetch nobody waits for can be cancelled; it never fetches. */
+    @Test
+    void queuedPrefetchCanBeCancelled() throws Exception {
+        BlockCache c = cache(64);
+        CountDownLatch gate = new CountDownLatch(1);
+        java.util.Set<Long> fetched = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        BlockCache.BlockFetcher gated = (key, offset, length, target) -> {
+            fetched.add(key.index());
+            try {
+                if (!gate.await(30, TimeUnit.SECONDS)) throw new IOException("gate timeout");
+            } catch (InterruptedException e) {
+                throw new InterruptedIOException();
+            }
+            Files.write(target, new byte[(int) length]);
+        };
+        List<java.util.concurrent.CompletableFuture<Void>> f = new ArrayList<>();
+        for (int i = 0; i < 6; i++) f.add(c.prefetch(new BlockKey(OBJ, i), BS, gated));
+        String hash = BlockCache.objectHash(OBJ);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (fetched.size() < BlockCache.prefetchThreads(4) && System.nanoTime() < deadline) Thread.sleep(5);
+
+        assertThat(c.cancelQueued(new BlockKey(OBJ, 0), hash)).as("already running").isFalse();
+        assertThat(c.cancelQueued(new BlockKey(OBJ, 4), hash)).isTrue();
+        assertThat(c.cancelQueued(new BlockKey(OBJ, 4), hash)).as("gone").isFalse();
+        assertThat(f.get(4)).isCompletedExceptionally();
+        gate.countDown();
+        for (int i = 0; i < 6; i++) {
+            if (i != 4) f.get(i).get(10, TimeUnit.SECONDS);
+        }
+        assertThat(fetched).doesNotContain(4L);
+        assertThat(c.isCached(new BlockKey(OBJ, 4))).isFalse();
+        try (BlockCache.Lease l = c.acquire(new BlockKey(OBJ, 4), BS, new FakeFetcher())) {
+            assertContent(l, new BlockKey(OBJ, 4), BS); // a later acquire fetches it normally
+        }
+    }
+
     @Test
     void prefetchIsSkippedWhenTheBlockCouldNotBeCached() throws Exception {
         BlockCache c = cache(8);

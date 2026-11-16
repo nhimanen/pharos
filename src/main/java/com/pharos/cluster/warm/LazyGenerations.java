@@ -71,6 +71,8 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     private final ClusterConfig.ReaderConfig config;
     private final ReplicaSource source;
     private final Set<String> prefetchExtensions;
+    /** Block keys of each shard's last prefetch, cancelled when the next one starts. */
+    private final Map<String, List<BlockKey>> lastPrefetch = new java.util.HashMap<>();
 
     /** Parsed manifests by generation dir; a changed manifest file (a new lineage) is re-read. */
     private final Map<Path, CachedManifest> manifests = new LinkedHashMap<>(16, 0.75f, true) {
@@ -165,35 +167,75 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     /**
      * Starts, on the cache's prefetch pool: the download of every remote (not eager) Lucene file's
      * head sidecar into {@code luceneDir} (see {@link RemoteDirectory#headFile}), and the fetch of
-     * every block of the remote files whose extension is one of {@code prefetchExtensions}. The
-     * future completes when all are done (blocks cached or skipped), exceptionally when one fails.
-     * A head is written to a temp file and moved into place, so a sidecar is complete or absent.
+     * every block of the remote files whose extension is one of {@code prefetchExtensions}. Those
+     * files are taken in the order of {@code prefetchExtensions}, whole, while their total stays
+     * within half the cache's cap (the rest is fetched on first read). The blocks the shard's previous
+     * prefetch still has queued are cancelled first. The future completes when all are done (blocks
+     * cached or skipped), exceptionally when one fails or is cancelled. A head is written to a temp
+     * file and moved into place, so a sidecar is complete or absent.
      */
     public Prefetch prefetch(ShardManifest manifest, Path luceneDir) throws IOException {
         ShardId shard = new ShardId(manifest.shard());
+        List<ManifestFile> remoteFiles = manifest.files().stream()
+                .filter(f -> ManifestFile.LUCENE.equals(f.role()) && !eager(f) && f.length() > 0)
+                .toList();
+        if (remoteFiles.isEmpty()) return new Prefetch(CompletableFuture.completedFuture(null), 0, 0, 0, 0);
+        BlockCache cache = blockCache();
+        int cancelled = cancelPrevious(shard.value(), cache);
+        Path edges = luceneDir.resolve(RemoteDirectory.EDGES_DIR);
+        Files.createDirectories(edges); // tasks never create it: a moved partial dir stays gone
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (ManifestFile f : remoteFiles) futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir)));
+        int heads = futures.size();
+
+        List<String> order = config.getPrefetchExtensions();
+        List<ManifestFile> wanted = remoteFiles.stream()
+                .filter(f -> prefetchExtensions.contains(extension(f.name())))
+                .sorted(Comparator.comparingInt((ManifestFile f) -> order.indexOf(extension(f.name())))
+                        .thenComparing(ManifestFile::name))
+                .toList();
+        long budget = cache.maxBytes() / 2;
         long bytes = 0;
         int blocks = 0;
-        BlockCache cache = null;
-        Path edges = luceneDir.resolve(RemoteDirectory.EDGES_DIR);
-        for (ManifestFile f : manifest.files()) {
-            if (!ManifestFile.LUCENE.equals(f.role()) || eager(f) || f.length() == 0) continue;
-            if (cache == null) {
-                cache = blockCache();
-                Files.createDirectories(edges); // tasks never create it: a moved partial dir stays gone
+        List<BlockKey> queued = new ArrayList<>();
+        for (ManifestFile f : wanted) {
+            if (bytes + f.length() > budget) {
+                log.info("Shard {}: not prefetching {} of generation {} ({} bytes): the prefetch is capped at half"
+                        + " the block cache ({} bytes)", shard, f.name(), manifest.generation(), f.length(), budget);
+                continue;
             }
-            futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir)));
-            String name = f.name();
-            if (!prefetchExtensions.contains(name.substring(name.lastIndexOf('.') + 1))) continue;
             CachingRemoteIndexInput.RemoteFile remote =
                     new CachingRemoteIndexInput.RemoteFile(shard, manifest.generation(), f, cache, source);
             List<CompletableFuture<Void>> fileBlocks = remote.prefetchAll();
             futures.addAll(fileBlocks);
+            queued.addAll(remote.blockKeys());
             blocks += fileBlocks.size();
             bytes += f.length();
         }
-        return new Prefetch(CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)),
-                futures.size() - blocks, blocks, bytes);
+        synchronized (lastPrefetch) {
+            lastPrefetch.put(shard.value(), queued);
+        }
+        return new Prefetch(CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)), heads, blocks, bytes,
+                cancelled);
+    }
+
+    /** Cancels the still-queued blocks of the shard's previous prefetch; returns how many. */
+    private int cancelPrevious(String shard, BlockCache cache) {
+        List<BlockKey> previous;
+        synchronized (lastPrefetch) {
+            previous = lastPrefetch.remove(shard);
+        }
+        if (previous == null) return 0;
+        int n = 0;
+        for (BlockKey k : previous) {
+            if (cache.cancelQueued(k, BlockCache.objectHash(k.objectKey()))) n++;
+        }
+        if (n > 0) log.info("Shard {}: cancelled {} queued prefetch blocks of the previous generation", shard, n);
+        return n;
+    }
+
+    private static String extension(String name) {
+        return name.substring(name.lastIndexOf('.') + 1);
     }
 
     private void downloadHead(ManifestFile f, Path luceneDir) throws IOException {
@@ -218,9 +260,10 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
 
     /**
      * A started prefetch: {@code done} completes when its {@code heads} head sidecars and its
-     * {@code blocks} blocks ({@code bytes} bytes of files) are in.
+     * {@code blocks} blocks ({@code bytes} bytes of files) are in; {@code cancelledPrevious} queued
+     * blocks of the shard's previous prefetch were cancelled.
      */
-    public record Prefetch(CompletableFuture<Void> done, int heads, int blocks, long bytes) {}
+    public record Prefetch(CompletableFuture<Void> done, int heads, int blocks, long bytes, int cancelledPrevious) {}
 
     // ---------------------------------------------------------------- block cache
 
