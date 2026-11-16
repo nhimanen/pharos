@@ -2,8 +2,10 @@
 """Phase 1 gate checks (standard library only). Driven by scripts/cluster-gate.sh.
 
 1. For every eval/benchmark.py query whose project is pharos or lucene, compare the top-10
-   ids from /api/search?pipeline=keyword on writer and reader, and /api/callers of each
-   query's top result. Any mismatch -> exit 1.
+   ids from /api/search?pipeline=keyword on writer and reader, and for each query's top result
+   /api/callers (Lucene calledMethods) plus the graph-backed /api/usages and /api/impact
+   (which on the reader come from the compact graph; compared as sets, since reverse-edge order
+   may differ). Any mismatch -> exit 1; no non-empty graph answer at all -> exit 1 (vacuous).
 2. Freshness: append a method to the writer's copy of a pharos source file, re-index the
    writer incrementally (GATE_REINDEX_CMD), take t0 after the publish returns, then poll the
    reader until the method is searchable. Prints elapsed time vs poll interval.
@@ -60,9 +62,69 @@ def ids(data):
     return [r.get("id") for r in data]
 
 
+def fqn_of(result_id, project):
+    """Search ids are '<project>:<fqn>'; graph endpoints take the bare FQN."""
+    prefix = project + ":"
+    return result_id[len(prefix):] if result_id and result_id.startswith(prefix) else result_id
+
+
+def check_dict(data):
+    if isinstance(data, dict) and "__error__" in data:
+        raise FetchError(data["__error__"])
+    if not isinstance(data, dict):
+        raise FetchError("unexpected response: " + repr(data)[:200])
+    return data
+
+
+def usage_sets(data):
+    """/api/usages: every list-valued kind as a set (order is not part of the contract)."""
+    d = check_dict(data)
+    return {k: frozenset(v) for k, v in d.items() if isinstance(v, list)}
+
+
+def impact_set(data):
+    """/api/impact: the (fqn, depth) callers as a set, plus the totals."""
+    d = check_dict(data)
+    entries = set()
+    for e in d.get("callers") or []:
+        entries.add(json.dumps(e, sort_keys=True))
+    return {"totalCallers": d.get("totalCallers"), "truncated": d.get("truncated"),
+            "callers": frozenset(entries)}
+
+
+def compare_graph(args, project, fqn, st):
+    """Graph-backed endpoints for one FQN. Returns False on error/mismatch."""
+    try:
+        wu = usage_sets(get_json(args.writer, "/api/usages", {"fqn": fqn, "kind": "all"}))
+        ru = usage_sets(get_json(args.reader, "/api/usages", {"fqn": fqn, "kind": "all"}))
+        wi = impact_set(get_json(args.writer, "/api/impact", {"fqn": fqn, "depth": 3}))
+        ri = impact_set(get_json(args.reader, "/api/impact", {"fqn": fqn, "depth": 3}))
+    except FetchError as e:
+        st["errors"] += 1
+        print(f"ERROR graph [{project}] {fqn}: {e}")
+        return False
+    st["graph"] += 1
+    if any(wu.values()) or wi["callers"]:
+        st["graph_non_empty"] += 1
+    ok = True
+    if wu != ru:
+        st["mismatches"] += 1
+        ok = False
+        diff = {k: (sorted(wu.get(k, ())), sorted(ru.get(k, ())))
+                for k in set(wu) | set(ru) if wu.get(k) != ru.get(k)}
+        print(f"MISMATCH usages [{project}] {fqn}: kind -> (writer, reader): {json.dumps(diff)[:2000]}")
+    if wi != ri:
+        st["mismatches"] += 1
+        ok = False
+        print(f"MISMATCH impact [{project}] {fqn}\n  writer: total={wi['totalCallers']} "
+              f"{sorted(wi['callers'])[:20]}\n  reader: total={ri['totalCallers']} {sorted(ri['callers'])[:20]}")
+    return ok
+
+
 def compare(args):
     queries = load_queries()
-    st = {"compared": 0, "non_empty": 0, "empty": 0, "errors": 0, "mismatches": 0, "callers": 0}
+    st = {"compared": 0, "non_empty": 0, "empty": 0, "errors": 0, "mismatches": 0, "callers": 0,
+          "graph": 0, "graph_non_empty": 0}
     empties = []
     for query, project in queries:
         p = {"q": query, "pipeline": "keyword", "limit": 10, "project": project}
@@ -83,27 +145,34 @@ def compare(args):
             empties.append(f"[{project}] {query!r}")
             continue
         st["non_empty"] += 1
-        cp = {"fqn": w[0], "project": project}
+        fqn = fqn_of(w[0], project)
+        compare_graph(args, project, fqn, st)
+        cp = {"fqn": fqn, "project": project}
         try:
             wc = ids(get_json(args.writer, "/api/callers", cp))
             rc = ids(get_json(args.reader, "/api/callers", cp))
         except FetchError as e:
             st["errors"] += 1
-            print(f"ERROR callers [{project}] {w[0]}: {e}")
+            print(f"ERROR callers [{project}] {fqn}: {e}")
             continue
         st["callers"] += 1
         if wc != rc:
             st["mismatches"] += 1
-            print(f"MISMATCH callers [{project}] {w[0]}\n  writer: {wc}\n  reader: {rc}")
+            print(f"MISMATCH callers [{project}] {fqn}\n  writer: {wc}\n  reader: {rc}")
     for e in empties:
         print(f"EMPTY top-10 on both: {e}")
     print(f"queries total: {len(queries)}, compared: {st['compared']}, non-empty: {st['non_empty']}, "
-          f"empty: {st['empty']}, callers compared: {st['callers']}, errors: {st['errors']}, "
-          f"mismatches: {st['mismatches']}")
+          f"empty: {st['empty']}, callers compared: {st['callers']}, graph compared: {st['graph']} "
+          f"(non-empty: {st['graph_non_empty']}), errors: {st['errors']}, mismatches: {st['mismatches']}")
+    search_ok = st["non_empty"] >= 0.9 * st["compared"] and st["compared"] > 0
+    graph_ok = st["graph_non_empty"] > 0
     ok = (st["errors"] == 0 and st["mismatches"] == 0 and st["compared"] == len(queries)
-          and st["non_empty"] >= 0.9 * st["compared"] and st["compared"] > 0)
-    if not ok and st["errors"] == 0 and st["mismatches"] == 0:
-        print("FAIL: fewer than 90% of queries returned a non-empty top-10 (vacuous comparison)")
+          and search_ok and graph_ok)
+    if st["errors"] == 0 and st["mismatches"] == 0:
+        if not search_ok:
+            print("FAIL: fewer than 90% of queries returned a non-empty top-10 (vacuous comparison)")
+        if not graph_ok:
+            print("FAIL: no top result had a non-empty graph answer (vacuous graph comparison)")
     return ok
 
 
