@@ -564,4 +564,30 @@ class ObjectStorePublisherTest {
                     .collect(Collectors.toSet());
         }
     }
+
+    // ── Adaptation 4: the manifest ships the shard's index-format.json ───────────────────────
+
+    @Test
+    void manifestCarriesTheShardsIndexFormatStamp() throws Exception {
+        indexFull(manager(publisher));
+        var stamp = com.pharos.indexer.IndexFormat.read(tmp.resolve("indexes").resolve(PROJECT));
+
+        JsonNode f = manifest(1).get("indexFormat");
+        assertThat(f.get("format").asInt()).isEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+        assertThat(f.get("pharosVersion").asText()).isEqualTo(stamp.pharosVersion());
+        assertThat(java.time.Instant.parse(f.get("writtenAt").asText())).isEqualTo(stamp.writtenAt());
+        ShardManifest typed = ShardManifest.read(store.get(layout.manifestKey(SHARD, Generation.FIRST))
+                .orElseThrow().data());
+        assertThat(typed.indexFormat()).isEqualTo(stamp);
+        assertThat(typed.indexFormatVersion()).isEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+    }
+
+    @Test
+    void manifestWithoutTheFieldReadsAsFormatZero() throws Exception {
+        String legacy = "{\"formatVersion\":1,\"shard\":\"p\",\"generation\":1,\"files\":[]}";
+        ShardManifest m = ShardManifest.read(legacy.getBytes(StandardCharsets.UTF_8));
+        assertThat(m.indexFormat()).isNull();
+        assertThat(m.indexFormatVersion()).isZero();
+        assertThat(JSON.readTree(m.toJson()).has("indexFormatVersion")).isFalse();
+    }
 }

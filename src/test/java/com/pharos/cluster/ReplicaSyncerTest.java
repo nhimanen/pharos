@@ -398,7 +398,7 @@ class ReplicaSyncerTest {
         files.set(0, new ManifestFile(first.role(), "../../escape", first.key(), first.length(), first.checksum()));
         ShardManifest evil = new ShardManifest(m.formatVersion(), m.shard(), m.generation(), m.parentGeneration(),
                 m.createdAt(), m.writerNode(), m.docCount(), m.sizeBytes(), m.modelFingerprint(), files,
-                m.projectMeta());
+                m.projectMeta(), m.indexFormat());
         store.put(layout.manifestKey(SHARD, Generation.FIRST), evil.toJson());
 
         syncer.syncOnce();

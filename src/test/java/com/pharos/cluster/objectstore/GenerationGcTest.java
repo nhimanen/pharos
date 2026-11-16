@@ -70,7 +70,7 @@ class GenerationGcTest {
                 new ManifestFile(ManifestFile.GRAPH, "graph.cgf", graph(g), 2, "c" + g),
                 new ManifestFile(ManifestFile.REFS, "unresolved-refs.json.gz", refs(g), 2, "d" + g));
         ShardManifest m = new ShardManifest(ShardManifest.FORMAT_VERSION, SHARD.value(), g,
-                g == 1 ? null : g - 1, at, "node-a", 1, 12, "none", files, null);
+                g == 1 ? null : g - 1, at, "node-a", 1, 12, "none", files, null, null);
         store.put(manifestKey(g), m.toJson());
     }
 

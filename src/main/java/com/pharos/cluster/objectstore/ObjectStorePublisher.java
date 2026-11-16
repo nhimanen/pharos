@@ -11,6 +11,7 @@ import com.pharos.cluster.ShardId;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphWriter;
 import com.pharos.graph.GraphViews;
+import com.pharos.indexer.IndexFormat;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
@@ -198,7 +199,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
             ShardManifest manifest = new ShardManifest(ShardManifest.FORMAT_VERSION, shard.value(), gen.value(),
                     previous.map(p -> p.generation().value()).orElse(null), Instant.now(), nodeId,
                     docCount, sizeBytes, snapshot.modelFingerprint(), files,
-                    ShardManifest.stripRefs(snapshot.meta()));
+                    ShardManifest.stripRefs(snapshot.meta()), formatStamp(snapshot.shardDir()));
             byte[] manifestJson = manifest.toJson();
             String manifestKey = layout.manifestKey(shard, gen);
             if (store.putIfAbsent(manifestKey, manifestJson).isEmpty()) {
@@ -229,6 +230,11 @@ public final class ObjectStorePublisher implements IndexPublisher {
         } finally {
             if (tempDir != null) deleteRecursively(tempDir);
         }
+    }
+
+    /** The shard's index-format.json as written by the index run; null when it has none (format 0). */
+    private static IndexFormat.Stamp formatStamp(Path shardDir) {
+        return Files.isRegularFile(shardDir.resolve(IndexFormat.FILE_NAME)) ? IndexFormat.read(shardDir) : null;
     }
 
     private Optional<Latest> readLatest(ShardId shard) throws IOException {

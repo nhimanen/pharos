@@ -5,6 +5,7 @@ import com.pharos.cluster.objectstore.ShardManifest;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.GraphViews;
+import com.pharos.indexer.IndexFormat;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
@@ -65,6 +66,10 @@ import java.util.zip.CheckedInputStream;
  * ({@link CodecUtil#checksumEntireFile}) and that checksum must match the manifest, while files
  * hard-linked from the active generation (already verified when they were downloaded) only have
  * their footer compared.
+ *
+ * <p>A served generation dir carries the
+ * manifest's stamp as {@code index-format.json}, so {@code index-status} and
+ * {@code IndexFormat.check} see the writer's format on the reader.
  *
  * <p>If {@code LATEST} names a generation below the served one (the bucket was wiped, or the
  * shard rolled back), a WARN names both and the published generation is served as a new lineage:
@@ -222,6 +227,8 @@ public class ReplicaSyncer implements Closeable {
         Path genDir = shardRoot.resolve("gen-" + gen.value());
         if (Files.isDirectory(genDir) && sameManifest(genDir, manifestJson)) {
             log.info("Shard {}: adopting complete generation {} found in {}", shard, gen.value(), genDir);
+            // materialised by a build that did not write the stamp yet
+            if (!Files.exists(genDir.resolve(IndexFormat.FILE_NAME))) writeFormatStamp(genDir, manifest);
         } else {
             if (cache.active(shard.value()).filter(genDir::equals).isPresent()) {
                 throw new IOException("active generation dir " + genDir + " does not match its manifest");
@@ -237,6 +244,11 @@ public class ReplicaSyncer implements Closeable {
         served.put(shard, gen);
         register(shard, gen, manifest.projectMeta(), genDir);
         prune(shard, shardRoot, gen);
+    }
+
+    /** Carries the writer's stamp into the generation dir; no stamp in the manifest means format 0. */
+    private static void writeFormatStamp(Path dir, ShardManifest manifest) {
+        if (manifest.indexFormat() != null) IndexFormat.write(dir, manifest.indexFormat());
     }
 
     /** Every entry needs a role and a plain file name; at least one Lucene file, at most one graph. */
@@ -291,6 +303,7 @@ public class ReplicaSyncer implements Closeable {
             }
         }
         checkLuceneChecksums(lucene, manifest, downloadedLucene);
+        writeFormatStamp(partial, manifest);
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
         log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded) in {} ms",

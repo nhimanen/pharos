@@ -56,7 +56,8 @@ public final class IndexFormat {
 
     public record Stamp(int format, String pharosVersion, Instant writtenAt) {}
 
-    static final String FILE_NAME = "index-format.json";
+    /** The stamp's file name inside a project index dir (or a reader's generation dir). */
+    public static final String FILE_NAME = "index-format.json";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private record Cached(long mtime, Status status, Stamp stamp) {}
@@ -90,12 +91,20 @@ public final class IndexFormat {
     }
 
     public static void write(Path projectIndexDir) {
+        write(projectIndexDir, new Stamp(IndexVersions.INDEX_FORMAT, PharosVersion.get(), Instant.now()));
+    }
+
+    /**
+     * Writes {@code stamp} as given (atomic replace). A reader uses this to carry the writer's
+     * stamp from a published manifest into the generation dir it materialises.
+     */
+    public static void write(Path projectIndexDir, Stamp stamp) {
         try {
             Files.createDirectories(projectIndexDir);
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("format", IndexVersions.INDEX_FORMAT);
-            m.put("pharosVersion", PharosVersion.get());
-            m.put("writtenAt", Instant.now().toString());
+            m.put("format", stamp.format());
+            m.put("pharosVersion", stamp.pharosVersion());
+            m.put("writtenAt", stamp.writtenAt() == null ? null : stamp.writtenAt().toString());
             Path tmp = Files.createTempFile(projectIndexDir, FILE_NAME, ".tmp");
             try {
                 MAPPER.writeValue(tmp.toFile(), m);
@@ -107,6 +116,16 @@ public final class IndexFormat {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * The status an index of {@code format} has for this build (never {@code MISSING} or
+     * {@code INVALID}). An unstamped index is format 0.
+     */
+    public static Status statusOf(int format) {
+        return format == IndexVersions.INDEX_FORMAT ? Status.OK
+                : format > IndexVersions.INDEX_FORMAT ? Status.NEWER
+                : format >= MIN_READABLE_FORMAT ? Status.UPGRADE_AVAILABLE : Status.OUTDATED;
     }
 
     public static Status status(Path projectIndexDir) {
@@ -151,10 +170,7 @@ public final class IndexFormat {
         Cached c = CACHE.get(k);
         if (c != null && c.mtime() == key) return c;
         Stamp s = read(dir);
-        Status st = s.format() == IndexVersions.INDEX_FORMAT ? Status.OK
-                : s.format() > IndexVersions.INDEX_FORMAT ? Status.NEWER
-                : s.format() >= MIN_READABLE_FORMAT ? Status.UPGRADE_AVAILABLE : Status.OUTDATED;
-        Cached n = new Cached(key, st, s);
+        Cached n = new Cached(key, statusOf(s.format()), s);
         CACHE.put(k, n);
         return n;
     }
