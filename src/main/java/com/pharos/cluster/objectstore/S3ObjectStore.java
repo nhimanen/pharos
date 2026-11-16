@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -146,20 +147,28 @@ public class S3ObjectStore implements ObjectStore {
 
     @Override
     public void downloadRange(String key, long offset, long length, Path target) throws IOException {
-        if (offset < 0 || length < 0) throw new IllegalArgumentException("negative offset or length");
+        long end = ObjectStore.checkRange(offset, length);
         Path abs = target.toAbsolutePath();
         Path dir = abs.getParent();
         Files.createDirectories(dir);
         Path tmp = Files.createTempFile(dir, abs.getFileName().toString(), ".part");
         try {
-            if (length > 0) {
+            if (length == 0) {
+                // No ranged GET can express zero bytes; a HEAD gives the same missing-key / past-end answers.
+                long size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+                        .contentLength();
+                if (offset > size) {
+                    throw new EOFException("range " + offset + "+0 is past the end (size " + size + ") of " + key);
+                }
+            } else {
                 GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
-                        .range("bytes=" + offset + "-" + (offset + length - 1)).build();
+                        .range("bytes=" + offset + "-" + (end - 1)).build();
                 try (ResponseInputStream<GetObjectResponse> in = s3.getObject(req)) {
+                    checkContentRange(in.response().contentRange(), offset, key);
                     long copied = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
                     if (copied != length) {
                         Long total = totalSize(in.response().contentRange());
-                        if (total != null && offset + length > total) {
+                        if (total != null && end > total) {
                             throw new EOFException("range " + offset + "+" + length + " exceeds size " + total
                                     + " of " + key);
                         }
@@ -181,6 +190,32 @@ public class S3ObjectStore implements ObjectStore {
             throw wrap("download range", key, e);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * Rejects a response whose body does not start at {@code offset}: a {@code Content-Range} with
+     * another start, or none at all for a non-zero offset (a 200 that ignored the Range header and
+     * sent the object from byte 0).
+     */
+    static void checkContentRange(String contentRange, long offset, String key) throws IOException {
+        if (contentRange == null) {
+            if (offset == 0) return;
+            throw new IOException("server ignored the Range header for '" + key + "' (no Content-Range,"
+                    + " expected a body starting at " + offset + ")");
+        }
+        String v = contentRange.trim();
+        int dash = v.indexOf('-');
+        long start;
+        try {
+            if (!v.startsWith("bytes ") || dash < 0) throw new NumberFormatException(v);
+            start = Long.parseLong(v.substring("bytes ".length(), dash).trim());
+        } catch (NumberFormatException e) {
+            throw new IOException("unparseable Content-Range '" + contentRange + "' for '" + key + "'");
+        }
+        if (start != offset) {
+            throw new IOException("Content-Range '" + contentRange + "' for '" + key + "' starts at " + start
+                    + ", expected " + offset);
         }
     }
 

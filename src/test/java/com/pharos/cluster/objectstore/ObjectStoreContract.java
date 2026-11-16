@@ -162,4 +162,34 @@ public abstract class ObjectStoreContract {
         assertThat(t).exists();
         assertThat(Files.size(t)).isZero();
     }
+
+    @Test
+    void zeroLengthRangeOfMissingKeyIsNoSuchFile() {
+        Path t = tmp.resolve("zero-missing.bin");
+        assertThatThrownBy(() -> store().downloadRange("range/nope-zero", 0, 0, t))
+                .isInstanceOf(NoSuchFileException.class);
+        assertThat(t).doesNotExist();
+    }
+
+    @Test
+    void zeroLengthRangeAtEndIsEmptyButPastEndIsEof() throws IOException {
+        putRangeObject("range/zero-end");
+        Path atEnd = tmp.resolve("zero-at-end.bin");
+        store().downloadRange("range/zero-end", 10_000, 0, atEnd);
+        assertThat(Files.size(atEnd)).isZero();
+        Path past = tmp.resolve("zero-past-end.bin");
+        assertThatThrownBy(() -> store().downloadRange("range/zero-end", 10_001, 0, past))
+                .isInstanceOf(EOFException.class);
+        assertThat(past).doesNotExist();
+    }
+
+    @Test
+    void rangeOverflowIsIllegalArgument() throws IOException {
+        putRangeObject("range/overflow");
+        Path t = tmp.resolve("overflow.bin");
+        assertThatThrownBy(() -> store().downloadRange("range/overflow", Long.MAX_VALUE - 5, 10, t))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("overflow");
+        assertThat(t).doesNotExist();
+    }
 }

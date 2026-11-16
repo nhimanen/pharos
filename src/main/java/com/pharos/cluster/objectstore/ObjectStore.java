@@ -30,6 +30,22 @@ public interface ObjectStore extends Closeable {
      */
     void downloadRange(String key, long offset, long length, Path target) throws IOException;
 
+    /**
+     * Validates a {@link #downloadRange} request and returns its exclusive end {@code offset + length}.
+     *
+     * @throws IllegalArgumentException for a negative offset or length, or when the end overflows a long
+     */
+    static long checkRange(long offset, long length) {
+        if (offset < 0 || length < 0) {
+            throw new IllegalArgumentException("negative offset or length: " + offset + "+" + length);
+        }
+        try {
+            return Math.addExact(offset, length);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("range " + offset + "+" + length + " overflows a long");
+        }
+    }
+
     /** Uploads a file; returns the new ETag. */
     String put(String key, Path source) throws IOException;
 

@@ -71,17 +71,17 @@ public class InMemoryObjectStore implements ObjectStore {
 
     @Override
     public void downloadRange(String key, long offset, long length, Path target) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
         Entry e = map.get(key);
         if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
-        if (offset < 0 || length < 0) throw new IllegalArgumentException("negative offset or length");
-        if (offset + length > e.data().length) {
+        if (end > e.data().length) {
             throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
         }
         Path abs = target.toAbsolutePath();
         Files.createDirectories(abs.getParent());
         Path tmp = Files.createTempFile(abs.getParent(), abs.getFileName().toString(), ".part");
         try {
-            byte[] slice = java.util.Arrays.copyOfRange(e.data(), (int) offset, (int) (offset + length));
+            byte[] slice = java.util.Arrays.copyOfRange(e.data(), (int) offset, (int) end);
             for (String s : midBodyFailSubstrings) {
                 if (key.contains(s)) {
                     Files.write(tmp, java.util.Arrays.copyOf(slice, slice.length / 2));
