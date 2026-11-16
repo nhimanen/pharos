@@ -318,10 +318,20 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
         String input = text.length() > MAX_INPUT_LENGTH ? text.substring(0, MAX_INPUT_LENGTH) : text;
         try (var t = NativeInferenceGuard.enter()) {
             maybeResetThreadPredictor();
-            return threadPredictor.get().predict(input);
+            return predictOrThrow(modelId, () -> threadPredictor.get().predict(input));
+        }
+    }
+
+    @FunctionalInterface
+    interface Prediction { float[] run() throws TranslateException; }
+
+    /** Runs a prediction; a translator failure is logged at WARN and rethrown, never turned into a null vector. */
+    static float[] predictOrThrow(String modelId, Prediction p) {
+        try {
+            return p.run();
         } catch (TranslateException e) {
-            log.debug("Embedding failed: {}", e.getMessage());
-            return null;
+            log.warn("Embedding failed for model '{}': {}", modelId, e.getMessage());
+            throw new EmbeddingException("Embedding failed for model '" + modelId + "': " + e.getMessage(), e);
         }
     }
 
@@ -366,7 +376,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             }
             return batchPred.predict(sanitised);
         } catch (TranslateException e) {
-            log.debug("Batch embedding failed, falling back to sequential: {}", e.getMessage());
+            log.warn("Batch embedding failed for model '{}', retrying sequentially: {}", modelId, e.getMessage());
             return EmbeddingProvider.super.embedBatch(texts);
         }
     }

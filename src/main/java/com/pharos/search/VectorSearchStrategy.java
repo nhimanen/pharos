@@ -55,7 +55,12 @@ public class VectorSearchStrategy {
             return List.of();
         }
 
-        float[] queryVector = embedder.embedQuery(req.query());
+        float[] queryVector;
+        try {
+            queryVector = embedder.embedQuery(req.query());
+        } catch (com.pharos.embedding.EmbeddingException e) {
+            queryVector = null;   // already logged at WARN by the provider
+        }
         if (queryVector == null) {
             log.warn("Embedding returned null for query: {}", req.query());
             return List.of();
