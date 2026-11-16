@@ -730,34 +730,6 @@ public class DocumentMapper {
         return chunkVectorFieldName(modelId);
     }
 
-    /**
-     * Reader-aware {@link #vectorFieldFor(String)}. Indexes written by 1.4.0/1.4.1 with a
-     * {@code legacy}-model provider stored vectors under {@code vec.legacy}, not the
-     * {@code vectorEmbedding} field search reads. For the legacy model, when this reader has
-     * no {@code vectorEmbedding} field but does have {@code vec.legacy}, read that one, so
-     * those indexes keep serving vector search without a re-embed.
-     */
-    public static String vectorFieldFor(String modelId, org.apache.lucene.index.IndexReader reader) {
-        return resolveLegacy(modelId, reader, vectorFieldFor(modelId), vectorFieldName(modelId));
-    }
-
-    /** Reader-aware {@link #chunkVectorFieldFor(String)}; see {@link #vectorFieldFor(String, org.apache.lucene.index.IndexReader)}. */
-    public static String chunkVectorFieldFor(String modelId, org.apache.lucene.index.IndexReader reader) {
-        return resolveLegacy(modelId, reader, chunkVectorFieldFor(modelId), chunkVectorFieldName(modelId));
-    }
-
-    private static String resolveLegacy(String modelId, org.apache.lucene.index.IndexReader reader,
-                                         String primary, String misnamed) {
-        if (!com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId) || reader == null) return primary;
-        boolean hasPrimary = false, hasMisnamed = false;
-        for (org.apache.lucene.index.LeafReaderContext ctx : reader.leaves()) {
-            var fis = ctx.reader().getFieldInfos();
-            hasPrimary |= fis.fieldInfo(primary) != null;
-            hasMisnamed |= fis.fieldInfo(misnamed) != null;
-        }
-        return !hasPrimary && hasMisnamed ? misnamed : primary;
-    }
-
     private static String sanitizeModelId(String modelId) {
         if (modelId == null || modelId.isBlank()) {
             throw new IllegalArgumentException("modelId must be non-blank for field naming");

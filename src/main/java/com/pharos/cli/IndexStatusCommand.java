@@ -58,6 +58,10 @@ public class IndexStatusCommand implements Callable<Integer> {
             r.put("rootPath", p.getRootPath());
             r.put("rootExists", p.getRootPath() != null && Files.isDirectory(Path.of(p.getRootPath())));
             r.put("indexBytes", sizeOf(dir));
+            // Status values stay as-is; this flag marks projects whose vectors pharos 1.4.0-1.4.1 stored
+            // under vec.legacy (never searched) and that the next 'pharos index' re-embeds.
+            r.put("needsReembed", dir != null && com.pharos.indexer.LegacyVectorFields
+                    .hasLiveMisnamedVectors(dir.resolve("lucene")));
             r.put("lastIndexed", p.getLastIndexed() == null ? null : p.getLastIndexed().toString());
             rows.add(r);
         }
@@ -87,6 +91,11 @@ public class IndexStatusCommand implements Callable<Integer> {
                     humanBytes((Long) r.get("indexBytes")),
                     Boolean.TRUE.equals(r.get("rootExists")) ? "ok" : "gone",
                     r.get("lastIndexed") == null ? "never" : r.get("lastIndexed"));
+        }
+        for (Map<String, Object> r : rows) {
+            if (Boolean.TRUE.equals(r.get("needsReembed"))) {
+                System.out.printf("note: %s: vectors need re-embed (run: pharos index %s)%n", r.get("name"), r.get("name"));
+            }
         }
         return 0;
     }

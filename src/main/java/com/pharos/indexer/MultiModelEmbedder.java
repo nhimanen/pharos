@@ -218,7 +218,10 @@ public class MultiModelEmbedder {
                     String name = f.name();
                     if (name.startsWith("chunkVec.") || DocumentMapper.F_CHUNK_VECTORS_LEGACY.equals(name)) {
                         BytesRef br = doc.getBinaryValue(name);
-                        if (br != null) snap.chunkVecsByField.put(name, br.bytes.clone());
+                        // chunkVec.legacy is the misnamed legacy-model field; it belongs in chunkVectors
+                        String target = LegacyVectorFields.MISNAMED_CHUNKS.equals(name)
+                                ? DocumentMapper.F_CHUNK_VECTORS_LEGACY : name;
+                        if (br != null) snap.chunkVecsByField.put(target, br.bytes.clone());
                     }
                 }
                 snapshots.add(snap);

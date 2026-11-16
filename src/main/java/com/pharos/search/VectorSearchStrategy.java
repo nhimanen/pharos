@@ -40,9 +40,13 @@ public class VectorSearchStrategy {
     private final EmbeddingProvider embedder;
     /** Cached per-modelId Lucene field name for KNN queries. Resolves the legacy
      *  fallback path automatically (see {@link DocumentMapper#vectorFieldFor(String)}). */
+    private final String vectorField;
+    private final String chunkVectorField;
 
     public VectorSearchStrategy(EmbeddingProvider embedder) {
         this.embedder = embedder;
+        this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
+        this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
 
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
@@ -57,8 +61,6 @@ public class VectorSearchStrategy {
             return List.of();
         }
 
-        String vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId(), reader);
-        String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         Query filter      = buildFilter(req);
         int   limit       = req.limit();
         int   firstPassK  = limit * RESCORE_FACTOR;
@@ -71,7 +73,7 @@ public class VectorSearchStrategy {
         TopDocs firstPass = searcher.search(vectorQuery, firstPassK);
 
         // Late-interaction rescoring when chunkVectors field is present
-        if (hasChunkVectors(reader, chunkVectorField) && firstPass.totalHits.value() > 0) {
+        if (hasChunkVectors(reader) && firstPass.totalHits.value() > 0) {
             // Wrap single query vector as float[][] — the rescorer treats it as a 1-element
             // multi-vector, so SUM_MAX_SIM becomes MAX(cosine(queryVec, chunkVec_i)).
             float[][] queryMultiVec = new float[][] { queryVector };
@@ -104,7 +106,6 @@ public class VectorSearchStrategy {
      */
     public SnippetResolver buildVectorResolver(IndexReader reader, float[] queryVec) {
         if (queryVec == null) return SnippetResolver.none();
-        final String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         return result -> {
             try {
                 IndexSearcher searcher = new IndexSearcher(reader);
@@ -149,7 +150,7 @@ public class VectorSearchStrategy {
     }
 
     /** Returns true when the index contains the per-model chunk-vectors late-interaction field. */
-    private static boolean hasChunkVectors(IndexReader reader, String chunkVectorField) {
+    private boolean hasChunkVectors(IndexReader reader) {
         return reader.leaves().stream().anyMatch(
                 ctx -> ctx.reader().getFieldInfos().fieldInfo(chunkVectorField) != null);
     }

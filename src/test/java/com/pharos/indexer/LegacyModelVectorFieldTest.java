@@ -75,38 +75,112 @@ class LegacyModelVectorFieldTest {
         }
     }
 
-    /** Indexes written by 1.4.0/1.4.1 hold legacy-model vectors in vec.legacy; they must stay searchable. */
-    @Test
-    void indexWithMisnamedVecLegacy_isStillSearchable() throws Exception {
-        ByteBuffersDirectory dir = new ByteBuffersDirectory();
-        try (IndexWriter w = new IndexWriter(dir, new IndexWriterConfig())) {
-            Document d = new Document();
-            d.add(new StringField(DocumentMapper.F_ID, "p:x", Field.Store.YES));
-            d.add(new KnnFloatVectorField("vec.legacy", new float[]{1, 0, 0, 0}, VectorSimilarityFunction.COSINE));
-            w.addDocument(d);
+    // ── Migration of indexes written by 1.4.0-1.4.1 (vectors under vec.legacy) ──────────────
+
+    private IndexConfig config;
+    private LuceneIndexer lucene;
+    private SelectiveIndexUpdateTest.TestRegistry registry;
+    private ProjectIndexManager manager;
+    private Path root;
+
+    private void setUpProject(EmbeddingProvider provider) throws Exception {
+        root = tmp.resolve("mig");
+        Path pkg = Files.createDirectories(root.resolve("src/main/java/com/example"));
+        Files.writeString(pkg.resolve("A.java"), "package com.example;\npublic class A { public void alphaMethod() { int a = 1; } }");
+        Files.writeString(pkg.resolve("B.java"), "package com.example;\npublic class B { public void betaMethod() { int b = 2; } }");
+        config = IndexConfig.defaults();
+        config.setIndexDir(tmp.resolve("indexes-mig"));
+        lucene = new LuceneIndexer(config);
+        registry = new SelectiveIndexUpdateTest.TestRegistry();
+        ModuleGraphBuilder noopGraph = new ModuleGraphBuilder(registry) {
+            @Override
+            public synchronized List<String> incorporate(Path r, ProjectMeta meta,
+                    com.pharos.parser.MavenPomReader.PomInfo pomInfo) { return List.of(); }
+        };
+        manager = new ProjectIndexManager(config, lucene, registry, List.of(provider), noopGraph);
+    }
+
+    /** Turns a healthy index into what 1.4.0/1.4.1 wrote: every doc's vector under vec.legacy. */
+    private void downgradeToMisnamed() throws Exception {
+        var parser = new com.pharos.parser.JavaCodeParser();
+        try (IndexWriter w = lucene.openWriter("mig")) {
+            w.deleteAll();
+            for (String f : List.of("A", "B")) {
+                Path src = root.resolve("src/main/java/com/example/" + f + ".java");
+                List<String> lines = Files.readAllLines(src);
+                for (var m : parser.parseFile(src, "mig", root).methods()) {
+                    Document d = DocumentMapper.toDocument(m, (float[]) null, 0, List.of(), lines);
+                    d.add(new KnnFloatVectorField("vec.legacy", new float[]{1, 0, 0, 0}, VectorSimilarityFunction.COSINE));
+                    w.addDocument(d);
+                }
+            }
+            w.commit();
         }
-        try (DirectoryReader r = DirectoryReader.open(dir)) {
-            assertThat(DocumentMapper.vectorFieldFor("legacy", r)).isEqualTo("vec.legacy");
-            assertThat(DocumentMapper.chunkVectorFieldFor("legacy", r)).isEqualTo("chunkVectors");
-            assertThat(DocumentMapper.vectorFieldFor("other", r)).isEqualTo("vec.other");
-            List<SearchResult> res = new VectorSearchStrategy(new FakeProvider("legacy"))
-                    .search(r, new SearchRequest("q", SearchRequest.SearchType.VECTOR, null, null, 5, "text", null, null, 0));
-            assertThat(res).hasSize(1);
+    }
+
+    private boolean liveMisnamed() throws Exception {
+        try (DirectoryReader r = DirectoryReader.open(new org.apache.lucene.store.NIOFSDirectory(lucene.getLucenePath("mig")))) {
+            return LegacyVectorFields.hasLiveMisnamedVectors(r);
         }
     }
 
     @Test
-    void indexWithCanonicalField_prefersIt() throws Exception {
-        ByteBuffersDirectory dir = new ByteBuffersDirectory();
-        try (IndexWriter w = new IndexWriter(dir, new IndexWriterConfig())) {
-            Document d = new Document();
-            d.add(new KnnFloatVectorField("vectorEmbedding", new float[]{1, 0, 0, 0}, VectorSimilarityFunction.COSINE));
-            d.add(new KnnFloatVectorField("vec.legacy", new float[]{0, 1, 0, 0}, VectorSimilarityFunction.COSINE));
-            w.addDocument(d);
-        }
-        try (DirectoryReader r = DirectoryReader.open(dir)) {
-            assertThat(DocumentMapper.vectorFieldFor("legacy", r)).isEqualTo("vectorEmbedding");
-        }
+    void incrementalIndexOnVecLegacyIndex_reembedsFromCacheAndEndsClean() throws Exception {
+        CountingProvider provider = new CountingProvider("legacy");
+        setUpProject(provider);
+        manager.index(root, "mig", false, true);
+        downgradeToMisnamed();
+        assertThat(liveMisnamed()).isTrue();
+
+        manager.index(root, "mig", true, true);   // plain incremental: no source file changed
+        assertThat(liveMisnamed()).as("no live vec.legacy doc left").isFalse();
+
+        // Second migration: the incremental texts are now cached, so nothing reaches the provider.
+        // (Full-index texts differ slightly from incremental ones, so the first run can't be all hits.)
+        downgradeToMisnamed();
+        int before = provider.calls.get();
+        manager.index(root, "mig", true, true);
+        assertThat(liveMisnamed()).isFalse();
+        assertThat(provider.calls.get()).as("unchanged texts are served from the embedding cache").isEqualTo(before);
+        SearchEngine engine = new SearchEngine(lucene, provider, registry);
+        assertThat(engine.search(new SearchRequest("alphaMethod", SearchRequest.SearchType.VECTOR,
+                "mig", null, 10, "text", null, null, 0))).isNotEmpty();
+
+        int callsAfterMigration = provider.calls.get();
+        manager.index(root, "mig", true, true);
+        assertThat(provider.calls.get()).as("migrated index is not re-embedded again").isEqualTo(callsAfterMigration);
+    }
+
+    @Test
+    void namedModelIsNotReembeddedOnIncrementalRun() throws Exception {
+        CountingProvider provider = new CountingProvider("jina-code-v2");
+        setUpProject(provider);
+        manager.index(root, "mig", false, true);
+        int calls = provider.calls.get();
+        manager.index(root, "mig", true, true);
+        assertThat(provider.calls.get()).isEqualTo(calls);
+        assertThat(liveMisnamed()).isFalse();
+    }
+
+    @Test
+    void embedOnVecLegacyIndex_endsClean() throws Exception {
+        CountingProvider provider = new CountingProvider("legacy");
+        setUpProject(provider);
+        manager.index(root, "mig", false, true);
+        downgradeToMisnamed();
+        ProjectMeta meta = registry.find("mig").orElseThrow();
+
+        int updated = new MultiModelEmbedder(config, lucene, registry).embed(meta, provider, "fp", false);
+
+        assertThat(updated).isGreaterThan(0);
+        assertThat(liveMisnamed()).as("no live vec.legacy / chunkVec.legacy doc left").isFalse();
+        assertThat(registry.find("mig").orElseThrow().getEmbeddedModels()).contains("legacy");
+    }
+
+    static class CountingProvider extends FakeProvider {
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        CountingProvider(String id) { super(id); }
+        @Override public float[] embed(String text) { calls.incrementAndGet(); return super.embed(text); }
     }
 
     static class FakeProvider implements EmbeddingProvider {

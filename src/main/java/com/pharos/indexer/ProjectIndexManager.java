@@ -742,6 +742,20 @@ public class ProjectIndexManager {
             }
         }
 
+        // Indexes written by pharos 1.4.0-1.4.1 with the 'legacy' model stored vectors in vec.legacy,
+        // which search never reads. Re-embed every tracked file (the persistent embedding cache
+        // serves unchanged texts) so each doc is rewritten under vectorEmbedding / chunkVectors.
+        if (generateEmbeddings && !runtimes.isEmpty()
+                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
+            Set<Path> already = new java.util.HashSet<>(dirtyFiles);
+            int before = dirtyFiles.size();
+            for (Path tracked : stateTracker.trackedFiles()) {
+                if (!already.contains(tracked) && currentFiles.contains(tracked)) dirtyFiles.add(tracked);
+            }
+            log.warn("re-embedding project {}: vectors were stored in vec.legacy by pharos 1.4.0-1.4.1 ({} file(s))",
+                    projectName, dirtyFiles.size() - before);
+        }
+
         if (dirtyFiles.isEmpty() && deletedFiles.isEmpty()) {
             log.info("No changes detected for '{}', index is up to date", projectName);
             return registry.find(projectName).orElseThrow();

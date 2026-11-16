@@ -1,5 +1,12 @@
 # Upgrading
 
+## Legacy-model vectors (1.4.0-1.4.1)
+
+With the old single-model config (`embeddingModelUrl`) or a provider with model id `legacy`, 1.4.0-1.4.1
+stored vectors in a field vector search never read, so vector search returned nothing. After upgrading,
+run `pharos index <project>`: it detects such projects (`pharos index-status` shows them) and re-embeds
+every file; unchanged texts are served from the embedding cache, so it is fast. Named models are unaffected.
+
 ## Invalid project names (e.g. ".")
 
 ### What happened

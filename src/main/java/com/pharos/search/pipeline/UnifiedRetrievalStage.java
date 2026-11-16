@@ -83,11 +83,15 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
     private final KeywordSearchStrategy keywordStrategy;
     private final EmbeddingProvider     embedder;
+    private final String vectorField;
+    private final String chunkVectorField;
 
     public UnifiedRetrievalStage(KeywordSearchStrategy keywordStrategy,
                                   EmbeddingProvider embedder) {
         this.keywordStrategy  = keywordStrategy;
         this.embedder         = embedder;
+        this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
+        this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
 
     @Override
@@ -126,8 +130,6 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         }
 
         // ── KNN recall pass ───────────────────────────────────────────────────
-        String vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId(), reader);
-        String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         Query filter = buildFilter(req);
         Query knnQuery = filter != null
                 ? new KnnFloatVectorQuery(vectorField, queryVec, candidateSize, filter)
