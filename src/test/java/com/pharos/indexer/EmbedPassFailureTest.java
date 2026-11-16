@@ -24,6 +24,12 @@ class EmbedPassFailureTest {
     static class FakeProvider implements EmbeddingProvider {
         final Set<String> bad;
         FakeProvider(Set<String> bad) { this.bad = bad; }
+        /** A provider whose model is broken: even the canary fails. */
+        static FakeProvider broken(String... texts) {
+            var s = new java.util.HashSet<>(java.util.Arrays.asList(texts));
+            s.add(DjlEmbeddingProvider.CANARY_TEXT);
+            return new FakeProvider(s);
+        }
         public String modelId() { return "fake"; }
         public int dimensions() { return 2; }
         public boolean isAvailable() { return true; }
@@ -71,7 +77,7 @@ class EmbedPassFailureTest {
     void allFailBatchThrows() throws Exception {
         assertThrows(EmbeddingException.class, () -> manager().runEmbedPass(
                 spool("x", "y"), 2,
-                runtime(new FakeProvider(Set.of("x", "y")), null), (s, c, t) -> {}, "p"));
+                runtime(FakeProvider.broken("x", "y"), null), (s, c, t) -> {}, "p"));
     }
 
     @Test
@@ -80,8 +86,17 @@ class EmbedPassFailureTest {
         // chunkSize 4: chunk 1 = a,b,c,d (fine), chunk 2 = x,y (all fail -> abort)
         assertThrows(EmbeddingException.class, () -> manager().runEmbedPass(
                 spool("a", "b", "c", "d", "x", "y"), 6,
-                runtime(new FakeProvider(Set.of("x", "y")), cache), (s, c, t) -> {}, "p"));
+                runtime(FakeProvider.broken("x", "y"), cache), (s, c, t) -> {}, "p"));
         var reloaded = new PersistentEmbeddingCache(tmp, "fp", 2);
         assertNotNull(reloaded.get(PersistentEmbeddingCache.sha256Hex("a")));
+    }
+
+    @Test
+    void singleBadTextAsOnlyMissDoesNotAbort() throws Exception {
+        var cache = new PersistentEmbeddingCache(tmp, "fp", 2);
+        manager().runEmbedPass(spool("BAD"), 1,
+                runtime(new FakeProvider(Set.of("BAD")), cache), (s, c, t) -> {}, "p");
+        ByteBuffer b = ByteBuffer.wrap(Files.readAllBytes(tmp.resolve("slots.bin")));
+        assertTrue(Float.isNaN(b.getFloat(0)));
     }
 }

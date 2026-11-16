@@ -170,6 +170,7 @@ public class EmbeddingProviderConfig {
     private static final java.util.regex.Pattern HF_REPO_ID =
             java.util.regex.Pattern.compile("^[A-Za-z0-9][\\w.-]*/[\\w.-]+$");
 
+    // TODO(Task 5): this rejects '@'; allow an optional "@<sha>" revision suffix if hf://<repo>@<sha> pinning lands.
     /** True for {@code owner/name} repo ids that cannot traverse directories. */
     public static boolean isValidHfRepoId(String id) {
         if (id == null || !HF_REPO_ID.matcher(id).matches()) return false;

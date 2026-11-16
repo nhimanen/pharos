@@ -245,7 +245,18 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
         if (legacy) {
             log.info("Accepting pre-marker model directory {}", modelDir);
             Path dataFile = modelDir.resolve("model.onnx_data");
-            if (!Files.exists(dataFile)) fetchOptionalOnnxData(base, dataFile);
+            if (!Files.exists(dataFile)) {
+                try {
+                    fetchOptionalOnnxData(base, dataFile);
+                } catch (IOException e) {
+                    // Offline or server trouble must not break a model that already works:
+                    // accept the directory, skip the marker so the probe retries next start.
+                    log.warn("Could not probe for external model data in {} ({}); using the cached model",
+                            modelDir, e.getMessage());
+                    try { ensureConfigJson(base, modelDir); } catch (IOException ignored) { }
+                    return;
+                }
+            }
         } else {
             // Unknown state: discard everything so no half-model can be loaded.
             try (var stream = Files.list(modelDir)) {
@@ -258,12 +269,16 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             log.info("Downloading tokenizer from {}tokenizer.json ...", base);
             downloadWithRedirects(base + "tokenizer.json", tokenizerPath);
         }
+        ensureConfigJson(base, modelDir);
+        Files.writeString(marker, "ok\n");
+    }
+
+    private static void ensureConfigJson(String base, Path modelDir) throws IOException {
         Path configJsonFile = modelDir.resolve("config.json");
         if (!Files.exists(configJsonFile)) {
             log.info("Downloading model config from {}config.json ...", base);
             downloadWithRedirects(base + "config.json", configJsonFile);
         }
-        Files.writeString(marker, "ok\n");
     }
 
     /** Fetches the optional external-data file; a 404 means the model has none. */
@@ -375,6 +390,8 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      * null slot (indexed without a vector), one WARN reports the count, and the failure is
      * rethrown only when every non-blank item failed (the model itself is broken).
      */
+    public static final String CANARY_TEXT = "health check";
+
     public static float[][] embedEachTolerant(String modelId, List<String> texts,
                                        java.util.function.Function<String, float[]> embedOne) {
         float[][] results = new float[texts.size()][];
@@ -392,7 +409,14 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             }
         }
         if (failed > 0) {
-            if (failed == attempted) throw last;
+            if (failed == attempted) {
+                // Every text failed: tell a poisoned text from a broken model with a canary.
+                try {
+                    embedOne.apply(CANARY_TEXT);
+                } catch (EmbeddingException canaryFailure) {
+                    throw last;
+                }
+            }
             log.warn("Embedding failed for {} of {} texts with model '{}'; they are indexed without a vector",
                     failed, attempted, modelId);
         }

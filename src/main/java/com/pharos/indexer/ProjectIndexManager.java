@@ -1366,9 +1366,9 @@ public class ProjectIndexManager {
             }
         } catch (IOException | RuntimeException abort) {
             // Keep what was already embedded so the next run does not redo it.
-            pool.shutdown();
+            pool.shutdownNow();
             try {
-                pool.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS);
+                pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
                 if (rt.cache != null) rt.cache.save();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();

@@ -159,4 +159,19 @@ class HuggingFaceDownloadTest {
         }
         assertEquals(cache.resolve("jinaai-jina-v2"), DjlEmbeddingProvider.resolveModelDir(cache, "jinaai/jina-v2"));
     }
+
+    @Test
+    void legacyDirOfflineProbeIsToleratedWithoutMarker(@TempDir Path dir) throws Exception {
+        Files.writeString(dir.resolve("model.onnx"), "OLD");
+        Files.writeString(dir.resolve("tokenizer.json"), "{}");
+        Files.writeString(dir.resolve("config.json"), "{}");
+        String unreachable = "http://127.0.0.1:1/m/resolve/main/";
+        DjlEmbeddingProvider.ensureModelFiles(unreachable, dir);   // must not throw
+        assertFalse(Files.exists(dir.resolve(".complete")));
+        assertEquals("OLD", Files.readString(dir.resolve("model.onnx")));
+
+        DjlEmbeddingProvider.ensureModelFiles(base, dir);          // reachable on the next start
+        assertTrue(Files.exists(dir.resolve(".complete")));
+        assertEquals("DATA", Files.readString(dir.resolve("model.onnx_data")));
+    }
 }
