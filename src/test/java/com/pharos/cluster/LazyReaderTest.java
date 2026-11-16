@@ -137,6 +137,9 @@ class LazyReaderTest {
             w.forceMerge(1);
             w.commit();
         }
+        // forceMerge of an index that is already one segment can leave its compound file alone
+        // (seen intermittently): copy the segment into a fresh index that never uses compound files.
+        if (hasCompoundFile(projectDir.resolve("lucene"))) rewriteWithoutCompoundFiles(projectDir.resolve("lucene"));
         ProjectMeta meta = cluster.writerRegistry.find(JAVA).orElseThrow();
         long gen = cluster.writerRuntime.publisher().publish(new LocalSnapshot(JAVA, projectDir, meta, "none"))
                 .orElseThrow().value();
@@ -145,6 +148,31 @@ class LazyReaderTest {
         assertThat(lucene).as("fixture: terms dictionary in its own file").anyMatch(n -> n.endsWith(".tim"));
         assertThat(lucene).as("fixture: no compound file").noneMatch(n -> n.endsWith(".cfs"));
         return gen;
+    }
+
+    private static boolean hasCompoundFile(Path luceneDir) throws IOException {
+        return names(luceneDir).stream().anyMatch(n -> n.endsWith(".cfs"));
+    }
+
+    private static void rewriteWithoutCompoundFiles(Path luceneDir) throws IOException {
+        Path fresh = luceneDir.resolveSibling("lucene.rewrite");
+        IndexWriterConfig iwc = new IndexWriterConfig(LuceneIndexer.buildAnalyzer())
+                .setUseCompoundFile(false).setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE);
+        try (FSDirectory src = FSDirectory.open(luceneDir); DirectoryReader r = DirectoryReader.open(src);
+             FSDirectory dst = FSDirectory.open(fresh); IndexWriter w = new IndexWriter(dst, iwc)) {
+            org.apache.lucene.index.CodecReader[] leaves = r.leaves().stream()
+                    .map(c -> (org.apache.lucene.index.CodecReader) c.reader())
+                    .toArray(org.apache.lucene.index.CodecReader[]::new);
+            w.addIndexes(leaves);
+            w.commit();
+        }
+        try (Stream<Path> s = Files.list(luceneDir)) {
+            for (Path p : s.toList()) Files.delete(p);
+        }
+        try (Stream<Path> s = Files.list(fresh)) {
+            for (Path p : s.toList()) Files.move(p, luceneDir.resolve(p.getFileName()));
+        }
+        Files.delete(fresh);
     }
 
     private void addMethodAndReindex(String method) throws IOException {
