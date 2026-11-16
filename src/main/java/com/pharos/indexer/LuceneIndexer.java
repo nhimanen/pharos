@@ -154,6 +154,8 @@ public class LuceneIndexer implements Closeable {
      * Called by force re-index to clear incompatible or corrupt index state.
      */
     public void deleteIndex(String projectName) throws IOException {
+        // Refuse before touching anything: a name like "." resolves to the index root itself.
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
         DirectoryReader cached = openReaders.remove(projectName);
         if (cached != null) {
             try { cached.close(); } catch (IOException ignored) {}

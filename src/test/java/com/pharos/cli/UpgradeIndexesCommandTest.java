@@ -237,4 +237,15 @@ class UpgradeIndexesCommandTest {
             }
         }
     }
+
+    @Test
+    void invalidRegistryNameIsSkippedAndCountedNotCrashed() throws Exception {
+        Files.createDirectories(config.getIndexDir());
+        registry.register(new ProjectMeta(".", tmp.toString(),
+                config.getIndexDir().resolve(".").toString()));
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).isEqualTo(1);
+        assertThat(out.toString()).contains("invalid project name '.'").contains("registry.json");
+        assertThat(config.getIndexDir()).isDirectory();
+    }
 }

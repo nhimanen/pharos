@@ -6,6 +6,7 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.ProgressListener;
 import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.indexer.ProjectNames;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
@@ -86,10 +87,17 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         for (ProjectMeta p : registry.listAll()) {
             known.add(p.getName());
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
+            if (!ProjectNames.isValid(p.getName())) {
+                System.out.printf("Skipping invalid project name '%s': remove it from %s manually "
+                        + "(its index directory would be the index root; pharos will not touch it). "
+                        + "Then re-index it with: pharos index --project <name> <path>%n", p.getName(), "~/.pharos/registry.json");
+                skipped++;
+                continue;
+            }
             switch (IndexFormat.status(IndexFormat.dir(p.getIndexPath()))) {
                 case UPGRADE_AVAILABLE, OUTDATED, NEWER -> todo.add(p);
                 case MISSING -> missing.add(p);
-                case OK -> { }
+                case OK, INVALID -> { }
             }
         }
         for (String n : names) {

@@ -314,6 +314,8 @@ public class ProjectIndexManager {
      * is a no-op when the resource does not exist.
      */
     public void removeProject(String projectName) throws IOException {
+        // Refuse first, before any step touches disk: "." would resolve to the whole index root.
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
         // 1. Downgrade module-graph node INDEXED → EXTERNAL (preserves dep edges)
         try (ModuleGraph moduleGraph = moduleGraphBuilder.open()) {
             moduleGraph.findByProjectName(projectName)
@@ -399,6 +401,7 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
+        ProjectNames.validate(projectName, config.getIndexDir());
         if (incremental) {
             // An index written by another format can't be updated in place: rebuild it fully.
             // A project with no index dir yet is just a normal first full index.

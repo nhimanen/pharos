@@ -107,4 +107,18 @@ class IndexStatusCommandTest {
         }
         return m;
     }
+
+    @Test
+    void invalidNameReportedAsInvalidWithoutCrashing() throws Exception {
+        registry.register(new ProjectMeta(".", tmp.toString(), tmp.resolve("indexes").toString()));
+        var buf = new java.io.ByteArrayOutputStream();
+        var old = System.out;
+        System.setOut(new java.io.PrintStream(buf, true));
+        int rc;
+        try { rc = new picocli.CommandLine(new IndexStatusCommand(registry)).execute("--json"); }
+        finally { System.setOut(old); }
+        assertThat(rc).isEqualTo(0);
+        assertThat(buf.toString()).contains("\"name\" : \".\"").contains("\"status\" : \"invalid\"")
+                .contains("\"indexBytes\" : 0");
+    }
 }

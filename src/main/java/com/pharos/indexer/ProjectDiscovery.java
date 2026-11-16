@@ -171,7 +171,9 @@ public class ProjectDiscovery {
      * Uses the directory name, stripping common version-suffix patterns like "-1.0" or "_main".
      */
     static String deriveProjectName(Path projectRoot) {
-        String name = projectRoot.getFileName().toString();
+        // Normalize first: for "." or "x/.." getFileName() is not the directory's real name.
+        Path fileName = projectRoot.toAbsolutePath().normalize().getFileName();
+        String name = fileName == null ? "" : fileName.toString();
         // Strip trailing version numbers: my-lib-1.2.3 → my-lib
         name = name.replaceAll("-\\d+(\\.\\d+)*$", "");
         return name;

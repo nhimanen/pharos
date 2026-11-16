@@ -7,6 +7,7 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
+import com.pharos.indexer.ProjectNames;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -27,7 +28,7 @@ import java.util.stream.Stream;
  */
 @Command(
         name = "index-status",
-        description = "Show each project's index format status (ok, upgrade-available, outdated, newer, missing)",
+        description = "Show each project's index format status (ok, upgrade-available, outdated, newer, missing, invalid)",
         mixinStandardHelpOptions = true
 )
 public class IndexStatusCommand implements Callable<Integer> {
@@ -45,11 +46,13 @@ public class IndexStatusCommand implements Callable<Integer> {
     public Integer call() throws Exception {
         List<Map<String, Object>> rows = new ArrayList<>();
         for (ProjectMeta p : registry.listAll()) {
-            Path dir = IndexFormat.dir(p.getIndexPath());
+            boolean invalid = !ProjectNames.isValid(p.getName());
+            // An invalid name may point at the whole index root: never read or size it.
+            Path dir = invalid ? null : IndexFormat.dir(p.getIndexPath());
             IndexFormat.Stamp stamp = IndexFormat.read(dir);
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("name", p.getName());
-            r.put("status", IndexFormat.status(dir).wireName());
+            r.put("status", (invalid ? IndexFormat.Status.INVALID : IndexFormat.status(dir)).wireName());
             r.put("format", stamp.format());
             r.put("pharosVersion", stamp.pharosVersion());
             r.put("rootPath", p.getRootPath());
