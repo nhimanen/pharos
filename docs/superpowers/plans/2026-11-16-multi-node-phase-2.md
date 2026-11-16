@@ -213,10 +213,11 @@
    - Report the time from reader start to serving.
 3. **Warm.** The same 99 queries as the Phase 1 gate run against a lazy reader with a warm cache and against a full-mode reader (local files). Interleave 3 runs per side.
    - **Pass:** lazy warm p95 ≤ 1.10 × full-mode p95.
-   - **Pass:** top-10 identical on all 99 queries.
+   - **Pass (strict):** against the same full copy opened with `NIOFSDirectory`, top-10 doc ids, order and scores are bitwise identical on all 99 queries, plus stored fields.
+   - **Pass (production copy, MMap):** non-vector queries are identical. Vector and hybrid scores agree within 4 ulp or 1e-6 relative, and top-10 matches except for swaps between results whose scores tie within that tolerance. Lucene scores vectors differently on mmap inputs (evaluation order), so near-ties can swap. That is documented, not a bug.
 4. **Cap.** Set `cacheMaxBytes` to 50% of the lucene shard's Lucene bytes, rounded down to a block multiple, and run all 99 queries twice. Sample `bytesOnDisk` from `/health` every second.
    - **Pass:** the maximum sample ≤ `cacheMaxBytes + maxConcurrentFetches × blockSizeBytes`.
-   - **Pass:** top-10 identical to full mode.
+   - **Pass:** top-10 identical to full mode under the same rules as step 3.
    - Record the hit rate.
 5. **Safety.** Marker check: `~/.pharos` is untouched. Kill processes by PID only.
 
