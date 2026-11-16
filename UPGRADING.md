@@ -31,10 +31,11 @@ Then re-index the directory with a proper name: `pharos index --project <name> <
 
 A `.` project wrote its files directly into the indexes directory. These may be left over there and
 can be deleted by hand: `callgraph-*.arcadedb*`, `callgraph.current`, `file-state.json`,
-`graph.stamp`, `index-format.json`. If you also have a project named `lucene`, its directory
-`indexes/lucene` may contain `segments_N` and `write.lock` files placed by the `.` project;
-those belong to the stray, not to a real index. **Never delete project subdirectories** of the
-indexes directory.
+`graph.stamp`, `index-format.json`. Delete only these names, and only directly in the indexes
+directory. If you also have a project named `lucene`, the `.` project may have placed
+`segments_N` and `write.lock` directly in `indexes/lucene/`; those two may go too. The real
+`lucene` index lives one level down, in `indexes/lucene/lucene/`: never touch that folder.
+**Never delete project subdirectories** of the indexes directory.
 
 ## Upgrading to 1.4.0 (index format 1)
 
