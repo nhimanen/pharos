@@ -750,6 +750,8 @@ public class ConceptMiner {
                 projectName, date, newRules.size()));
         for (String rule : newRules) sb.append(rule).append('\n');
 
+        Path parent = synonymFile.toAbsolutePath().getParent();
+        if (parent != null) Files.createDirectories(parent);
         Files.writeString(synonymFile, sb.toString(),
                 java.nio.file.StandardOpenOption.CREATE,
                 java.nio.file.StandardOpenOption.APPEND);

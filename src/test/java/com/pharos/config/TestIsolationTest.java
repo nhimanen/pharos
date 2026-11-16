@@ -56,7 +56,7 @@ class TestIsolationTest {
         mgr.index(root, "isolation-test", false, false, false, true, ProgressListener.SILENT);
 
         Path synonyms = config.getSynonymsFile().toAbsolutePath().normalize();
-        assertThat(synonyms).startsWith(IndexConfig.DEFAULT_BASE.toAbsolutePath().normalize());
+        assertThat(synonyms.startsWith(IndexConfig.DEFAULT_BASE.toAbsolutePath().normalize())).isTrue();
         assertThat(synonyms.startsWith(
                 Path.of(System.getProperty("user.home"), ".pharos").toAbsolutePath().normalize())).isFalse();
     }
