@@ -200,7 +200,7 @@ public class S3ObjectStore implements ObjectStore {
                 closeQuietly(in);
                 throw e;
             }
-            return new RangeStream(in, key);
+            return new RangeStream(in, in::abort, length, (op, e) -> wrap(op, key, e));
         } catch (NoSuchKeyException e) {
             throw missing(key);
         } catch (S3Exception e) {
@@ -222,48 +222,88 @@ public class S3ObjectStore implements ObjectStore {
         }
     }
 
-    /** A ranged GET body that reports SDK failures while streaming as {@link IOException}s naming the key. */
-    private final class RangeStream extends java.io.FilterInputStream {
-        private final String key;
+    /**
+     * A ranged GET body that reports SDK failures while streaming as {@link IOException}s naming the
+     * key. It aborts the HTTP connection (never drains it) when a read fails, and when it is closed
+     * before all {@code length} bytes were read: draining a large unread rest would stall the closing
+     * thread, and a broken connection must not go back to the pool.
+     */
+    static final class RangeStream extends java.io.FilterInputStream {
+        @FunctionalInterface
+        interface Wrapper {
+            IOException wrap(String op, SdkException e);
+        }
 
-        RangeStream(InputStream in, String key) {
+        private final Runnable abort;
+        private final Wrapper wrapper;
+        private long remaining;
+        private boolean aborted;
+        private boolean closed;
+
+        RangeStream(InputStream in, Runnable abort, long length, Wrapper wrapper) {
             super(in);
-            this.key = key;
+            this.abort = abort;
+            this.remaining = length;
+            this.wrapper = wrapper;
         }
 
         @Override
         public int read() throws IOException {
-            try {
-                return super.read();
-            } catch (SdkException e) {
-                throw wrap("read range", key, e);
-            }
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n < 0 ? -1 : one[0] & 0xff;
         }
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
             try {
-                return in.read(b, off, len);
+                int n = in.read(b, off, len);
+                if (n > 0) remaining -= n;
+                return n;
             } catch (SdkException e) {
-                throw wrap("read range", key, e);
+                abortOnce();
+                throw wrapper.wrap("read range", e);
+            } catch (IOException | RuntimeException e) {
+                abortOnce();
+                throw e;
             }
         }
 
         @Override
         public long skip(long n) throws IOException {
             try {
-                return super.skip(n);
+                long skipped = in.skip(n);
+                if (skipped > 0) remaining -= skipped;
+                return skipped;
             } catch (SdkException e) {
-                throw wrap("read range", key, e);
+                abortOnce();
+                throw wrapper.wrap("read range", e);
+            } catch (IOException | RuntimeException e) {
+                abortOnce();
+                throw e;
+            }
+        }
+
+        /** Aborts the connection the first time only (a failed read, or a close with bytes left). */
+        private void abortOnce() {
+            if (aborted) return;
+            aborted = true;
+            try {
+                abort.run();
+            } catch (RuntimeException ignored) {
+                // closing the stream releases what is left
             }
         }
 
         @Override
         public void close() throws IOException {
+            if (closed) return;
+            closed = true;
             try {
-                super.close();
+                if (remaining > 0) abortOnce();
+                in.close();
             } catch (SdkException e) {
-                throw wrap("close range", key, e);
+                throw wrapper.wrap("close range", e);
             }
         }
     }
