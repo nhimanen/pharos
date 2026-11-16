@@ -31,6 +31,8 @@ BENCH_TIMEOUT=300
 PIPELINES="vector,hybrid,hybrid-rrf,hybrid-reranked"
 MODELS="jina,granite"
 PROJECTS="pharos,lucene"
+ORIG_ARGS=("$@")   # parsing below shifts $@ away; the scope re-exec needs the originals
+PRINT_CONFIG=0
 DRY_RUN=0; NO_BUILD=0; FRESH=0; CHECK_MARKER=0
 JINA_URL="hf://jinaai/jina-embeddings-v2-base-code"
 GRANITE_URL="hf://onnx-community/granite-embedding-english-r2-ONNX"
@@ -59,6 +61,7 @@ Usage: scripts/embedding-ab.sh [options]
                        finished projects/benchmarks are skipped)
   --no-build           do not run 'mvn -q -DskipTests package' even if the jar looks stale
   --dry-run            run the preflight checks and print the plan; no copies, no JVMs, no scope
+  --print-config       print the resolved options (after the scope re-exec) and exit; no JVM
   --check-marker       only check that ~/.pharos and ~/.djl.ai were not modified since the run started
   -h, --help
 Env: INDEX_EXTRA_FLAGS  extra flags for 'pharos index' (e.g. --no-synonyms)
@@ -83,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --fresh) FRESH=1; shift;;
     --no-build) NO_BUILD=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --print-config) PRINT_CONFIG=1; shift;;
     --check-marker|--marker) CHECK_MARKER=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
@@ -117,10 +121,21 @@ check_marker() {
 if [[ $CHECK_MARKER -eq 1 ]]; then check_marker; exit $?; fi
 
 # ---- re-exec inside a memory-capped systemd scope ----------------------------------------------
-if [[ $DRY_RUN -eq 0 && -z "${AB_IN_SCOPE:-}" ]]; then
+if [[ $DRY_RUN -eq 0 && -z "${AB_IN_SCOPE:-}" ]]; then   # (also taken by --print-config, to test the re-exec)
   command -v systemd-run >/dev/null || { echo "systemd-run not found" >&2; exit 1; }
-  exec systemd-run --user --scope --quiet -p "MemoryMax=$MEMORY_MAX" --setenv=AB_IN_SCOPE=1 -- bash "$SELF" "$@"
+  exec systemd-run --user --scope --quiet -p "MemoryMax=$MEMORY_MAX" --setenv=AB_IN_SCOPE=1 -- bash "$SELF" "${ORIG_ARGS[@]}"
 fi
+
+print_config() {
+  local probe="$SCRATCH"; while [[ ! -d "$probe" && "$probe" != / ]]; do probe="$(dirname "$probe")"; done
+  echo "resolved options (AB_IN_SCOPE=${AB_IN_SCOPE:-no}):"
+  echo "  scratch=$SCRATCH  (fs=$(stat -f -c %T "$probe") free=$(( $(df -Pk "$probe" | awk 'NR==2{print $4}')/1024/1024 ))GB, checked on $probe)"
+  echo "  lucene-src=$LUCENE_SRC pharos-src=$PHAROS_SRC jina-port=$JINA_PORT granite-port=$GRANITE_PORT"
+  echo "  index-heap=$INDEX_HEAP daemon-heap=$DAEMON_HEAP memory-max=$MEMORY_MAX min-free-gb=$MIN_FREE_GB"
+  echo "  models=$MODELS pipelines=$PIPELINES bench-timeout=$BENCH_TIMEOUT fresh=$FRESH no-build=$NO_BUILD dry-run=$DRY_RUN"
+}
+if [[ $PRINT_CONFIG -eq 1 ]]; then print_config; exit 0; fi
+[[ $DRY_RUN -eq 0 ]] || print_config
 
 # ---- preflight ---------------------------------------------------------------------------------
 declare -A SRC_COMMIT
