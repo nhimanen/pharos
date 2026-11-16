@@ -611,4 +611,80 @@ class ReplicaSyncerTest {
                 .anySatisfy(m -> assertThat(m).contains("outdated", "still serving nothing yet",
                         "pharos index --full " + PROJECT));
     }
+
+    // ── Pre-PR fix 5: registry before cache; prune keeps what is still referenced ────────────
+
+    /** A registry whose writes can fail, and whose view of the shard can be pinned (another process). */
+    private static final class FlakyRegistry extends ProjectRegistry {
+        volatile boolean fail;
+        volatile Path pinned;
+
+        FlakyRegistry(Path file) { super(file); }
+
+        @Override
+        public synchronized void register(ProjectMeta meta) {
+            if (fail) throw new IllegalStateException("disk full (injected)");
+            super.register(meta);
+        }
+
+        @Override
+        public synchronized java.util.Optional<ProjectMeta> find(String name) {
+            if (pinned == null) return super.find(name);
+            ProjectMeta m = new ProjectMeta();
+            m.setName(name);
+            m.setIndexPath(pinned.toString());
+            return java.util.Optional.of(m);
+        }
+    }
+
+    private ReplicaSyncer syncerWith(ProjectRegistry registry) {
+        return new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout), cache,
+                registry, cacheDir, readerSynonyms, Duration.ofSeconds(10));
+    }
+
+    @Test
+    void failedRegistrationDoesNotActivateTheNewGeneration() throws Exception {
+        FlakyRegistry registry = new FlakyRegistry(tmp.resolve("flaky-registry.json"));
+        try (ReplicaSyncer s = syncerWith(registry)) {
+            publishFull();
+            s.syncOnce();
+            publishIncremental("triple");
+            registry.fail = true;
+            s.syncOnce();
+
+            // gen-2 is materialised, but graph (registry) and Lucene (cache) both stay on gen-1
+            assertThat(genDir(2)).isDirectory();
+            assertThat(s.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
+            assertThat(cache.active(PROJECT)).contains(genDir(1));
+            assertThat(registry.find(PROJECT).orElseThrow().getIndexPath()).isEqualTo(genDir(1).toString());
+
+            registry.fail = false;
+            s.syncOnce(); // the next poll adopts gen-2 and registers it, then activates it
+            assertThat(s.served()).isEqualTo(Map.of(SHARD, new Generation(2)));
+            assertThat(cache.active(PROJECT)).contains(genDir(2));
+            assertThat(registry.find(PROJECT).orElseThrow().getIndexPath()).isEqualTo(genDir(2).toString());
+        }
+    }
+
+    @Test
+    void pruneKeepsTheGenerationTheRegistryStillPointsAt() throws Exception {
+        FlakyRegistry registry = new FlakyRegistry(tmp.resolve("flaky-registry.json"));
+        try (ReplicaSyncer s = syncerWith(registry)) {
+            publishFull();
+            s.syncOnce();
+            registry.pinned = genDir(1); // e.g. another process on this cacheDir still names gen-1
+            publishIncremental("triple");
+            s.syncOnce();
+            publishIncremental("quadruple");
+            s.syncOnce();
+
+            assertThat(s.served()).isEqualTo(Map.of(SHARD, new Generation(3)));
+            assertThat(genDirNames()).containsExactly("gen-1", "gen-2", "gen-3");
+
+            registry.pinned = null;
+            publishIncremental("quintuple");
+            s.syncOnce();
+            assertThat(genDirNames()).containsExactly("gen-3", "gen-4");
+        }
+    }
 }

@@ -65,8 +65,8 @@ public class ProjectRegistry {
         return new ProjectRegistry(registryFile);
     }
 
-    /** Package-private: explicit registry path, used by tests that need an isolated location. */
-    ProjectRegistry(Path registryFile) {
+    /** Explicit registry path (see {@link #at}); protected so tests can inject failures. */
+    protected ProjectRegistry(Path registryFile) {
         this.registryFile = registryFile;
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())

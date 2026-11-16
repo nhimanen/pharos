@@ -247,9 +247,13 @@ public class ReplicaSyncer implements Closeable {
             materialise(shard, gen, manifest, manifestJson, shardRoot, genDir);
         }
 
+        // Registry first, then the cache: graphs resolve through the registry's indexPath and
+        // Lucene through the cache, so a generation is only activated once the registry names it.
+        // A failed registration fails this shard's sync: it keeps serving the previous generation
+        // (both views agree) and the next poll adopts the materialised dir and retries.
+        register(shard, gen, manifest.projectMeta(), genDir);
         cache.activate(shard.value(), genDir);
         served.put(shard, gen);
-        register(shard, gen, manifest.projectMeta(), genDir);
         prune(shard, shardRoot, gen);
     }
 
@@ -442,7 +446,7 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
-    private void register(ShardId shard, Generation gen, ProjectMeta published, Path genDir) {
+    private void register(ShardId shard, Generation gen, ProjectMeta published, Path genDir) throws IOException {
         ProjectMeta meta = published != null ? ShardManifest.stripRefs(published) : new ProjectMeta();
         meta.setName(shard.value());
         meta.setIndexPath(genDir.toString()); // the writer's indexPath means nothing here
@@ -450,8 +454,7 @@ public class ReplicaSyncer implements Closeable {
             registry.register(meta);
             registered.put(shard, gen);
         } catch (RuntimeException e) {
-            log.warn("Shard {}: serving generation {} but registering it failed (will retry): {}",
-                    shard, gen.value(), e.toString());
+            throw new IOException("registering generation " + gen.value() + " failed: " + e, e);
         }
     }
 
@@ -481,9 +484,19 @@ public class ReplicaSyncer implements Closeable {
                 }
             }
             long previous = gens.stream().filter(g -> g < active.value()).max(Comparator.naturalOrder()).orElse(-1L);
+            // Never delete what the registry (graph reads, other processes on this cacheDir) or
+            // the cache (Lucene reads) still points at.
+            Set<Path> inUse = new HashSet<>();
+            registry.find(shard.value()).map(ProjectMeta::getIndexPath)
+                    .ifPresent(p -> inUse.add(Path.of(p).toAbsolutePath().normalize()));
+            cache.active(shard.value()).ifPresent(p -> inUse.add(p.toAbsolutePath().normalize()));
             for (long g : gens) {
                 if (g == active.value() || g == previous) continue;
                 Path dir = shardRoot.resolve("gen-" + g);
+                if (inUse.contains(dir.toAbsolutePath().normalize())) {
+                    log.info("Shard {}: keeping generation dir {} (still referenced)", shard, dir);
+                    continue;
+                }
                 GraphViews.evict(dir);
                 deleteRecursively(dir);
             }
