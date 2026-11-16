@@ -138,7 +138,17 @@ public final class IndexFormat {
         String me = PharosVersion.get();
         Stamp s = c.stamp();
         String msg;
-        if (c.status() == Status.OUTDATED) {
+        if (isReaderGeneration(projectIndexDir)) {
+            // A reader never re-indexes: the fix is on this reader (newer) or on the writer (outdated).
+            msg = "Project '" + project + "' generation " + projectIndexDir.getFileName()
+                    + " was published by pharos " + s.pharosVersion() + " (index format " + s.format()
+                    + "); this reader (pharos " + me + ") reads index formats " + MIN_READABLE_FORMAT + "–"
+                    + IndexVersions.INDEX_FORMAT + ". "
+                    + (c.status() == Status.NEWER
+                        ? "Upgrade pharos on this reader."
+                        : "Re-publish it from an upgraded writer (on the writer: pharos index --full "
+                          + project + "); this reader picks it up on its next sync.");
+        } else if (c.status() == Status.OUTDATED) {
             msg = "Project '" + project + "' was indexed by pharos " + s.pharosVersion()
                     + " (index format " + s.format() + "); this pharos (" + me
                     + ") reads index formats " + MIN_READABLE_FORMAT + "–" + IndexVersions.INDEX_FORMAT
@@ -152,6 +162,18 @@ public final class IndexFormat {
                     + ") or reinstall the newer pharos.";
         }
         throw new IncompatibleIndexException(project, c.status(), s, msg);
+    }
+
+    private static final java.util.regex.Pattern READER_GEN_DIR = java.util.regex.Pattern.compile("gen-\\d{1,18}");
+
+    /**
+     * True for a reader node's materialised generation dir ({@code <cacheDir>/<shard>/gen-N} holding
+     * the published {@code manifest.json}); writer index dirs never contain a manifest.
+     */
+    static boolean isReaderGeneration(Path dir) {
+        return dir != null && dir.getFileName() != null
+                && READER_GEN_DIR.matcher(dir.getFileName().toString()).matches()
+                && Files.isRegularFile(dir.resolve("manifest.json"));
     }
 
     private static Cached cached(Path dir) {
