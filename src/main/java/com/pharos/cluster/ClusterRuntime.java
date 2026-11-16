@@ -1,5 +1,6 @@
 package com.pharos.cluster;
 
+import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -117,7 +118,7 @@ public final class ClusterRuntime implements Closeable {
         SourceReader.setEnabled(config.getCluster().getRole() != NodeRole.READER);
     }
 
-    /** Lazy mode's directory factory and block cache; null unless this is a lazy reader. */
+    /** Lazy mode's directory factory and block cache; null unless this is a reader (a full-mode reader reports mode {@code full} and zeros). */
     LazyGenerations lazyGenerations() {
         return lazy;
     }
@@ -130,11 +131,12 @@ public final class ClusterRuntime implements Closeable {
      * shared one, false when it runs a private one (or none has been created yet).
      */
     public Map<String, Object> readerCacheStats() {
-        if (lazy == null) return null;
-        WarmStats st = lazy.stats().orElse(new WarmStats(0, 0, 0, 0, 0, 0, 0, 0));
+        if (!isReader()) return null;
+        WarmStats st = lazy == null ? new WarmStats(0, 0, 0, 0, 0, 0, 0, 0)
+                : lazy.stats().orElse(new WarmStats(0, 0, 0, 0, 0, 0, 0, 0));
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("mode", config.getCluster().getReader().getMode());
-        out.put("cacheMaxBytes", lazy.cacheMaxBytes());
+        out.put("mode", lazy == null ? ClusterConfig.ReaderConfig.FULL : config.getCluster().getReader().getMode());
+        out.put("cacheMaxBytes", lazy == null ? 0L : lazy.cacheMaxBytes());
         out.put("bytesOnDisk", st.bytesOnDisk());
         out.put("hits", st.hits());
         out.put("misses", st.misses());
@@ -142,15 +144,24 @@ public final class ClusterRuntime implements Closeable {
         out.put("bytesFetched", st.bytesFetched());
         out.put("evictions", st.evictions());
         out.put("leasesOpen", st.leasesOpen());
-        out.put("shared", lazy.sharedCache());
+        out.put("shared", lazy != null && lazy.sharedCache());
+        out.put("source", "process");
         return out;
     }
 
-    /** The one-line text form of {@link #readerCacheStats}: {@code reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions}. */
+    /**
+     * The one-line text form of {@link #readerCacheStats}:
+     * {@code reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions}; {@code hit rate n/a}
+     * before the first lookup, and a full-mode reader has no block cache.
+     */
     public static String readerCacheLine(Map<String, Object> rc) {
-        return String.format(java.util.Locale.ROOT, "reader cache: %s / %s, hit rate %.1f%%, %d evictions",
+        if (ClusterConfig.ReaderConfig.FULL.equals(rc.get("mode"))) return "reader cache: full mode (no block cache)";
+        boolean lookups = ((Number) rc.get("hits")).longValue() + ((Number) rc.get("misses")).longValue() > 0;
+        String rate = lookups ? String.format(java.util.Locale.ROOT, "%.1f%%",
+                100 * ((Number) rc.get("hitRate")).doubleValue()) : "n/a";
+        return String.format(java.util.Locale.ROOT, "reader cache: %s / %s, hit rate %s, %d evictions",
                 gib(((Number) rc.get("bytesOnDisk")).longValue()), gib(((Number) rc.get("cacheMaxBytes")).longValue()),
-                100 * ((Number) rc.get("hitRate")).doubleValue(), ((Number) rc.get("evictions")).longValue());
+                rate, ((Number) rc.get("evictions")).longValue());
     }
 
     private static String gib(long bytes) {

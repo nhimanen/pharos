@@ -91,7 +91,7 @@ class WarmStatsSurfaceTest {
     }
 
     @Test
-    void runtimeReportsNoReaderCacheOffLazyReaders() throws Exception {
+    void runtimeReportsReaderCacheOnEveryReaderAndNotOnRoleAll() throws Exception {
         for (NodeRole role : List.of(NodeRole.ALL, NodeRole.READER)) {
             IndexConfig config = ClusterFixture.config(tmp.resolve(role.json()), role, "test-bucket");
             config.getCluster().getReader().setMode(ClusterConfig.ReaderConfig.FULL);
@@ -100,26 +100,84 @@ class WarmStatsSurfaceTest {
             ProjectRegistry registry = ClusterRuntime.registryFor(config);
             try (LuceneIndexer lucene = new LuceneIndexer(config, backend.localCache());
                  ClusterRuntime runtime = new ClusterRuntime(config, backend, registry, lucene)) {
-                assertThat(runtime.readerCacheStats()).as(role + " in full mode").isNull();
+                Map<String, Object> rc = runtime.readerCacheStats();
+                if (role == NodeRole.ALL) {
+                    assertThat(rc).as("role all").isNull();
+                    continue;
+                }
+                assertThat(rc).containsEntry("mode", "full").containsEntry("cacheMaxBytes", 0L)
+                        .containsEntry("bytesOnDisk", 0L).containsEntry("hits", 0L).containsEntry("misses", 0L)
+                        .containsEntry("bytesFetched", 0L).containsEntry("evictions", 0L)
+                        .containsEntry("leasesOpen", 0L).containsEntry("shared", false)
+                        .containsEntry("source", "process").containsKey("hitRate");
+                assertThat(ClusterRuntime.readerCacheLine(rc)).isEqualTo("reader cache: full mode (no block cache)");
             }
         }
+    }
+
+    @Test
+    void textLineSaysNaBeforeAnyLookup() {
+        Map<String, Object> rc = sample();
+        rc.put("hits", 0L);
+        rc.put("misses", 0L);
+        rc.put("hitRate", 1.0);
+        assertThat(ClusterRuntime.readerCacheLine(rc)).isEqualTo("reader cache: 1.2 GiB / 8.0 GiB, hit rate n/a, 41 evictions");
+    }
+
+    private String python(String body, String... args) throws Exception {
+        String py = "import importlib.machinery as m, importlib.util as u, json, sys, threading, http.server\n"
+                + "l = m.SourceFileLoader('pharos_cli', sys.argv[1]); s = u.spec_from_loader('pharos_cli', l)\n"
+                + "mod = u.module_from_spec(s); l.exec_module(mod)\n" + body;
+        List<String> cmd = new java.util.ArrayList<>(List.of("python3", "-I", "-B", "-c", py,
+                Path.of("pharos").toAbsolutePath().toString()));
+        cmd.addAll(List.of(args));
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        String out = new String(p.getInputStream().readAllBytes());
+        assertThat(p.waitFor()).as(out).isZero();
+        return out.strip();
     }
 
     /** ./pharos prints the same line from the JSON, checked against a stub (no JVM, no daemon). */
     @Test
     void pythonClientPrintsTheReaderCacheLine() throws Exception {
-        Path script = Path.of("pharos").toAbsolutePath();
-        String json = new ObjectMapper().writeValueAsString(sample());
         Path stub = tmp.resolve("stub.json");
-        Files.writeString(stub, json);
-        String py = "import importlib.machinery as m, importlib.util as u, json, sys\n"
-                + "l = m.SourceFileLoader('pharos_cli', sys.argv[1]); s = u.spec_from_loader('pharos_cli', l)\n"
-                + "mod = u.module_from_spec(s); l.exec_module(mod)\n"
-                + "print(mod.reader_cache_line(json.load(open(sys.argv[2]))))\n";
-        Process p = new ProcessBuilder("python3", "-I", "-B", "-c", py, script.toString(), stub.toString())
-                .redirectErrorStream(true).start();
-        String out = new String(p.getInputStream().readAllBytes());
-        assertThat(p.waitFor()).as(out).isZero();
-        assertThat(out.strip()).isEqualTo("reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions");
+        Files.writeString(stub, new ObjectMapper().writeValueAsString(sample()));
+        String body = "print(mod.reader_cache_line(json.load(open(sys.argv[2]))))\n"
+                + "print(mod.reader_cache_line({'mode':'lazy','bytesOnDisk':0,'cacheMaxBytes':1<<30,'hits':0,'misses':0,'hitRate':1.0,'evictions':0}))\n"
+                + "print(mod.reader_cache_line({'mode':'full'}))\n";
+        assertThat(python(body, stub.toString()).lines().toList()).containsExactly(
+                "reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions",
+                "reader cache: 0 B / 1.0 GiB, hit rate n/a, 0 evictions",
+                "reader cache: full mode (no block cache)");
+    }
+
+    /** index-status --json through ./pharos: the daemon's /health readerCache replaces the process's. */
+    @Test
+    void pythonClientSubstitutesTheDaemonsReaderCacheInJson() throws Exception {
+        Map<String, Object> proc = sample();
+        proc.put("source", "process");
+        Map<String, Object> daemon = sample();
+        daemon.put("hits", 5L);
+        daemon.put("source", "process"); // what the daemon's own JVM reports
+        Path procJson = tmp.resolve("proc.json");
+        Files.writeString(procJson, new ObjectMapper().writeValueAsString(Map.of("role", "reader",
+                "readerCache", proc, "projects", List.of())));
+        Path health = tmp.resolve("health.json");
+        Files.writeString(health, new ObjectMapper().writeValueAsString(Map.of("status", "ok", "readerCache", daemon)));
+        String body = "doc = open(sys.argv[2]).read(); body = open(sys.argv[3]).read()\n"
+                + "class H(http.server.BaseHTTPRequestHandler):\n"
+                + "    def do_GET(self):\n"
+                + "        self.send_response(200); self.end_headers(); self.wfile.write(body.encode())\n"
+                + "    def log_message(self, *a): pass\n"
+                + "srv = http.server.HTTPServer(('127.0.0.1', 0), H)\n"
+                + "threading.Thread(target=srv.serve_forever, daemon=True).start()\n"
+                + "mod.BASE_URL = 'http://127.0.0.1:%d' % srv.server_port\n"
+                + "out = json.loads(mod.index_status_json(doc))\n"
+                + "print(json.dumps(out['readerCache']['source']), out['readerCache']['hits'])\n"
+                + "mod.BASE_URL = 'http://127.0.0.1:1'\n"
+                + "out = json.loads(mod.index_status_json(doc))\n"
+                + "print(json.dumps(out['readerCache']['source']), out['readerCache']['hits'])\n";
+        assertThat(python(body, procJson.toString(), health.toString()).lines().toList())
+                .containsExactly("\"daemon\" 5", "\"process\" 973");
     }
 }

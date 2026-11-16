@@ -967,8 +967,11 @@ def _gib(n):
 
 def reader_cache_line(rc):
     """One-line text form of the `readerCache` object of index-status --json and /health."""
+    if rc.get("mode") == "full":
+        return "reader cache: full mode (no block cache)"
+    rate = f"{100 * rc['hitRate']:.1f}%" if rc["hits"] + rc["misses"] > 0 else "n/a"
     return (f"reader cache: {_gib(rc['bytesOnDisk'])} / {_gib(rc['cacheMaxBytes'])}, "
-            f"hit rate {100 * rc['hitRate']:.1f}%, {rc['evictions']} evictions")
+            f"hit rate {rate}, {rc['evictions']} evictions")
 
 
 def _daemon_reader_cache():
@@ -978,6 +981,19 @@ def _daemon_reader_cache():
             return json.loads(resp.read()).get("readerCache")
     except Exception:
         return None
+
+
+def index_status_json(text):
+    """index-status --json from the jar, its `readerCache` replaced by the running daemon's (its
+    hits are the real ones; the one-shot JVM served no queries) with "source": "daemon"."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return text
+    daemon = _daemon_reader_cache() if "readerCache" in doc else None
+    if daemon:
+        doc["readerCache"] = dict(daemon, source="daemon")
+    return json.dumps(doc, indent=2)
 
 
 def cmd_index_status(args):
@@ -991,8 +1007,10 @@ def cmd_index_status(args):
     cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index-status"]
     if args.json:
         cmd.append("--json")
-        sys.exit(subprocess.run(cmd).returncode)
     r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    if args.json:
+        print(index_status_json(r.stdout))
+        sys.exit(r.returncode)
     lines = r.stdout.splitlines()
     own = [l for l in lines if l.startswith("reader cache:")]
     if own:
