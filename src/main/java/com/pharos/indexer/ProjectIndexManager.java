@@ -399,14 +399,6 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
-        Path existing = luceneIndexer.getProjectIndexDir(projectName);
-        if (Files.isDirectory(existing) && IndexFormat.overwrittenByOlderPharos(existing)) {
-            String msg = "index was re-indexed by an older pharos after its format stamp: "
-                    + "treating it as an unstamped legacy index";
-            log.warn(msg);
-            progress.onProgress(msg, 0, 0);
-            IndexFormat.forgetStaleLayout(existing);
-        }
         if (incremental) {
             // An index written by another format can't be updated in place: rebuild it fully.
             // A project with no index dir yet is just a normal first full index.

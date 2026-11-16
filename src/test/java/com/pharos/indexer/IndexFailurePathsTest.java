@@ -228,29 +228,6 @@ class IndexFailurePathsTest {
     }
 
     @Test
-    void indexOverwrittenByAnOlderPharosIsNotTrustedAndIsRebuilt() throws Exception {
-        index(false, false);
-        // What a pre-1.4 build leaves after re-indexing: its own legacy graph next to the
-        // stale pointer and stamp.
-        try (CallGraph legacy = CallGraph.open(dir().resolve(CallGraph.LEGACY_DIR))) {
-            legacy.addMethod("old.Build#x()", "old.Build");
-            legacy.flush();
-        }
-        assertThat(IndexFormat.status(dir())).isEqualTo(IndexFormat.Status.OUTDATED);
-        assertThatThrownBy(() -> IndexFormat.check(PROJECT, dir()))
-                .hasMessageContaining("re-indexed by a pharos older than")
-                .hasMessageContaining("pharos index --full " + PROJECT);
-
-        index(true, false);  // turned into a full run
-
-        assertThat(IndexFormat.status(dir())).isEqualTo(IndexFormat.Status.OK);
-        assertThat(dir().resolve(CallGraph.LEGACY_DIR)).doesNotExist();
-        try (CallGraph g = CallGraph.openExisting(CallGraph.projectGraphDir(dir()))) {
-            assertThat(g.callers(GET_NAME)).isNotEmpty();
-        }
-    }
-
-    @Test
     void hugeGenerationNumberDoesNotBreakAFullRun() throws Exception {
         index(false, false);
         Files.createDirectories(dir().resolve("callgraph-99999999999999999999999.arcadedb"));
