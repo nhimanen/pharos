@@ -40,6 +40,7 @@ class BlockCacheTest {
 
     @TempDir Path dir;
     private final AtomicLong now = new AtomicLong(1_000_000_000_000L);
+    private final AtomicLong usable = new AtomicLong(Long.MAX_VALUE);
     private final List<BlockCache> open = new ArrayList<>();
     private final List<ListAppender<ILoggingEvent>> appenders = new ArrayList<>();
 
@@ -52,7 +53,7 @@ class BlockCacheTest {
     }
 
     private BlockCache cache(long maxBlocks) throws IOException {
-        BlockCache c = new BlockCache(dir, maxBlocks * BS, BS, 4, now::get);
+        BlockCache c = new BlockCache(dir, maxBlocks * BS, BS, 4, now::get, usable::get);
         open.add(c);
         return c;
     }
@@ -67,10 +68,23 @@ class BlockCacheTest {
         volatile CountDownLatch gate;
         volatile IOException failWith;
         volatile int shortBy;
+        /** Fail the on-disk fetch the way a full disk does, after a partial write. */
+        volatile boolean enospc;
+        final AtomicInteger memCalls = new AtomicInteger();
+
+        @Override
+        public void fetchToMemory(BlockKey key, long offset, long length, java.nio.ByteBuffer target) {
+            memCalls.incrementAndGet();
+            for (int i = 0; i < length; i++) target.put(expected(key, offset + i));
+        }
 
         @Override
         public void fetch(BlockKey key, long offset, long length, Path target) throws IOException {
             calls.incrementAndGet();
+            if (enospc) {
+                Files.write(target, new byte[(int) length / 3]);
+                throw new java.nio.file.FileSystemException(target.toString(), null, "No space left on device");
+            }
             CountDownLatch g = gate;
             if (g != null) {
                 try {
@@ -286,12 +300,136 @@ class BlockCacheTest {
         Files.write(empty, new byte[0]);
         Files.write(oversized, new byte[BS + 1]);
         Files.write(good, new byte[BS]);
+        Path part = blk.resolveSibling("4.blk.tmp8812345.part"); // a fetcher's own temp file
+        Files.write(part, new byte[10]);
+        Path foreignInHashDir = blk.resolveSibling("readme.txt");
+        Path foreignTop = dir.resolve("notes").resolve("7.blk");
+        Files.write(foreignInHashDir, new byte[3]);
+        Files.createDirectories(foreignTop.getParent());
+        Files.write(foreignTop, new byte[0]);
         BlockCache c = cache(8);
+        assertThat(part).doesNotExist();
+        assertThat(foreignInHashDir).exists();
+        assertThat(foreignTop).exists();
         assertThat(tmp).doesNotExist();
         assertThat(empty).doesNotExist();
         assertThat(oversized).doesNotExist();
         assertThat(good).exists();
         assertThat(c.stats().bytesOnDisk()).isEqualTo(BS);
+    }
+
+    @Test
+    void refusesNonEmptyDirWithoutMarker() throws Exception {
+        Path stranger = dir.resolve("important.txt");
+        Files.writeString(stranger, "not a cache");
+        assertThatThrownBy(() -> new BlockCache(dir, 8L * BS, BS, 2, now::get, usable::get))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining(dir.toString())
+                .hasMessageContaining("marker");
+        assertThat(stranger).exists();
+    }
+
+    @Test
+    void lowUsableSpaceServesUncached() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        ListAppender<ILoggingEvent> log = capture();
+        usable.set(BS); // a block fits, the safety margin does not
+        BlockKey k = new BlockKey(OBJ, 0);
+        try (BlockCache.Lease l = c.acquire(k, BS, f)) {
+            assertContent(l, k, BS);
+        }
+        assertThat(f.calls).hasValue(0);
+        assertThat(f.memCalls).hasValue(1);
+        assertThat(c.stats().writeFailures()).isEqualTo(1);
+        assertThat(c.stats().bytesOnDisk()).isZero();
+        assertThat(c.stats().leasesOpen()).isZero();
+        assertThat(filesUnder(dir)).isEmpty();
+        assertThat(warnings(log)).anyMatch(m -> m.contains("could not be cached"));
+    }
+
+    @Test
+    void diskFullMidFetchIsRetriedOnceIntoMemory() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        f.enospc = true;
+        BlockKey k = new BlockKey(OBJ, 2);
+        try (BlockCache.Lease l = c.acquire(k, BS, f)) {
+            assertContent(l, k, BS);
+        }
+        assertThat(f.calls).hasValue(1);
+        assertThat(f.memCalls).hasValue(1);
+        assertThat(c.stats().writeFailures()).isEqualTo(1);
+        assertThat(filesUnder(dir)).isEmpty();
+        assertThat(c.stats().bytesOnDisk()).isZero();
+    }
+
+    @Test
+    void networkErrorIsNotRetried() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        f.failWith = new IOException("connection reset");
+        assertThatThrownBy(() -> c.acquire(new BlockKey(OBJ, 0), BS, f))
+                .isInstanceOf(IOException.class).hasMessageContaining("connection reset");
+        assertThat(f.calls).hasValue(1);
+        assertThat(f.memCalls).hasValue(0);
+        assertThat(c.stats().writeFailures()).isZero();
+    }
+
+    @Test
+    void defaultMemoryFetchUsesThePathFetcher() throws Exception {
+        BlockCache c = cache(8);
+        usable.set(0);
+        AtomicInteger calls = new AtomicInteger();
+        BlockCache.BlockFetcher pathOnly = (key, offset, length, target) -> {
+            calls.incrementAndGet();
+            byte[] b = new byte[(int) length];
+            for (int i = 0; i < b.length; i++) b[i] = expected(key, offset + i);
+            Files.write(target, b);
+        };
+        BlockKey k = new BlockKey(OBJ, 1);
+        try (BlockCache.Lease l = c.acquire(k, BS, pathOnly)) {
+            assertContent(l, k, BS);
+        }
+        assertThat(calls).hasValue(1);
+        assertThat(filesUnder(dir)).isEmpty();
+    }
+
+    @Test
+    void mapFailureAfterMoveServesFromMemory() throws Exception {
+        BlockCache c = cache(8);
+        c.failMappingForTest = true;
+        FakeFetcher f = new FakeFetcher();
+        BlockKey k = new BlockKey(OBJ, 0);
+        try (BlockCache.Lease l = c.acquire(k, BS, f)) {
+            assertContent(l, k, BS);
+        }
+        assertThat(f.calls).hasValue(1);
+        assertThat(c.stats().writeFailures()).isEqualTo(1);
+        assertThat(c.stats().bytesOnDisk()).isZero();
+        assertThat(blockFile(k)).doesNotExist();
+    }
+
+    @Test
+    void differentLengthForTheSameBlockIsRejected() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        f.gate = new CountDownLatch(1);
+        BlockKey k = new BlockKey(OBJ, 0);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<BlockCache.Lease> first = pool.submit(() -> c.acquire(k, BS, f));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (c.stats().misses() < 1 && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertThatThrownBy(() -> c.acquire(k, 100, f)).isInstanceOf(IllegalArgumentException.class);
+            f.gate.countDown();
+            first.get(10, TimeUnit.SECONDS).close();
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThatThrownBy(() -> c.acquire(k, 100, f)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(f.calls).hasValue(1);
+        assertThat(blockFile(k)).hasSize(BS);
     }
 
     @Test
@@ -321,10 +459,12 @@ class BlockCacheTest {
         touchAll(first, f, 0, 2);
         first.close();
         open.remove(first);
-        BlockCache c = new BlockCache(dir, 8L * BS, BS / 2, 2, now::get); // block i now covers other bytes
+        Path foreign = dir.resolve("keep.me");
+        Files.writeString(foreign, "x");
+        BlockCache c = new BlockCache(dir, 8L * BS, BS / 2, 2, now::get, usable::get); // block i now covers other bytes
         open.add(c);
         assertThat(c.stats().bytesOnDisk()).isZero();
-        assertThat(filesUnder(dir)).isEmpty();
+        assertThat(filesUnder(dir)).containsExactly(foreign);
     }
 
     @Test
@@ -430,6 +570,8 @@ class BlockCacheTest {
             assertContent(l, k, BS);
             assertThat(c.stats().leasesOpen()).isEqualTo(1);
         }
+        assertThat(f.calls).hasValue(0);
+        assertThat(f.memCalls).hasValue(1);
         WarmStats s = c.stats();
         assertThat(s.writeFailures()).isEqualTo(1);
         assertThat(s.bytesOnDisk()).isZero();
@@ -440,7 +582,7 @@ class BlockCacheTest {
         try (BlockCache.Lease l = c.acquire(k, BS, f)) { // not cached, so fetched again — and cached now
             assertContent(l, k, BS);
         }
-        assertThat(f.calls).hasValue(2);
+        assertThat(f.calls).hasValue(1);
         assertThat(blockFile(k)).exists();
     }
 

@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -26,12 +27,15 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -40,29 +44,42 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * On-disk LRU cache of fixed-size object blocks, filled on demand by ranged reads.
  *
- * <p>Layout: {@code <dir>/<first 2 hex of sha256(objectKey)>/<sha256(objectKey)>/<index>.blk}, written
- * via {@code <index>.blk.tmp} and an atomic move. A {@code block-size} marker records the block size
- * the files were cut with; a cache cut with another size is wiped at startup (block {@code i} would
- * otherwise cover different bytes).
+ * <p><b>Layout.</b> {@code <dir>/<first 2 hex of sha256(objectKey)>/<sha256(objectKey)>/<index>.blk},
+ * written via {@code <index>.blk.tmp}, fsynced, then moved into place atomically. A
+ * {@code block-size} marker records the block size the files were cut with. At startup the cache
+ * refuses a non-empty dir without the marker (it may not be a cache dir), wipes the blocks of a
+ * cache cut with another block size (block {@code i} would cover other bytes), deletes temp files
+ * and blocks whose length can't be valid, and seeds the LRU by file mtime. Only paths that match the
+ * layout are ever deleted. Empty hash dirs are only removed by that startup scan.
  *
- * <p>Readers {@link #acquire} a {@link Lease}: a read-only {@link MemorySegment} over the block that
- * stays valid until the lease is closed. Only leased blocks are pinned. Every other block may be
- * evicted, least recently used first, whenever the on-disk bytes exceed {@code maxBytes}. The cap
- * is exceeded only by leased blocks and by in-flight fetches (at most
- * {@code maxConcurrentFetches × blockSize} of temp files).
+ * <p><b>Leases and the cap.</b> Readers {@link #acquire} a {@link Lease}: a read-only
+ * {@link MemorySegment} over the block that stays valid until the lease is closed. Only leased
+ * blocks are pinned. Every other block may be evicted, least recently used first, whenever the
+ * on-disk bytes exceed {@code maxBytes}. The cap is exceeded only by leased blocks and by in-flight
+ * fetches (at most {@code maxConcurrentFetches × blockSize} of temp files).
  *
- * <p>Concurrent acquires of one missing block share one fetch (single-flight). A failed fetch fails
- * every waiter and caches nothing; the next acquire retries. A block that was fetched but could not
- * be written to the cache dir (read-only, disk full on move) is still served, from memory, with a
- * WARN.
+ * <p><b>Fetching.</b> Concurrent acquires of one missing block share one fetch (single-flight). A
+ * failed fetch fails every waiter and caches nothing; the next acquire retries. A block that can't
+ * be written to the cache — the dir rejects writes, usable space is below the block plus a margin,
+ * the fetch hits "no space left", or the fsync/move/map fails — is still served, from memory owned
+ * by the cache, with a rate-limited WARN (the "uncached path"). A disk-full fetch is retried once
+ * into memory; any other fetch error is not retried, so a network failure never costs a second GET.
  *
- * <p>Unmapping: each cached block is mapped into its own {@link Arena#ofShared()}, which is closed
- * only once the block has left the cache <em>and</em> its lease count is zero — never while a lease
- * could still be reading the segment.
+ * <p><b>Unmapping.</b> Each block lives in its own {@link Arena#ofShared()}, which is closed only
+ * once the block has left the cache <em>and</em> its lease count is zero — never while a lease
+ * could still read the segment. Arenas are closed and evicted files deleted outside the cache lock;
+ * a fetch of a block whose old file is still being deleted waits before moving the new file in.
+ *
+ * <p><b>Operational constraints.</b> Nothing else may modify the cache dir while a cache runs on it
+ * (one process per dir, enforced by the reader's sync lock): truncating a mapped block file makes a
+ * read fault with SIGBUS / {@link InternalError}. On Windows a mapped file can't be deleted, so an
+ * evicted block still mapped elsewhere would fail to delete; the cache targets Linux/macOS and only
+ * logs such failures.
  */
 public final class BlockCache implements Closeable {
 
@@ -70,29 +87,56 @@ public final class BlockCache implements Closeable {
 
     /** Minimum interval between two thrash (or two write-failure) WARNs. */
     static final long WARN_INTERVAL_MILLIS = 60_000;
+    /** A caching fetch needs this much usable space beyond the block itself. */
+    static final long SPACE_MARGIN_BYTES = 1L << 20;
     /** A hit rewrites the block's mtime (the LRU order seen by the next start) at most this often. */
     private static final long TOUCH_GRANULARITY_MILLIS = 1_000;
-    private static final String BLOCK_SIZE_MARKER = "block-size";
+    static final String BLOCK_SIZE_MARKER = "block-size";
+    private static final Pattern PREFIX = Pattern.compile("[0-9a-f]{2}");
     private static final Pattern HASH = Pattern.compile("[0-9a-f]{64}");
-    private static final Pattern BLOCK_NAME = Pattern.compile("(0|[1-9][0-9]{0,18})\\.blk");
+    private static final Pattern BLOCK_NAME = Pattern.compile("(0|[1-9][0-9]{0,17})\\.blk");
+    /** Our own temp ({@code N.blk.tmp}) and a fetcher's temp next to it ({@code N.blk.tmp<random>.part}). */
+    private static final Pattern TEMP_NAME = Pattern.compile("(0|[1-9][0-9]{0,17})\\.blk\\.tmp([0-9]*\\.part)?");
 
-    /** Fetches {@code length} bytes at {@code offset} of {@code key.objectKey()} into {@code target}. */
+    /** Fetches {@code length} bytes at {@code offset} of {@code key.objectKey()}. */
     @FunctionalInterface
     public interface BlockFetcher {
+        /** Writes exactly the requested bytes to {@code target} (the cache's temp file). */
         void fetch(BlockKey key, long offset, long length, Path target) throws IOException;
+
+        /**
+         * Puts exactly {@code length} bytes into {@code target} (position 0 → {@code length}); used
+         * when the block can't be cached on disk. The default spills through a temp file in
+         * {@code java.io.tmpdir}, so it still needs disk space there. A fetcher that can stream the
+         * bytes (a ranged GET body) should override it so a full disk can't fail the read.
+         */
+        default void fetchToMemory(BlockKey key, long offset, long length, ByteBuffer target) throws IOException {
+            Path tmp = Files.createTempFile("pharos-block-", ".tmp");
+            try {
+                fetch(key, offset, length, tmp);
+                readFully(tmp, length, target);
+            } finally {
+                Files.deleteIfExists(tmp);
+            }
+        }
     }
 
     private final Path dir;
     private final long maxBytes;
     private final int blockSize;
     private final LongSupplier clock;
+    private final LongSupplier usableSpace;
     private final ExecutorService fetchers;
+    /** Test seam: makes mapping a freshly moved block fail. */
+    volatile boolean failMappingForTest;
 
     private final Object lock = new Object();
     // All fields below are guarded by lock.
     /** Cached blocks in access order (eldest = least recently used). */
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>(64, 0.75f, true);
     private final Map<String, Flight> inflight = new HashMap<>();
+    /** Ids whose evicted file is being deleted outside the lock; a fetch of the id waits before its move. */
+    private final Set<String> deleting = new HashSet<>();
     private long bytesOnDisk;
     private long hits;
     private long misses;
@@ -108,12 +152,15 @@ public final class BlockCache implements Closeable {
     private boolean closed;
 
     public BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches) throws IOException {
-        this(dir, maxBytes, blockSize, maxConcurrentFetches, System::currentTimeMillis);
+        this(dir, maxBytes, blockSize, maxConcurrentFetches, System::currentTimeMillis, null);
     }
 
-    /** Visible for tests: {@code clock} (epoch millis) drives WARN rate limits and block mtimes. */
-    BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches, LongSupplier clock)
-            throws IOException {
+    /**
+     * Visible for tests: {@code clock} (epoch millis) drives WARN rate limits and block mtimes;
+     * {@code usableSpace} (bytes) replaces the file store's usable space when non-null.
+     */
+    BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches, LongSupplier clock,
+               LongSupplier usableSpace) throws IOException {
         if (blockSize <= 0) throw new IllegalArgumentException("blockSize must be positive: " + blockSize);
         if (maxBytes <= 0) throw new IllegalArgumentException("maxBytes must be positive: " + maxBytes);
         if (maxConcurrentFetches <= 0) {
@@ -123,6 +170,7 @@ public final class BlockCache implements Closeable {
         this.maxBytes = maxBytes;
         this.blockSize = blockSize;
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.usableSpace = usableSpace != null ? usableSpace : this::fileStoreUsableSpace;
         Files.createDirectories(this.dir);
         recover();
         AtomicInteger n = new AtomicInteger();
@@ -140,6 +188,8 @@ public final class BlockCache implements Closeable {
      * {@code blockLength} is the block's true length: {@code blockSize}, or less for an object's last
      * block. Blocks until the block is available.
      *
+     * @throws IllegalArgumentException when {@code blockLength} is out of range, or differs from the
+     *         length this block is already cached or being fetched with
      * @throws IOException when the fetch fails (nothing is cached; the next acquire retries)
      * @throws InterruptedIOException when the calling thread is interrupted while waiting; the shared
      *         fetch keeps running for the other waiters
@@ -156,37 +206,49 @@ public final class BlockCache implements Closeable {
         Entry hit = null;
         boolean touch = false;
         Flight flight = null;
-        synchronized (lock) {
-            if (closed) throw new IllegalStateException("block cache " + dir + " is closed");
-            Entry e = entries.get(id);
-            if (e != null) {
-                if (e.length == blockLength && ensureMapped(e)) {
-                    hits++;
-                    e.leases++;
-                    leasesOpen++;
-                    hit = e;
-                    long now = clock.getAsLong();
-                    if (now - e.lastTouch >= TOUCH_GRANULARITY_MILLIS) {
-                        e.lastTouch = now;
-                        touch = true;
+        Cleanup cleanup = new Cleanup();
+        try {
+            synchronized (lock) {
+                if (closed) throw new IllegalStateException("block cache " + dir + " is closed");
+                Entry e = entries.get(id);
+                if (e != null && e.verified && e.length != blockLength) {
+                    throw lengthMismatch(key, blockLength, e.length);
+                }
+                if (e != null) {
+                    if (e.length == blockLength && ensureMapped(e)) {
+                        e.verified = true;
+                        hits++;
+                        e.leases++;
+                        leasesOpen++;
+                        hit = e;
+                        long now = clock.getAsLong();
+                        if (now - e.lastTouch >= TOUCH_GRANULARITY_MILLIS) {
+                            e.lastTouch = now;
+                            touch = true;
+                        }
+                    } else {
+                        log.warn("cached block {} of '{}' at {} is invalid (expected {} bytes); fetching it again",
+                                key.index(), key.objectKey(), e.file, blockLength);
+                        drop(e, cleanup);
                     }
-                } else {
-                    log.warn("cached block {} of '{}' at {} is invalid (expected {} bytes); fetching it again",
-                            key.index(), key.objectKey(), e.file, blockLength);
-                    drop(e);
+                }
+                if (hit == null) {
+                    flight = inflight.get(id);
+                    if (flight != null && flight.length != blockLength) {
+                        throw lengthMismatch(key, blockLength, flight.length);
+                    }
+                    misses++;
+                    if (flight == null) {
+                        flight = new Flight(blockLength);
+                        inflight.put(id, flight);
+                        Flight f = flight;
+                        fetchers.execute(() -> runFetch(f, key, hash, id, blockLength, fetcher));
+                    }
+                    flight.waiters++;
                 }
             }
-            if (hit == null) {
-                misses++;
-                flight = inflight.get(id);
-                if (flight == null) {
-                    flight = new Flight();
-                    inflight.put(id, flight);
-                    Flight f = flight;
-                    fetchers.execute(() -> runFetch(f, key, hash, id, blockLength, fetcher));
-                }
-                flight.waiters++;
-            }
+        } finally {
+            cleanup.run();
         }
         if (hit != null) {
             if (touch) setMtime(hit.file, hit.lastTouch);
@@ -195,17 +257,24 @@ public final class BlockCache implements Closeable {
         return await(flight, key);
     }
 
+    private static IllegalArgumentException lengthMismatch(BlockKey key, long asked, long known) {
+        return new IllegalArgumentException("block " + key.index() + " of '" + key.objectKey()
+                + "' requested with length " + asked + " but it is " + known + " bytes long");
+    }
+
     private Lease await(Flight flight, BlockKey key) throws IOException {
         try {
             return new Lease(this, flight.done.get());
         } catch (InterruptedException ie) {
+            Entry reserved = null;
             synchronized (lock) {
-                if (!flight.done.isDone()) {
+                if (flight.result != null) {
+                    reserved = flight.result; // a lease was reserved for this thread
+                } else if (!flight.settled) {
                     flight.waiters--; // the fetch completes without a reservation for this thread
-                } else if (!flight.done.isCompletedExceptionally()) {
-                    release(flight.done.join()); // give back the lease reserved for this thread
                 }
             }
+            if (reserved != null) release(reserved); // give back the lease reserved for this thread
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("interrupted waiting for block " + key.index() + " of '"
                     + key.objectKey() + "'");
@@ -218,14 +287,16 @@ public final class BlockCache implements Closeable {
     }
 
     private void release(Entry e) {
+        Cleanup cleanup = new Cleanup();
         synchronized (lock) {
             e.leases--;
             leasesOpen--;
             if (e.leases == 0) {
-                if (e.removed) closeArena(e);
-                else if (bytesOnDisk > maxBytes) evictOverCap(true);
+                if (e.removed) closeArena(e, cleanup);
+                else if (bytesOnDisk > maxBytes) evictOverCap(true, cleanup);
             }
         }
+        cleanup.run();
     }
 
     // ---------------------------------------------------------------- fetch
@@ -238,94 +309,172 @@ public final class BlockCache implements Closeable {
         } catch (Throwable t) {
             failure = t;
         }
+        Cleanup cleanup = new Cleanup();
+        boolean publish = false;
         synchronized (lock) {
             if (closed) { // close() already failed this flight
-                if (entry != null) closeArena(entry);
-                return;
-            }
-            inflight.remove(id);
-            if (failure != null) {
-                flight.done.completeExceptionally(failure);
-                return;
-            }
-            bytesFetched += length;
-            // Reserve one lease per waiter before anyone can see the entry: eviction can't take it
-            // and an uncached entry's memory can't be freed before every waiter has read it.
-            entry.leases = flight.waiters;
-            leasesOpen += flight.waiters;
-            if (entry.cached) {
-                entries.put(id, entry);
-                bytesOnDisk += length;
-                evictOverCap(true);
+                if (entry != null) closeArena(entry, cleanup);
             } else {
-                entry.removed = true; // never in the cache: free on last release
-                if (entry.leases == 0) closeArena(entry);
+                inflight.remove(id);
+                flight.settled = true;
+                publish = true;
+                if (failure == null) {
+                    bytesFetched += length;
+                    // Reserve one lease per waiter before anyone can see the entry: eviction can't take
+                    // it and an uncached entry's memory can't be freed before every waiter has read it.
+                    entry.leases = flight.waiters;
+                    leasesOpen += flight.waiters;
+                    if (entry.cached) {
+                        entries.put(id, entry);
+                        bytesOnDisk += length;
+                        evictOverCap(true, cleanup);
+                    } else {
+                        entry.removed = true; // never in the cache: free on last release
+                        if (entry.leases == 0) closeArena(entry, cleanup);
+                    }
+                    flight.result = entry;
+                }
             }
-            flight.done.complete(entry);
+        }
+        // Evicted files are gone before any waiter returns, so the cap holds on disk when they read.
+        cleanup.run();
+        if (publish) {
+            if (failure != null) flight.done.completeExceptionally(failure);
+            else flight.done.complete(entry);
         }
     }
 
     private Entry fetchBlock(BlockKey key, String hash, String id, long length, BlockFetcher fetcher)
             throws IOException {
+        long offset = Math.multiplyExact(key.index(), (long) blockSize);
         Path file = blockFile(hash, key.index());
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-        Path target;
-        boolean toCache;
-        try {
-            Files.createDirectories(file.getParent());
-            Files.deleteIfExists(tmp);
-            Files.createFile(tmp); // probe: does the cache dir take writes?
-            target = tmp;
-            toCache = true;
-        } catch (IOException e) {
-            noteWriteFailure(key, e);
-            target = Files.createTempFile("pharos-block-", ".tmp");
-            toCache = false;
+        String reason = prepareTemp(file, tmp, length);
+        if (reason != null) {
+            noteWriteFailure(key, reason);
+            return fetchToMemory(key, id, offset, length, fetcher);
         }
         boolean moved = false;
         try {
-            fetcher.fetch(key, Math.multiplyExact(key.index(), (long) blockSize), length, target);
-            long got = Files.size(target);
+            try {
+                fetcher.fetch(key, offset, length, tmp);
+            } catch (IOException e) {
+                // Retry once into memory only when the disk is the problem; a network error is not retried.
+                if (!isDiskFull(e) && !lowOnSpace(length)) throw e;
+                deleteQuietly(tmp);
+                noteWriteFailure(key, "disk full during the fetch: " + e);
+                return fetchToMemory(key, id, offset, length, fetcher);
+            }
+            long got = Files.size(tmp);
             if (got != length) {
                 throw new IOException("fetched block " + key.index() + " of '" + key.objectKey() + "' has " + got
                         + " bytes, expected " + length);
             }
-            if (toCache) {
-                try {
-                    Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                    moved = true;
-                } catch (IOException e) {
-                    noteWriteFailure(key, e);
+            try {
+                try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
+                    ch.force(true);
                 }
+                awaitNoPendingDelete(id);
+                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                moved = true;
+            } catch (InterruptedIOException e) {
+                throw e;
+            } catch (IOException e) {
+                noteWriteFailure(key, "cannot persist the block: " + e);
+                return loadIntoMemory(id, tmp, length);
             }
-            if (moved) {
-                Entry e = new Entry(id, file, length, true);
-                e.lastTouch = clock.getAsLong();
-                setMtime(file, e.lastTouch);
-                try {
-                    map(e);
-                } catch (IOException | RuntimeException ex) {
-                    deleteQuietly(file);
-                    throw ex;
-                }
+            Entry e = new Entry(id, file, length, true);
+            e.verified = true;
+            e.lastTouch = clock.getAsLong();
+            setMtime(file, e.lastTouch);
+            try {
+                if (failMappingForTest) throw new IOException("injected map failure");
+                map(e);
                 return e;
+            } catch (IOException | RuntimeException ex) {
+                noteWriteFailure(key, "cannot map the block: " + ex);
+                try {
+                    return loadIntoMemory(id, file, length);
+                } finally {
+                    deleteQuietly(file);
+                }
             }
-            return loadIntoMemory(id, target, length);
         } finally {
-            if (!moved) deleteQuietly(target);
+            if (!moved) deleteQuietly(tmp);
         }
     }
 
-    /** An uncached entry: the fetched bytes copied into off-heap memory owned by the entry's arena. */
-    private static Entry loadIntoMemory(String id, Path source, long length) throws IOException {
-        Entry e = new Entry(id, source, length, false);
+    /** Creates the temp file for a caching fetch; returns why the block can't be cached, or null. */
+    private String prepareTemp(Path file, Path tmp, long length) {
+        long free = usableSpace.getAsLong();
+        if (free < length + SPACE_MARGIN_BYTES) {
+            return "only " + free + " bytes usable, the block needs " + length + " plus a margin of "
+                    + SPACE_MARGIN_BYTES;
+        }
+        try {
+            Files.createDirectories(file.getParent());
+            Files.deleteIfExists(tmp);
+            Files.createFile(tmp);
+            return null;
+        } catch (IOException e) {
+            return "the cache dir does not take writes: " + e;
+        }
+    }
+
+    private boolean lowOnSpace(long length) {
+        return usableSpace.getAsLong() < length + SPACE_MARGIN_BYTES;
+    }
+
+    /** ENOSPC / EDQUOT anywhere in the cause chain (the JDK reports them as message text only). */
+    static boolean isDiskFull(Throwable t) {
+        int depth = 0;
+        for (Throwable c = t; c != null && depth < 16; c = c.getCause(), depth++) {
+            String m = c.getMessage();
+            if (m != null && (m.contains("No space left on device") || m.contains("Disk quota exceeded")
+                    || m.contains("not enough space on the disk"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long fileStoreUsableSpace() {
+        try {
+            return Files.getFileStore(dir).getUsableSpace();
+        } catch (IOException e) {
+            return Long.MAX_VALUE; // unknown: let the write itself tell
+        }
+    }
+
+    /** The uncached path: the fetcher fills off-heap memory owned by the entry's arena. */
+    private static Entry fetchToMemory(BlockKey key, String id, long offset, long length, BlockFetcher fetcher)
+            throws IOException {
         Arena arena = Arena.ofShared();
-        try (FileChannel ch = FileChannel.open(source, StandardOpenOption.READ)) {
+        try {
             MemorySegment seg = arena.allocate(length);
             ByteBuffer buf = seg.asByteBuffer();
-            while (buf.hasRemaining()) {
-                if (ch.read(buf) < 0) throw new EOFException("fetched block " + source + " shrank while reading");
+            fetcher.fetchToMemory(key, offset, length, buf);
+            if (buf.position() != length) {
+                throw new IOException("fetched block " + key.index() + " of '" + key.objectKey() + "' has "
+                        + buf.position() + " bytes, expected " + length);
             }
+            Entry e = new Entry(id, null, length, false);
+            e.arena = arena;
+            e.segment = seg.asReadOnly();
+            return e;
+        } catch (IOException | RuntimeException | Error ex) {
+            arena.close();
+            throw ex;
+        }
+    }
+
+    /** An uncached entry from bytes already on disk (a temp or block file the caller deletes). */
+    private static Entry loadIntoMemory(String id, Path source, long length) throws IOException {
+        Arena arena = Arena.ofShared();
+        try {
+            MemorySegment seg = arena.allocate(length);
+            readFully(source, length, seg.asByteBuffer());
+            Entry e = new Entry(id, null, length, false);
             e.arena = arena;
             e.segment = seg.asReadOnly();
             return e;
@@ -335,7 +484,31 @@ public final class BlockCache implements Closeable {
         }
     }
 
-    // ---------------------------------------------------------------- mapping and eviction (under lock)
+    private static void readFully(Path source, long length, ByteBuffer target) throws IOException {
+        try (FileChannel ch = FileChannel.open(source, StandardOpenOption.READ)) {
+            if (ch.size() != length) {
+                throw new IOException(source + " has " + ch.size() + " bytes, expected " + length);
+            }
+            while (target.position() < length) {
+                if (ch.read(target) < 0) throw new EOFException(source + " shrank while reading");
+            }
+        }
+    }
+
+    private void awaitNoPendingDelete(String id) throws InterruptedIOException {
+        synchronized (lock) {
+            while (deleting.contains(id)) {
+                try {
+                    lock.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("interrupted waiting for an eviction of " + id);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- mapping and eviction
 
     private static void map(Entry e) throws IOException {
         Arena arena = Arena.ofShared();
@@ -350,7 +523,7 @@ public final class BlockCache implements Closeable {
         }
     }
 
-    /** Maps a seeded entry on first use, checking its on-disk length; false when it is unusable. */
+    /** Maps a seeded entry on first use, checking its on-disk length; false when it is unusable. Under lock. */
     private static boolean ensureMapped(Entry e) {
         if (e.segment != null) return true;
         try {
@@ -362,17 +535,17 @@ public final class BlockCache implements Closeable {
         }
     }
 
-    /** Removes an invalid entry from the cache and deletes its file (not an eviction). */
-    private void drop(Entry e) {
+    /** Removes an invalid entry from the cache (not an eviction). Under lock. */
+    private void drop(Entry e, Cleanup cleanup) {
         entries.remove(e.id);
         e.removed = true;
         bytesOnDisk -= e.length;
-        deleteQuietly(e.file);
-        if (e.leases == 0) closeArena(e);
+        deleteLater(e, cleanup);
+        if (e.leases == 0) closeArena(e, cleanup);
     }
 
-    /** Evicts unleased blocks, least recently used first, until at or under the cap. */
-    private void evictOverCap(boolean warn) {
+    /** Evicts unleased blocks, least recently used first, until at or under the cap. Under lock. */
+    private void evictOverCap(boolean warn, Cleanup cleanup) {
         if (bytesOnDisk <= maxBytes) return;
         int evicted = 0;
         Iterator<Entry> it = entries.values().iterator();
@@ -384,10 +557,24 @@ public final class BlockCache implements Closeable {
             bytesOnDisk -= e.length;
             evictions++;
             evicted++;
-            deleteQuietly(e.file);
-            closeArena(e);
+            deleteLater(e, cleanup);
+            closeArena(e, cleanup);
         }
         if (evicted > 0 && warn) maybeWarnThrash();
+    }
+
+    private void deleteLater(Entry e, Cleanup cleanup) {
+        deleting.add(e.id);
+        cleanup.deletes.add(e);
+    }
+
+    /** Detaches the entry's arena under the lock; the cleanup closes it after the lock is released. */
+    private static void closeArena(Entry e, Cleanup cleanup) {
+        if (e.arena != null) {
+            cleanup.arenas.add(e.arena);
+            e.arena = null;
+            e.segment = null;
+        }
     }
 
     private void maybeWarnThrash() {
@@ -397,13 +584,13 @@ public final class BlockCache implements Closeable {
         lastThrashWarn = now;
         thrashWarnings++;
         long total = hits + misses;
-        String rate = total == 0 ? "n/a" : String.format(java.util.Locale.ROOT, "%.1f%%", 100.0 * hits / total);
+        String rate = total == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f%%", 100.0 * hits / total);
         log.warn("block cache {} is evicting: the working set exceeds the cap of {} bytes; hit rate {}"
                         + " ({} hits, {} misses, {} evictions so far)",
                 dir, maxBytes, rate, hits, misses, evictions);
     }
 
-    private void noteWriteFailure(BlockKey key, IOException e) {
+    private void noteWriteFailure(BlockKey key, String reason) {
         synchronized (lock) {
             writeFailures++;
             long now = clock.getAsLong();
@@ -412,33 +599,92 @@ public final class BlockCache implements Closeable {
             lastWriteWarn = now;
         }
         log.warn("fetched block {} of '{}' could not be cached in {} ({}); serving it uncached",
-                key.index(), key.objectKey(), dir, e.toString());
+                key.index(), key.objectKey(), dir, reason);
     }
 
-    private static void closeArena(Entry e) {
-        if (e.arena != null) {
-            e.arena.close();
-            e.arena = null;
-            e.segment = null;
+    /** Work collected under the lock and done after releasing it: close arenas, delete evicted files. */
+    private final class Cleanup {
+        final List<Arena> arenas = new ArrayList<>(2);
+        final List<Entry> deletes = new ArrayList<>(2);
+
+        void run() {
+            try {
+                for (Arena a : arenas) {
+                    try {
+                        a.close();
+                    } catch (RuntimeException e) {
+                        log.warn("cannot release a block mapping: {}", e.toString());
+                    }
+                }
+                for (Entry e : deletes) deleteQuietly(e.file);
+            } finally {
+                arenas.clear();
+                if (!deletes.isEmpty()) {
+                    synchronized (lock) {
+                        for (Entry e : deletes) deleting.remove(e.id);
+                        lock.notifyAll();
+                    }
+                    deletes.clear();
+                }
+            }
         }
     }
 
     // ---------------------------------------------------------------- recovery
 
     private void recover() throws IOException {
-        if (!blockSizeMatches()) {
-            wipeBlocks();
-            Files.writeString(dir.resolve(BLOCK_SIZE_MARKER), Integer.toString(blockSize));
+        Path marker = dir.resolve(BLOCK_SIZE_MARKER);
+        String want = Integer.toString(blockSize);
+        if (!Files.exists(marker)) {
+            try (Stream<Path> s = Files.list(dir)) {
+                if (s.findAny().isPresent()) {
+                    throw new IOException("block cache dir " + dir + " is not empty but has no " + BLOCK_SIZE_MARKER
+                            + " marker; refusing to use it (point the cache at an empty or dedicated dir)");
+                }
+            }
+            Files.writeString(marker, want);
+        } else if (!Files.readString(marker, StandardCharsets.UTF_8).trim().equals(want)) {
+            log.info("block cache {}: block size changed to {}; dropping blocks cut with the old size", dir, want);
+            scan(true, new ArrayList<>());
+            Files.writeString(marker, want);
         }
         List<Entry> seeds = new ArrayList<>();
+        scan(false, seeds);
+        seeds.sort(Comparator.<Entry>comparingLong(e -> e.lastTouch).thenComparing(e -> e.id));
+        Cleanup cleanup = new Cleanup();
+        synchronized (lock) {
+            for (Entry e : seeds) {
+                entries.put(e.id, e);
+                bytesOnDisk += e.length;
+            }
+            evictOverCap(false, cleanup);
+        }
+        cleanup.run();
+        if (!seeds.isEmpty()) {
+            log.info("block cache {}: {} blocks, {} bytes on disk (cap {})", dir, entries.size(), bytesOnDisk, maxBytes);
+        }
+    }
+
+    /**
+     * Walks the layout dirs only. Deletes temp files and (with {@code wipe}, all; otherwise
+     * invalid-length) block files; seeds the rest. Files outside the layout are left alone.
+     */
+    private void scan(boolean wipe, List<Entry> seeds) throws IOException {
         Files.walkFileTree(dir, new SimpleFileVisitor<>() {
             @Override
+            public FileVisitResult preVisitDirectory(Path d, BasicFileAttributes attrs) {
+                if (d.equals(dir) || isPrefixDir(d) || isHashDir(d)) return FileVisitResult.CONTINUE;
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+
+            @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                if (file.getParent() == null || !isHashDir(file.getParent())) return FileVisitResult.CONTINUE;
                 String name = file.getFileName().toString();
-                if (name.endsWith(".tmp") || name.endsWith(".part")) {
+                if (TEMP_NAME.matcher(name).matches()) {
                     Files.deleteIfExists(file);
-                } else if (name.endsWith(".blk")) {
-                    Entry e = seed(file, attrs);
+                } else if (BLOCK_NAME.matcher(name).matches()) {
+                    Entry e = wipe ? null : seed(file, attrs);
                     if (e == null) Files.deleteIfExists(file);
                     else seeds.add(e);
                 }
@@ -446,12 +692,18 @@ public final class BlockCache implements Closeable {
             }
 
             @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                log.debug("block cache scan skipped {}: {}", file, exc.toString());
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
             public FileVisitResult postVisitDirectory(Path d, IOException exc) {
-                if (!d.equals(dir)) {
+                if (!d.equals(dir)) { // only layout dirs get here
                     try {
                         Files.deleteIfExists(d);
                     } catch (DirectoryNotEmptyException ignored) {
-                        // still holds blocks
+                        // still holds blocks (or files that are not ours)
                     } catch (IOException e) {
                         log.debug("cannot remove empty cache dir {}: {}", d, e.toString());
                     }
@@ -459,60 +711,28 @@ public final class BlockCache implements Closeable {
                 return FileVisitResult.CONTINUE;
             }
         });
-        seeds.sort(Comparator.<Entry>comparingLong(e -> e.lastTouch).thenComparing(e -> e.id));
-        for (Entry e : seeds) {
-            entries.put(e.id, e);
-            bytesOnDisk += e.length;
-        }
-        evictOverCap(false);
-        if (!seeds.isEmpty()) {
-            log.info("block cache {}: {} blocks, {} bytes on disk (cap {})", dir, entries.size(), bytesOnDisk, maxBytes);
-        }
     }
 
-    /** A seed entry for a block file in the expected place with a possible length; null otherwise. */
+    private boolean isPrefixDir(Path d) {
+        return dir.equals(d.getParent()) && PREFIX.matcher(d.getFileName().toString()).matches();
+    }
+
+    private boolean isHashDir(Path d) {
+        Path prefix = d.getParent();
+        if (prefix == null || !isPrefixDir(prefix)) return false;
+        String hash = d.getFileName().toString();
+        return HASH.matcher(hash).matches() && hash.startsWith(prefix.getFileName().toString());
+    }
+
+    /** A seed entry for a block file with a possible length; null when the length can't be valid. */
     private Entry seed(Path file, BasicFileAttributes attrs) {
-        Path hashDir = file.getParent();
-        Path prefixDir = hashDir == null ? null : hashDir.getParent();
-        if (prefixDir == null || !dir.equals(prefixDir.getParent())) return null;
-        String hash = hashDir.getFileName().toString();
-        if (!HASH.matcher(hash).matches() || !prefixDir.getFileName().toString().equals(hash.substring(0, 2))) {
-            return null;
-        }
-        String name = file.getFileName().toString();
-        if (!BLOCK_NAME.matcher(name).matches()) return null;
         long size = attrs.size();
         if (size <= 0 || size > blockSize) return null;
-        long index;
-        try {
-            index = Long.parseLong(name.substring(0, name.length() - ".blk".length()));
-        } catch (NumberFormatException e) {
-            return null;
-        }
-        Entry e = new Entry(hash + "/" + index, file, size, true);
+        String name = file.getFileName().toString();
+        long index = Long.parseLong(name.substring(0, name.length() - ".blk".length()));
+        Entry e = new Entry(file.getParent().getFileName() + "/" + index, file, size, true);
         e.lastTouch = attrs.lastModifiedTime().toMillis();
         return e;
-    }
-
-    private boolean blockSizeMatches() {
-        Path marker = dir.resolve(BLOCK_SIZE_MARKER);
-        try {
-            return Files.readString(marker, StandardCharsets.UTF_8).trim().equals(Integer.toString(blockSize));
-        } catch (IOException e) {
-            return false;
-        }
-    }
-
-    /** Deletes every block and temp file: they were cut with another (or an unknown) block size. */
-    private void wipeBlocks() throws IOException {
-        Files.walkFileTree(dir, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                String name = file.getFileName().toString();
-                if (name.endsWith(".blk") || name.endsWith(".tmp")) Files.deleteIfExists(file);
-                return FileVisitResult.CONTINUE;
-            }
-        });
     }
 
     // ---------------------------------------------------------------- stats / close / helpers
@@ -534,6 +754,7 @@ public final class BlockCache implements Closeable {
      */
     @Override
     public void close() {
+        Cleanup cleanup = new Cleanup();
         synchronized (lock) {
             if (closed) return;
             closed = true;
@@ -543,11 +764,12 @@ public final class BlockCache implements Closeable {
             inflight.clear();
             for (Entry e : entries.values()) {
                 e.removed = true;
-                if (e.leases == 0) closeArena(e);
+                if (e.leases == 0) closeArena(e, cleanup);
             }
             entries.clear();
             bytesOnDisk = 0;
         }
+        cleanup.run();
         fetchers.shutdownNow();
     }
 
@@ -573,8 +795,11 @@ public final class BlockCache implements Closeable {
     }
 
     private static void deleteQuietly(Path file) {
+        if (file == null) return;
         try {
             Files.deleteIfExists(file);
+        } catch (NoSuchFileException ignored) {
+            // already gone
         } catch (IOException e) {
             log.debug("cannot delete {}: {}", file, e.toString());
         }
@@ -585,6 +810,7 @@ public final class BlockCache implements Closeable {
     /** One block; fields other than the finals are guarded by the cache lock. */
     private static final class Entry {
         final String id;
+        /** The block file; null for an uncached (memory-only) entry. */
         final Path file;
         final long length;
         /** False for a block served from memory because it could not be written to the cache dir. */
@@ -594,6 +820,8 @@ public final class BlockCache implements Closeable {
         int leases;
         /** Out of the cache (evicted, dropped, closed, or never cached): the arena closes at zero leases. */
         boolean removed;
+        /** Its length is known good (fetched, or matched an acquire); a seeded file's is not, yet. */
+        boolean verified;
         long lastTouch;
 
         Entry(String id, Path file, long length, boolean cached) {
@@ -607,7 +835,14 @@ public final class BlockCache implements Closeable {
     /** A fetch in progress; {@code waiters} (under the lock) is how many leases to reserve on success. */
     private static final class Flight {
         final CompletableFuture<Entry> done = new CompletableFuture<>();
+        final long length;
         int waiters;
+        /** Set when the fetch has finished (under the lock), before {@link #done} completes. */
+        boolean settled;
+        /** The fetched entry, holding one reserved lease per waiter; null until settled successfully. */
+        Entry result;
+
+        Flight(long length) { this.length = length; }
     }
 
     /** A pin on one block. {@link #segment()} is valid until {@link #close()}; close is idempotent. */
