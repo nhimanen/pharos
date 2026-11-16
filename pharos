@@ -909,7 +909,7 @@ def cmd_publish(args):
     """Publish a project's existing local index to the cluster object store (writer nodes).
 
     Spawns its own JVM like backfill-embedding-cache. Exit codes: 0 published, 1 not indexed,
-    2 wrong node role, 3 publish failed.
+    2 wrong node role, 3 publish failed, 4 local index not publishable (re-index first).
     """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
@@ -1620,7 +1620,9 @@ cluster object store, without re-indexing. Use it when 'pharos index' exited
 with code 3 (indexed locally, publish failed). Requires cluster.role 'writer'.
 
 EXIT CODES
-  0 published, 1 project not indexed, 2 not a writer node, 3 publish failed
+  0 published, 1 project not indexed, 2 not a writer node, 3 publish failed,
+  4 local index not publishable (broken graph pointer or index format not
+    current: re-index with 'pharos index --full' first)
 
 EXAMPLES
   pharos publish myproject

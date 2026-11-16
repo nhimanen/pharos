@@ -146,6 +146,54 @@ class ClusterRoundTripTest {
         assertThat(keywordIds(c.readerEngine, "Calculator")).isNotEmpty();
     }
 
+    // ── Adaptation 6: publish refuses a broken pointer or a non-current index format ─────────
+
+    private Captured publish(ClusterFixture c) {
+        return capture(() -> new CommandLine(
+                new PublishCommand(c.writerConfig, c.writerRegistry, c.writerRuntime)).execute(JAVA));
+    }
+
+    @Test
+    void publishRefusesBrokenGraphPointer() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        ClusterFixture c = cluster;
+        c.index(JAVA, false); // generation 1
+        Path shard = c.writerLucene.getProjectIndexDir(JAVA);
+        Files.writeString(shard.resolve(com.pharos.graph.CallGraph.POINTER_FILE), "not-a-generation");
+
+        Captured r = publish(c);
+
+        assertThat(r.exit).as(r.err).isEqualTo(4);
+        assertThat(r.err).contains("Not publishing sample-app", "malformed", "pharos index --full");
+        assertThat(store.get("pharos/shards/sample-app/manifests/gen-2.json")).isEmpty();
+    }
+
+    @Test
+    void publishRefusesIndexWhoseFormatIsNotCurrent() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        ClusterFixture c = cluster;
+        c.index(JAVA, false);
+        Path shard = c.writerLucene.getProjectIndexDir(JAVA);
+        int[] formats = {com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT,      // upgrade-available
+                         com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1};      // newer
+        long mtime = System.currentTimeMillis();
+        for (int format : formats) {
+            com.pharos.indexer.IndexFormat.write(shard, new com.pharos.indexer.IndexFormat.Stamp(format, "test", null));
+            // IndexFormat caches by the stamp's mtime
+            Files.setLastModifiedTime(shard.resolve(com.pharos.indexer.IndexFormat.FILE_NAME),
+                    FileTime.fromMillis(mtime += 60_000));
+
+            Captured r = publish(c);
+
+            assertThat(r.exit).as(r.err).isEqualTo(4);
+            assertThat(r.err).contains("index format is " + format,
+                    "publishes index format " + com.pharos.indexer.IndexVersions.INDEX_FORMAT, "Re-index first");
+            assertThat(store.get("pharos/shards/sample-app/manifests/gen-2.json")).isEmpty();
+        }
+    }
+
     private record Captured(int exit, String out, String err) {}
 
     private static Captured capture(java.util.function.IntSupplier run) {

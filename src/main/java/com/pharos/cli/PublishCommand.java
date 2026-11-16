@@ -8,7 +8,10 @@ import com.pharos.cluster.RoleGuard;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.graph.CallGraph;
 import com.pharos.indexer.FileStateTracker;
+import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.IndexVersions;
 import picocli.CommandLine.*;
 
 import java.io.IOException;
@@ -21,7 +24,8 @@ import java.util.concurrent.Callable;
 /**
  * Publishes a project's committed local index to the object store without re-indexing: the
  * retry after {@code pharos index} exited with code 3. Exit codes: 0 published, 1 not indexed,
- * 2 wrong node role, 3 publish failed.
+ * 2 wrong node role, 3 publish failed, 4 the local index is not publishable as it is (its call
+ * graph pointer is broken, or its index format is not this build's: re-index first).
  */
 @Command(
         name = "publish",
@@ -58,6 +62,13 @@ public class PublishCommand implements Callable<Integer> {
             System.err.println("Run 'pharos index <path>' first.");
             return 1;
         }
+        String unpublishable = unpublishableReason(shardDir);
+        if (unpublishable != null) {
+            System.err.println("Not publishing " + projectName + ": " + unpublishable);
+            System.err.println("Re-index first: pharos index --full --project " + projectName + " "
+                    + (meta.get().getRootPath() == null ? "<path>" : meta.get().getRootPath()));
+            return 4;
+        }
         try {
             LocalSnapshot snapshot = new LocalSnapshot(projectName, shardDir, meta.get(),
                     modelFingerprint(shardDir));
@@ -77,6 +88,22 @@ public class PublishCommand implements Callable<Integer> {
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
             return 3;
         }
+    }
+
+    /**
+     * Why the local index must not be published, or null. A writer only publishes what it would
+     * serve itself at the current format: an index that needs upgrading (even an N-1 one that this
+     * build still serves) is re-indexed first, so readers never receive an old format from it.
+     */
+    private static String unpublishableReason(Path shardDir) {
+        String pointer = CallGraph.pointerProblem(shardDir);
+        if (pointer != null) return pointer;
+        IndexFormat.Status status = IndexFormat.status(shardDir);
+        if (status != IndexFormat.Status.OK) {
+            return "its index format is " + IndexFormat.read(shardDir).format() + " (" + status.wireName()
+                    + "); this pharos writes and publishes index format " + IndexVersions.INDEX_FORMAT;
+        }
+        return null;
     }
 
     /**
