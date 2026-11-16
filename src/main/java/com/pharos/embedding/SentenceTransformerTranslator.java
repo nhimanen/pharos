@@ -5,7 +5,6 @@ import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
-import ai.djl.ndarray.types.DataType;
 import ai.djl.translate.Batchifier;
 import ai.djl.translate.Translator;
 import ai.djl.translate.TranslatorContext;
@@ -20,7 +19,7 @@ import java.util.Map;
  * Pipeline:
  *   1. Tokenize input with HuggingFaceTokenizer loaded from a local tokenizer.json (truncates at maxLength tokens)
  *   2. Run ONNX model with input_ids, attention_mask, token_type_ids
- *   3. Mean-pool last_hidden_state over non-padding tokens → float[] embedding
+ *   3. Pool last_hidden_state (masked mean, or the CLS token when configured) → float[] embedding
  *
  * The attention mask is stashed on the TranslatorContext between processInput and processOutput.
  */
@@ -30,6 +29,7 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
 
     private final Path tokenizerJson;
     private final int maxLength;
+    private final com.pharos.config.Pooling pooling;
     private HuggingFaceTokenizer tokenizer;
 
     /**
@@ -37,8 +37,13 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
      * @param maxLength     max token length passed to the tokenizer (e.g. 8192)
      */
     public SentenceTransformerTranslator(Path tokenizerJson, int maxLength) {
+        this(tokenizerJson, maxLength, com.pharos.config.Pooling.MEAN);
+    }
+
+    public SentenceTransformerTranslator(Path tokenizerJson, int maxLength, com.pharos.config.Pooling pooling) {
         this.tokenizerJson = tokenizerJson;
         this.maxLength = maxLength;
+        this.pooling = pooling == null ? com.pharos.config.Pooling.MEAN : pooling;
     }
 
     @Override
@@ -77,23 +82,9 @@ public class SentenceTransformerTranslator implements Translator<String, float[]
         NDArray hidden = list.get(0);
         NDArray mask = (NDArray) ctx.getAttachment(MASK_KEY);
 
-        // All intermediate tensors (maskExpanded, products) are created inside a child NDManager
-        // and released immediately when the try block exits, rather than waiting for GC pressure
-        // to trigger deallocation of the parent TranslatorContext manager.
-        // All intermediate tensors are created inside a child NDManager and released immediately
-        // when the try block exits, rather than waiting for GC to trigger deallocation.
-        // Perform mean pooling — all intermediate NDArrays are owned by ctx.getNDManager()
-        // and released when the TranslatorContext closes. Manual .attach() re-parenting is
-        // avoided because OrtNDArray.attach() requires an OrtNDManager, not a sub-manager
-        // from a different engine backend (e.g. RsNDManager), which causes a ClassCastException.
-        NDArray maskFloat    = mask.toType(DataType.FLOAT32, false);
-        NDArray maskExpanded = maskFloat
-                .reshape(1, mask.getShape().get(1), 1)
-                .broadcast(hidden.getShape());
-        NDArray sumEmbeddings = hidden.mul(maskExpanded).sum(new int[]{1});
-        NDArray sumMask       = maskExpanded.sum(new int[]{1}).clip(1e-9f, Float.MAX_VALUE);
-        // toFloatArray() copies to a Java primitive array — safe to return after context closes
-        return sumEmbeddings.div(sumMask).squeeze(0).toFloatArray();
+        // Pooling intermediates are owned by ctx.getNDManager() and released when the context closes.
+        // toFloatArray() copies to Java primitives, so the result is safe after the context closes.
+        return EmbeddingPooling.pool(hidden, mask, pooling)[0];
     }
 
     @Override

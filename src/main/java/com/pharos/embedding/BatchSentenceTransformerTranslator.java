@@ -5,7 +5,6 @@ import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
-import ai.djl.ndarray.types.DataType;
 import ai.djl.translate.Batchifier;
 import ai.djl.translate.Translator;
 import ai.djl.translate.TranslatorContext;
@@ -36,6 +35,7 @@ public class BatchSentenceTransformerTranslator implements Translator<List<Strin
 
     private final Path tokenizerJson;
     private final int maxLength;
+    private final com.pharos.config.Pooling pooling;
     private HuggingFaceTokenizer tokenizer;
 
     /**
@@ -43,8 +43,13 @@ public class BatchSentenceTransformerTranslator implements Translator<List<Strin
      * @param maxLength     per-sequence token limit (same as the single-item translator)
      */
     public BatchSentenceTransformerTranslator(Path tokenizerJson, int maxLength) {
+        this(tokenizerJson, maxLength, com.pharos.config.Pooling.MEAN);
+    }
+
+    public BatchSentenceTransformerTranslator(Path tokenizerJson, int maxLength, com.pharos.config.Pooling pooling) {
         this.tokenizerJson = tokenizerJson;
         this.maxLength = maxLength;
+        this.pooling = pooling == null ? com.pharos.config.Pooling.MEAN : pooling;
     }
 
     @Override
@@ -99,22 +104,8 @@ public class BatchSentenceTransformerTranslator implements Translator<List<Strin
         // last_hidden_state: [batch, seq_len, hidden_size]
         NDArray hidden = list.get(0);
         NDArray mask   = (NDArray) ctx.getAttachment(MASK_KEY); // [batch, seq_len]
-        int batchSize  = (int) ctx.getAttachment(SIZE_KEY);
 
-        // Mean-pool over the sequence dimension (dim=1) using the attention mask
-        NDArray maskFloat    = mask.toType(DataType.FLOAT32, false);                   // [batch, seq]
-        NDArray maskExpanded = maskFloat
-                .reshape(batchSize, mask.getShape().get(1), 1)
-                .broadcast(hidden.getShape());                                          // [batch, seq, hidden]
-        NDArray sumEmbeddings = hidden.mul(maskExpanded).sum(new int[]{1});             // [batch, hidden]
-        NDArray sumMask       = maskExpanded.sum(new int[]{1}).clip(1e-9f, Float.MAX_VALUE); // [batch, hidden]
-        NDArray pooled        = sumEmbeddings.div(sumMask);                             // [batch, hidden]
-
-        float[][] results = new float[batchSize][];
-        for (int i = 0; i < batchSize; i++) {
-            results[i] = pooled.get(i).toFloatArray();
-        }
-        return results;
+        return EmbeddingPooling.pool(hidden, mask, pooling);
     }
 
     @Override

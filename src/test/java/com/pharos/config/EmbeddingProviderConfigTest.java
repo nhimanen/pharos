@@ -66,17 +66,19 @@ class EmbeddingProviderConfigTest {
         d.validate();
     }
 
-    private static IndexConfig loadWith(EmbeddingProviderConfig parent) throws Exception {
-        java.nio.file.Path home = java.nio.file.Files.createTempDirectory("pharos-fb");
-        IndexConfig c = IndexConfig.defaults();
-        c.setEmbeddingProviders(new java.util.ArrayList<>(java.util.List.of(parent)));
-        // validateFallbacks is private; exercise it through the public inherit/validate path
-        for (EmbeddingProviderConfig p : c.getEmbeddingProviders()) {
-            p.validate();
-            for (EmbeddingProviderConfig fb : p.getFallbacks()) fb.inheritRuntimeSettings(p);
-            for (EmbeddingProviderConfig fb : p.getFallbacks()) fb.validate();
+    /** Drives the real IndexConfig.load() from config.json under the surefire-isolated pharos.home. */
+    private IndexConfig loadWith(EmbeddingProviderConfig parent) throws Exception {
+        java.nio.file.Path file = IndexConfig.DEFAULT_BASE.resolve("config.json");
+        java.nio.file.Files.createDirectories(file.getParent());
+        IndexConfig cfg = IndexConfig.defaults();
+        cfg.setEmbeddingProviders(new java.util.ArrayList<>(java.util.List.of(parent)));
+        try {
+            mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+            mapper.writeValue(file.toFile(), cfg);
+            return IndexConfig.load();
+        } finally {
+            java.nio.file.Files.deleteIfExists(file);
         }
-        return c;
     }
 
     @Test
@@ -87,10 +89,11 @@ class EmbeddingProviderConfigTest {
         parent.setDocumentPrefix("d: ");
         EmbeddingProviderConfig fb = base("djl");
         parent.getFallbacks().add(fb);
-        loadWith(parent);
-        assertThat(fb.getPooling()).isEqualTo(Pooling.CLS);
-        assertThat(fb.getQueryPrefix()).isEqualTo("q: ");
-        assertThat(fb.getDocumentPrefix()).isEqualTo("d: ");
+        IndexConfig loaded = loadWith(parent);
+        EmbeddingProviderConfig loadedFb = loaded.getEmbeddingProviders().get(0).getFallbacks().get(0);
+        assertThat(loadedFb.getPooling()).isEqualTo(Pooling.CLS);
+        assertThat(loadedFb.getQueryPrefix()).isEqualTo("q: ");
+        assertThat(loadedFb.getDocumentPrefix()).isEqualTo("d: ");
     }
 
     @Test

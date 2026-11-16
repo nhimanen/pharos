@@ -149,7 +149,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             return zooModel.newPredictor();
         }
         SentenceTransformerTranslator translator =
-                new SentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens);
+                new SentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens, pooling);
         return hfModel.newPredictor(translator);
     }
 
@@ -162,7 +162,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     private Predictor<List<String>, float[][]> newBatchPredictor() {
         if (hfModel == null) return null;
         BatchSentenceTransformerTranslator translator =
-                new BatchSentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens);
+                new BatchSentenceTransformerTranslator(tokenizerFile.toAbsolutePath(), maxTokens, pooling);
         return (Predictor<List<String>, float[][]>) hfModel.newPredictor(translator);
     }
 
