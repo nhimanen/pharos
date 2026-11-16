@@ -8,6 +8,7 @@ import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardId;
+import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -29,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -108,7 +110,14 @@ class ObjectStorePublisherTest {
         store = new SpyStore();
         layout = new ObjectStoreLayout("pharos");
         catalog = new ObjectStoreCatalog(store, layout);
-        publisher = new ObjectStorePublisher(store, layout, catalog, null, "node-a", synonyms);
+        publisher = new ObjectStorePublisher(store, layout, catalog, gc(), "node-a", synonyms);
+    }
+
+    /** The real GC with the default retention, as production wires it. */
+    private GenerationGc gc() {
+        ClusterConfig cfg = new ClusterConfig();
+        return new GenerationGc(store, layout, cfg.getRetentionGenerations(),
+                Duration.ofMinutes(cfg.getRetentionMinutes()));
     }
 
     private ProjectIndexManager manager(IndexPublisher pub) {
@@ -327,7 +336,7 @@ class ObjectStorePublisherTest {
         touchOneFileAndReindex(mLocal);
         store.hideOnce.add(layout.latestKey(SHARD));
         store.putKeys.clear();
-        ObjectStorePublisher runB = new ObjectStorePublisher(store, layout, catalog, null, "node-b", synonyms);
+        ObjectStorePublisher runB = new ObjectStorePublisher(store, layout, catalog, gc(), "node-b", synonyms);
         Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
 
@@ -432,6 +441,27 @@ class ObjectStorePublisherTest {
         assertThat(keys(m)).contains(refsKey);
         assertThat(m.get("projectMeta").get("unresolvedRefs")).isEmpty();
         assertThat(meta.getUnresolvedRefs()).as("caller's meta not mutated").hasSize(1);
+    }
+
+    @Test
+    void publishRunsGenerationGc() throws Exception {
+        ObjectStorePublisher gcPublisher = new ObjectStorePublisher(store, layout, catalog,
+                new GenerationGc(store, layout, 2, Duration.ZERO), "node-a", synonyms);
+        indexFull(manager(gcPublisher));
+        Set<String> gen1 = keys(manifest(1));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        gcPublisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
+        gcPublisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
+
+        assertThat(store.get(layout.manifestKey(SHARD, Generation.FIRST))).isEmpty();
+        Set<String> live = new HashSet<>(keys(manifest(2)));
+        live.addAll(keys(manifest(3)));
+        for (String key : live) assertThat(store.get(key)).as(key).isPresent();
+        for (String key : gen1) {
+            if (!live.contains(key)) assertThat(store.get(key)).as(key).isEmpty();
+        }
+        assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(3);
     }
 
     @Test

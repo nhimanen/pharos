@@ -36,7 +36,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedInputStream;
@@ -70,18 +69,17 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private final ObjectStoreLayout layout;
     private final ObjectStoreCatalog catalog;
     /** Nullable: no GC when absent. */
-    private final BiConsumer<ShardId, Instant> gc;
+    private final GenerationGc gc;
     private final String nodeId;
     private final Path synonymsFile;
 
     /**
-     * @param gc           generation GC hook, called with the shard and the {@code LATEST}
-     *                     last-modified time after a successful publish; {@code null} disables
-     *                     GC (Task 9 passes a {@code GenerationGc::collect} adapter)
+     * @param gc           generation GC, run with the shard and the {@code LATEST} last-modified
+     *                     time (store clock) after a successful publish; {@code null} disables GC
      * @param synonymsFile shipped to {@code catalog/synonyms.txt} when it exists
      */
     public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
-                                BiConsumer<ShardId, Instant> gc, String nodeId, Path synonymsFile) {
+                                GenerationGc gc, String nodeId, Path synonymsFile) {
         this.store = store;
         this.layout = layout;
         this.catalog = catalog;
@@ -302,8 +300,12 @@ public final class ObjectStorePublisher implements IndexPublisher {
             Instant latestModified = store.list(latestKey).stream()
                     .filter(o -> o.key().equals(latestKey))
                     .map(ObjectInfo::lastModified)
-                    .findFirst().orElseGet(Instant::now);
-            gc.accept(shard, latestModified);
+                    .findFirst().orElse(null);
+            if (latestModified == null) {
+                log.warn("Generation GC for shard {} skipped: LATEST not listed", shard);
+                return;
+            }
+            gc.collect(shard, latestModified);
         } catch (IOException | RuntimeException e) {
             log.warn("Generation GC for shard {} failed (publish succeeded): {}", shard, e.toString());
         }
