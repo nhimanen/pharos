@@ -5,6 +5,14 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 ## [Unreleased]
 
+### Fixed
+- Vector search returned nothing (hybrid silently fell back to keyword) for configs using the old
+  single-model form (`embeddingModelUrl`), or any provider with model id `legacy`: indexing wrote
+  `vec.legacy` while search reads `vectorEmbedding`. Writers and readers now share one mapping
+  (`DocumentMapper.vectorFieldFor` / `chunkVectorFieldFor`), and readers fall back to `vec.legacy`
+  when an index has no `vectorEmbedding`, so indexes built by 1.4.0/1.4.1 work without re-embedding.
+  Named models keep `vec.<id>`. Index format unchanged.
+
 ## [1.4.1] - 2026-11-16
 
 **Index format:** 1 (unchanged)
