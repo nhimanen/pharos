@@ -205,6 +205,10 @@
                          when parsing corpora (e.g. Lucene) that use the Vector API. -->
                     <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2 -Dpolyglot.engine.WarnInterpreterOnly=false</argLine>
                     <excludedGroups>${excludedGroups}</excludedGroups>
+                    <!-- Keep tests out of the real ~/.pharos (synonyms, registry, config, module graph). -->
+                    <systemPropertyVariables>
+                        <pharos.home>${project.build.directory}/test-pharos-home</pharos.home>
+                    </systemPropertyVariables>
                     <!-- Excluded due to ArcadeDB temp-dir contention when run in parallel
                          with the full suite. Pass individually with -Dtest=ClassName. -->
                     <excludes>

@@ -12,6 +12,9 @@ mvn test -Dtest=ClassName   # Run a single test class
 mvn clean compile           # Compile only
 ```
 
+**Test isolation:** surefire sets `-Dpharos.home=target/test-pharos-home`, so tests never touch the real `~/.pharos`
+(`IndexConfig.DEFAULT_BASE` honors `pharos.home`; unset means `~/.pharos`). Pass `-Dpharos.home=<dir>` to relocate state when running the CLI.
+
 **Java 25+ required.** The shade plugin produces a single executable JAR.
 
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package

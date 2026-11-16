@@ -867,8 +867,7 @@ public class SearchEngine {
     private static List<PipelineConfig> loadPipelineConfigs() {
         ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
         try {
-            java.nio.file.Path external = java.nio.file.Path.of(
-                    System.getProperty("user.home"), ".pharos", "pipelines.yaml");
+            java.nio.file.Path external = com.pharos.config.IndexConfig.DEFAULT_BASE.resolve("pipelines.yaml");
             java.io.InputStream in;
             if (java.nio.file.Files.isReadable(external)) {
                 log.info("Loading pipeline config from {}", external);
