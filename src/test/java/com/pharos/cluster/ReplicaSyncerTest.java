@@ -490,4 +490,125 @@ class ReplicaSyncerTest {
             assertThat(polling.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
         }
     }
+
+    // ── Adaptations 4 and 5: the format stamp ships in the manifest; readers gate on it ─────────
+
+    /** Rewrites manifest {@code gen} in the store with {@code stamp} (null = a pre-stamp manifest). */
+    private void restampManifest(long gen, com.pharos.indexer.IndexFormat.Stamp stamp) throws IOException {
+        ShardManifest m = manifest(gen);
+        ShardManifest re = new ShardManifest(m.formatVersion(), m.shard(), m.generation(), m.parentGeneration(),
+                m.createdAt(), m.writerNode(), m.docCount(), m.sizeBytes(), m.modelFingerprint(), m.files(),
+                m.projectMeta(), stamp);
+        store.put(layout.manifestKey(SHARD, new Generation(gen)), re.toJson());
+    }
+
+    private static ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> captureLog() {
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ReplicaSyncer.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void releaseLog(ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> a) {
+        ((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ReplicaSyncer.class)).detachAppender(a);
+    }
+
+    @Test
+    void manifestCarriesTheStampAndTheReaderWritesItIntoTheGenerationDir() throws Exception {
+        publishFull();
+        var writerStamp = com.pharos.indexer.IndexFormat.read(tmp.resolve("writer-indexes").resolve(PROJECT));
+        assertThat(writerStamp.format()).isEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+        assertThat(manifest(1).indexFormat()).isEqualTo(writerStamp);
+
+        syncer.syncOnce();
+
+        assertThat(genDir(1).resolve("index-format.json")).isRegularFile();
+        assertThat(com.pharos.indexer.IndexFormat.read(genDir(1))).isEqualTo(writerStamp);
+        assertThat(com.pharos.indexer.IndexFormat.status(genDir(1))).isEqualTo(com.pharos.indexer.IndexFormat.Status.OK);
+
+        // index-status on the reader reads the stamp of the served generation
+        var buf = new java.io.ByteArrayOutputStream();
+        var out = System.out;
+        System.setOut(new java.io.PrintStream(buf, true, StandardCharsets.UTF_8));
+        int rc;
+        try {
+            rc = new picocli.CommandLine(new com.pharos.cli.IndexStatusCommand(readerRegistry)).execute("--json");
+        } finally {
+            System.setOut(out);
+        }
+        assertThat(rc).isZero();
+        var row = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(buf.toString(StandardCharsets.UTF_8)).get("projects").get(0);
+        assertThat(row.get("status").asText()).isEqualTo("ok");
+        assertThat(row.get("format").asInt()).isEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+    }
+
+    @Test
+    void manifestWithoutStampCountsAsFormatZero() throws Exception {
+        publishFull();
+        restampManifest(1, null);
+
+        syncer.syncOnce();
+
+        // format 0 is N-1 for this build: materialised and served, status upgrade-available
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
+        assertThat(genDir(1).resolve("index-format.json")).doesNotExist();
+        assertThat(com.pharos.indexer.IndexFormat.status(genDir(1)))
+                .isEqualTo(com.pharos.indexer.IndexFormat.statusOf(0))
+                .isEqualTo(com.pharos.indexer.IndexFormat.Status.UPGRADE_AVAILABLE);
+    }
+
+    @Test
+    void newerFormatManifestLeavesTheOldGenerationServing() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        publishIncremental("triple");
+        int newer = com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1;
+        restampManifest(2, new com.pharos.indexer.IndexFormat.Stamp(newer, "9.9.9", java.time.Instant.now()));
+        var log = captureLog();
+        try {
+            syncer.syncOnce();
+            syncer.syncOnce(); // the WARN is not repeated for the same generation
+        } finally {
+            releaseLog(log);
+        }
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
+        assertThat(cache.active(PROJECT)).contains(genDir(1));
+        assertThat(genDir(2)).doesNotExist();
+        assertThat(genDirNames()).containsExactly("gen-1");
+        assertThat(readerRegistry.find(PROJECT).orElseThrow().getIndexPath()).isEqualTo(genDir(1).toString());
+        var warns = log.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        assertThat(warns).hasSize(1);
+        assertThat(warns.get(0)).contains(PROJECT, "generation 2", "index format " + newer, "newer",
+                "reads index formats " + com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT + "-"
+                        + com.pharos.indexer.IndexVersions.INDEX_FORMAT,
+                "still serving generation 1", "upgrade pharos on this reader");
+
+        // the writer re-publishes with a format this reader serves: the swap happens
+        restampManifest(2, manifest(1).indexFormat());
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(2)));
+    }
+
+    @Test
+    void outdatedFormatManifestIsNotMaterialised() throws Exception {
+        publishFull();
+        int outdated = com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT - 1;
+        restampManifest(1, new com.pharos.indexer.IndexFormat.Stamp(outdated, "0.0.1", null));
+        var log = captureLog();
+        try {
+            syncer.syncOnce();
+        } finally {
+            releaseLog(log);
+        }
+        assertThat(syncer.served()).isEmpty();
+        assertThat(genDir(1)).doesNotExist();
+        assertThat(log.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage))
+                .anySatisfy(m -> assertThat(m).contains("outdated", "still serving nothing yet",
+                        "pharos index --full " + PROJECT));
+    }
 }

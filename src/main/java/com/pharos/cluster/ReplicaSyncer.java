@@ -6,6 +6,7 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.GraphViews;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.IndexVersions;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
@@ -67,7 +68,10 @@ import java.util.zip.CheckedInputStream;
  * hard-linked from the active generation (already verified when they were downloaded) only have
  * their footer compared.
  *
- * <p>A served generation dir carries the
+ * <p>Format gate: a generation whose manifest carries an index format this build cannot serve
+ * ({@code outdated} or {@code newer}; a manifest without the stamp counts as format 0) is neither
+ * materialised nor swapped in. The shard keeps serving its current generation and a WARN (once per
+ * generation) names the shard, both formats and the fix. A served generation dir carries the
  * manifest's stamp as {@code index-format.json}, so {@code index-status} and
  * {@code IndexFormat.check} see the writer's format on the reader.
  *
@@ -97,6 +101,8 @@ public class ReplicaSyncer implements Closeable {
     private final Map<ShardId, Generation> served = new ConcurrentHashMap<>();
     /** Generation last registered per shard; re-tried when it lags {@link #served}. */
     private final Map<ShardId, Generation> registered = new HashMap<>();
+    /** Generation last refused per shard by the format gate; its WARN is not repeated every poll. */
+    private final Map<ShardId, Generation> refused = new HashMap<>();
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
     private ScheduledExecutorService scheduler;
@@ -218,6 +224,7 @@ public class ReplicaSyncer implements Closeable {
         }
 
         ShardManifest manifest = source.manifest(shard, gen);
+        if (!formatServable(shard, gen, manifest)) return;
         checkFiles(manifest);
         byte[] manifestJson = manifest.toJson();
 
@@ -244,6 +251,32 @@ public class ReplicaSyncer implements Closeable {
         served.put(shard, gen);
         register(shard, gen, manifest.projectMeta(), genDir);
         prune(shard, shardRoot, gen);
+    }
+
+    /**
+     * The reader compatibility gate: false (and a WARN once per generation) when the manifest's
+     * index format is not servable by this build. The caller then keeps the current generation.
+     */
+    private boolean formatServable(ShardId shard, Generation gen, ShardManifest manifest) {
+        int format = manifest.indexFormatVersion();
+        IndexFormat.Status status = IndexFormat.statusOf(format);
+        if (IndexFormat.servable(status)) {
+            refused.remove(shard);
+            return true;
+        }
+        if (!gen.equals(refused.put(shard, gen))) {
+            String serving = Optional.ofNullable(served.get(shard))
+                    .map(g -> "generation " + g.value()).orElse("nothing yet");
+            String fix = status == IndexFormat.Status.NEWER
+                    ? "upgrade pharos on this reader to a version that reads index format " + format
+                    : "re-index and re-publish the shard on a writer running a current pharos"
+                      + " (pharos index --full " + shard.value() + ")";
+            log.warn("Shard {}: not materialising generation {}: its index format {} is {} for this reader"
+                    + " (pharos {} reads index formats {}-{}); still serving {}. Fix: {}",
+                    shard, gen.value(), format, status.wireName(), com.pharos.PharosVersion.get(),
+                    IndexFormat.MIN_READABLE_FORMAT, IndexVersions.INDEX_FORMAT, serving, fix);
+        }
+        return false;
     }
 
     /** Carries the writer's stamp into the generation dir; no stamp in the manifest means format 0. */
