@@ -42,7 +42,7 @@ public class ProjectsCommand implements Callable<Integer> {
             String lastIndexed = p.getLastIndexed() != null ? fmt.format(p.getLastIndexed()) : "never";
             System.out.printf("%-25s  %7d  %7d  %6d  %-16s  %s%n",
                     p.getName(), p.getMethodCount(), p.getClassCount(), p.getFileCount(), lastIndexed,
-                    formatLabel(IndexFormat.status(Path.of(p.getIndexPath()))));
+                    formatLabel(IndexFormat.status(IndexFormat.dir(p.getIndexPath()))));
             if (!p.getLinkedProjects().isEmpty()) {
                 System.out.printf("  → linked: %s%n", String.join(", ", p.getLinkedProjects()));
             }

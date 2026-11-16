@@ -45,7 +45,7 @@ public class IndexStatusCommand implements Callable<Integer> {
     public Integer call() throws Exception {
         List<Map<String, Object>> rows = new ArrayList<>();
         for (ProjectMeta p : registry.listAll()) {
-            Path dir = Path.of(p.getIndexPath());
+            Path dir = IndexFormat.dir(p.getIndexPath());
             IndexFormat.Stamp stamp = IndexFormat.read(dir);
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("name", p.getName());
@@ -90,7 +90,7 @@ public class IndexStatusCommand implements Callable<Integer> {
 
     /** Total size of regular files under {@code dir}; 0 if it does not exist. */
     static long sizeOf(Path dir) {
-        if (!Files.isDirectory(dir)) return 0;
+        if (dir == null || !Files.isDirectory(dir)) return 0;
         try (Stream<Path> s = Files.walk(dir)) {
             return s.filter(Files::isRegularFile).mapToLong(f -> {
                 try { return Files.size(f); } catch (IOException e) { return 0; }

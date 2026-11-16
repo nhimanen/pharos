@@ -191,6 +191,45 @@ class UpgradeIndexesCommandTest {
         assertThat(IndexFormat.status(dir("n"))).isEqualTo(IndexFormat.Status.OK);
     }
 
+    @Test
+    void failedGraphBuildCountsAsFailedAndLeavesTheProjectUnstamped() throws Exception {
+        indexProject("b", true);
+        ProjectIndexManager failing = new ProjectIndexManager(config, luceneIndexer, registry,
+                List.of(new NoOpEmbeddingProvider()), noopModuleGraph()) {
+            @Override
+            protected void populateGraph(com.pharos.graph.CallGraph graph,
+                    com.pharos.parser.model.ParsedProject project,
+                    com.pharos.parser.model.ParsedRelationships relationships) {
+                throw new OutOfMemoryError("simulated heap exhaustion");
+            }
+        };
+        int rc = run(new UpgradeIndexesCommand(failing, registry, config, p -> "n", false), "--yes");
+        assertThat(rc).isEqualTo(1);
+        assertThat(out.toString()).contains("0 upgraded").contains("1 failed");
+        assertThat(err.toString()).contains("FAILED 'b'").contains("Call graph build failed")
+                .contains("simulated heap exhaustion");
+        assertThat(Files.exists(dir("b").resolve("index-format.json"))).as("not stamped").isFalse();
+        assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+    }
+
+    @Test
+    void entryWithoutIndexPathIsReportedMissing() throws Exception {
+        registry.register(new ProjectMeta("nopath", tmp.toString(), null));
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).isEqualTo(1);
+        assertThat(out.toString()).contains("nopath").contains("missing index dir");
+    }
+
+    private ModuleGraphBuilder noopModuleGraph() {
+        return new ModuleGraphBuilder(registry) {
+            @Override
+            public synchronized List<String> incorporate(Path root, ProjectMeta meta,
+                    com.pharos.parser.MavenPomReader.PomInfo pomInfo) {
+                return List.of();
+            }
+        };
+    }
+
     private static void deleteRecursively(Path p) throws Exception {
         try (var w = Files.walk(p)) {
             for (Path x : (Iterable<Path>) w.sorted(java.util.Comparator.reverseOrder())::iterator) {

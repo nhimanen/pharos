@@ -1013,7 +1013,7 @@ public class WebServer {
         m.put("artifactId", p.getArtifactId());
         m.put("indexed", luceneIndexer.indexExists(p.getName()));
         m.put("embeddedModels", p.getEmbeddedModels());
-        Path indexDir = Path.of(p.getIndexPath());
+        Path indexDir = IndexFormat.dir(p.getIndexPath());
         IndexFormat.Stamp stamp = IndexFormat.read(indexDir);
         Map<String, Object> fmt = new LinkedHashMap<>();
         fmt.put("status", IndexFormat.status(indexDir).wireName());

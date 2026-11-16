@@ -140,8 +140,9 @@ public class CallGraph implements AutoCloseable {
     public static final String LEGACY_DIR = "callgraph.arcadedb";
     /** Names the live generation dir of a project's graph. */
     public static final String POINTER_FILE = "callgraph.current";
+    /** At most 18 digits, so the generation number always fits a long. */
     private static final java.util.regex.Pattern GENERATION =
-            java.util.regex.Pattern.compile("callgraph-(\\d+)\\.arcadedb");
+            java.util.regex.Pattern.compile("callgraph-(\\d{1,18})\\.arcadedb");
     /** A graph dir name (legacy or generation) followed by an optional sidecar suffix. */
     private static final java.util.regex.Pattern GRAPH_ENTRY =
             java.util.regex.Pattern.compile("(callgraph(?:-\\d+)?\\.arcadedb)(\\..*)?");
@@ -150,6 +151,41 @@ public class CallGraph implements AutoCloseable {
     public static Path projectGraphDir(Path projectIndexDir) {
         String target = readPointer(projectIndexDir);
         return projectIndexDir.resolve(target != null ? target : LEGACY_DIR);
+    }
+
+    /**
+     * The live graph dir for a writer (incremental patch). Unlike {@link #projectGraphDir}, a
+     * pointer that exists but is malformed, unreadable, or names a generation dir that is gone is
+     * an error: falling back to the legacy dir would create and patch an empty legacy graph.
+     *
+     * @throws java.io.IOException when the pointer is present but unusable
+     */
+    public static Path writerGraphDir(Path projectIndexDir) throws java.io.IOException {
+        String problem = pointerProblem(projectIndexDir);
+        if (problem != null) throw new java.io.IOException(problem);
+        return projectGraphDir(projectIndexDir);
+    }
+
+    /**
+     * Why the project's {@link #POINTER_FILE} cannot be used, or null when it is fine or absent
+     * (absent = legacy layout).
+     */
+    public static String pointerProblem(Path projectIndexDir) {
+        Path f = projectIndexDir.resolve(POINTER_FILE);
+        if (!Files.exists(f, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return null;
+        String name;
+        try {
+            name = Files.readString(f).trim();
+        } catch (java.io.IOException e) {
+            return "Call graph pointer " + f + " is unreadable: " + e.getMessage();
+        }
+        if (!GENERATION.matcher(name).matches()) {
+            return "Call graph pointer " + f + " is malformed: '" + name + "'";
+        }
+        if (!Files.isDirectory(projectIndexDir.resolve(name))) {
+            return "Call graph pointer " + f + " names " + name + ", which does not exist";
+        }
+        return null;
     }
 
     private static String readPointer(Path projectIndexDir) {
@@ -193,12 +229,29 @@ public class CallGraph implements AutoCloseable {
         if (!GENERATION.matcher(name).matches()) throw new IllegalArgumentException(name);
         Path tmp = Files.createTempFile(projectIndexDir, POINTER_FILE + ".", ".tmp");
         try {
-            Files.writeString(tmp, name + "\n");
+            // Durable before it becomes visible: after a crash the pointer names a complete
+            // generation, never an empty or truncated file.
+            try (var ch = java.nio.channels.FileChannel.open(tmp,
+                    java.nio.file.StandardOpenOption.WRITE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+                ch.write(java.nio.ByteBuffer.wrap((name + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                ch.force(true);
+            }
             Files.move(tmp, projectIndexDir.resolve(POINTER_FILE),
                     java.nio.file.StandardCopyOption.ATOMIC_MOVE,
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            fsyncDirectory(projectIndexDir);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Best effort: persists a rename in {@code dir}. Not every platform can open a directory. */
+    private static void fsyncDirectory(Path dir) {
+        try (var ch = java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ)) {
+            ch.force(true);
+        } catch (java.io.IOException | UnsupportedOperationException e) {
+            log.debug("Could not fsync {}: {}", dir, e.getMessage());
         }
     }
 

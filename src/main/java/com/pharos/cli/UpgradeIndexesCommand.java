@@ -86,7 +86,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         for (ProjectMeta p : registry.listAll()) {
             known.add(p.getName());
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
-            switch (IndexFormat.status(Path.of(p.getIndexPath()))) {
+            switch (IndexFormat.status(IndexFormat.dir(p.getIndexPath()))) {
                 case UPGRADE_AVAILABLE, OUTDATED, NEWER -> todo.add(p);
                 case MISSING -> missing.add(p);
                 case OK -> { }
@@ -109,8 +109,8 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             System.out.println("Upgrade plan (" + todo.size() + " project" + (todo.size() == 1 ? "" : "s") + "):");
             for (ProjectMeta p : todo) {
                 System.out.printf("  %-25s  %10s  %s  [%s]  embeddings: %s%n", p.getName(),
-                        IndexStatusCommand.humanBytes(IndexStatusCommand.sizeOf(Path.of(p.getIndexPath()))),
-                        p.getRootPath(), IndexFormat.status(Path.of(p.getIndexPath())).wireName(),
+                        IndexStatusCommand.humanBytes(IndexStatusCommand.sizeOf(IndexFormat.dir(p.getIndexPath()))),
+                        p.getRootPath(), IndexFormat.status(IndexFormat.dir(p.getIndexPath())).wireName(),
                         embed ? "yes" : "no");
             }
         }

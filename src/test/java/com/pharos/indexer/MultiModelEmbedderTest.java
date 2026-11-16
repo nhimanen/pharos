@@ -148,6 +148,7 @@ class MultiModelEmbedderTest {
                 List.of(), List.of(), innerCtor.filePath(), innerCtor.startLine(), innerCtor.endLine());
         try (var w = luceneIndexer.openWriter("test")) {
             w.addDocument(DocumentMapper.toDocument(stale, new float[]{1, 0, 0, 0}));
+            w.commit();
         }
         assertThat(docs("test:com.example.Outer#<init>()")).hasSize(2);
 

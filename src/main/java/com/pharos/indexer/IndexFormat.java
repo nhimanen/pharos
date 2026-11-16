@@ -57,13 +57,34 @@ public final class IndexFormat {
     static final String FILE_NAME = "index-format.json";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private record Cached(long mtime, Status status, Stamp stamp) {}
+    private record Cached(long mtime, boolean overwritten, Status status, Stamp stamp) {}
+
+    /**
+     * True when a pharos older than the pointer layout wrote to this index after this format's
+     * stamp: such a build only knows the legacy {@code callgraph.arcadedb}, which a stamped full
+     * run removes, so a legacy dir next to a stamp and a pointer means the stamp no longer
+     * describes the index (an old build re-indexed it, or a reader of it created an empty graph).
+     */
+    public static boolean overwrittenByOlderPharos(Path projectIndexDir) {
+        return Files.isRegularFile(projectIndexDir.resolve(FILE_NAME))
+                && Files.exists(projectIndexDir.resolve(com.pharos.graph.CallGraph.POINTER_FILE))
+                && Files.isDirectory(projectIndexDir.resolve(com.pharos.graph.CallGraph.LEGACY_DIR));
+    }
 
     private static final Map<Path, Cached> CACHE = new ConcurrentHashMap<>();
 
     private IndexFormat() {}
 
+    /**
+     * The index dir recorded in a registry entry, or null when it has none (a damaged or
+     * hand-edited registry). Every method here treats a null dir as {@link Status#MISSING}.
+     */
+    public static Path dir(String indexPath) {
+        return indexPath == null || indexPath.isBlank() ? null : Path.of(indexPath);
+    }
+
     public static Stamp read(Path projectIndexDir) {
+        if (projectIndexDir == null) return new Stamp(0, "unknown", null);
         Path f = projectIndexDir.resolve(FILE_NAME);
         if (!Files.isRegularFile(f)) return new Stamp(0, "unknown", null);
         try {
@@ -98,6 +119,17 @@ public final class IndexFormat {
         }
     }
 
+    /**
+     * Undoes the layout an older pharos left behind (see {@link #overwrittenByOlderPharos}):
+     * drops the stale stamp, then the stale pointer, so the index reads as the unstamped
+     * legacy layout it really is (the old build's Lucene index and its callgraph.arcadedb).
+     * The stamp goes first so the index is never reported current in between.
+     */
+    public static void forgetStaleLayout(Path projectIndexDir) throws IOException {
+        Files.deleteIfExists(projectIndexDir.resolve(FILE_NAME));
+        Files.deleteIfExists(projectIndexDir.resolve(com.pharos.graph.CallGraph.POINTER_FILE));
+    }
+
     public static Status status(Path projectIndexDir) {
         return cached(projectIndexDir).status();
     }
@@ -108,7 +140,12 @@ public final class IndexFormat {
         String me = PharosVersion.get();
         Stamp s = c.stamp();
         String msg;
-        if (c.status() == Status.OUTDATED) {
+        if (c.overwritten()) {
+            msg = "Project '" + project + "' was re-indexed by a pharos older than " + s.pharosVersion()
+                    + " after this pharos stamped it (index format " + s.format()
+                    + "), so its index cannot be trusted. Run: pharos index --full " + project
+                    + "   (or upgrade all: ./setup.sh --upgrade-indexes)";
+        } else if (c.status() == Status.OUTDATED) {
             msg = "Project '" + project + "' was indexed by pharos " + s.pharosVersion()
                     + " (index format " + s.format() + "); this pharos (" + me
                     + ") reads index formats " + MIN_READABLE_FORMAT + "–" + IndexVersions.INDEX_FORMAT
@@ -125,8 +162,8 @@ public final class IndexFormat {
     }
 
     private static Cached cached(Path dir) {
-        if (!Files.isDirectory(dir)) {
-            return new Cached(-1, Status.MISSING, new Stamp(0, "unknown", null));
+        if (dir == null || !Files.isDirectory(dir)) {
+            return new Cached(-1, false, Status.MISSING, new Stamp(0, "unknown", null));
         }
         long mtime = -1;
         try {
@@ -136,14 +173,16 @@ public final class IndexFormat {
             // fall through with -1
         }
         long key = mtime;
+        boolean overwritten = overwrittenByOlderPharos(dir);
         Path k = dir.toAbsolutePath().normalize();
         Cached c = CACHE.get(k);
-        if (c != null && c.mtime() == key) return c;
+        if (c != null && c.mtime() == key && c.overwritten() == overwritten) return c;
         Stamp s = read(dir);
-        Status st = s.format() == IndexVersions.INDEX_FORMAT ? Status.OK
+        Status st = overwritten ? Status.OUTDATED
+                : s.format() == IndexVersions.INDEX_FORMAT ? Status.OK
                 : s.format() > IndexVersions.INDEX_FORMAT ? Status.NEWER
                 : s.format() >= MIN_READABLE_FORMAT ? Status.UPGRADE_AVAILABLE : Status.OUTDATED;
-        Cached n = new Cached(key, st, s);
+        Cached n = new Cached(key, overwritten, st, s);
         CACHE.put(k, n);
         return n;
     }

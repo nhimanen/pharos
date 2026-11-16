@@ -77,6 +77,20 @@ class IndexStatusCommandTest {
     }
 
     @Test
+    void entryWithoutIndexPathIsMissingNotAnError() throws Exception {
+        registry.register(new ProjectMeta("nopath", tmp.toString(), null));
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute("--json")).isZero();
+        JsonNode j = new ObjectMapper().readTree(out.toString());
+        Map<String, JsonNode> byName = new TreeMap<>();
+        j.get("projects").forEach(p -> byName.put(p.get("name").asText(), p));
+        assertThat(byName.get("nopath").get("status").asText()).isEqualTo("missing");
+        assertThat(byName.get("nopath").get("indexBytes").asLong()).isZero();
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute()).isZero();
+        assertThat(new CommandLine(new ProjectsCommand(registry)).execute()).isZero();
+        assertThat(out.toString()).contains("nopath");
+    }
+
+    @Test
     void writesNothing() throws Exception {
         Map<String, Long> before = snapshot();
         new CommandLine(new IndexStatusCommand(registry)).execute("--json");
