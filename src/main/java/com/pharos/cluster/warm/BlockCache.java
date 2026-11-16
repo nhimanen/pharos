@@ -257,6 +257,45 @@ public final class BlockCache implements Closeable {
         return await(flight, key);
     }
 
+    /**
+     * Starts fetching block {@code key} in the background if it is neither cached nor being fetched,
+     * and returns without waiting. The returned future completes when the block is in the cache (or
+     * was served by the fetch), immediately for a cached block, and exceptionally when the fetch fails
+     * or the cache is closed; a failed prefetch caches nothing, so the next acquire retries. A
+     * prefetch shares the single-flight fetch with concurrent acquires, takes no lease and does not
+     * count as a hit or a miss.
+     *
+     * @throws IllegalArgumentException as for {@link #acquire}
+     */
+    public CompletableFuture<Void> prefetch(BlockKey key, long blockLength, BlockFetcher fetcher) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(fetcher, "fetcher");
+        if (blockLength <= 0 || blockLength > blockSize) {
+            throw new IllegalArgumentException("block length " + blockLength + " of block " + key.index() + " of '"
+                    + key.objectKey() + "' is outside (0, " + blockSize + "]");
+        }
+        String hash = sha256(key.objectKey());
+        String id = hash + "/" + key.index();
+        synchronized (lock) {
+            if (closed) {
+                return CompletableFuture.failedFuture(new IllegalStateException("block cache " + dir + " is closed"));
+            }
+            Entry e = entries.get(id);
+            if (e != null && e.verified && e.length != blockLength) throw lengthMismatch(key, blockLength, e.length);
+            // An unverified entry of another length is dropped and refetched by the next acquire.
+            if (e != null) return CompletableFuture.completedFuture(null);
+            Flight flight = inflight.get(id);
+            if (flight != null && flight.length != blockLength) throw lengthMismatch(key, blockLength, flight.length);
+            if (flight == null) {
+                flight = new Flight(blockLength);
+                inflight.put(id, flight);
+                Flight f = flight;
+                fetchers.execute(() -> runFetch(f, key, hash, id, blockLength, fetcher));
+            }
+            return flight.done.thenApply(entry -> null);
+        }
+    }
+
     private static IllegalArgumentException lengthMismatch(BlockKey key, long asked, long known) {
         return new IllegalArgumentException("block " + key.index() + " of '" + key.objectKey()
                 + "' requested with length " + asked + " but it is " + known + " bytes long");

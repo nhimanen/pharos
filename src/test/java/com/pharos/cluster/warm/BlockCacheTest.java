@@ -207,6 +207,51 @@ class BlockCacheTest {
     }
 
     @Test
+    void prefetchFetchesInTheBackgroundOnceAndAcquireJoinsIt() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        f.gate = new CountDownLatch(1);
+        BlockKey k = new BlockKey(OBJ, 2);
+        java.util.concurrent.CompletableFuture<Void> first = c.prefetch(k, BS, f); // does not wait for the gate
+        java.util.concurrent.CompletableFuture<Void> second = c.prefetch(k, BS, f); // joins the flight
+        assertThat(first).isNotDone();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<BlockCache.Lease> acquired = pool.submit(() -> c.acquire(k, BS, f));
+            f.gate.countDown();
+            first.get(10, TimeUnit.SECONDS);
+            second.get(10, TimeUnit.SECONDS);
+            try (BlockCache.Lease l = acquired.get(10, TimeUnit.SECONDS)) {
+                assertContent(l, k, BS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThat(c.prefetch(k, BS, f)).isCompleted(); // cached: nothing to do
+        assertThat(f.calls).hasValue(1);
+        assertThat(c.stats().leasesOpen()).isZero();
+        assertThat(c.stats().bytesOnDisk()).isEqualTo(BS);
+        assertThat(blockFile(k)).exists().hasSize(BS);
+    }
+
+    @Test
+    void failedPrefetchCachesNothingAndTheNextAcquireRetries() throws Exception {
+        BlockCache c = cache(8);
+        FakeFetcher f = new FakeFetcher();
+        f.failWith = new IOException("bucket gone");
+        BlockKey k = new BlockKey(OBJ, 1);
+        assertThatThrownBy(() -> c.prefetch(k, BS, f).get(10, TimeUnit.SECONDS))
+                .hasRootCauseMessage("bucket gone");
+        assertThat(c.stats().bytesOnDisk()).isZero();
+        f.failWith = null;
+        try (BlockCache.Lease l = c.acquire(k, BS, f)) {
+            assertContent(l, k, BS);
+        }
+        assertThat(f.calls).hasValue(2);
+        assertThatThrownBy(() -> c.prefetch(k, BS + 1, f)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void evictsLeastRecentlyUsedOverCap() throws Exception {
         BlockCache c = cache(4);
         FakeFetcher f = new FakeFetcher();

@@ -1,0 +1,648 @@
+package com.pharos.cluster.warm;
+
+import com.pharos.cluster.Generation;
+import com.pharos.cluster.ReplicaSource;
+import com.pharos.cluster.ShardId;
+import com.pharos.cluster.objectstore.GenerationGc;
+import com.pharos.cluster.objectstore.InMemoryObjectStore;
+import com.pharos.cluster.objectstore.ManifestFile;
+import com.pharos.cluster.objectstore.ObjectStoreCatalog;
+import com.pharos.cluster.objectstore.ObjectStoreLayout;
+import com.pharos.cluster.objectstore.ObjectStorePublisher;
+import com.pharos.cluster.objectstore.ObjectStoreReplicaSource;
+import com.pharos.cluster.objectstore.ShardManifest;
+import com.pharos.config.ClusterConfig;
+import com.pharos.config.IndexConfig;
+import com.pharos.config.ProjectMeta;
+import com.pharos.config.ProjectRegistry;
+import com.pharos.embedding.EmbeddingProvider;
+import com.pharos.graph.ModuleGraphBuilder;
+import com.pharos.indexer.DocumentMapper;
+import com.pharos.indexer.LuceneIndexer;
+import com.pharos.indexer.ProgressListener;
+import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.parser.JavaCodeParser;
+import com.pharos.parser.MavenPomReader;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StoredField;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.CheckIndex;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.search.PrefixQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.NIOFSDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.BytesRef;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class RemoteDirectoryTest {
+
+    private static final String PROJECT = "sample-app";
+    private static final ShardId SHARD = new ShardId(PROJECT);
+    private static final int KIB = 1024;
+
+    /** sample-app indexed with fake embeddings and published to an in-memory store, once per class. */
+    @TempDir static Path shared;
+    private static InMemoryObjectStore store;
+    private static ObjectStoreReplicaSource source;
+    private static ShardManifest manifest;
+    /** A full local copy of the published Lucene files: the FSDirectory reference. */
+    private static Path fullCopy;
+    /** Only the small files the reader downloads eagerly (segments_N, .si, .fnm). */
+    private static Path eagerCopy;
+
+    @TempDir Path tmp;
+    private final List<AutoCloseable> open = new ArrayList<>();
+
+    @BeforeAll
+    static void indexAndPublish() throws IOException {
+        Path src = shared.resolve("src");
+        Path from = Path.of("src/test/resources/test-projects/sample-app");
+        try (Stream<Path> s = Files.walk(from)) {
+            for (Path p : s.toList()) {
+                Path dest = src.resolve(from.relativize(p).toString());
+                if (Files.isDirectory(p)) Files.createDirectories(dest);
+                else Files.copy(p, dest);
+            }
+        }
+        store = new InMemoryObjectStore();
+        ObjectStoreLayout layout = new ObjectStoreLayout("pharos");
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        ClusterConfig cfg = new ClusterConfig();
+        GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
+                Duration.ofMinutes(cfg.getRetentionMinutes()));
+        Path synonyms = shared.resolve("synonyms.txt");
+        Files.writeString(synonyms, "auth, authentication\n");
+        ObjectStorePublisher publisher = new ObjectStorePublisher(store, layout, catalog, gc, "writer", synonyms);
+
+        IndexConfig config = IndexConfig.defaults();
+        config.setIndexDir(shared.resolve("writer-indexes"));
+        ProjectRegistry registry = ProjectRegistry.at(shared.resolve("writer-registry.json"));
+        ModuleGraphBuilder noopModules = new ModuleGraphBuilder(registry) {
+            @Override
+            public synchronized List<String> incorporate(Path root, ProjectMeta meta, MavenPomReader.PomInfo pom) {
+                return List.of();
+            }
+        };
+        LuceneIndexer lucene = new LuceneIndexer(config);
+        try {
+            new ProjectIndexManager(config, lucene, registry, List.of(new HashEmbeddings()), noopModules,
+                    List.of(new JavaCodeParser()), publisher)
+                    .index(src, PROJECT, false, false, true, false, ProgressListener.SILENT); // with embeddings
+        } finally {
+            lucene.close();
+        }
+
+        source = new ObjectStoreReplicaSource(store, layout);
+        manifest = source.manifest(SHARD, Generation.FIRST);
+        fullCopy = shared.resolve("full");
+        eagerCopy = shared.resolve("eager");
+        Files.createDirectories(eagerCopy);
+        for (ManifestFile f : luceneFiles(manifest)) {
+            source.download(f, fullCopy.resolve(f.name()));
+            if (f.name().startsWith("segments_") || f.name().endsWith(".si") || f.name().endsWith(".fnm")) {
+                Files.copy(fullCopy.resolve(f.name()), eagerCopy.resolve(f.name()));
+            }
+        }
+    }
+
+    @AfterEach
+    void closeAll() throws Exception {
+        for (int i = open.size() - 1; i >= 0; i--) open.get(i).close();
+    }
+
+    private <T extends AutoCloseable> T track(T c) {
+        open.add(c);
+        return c;
+    }
+
+    private static List<ManifestFile> luceneFiles(ShardManifest m) {
+        return m.files().stream().filter(f -> ManifestFile.LUCENE.equals(f.role())).toList();
+    }
+
+    private BlockCache cache(int blockSize) throws IOException {
+        return track(new BlockCache(tmp.resolve("blocks-" + blockSize), 1L << 30, blockSize, 4));
+    }
+
+    private RemoteDirectory remote(BlockCache cache, Path eager, ReplicaSource src, ShardManifest m) {
+        return track(new RemoteDirectory(SHARD, m, eager, cache, src));
+    }
+
+    // ---------------------------------------------------------------- the published fixture
+
+    @Test
+    void listAllAndFileLengthComeFromTheManifest() throws IOException {
+        RemoteDirectory dir = remote(cache(64 * KIB), null, source, manifest);
+        List<String> names = luceneFiles(manifest).stream().map(ManifestFile::name).sorted().toList();
+        assertThat(names).isNotEmpty();
+        assertThat(dir.listAll()).containsExactlyElementsOf(names);
+        for (ManifestFile f : luceneFiles(manifest)) {
+            assertThat(dir.fileLength(f.name())).isEqualTo(f.length());
+        }
+        assertThatThrownBy(() -> dir.fileLength("_99.cfs")).isInstanceOf(NoSuchFileException.class);
+        assertThatThrownBy(() -> dir.openInput("_99.cfs", IOContext.DEFAULT)).isInstanceOf(NoSuchFileException.class);
+    }
+
+    @Test
+    void checkIndexPassesOverRemoteDirectory() throws Exception {
+        long total = luceneFiles(manifest).stream().mapToLong(ManifestFile::length).sum();
+        for (int blockSize : new int[]{64 * KIB, KIB}) { // 1 KiB: every file of the small fixture spans blocks
+            BlockCache cache = cache(blockSize);
+            RemoteDirectory dir = remote(cache, null, source, manifest); // no eager files: every byte via blocks
+            long start = System.nanoTime();
+            CheckIndex.Status status;
+            try (CheckIndex check = new CheckIndex(dir)) {
+                check.setInfoStream(null);
+                check.setLevel(CheckIndex.Level.MIN_LEVEL_FOR_SLOW_CHECKS);
+                status = check.checkIndex();
+            }
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            System.out.printf("CheckIndex over RemoteDirectory, %d B blocks, %d B of files: %d ms, %s%n",
+                    blockSize, total, millis, cache.stats());
+            assertThat(status.clean).as("CheckIndex clean with %d B blocks", blockSize).isTrue();
+            assertThat(status.numSegments).isPositive();
+            // CheckIndex verifies every file's checksum, so every block was fetched exactly once.
+            assertThat(cache.stats().bytesFetched()).isEqualTo(total);
+            assertThat(cache.stats().leasesOpen()).isZero();
+        }
+    }
+
+    @Test
+    void queriesMatchFsDirectory() throws Exception {
+        // NIOFSDirectory reads through the same generic paths as the remote input: everything is
+        // identical. MMapDirectory scores vectors with MemorySegment code that sums in another order,
+        // so KNN scores may differ from it in the last bit (see CachingRemoteIndexInput).
+        try (FSDirectory nio = new NIOFSDirectory(fullCopy); DirectoryReader viaNio = DirectoryReader.open(nio);
+             FSDirectory mmap = new MMapDirectory(fullCopy); DirectoryReader viaMmap = DirectoryReader.open(mmap)) {
+            for (int blockSize : new int[]{64 * KIB, KIB}) {
+                RemoteDirectory dir = remote(cache(blockSize), eagerCopy, source, manifest);
+                try (DirectoryReader actual = DirectoryReader.open(dir)) {
+                    assertSameResults(viaNio, actual, true);
+                    assertSameResults(viaMmap, actual, false);
+                }
+            }
+        }
+    }
+
+    private static void assertSameResults(DirectoryReader expected, DirectoryReader actual, boolean exactKnnScores)
+            throws IOException {
+        assertThat(actual.maxDoc()).isEqualTo(expected.maxDoc()).isPositive();
+        IndexSearcher e = new IndexSearcher(expected);
+        IndexSearcher a = new IndexSearcher(actual);
+
+        List<Query> queries = new ArrayList<>();
+        List<String> methodTerms = terms(expected, DocumentMapper.F_METHOD_NAME, 1, 20);
+        List<String> bodyTerms = terms(expected, DocumentMapper.F_BODY, 2, 40);
+        assertThat(methodTerms).isNotEmpty();
+        assertThat(bodyTerms).hasSizeGreaterThan(4);
+        for (String t : methodTerms) queries.add(new TermQuery(new Term(DocumentMapper.F_METHOD_NAME, t)));
+        for (int i = 0; i + 1 < bodyTerms.size(); i += 2) {
+            queries.add(new TermQuery(new Term(DocumentMapper.F_BODY, bodyTerms.get(i))));
+            queries.add(new PhraseQuery(20, DocumentMapper.F_BODY, bodyTerms.get(i), bodyTerms.get(i + 1)));
+            queries.add(new PhraseQuery(DocumentMapper.F_BODY, bodyTerms.get(i), bodyTerms.get(i + 1)));
+            String prefix = bodyTerms.get(i).substring(0, Math.min(2, bodyTerms.get(i).length()));
+            queries.add(new PrefixQuery(new Term(DocumentMapper.F_BODY, prefix)));
+        }
+        String vectorField = null;
+        for (FieldInfo fi : expected.leaves().get(0).reader().getFieldInfos()) {
+            if (fi.getVectorDimension() > 0) {
+                vectorField = fi.name;
+                break;
+            }
+        }
+        assertThat(vectorField).as("the fixture has a vector field").isNotNull();
+        for (String text : List.of("add two numbers", "greeting service", "user model")) {
+            queries.add(new KnnFloatVectorQuery(vectorField, HashEmbeddings.vector(text), 5));
+        }
+
+        int withHits = 0;
+        for (Query q : queries) {
+            TopDocs te = e.search(q, 50);
+            TopDocs ta = a.search(q, 50);
+            assertThat(ta.totalHits).as("%s", q).isEqualTo(te.totalHits);
+            assertThat(ta.scoreDocs).as("%s", q).hasSameSizeAs(te.scoreDocs);
+            for (int i = 0; i < te.scoreDocs.length; i++) {
+                assertThat(ta.scoreDocs[i].doc).as("%s #%d", q, i).isEqualTo(te.scoreDocs[i].doc);
+                float want = te.scoreDocs[i].score;
+                if (exactKnnScores || !(q instanceof KnnFloatVectorQuery)) {
+                    assertThat(ta.scoreDocs[i].score).as("%s #%d", q, i).isEqualTo(want);
+                } else {
+                    assertThat(ta.scoreDocs[i].score).as("%s #%d", q, i)
+                            .isCloseTo(want, org.assertj.core.data.Offset.offset(2 * Math.ulp(want)));
+                }
+            }
+            if (te.scoreDocs.length > 0) withHits++;
+        }
+        assertThat(withHits).isGreaterThan(queries.size() / 2);
+
+        // Stored fields of every document.
+        StoredFields se = expected.storedFields();
+        StoredFields sa = actual.storedFields();
+        for (int d = 0; d < expected.maxDoc(); d++) {
+            assertThat(sa.document(d).toString()).isEqualTo(se.document(d).toString());
+        }
+        // Numeric doc values.
+        int valued = 0;
+        for (int l = 0; l < expected.leaves().size(); l++) {
+            LeafReaderContext le = expected.leaves().get(l);
+            LeafReaderContext la = actual.leaves().get(l);
+            NumericDocValues ve = le.reader().getNumericDocValues(DocumentMapper.F_IN_DEGREE);
+            NumericDocValues va = la.reader().getNumericDocValues(DocumentMapper.F_IN_DEGREE);
+            if (ve == null) {
+                assertThat(va).isNull();
+                continue;
+            }
+            for (int d = ve.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = ve.nextDoc()) {
+                assertThat(va.advance(d)).isEqualTo(d);
+                assertThat(va.longValue()).isEqualTo(ve.longValue());
+                valued++;
+            }
+            assertThat(va.nextDoc()).isEqualTo(DocIdSetIterator.NO_MORE_DOCS);
+        }
+        assertThat(valued).isPositive();
+    }
+
+    /** Up to {@code max} terms of {@code field} with at least {@code minDocFreq} docs, in term order. */
+    private static List<String> terms(DirectoryReader r, String field, int minDocFreq, int max) throws IOException {
+        List<String> out = new ArrayList<>();
+        for (LeafReaderContext ctx : r.leaves()) {
+            Terms terms = ctx.reader().terms(field);
+            if (terms == null) continue;
+            TermsEnum te = terms.iterator();
+            for (BytesRef t = te.next(); t != null && out.size() < max; t = te.next()) {
+                String s = t.utf8ToString();
+                if (te.docFreq() >= minDocFreq && s.length() >= 3 && !out.contains(s)) out.add(s);
+            }
+        }
+        return out;
+    }
+
+    @Test
+    void diskFullStreamsBlocksIntoMemoryWithoutDownloadRange() throws Exception {
+        // No usable space: every block takes the uncached path, which must stream via openRange
+        // rather than spilling a downloadRange temp file into java.io.tmpdir.
+        BlockCache cache = track(new BlockCache(tmp.resolve("full-disk"), 1L << 30, KIB, 4,
+                System::currentTimeMillis, () -> 0L));
+        ReplicaSource noDownloads = new DelegatingSource(source) {
+            @Override
+            public void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException {
+                throw new IOException("downloadRange must not be used on a full disk");
+            }
+        };
+        RemoteDirectory dir = remote(cache, null, noDownloads, manifest);
+        try (CheckIndex check = new CheckIndex(dir)) {
+            check.setInfoStream(null);
+            assertThat(check.checkIndex().clean).isTrue();
+        }
+        assertThat(cache.stats().writeFailures()).isPositive();
+        assertThat(cache.stats().bytesOnDisk()).isZero();
+    }
+
+    // ---------------------------------------------------------------- a synthetic object
+
+    /** One "Lucene" file of random bytes, published by hand. */
+    private record Blob(byte[] data, ShardManifest manifest) {}
+
+    private static Blob blob(String name, int size) throws IOException {
+        byte[] data = new byte[size];
+        new Random(size).nextBytes(data);
+        String key = "pharos/shards/" + PROJECT + "/objects/" + name + "-test";
+        store.put(key, data);
+        ShardManifest m = manifestOf(7, List.of(new ManifestFile(ManifestFile.LUCENE, name, key, size, "0")));
+        return new Blob(data, m);
+    }
+
+    private static ShardManifest manifestOf(long gen, List<ManifestFile> files) {
+        return new ShardManifest(ShardManifest.FORMAT_VERSION, PROJECT, gen, null, Instant.now(), "writer", 0,
+                files.stream().mapToLong(ManifestFile::length).sum(), null, files, null, null);
+    }
+
+    private static ByteBuffer le(byte[] data) {
+        return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    @Test
+    void readsAcrossBlockBoundary() throws Exception {
+        Blob b = blob("_x.bin", 10_000);
+        RemoteDirectory dir = remote(cache(KIB), null, source, b.manifest());
+        try (IndexInput in = dir.openInput("_x.bin", IOContext.DEFAULT)) {
+            assertThat(in).isInstanceOf(CachingRemoteIndexInput.class);
+            assertThat(in.length()).isEqualTo(10_000);
+            ByteBuffer d = le(b.data());
+
+            in.seek(KIB - 3);
+            assertThat(in.readLong()).isEqualTo(d.getLong(KIB - 3));
+            assertThat(in.getFilePointer()).isEqualTo(KIB + 5);
+            in.seek(2 * KIB - 2);
+            assertThat(in.readInt()).isEqualTo(d.getInt(2 * KIB - 2));
+            in.seek(3 * KIB - 1);
+            assertThat(in.readShort()).isEqualTo(d.getShort(3 * KIB - 1));
+
+            RandomAccessInput ra = (RandomAccessInput) in;
+            for (long p : new long[]{0, KIB - 7, KIB - 1, KIB, 5 * KIB - 4, 10_000 - 8}) {
+                assertThat(ra.readLong(p)).as("long at %d", p).isEqualTo(d.getLong((int) p));
+                assertThat(ra.readInt(p)).as("int at %d", p).isEqualTo(d.getInt((int) p));
+                assertThat(ra.readShort(p)).as("short at %d", p).isEqualTo(d.getShort((int) p));
+                assertThat(ra.readByte(p)).as("byte at %d", p).isEqualTo(b.data()[(int) p]);
+            }
+
+            // Long and short bulk reads spanning several blocks, from the sequential and positional APIs.
+            byte[] big = new byte[9_000];
+            in.seek(500);
+            in.readBytes(big, 0, big.length);
+            assertThat(big).isEqualTo(java.util.Arrays.copyOfRange(b.data(), 500, 9_500));
+            byte[] small = new byte[100];
+            ra.readBytes(KIB - 50, small, 0, small.length);
+            assertThat(small).isEqualTo(java.util.Arrays.copyOfRange(b.data(), KIB - 50, KIB + 50));
+
+            // Byte-by-byte over the whole object.
+            in.seek(0);
+            ByteArrayOutputStream all = new ByteArrayOutputStream();
+            for (int i = 0; i < 10_000; i++) all.write(in.readByte());
+            assertThat(all.toByteArray()).isEqualTo(b.data());
+
+            // Past the end.
+            assertThatThrownBy(in::readByte).isInstanceOf(EOFException.class);
+            in.seek(10_000 - 3);
+            assertThatThrownBy(in::readInt).isInstanceOf(EOFException.class);
+            assertThatThrownBy(() -> in.readBytes(new byte[10], 0, 10)).isInstanceOf(EOFException.class);
+            assertThatThrownBy(() -> ra.readLong(10_000 - 7)).isInstanceOf(EOFException.class);
+            assertThatThrownBy(() -> ra.readByte(10_000)).isInstanceOf(EOFException.class);
+            assertThatThrownBy(() -> in.seek(10_001)).isInstanceOf(EOFException.class);
+        }
+    }
+
+    @Test
+    void sliceAndCloneAreIndependent() throws Exception {
+        Blob b = blob("_y.bin", 5_000);
+        BlockCache cache = cache(KIB);
+        RemoteDirectory dir = remote(cache, null, source, b.manifest());
+        ByteBuffer d = le(b.data());
+        IndexInput in = dir.openInput("_y.bin", IOContext.DEFAULT);
+        in.seek(100);
+
+        IndexInput clone = in.clone();
+        assertThat(clone.getFilePointer()).isEqualTo(100);
+        clone.seek(4_000);
+        assertThat(clone.readByte()).isEqualTo(b.data()[4_000]);
+        assertThat(in.getFilePointer()).isEqualTo(100); // the clone's seek and read did not move the parent
+        assertThat(in.readByte()).isEqualTo(b.data()[100]);
+
+        IndexInput slice = in.slice("s", 1_000, 3_000);
+        assertThat(slice.length()).isEqualTo(3_000);
+        assertThat(slice.getFilePointer()).isZero();
+        assertThat(slice.readInt()).isEqualTo(d.getInt(1_000));
+        slice.seek(2_999);
+        assertThat(slice.readByte()).isEqualTo(b.data()[3_999]);
+        assertThatThrownBy(slice::readByte).isInstanceOf(EOFException.class); // its own end, not the file's
+        assertThatThrownBy(() -> ((RandomAccessInput) slice).readByte(3_000)).isInstanceOf(EOFException.class);
+        assertThatThrownBy(() -> slice.seek(3_001)).isInstanceOf(EOFException.class);
+        assertThat(((RandomAccessInput) slice).readLong(KIB)).isEqualTo(d.getLong(1_000 + KIB));
+
+        IndexInput nested = slice.slice("n", 500, 1_000); // file range [1500, 2500)
+        assertThat(nested.readLong()).isEqualTo(d.getLong(1_500));
+        IndexInput nestedClone = nested.clone();
+        nestedClone.seek(992);
+        assertThat(nestedClone.readLong()).isEqualTo(d.getLong(2_492));
+        assertThatThrownBy(nestedClone::readByte).isInstanceOf(EOFException.class);
+        assertThat(nested.getFilePointer()).isEqualTo(8);
+
+        RandomAccessInput ras = in.randomAccessSlice(2_000, 100);
+        assertThat(ras.readInt(0)).isEqualTo(d.getInt(2_000));
+        assertThatThrownBy(() -> ras.readInt(97)).isInstanceOf(EOFException.class);
+
+        assertThatThrownBy(() -> in.slice("bad", 4_000, 1_001)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> slice.slice("bad", -1, 10)).isInstanceOf(IllegalArgumentException.class);
+
+        // Closing clones and slices (which Lucene never does) leaves the parent usable, and vice versa.
+        clone.close();
+        slice.close();
+        assertThat(in.readByte()).isEqualTo(b.data()[101]);
+        in.close();
+        assertThat(nested.readByte()).isEqualTo(b.data()[1_508]);
+        assertThat(cache.stats().leasesOpen()).isZero();
+    }
+
+    @Test
+    void prefetchFetchesBlocksAheadWithoutWaiting() throws Exception {
+        Blob b = blob("_p.bin", 10 * KIB + 10);
+        BlockCache cache = cache(KIB);
+        RemoteDirectory dir = remote(cache, null, source, b.manifest());
+        try (IndexInput in = dir.openInput("_p.bin", IOContext.DEFAULT)) {
+            IndexInput slice = in.slice("tail", 2 * KIB, 8 * KIB + 10);
+            slice.prefetch(0, slice.length()); // blocks 2..10
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (cache.stats().bytesOnDisk() < 8 * KIB + 10 && System.nanoTime() < deadline) Thread.sleep(5);
+            assertThat(cache.stats().bytesOnDisk()).isEqualTo(8 * KIB + 10);
+            assertThat(cache.stats().misses()).isZero();
+            byte[] all = new byte[(int) slice.length()];
+            slice.readBytes(all, 0, all.length);
+            assertThat(all).isEqualTo(java.util.Arrays.copyOfRange(b.data(), 2 * KIB, b.data().length));
+            assertThat(cache.stats().misses()).isZero(); // every block was already there
+            assertThat(cache.stats().bytesFetched()).isEqualTo(8 * KIB + 10);
+            assertThatThrownBy(() -> slice.prefetch(1, slice.length())).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    // ---------------------------------------------------------------- review focus 1
+
+    @Test
+    void missingObjectFailsWithShardGenKeyInMessage() throws Exception {
+        // Two segments, not compound: segment 0's stored fields span many blocks; segment 1 is separate.
+        Path local = tmp.resolve("synthetic");
+        Random rnd = new Random(3);
+        IndexWriterConfig iwc = new IndexWriterConfig(new StandardAnalyzer())
+                .setUseCompoundFile(false).setMergePolicy(NoMergePolicy.INSTANCE);
+        try (FSDirectory fs = FSDirectory.open(local); IndexWriter w = new IndexWriter(fs, iwc)) {
+            for (int i = 0; i < 200; i++) {
+                Document doc = new Document();
+                doc.add(new StringField("tag", "alpha", Field.Store.NO));
+                byte[] payload = new byte[2_000];
+                rnd.nextBytes(payload);
+                doc.add(new StoredField("payload", HexFormat.of().formatHex(payload)));
+                w.addDocument(doc);
+            }
+            w.commit();
+            for (int i = 0; i < 5; i++) {
+                Document doc = new Document();
+                doc.add(new StringField("tag", "beta", Field.Store.YES));
+                doc.add(new StoredField("payload", "small-" + i));
+                w.addDocument(doc);
+            }
+            w.commit();
+        }
+        List<ManifestFile> files = new ArrayList<>();
+        String fdtKey = null;
+        String fdtName = null;
+        try (Stream<Path> s = Files.list(local)) {
+            for (Path p : s.sorted().toList()) {
+                String name = p.getFileName().toString();
+                if (name.equals("write.lock")) continue;
+                String key = "pharos/shards/" + PROJECT + "/objects/synthetic-" + name;
+                store.put(key, p);
+                files.add(new ManifestFile(ManifestFile.LUCENE, name, key, Files.size(p), "0"));
+                if (name.startsWith("_0") && name.endsWith(".fdt")) {
+                    fdtKey = key;
+                    fdtName = name;
+                }
+            }
+        }
+        assertThat(fdtKey).as("segment 0 has its own .fdt").isNotNull();
+        byte[] fdtBytes = Files.readAllBytes(local.resolve(fdtName));
+        assertThat(fdtBytes.length).isGreaterThan(20 * 4 * KIB);
+
+        RemoteDirectory dir = remote(cache(4 * KIB), null, source, manifestOf(42, files));
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+            IndexSearcher searcher = new IndexSearcher(reader);
+            store.delete(fdtKey);
+
+            // A middle document of segment 0 needs blocks of the deleted .fdt that were never read.
+            String key = fdtKey;
+            String name = fdtName;
+            assertThatThrownBy(() -> reader.storedFields().document(100))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("shard " + PROJECT)
+                    .hasMessageContaining("generation 42")
+                    .hasMessageContaining(name)
+                    .hasMessageContaining(key)
+                    .hasRootCauseInstanceOf(NoSuchFileException.class);
+
+            // Queries that touch other files still work on the same reader.
+            TopDocs beta = searcher.search(new TermQuery(new Term("tag", "beta")), 10);
+            assertThat(beta.totalHits.value()).isEqualTo(5);
+            for (var sd : beta.scoreDocs) {
+                assertThat(reader.storedFields().document(sd.doc).get("tag")).isEqualTo("beta");
+            }
+            assertThat(searcher.count(new TermQuery(new Term("tag", "alpha")))).isEqualTo(200);
+
+            // Once the object is back, the same read retries and succeeds.
+            store.put(key, fdtBytes);
+            assertThat(reader.storedFields().document(100).get("payload")).hasSize(4_000);
+        }
+    }
+
+    // ---------------------------------------------------------------- read-only
+
+    @Test
+    void writeMethodsAreUnsupported() throws IOException {
+        Blob b = blob("_w.bin", 100);
+        RemoteDirectory dir = remote(cache(KIB), null, source, b.manifest());
+        List<org.junit.jupiter.api.function.Executable> writes = List.of(
+                () -> dir.deleteFile("_w.bin"),
+                () -> dir.createOutput("_n.bin", IOContext.DEFAULT),
+                () -> dir.createTempOutput("p", "s", IOContext.DEFAULT),
+                () -> dir.sync(List.of("_w.bin")),
+                dir::syncMetaData,
+                () -> dir.rename("_w.bin", "_v.bin"));
+        for (var w : writes) {
+            assertThatThrownBy(w::execute)
+                    .isInstanceOf(UnsupportedOperationException.class)
+                    .hasMessage("read-only remote directory");
+        }
+        assertThat(dir.listAll()).containsExactly("_w.bin");
+        assertThat(dir.obtainLock("write.lock")).isNotNull(); // NoLockFactory
+    }
+
+    @Test
+    void eagerFileIsReadLocallyAndOthersRemotely() throws IOException {
+        RemoteDirectory dir = remote(cache(64 * KIB), eagerCopy, source, manifest);
+        for (ManifestFile f : luceneFiles(manifest)) {
+            try (IndexInput in = dir.openInput(f.name(), IOContext.DEFAULT)) {
+                boolean eager = Files.exists(eagerCopy.resolve(f.name()));
+                assertThat(in instanceof CachingRemoteIndexInput).as(f.name()).isEqualTo(!eager);
+                assertThat(in.length()).isEqualTo(f.length());
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- doubles
+
+    /** Deterministic fake embeddings: a unit vector seeded by the text. */
+    static final class HashEmbeddings implements EmbeddingProvider {
+        static final int DIMS = 16;
+
+        static float[] vector(String text) {
+            Random r = new Random(text.hashCode());
+            float[] v = new float[DIMS];
+            double norm = 0;
+            for (int i = 0; i < DIMS; i++) {
+                v[i] = (float) r.nextGaussian();
+                norm += v[i] * v[i];
+            }
+            for (int i = 0; i < DIMS; i++) v[i] /= (float) Math.sqrt(norm);
+            return v;
+        }
+
+        @Override public String modelId() { return "test-hash"; }
+        @Override public float[] embed(String text) { return text == null || text.isBlank() ? null : vector(text); }
+        @Override public int dimensions() { return DIMS; }
+        @Override public boolean isAvailable() { return true; }
+    }
+
+    private static class DelegatingSource implements ReplicaSource {
+        private final ReplicaSource d;
+
+        DelegatingSource(ReplicaSource d) { this.d = d; }
+
+        @Override public Optional<Generation> latest(ShardId shard) throws IOException { return d.latest(shard); }
+        @Override public ShardManifest manifest(ShardId shard, Generation gen) throws IOException {
+            return d.manifest(shard, gen);
+        }
+        @Override public void download(ManifestFile file, Path target) throws IOException { d.download(file, target); }
+        @Override public void downloadRange(ManifestFile file, long offset, long length, Path target)
+                throws IOException {
+            d.downloadRange(file, offset, length, target);
+        }
+        @Override public InputStream openRange(ManifestFile file, long offset, long length) throws IOException {
+            return d.openRange(file, offset, length);
+        }
+        @Override public Optional<byte[]> synonyms() throws IOException { return d.synonyms(); }
+    }
+}
