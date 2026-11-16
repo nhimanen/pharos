@@ -20,6 +20,16 @@ public interface ObjectStore extends Closeable {
      */
     void download(String key, Path target) throws IOException;
 
+    /**
+     * Streams exactly {@code length} bytes starting at {@code offset} to {@code target} (temp file in
+     * the same directory, then an atomic move; a failure leaves no target behind).
+     *
+     * @throws java.nio.file.NoSuchFileException when the key does not exist
+     * @throws java.io.EOFException when {@code offset + length} exceeds the object size
+     * @throws IOException on a short body
+     */
+    void downloadRange(String key, long offset, long length, Path target) throws IOException;
+
     /** Uploads a file; returns the new ETag. */
     String put(String key, Path source) throws IOException;
 

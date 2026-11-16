@@ -349,6 +349,7 @@ class ReplicaSyncerTest {
             @Override public java.util.Optional<Generation> latest(ShardId shard) throws IOException { return real.latest(shard); }
             @Override public ShardManifest manifest(ShardId shard, Generation gen) throws IOException { return real.manifest(shard, gen); }
             @Override public void download(ManifestFile file, Path target) throws IOException { real.download(file, target); }
+            @Override public void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException { real.downloadRange(file, offset, length, target); }
             @Override public java.util.Optional<byte[]> synonyms() throws IOException { throw new IOException("synonyms unreadable"); }
         };
         try (ReplicaSyncer s = new ReplicaSyncer(catalog, failingSynonyms, cache, readerRegistry, cacheDir,

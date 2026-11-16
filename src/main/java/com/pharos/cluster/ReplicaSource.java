@@ -19,6 +19,9 @@ public interface ReplicaSource {
     /** Downloads one file of a manifest (by its {@code key}) to {@code target}. */
     void download(ManifestFile file, Path target) throws IOException;
 
+    /** Downloads {@code length} bytes at {@code offset} of one manifest file to {@code target}. */
+    void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException;
+
     /** The cluster-wide synonyms file; empty when none was shipped. */
     Optional<byte[]> synonyms() throws IOException;
 }

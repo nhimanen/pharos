@@ -72,6 +72,7 @@ class ObjectStorePublisherTest {
             return hideOnce.remove(key) ? Optional.empty() : delegate.get(key);
         }
         @Override public void download(String key, Path target) throws IOException { delegate.download(key, target); }
+        @Override public void downloadRange(String key, long offset, long length, Path target) throws IOException { delegate.downloadRange(key, offset, length, target); }
         @Override public String put(String key, Path src) throws IOException {
             beforePut.accept(key);
             putKeys.add(key);

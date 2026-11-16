@@ -21,6 +21,7 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -140,6 +141,58 @@ public class S3ObjectStore implements ObjectStore {
             throw wrap("download", key, e);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Override
+    public void downloadRange(String key, long offset, long length, Path target) throws IOException {
+        if (offset < 0 || length < 0) throw new IllegalArgumentException("negative offset or length");
+        Path abs = target.toAbsolutePath();
+        Path dir = abs.getParent();
+        Files.createDirectories(dir);
+        Path tmp = Files.createTempFile(dir, abs.getFileName().toString(), ".part");
+        try {
+            if (length > 0) {
+                GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
+                        .range("bytes=" + offset + "-" + (offset + length - 1)).build();
+                try (ResponseInputStream<GetObjectResponse> in = s3.getObject(req)) {
+                    long copied = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+                    if (copied != length) {
+                        Long total = totalSize(in.response().contentRange());
+                        if (total != null && offset + length > total) {
+                            throw new EOFException("range " + offset + "+" + length + " exceeds size " + total
+                                    + " of " + key);
+                        }
+                        throw new IOException("short range body for '" + key + "': expected " + length
+                                + " bytes, got " + copied);
+                    }
+                }
+            }
+            Files.move(tmp, abs, StandardCopyOption.REPLACE_EXISTING);
+        } catch (NoSuchKeyException e) {
+            throw missing(key);
+        } catch (S3Exception e) {
+            if (isMissingKey(e)) throw missing(key);
+            if (e.statusCode() == 416) {
+                throw new EOFException("range " + offset + "+" + length + " is past the end of " + key);
+            }
+            throw wrap("download range", key, e);
+        } catch (SdkException e) {
+            throw wrap("download range", key, e);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Total object size from a {@code Content-Range: bytes a-b/total} value; null when unknown. */
+    private static Long totalSize(String contentRange) {
+        if (contentRange == null) return null;
+        int slash = contentRange.lastIndexOf('/');
+        if (slash < 0) return null;
+        try {
+            return Long.parseLong(contentRange.substring(slash + 1).trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

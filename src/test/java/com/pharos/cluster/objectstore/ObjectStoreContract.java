@@ -3,6 +3,7 @@ package com.pharos.cluster.objectstore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -115,5 +116,50 @@ public abstract class ObjectStoreContract {
         store().download("big/blob", dst);
         assertThat(Files.readAllBytes(dst)).isEqualTo(data);
         assertThat(store().list("big/")).singleElement().satisfies(i -> assertThat(i.size()).isEqualTo(data.length));
+    }
+
+    private byte[] putRangeObject(String key) throws IOException {
+        byte[] data = new byte[10_000];
+        new Random(7).nextBytes(data);
+        store().put(key, data);
+        return data;
+    }
+
+    @Test
+    void rangeReturnsExactBytes() throws IOException {
+        byte[] data = putRangeObject("range/blob");
+        long[][] ranges = {{0, 1}, {4095, 2}, {9990, 10}};
+        for (long[] r : ranges) {
+            Path t = tmp.resolve("r-" + r[0] + ".bin");
+            store().downloadRange("range/blob", r[0], r[1], t);
+            assertThat(Files.readAllBytes(t))
+                    .isEqualTo(java.util.Arrays.copyOfRange(data, (int) r[0], (int) (r[0] + r[1])));
+        }
+    }
+
+    @Test
+    void rangePastEndIsEof() throws IOException {
+        putRangeObject("range/short");
+        Path t = tmp.resolve("eof.bin");
+        assertThatThrownBy(() -> store().downloadRange("range/short", 9990, 11, t))
+                .isInstanceOf(EOFException.class);
+        assertThat(t).doesNotExist();
+    }
+
+    @Test
+    void rangeOfMissingKeyIsNoSuchFile() {
+        Path t = tmp.resolve("missing.bin");
+        assertThatThrownBy(() -> store().downloadRange("range/nope", 0, 10, t))
+                .isInstanceOf(NoSuchFileException.class);
+        assertThat(t).doesNotExist();
+    }
+
+    @Test
+    void zeroLengthRangeWritesEmptyFile() throws IOException {
+        putRangeObject("range/zero");
+        Path t = tmp.resolve("zero.bin");
+        store().downloadRange("range/zero", 5, 0, t);
+        assertThat(t).exists();
+        assertThat(Files.size(t)).isZero();
     }
 }

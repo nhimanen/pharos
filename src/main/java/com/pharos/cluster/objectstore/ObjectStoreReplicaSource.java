@@ -82,6 +82,11 @@ public final class ObjectStoreReplicaSource implements ReplicaSource {
     }
 
     @Override
+    public void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException {
+        store.downloadRange(file.key(), offset, length, target);
+    }
+
+    @Override
     public Optional<byte[]> synonyms() throws IOException {
         return store.get(layout.synonymsKey()).map(StoredObject::data);
     }
