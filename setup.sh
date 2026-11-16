@@ -441,7 +441,8 @@ if [ "$UPGRADE_INDEXES" = true ]; then
 fi
 
 echo ""
-echo "Done. pharos $(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" --version 2>/dev/null || echo '(version unknown)') installed."
+# `--version` already prints "pharos <version>", so do not prefix another "pharos".
+echo "Done. $(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" --version 2>/dev/null || echo 'pharos (version unknown)') installed."
 echo "  JAR:    $PHAROS_BIN/pharos.jar"
 echo "  Client: $PHAROS_BIN/pharos-cli.py"
 echo "  Path:   $LOCAL_BIN/pharos"

@@ -100,7 +100,9 @@ t_release_install_verifies_and_installs() {
   run_setup "$h" --release latest
   local got; got="$(sha256sum "$h/.pharos/bin/pharos.jar" 2>/dev/null | cut -d' ' -f1)"
   [ "$(rc "$h")" = 0 ] && [ "$got" = "$GOOD_SHA" ] && [ -f "$h/.pharos/bin/setup.sh" ] \
-    && [ -f "$h/.claude/skills/pharos/SKILL.md" ] && [ -L "$h/.local/bin/pharos" ]
+    && [ -f "$h/.claude/skills/pharos/SKILL.md" ] && [ -L "$h/.local/bin/pharos" ] \
+    && grep -qE '^Done\. pharos [0-9][^ ]* installed\.$' "$h/out.txt" \
+    && ! grep -q 'pharos pharos' "$h/out.txt"
   check release_install_verifies_and_installs $? "rc=$(rc "$h"); $(tail -5 "$h/out.txt")"
 }
 

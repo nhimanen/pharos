@@ -916,6 +916,22 @@ def cmd_backfill_embedding_cache(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
+def cmd_version(args):
+    """Print the jar's version and this CLI's location. Spawns a one-shot JVM; no daemon."""
+    if not JAR.exists():
+        print(f"pharos CLI: {Path(__file__).resolve()}")
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    r = subprocess.run(["java"] + _jvm_flags() + ["-jar", str(JAR), "--version"],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    print(f"cli: {Path(__file__).resolve()}")
+    print(f"jar: {JAR}")
+    sys.exit(0)
+
+
 def cmd_index_status(args):
     """Show per-project index format status (read-only; spawns the jar, no daemon)."""
     if not JAR.exists():
@@ -1192,6 +1208,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Run 'pharos <command> --help' for detailed usage of each command.",
         add_help=True,
     )
+    parser.add_argument("--version", action="store_true",
+                        help="Print the installed pharos jar's version and this CLI's location, then exit")
     sub = parser.add_subparsers(dest="command", metavar="command", parser_class=HelpOnErrorParser)
 
     # web
@@ -1651,6 +1669,9 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.version:
+        cmd_version(args)
 
     if not hasattr(args, "func"):
         parser.print_help()

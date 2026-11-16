@@ -89,7 +89,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
             if (!ProjectNames.isValid(p.getName())) {
                 System.out.printf("Skipping invalid project name '%s': remove it from %s manually "
-                        + "(its index directory would be the index root; pharos will not touch it). "
+                        + "(its index directory would be the index root; pharos will not touch it). See UPGRADING.md. "
                         + "Then re-index it with: pharos index --project <name> <path>%n", p.getName(), "~/.pharos/registry.json");
                 skipped++;
                 continue;
