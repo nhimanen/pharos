@@ -334,7 +334,7 @@ class RemoveIndexCommandTest {
         var old = System.out;
         System.setOut(new java.io.PrintStream(buf, true));
         int exit;
-        try { exit = new CommandLine(new RemoveIndexCommand(registry, indexManager)).execute("."); }
+        try { exit = new CommandLine(new RemoveIndexCommand(registry, indexManager, config)).execute("."); }
         finally { System.setOut(old); }
         org.assertj.core.api.Assertions.assertThat(exit).isZero();
         org.assertj.core.api.Assertions.assertThat(registry.find(".")).isEmpty();
