@@ -33,6 +33,14 @@ class S3ObjectStoreErrorMappingTest {
     }
 
     @Test
+    void anyNotFoundOnHeadIsMissing() {
+        // A HEAD response has no body, so NoSuchKey can't be told from other 404s.
+        assertThat(S3ObjectStore.isMissingOnHead((S3Exception) S3Exception.builder().statusCode(404).build())).isTrue();
+        assertThat(S3ObjectStore.isMissingOnHead(err(404, "NoSuchKey"))).isTrue();
+        assertThat(S3ObjectStore.isMissingOnHead(err(403, "AccessDenied"))).isFalse();
+    }
+
+    @Test
     void contentRangeStartingAtOffsetIsAccepted() throws Exception {
         S3ObjectStore.checkContentRange("bytes 100-199/1000", 100, "k");
         S3ObjectStore.checkContentRange("bytes 0-9/10", 0, "k");

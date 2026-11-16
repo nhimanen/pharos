@@ -155,8 +155,14 @@ public class S3ObjectStore implements ObjectStore {
         try {
             if (length == 0) {
                 // No ranged GET can express zero bytes; a HEAD gives the same missing-key / past-end answers.
-                long size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
-                        .contentLength();
+                long size;
+                try {
+                    size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+                            .contentLength();
+                } catch (S3Exception e) {
+                    if (isMissingOnHead(e)) throw missing(key);
+                    throw e;
+                }
                 if (offset > size) {
                     throw new EOFException("range " + offset + "+0 is past the end (size " + size + ") of " + key);
                 }
@@ -321,6 +327,14 @@ public class S3ObjectStore implements ObjectStore {
 
     private static NoSuchFileException missing(String key) {
         return new NoSuchFileException(key, null, "object not found: " + key);
+    }
+
+    /**
+     * A HEAD response has no body, so S3 can't say NoSuchKey: any 404 counts as a missing object
+     * (a missing bucket included — the next non-HEAD call reports that precisely).
+     */
+    static boolean isMissingOnHead(S3Exception e) {
+        return e.statusCode() == 404 || isMissingKey(e);
     }
 
     /** True only for a missing object (NoSuchKey); a 404 for NoSuchBucket etc. is a real error. */
