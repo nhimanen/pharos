@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def load_queries():
+    sys.dont_write_bytecode = True  # don't leave eval/__pycache__ behind in the repo
     spec = importlib.util.spec_from_file_location("benchmark", HERE.parent / "eval" / "benchmark.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

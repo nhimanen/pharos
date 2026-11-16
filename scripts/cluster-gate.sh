@@ -11,7 +11,9 @@
 # Env:
 #   MINIO_BIN   path to the minio server binary (default $HOME/.cache/pharos-gate/minio)
 #   GATE        work dir (default: fresh mktemp -d)
-#   PHAROS_HEAP JVM heap for pharos processes (default 8g)
+#   PHAROS_HEAP       JVM heap for pharos processes (default 8g)
+#   PHAROS_INDEX_HEAP heap for the writer index runs (default $PHAROS_HEAP)
+#   PHAROS_WEB_HEAP   heap for each web daemon (default $PHAROS_HEAP)
 set -euo pipefail
 
 MINIO_BIN="${MINIO_BIN:-$HOME/.cache/pharos-gate/minio}"
@@ -68,6 +70,9 @@ export PHAROS_GATE_SECRET_KEY="gatesecret-0123456789"
 export MINIO_ROOT_USER="$PHAROS_GATE_ACCESS_KEY"
 export MINIO_ROOT_PASSWORD="$PHAROS_GATE_SECRET_KEY"
 
+INDEX_HEAP="${PHAROS_INDEX_HEAP:-${PHAROS_HEAP:-8g}}"
+WEB_HEAP="${PHAROS_WEB_HEAP:-${PHAROS_HEAP:-8g}}"
+
 POLL=10
 write_config() {  # $1 = role, $2 = node id, $3 = pharos home
   cat > "$3/config.json" <<JSON
@@ -91,6 +96,9 @@ write_config() {  # $1 = role, $2 = node id, $3 = pharos home
 }
 JSON
 }
+# Lets com.pharos.cluster INFO lines through (the freshness check parses them).
+LOGBACK="$REPO/scripts/cluster-gate-logback.xml"
+
 write_config writer gate-writer "$W_PH"
 write_config reader gate-reader "$R_PH"
 
@@ -104,11 +112,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-jvm() {  # $1 = home dir (user.home); rest = pharos args. Always call in a subshell: ( jvm ... )
-  local home="$1"; shift
-  exec java -Xmx"${PHAROS_HEAP:-8g}" --enable-native-access=ALL-UNNAMED \
+jvm() {  # $1 = heap, $2 = home dir (user.home); rest = pharos args. Always call in a subshell: ( jvm ... )
+  local heap="$1" home="$2"; shift 2
+  exec java -Xmx"$heap" --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector \
-    -Dpolyglot.engine.WarnInterpreterOnly=false \
+    -Dpolyglot.engine.WarnInterpreterOnly=false -Dlogback.configurationFile="$LOGBACK" \
     -Duser.home="$home" -Dpharos.home="$home/.pharos" \
     -jar "$JAR" "$@"
 }
@@ -120,7 +128,7 @@ wait_http() {  # $1 = url, $2 = timeout seconds
   done
 }
 
-echo "== gate dir: $GATE"
+echo "== gate dir: $GATE (index heap $INDEX_HEAP, web heap $WEB_HEAP each)"
 echo "== starting MinIO on 127.0.0.1:9000"
 "$MINIO_BIN" server "$MINIO_DATA" --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
   > "$GATE/minio.log" 2>&1 &
@@ -132,17 +140,17 @@ mkdir -p "$PHAROS_SRC"
 cp -r "$REPO/src" "$REPO/pom.xml" "$PHAROS_SRC/"
 
 echo "== indexing pharos + lucene on the writer (publishes to MinIO)"
-( jvm "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed ) > "$GATE/writer-index-pharos.log" 2>&1 \
+( jvm "$INDEX_HEAP" "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed ) > "$GATE/writer-index-pharos.log" 2>&1 \
   || { echo "cluster-gate: indexing pharos failed; see $GATE/writer-index-pharos.log" >&2; tail -n 20 "$GATE/writer-index-pharos.log" >&2; exit 1; }
 tail -n 5 "$GATE/writer-index-pharos.log"
-( jvm "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed ) > "$GATE/writer-index-lucene.log" 2>&1 \
+( jvm "$INDEX_HEAP" "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed ) > "$GATE/writer-index-lucene.log" 2>&1 \
   || { echo "cluster-gate: indexing lucene failed; see $GATE/writer-index-lucene.log" >&2; tail -n 20 "$GATE/writer-index-lucene.log" >&2; exit 1; }
 tail -n 5 "$GATE/writer-index-lucene.log"
 
 echo "== starting writer web :7300 and reader web :7301"
-( jvm "$W_HOME" web --port 7300 --no-open ) > "$GATE/writer-web.log" 2>&1 &
+( jvm "$WEB_HEAP" "$W_HOME" web --port 7300 --no-open ) > "$GATE/writer-web.log" 2>&1 &
 PIDS+=($!)
-( jvm "$R_HOME" web --port 7301 --no-open ) > "$GATE/reader-web.log" 2>&1 &
+( jvm "$WEB_HEAP" "$R_HOME" web --port 7301 --no-open ) > "$GATE/reader-web.log" 2>&1 &
 PIDS+=($!)
 wait_http http://127.0.0.1:7300/health 120
 wait_http http://127.0.0.1:7301/health 120
@@ -165,7 +173,7 @@ sys.exit(0 if json.load(sys.stdin).get("ready") else 1)'; do
 done
 
 # The freshness check re-indexes the edited copy on the writer with this command.
-export GATE_REINDEX_CMD="java -Xmx${PHAROS_HEAP:-8g} --enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector -Duser.home=$W_HOME -Dpharos.home=$W_PH -jar $JAR index $PHAROS_SRC --project pharos --no-embed"
+export GATE_REINDEX_CMD="java -Xmx$INDEX_HEAP --enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector -Dlogback.configurationFile=$LOGBACK -Duser.home=$W_HOME -Dpharos.home=$W_PH -jar $JAR index $PHAROS_SRC --project pharos --no-embed"
 export GATE_REINDEX_LOG="$GATE/freshness-reindex.log"
 export GATE_PHAROS_SRC="$PHAROS_SRC"
 export GATE_READER_LOG="$GATE/reader-web.log"
