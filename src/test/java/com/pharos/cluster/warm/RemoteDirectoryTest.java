@@ -419,6 +419,55 @@ class RemoteDirectoryTest {
         }
     }
 
+    /** Bulk float/int/long reads equal NIOFSDirectory's (little-endian), at any alignment and across blocks. */
+    @Test
+    void bulkReadsMatchNiofs() throws Exception {
+        Blob b = blob("_v.bin", 10_000);
+        Path local = tmp.resolve("bulk");
+        Files.createDirectories(local);
+        Files.write(local.resolve("_v.bin"), b.data());
+        RemoteDirectory dir = remote(cache(KIB), null, source, b.manifest());
+        try (FSDirectory nio = new NIOFSDirectory(local);
+             IndexInput want = nio.openInput("_v.bin", IOContext.DEFAULT);
+             IndexInput got = dir.openInput("_v.bin", IOContext.DEFAULT)) {
+            for (long start : new long[]{0, 1, 3, KIB - 6, KIB - 4, 2 * KIB - 1, 5_000}) {
+                for (int count : new int[]{1, 2, 7, 300, 1_000}) {
+                    if (start + 8L * count > 10_000) continue;
+                    want.seek(start);
+                    got.seek(start);
+                    float[] wf = new float[count + 2];
+                    float[] gf = new float[count + 2];
+                    want.readFloats(wf, 1, count);
+                    got.readFloats(gf, 1, count);
+                    assertThat(gf).as("floats at %d x %d", start, count).isEqualTo(wf);
+                    assertThat(got.getFilePointer()).isEqualTo(want.getFilePointer());
+
+                    want.seek(start);
+                    got.seek(start);
+                    int[] wi = new int[count + 2];
+                    int[] gi = new int[count + 2];
+                    want.readInts(wi, 1, count);
+                    got.readInts(gi, 1, count);
+                    assertThat(gi).as("ints at %d x %d", start, count).isEqualTo(wi);
+                    assertThat(got.getFilePointer()).isEqualTo(want.getFilePointer());
+
+                    want.seek(start);
+                    got.seek(start);
+                    long[] wl = new long[count + 2];
+                    long[] gl = new long[count + 2];
+                    want.readLongs(wl, 1, count);
+                    got.readLongs(gl, 1, count);
+                    assertThat(gl).as("longs at %d x %d", start, count).isEqualTo(wl);
+                    assertThat(got.getFilePointer()).isEqualTo(want.getFilePointer());
+                }
+            }
+            got.seek(10_000 - 7);
+            assertThatThrownBy(() -> got.readLongs(new long[1], 0, 1)).isInstanceOf(EOFException.class);
+            assertThatThrownBy(() -> got.readFloats(new float[2], 0, 2)).isInstanceOf(EOFException.class);
+            assertThat(got.getFilePointer()).as("a failed bulk read does not move").isEqualTo(10_000 - 7);
+        }
+    }
+
     @Test
     void sliceAndCloneAreIndependent() throws Exception {
         Blob b = blob("_y.bin", 5_000);

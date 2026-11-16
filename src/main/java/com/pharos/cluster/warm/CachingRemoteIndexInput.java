@@ -117,6 +117,57 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         return v;
     }
 
+    /** Bulk little-endian floats, copied from the buffer a run at a time (vector reads). */
+    @Override
+    public void readFloats(float[] dst, int off, int len) throws IOException {
+        readElements(dst, off, len, LE_FLOAT);
+    }
+
+    @Override
+    public void readInts(int[] dst, int off, int len) throws IOException {
+        readElements(dst, off, len, LE_INT);
+    }
+
+    @Override
+    public void readLongs(long[] dst, int off, int len) throws IOException {
+        readElements(dst, off, len, LE_LONG);
+    }
+
+    private static final ValueLayout.OfFloat LE_FLOAT =
+            ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfInt LE_INT =
+            ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LE_LONG =
+            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+
+    /**
+     * Reads {@code len} elements of {@code layout} at the file pointer into {@code dst} (a primitive
+     * array): whole runs straight out of the buffer, an element straddling a block boundary through
+     * {@link #spanning}. The range is checked first, so a read past the end moves nothing.
+     */
+    private void readElements(Object dst, int off, int len, ValueLayout layout) throws IOException {
+        Objects.checkFromIndexSize(off, len, java.lang.reflect.Array.getLength(dst));
+        int size = (int) layout.byteSize();
+        checkRange(pos, (long) len * size);
+        while (len > 0) {
+            long abs = offset + pos;
+            if (!buffered(abs, size) && !fillHolds(abs, size)) {
+                MemorySegment one = MemorySegment.ofArray(spanning(abs, size));
+                MemorySegment.copy(one, layout, 0, dst, off, 1);
+                pos += size;
+                off++;
+                len--;
+                continue;
+            }
+            int idx = (int) (abs - bufStart);
+            int n = Math.min(len, (bufLen - idx) / size);
+            MemorySegment.copy(MemorySegment.ofArray(buf), layout, idx, dst, off, n);
+            pos += (long) n * size;
+            off += n;
+            len -= n;
+        }
+    }
+
     @Override
     public CachingRemoteIndexInput clone() {
         CachingRemoteIndexInput c = (CachingRemoteIndexInput) super.clone();
