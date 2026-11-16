@@ -167,6 +167,18 @@ public class EmbeddingProviderConfig {
      *
      * @throws IllegalArgumentException on any invalid field combination
      */
+    private static final java.util.regex.Pattern HF_REPO_ID =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9][\\w.-]*/[\\w.-]+$");
+
+    /** True for {@code owner/name} repo ids that cannot traverse directories. */
+    public static boolean isValidHfRepoId(String id) {
+        if (id == null || !HF_REPO_ID.matcher(id).matches()) return false;
+        for (String seg : id.split("/")) {
+            if (seg.equals(".") || seg.equals("..")) return false;
+        }
+        return true;
+    }
+
     public void validate() {
         if (modelId == null || modelId.isBlank()) {
             throw new IllegalArgumentException("embeddingProvider.modelId is required");
@@ -183,6 +195,12 @@ public class EmbeddingProviderConfig {
         if (url == null || url.isBlank()) {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].url is required");
+        }
+        if ("djl".equals(type) && url.startsWith("hf://")
+                && !isValidHfRepoId(url.substring("hf://".length()))) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].url='" + url
+                    + "' is not a valid HuggingFace repo id (expected hf://owner/name)");
         }
         if ("openai".equals(type) && (model == null || model.isBlank())) {
             throw new IllegalArgumentException(

@@ -12,11 +12,13 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -177,10 +179,30 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      * the local path to tokenizer.json.
      */
     private Path prepareHuggingFaceFiles(String modelId) throws IOException {
-        Path modelDir = MODEL_CACHE.resolve(modelId.replace('/', '-'));
+        Path modelDir = resolveModelDir(MODEL_CACHE, modelId);
         ensureModelFiles(hfBaseUrl + modelId + "/resolve/main/", modelDir);
         return modelDir.resolve("tokenizer.json");
     }
+
+    /**
+     * Maps a repo id to its cache directory, refusing ids that could escape the cache root
+     * (the marker-less path deletes files in this directory).
+     */
+    static Path resolveModelDir(Path cacheRoot, String repoId) {
+        if (!com.pharos.config.EmbeddingProviderConfig.isValidHfRepoId(repoId)) {
+            throw new IllegalArgumentException("Invalid HuggingFace repo id '" + repoId
+                    + "' (expected owner/name using letters, digits, '.', '_' or '-')");
+        }
+        Path dir = cacheRoot.resolve(repoId.replace('/', '-')).normalize();
+        if (!cacheRoot.normalize().equals(dir.getParent())) {
+            throw new IllegalArgumentException("Model directory for '" + repoId
+                    + "' would be outside the model cache: " + dir);
+        }
+        return dir;
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<Path, Object> DIR_LOCKS =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Base URL override for tests (package-private). */
     static String hfBaseUrl = "https://huggingface.co/";
@@ -194,6 +216,21 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      * files) from before markers existed, which is accepted once and marked.
      */
     static void ensureModelFiles(String base, Path modelDir) throws IOException {
+        Path normalized = modelDir.toAbsolutePath().normalize();
+        Files.createDirectories(normalized.getParent());
+        // JVM-level monitor (FileChannel.lock cannot be held twice in one JVM) plus an
+        // OS-level lock so a daemon and a CLI process cannot race on the same directory.
+        synchronized (DIR_LOCKS.computeIfAbsent(normalized, k -> new Object())) {
+            Path lockFile = normalized.resolveSibling(normalized.getFileName() + ".lock");
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(lockFile,
+                         StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                 java.nio.channels.FileLock ignored = ch.lock()) {
+                ensureModelFilesLocked(base, normalized);
+            }
+        }
+    }
+
+    private static void ensureModelFilesLocked(String base, Path modelDir) throws IOException {
         Files.createDirectories(modelDir);
         Path marker = modelDir.resolve(COMPLETE_MARKER);
         Path onnxFile = modelDir.resolve("model.onnx");
@@ -207,6 +244,8 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
         boolean legacy = !hasParts && Files.exists(onnxFile) && Files.exists(tokenizerPath);
         if (legacy) {
             log.info("Accepting pre-marker model directory {}", modelDir);
+            Path dataFile = modelDir.resolve("model.onnx_data");
+            if (!Files.exists(dataFile)) fetchOptionalOnnxData(base, dataFile);
         } else {
             // Unknown state: discard everything so no half-model can be loaded.
             try (var stream = Files.list(modelDir)) {
@@ -215,11 +254,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             log.info("Downloading ONNX model from {}onnx/model.onnx ...", base);
             downloadWithRedirects(base + "onnx/model.onnx", onnxFile);
             // Large models keep weights in a sibling external-data file; absent (404) is normal.
-            try {
-                downloadWithRedirects(base + "onnx/model.onnx_data", modelDir.resolve("model.onnx_data"));
-            } catch (HttpStatusException e) {
-                if (e.status != 404) throw e;
-            }
+            fetchOptionalOnnxData(base, modelDir.resolve("model.onnx_data"));
             log.info("Downloading tokenizer from {}tokenizer.json ...", base);
             downloadWithRedirects(base + "tokenizer.json", tokenizerPath);
         }
@@ -229,6 +264,15 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             downloadWithRedirects(base + "config.json", configJsonFile);
         }
         Files.writeString(marker, "ok\n");
+    }
+
+    /** Fetches the optional external-data file; a 404 means the model has none. */
+    private static void fetchOptionalOnnxData(String base, Path dataFile) throws IOException {
+        try {
+            downloadWithRedirects(base + "onnx/model.onnx_data", dataFile);
+        } catch (HttpStatusException e) {
+            if (e.status != 404) throw e;
+        }
     }
 
     static final class HttpStatusException extends IOException {
@@ -280,6 +324,10 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
                 // Resolve relative redirects against the current URL
                 current = new URL(current, location);
             } else {
+                try (InputStream err = conn.getErrorStream()) {
+                    if (err != null) err.transferTo(OutputStream.nullOutputStream());
+                } catch (IOException ignored) { }
+                conn.disconnect();
                 throw new HttpStatusException(status, urlStr);
             }
         }
@@ -320,6 +368,35 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             maybeResetThreadPredictor();
             return predictOrThrow(modelId, () -> threadPredictor.get().predict(input));
         }
+    }
+
+    /**
+     * Sequential per-item embedding that tolerates individual failures: a failing item gets a
+     * null slot (indexed without a vector), one WARN reports the count, and the failure is
+     * rethrown only when every non-blank item failed (the model itself is broken).
+     */
+    public static float[][] embedEachTolerant(String modelId, List<String> texts,
+                                       java.util.function.Function<String, float[]> embedOne) {
+        float[][] results = new float[texts.size()][];
+        int attempted = 0, failed = 0;
+        EmbeddingException last = null;
+        for (int i = 0; i < texts.size(); i++) {
+            String t = texts.get(i);
+            if (t == null || t.isBlank()) continue;
+            attempted++;
+            try {
+                results[i] = embedOne.apply(t);
+            } catch (EmbeddingException e) {
+                failed++;
+                last = e;
+            }
+        }
+        if (failed > 0) {
+            if (failed == attempted) throw last;
+            log.warn("Embedding failed for {} of {} texts with model '{}'; they are indexed without a vector",
+                    failed, attempted, modelId);
+        }
+        return results;
     }
 
     @FunctionalInterface
@@ -372,12 +449,12 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             Predictor<List<String>, float[][]> batchPred = threadBatchPredictor.get();
             if (batchPred == null) {
                 // Zoo model path — sequential fallback
-                return EmbeddingProvider.super.embedBatch(texts);
+                return embedEachTolerant(modelId, texts, this::embed);
             }
             return batchPred.predict(sanitised);
         } catch (TranslateException e) {
             log.warn("Batch embedding failed for model '{}', retrying sequentially: {}", modelId, e.getMessage());
-            return EmbeddingProvider.super.embedBatch(texts);
+            return embedEachTolerant(modelId, texts, this::embed);
         }
     }
 

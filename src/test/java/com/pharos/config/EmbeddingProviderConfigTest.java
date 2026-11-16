@@ -144,4 +144,19 @@ class EmbeddingProviderConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("my-model").hasMessageContaining("pooling");
     }
+
+    @Test
+    void validate_rejectsTraversalAndMalformedHfIds() {
+        for (String bad : new String[]{"hf://..", "hf://.", "hf://", "hf://a\\b", "hf://../x", "hf://a/.."}) {
+            EmbeddingProviderConfig c = base("djl");
+            c.setUrl(bad);
+            assertThatThrownBy(c::validate)
+                    .as(bad)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("my-model");
+        }
+        EmbeddingProviderConfig ok = base("djl");
+        ok.setUrl("hf://jinaai/jina-embeddings-v2-base-code");
+        ok.validate();
+    }
 }

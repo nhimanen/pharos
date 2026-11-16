@@ -97,4 +97,66 @@ class HuggingFaceDownloadTest {
         assertEquals("OLD", Files.readString(dir.resolve("model.onnx")));
         assertTrue(Files.exists(dir.resolve(".complete")));
     }
+
+    @Test
+    void legacyDirWithoutOnnxDataFetchesIt(@TempDir Path dir) throws Exception {
+        Files.writeString(dir.resolve("model.onnx"), "OLD");
+        Files.writeString(dir.resolve("tokenizer.json"), "{}");
+        DjlEmbeddingProvider.ensureModelFiles(base, dir);
+        assertEquals("DATA", Files.readString(dir.resolve("model.onnx_data")));
+    }
+
+    @Test
+    void followsRedirectHop(@TempDir Path dir) throws Exception {
+        server.createContext("/m2/resolve/main/onnx/model.onnx", ex -> {
+            ex.getResponseHeaders().add("Location", "/cdn/blob1");
+            ex.sendResponseHeaders(302, -1);
+            ex.close();
+        });
+        server.createContext("/cdn/blob1", ex -> {
+            byte[] b = "CDNMODEL".getBytes();
+            ex.sendResponseHeaders(200, b.length);
+            ex.getResponseBody().write(b);
+            ex.close();
+        });
+        String redirBase = base.replace("/m/", "/m2/");
+        DjlEmbeddingProvider.ensureModelFiles(redirBase, dir);
+        assertEquals("CDNMODEL", Files.readString(dir.resolve("model.onnx")));
+    }
+
+    @Test
+    void chunkedResponseWithoutContentLengthPasses(@TempDir Path dir) throws Exception {
+        server.createContext("/m3/resolve/main/onnx/model.onnx", ex -> {
+            ex.sendResponseHeaders(200, 0);   // chunked
+            ex.getResponseBody().write("CHUNKED".getBytes());
+            ex.close();
+        });
+        DjlEmbeddingProvider.ensureModelFiles(base.replace("/m/", "/m3/"), dir);
+        assertEquals("CHUNKED", Files.readString(dir.resolve("model.onnx")));
+    }
+
+    @Test
+    void concurrentCallsDownloadOnce(@TempDir Path root) throws Exception {
+        Path dir = root.resolve("model");
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(4);
+        try {
+            var fs = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            for (int i = 0; i < 4; i++) fs.add(pool.submit(() -> {
+                DjlEmbeddingProvider.ensureModelFiles(base, dir);
+                return null;
+            }));
+            for (var f : fs) f.get();
+        } finally { pool.shutdown(); }
+        assertTrue(Files.exists(dir.resolve(".complete")));
+        assertEquals("MODEL", Files.readString(dir.resolve("model.onnx")));
+    }
+
+    @Test
+    void repoIdsThatEscapeTheCacheAreRejected(@TempDir Path cache) {
+        for (String bad : new String[]{"..", ".", "", "a\\b", "../x", "a/..", "x/../../y"}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> DjlEmbeddingProvider.resolveModelDir(cache, bad), "id: '" + bad + "'");
+        }
+        assertEquals(cache.resolve("jinaai-jina-v2"), DjlEmbeddingProvider.resolveModelDir(cache, "jinaai/jina-v2"));
+    }
 }
