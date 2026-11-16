@@ -156,6 +156,13 @@ sys.exit(0 if {"pharos", "lucene"} <= names else 1)'; do
   (( SECONDS < end )) || { echo "cluster-gate: reader never showed both projects" >&2; exit 1; }
   sleep 2
 done
+# The reader binds its port before its first sync; wait until /health reports ready.
+until curl -fs http://127.0.0.1:7301/health | python3 -I -c '
+import json, sys
+sys.exit(0 if json.load(sys.stdin).get("ready") else 1)'; do
+  (( SECONDS < end )) || { echo "cluster-gate: reader never reported ready" >&2; exit 1; }
+  sleep 2
+done
 
 # The freshness check re-indexes the edited copy on the writer with this command.
 export GATE_REINDEX_CMD="java -Xmx${PHAROS_HEAP:-8g} --enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector -Duser.home=$W_HOME -Dpharos.home=$W_PH -jar $JAR index $PHAROS_SRC --project pharos --no-embed"
