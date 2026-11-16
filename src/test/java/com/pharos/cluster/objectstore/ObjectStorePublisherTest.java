@@ -418,6 +418,33 @@ class ObjectStorePublisherTest {
     }
 
     @Test
+    void shardIsRegisteredBeforeLatestMoves() throws Exception {
+        boolean[] listedAtCommit = {false};
+        store.beforeConditionalPut = key -> {
+            if (key.equals(layout.latestKey(SHARD))) {
+                try {
+                    listedAtCommit[0] = catalog.shards().contains(SHARD);
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        };
+        indexFull(manager(publisher));
+        assertThat(listedAtCommit[0]).isTrue();
+    }
+
+    @Test
+    void catalogFailureFailsPublishBeforeTheCommitPoint() {
+        store.beforeConditionalPut = key -> {
+            if (key.equals(layout.catalogKey())) throw new IllegalStateException("catalog down");
+        };
+        assertThatThrownBy(() -> indexFull(manager(publisher)))
+                .isInstanceOf(PublishException.class).hasMessageContaining("catalog down");
+        assertThat(store.get(layout.latestKey(SHARD))).as("generation 1 not committed").isEmpty();
+        assertThat(store.get(layout.manifestKey(SHARD, Generation.FIRST))).isEmpty();
+    }
+
+    @Test
     void writerRejectsUnsafeProjectNameBeforeIndexing() {
         ProjectIndexManager m = manager(publisher);
         assertThatThrownBy(() -> m.index(source, "my project", false, false, false, false,

@@ -49,8 +49,10 @@ import java.util.zip.GZIPOutputStream;
  * content-addressed key is not in manifest P → upload this generation's graph and refs under
  * content-named keys ({@code graph/gen-N@<crc32>.cgf.gz}, {@code refs/gen-N@<crc32>.json.gz}), so
  * a racing run for the same N cannot overwrite bytes a committed manifest references → ship
- * synonyms → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N → register
- * the shard in the catalog → GC.
+ * synonyms → register the shard in the catalog (idempotent; readers skip a listed shard without
+ * {@code LATEST}) → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N → GC.
+ * Registering before the commit point means a catalog failure can never be reported as a failed
+ * publish of a generation that is in fact committed.
  *
  * <p>The commit point is the {@code LATEST} CAS alone. If manifest gen-N already exists while
  * {@code LATEST} still carries the ETag read in step 1, nobody committed N: the manifest is an
@@ -179,7 +181,10 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 store.put(layout.synonymsKey(), synonymsFile);
             }
 
-            // 5. Manifest gen-N, create-only; an orphan left by a run that never committed N is replaced.
+            // 5. Catalog before the commit point (idempotent).
+            catalog.register(shard);
+
+            // 6. Manifest gen-N, create-only; an orphan left by a run that never committed N is replaced.
             long sizeBytes = files.stream().mapToLong(ManifestFile::length).sum();
             ShardManifest manifest = new ShardManifest(ShardManifest.FORMAT_VERSION, shard.value(), gen.value(),
                     previous.map(p -> p.generation().value()).orElse(null), Instant.now(), nodeId,
@@ -192,7 +197,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
                         previous.map(Latest::etag).orElse(null));
             }
 
-            // 6. Commit point: CAS LATEST from P to N.
+            // 7. Commit point: CAS LATEST from P to N.
             byte[] latest = ("{\"generation\": " + gen.value() + ", \"manifest\": \""
                     + ObjectStoreLayout.manifestName(gen) + "\"}").getBytes(StandardCharsets.UTF_8);
             Optional<String> committed = previous.isPresent()
@@ -202,8 +207,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
             }
 
-            // 7. Catalog, then best-effort GC.
-            catalog.register(shard);
+            // 8. Best-effort GC.
             runGc(shard);
 
             log.info("Published shard {} generation {}: {} files uploaded, {} reused, {} bytes uploaded",
