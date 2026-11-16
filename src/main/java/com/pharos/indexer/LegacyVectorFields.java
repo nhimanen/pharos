@@ -59,6 +59,8 @@ public final class LegacyVectorFields {
              DirectoryReader r = DirectoryReader.indexExists(dir) ? DirectoryReader.open(dir) : null) {
             return r != null && hasLiveMisnamedVectors(r);
         } catch (IOException | RuntimeException e) {
+            org.slf4j.LoggerFactory.getLogger(LegacyVectorFields.class)
+                    .warn("Could not check {} for legacy-named vectors: {}", luceneDir, e.toString());
             return false;
         }
     }

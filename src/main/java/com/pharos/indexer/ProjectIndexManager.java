@@ -446,6 +446,17 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
+        // 1.4.0-1.4.1 stored the legacy model's vectors under vec.legacy, which search never reads.
+        // Only a full index embeds exactly like a fresh one (chunked text, chunk vectors), so it also
+        // reuses the existing embedding cache; an incremental run would miss it and downgrade chunks.
+        if (incremental && generateEmbeddings && !embedders.isEmpty()
+                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
+            String msg = "vectors stored under vec.legacy by pharos 1.4.0-1.4.1; "
+                    + "running a full re-index to re-embed (cached vectors are reused)";
+            log.warn("project {}: {}", projectName, msg);
+            progress.onProgress(msg, 0, 0);
+            incremental = false;
+        }
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -740,20 +751,6 @@ public class ProjectIndexManager {
                         versionDirty.size(), projectName);
                 dirtyFiles.addAll(versionDirty);
             }
-        }
-
-        // Indexes written by pharos 1.4.0-1.4.1 with the 'legacy' model stored vectors in vec.legacy,
-        // which search never reads. Re-embed every tracked file (the persistent embedding cache
-        // serves unchanged texts) so each doc is rewritten under vectorEmbedding / chunkVectors.
-        if (generateEmbeddings && !runtimes.isEmpty()
-                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
-            Set<Path> already = new java.util.HashSet<>(dirtyFiles);
-            int before = dirtyFiles.size();
-            for (Path tracked : stateTracker.trackedFiles()) {
-                if (!already.contains(tracked) && currentFiles.contains(tracked)) dirtyFiles.add(tracked);
-            }
-            log.warn("re-embedding project {}: vectors were stored in vec.legacy by pharos 1.4.0-1.4.1 ({} file(s))",
-                    projectName, dirtyFiles.size() - before);
         }
 
         if (dirtyFiles.isEmpty() && deletedFiles.isEmpty()) {

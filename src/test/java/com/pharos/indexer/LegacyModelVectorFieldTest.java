@@ -124,31 +124,58 @@ class LegacyModelVectorFieldTest {
         }
     }
 
+    private int docsWithChunkVectors() throws Exception {
+        try (DirectoryReader r = DirectoryReader.open(new org.apache.lucene.store.NIOFSDirectory(lucene.getLucenePath("mig")))) {
+            int n = 0;
+            for (LeafReaderContext c : r.leaves()) {
+                var bdv = c.reader().getBinaryDocValues(DocumentMapper.F_CHUNK_VECTORS_LEGACY);
+                var live = c.reader().getLiveDocs();
+                if (bdv == null) continue;
+                for (int d = bdv.nextDoc(); d != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS; d = bdv.nextDoc()) {
+                    if (live == null || live.get(d)) n++;
+                }
+            }
+            return n;
+        }
+    }
+
+    /** A method larger than the chunker's window, so it gets several chunk vectors. */
+    private void addBigMethod() throws Exception {
+        StringBuilder body = new StringBuilder();
+        for (int i = 0; i < 400; i++) body.append("        int v").append(i).append(" = ").append(i).append(" * 31;\n");
+        Files.writeString(root.resolve("src/main/java/com/example/Big.java"),
+                "package com.example;\npublic class Big {\n    public void huge() {\n" + body + "    }\n}\n");
+    }
+
     @Test
-    void incrementalIndexOnVecLegacyIndex_reembedsFromCacheAndEndsClean() throws Exception {
+    void indexOnVecLegacyIndex_runsFullReindexServedFromTheCache() throws Exception {
         CountingProvider provider = new CountingProvider("legacy");
         setUpProject(provider);
-        manager.index(root, "mig", false, true);
+        addBigMethod();
+        manager.index(root, "mig", false, true);            // seeds the full-index embedding cache
+        assertThat(docsWithChunkVectors()).as("multi-chunk method has chunk vectors").isGreaterThan(0);
         downgradeToMisnamed();
         assertThat(liveMisnamed()).isTrue();
-
-        manager.index(root, "mig", true, true);   // plain incremental: no source file changed
-        assertThat(liveMisnamed()).as("no live vec.legacy doc left").isFalse();
-
-        // Second migration: the incremental texts are now cached, so nothing reaches the provider.
-        // (Full-index texts differ slightly from incremental ones, so the first run can't be all hits.)
-        downgradeToMisnamed();
         int before = provider.calls.get();
-        manager.index(root, "mig", true, true);
-        assertThat(liveMisnamed()).isFalse();
-        assertThat(provider.calls.get()).as("unchanged texts are served from the embedding cache").isEqualTo(before);
+
+        manager.index(root, "mig", true, true);             // plain `pharos index`, no --full
+
+        assertThat(liveMisnamed()).as("no live vec.legacy / chunkVec.legacy doc left").isFalse();
+        assertThat(provider.calls.get()).as("full re-index reuses the cached full-index embeddings").isEqualTo(before);
+        assertThat(docsWithChunkVectors()).as("multi-chunk methods keep their chunk vectors").isGreaterThan(0);
         SearchEngine engine = new SearchEngine(lucene, provider, registry);
         assertThat(engine.search(new SearchRequest("alphaMethod", SearchRequest.SearchType.VECTOR,
                 "mig", null, 10, "text", null, null, 0))).isNotEmpty();
+    }
 
-        int callsAfterMigration = provider.calls.get();
-        manager.index(root, "mig", true, true);
-        assertThat(provider.calls.get()).as("migrated index is not re-embedded again").isEqualTo(callsAfterMigration);
+    @Test
+    void healthyLegacyIndexStaysIncremental() throws Exception {
+        CountingProvider provider = new CountingProvider("legacy");
+        setUpProject(provider);
+        manager.index(root, "mig", false, true);
+        java.util.List<String> msgs = new java.util.ArrayList<>();
+        manager.index(root, "mig", true, true, (stage, done, total) -> msgs.add(stage));
+        assertThat(msgs).noneMatch(m -> m.contains("full re-index"));
     }
 
     @Test
