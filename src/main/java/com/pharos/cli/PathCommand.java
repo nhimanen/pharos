@@ -1,7 +1,6 @@
 package com.pharos.cli;
 
 import com.pharos.indexer.IncompatibleIndexException;
-import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -11,7 +10,6 @@ import com.pharos.graph.GraphViews;
 import com.pharos.graph.CrossProjectLinker;
 import picocli.CommandLine.*;
 
-import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.Callable;
 
@@ -60,15 +58,12 @@ public class PathCommand implements Callable<Integer> {
     private List<String> findPath() throws Exception {
         // Search each per-project graph individually
         for (ProjectMeta meta : registry.listAll()) {
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-            } catch (IncompatibleIndexException e) {
-                System.err.println("Skipping '" + meta.getName() + "': " + e.getMessage());
-                continue;
-            }
+            // GraphViews checks the index format before opening anything
             try (GraphView graph = GraphViews.open(meta)) {
                 List<String> path = graph.shortestPath(fromFqn, toFqn);
                 if (!path.isEmpty()) return path;
+            } catch (IncompatibleIndexException e) {
+                System.err.println("Skipping '" + meta.getName() + "': " + e.getMessage());
             } catch (Exception e) {
                 // Graph not available for this project
             }

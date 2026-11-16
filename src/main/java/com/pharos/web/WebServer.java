@@ -721,8 +721,7 @@ public class WebServer {
 
     /** Open the read-only call graph for the given project. Caller must close. */
     private GraphView loadCallGraphCached(ProjectMeta meta) throws Exception {
-        IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-        return GraphViews.open(meta);
+        return GraphViews.open(meta); // checks the index format first (IncompatibleIndexException)
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {

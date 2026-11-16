@@ -4,7 +4,6 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
 import com.pharos.indexer.IncompatibleIndexException;
-import com.pharos.indexer.IndexFormat;
 import com.pharos.graph.GraphView;
 import com.pharos.graph.GraphViews;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
@@ -23,7 +22,6 @@ import com.pharos.cluster.NodeRole;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -473,13 +471,7 @@ public class McpToolRegistry {
         String to = args.path("to_fqn").asText();
 
         for (ProjectMeta meta : registry.listAll()) {
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-            } catch (IncompatibleIndexException e) {
-                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
-                skipped.get().add(e.getMessage());
-                continue;
-            }
+            // GraphViews checks the index format before opening anything
             try (GraphView g = GraphViews.open(meta)) {
                 List<String> path = g.shortestPath(from, to);
                 if (!path.isEmpty()) {
@@ -493,6 +485,9 @@ public class McpToolRegistry {
                     out.put("path", steps);
                     return mapper.writeValueAsString(out);
                 }
+            } catch (IncompatibleIndexException e) {
+                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                skipped.get().add(e.getMessage());
             } catch (Exception ignored) {}
         }
         return "No call path found from `" + from + "` to `" + to + "`";
@@ -817,15 +812,12 @@ public class McpToolRegistry {
     private Set<String> getFromGraph(String fqn, boolean callers) {
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            // GraphViews checks the index format before opening anything
+            try (GraphView graph = GraphViews.open(meta)) {
+                result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (IncompatibleIndexException e) {
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
                 skipped.get().add(e.getMessage());
-                continue;
-            }
-            try (GraphView graph = GraphViews.open(meta)) {
-                result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (Exception ignored) {}
         }
         return result;

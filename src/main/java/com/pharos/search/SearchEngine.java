@@ -707,17 +707,14 @@ public class SearchEngine {
         List<GraphView> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll()) {
             if (onlyProject != null && !onlyProject.equals(meta.getName())) continue;
+            // GraphViews checks the index format, then opens existing graphs only: a project
+            // without one is skipped, nothing is created.
             try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+                graphs.add(GraphViews.open(meta));
             } catch (IncompatibleIndexException e) {
                 if (onlyProject != null) throw e;
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
                 warnings.add(e.getMessage());
-                continue;
-            }
-            // GraphViews opens existing graphs only: a project without one is skipped, nothing is created.
-            try {
-                graphs.add(GraphViews.open(meta));
             } catch (Exception e) {
                 log.warn("Skipping unreadable graph of project {}: {}", meta.getName(), e.toString());
             }
