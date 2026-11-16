@@ -289,6 +289,124 @@ class GenerationGcTest {
         assertGenerationGone(2);
     }
 
+    // --- fix round 1 ----------------------------------------------------------------------------
+
+    private void assertAllIntact(int n) {
+        for (long g = 1; g <= n; g++) {
+            assertThat(exists(unique(g))).as("unique %d", g).isTrue();
+            assertThat(exists(graph(g))).as("graph %d", g).isTrue();
+            assertThat(exists(refs(g))).as("refs %d", g).isTrue();
+            assertThat(exists(manifestKey(g))).as("manifest %d", g).isTrue();
+        }
+        assertThat(exists(shared())).isTrue();
+    }
+
+    @Test
+    void emptyObjectLatestManifestDeletesNothing() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        store.put(manifestKey(5), bytes("{}"));
+
+        assertThat(gc.collect(SHARD, T0)).isZero();
+        assertAllIntact(5);
+    }
+
+    @Test
+    void latestManifestWithoutFilesDeletesNothing() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        store.put(manifestKey(5), bytes("{\"formatVersion\":1,\"generation\":5}"));
+
+        assertThat(gc.collect(SHARD, T0)).isZero();
+        assertAllIntact(5);
+    }
+
+    @Test
+    void manifestGenerationMismatchDeletesNothing() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        store.put(manifestKey(1), store.get(manifestKey(2)).orElseThrow().data());
+
+        assertThat(gc.collect(SHARD, T0)).isZero();
+        assertAllIntact(5);
+    }
+
+    @Test
+    void unsupportedFormatVersionDeletesNothing() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        String json = new String(store.get(manifestKey(1)).orElseThrow().data(), StandardCharsets.UTF_8)
+                .replace("\"formatVersion\" : 1", "\"formatVersion\" : 99");
+        assertThat(json).contains("99");
+        store.put(manifestKey(1), bytes(json));
+
+        assertThat(gc.collect(SHARD, T0)).isZero();
+        assertAllIntact(5);
+    }
+
+    @Test
+    void foreignShardOrKeyOutsideShardDeletesNothing() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        String m1 = new String(store.get(manifestKey(1)).orElseThrow().data(), StandardCharsets.UTF_8);
+        store.put(manifestKey(1), bytes(m1.replace("\"shard\" : \"proj\"", "\"shard\" : \"other\"")));
+        assertThat(gc.collect(SHARD, T0)).isZero();
+
+        store.put(manifestKey(1), bytes(m1.replace(unique(1), "elsewhere/u1")));
+        assertThat(gc.collect(SHARD, T0)).isZero();
+
+        store.put(manifestKey(1), bytes(m1.replace("\"" + unique(1) + "\"", "\" \"")));
+        assertThat(gc.collect(SHARD, T0)).isZero();
+        assertAllIntact(5);
+    }
+
+    @Test
+    void objectReuploadedAfterListingSurvives() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        ThrowingStore spy = new ThrowingStore(store);
+        spy.afterFirstList = () -> {
+            clock.now = T0; // a concurrent publish re-puts the identical content-addressed key
+            store.put(unique(1), bytes("u1"));
+        };
+
+        assertThat(new GenerationGc(spy, layout, 3, MIN_AGE).collect(SHARD, T0)).isEqualTo(7);
+        assertThat(exists(unique(1))).isTrue();
+        assertThat(spy.deletes).doesNotContain(unique(1));
+        assertGenerationGone(2);
+    }
+
+    @Test
+    void objectGoneAfterListingIsSkipped() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        ThrowingStore spy = new ThrowingStore(store);
+        spy.afterFirstList = () -> store.delete(unique(1));
+
+        assertThat(new GenerationGc(spy, layout, 3, MIN_AGE).collect(SHARD, T0)).isEqualTo(7);
+        assertThat(spy.deletes).doesNotContain(unique(1));
+    }
+
+    @Test
+    void strayKeysUnderShardSurvive() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        String notes = layout.shardPrefix(SHARD) + "manifests/notes.txt";
+        String other = layout.shardPrefix(SHARD) + "other/thing.bin";
+        store.put(notes, bytes("n"));
+        store.put(other, bytes("o"));
+
+        assertThat(gc.collect(SHARD, T0)).isEqualTo(8);
+        assertThat(exists(notes)).isTrue();
+        assertThat(exists(other)).isTrue();
+    }
+
+    @Test
+    void unexpectedRuntimeExceptionDoesNotEscape() throws Exception {
+        generations(5, T0.minus(Duration.ofHours(2)));
+        ThrowingStore spy = new ThrowingStore(store);
+        // data keys are visited in key order: graph/, lucene/, refs/; the re-check of lucene u1 blows up
+        spy.runtimeFailListKey = unique(1);
+
+        int deleted = new GenerationGc(spy, layout, 3, MIN_AGE).collect(SHARD, T0);
+
+        assertThat(deleted).isEqualTo(4); // 2 manifests + graph 1-2
+        assertThat(exists(unique(1))).isTrue();
+        assertThat(exists(refs(1))).isTrue();
+    }
+
     /** Delegating store whose list/get/delete can be made to throw. */
     static final class ThrowingStore implements ObjectStore {
         final ObjectStore delegate;
@@ -296,6 +414,10 @@ class GenerationGcTest {
         String failListPrefix;
         String failGetKey;
         String failDeleteKey;
+        /** list(prefix) of exactly this key throws an unchecked exception. */
+        String runtimeFailListKey;
+        /** Runs once, after the first listing returns (simulates a concurrent writer). */
+        Runnable afterFirstList;
 
         ThrowingStore(ObjectStore delegate) { this.delegate = delegate; }
 
@@ -316,7 +438,14 @@ class GenerationGcTest {
             if (failListPrefix != null && (failListPrefix.startsWith(prefix) || prefix.startsWith(failListPrefix))) {
                 throw new IOException("injected list failure: " + prefix);
             }
-            return delegate.list(prefix);
+            if (prefix.equals(runtimeFailListKey)) throw new IllegalStateException("injected bug: " + prefix);
+            List<ObjectInfo> out = delegate.list(prefix);
+            if (afterFirstList != null) {
+                Runnable r = afterFirstList;
+                afterFirstList = null;
+                r.run();
+            }
+            return out;
         }
         @Override public void delete(String key) throws IOException {
             if (key.equals(failDeleteKey)) throw new IOException("injected delete failure: " + key);

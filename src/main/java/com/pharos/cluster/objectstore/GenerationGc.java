@@ -33,9 +33,19 @@ import java.util.regex.Pattern;
  * manifest and last modified more than {@code minAge} before {@code now} are deleted.
  *
  * <p>Safety: GC deletes nothing when {@code LATEST} is missing or unreadable, when any listing or
- * manifest read fails, or when any manifest cannot be parsed. Deletes are best-effort: a failed
- * delete is logged and the rest continue. Manifests are deleted before data files, so a crash
- * mid-GC leaves only unreferenced data for the next run.
+ * manifest read fails, or when any manifest is unparseable or fails validation (unsupported
+ * {@code formatVersion}, {@code generation} or {@code shard} not matching its key, no files, or a
+ * file key that is blank or outside this shard). Deletes are best-effort: a failed delete is
+ * logged and the rest continue. Manifests are deleted before data files, so a crash mid-GC leaves
+ * only unreferenced data for the next run. {@link #collect} never throws.
+ *
+ * <p>Concurrency: Phase 1 assumes a single writer per shard (leases arrive in Phase 4); GC runs
+ * on that writer after its own publish. Decisions are made from one listing snapshot, so a
+ * content-addressed data key re-uploaded after the listing (e.g. by a racing publish) would look
+ * old. To narrow that window, each data object's {@code lastModified} is re-read
+ * ({@code list(exactKey)}) immediately before its delete, and the delete is skipped if the object
+ * is gone or now younger than {@code minAge}. A window between that re-read and the delete
+ * remains; it is closed only by the Phase 4 writer lease.
  */
 public final class GenerationGc {
 
@@ -59,12 +69,29 @@ public final class GenerationGc {
 
     private record Manifest(String key, long generation, Instant lastModified, ShardManifest parsed) {}
 
+    /** Signals that GC for the shard must stop without deleting anything (more). */
+    private static final class Abort extends Exception {
+        Abort(String message) { super(message, null, false, false); }
+    }
+
     /**
      * @param now the object store's clock (the {@code lastModified} of the {@code LATEST} just
      *            written), never the local clock
-     * @return the number of objects deleted
+     * @return the number of objects deleted; never throws
      */
     public int collect(ShardId shard, Instant now) {
+        int[] deleted = {0};
+        try {
+            run(shard, now, deleted);
+        } catch (Abort e) {
+            log.warn("GC of shard {} aborted after {} deletes: {}", shard, deleted[0], e.getMessage());
+        } catch (RuntimeException e) {
+            log.warn("GC of shard {} failed after {} deletes: {}", shard, deleted[0], e.toString());
+        }
+        return deleted[0];
+    }
+
+    private void run(ShardId shard, Instant now, int[] deleted) throws Abort {
         String prefix = layout.shardPrefix(shard);
         String manifestsPrefix = prefix + "manifests/";
         Instant cutoff = now.minus(minAge);
@@ -72,24 +99,24 @@ public final class GenerationGc {
         // 1. LATEST: the generation readers see. Without it, we know nothing safe.
         long latestGen;
         String latestManifestKey;
+        Optional<StoredObject> latest;
         try {
-            Optional<StoredObject> latest = store.get(layout.latestKey(shard));
-            if (latest.isEmpty()) {
-                log.warn("GC of shard {} skipped: LATEST is missing", shard);
-                return 0;
-            }
+            latest = store.get(layout.latestKey(shard));
+        } catch (IOException e) {
+            throw new Abort("cannot read LATEST: " + e);
+        }
+        if (latest.isEmpty()) throw new Abort("LATEST is missing");
+        try {
             JsonNode node = JSON.readTree(latest.get().data());
             JsonNode g = node == null ? null : node.get("generation");
             JsonNode m = node == null ? null : node.get("manifest");
             if (g == null || !g.canConvertToLong() || g.asLong() <= 0 || m == null || !m.isTextual()) {
-                log.warn("GC of shard {} skipped: LATEST is unreadable", shard);
-                return 0;
+                throw new Abort("LATEST is unreadable");
             }
             latestGen = g.asLong();
             latestManifestKey = manifestsPrefix + m.asText();
-        } catch (IOException | RuntimeException e) {
-            log.warn("GC of shard {} skipped: cannot read LATEST: {}", shard, e.toString());
-            return 0;
+        } catch (IOException e) {
+            throw new Abort("LATEST is unreadable: " + e);
         }
 
         // 2. Complete listing and every manifest read before any delete.
@@ -101,31 +128,24 @@ public final class GenerationGc {
                 if (!o.key().startsWith(manifestsPrefix)) continue;
                 Matcher mm = MANIFEST_NAME.matcher(o.key().substring(manifestsPrefix.length()));
                 if (!mm.matches()) continue; // not a manifest we know: never touched
+                long gen = Long.parseLong(mm.group(1));
                 StoredObject obj = store.get(o.key()).orElse(null);
-                if (obj == null) {
-                    log.warn("GC of shard {} aborted: manifest {} vanished during GC", shard, o.key());
-                    return 0;
-                }
+                if (obj == null) throw new Abort("manifest " + o.key() + " vanished during GC");
                 ShardManifest parsed;
                 try {
                     parsed = ShardManifest.read(obj.data());
                 } catch (IOException e) {
-                    log.warn("GC of shard {} aborted: unparseable manifest {}: {}", shard, o.key(), e.toString());
-                    return 0;
+                    throw new Abort("unparseable manifest " + o.key() + ": " + e);
                 }
-                manifests.put(Long.parseLong(mm.group(1)),
-                        new Manifest(o.key(), Long.parseLong(mm.group(1)), o.lastModified(), parsed));
+                validate(shard, o.key(), gen, prefix, parsed);
+                manifests.put(gen, new Manifest(o.key(), gen, o.lastModified(), parsed));
             }
-        } catch (IOException | RuntimeException e) {
-            log.warn("GC of shard {} aborted: listing failed: {}", shard, e.toString());
-            return 0;
+        } catch (IOException e) {
+            throw new Abort("listing failed: " + e);
         }
         Manifest latestManifest = manifests.values().stream()
                 .filter(m -> m.key().equals(latestManifestKey)).findFirst().orElse(null);
-        if (latestManifest == null) {
-            log.warn("GC of shard {} aborted: LATEST points at missing manifest {}", shard, latestManifestKey);
-            return 0;
-        }
+        if (latestManifest == null) throw new Abort("LATEST points at missing manifest " + latestManifestKey);
 
         // 3. Decide which manifests survive.
         List<Manifest> kept = new ArrayList<>();
@@ -154,28 +174,62 @@ public final class GenerationGc {
             for (ManifestFile f : m.parsed().files()) referenced.add(f.key());
         }
 
-        // 4. Delete manifests first, then unreferenced old data.
-        int deleted = 0;
+        // 4. Delete manifests first, then unreferenced old data (each re-checked just before).
         for (Manifest m : doomed) {
-            deleted += delete(shard, m.key(), protectedKeys);
+            deleted[0] += delete(shard, m.key(), protectedKeys);
         }
         for (ObjectInfo o : objects) {
             String rel = o.key().substring(prefix.length());
             if (DATA_DIRS.stream().noneMatch(rel::startsWith)) continue;
             if (referenced.contains(o.key())) continue;
             if (!o.lastModified().isBefore(cutoff)) continue;
-            deleted += delete(shard, o.key(), protectedKeys);
+            if (!stillOld(o.key(), cutoff)) {
+                log.info("GC of shard {} kept {}: re-uploaded or removed since listing", shard, o.key());
+                continue;
+            }
+            deleted[0] += delete(shard, o.key(), protectedKeys);
         }
-        if (deleted > 0) {
+        if (deleted[0] > 0) {
             log.info("GC of shard {}: deleted {} objects ({} manifests), LATEST generation {}",
-                    shard, deleted, doomed.size(), latestGen);
+                    shard, deleted[0], doomed.size(), latestGen);
         }
-        return deleted;
+    }
+
+    /** Rejects manifests that parse leniently but cannot be trusted to list their references. */
+    private static void validate(ShardId shard, String key, long keyGen, String prefix, ShardManifest m)
+            throws Abort {
+        if (m.formatVersion() != ShardManifest.FORMAT_VERSION) {
+            throw new Abort("manifest " + key + " has unsupported formatVersion " + m.formatVersion());
+        }
+        if (m.generation() != keyGen) {
+            throw new Abort("manifest " + key + " has generation " + m.generation() + ", expected " + keyGen);
+        }
+        if (!shard.value().equals(m.shard())) {
+            throw new Abort("manifest " + key + " belongs to shard " + m.shard());
+        }
+        if (m.files().isEmpty()) throw new Abort("manifest " + key + " lists no files");
+        for (ManifestFile f : m.files()) {
+            if (f == null || f.key() == null || f.key().isBlank() || !f.key().startsWith(prefix)) {
+                throw new Abort("manifest " + key + " has an invalid file entry " + f);
+            }
+        }
     }
 
     private static boolean isYoung(Manifest m, Instant cutoff) {
         Instant created = m.parsed().createdAt();
         return !m.lastModified().isBefore(cutoff) || (created != null && !created.isBefore(cutoff));
+    }
+
+    /** Re-reads one key's lastModified; false if gone, now young, or unreadable. */
+    private boolean stillOld(String key, Instant cutoff) throws Abort {
+        List<ObjectInfo> current;
+        try {
+            current = store.list(key);
+        } catch (IOException e) {
+            throw new Abort("re-check of " + key + " failed: " + e);
+        }
+        return current.stream().filter(o -> o.key().equals(key)).findFirst()
+                .map(o -> o.lastModified().isBefore(cutoff)).orElse(false);
     }
 
     private int delete(ShardId shard, String key, Set<String> protectedKeys) {
