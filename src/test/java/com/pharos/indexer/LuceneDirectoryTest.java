@@ -16,8 +16,25 @@ class LuceneDirectoryTest {
 
     @Test
     void indexesAreOpenedWithMMapDirectory() throws Exception {
-        try (Directory dir = LuceneIndexer.openDirectory(tmp)) {
+        try (LuceneIndexer indexer = new LuceneIndexer(com.pharos.config.IndexConfig.defaults());
+             Directory dir = indexer.openDirectory(tmp)) {
+            assertThat(indexer.directoryFactory()).isSameAs(LuceneDirectoryFactory.DEFAULT);
             assertThat(dir).isInstanceOf(MMapDirectory.class);
         }
+    }
+
+    @Test
+    void directoriesAreOpenedThroughTheInstalledFactory() throws Exception {
+        java.util.List<Path> opened = new java.util.ArrayList<>();
+        try (LuceneIndexer indexer = new LuceneIndexer(com.pharos.config.IndexConfig.defaults())) {
+            indexer.setDirectoryFactory(p -> {
+                opened.add(p);
+                return new org.apache.lucene.store.ByteBuffersDirectory();
+            });
+            try (Directory dir = indexer.openDirectory(tmp)) {
+                assertThat(dir).isInstanceOf(org.apache.lucene.store.ByteBuffersDirectory.class);
+            }
+        }
+        assertThat(opened).containsExactly(tmp);
     }
 }

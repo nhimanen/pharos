@@ -35,8 +35,16 @@ public final class SyncLock implements Closeable {
      * @throws IOException when the lock file cannot be created or opened
      */
     public static Optional<SyncLock> tryAcquire(Path cacheDir) throws IOException {
-        Files.createDirectories(cacheDir);
-        FileChannel ch = FileChannel.open(cacheDir.resolve(FILE),
+        return tryAcquire(cacheDir, FILE);
+    }
+
+    /**
+     * The same exclusive lock on {@code <dir>/<fileName>}, for other single-process resources of a
+     * cache dir (the reader's block cache).
+     */
+    public static Optional<SyncLock> tryAcquire(Path dir, String fileName) throws IOException {
+        Files.createDirectories(dir);
+        FileChannel ch = FileChannel.open(dir.resolve(fileName),
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         FileLock lock;
         try {

@@ -425,6 +425,15 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
 - Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv` (set both or neither; a named variable that is unset or empty is an error, not a silent fallback), or, when neither is configured, the AWS default credential chain. Use `"pathStyle": true` for MinIO.
 - `nodeId` defaults to the host name. `pollIntervalSeconds` must be positive, `retentionMinutes` non-negative, `retentionGenerations` at least 2, and `prefix` must not start with `/` or contain `.`/`..` segments.
 - The writer keeps the newest `retentionGenerations` generations, and anything younger than `retentionMinutes`; older ones are garbage-collected after a publish.
+- Readers serve a generation **lazily** by default: only the manifest, the graph and the small Lucene files (`segments_N`, `.si`, `.fnm`, `.cfe`, and any file up to `eagerMaxBytes`) are downloaded; every other file is read in blocks of `blockSizeBytes` through a local block cache in `<cacheDir>/.blocks`, capped at `cacheMaxBytes` (least recently used blocks are evicted). Before a new generation is swapped in, the blocks of the `prefetchExtensions` files (term dictionaries, vector graphs) are prefetched, waiting at most `prefetchTimeoutSeconds`. `"mode": "full"` copies every file instead. The optional `cluster.reader` section, with its defaults:
+
+  ```json
+  "reader": {"mode": "lazy", "cacheMaxBytes": 8589934592, "blockSizeBytes": 8388608, "eagerMaxBytes": 1048576,
+             "prefetchExtensions": ["tip", "tmd", "tim", "vex", "vem"], "prefetchTimeoutSeconds": 30,
+             "maxConcurrentFetches": 16}
+  ```
+
+  `blockSizeBytes` must be a power of two between 64 KiB and 64 MiB, and `cacheMaxBytes` at least four blocks.
 - If publishing fails at the end of an index run (store unreachable, bad credentials), the local index is kept and `pharos index` exits with code **3**. Retry the upload without re-indexing:
 
   ```bash

@@ -3,6 +3,7 @@ package com.pharos.cluster;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.cluster.warm.LazyGenerations;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import com.pharos.indexer.LuceneIndexer;
@@ -38,8 +39,15 @@ import java.util.regex.Pattern;
  * syncer and follows the registry the holder maintains (re-activating every poll interval, and
  * taking over the lock once the holder is gone).
  *
- * <p>{@link #close} stops the syncer, releases the lock and closes the backend (object-store
- * clients); it is idempotent.
+ * <p>Readers in {@code cluster.reader.mode} {@code lazy} (the default) install a
+ * {@link LazyGenerations} as the {@link LuceneIndexer}'s directory factory before anything is
+ * activated: lazy generation dirs open as remote directories over the block cache, every other dir
+ * as before. A full-mode reader, and every other role, keeps the default factory and never builds a
+ * Phase 2 class. A full-mode reader does not activate lazy generation dirs found on disk (the syncer
+ * materialises them again).
+ *
+ * <p>{@link #close} stops the syncer, releases the lock, closes the block cache and the backend
+ * (object-store clients); it is idempotent.
  */
 public final class ClusterRuntime implements Closeable {
 
@@ -50,6 +58,8 @@ public final class ClusterRuntime implements Closeable {
     private final ReplicationBackend backend;
     private final ProjectRegistry registry;
     private final LuceneIndexer luceneIndexer;
+    /** Lazy mode on a reader; null otherwise. */
+    private final LazyGenerations lazy;
     private final CountDownLatch firstSync = new CountDownLatch(1);
     /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -68,6 +78,12 @@ public final class ClusterRuntime implements Closeable {
         this.backend = Objects.requireNonNull(backend, "backend");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.luceneIndexer = Objects.requireNonNull(luceneIndexer, "luceneIndexer");
+        if (isReader() && config.getCluster().getReader().isLazy()) {
+            lazy = new LazyGenerations(cacheDir(), config.getCluster().getReader(), backend.source());
+            luceneIndexer.setDirectoryFactory(lazy);
+        } else {
+            lazy = null;
+        }
         if (isReader() && backend.localCache() instanceof ReaderLocalCache) {
             try {
                 activateRegistered();
@@ -94,6 +110,11 @@ public final class ClusterRuntime implements Closeable {
      */
     public static void applySourceReadPolicy(IndexConfig config) {
         SourceReader.setEnabled(config.getCluster().getRole() != NodeRole.READER);
+    }
+
+    /** Lazy mode's directory factory and block cache; null unless this is a lazy reader. */
+    LazyGenerations lazyGenerations() {
+        return lazy;
     }
 
     public IndexPublisher publisher() {
@@ -174,7 +195,7 @@ public final class ClusterRuntime implements Closeable {
         syncLock = lock;
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
-                Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()));
+                Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);
@@ -303,18 +324,20 @@ public final class ClusterRuntime implements Closeable {
         return changed;
     }
 
-    private static boolean completeGeneration(Path dir) {
+    /** A materialised generation dir this reader can serve (a lazy one only in lazy mode). */
+    private boolean completeGeneration(Path dir) {
         return GEN_DIR.matcher(dir.getFileName().toString()).matches()
                 && Files.isDirectory(dir.resolve(ReplicaSyncer.LUCENE_DIR))
-                && Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE));
+                && Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE))
+                && (lazy != null || !LazyGenerations.isLazy(dir));
     }
 
     /** The highest-numbered complete generation dir of a shard whose index format this build serves. */
-    private static Optional<Path> newestServableGeneration(Path shardRoot) {
+    private Optional<Path> newestServableGeneration(Path shardRoot) {
         if (!Files.isDirectory(shardRoot)) return Optional.empty();
         try (var s = Files.list(shardRoot)) {
             return s.map(p -> p.toAbsolutePath().normalize())
-                    .filter(ClusterRuntime::completeGeneration)
+                    .filter(this::completeGeneration)
                     .filter(p -> IndexFormat.servable(IndexFormat.status(p)))
                     .max(java.util.Comparator.comparingLong(
                             p -> Long.parseLong(p.getFileName().toString().substring("gen-".length()))));
@@ -387,6 +410,7 @@ public final class ClusterRuntime implements Closeable {
                 log.warn("Releasing the sync lock failed: {}", e.toString());
             }
         }
+        if (lazy != null) lazy.close();
         try {
             backend.close();
         } catch (IOException | RuntimeException e) {

@@ -8,6 +8,7 @@ import com.pharos.cluster.objectstore.ObjectStoreLayout;
 import com.pharos.cluster.objectstore.ObjectStorePublisher;
 import com.pharos.cluster.objectstore.ObjectStoreReplicaSource;
 import com.pharos.cluster.objectstore.ShardManifest;
+import com.pharos.cluster.warm.LazyGenerations;
 import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
@@ -41,6 +42,7 @@ import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/** Full mode (Phase 1); {@link LazyModeReplicaSyncerTest} runs every case again in lazy mode. */
 class ReplicaSyncerTest {
 
     private static final String PROJECT = "sample-app";
@@ -61,6 +63,13 @@ class ReplicaSyncerTest {
     private ReaderLocalCache cache;
     private ProjectRegistry readerRegistry;
     private ReplicaSyncer syncer;
+    /** Lazy mode's directory factory and block cache; null in full mode. */
+    LazyGenerations lazy;
+
+    /** The lazy-mode hook for the syncers of this test; null runs full mode. */
+    LazyGenerations lazyGenerations(Path cacheDir, ReplicaSource source) {
+        return null;
+    }
 
     @BeforeEach
     void setUp() throws IOException {
@@ -88,13 +97,15 @@ class ReplicaSyncerTest {
         readerSynonyms = tmp.resolve("reader-home").resolve("synonyms.txt");
         cache = new ReaderLocalCache(cacheDir);
         readerRegistry = ProjectRegistry.at(tmp.resolve("reader-registry.json"));
+        lazy = lazyGenerations(cacheDir, new ObjectStoreReplicaSource(store, layout));
         syncer = new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout), cache,
-                readerRegistry, cacheDir, readerSynonyms, Duration.ofSeconds(10));
+                readerRegistry, cacheDir, readerSynonyms, Duration.ofSeconds(10), lazy);
     }
 
     @AfterEach
     void tearDown() {
         syncer.close();
+        if (lazy != null) lazy.close();
     }
 
     private ProjectIndexManager writerManager(IndexPublisher pub) {
@@ -163,6 +174,7 @@ class ReplicaSyncerTest {
         assertThat(numDocs(genDir(1).resolve("lucene"))).isEqualTo(writerDocs).isPositive();
         assertThat(genDir(1).resolve(GraphViews.COMPACT_FILE)).isRegularFile();
         assertThat(genDir(1).resolve("manifest.json")).isRegularFile();
+        assertThat(Files.exists(genDir(1).resolve(LazyGenerations.MARKER))).as("lazy marker").isEqualTo(lazy != null);
         assertThat(cache.active(PROJECT)).contains(genDir(1));
         assertThat(cache.shardDir(PROJECT)).isEqualTo(genDir(1));
         ProjectMeta meta = readerRegistry.find(PROJECT).orElseThrow();
@@ -354,7 +366,7 @@ class ReplicaSyncerTest {
             @Override public java.util.Optional<byte[]> synonyms() throws IOException { throw new IOException("synonyms unreadable"); }
         };
         try (ReplicaSyncer s = new ReplicaSyncer(catalog, failingSynonyms, cache, readerRegistry, cacheDir,
-                readerSynonyms, Duration.ofSeconds(10))) {
+                readerSynonyms, Duration.ofSeconds(10), lazy)) {
             s.syncOnce(); // logged, not thrown
             assertThat(s.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
         }
@@ -448,7 +460,7 @@ class ReplicaSyncerTest {
 
         ReaderLocalCache freshCache = new ReaderLocalCache(cacheDir);
         try (ReplicaSyncer restarted = new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout),
-                freshCache, readerRegistry, cacheDir, readerSynonyms, Duration.ofSeconds(10))) {
+                freshCache, readerRegistry, cacheDir, readerSynonyms, Duration.ofSeconds(10), lazy)) {
             restarted.syncOnce();
             assertThat(restarted.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
             assertThat(freshCache.active(PROJECT)).contains(genDir(1));
@@ -482,7 +494,7 @@ class ReplicaSyncerTest {
     void startPollsInBackground() throws Exception {
         publishFull();
         try (ReplicaSyncer polling = new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout),
-                new ReaderLocalCache(cacheDir), readerRegistry, cacheDir, readerSynonyms, Duration.ofMillis(50))) {
+                new ReaderLocalCache(cacheDir), readerRegistry, cacheDir, readerSynonyms, Duration.ofMillis(50), lazy)) {
             polling.start();
             long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
             while (polling.served().isEmpty() && System.nanoTime() < deadline) {
@@ -641,7 +653,7 @@ class ReplicaSyncerTest {
 
     private ReplicaSyncer syncerWith(ProjectRegistry registry) {
         return new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout), cache,
-                registry, cacheDir, readerSynonyms, Duration.ofSeconds(10));
+                registry, cacheDir, readerSynonyms, Duration.ofSeconds(10), lazy);
     }
 
     @Test

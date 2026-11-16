@@ -2,6 +2,7 @@ package com.pharos.cluster;
 
 import com.pharos.cluster.objectstore.ManifestFile;
 import com.pharos.cluster.objectstore.ShardManifest;
+import com.pharos.cluster.warm.LazyGenerations;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.GraphViews;
@@ -78,6 +79,17 @@ import java.util.zip.CheckedInputStream;
  * <p>If {@code LATEST} names a generation below the served one (the bucket was wiped, or the
  * shard rolled back), a WARN names both and the published generation is served as a new lineage:
  * it is materialised and activated, and the old lineage's directories are pruned.
+ *
+ * <p><b>Lazy mode</b> (a {@link LazyGenerations} is given): only the eager Lucene files
+ * ({@link LazyGenerations#eager}) are downloaded (or hard-linked) and checksummed, the graph as
+ * before; the stamp, the manifest and the {@value LazyGenerations#MARKER} marker are written; then
+ * the blocks of the {@code prefetchExtensions} files are prefetched, waiting at most
+ * {@code prefetchTimeoutSeconds} (after which a WARN is logged and the generation is activated
+ * anyway, the prefetch going on in the background); only then is the dir moved to {@code gen-N},
+ * registered and activated. The previous generation serves meanwhile. A lazy dir is adopted on
+ * restart like a full one, except by a full-mode syncer, which materialises it again in full.
+ * Remote files are not checksummed when the generation is opened; their lengths come from the
+ * manifest.
  */
 public class ReplicaSyncer implements Closeable {
 
@@ -97,6 +109,8 @@ public class ReplicaSyncer implements Closeable {
     private final Path cacheDir;
     private final Path synonymsFile;
     private final Duration pollInterval;
+    /** Lazy mode; null in full mode. */
+    private final LazyGenerations lazy;
 
     private final Map<ShardId, Generation> served = new ConcurrentHashMap<>();
     /** Generation last registered per shard; re-tried when it lags {@link #served}. */
@@ -113,6 +127,17 @@ public class ReplicaSyncer implements Closeable {
      */
     public ReplicaSyncer(ShardCatalog catalog, ReplicaSource source, ReaderLocalCache cache,
                          ProjectRegistry registry, Path cacheDir, Path synonymsFile, Duration pollInterval) {
+        this(catalog, source, cache, registry, cacheDir, synonymsFile, pollInterval, null);
+    }
+
+    /**
+     * @param lazy lazy mode's eager-file rule, prefetch and block cache (owned by the caller); null
+     *             materialises every file (full mode)
+     */
+    public ReplicaSyncer(ShardCatalog catalog, ReplicaSource source, ReaderLocalCache cache,
+                         ProjectRegistry registry, Path cacheDir, Path synonymsFile, Duration pollInterval,
+                         LazyGenerations lazy) {
+        this.lazy = lazy;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.source = Objects.requireNonNull(source, "source");
         this.cache = Objects.requireNonNull(cache, "cache");
@@ -232,7 +257,9 @@ public class ReplicaSyncer implements Closeable {
         Files.createDirectories(shardRoot);
         deletePartials(shardRoot);
         Path genDir = shardRoot.resolve("gen-" + gen.value());
-        if (Files.isDirectory(genDir) && sameManifest(genDir, manifestJson)) {
+        // A full-mode reader can't serve a lazy dir: it materialises the generation again.
+        if (Files.isDirectory(genDir) && sameManifest(genDir, manifestJson)
+                && (lazy != null || !LazyGenerations.isLazy(genDir))) {
             log.info("Shard {}: adopting complete generation {} found in {}", shard, gen.value(), genDir);
             // materialised by a build that did not write the stamp yet
             if (!Files.exists(genDir.resolve(IndexFormat.FILE_NAME))) writeFormatStamp(genDir, manifest);
@@ -315,10 +342,16 @@ public class ReplicaSyncer implements Closeable {
         Files.createDirectories(lucene);
         Map<String, Path> reusable = reusableLuceneFiles(shard);
         Set<String> downloadedLucene = new HashSet<>();
-        int linked = 0, downloaded = 0;
+        Set<String> localLucene = new HashSet<>();
+        int linked = 0, downloaded = 0, remote = 0;
         for (ManifestFile f : manifest.files()) {
             switch (f.role()) {
                 case ManifestFile.LUCENE -> {
+                    if (lazy != null && !lazy.eager(f)) {
+                        remote++; // read through the block cache on demand
+                        continue;
+                    }
+                    localLucene.add(f.name());
                     Path target = lucene.resolve(f.name());
                     if (link(reusable.get(f.key()), target, f)) {
                         linked++;
@@ -339,12 +372,55 @@ public class ReplicaSyncer implements Closeable {
                 default -> { } // refs are not needed by readers; unknown roles are ignored
             }
         }
-        checkLuceneChecksums(lucene, manifest, downloadedLucene);
+        checkLuceneChecksums(lucene, manifest, localLucene, downloadedLucene);
         writeFormatStamp(partial, manifest);
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
+        if (lazy != null) {
+            Files.write(partial.resolve(LazyGenerations.MARKER), new byte[0]);
+            prefetch(shard, gen, manifest);
+        }
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
-        log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded) in {} ms",
-                shard, gen.value(), linked, downloaded, (System.nanoTime() - startNanos) / 1_000_000);
+        if (lazy == null) {
+            log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded) in {} ms",
+                    shard, gen.value(), linked, downloaded, (System.nanoTime() - startNanos) / 1_000_000);
+        } else {
+            log.info("Shard {}: materialised lazy generation {} ({} files hard-linked, {} downloaded, {} Lucene files"
+                    + " remote) in {} ms", shard, gen.value(), linked, downloaded, remote,
+                    (System.nanoTime() - startNanos) / 1_000_000);
+        }
+    }
+
+    /**
+     * Lazy mode: prefetches the generation's {@code prefetchExtensions} blocks, waiting at most the
+     * prefetch timeout. Neither a timeout nor a failed prefetch stops the activation: the blocks
+     * are fetched when a query first needs them.
+     */
+    private void prefetch(ShardId shard, Generation gen, ShardManifest manifest) throws IOException {
+        Duration timeout = lazy.prefetchTimeout();
+        long start = System.nanoTime();
+        LazyGenerations.Prefetch p = lazy.prefetch(manifest);
+        if (p.blocks() == 0) return;
+        if (timeout.isZero()) { // configured not to wait
+            log.info("Shard {}: prefetching {} blocks of generation {} in the background", shard, p.blocks(),
+                    gen.value());
+            return;
+        }
+        try {
+            p.done().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            log.info("Shard {}: prefetched {} blocks ({} bytes) of generation {} in {} ms", shard, p.blocks(),
+                    p.bytes(), gen.value(), (System.nanoTime() - start) / 1_000_000);
+        } catch (java.util.concurrent.TimeoutException e) {
+            log.warn("Shard {}: the prefetch of generation {} ({} blocks, {} bytes) did not finish within {} s;"
+                    + " activating it anyway (the prefetch goes on in the background)", shard, gen.value(),
+                    p.blocks(), p.bytes(), timeout.toSeconds());
+        } catch (java.util.concurrent.ExecutionException e) {
+            log.warn("Shard {}: the prefetch of generation {} failed; activating it anyway (blocks are fetched"
+                    + " when first read): {}", shard, gen.value(), String.valueOf(e.getCause()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new java.io.InterruptedIOException("interrupted prefetching generation " + gen.value()
+                    + " of shard " + shard);
+        }
     }
 
     /** Key → file of the active generation, from its {@code manifest.json}; empty if unreadable. */
@@ -406,13 +482,14 @@ public class ReplicaSyncer implements Closeable {
     /**
      * Downloaded Lucene files are checksummed end to end ({@link CodecUtil#checksumEntireFile}
      * throws when the body does not match the footer); hard-linked ones have their footer read.
-     * Either checksum must match the manifest, and the commit must be readable.
+     * Either checksum must match the manifest, and the commit must be readable. Only the files in
+     * {@code local} are checked (lazy mode leaves the others remote).
      */
-    private static void checkLuceneChecksums(Path lucene, ShardManifest manifest, Set<String> downloaded)
-            throws IOException {
+    private static void checkLuceneChecksums(Path lucene, ShardManifest manifest, Set<String> local,
+                                             Set<String> downloaded) throws IOException {
         try (Directory dir = FSDirectory.open(lucene)) {
             for (ManifestFile f : manifest.files()) {
-                if (!ManifestFile.LUCENE.equals(f.role())) continue;
+                if (!ManifestFile.LUCENE.equals(f.role()) || !local.contains(f.name())) continue;
                 long actual;
                 try (IndexInput in = dir.openInput(f.name(), IOContext.READONCE)) {
                     actual = downloaded.contains(f.name())

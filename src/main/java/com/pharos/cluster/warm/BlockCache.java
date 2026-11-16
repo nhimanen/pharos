@@ -815,6 +815,16 @@ public final class BlockCache implements Closeable {
         }
     }
 
+    /** True when block {@code key} is in the cache now (on disk); in-flight fetches don't count. */
+    public boolean isCached(BlockKey key) {
+        String id = objectHash(key.objectKey()) + "/" + key.index();
+        synchronized (lock) {
+            return entries.containsKey(id);
+        }
+    }
+
+    public Path dir() { return dir; }
+
     public long maxBytes() { return maxBytes; }
 
     public int blockSize() { return blockSize; }

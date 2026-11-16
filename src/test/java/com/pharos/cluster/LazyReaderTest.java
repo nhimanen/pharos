@@ -1,0 +1,420 @@
+package com.pharos.cluster;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.pharos.cluster.objectstore.InMemoryObjectStore;
+import com.pharos.cluster.objectstore.ManifestFile;
+import com.pharos.cluster.objectstore.ObjectStoreCatalog;
+import com.pharos.cluster.objectstore.ObjectStoreLayout;
+import com.pharos.cluster.objectstore.ObjectStoreReplicaSource;
+import com.pharos.cluster.objectstore.ShardManifest;
+import com.pharos.cluster.objectstore.TestBackends;
+import com.pharos.cluster.warm.BlockCache;
+import com.pharos.cluster.warm.BlockKey;
+import com.pharos.cluster.warm.LazyGenerations;
+import com.pharos.cluster.warm.RemoteDirectory;
+import com.pharos.config.ClusterConfig;
+import com.pharos.config.IndexConfig;
+import com.pharos.config.ProjectMeta;
+import com.pharos.config.ProjectRegistry;
+import com.pharos.embedding.EmbeddingProvider;
+import com.pharos.graph.GraphViews;
+import com.pharos.indexer.LuceneDirectoryFactory;
+import com.pharos.indexer.LuceneIndexer;
+import com.pharos.search.SearchEngine;
+import com.pharos.search.SearchRequest;
+import com.pharos.search.SearchResult;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.TieredMergePolicy;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+import static com.pharos.cluster.ClusterFixture.JAVA;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Phase 2: reader generations served lazily through the block cache. */
+class LazyReaderTest {
+
+    private static final ShardId SHARD = new ShardId(JAVA);
+    private static final long KIB = 1024;
+    private static final long EAGER = 512;
+    private static final String BUCKET = "test-bucket";
+
+    @TempDir Path tmp;
+
+    private InMemoryObjectStore store;
+    private ObjectStoreLayout layout;
+    private ClusterFixture cluster; // the writer; its own reader is never started
+    private final List<AutoCloseable> open = new ArrayList<>();
+
+    @BeforeEach
+    void setUp() throws IOException {
+        store = new InMemoryObjectStore();
+        layout = new ObjectStoreLayout("pharos");
+        cluster = new ClusterFixture(tmp, store, store, BUCKET);
+    }
+
+    @AfterEach
+    void tearDown() throws Exception {
+        for (AutoCloseable c : open.reversed()) c.close();
+        cluster.close();
+    }
+
+    /** A reader node wired like {@code Main}, in its own home dir. */
+    private record Node(IndexConfig config, ReplicationBackend backend, ClusterRuntime runtime, LuceneIndexer lucene,
+                        SearchEngine engine) {
+        Path genDir(long gen) {
+            return config.getCluster().getCacheDir().resolve(JAVA).resolve("gen-" + gen);
+        }
+
+        void close() {
+            runtime.close();
+            lucene.close();
+        }
+    }
+
+    private Node reader(String home, Consumer<ClusterConfig.ReaderConfig> tune) {
+        IndexConfig config = ClusterFixture.config(tmp.resolve(home), NodeRole.READER, BUCKET);
+        tune.accept(config.getCluster().getReader());
+        config.getCluster().validate();
+        ReplicationBackend backend = TestBackends.objectStore(config, store);
+        ProjectRegistry registry = ClusterRuntime.registryFor(config);
+        LuceneIndexer lucene = new LuceneIndexer(config, backend.localCache());
+        ClusterRuntime runtime = new ClusterRuntime(config, backend, registry, lucene);
+        Node node = new Node(config, backend, runtime, lucene,
+                new SearchEngine(lucene, EmbeddingProvider.create(config), registry));
+        open.add(node::close);
+        return node;
+    }
+
+    private static void small(ClusterConfig.ReaderConfig r) {
+        r.setEagerMaxBytes(EAGER);
+        r.setBlockSizeBytes(64 * KIB);
+        r.setCacheMaxBytes(64 * KIB * KIB);
+    }
+
+    /**
+     * Indexes sample-app, rewrites the writer's index as one segment without compound files (so the
+     * terms dictionary is in its own .tim/.tip/.tmd files, as in a large shard) and publishes it.
+     */
+    private long publishWithoutCompoundFiles() throws IOException {
+        cluster.index(JAVA, false);
+        Path projectDir = cluster.writerLucene.getProjectIndexDir(JAVA);
+        TieredMergePolicy mp = new TieredMergePolicy();
+        mp.setNoCFSRatio(0.0);
+        IndexWriterConfig iwc = new IndexWriterConfig(LuceneIndexer.buildAnalyzer())
+                .setUseCompoundFile(false).setMergePolicy(mp);
+        try (FSDirectory d = FSDirectory.open(projectDir.resolve("lucene")); IndexWriter w = new IndexWriter(d, iwc)) {
+            w.forceMerge(1);
+            w.commit();
+        }
+        ProjectMeta meta = cluster.writerRegistry.find(JAVA).orElseThrow();
+        return cluster.writerRuntime.publisher().publish(new LocalSnapshot(JAVA, projectDir, meta, "none"))
+                .orElseThrow().value();
+    }
+
+    private void addMethodAndReindex(String method) throws IOException {
+        Path calc = cluster.source.resolve(JAVA).resolve("src/main/java/com/example/Calculator.java");
+        Files.writeString(calc, Files.readString(calc).replace("class Calculator {",
+                "class Calculator {\n    public int " + method + "(int x) { return 3 * x; }\n"));
+        Files.setLastModifiedTime(calc, FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        cluster.index(JAVA, true);
+    }
+
+    private ShardManifest manifest(long gen) throws IOException {
+        return new ObjectStoreReplicaSource(store, layout).manifest(SHARD, new Generation(gen));
+    }
+
+    private static boolean alwaysEager(String name) {
+        return name.startsWith("segments_") || name.endsWith(".si") || name.endsWith(".fnm") || name.endsWith(".cfe");
+    }
+
+    private static String extension(String name) {
+        return name.substring(name.lastIndexOf('.') + 1);
+    }
+
+    private static List<String> ids(SearchEngine engine, String query) throws IOException {
+        return engine.search(new SearchRequest(query, SearchRequest.SearchType.KEYWORD, JAVA, null, 10,
+                "text", null, null, 0)).stream().map(SearchResult::id).toList();
+    }
+
+    private static List<String> names(Path dir) throws IOException {
+        try (Stream<Path> s = Files.list(dir)) {
+            return s.map(p -> p.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void lazyGenerationHasOnlySmallFiles() throws Exception {
+        long gen = publishWithoutCompoundFiles();
+        Node lazy = reader("lazy", LazyReaderTest::small);
+        Node full = reader("full", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
+        lazy.runtime().startServing();
+        full.runtime().startServing();
+        assertThat(lazy.runtime().served()).isEqualTo(Map.of(SHARD, new Generation(gen)));
+        assertThat(full.runtime().served()).isEqualTo(Map.of(SHARD, new Generation(gen)));
+
+        Path dir = lazy.genDir(gen);
+        assertThat(names(dir)).containsExactlyInAnyOrder("manifest.json", "index-format.json",
+                GraphViews.COMPACT_FILE, LazyGenerations.MARKER, "lucene");
+        ShardManifest m = manifest(gen);
+        List<ManifestFile> remote = new ArrayList<>();
+        for (ManifestFile f : m.files()) {
+            if (!ManifestFile.LUCENE.equals(f.role())) continue;
+            Path local = dir.resolve("lucene").resolve(f.name());
+            if (alwaysEager(f.name()) || f.length() <= EAGER) {
+                assertThat(local).as(f.name()).isRegularFile().hasSize(f.length());
+            } else {
+                assertThat(local).as(f.name()).doesNotExist();
+                remote.add(f);
+            }
+        }
+        List<String> prefetch = lazy.config().getCluster().getReader().getPrefetchExtensions();
+        List<ManifestFile> prefetched = remote.stream().filter(f -> prefetch.contains(extension(f.name()))).toList();
+        assertThat(prefetched).as("remote .tim/.tip files").isNotEmpty();
+        assertThat(remote).hasSizeGreaterThan(prefetched.size());
+
+        BlockCache blocks = lazy.runtime().lazyGenerations().blockCache();
+        long bs = blocks.blockSize();
+        for (ManifestFile f : prefetched) {
+            for (long i = 0; i * bs < f.length(); i++) {
+                assertThat(blocks.isCached(new BlockKey(f.key(), i))).as("%s block %d", f.name(), i).isTrue();
+            }
+        }
+
+        // The full-mode reader of the same generation: every file local, no marker.
+        assertThat(full.genDir(gen).resolve(LazyGenerations.MARKER)).doesNotExist();
+        assertThat(full.lucene().directoryFactory()).isSameAs(LuceneDirectoryFactory.DEFAULT);
+        int withHits = 0;
+        for (String q : List.of("Calculator", "greeting service", "add two numbers", "user email",
+                "division by zero", "getName", "absolute value")) {
+            List<String> want = ids(full.engine(), q);
+            assertThat(ids(lazy.engine(), q)).as(q).isEqualTo(want);
+            if (!want.isEmpty()) withHits++;
+        }
+        assertThat(withHits).isGreaterThan(3);
+    }
+
+    /** Review Focus 5: a swap and a prune never pull bytes from under an in-flight read. */
+    @Test
+    void swapDuringReadKeepsOldGenerationReadable() throws Exception {
+        long g1 = publishWithoutCompoundFiles();
+        Node node = reader("lazy", r -> {
+            r.setEagerMaxBytes(0);
+            r.setBlockSizeBytes(64 * KIB);
+            r.setCacheMaxBytes(4 * 64 * KIB); // the minimum: generations compete for the cache
+        });
+        node.runtime().startServing();
+        LazyGenerations lazy = node.runtime().lazyGenerations();
+
+        Directory d1 = lazy.open(node.genDir(g1).resolve("lucene"));
+        assertThat(d1).isInstanceOf(RemoteDirectory.class);
+        DirectoryReader old = DirectoryReader.open(d1);
+        int docs = new IndexSearcher(old).count(new MatchAllDocsQuery());
+        String doc0 = old.storedFields().document(0).toString();
+        ManifestFile big = manifest(g1).files().stream()
+                .filter(f -> ManifestFile.LUCENE.equals(f.role()) && !alwaysEager(f.name()))
+                .max(Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+        byte[] expected = store.get(big.key()).orElseThrow().data();
+        IndexInput in = d1.openInput(big.name(), IOContext.DEFAULT);
+        byte[] got = new byte[expected.length];
+        int half = expected.length / 2;
+        in.readBytes(got, 0, half);
+
+        addMethodAndReindex("triple");
+        node.runtime().syncNow();
+        addMethodAndReindex("quadruple");
+        node.runtime().syncNow();
+        assertThat(node.runtime().served()).isEqualTo(Map.of(SHARD, new Generation(g1 + 2)));
+        assertThat(node.genDir(g1)).as("generation %d pruned", g1).doesNotExist();
+        assertThat(ids(node.engine(), "triple")).isNotEmpty();
+        assertThat(ids(node.engine(), "Calculator")).isNotEmpty();
+        // Fill the (4-block) cache with other objects: every unleased block of generation g1 is evicted.
+        BlockCache blocks = lazy.blockCache();
+        long fetchedBefore = blocks.stats().bytesFetched();
+        for (int i = 0; i < 5; i++) {
+            blocks.acquire(new BlockKey("filler-" + i, 0), blocks.blockSize(),
+                    (key, offset, length, target) -> Files.write(target, new byte[(int) length])).close();
+        }
+        assertThat(blocks.isCached(new BlockKey(big.key(), 0))).isFalse();
+        assertThat(blocks.stats().evictions()).isPositive();
+
+        in.readBytes(got, half, expected.length - half);
+        assertThat(got).isEqualTo(expected);
+        assertThat(new IndexSearcher(old).count(new MatchAllDocsQuery())).isEqualTo(docs);
+        assertThat(old.storedFields().document(0).toString()).isEqualTo(doc0);
+        assertThat(blocks.stats().bytesFetched() - fetchedBefore)
+                .as("evicted blocks of the old generation fetched again")
+                .isGreaterThan(5L * blocks.blockSize());
+        in.close();
+        old.close();
+        d1.close();
+        assertThat(blocks.stats().leasesOpen()).isZero();
+    }
+
+    @Test
+    void prefetchTimeoutActivatesAnyway() throws Exception {
+        long gen = publishWithoutCompoundFiles();
+        CountDownLatch release = new CountDownLatch(1);
+        ReplicaSource real = new ObjectStoreReplicaSource(store, layout);
+        ReplicaSource slow = new SlowRanges(real, release);
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        rc.setPrefetchTimeoutSeconds(1);
+        Path cacheDir = tmp.resolve("slow-cache");
+        ReaderLocalCache cache = new ReaderLocalCache(cacheDir);
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ReplicaSyncer.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        try (LazyGenerations lazy = new LazyGenerations(cacheDir, rc, slow);
+             ReplicaSyncer syncer = new ReplicaSyncer(new ObjectStoreCatalog(store, layout), slow, cache,
+                     ProjectRegistry.at(tmp.resolve("slow-registry.json")), cacheDir, null,
+                     Duration.ofSeconds(10), lazy)) {
+            long start = System.nanoTime();
+            syncer.syncOnce();
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            release.countDown();
+
+            assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(gen)));
+            assertThat(cache.active(JAVA)).contains(cacheDir.resolve(JAVA).resolve("gen-" + gen));
+            assertThat(millis).isBetween(900L, 20_000L);
+        } finally {
+            release.countDown();
+            logger.detachAppender(log);
+        }
+        assertThat(log.list.stream().filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage))
+                .anySatisfy(m -> assertThat(m).contains(JAVA, "generation " + gen, "prefetch", "1 s",
+                        "activating it anyway"));
+    }
+
+    @Test
+    void singleNodeNeverBuildsRemoteClasses() throws Exception {
+        IndexConfig config = IndexConfig.defaults();
+        config.setIndexDir(tmp.resolve("single").resolve("indexes"));
+        assertThat(config.getCluster().getRole()).isEqualTo(NodeRole.ALL);
+        ReplicationBackend backend = Backends.create(config);
+        try (LuceneIndexer lucene = new LuceneIndexer(config, backend.localCache());
+             ClusterRuntime runtime = new ClusterRuntime(config, backend,
+                     ProjectRegistry.at(tmp.resolve("single").resolve("registry.json")), lucene)) {
+            runtime.startServing(); // a no-op off readers
+            assertThat(lucene.directoryFactory()).isSameAs(LuceneDirectoryFactory.DEFAULT);
+            assertThat(runtime.lazyGenerations()).isNull();
+        }
+
+        Node full = reader("full", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
+        assertThat(full.lucene().directoryFactory()).isSameAs(LuceneDirectoryFactory.DEFAULT);
+        assertThat(full.runtime().lazyGenerations()).isNull();
+    }
+
+    /** One block cache dir per process: a second one on the cache dir gets a private, temporary one. */
+    @Test
+    void secondProcessGetsAPrivateBlockCache() throws Exception {
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        Path cacheDir = tmp.resolve("shared-cache");
+        ReplicaSource source = new ObjectStoreReplicaSource(store, layout);
+        try (LazyGenerations first = new LazyGenerations(cacheDir, rc, source)) {
+            first.blockCache();
+            assertThat(first.blockCacheDir()).isEqualTo(cacheDir.resolve(LazyGenerations.BLOCKS_DIR));
+            Path privateDir;
+            try (LazyGenerations second = new LazyGenerations(cacheDir, rc, source)) {
+                second.blockCache();
+                privateDir = second.blockCacheDir();
+                assertThat(privateDir.getParent()).isEqualTo(cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR));
+                assertThat(privateDir).isDirectory();
+            }
+            assertThat(privateDir).doesNotExist();
+        }
+    }
+
+    /** Switching a reader from lazy to full re-materialises the generation instead of serving a stub. */
+    @Test
+    void fullModeRematerialisesALazyGeneration() throws Exception {
+        long gen = publishWithoutCompoundFiles();
+        Node lazy = reader("switch", LazyReaderTest::small);
+        lazy.runtime().startServing();
+        assertThat(lazy.genDir(gen).resolve(LazyGenerations.MARKER)).exists();
+        List<String> want = ids(lazy.engine(), "Calculator");
+        lazy.close();
+
+        Node full = reader("switch", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
+        assertThat(((ReaderLocalCache) full.backend().localCache()).active(JAVA))
+                .as("a lazy dir is not activated in full mode").isEmpty();
+        full.runtime().startServing();
+        assertThat(full.genDir(gen).resolve(LazyGenerations.MARKER)).doesNotExist();
+        for (ManifestFile f : manifest(gen).files()) {
+            if (ManifestFile.LUCENE.equals(f.role())) {
+                assertThat(full.genDir(gen).resolve("lucene").resolve(f.name())).hasSize(f.length());
+            }
+        }
+        assertThat(ids(full.engine(), "Calculator")).isEqualTo(want).isNotEmpty();
+    }
+
+    /** Ranged reads (prefetch and block fetches) wait for {@code release}; whole-file downloads do not. */
+    private static final class SlowRanges implements ReplicaSource {
+        private final ReplicaSource d;
+        private final CountDownLatch release;
+
+        SlowRanges(ReplicaSource d, CountDownLatch release) {
+            this.d = d;
+            this.release = release;
+        }
+
+        private void await() throws IOException {
+            try {
+                if (!release.await(30, TimeUnit.SECONDS)) throw new IOException("never released");
+            } catch (InterruptedException e) {
+                throw new InterruptedIOException();
+            }
+        }
+
+        @Override public Optional<Generation> latest(ShardId shard) throws IOException { return d.latest(shard); }
+        @Override public ShardManifest manifest(ShardId shard, Generation gen) throws IOException {
+            return d.manifest(shard, gen);
+        }
+        @Override public void download(ManifestFile file, Path target) throws IOException { d.download(file, target); }
+        @Override public void downloadRange(ManifestFile file, long offset, long length, Path target)
+                throws IOException {
+            await();
+            d.downloadRange(file, offset, length, target);
+        }
+        @Override public InputStream openRange(ManifestFile file, long offset, long length) throws IOException {
+            await();
+            return d.openRange(file, offset, length);
+        }
+        @Override public Optional<byte[]> synonyms() throws IOException { return d.synonyms(); }
+    }
+}
