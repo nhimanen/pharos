@@ -65,4 +65,53 @@ class EmbeddingProviderConfigTest {
         d.setPooling(Pooling.CLS);
         d.validate();
     }
+
+    private static IndexConfig loadWith(EmbeddingProviderConfig parent) throws Exception {
+        java.nio.file.Path home = java.nio.file.Files.createTempDirectory("pharos-fb");
+        IndexConfig c = IndexConfig.defaults();
+        c.setEmbeddingProviders(new java.util.ArrayList<>(java.util.List.of(parent)));
+        // validateFallbacks is private; exercise it through the public inherit/validate path
+        for (EmbeddingProviderConfig p : c.getEmbeddingProviders()) {
+            p.validate();
+            for (EmbeddingProviderConfig fb : p.getFallbacks()) fb.inheritRuntimeSettings(p);
+            for (EmbeddingProviderConfig fb : p.getFallbacks()) fb.validate();
+        }
+        return c;
+    }
+
+    @Test
+    void fallback_inheritsParentPoolingAndPrefixes() throws Exception {
+        EmbeddingProviderConfig parent = base("djl");
+        parent.setPooling(Pooling.CLS);
+        parent.setQueryPrefix("q: ");
+        parent.setDocumentPrefix("d: ");
+        EmbeddingProviderConfig fb = base("djl");
+        parent.getFallbacks().add(fb);
+        loadWith(parent);
+        assertThat(fb.getPooling()).isEqualTo(Pooling.CLS);
+        assertThat(fb.getQueryPrefix()).isEqualTo("q: ");
+        assertThat(fb.getDocumentPrefix()).isEqualTo("d: ");
+    }
+
+    @Test
+    void fallback_conflictingExplicitSetting_isRejectedNamingTheModel() {
+        EmbeddingProviderConfig parent = base("djl");
+        parent.setQueryPrefix("q: ");
+        EmbeddingProviderConfig fb = base("djl");
+        fb.setQueryPrefix("other: ");
+        parent.getFallbacks().add(fb);
+        assertThatThrownBy(() -> loadWith(parent))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("my-model").hasMessageContaining("queryPrefix");
+    }
+
+    @Test
+    void openAiFallback_underClsParent_isRejected() {
+        EmbeddingProviderConfig parent = base("djl");
+        parent.setPooling(Pooling.CLS);
+        parent.getFallbacks().add(base("openai"));
+        assertThatThrownBy(() -> loadWith(parent))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("my-model").hasMessageContaining("pooling");
+    }
 }

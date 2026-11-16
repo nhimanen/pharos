@@ -189,6 +189,10 @@ public interface EmbeddingProvider {
         for (int i = 0; i < candidates.size(); i++) {
             EmbeddingProviderConfig candidate = candidates.get(i);
             try {
+                if (i > 0) {
+                    candidate.inheritRuntimeSettings(cfg);
+                    candidate.validate();
+                }
                 EmbeddingProvider provider = createOne(candidate);
                 if (i == 0) {
                     log.debug("Embedding provider '{}' resolved via primary runtime ({} @ {}).",

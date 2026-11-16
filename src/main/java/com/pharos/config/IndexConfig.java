@@ -253,6 +253,7 @@ public class IndexConfig {
             if (fb.getDimensions() <= 0) {
                 fb.setDimensions(parent.getDimensions());
             }
+            fb.inheritRuntimeSettings(parent);
             fb.validate();
             if (!fb.getModelId().equals(parent.getModelId())) {
                 throw new IllegalArgumentException(String.format(

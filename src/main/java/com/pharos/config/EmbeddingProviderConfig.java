@@ -270,6 +270,30 @@ public class EmbeddingProviderConfig {
     public String getDocumentPrefix() { return documentPrefix; }
     public void setDocumentPrefix(String documentPrefix) { this.documentPrefix = documentPrefix == null ? "" : documentPrefix; }
 
+    /**
+     * Makes this fallback runtime agree with {@code parent} on everything that changes the
+     * vectors (pooling, prefixes): the fingerprint, cache key and {@code vec.<modelId>} field
+     * are the parent's, so a differently-embedding fallback would corrupt them. Unset (default)
+     * values are copied from the parent; an explicit conflicting value is an error.
+     */
+    public void inheritRuntimeSettings(EmbeddingProviderConfig parent) {
+        if (modelId == null || modelId.isBlank()) modelId = parent.modelId;
+        if (dimensions <= 0) dimensions = parent.dimensions;
+        if (pooling == Pooling.MEAN) pooling = parent.pooling;
+        else if (pooling != parent.pooling) throw conflict("pooling", pooling.json(), parent.pooling.json(), parent);
+        if (queryPrefix.isEmpty()) queryPrefix = parent.queryPrefix;
+        else if (!queryPrefix.equals(parent.queryPrefix)) throw conflict("queryPrefix", queryPrefix, parent.queryPrefix, parent);
+        if (documentPrefix.isEmpty()) documentPrefix = parent.documentPrefix;
+        else if (!documentPrefix.equals(parent.documentPrefix)) throw conflict("documentPrefix", documentPrefix, parent.documentPrefix, parent);
+    }
+
+    private static IllegalArgumentException conflict(String field, String mine, String theirs,
+                                                     EmbeddingProviderConfig parent) {
+        return new IllegalArgumentException("embeddingProvider['" + parent.modelId + "'].fallbacks: " + field
+                + "='" + mine + "' conflicts with the parent's '" + theirs + "'. A fallback must embed "
+                + "identically to its parent; omit it to inherit.");
+    }
+
     public List<EmbeddingProviderConfig> getFallbacks() { return fallbacks; }
     public void setFallbacks(List<EmbeddingProviderConfig> fallbacks) {
         this.fallbacks = fallbacks == null ? new ArrayList<>() : fallbacks;
