@@ -132,8 +132,12 @@ mkdir -p "$PHAROS_SRC"
 cp -r "$REPO/src" "$REPO/pom.xml" "$PHAROS_SRC/"
 
 echo "== indexing pharos + lucene on the writer (publishes to MinIO)"
-( jvm "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed ) 2>&1 | tee "$GATE/writer-index-pharos.log" | tail -n 5
-( jvm "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed ) 2>&1 | tee "$GATE/writer-index-lucene.log" | tail -n 5
+( jvm "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed ) > "$GATE/writer-index-pharos.log" 2>&1 \
+  || { echo "cluster-gate: indexing pharos failed; see $GATE/writer-index-pharos.log" >&2; tail -n 20 "$GATE/writer-index-pharos.log" >&2; exit 1; }
+tail -n 5 "$GATE/writer-index-pharos.log"
+( jvm "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed ) > "$GATE/writer-index-lucene.log" 2>&1 \
+  || { echo "cluster-gate: indexing lucene failed; see $GATE/writer-index-lucene.log" >&2; tail -n 20 "$GATE/writer-index-lucene.log" >&2; exit 1; }
+tail -n 5 "$GATE/writer-index-lucene.log"
 
 echo "== starting writer web :7300 and reader web :7301"
 ( jvm "$W_HOME" web --port 7300 --no-open ) > "$GATE/writer-web.log" 2>&1 &

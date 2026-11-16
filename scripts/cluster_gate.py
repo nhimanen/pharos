@@ -52,7 +52,11 @@ class FetchError(Exception):
 
 def ids(data):
     if isinstance(data, dict):
-        raise FetchError(data["__error__"])
+        if "__error__" in data:
+            raise FetchError(data["__error__"])
+        raise FetchError("unexpected dict response: " + json.dumps(data)[:200])
+    if not isinstance(data, list):
+        raise FetchError("unexpected response: " + repr(data)[:200])
     return [r.get("id") for r in data]
 
 
@@ -123,6 +127,16 @@ def freshness(args):
     if rc != 0:
         print(f"FAIL: incremental re-index/publish exited {rc} (see {reindex_log})")
         return False
+    try:
+        pub = re.findall(r"Published shard (\S+) generation (\d+)", Path(reindex_log).read_text(errors="replace"))
+    except OSError:
+        pub = []
+    pub = [x for x in pub if "pharos" in x[0]] or pub
+    if not pub:
+        print(f"FAIL: no 'Published shard ... generation N' line in {reindex_log}; cannot identify the probe generation")
+        return False
+    shard, gen = pub[-1]
+    print(f"writer published shard {shard} generation {gen}")
     t0 = time.monotonic()
     deadline = t0 + 3 * poll + 120
     params = {"q": marker, "pipeline": "keyword", "limit": 5, "project": "pharos"}
@@ -137,16 +151,19 @@ def freshness(args):
         print(f"FAIL: {marker} not visible on the reader after {deadline - t0:.0f}s")
         return False
 
-    lines = []
+    ms, lines = [], []
     if log_path.is_file():
         with open(log_path, errors="replace") as f:
             f.seek(log_size_before)
-            lines = [ln.strip() for ln in f if "materialised generation" in ln]
-    ms = [int(m.group(1)) for ln in lines for m in [re.search(r" in (\d+) ms", ln)] if m]
+            for ln in f:
+                m = re.search(r"Shard (\S+): materialised generation (\d+) .* in (\d+) ms", ln)
+                if m and m.group(1) == shard and m.group(2) == gen:
+                    ms.append(int(m.group(3)))
+                    lines = [ln.strip()]
     if not ms:
-        print("FAIL: no 'materialised generation ... in N ms' line in the reader log; cannot judge")
+        print(f"FAIL: no 'materialised generation {gen} ... in N ms' line for shard {shard} in the reader log; cannot judge")
         return False
-    download = sum(ms) / 1000.0
+    download = ms[-1] / 1000.0
     bound = poll + download + 5
     ok = elapsed <= bound
     print(f"visible after {elapsed:.1f} s; poll interval {poll} s; generation download {download:.1f} s; "
