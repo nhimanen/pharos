@@ -1,5 +1,7 @@
 package com.pharos.cluster;
 
+import com.pharos.graph.GraphViews;
+
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Objects;
@@ -9,7 +11,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Reader cache: each shard is served from its active generation directory
  * ({@code <cacheDir>/<shard>/gen-N}), switched by {@link #activate}. {@code LuceneIndexer} notices
- * the changed path on its next {@code openReader} and swaps readers.
+ * the changed path on its next {@code openReader} and swaps readers. Activating another generation
+ * evicts the previous one's cached compact graph ({@link GraphViews#evict}).
  */
 public class ReaderLocalCache implements LocalCache {
 
@@ -21,7 +24,8 @@ public class ReaderLocalCache implements LocalCache {
     }
 
     public void activate(String project, Path generationDir) {
-        active.put(project, Objects.requireNonNull(generationDir, "generationDir"));
+        Path previous = active.put(project, Objects.requireNonNull(generationDir, "generationDir"));
+        if (previous != null && !previous.equals(generationDir)) GraphViews.evict(previous);
     }
 
     /** The active generation dir, or {@code <cacheDir>/<project>/none} (never created) before the first. */

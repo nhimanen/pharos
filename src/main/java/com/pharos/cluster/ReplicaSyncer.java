@@ -220,7 +220,10 @@ public class ReplicaSyncer implements Closeable {
             if (cache.active(shard.value()).filter(genDir::equals).isPresent()) {
                 throw new IOException("active generation dir " + genDir + " does not match its manifest");
             }
-            if (Files.exists(genDir)) deleteRecursively(genDir); // incomplete or stale leftover
+            if (Files.exists(genDir)) { // incomplete or stale leftover
+                GraphViews.evict(genDir);
+                deleteRecursively(genDir);
+            }
             materialise(shard, gen, manifest, manifestJson, shardRoot, genDir);
         }
 
@@ -428,7 +431,9 @@ public class ReplicaSyncer implements Closeable {
             long previous = gens.stream().filter(g -> g < active.value()).max(Comparator.naturalOrder()).orElse(-1L);
             for (long g : gens) {
                 if (g == active.value() || g == previous) continue;
-                deleteRecursively(shardRoot.resolve("gen-" + g));
+                Path dir = shardRoot.resolve("gen-" + g);
+                GraphViews.evict(dir);
+                deleteRecursively(dir);
             }
         } catch (IOException | RuntimeException e) {
             log.warn("Shard {}: pruning old generations failed: {}", shard, e.toString());
