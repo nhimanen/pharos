@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.cluster.RoleGuard;
 import com.pharos.analysis.ConceptMiner;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectRegistry;
@@ -30,14 +31,24 @@ public class MineCommand implements Callable<Integer> {
 
     private final ProjectRegistry registry;
     private final LuceneIndexer luceneIndexer;
+    private final IndexConfig config;
 
-    public MineCommand(ProjectRegistry registry, LuceneIndexer luceneIndexer) {
+    public MineCommand(ProjectRegistry registry, LuceneIndexer luceneIndexer, IndexConfig config) {
         this.registry = registry;
         this.luceneIndexer = luceneIndexer;
+        this.config = config;
     }
 
     @Override
     public Integer call() throws Exception {
+        // Readers never mine; that also keeps ConceptMiner's own LuceneIndexer (which ignores
+        // the backend's local cache) off reader nodes.
+        try {
+            RoleGuard.requireIndexing(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         if (registry.find(project).isEmpty()) {
             System.err.println("Project not indexed: " + project);
             System.err.println("Run 'pharos index <path>' first.");
@@ -45,7 +56,6 @@ public class MineCommand implements Callable<Integer> {
         }
         IndexReader reader = luceneIndexer.openReader(project);
         if (write) {
-            IndexConfig config = IndexConfig.load();
             Path synonymFile = config.getSynonymsFile();
             int added = new ConceptMiner().appendNewSynonyms(reader, synonymFile, project, sources);
             System.out.printf("Appended %d new synonym rules for '%s' (sources=0b%s)%n",

@@ -19,6 +19,7 @@ import com.pharos.search.SearchResponse;
 import com.pharos.search.SearchResult;
 import com.pharos.search.Snippet;
 import com.pharos.search.SourceReader;
+import com.pharos.cluster.NodeRole;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -45,7 +46,14 @@ public class McpToolRegistry {
     private final ProjectRegistry registry;
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
+    /** Readers have no module graph yet (it is not replicated). */
+    private final boolean readerNode;
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /** Answer of module tools on reader nodes. */
+    public static final String NOT_ON_READERS = "not available on reader nodes yet";
+    private static final java.util.Set<String> MODULE_TOOLS = java.util.Set.of(
+            "list_modules", "get_module_deps", "find_module_path", "get_module_boundary");
 
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(McpToolRegistry.class);
 
@@ -60,10 +68,17 @@ public class McpToolRegistry {
     public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry,
                             ModuleGraphBuilder moduleGraphBuilder,
                             ModuleBoundaryAnalyzer boundaryAnalyzer) {
+        this(searchEngine, registry, moduleGraphBuilder, boundaryAnalyzer, NodeRole.ALL);
+    }
+
+    public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry,
+                            ModuleGraphBuilder moduleGraphBuilder,
+                            ModuleBoundaryAnalyzer boundaryAnalyzer, NodeRole role) {
         this.searchEngine = searchEngine;
         this.registry = registry;
         this.moduleGraphBuilder = moduleGraphBuilder;
         this.boundaryAnalyzer = boundaryAnalyzer;
+        this.readerNode = role == NodeRole.READER;
     }
 
     public List<Map<String, Object>> getToolDefinitions() {
@@ -205,6 +220,9 @@ public class McpToolRegistry {
     }
 
     private String dispatch(String toolName, JsonNode args) throws Exception {
+        if (readerNode && MODULE_TOOLS.contains(toolName)) {
+            return toolName + " is " + NOT_ON_READERS + "; ask a writer node";
+        }
         return switch (toolName) {
             case "search_code"       -> callSearchCode(args);
             case "find_transitive_callers" -> callFindTransitiveCallers(args);

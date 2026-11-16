@@ -213,7 +213,7 @@ class RemoveIndexCommandTest {
     void all_andProjectName_returnsExitCode2() {
         registerProject("my-project");
 
-        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager))
+        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager, com.pharos.config.IndexConfig.defaults()))
                 .execute("my-project", "--all");
 
         assertThat(exit).isEqualTo(2);
@@ -223,7 +223,7 @@ class RemoveIndexCommandTest {
 
     @Test
     void noArgs_returnsExitCode2() {
-        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager)).execute();
+        int exit = new CommandLine(new RemoveIndexCommand(registry, indexManager, com.pharos.config.IndexConfig.defaults())).execute();
         assertThat(exit).isEqualTo(2);
     }
 
@@ -243,12 +243,12 @@ class RemoveIndexCommandTest {
     // --- helpers ---
 
     private int run(String projectName) {
-        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager);
+        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager, com.pharos.config.IndexConfig.defaults());
         return new CommandLine(cmd).execute(projectName);
     }
 
     private int runAll() {
-        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager);
+        RemoveIndexCommand cmd = new RemoveIndexCommand(registry, indexManager, com.pharos.config.IndexConfig.defaults());
         return new CommandLine(cmd).execute("--all");
     }
 

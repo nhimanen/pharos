@@ -1,5 +1,7 @@
 package com.pharos.cli;
 
+import com.pharos.config.IndexConfig;
+import com.pharos.cluster.RoleGuard;
 import com.pharos.indexer.EmbeddingCacheBackfiller;
 import picocli.CommandLine.*;
 
@@ -20,13 +22,21 @@ public class BackfillEmbeddingCacheCommand implements Callable<Integer> {
     private boolean all;
 
     private final EmbeddingCacheBackfiller backfiller;
+    private final IndexConfig config;
 
-    public BackfillEmbeddingCacheCommand(EmbeddingCacheBackfiller backfiller) {
+    public BackfillEmbeddingCacheCommand(EmbeddingCacheBackfiller backfiller, IndexConfig config) {
         this.backfiller = backfiller;
+        this.config = config;
     }
 
     @Override
     public Integer call() throws Exception {
+        try {
+            RoleGuard.requireIndexing(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         if (all && projectName != null) {
             System.err.println("Specify either a project name or --all, not both.");
             return 2;

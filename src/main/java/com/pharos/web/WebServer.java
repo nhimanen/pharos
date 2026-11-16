@@ -2,6 +2,7 @@ package com.pharos.web;
 
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.cluster.NodeRole;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -44,11 +45,20 @@ public class WebServer {
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final LuceneIndexer luceneIndexer;
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
+    /** Readers have no module graph yet (it is not replicated): module endpoints answer 501. */
+    private final boolean readerNode;
     private final ObjectMapper mapper;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
                      ModuleBoundaryAnalyzer boundaryAnalyzer) {
+        this(searchEngine, registry, moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, NodeRole.ALL);
+    }
+
+    public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
+                     ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
+                     ModuleBoundaryAnalyzer boundaryAnalyzer, NodeRole role) {
+        this.readerNode = role == NodeRole.READER;
         this.searchEngine = searchEngine;
         this.registry = registry;
         this.moduleGraphBuilder = moduleGraphBuilder;
@@ -57,6 +67,13 @@ public class WebServer {
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
+
+    /** Module endpoints need the module graph, which reader nodes do not have yet: 501. */
+    private boolean refuseOnReader(io.javalin.http.Context ctx) {
+        if (!readerNode) return false;
+        ctx.status(501).result(ctx.path() + " is not available on reader nodes yet");
+        return true;
     }
 
     public Javalin start(int port) {
@@ -134,7 +151,10 @@ public class WebServer {
         });
 
         // API: module dependency graph
-        app.get("/api/graph/modules", ctx -> ctx.json(buildModuleGraphData()));
+        app.get("/api/graph/modules", ctx -> {
+            if (refuseOnReader(ctx)) return;
+            ctx.json(buildModuleGraphData());
+        });
 
         // API: class dependency graph for a project
         app.get("/api/graph/classes/{project}", ctx -> {
@@ -434,6 +454,7 @@ public class WebServer {
 
         // API: list modules
         app.get("/api/modules", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String filter = ctx.queryParamAsClass("filter", String.class).getOrDefault("all");
             try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
                 List<Map<String, Object>> nodes = graph.allModules()
@@ -466,6 +487,7 @@ public class WebServer {
 
         // API: module dependencies
         app.get("/api/deps", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String moduleRef = ctx.queryParam("module");
             boolean transitive = Boolean.parseBoolean(ctx.queryParamAsClass("transitive", String.class).getOrDefault("false"));
             if (moduleRef == null) { ctx.status(400).result("module required"); return; }
@@ -490,6 +512,7 @@ public class WebServer {
 
         // API: module dependency path
         app.get("/api/mod-path", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String fromRef = ctx.queryParam("from");
             String toRef = ctx.queryParam("to");
             if (fromRef == null || toRef == null) { ctx.status(400).result("from and to required"); return; }
@@ -515,6 +538,7 @@ public class WebServer {
 
         // API: module boundary (entry/exit points)
         app.get("/api/boundary", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String project = ctx.queryParam("project");
             if (project == null) { ctx.status(400).result("project required"); return; }
             int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(200);

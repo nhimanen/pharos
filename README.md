@@ -369,6 +369,63 @@ Non-code files (Markdown, text, JSON, YAML, …) are indexed as a single documen
 
 A file that grows past its limit is removed from the index on the next incremental run.
 
+## Multi-node (experimental)
+
+Pharos can run as one **writer** and any number of **readers** that share an S3-compatible object store (AWS S3, MinIO, …). The writer indexes as usual and, after each index run, publishes the project as a new immutable generation. Readers poll the store every `pollIntervalSeconds`, download new generations into `cacheDir`, and serve search and call-graph queries from them. Writers and readers never talk to each other. Without a `cluster` section, pharos is the single-node tool described above (`role: all`, `backend: local`).
+
+Writer node, in `~/.pharos/config.json`:
+
+```json
+{"cluster": {
+  "role": "writer",
+  "backend": "object-store",
+  "nodeId": "node-a",
+  "pollIntervalSeconds": 5,
+  "cacheDir": "/var/cache/pharos",
+  "retentionGenerations": 4,
+  "retentionMinutes": 120,
+  "objectStore": {
+    "endpoint": "http://localhost:9000",
+    "region": "eu-west-1",
+    "bucket": "pharos-bucket",
+    "prefix": "indexes",
+    "pathStyle": false,
+    "accessKeyEnv": "PHAROS_ACCESS_KEY",
+    "secretKeyEnv": "PHAROS_SECRET_KEY"
+  }}}
+```
+
+Reader node (same `objectStore` section; `cacheDir` is where generations are kept):
+
+```json
+{"cluster": {
+  "role": "reader",
+  "backend": "object-store",
+  "nodeId": "node-b",
+  "pollIntervalSeconds": 5,
+  "cacheDir": "/var/cache/pharos",
+  "objectStore": {
+    "endpoint": "http://localhost:9000",
+    "region": "eu-west-1",
+    "bucket": "pharos-bucket",
+    "prefix": "indexes",
+    "pathStyle": false,
+    "accessKeyEnv": "PHAROS_ACCESS_KEY",
+    "secretKeyEnv": "PHAROS_SECRET_KEY"
+  }}}
+```
+
+- Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv`, or else the AWS default credential chain. Use `"pathStyle": true` for MinIO.
+- The writer keeps the newest `retentionGenerations` generations, and anything younger than `retentionMinutes`; older ones are garbage-collected after a publish.
+- If publishing fails at the end of an index run (store unreachable, bad credentials), the local index is kept and `pharos index` exits with code **3**. Retry the upload without re-indexing:
+
+  ```bash
+  pharos publish myproject      # writer only; prints "published myproject generation N"
+  ```
+
+- Readers refuse `index`, `link`, `embed`, `mine`, `remove-index` and `backfill-embedding-cache`. They start syncing when the daemon (`pharos web` / `mcp-server`) starts, and serve class bodies and snippets from the index, never from source files on the reader machine.
+- Not yet on readers: the module tools (MCP `list_modules`, `get_module_deps`, `find_module_path`, `get_module_boundary` and the web UI's module views) answer "not available on reader nodes yet", and the cross-project graph is not replicated, so call paths that span projects are only found on the writer.
+
 ## How it works
 
 1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers extract methods, classes, call references, field declarations, inheritance, annotations, and type references

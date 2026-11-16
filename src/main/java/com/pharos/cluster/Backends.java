@@ -1,5 +1,6 @@
 package com.pharos.cluster;
 
+import com.pharos.cluster.objectstore.ObjectStoreBackend;
 import com.pharos.config.IndexConfig;
 
 public final class Backends {
@@ -9,8 +10,7 @@ public final class Backends {
         BackendKind kind = config.getCluster().getBackend();
         return switch (kind) {
             case LOCAL -> new LocalBackend(config);
-            case OBJECT_STORE -> throw new UnsupportedOperationException(
-                    "object-store backend is not available yet");
+            case OBJECT_STORE -> new ObjectStoreBackend(config);
         };
     }
 }

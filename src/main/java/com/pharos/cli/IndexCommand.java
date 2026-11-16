@@ -1,6 +1,8 @@
 package com.pharos.cli;
 
 import com.pharos.indexer.ProjectNames;
+import com.pharos.cluster.RoleGuard;
+import com.pharos.cluster.PublishException;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -74,6 +76,7 @@ public class IndexCommand implements Callable<Integer> {
     private final ProjectIndexManager indexManager;
     private final CrossProjectLinker crossProjectLinker;
     private final ProjectRegistry registry;
+    private final IndexConfig config;
 
     public IndexCommand(ProjectIndexManager indexManager,
                         CrossProjectLinker crossProjectLinker,
@@ -82,10 +85,17 @@ public class IndexCommand implements Callable<Integer> {
         this.indexManager = indexManager;
         this.crossProjectLinker = crossProjectLinker;
         this.registry = registry;
+        this.config = config;
     }
 
     @Override
     public Integer call() {
+        try {
+            RoleGuard.requireIndexing(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         Path root = path.toAbsolutePath();
 
         try {
@@ -127,6 +137,8 @@ public class IndexCommand implements Callable<Integer> {
         // They are flushed to stdout after the display clears.
         List<String> deferred = new CopyOnWriteArrayList<>();
         AtomicInteger failures = new AtomicInteger(0);
+        List<String> publishFailed = new CopyOnWriteArrayList<>();
+        List<String> deferredErrors = new CopyOnWriteArrayList<>();
 
         List<String> names = projects.stream().map(DiscoveredProject::name).toList();
         MultiProjectDisplay display = new MultiProjectDisplay(names, System.console() != null, noProgress);
@@ -154,6 +166,14 @@ public class IndexCommand implements Callable<Integer> {
                         if (display.isActive()) deferred.add(summary);
                         else System.out.println(summary);
                         indexed.add(p.name());
+                    } catch (PublishException e) {
+                        String errLine = "  [" + p.name() + "] " + publishFailure(p.name(), e);
+                        display.markDone(slot, "  [" + p.name() + "] indexed locally, publish FAILED");
+                        if (display.isActive()) deferredErrors.add(errLine);
+                        else System.err.println(errLine);
+                        if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
+                        indexed.add(p.name());
+                        publishFailed.add(p.name());
                     } catch (Exception e) {
                         String errLine = "  [" + p.name() + "] FAILED: " + e.getMessage();
                         display.markDone(slot, errLine);
@@ -173,6 +193,7 @@ public class IndexCommand implements Callable<Integer> {
 
         display.clear();
         deferred.forEach(System.out::println);
+        deferredErrors.forEach(System.err::println);
 
         long elapsed = System.currentTimeMillis() - wallStart;
         System.out.printf("%nDone. %d/%d projects indexed in %.1fs%n",
@@ -182,7 +203,8 @@ public class IndexCommand implements Callable<Integer> {
             autoLinkAll(new ArrayList<>(indexed));
         }
 
-        return failures.get() > 0 ? 1 : 0;
+        if (failures.get() > 0) return 1;
+        return publishFailed.isEmpty() ? 0 : EXIT_PUBLISH_FAILED;
     }
 
     private void autoLinkAll(List<String> projectNames) {
@@ -205,10 +227,26 @@ public class IndexCommand implements Callable<Integer> {
         }
     }
 
+    /** Exit code when the local index run committed but publishing it to the backend failed. */
+    static final int EXIT_PUBLISH_FAILED = 3;
+
     private int indexSingle(Path projectPath, String name) throws Exception {
-        doIndex(projectPath, name);
+        try {
+            doIndex(projectPath, name);
+        } catch (PublishException e) {
+            if (!noProgress) System.err.print("\r" + " ".repeat(80) + "\r");
+            System.err.println(publishFailure(name, e));
+            if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
+            return EXIT_PUBLISH_FAILED;
+        }
         refreshCrossProjectGraph(name);
         return 0;
+    }
+
+    /** The local index is committed and kept; only the upload failed, so a publish retries it. */
+    static String publishFailure(String name, PublishException e) {
+        return "Indexed project '" + name + "' locally, but publishing it failed: " + e.getMessage()
+                + "\nThe local index is kept. Retry the upload with: pharos publish " + name;
     }
 
     /**

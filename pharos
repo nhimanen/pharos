@@ -830,6 +830,10 @@ def _parse_path_spec(spec: str) -> tuple:
     return path, name
 
 
+# Java exit code: indexed locally, publishing to the object store failed (retry: pharos publish).
+EXIT_PUBLISH_FAILED = 3
+
+
 def cmd_index(args):
     """Run indexing by spawning the JAR directly (daemon is search-only, no write lock).
 
@@ -875,6 +879,11 @@ def cmd_index(args):
         if name:
             cmd += ["--project", name]
         rc = subprocess.run(cmd).returncode
+        if rc == EXIT_PUBLISH_FAILED:
+            # The JVM already printed the cause; the local index is committed and kept.
+            print(f"\npharos: {path} was indexed locally but not published to the cluster "
+                  f"object store (exit 3). Fix the store/credentials, then run "
+                  f"'pharos publish <project>'.", file=sys.stderr)
         if rc != 0:
             failed.append((path, rc))
 
@@ -888,7 +897,21 @@ def cmd_index(args):
             print(f"\nFinished: all {len(specs)} paths indexed.",
                   file=sys.stderr)
 
+    if failed and all(rc == EXIT_PUBLISH_FAILED for _, rc in failed):
+        sys.exit(EXIT_PUBLISH_FAILED)
     sys.exit(1 if failed else 0)
+
+
+def cmd_publish(args):
+    """Publish a project's existing local index to the cluster object store (writer nodes).
+
+    Spawns its own JVM like backfill-embedding-cache. Exit codes: 0 published, 1 not indexed,
+    2 wrong node role, 3 publish failed.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "publish", args.project]
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_web(args):
@@ -1185,6 +1208,7 @@ COMMANDS
   index-status    Show each project's index format status (--json for machines)
   upgrade-indexes Re-index projects whose index format is not current
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
+  publish                   Publish a project's local index to the cluster object store (writer nodes)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
 
@@ -1582,6 +1606,26 @@ EXAMPLES
     p_upgrade.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
     p_upgrade.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
     p_upgrade.set_defaults(func=cmd_upgrade_indexes)
+
+    # publish
+    p_publish = sub.add_parser(
+        "publish",
+        help="Publish a project's local index to the cluster object store (writer nodes)",
+        description="""\
+Upload a project's existing, committed local index as a new generation to the
+cluster object store, without re-indexing. Use it when 'pharos index' exited
+with code 3 (indexed locally, publish failed). Requires cluster.role 'writer'.
+
+EXIT CODES
+  0 published, 1 project not indexed, 2 not a writer node, 3 publish failed
+
+EXAMPLES
+  pharos publish myproject
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_publish.add_argument("project", help="Project name (as shown in 'pharos projects')")
+    p_publish.set_defaults(func=cmd_publish)
 
     # embed
     p_embed = sub.add_parser(

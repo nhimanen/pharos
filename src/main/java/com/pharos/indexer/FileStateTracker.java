@@ -181,6 +181,15 @@ public class FileStateTracker {
         return paths;
     }
 
+    /** Distinct model fingerprints recorded across tracked files ({@code null} stamps skipped). */
+    public Set<String> recordedModelFingerprints() {
+        Set<String> out = new java.util.TreeSet<>();
+        for (FileState s : state.values()) {
+            if (s.modelFingerprint != null) out.add(s.modelFingerprint);
+        }
+        return out;
+    }
+
     /** Clears all tracked state (for full re-index). */
     public void clear() {
         state.clear();

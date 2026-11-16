@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.cluster.RoleGuard;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CrossProjectLinker;
@@ -30,6 +31,12 @@ public class LinkCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        try {
+            RoleGuard.requireIndexing(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         try {
             registry.link(project1, project2);
             System.out.printf("Linked '%s' and '%s'%n", project1, project2);
