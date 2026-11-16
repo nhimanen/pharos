@@ -529,6 +529,26 @@ class LazyReaderTest {
         assertThat(privateDir).as("deleted on close").doesNotExist();
     }
 
+    /** The runtime's operator stats count this process's cache: non-zero hits after a query. */
+    @Test
+    void readerCacheStatsCountHitsAfterAQuery() throws Exception {
+        publishWithoutCompoundFiles();
+        Node lazy = reader("stats", r -> { small(r); r.setEagerMaxBytes(0); });
+        assertThat(lazy.runtime().readerCacheStats()).as("before serving: zeros, not absent")
+                .containsEntry("hits", 0L).containsEntry("mode", "lazy");
+        lazy.runtime().startServing();
+        assertThat(ids(lazy.engine(), "Calculator")).isNotEmpty();
+        assertThat(ids(lazy.engine(), "greeting service")).isNotNull();
+
+        Map<String, Object> rc = lazy.runtime().readerCacheStats();
+        assertThat((Long) rc.get("hits")).isPositive();
+        assertThat((Long) rc.get("bytesOnDisk")).isPositive();
+        assertThat((Long) rc.get("bytesFetched")).isPositive();
+        assertThat(rc).containsEntry("mode", "lazy").containsEntry("cacheMaxBytes", 64 * KIB * KIB)
+                .containsEntry("shared", true).containsKeys("misses", "hitRate", "evictions", "leasesOpen");
+        assertThat((Double) rc.get("hitRate")).isBetween(0.0, 1.0);
+    }
+
     /** A file the next generation shares by object key keeps its head sidecar: it is not fetched again. */
     @Test
     void unchangedFileHeadIsNotRefetchedOnTheNextGeneration() throws Exception {

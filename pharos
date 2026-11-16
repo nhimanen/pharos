@@ -956,14 +956,52 @@ def cmd_version(args):
     sys.exit(0)
 
 
+def _gib(n):
+    """Bytes as B / KiB / MiB / GiB / TiB with one decimal (same as the jar's reader cache line)."""
+    v = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if v < 1024 or unit == "TiB":
+            return f"{int(n)} B" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+
+
+def reader_cache_line(rc):
+    """One-line text form of the `readerCache` object of index-status --json and /health."""
+    return (f"reader cache: {_gib(rc['bytesOnDisk'])} / {_gib(rc['cacheMaxBytes'])}, "
+            f"hit rate {100 * rc['hitRate']:.1f}%, {rc['evictions']} evictions")
+
+
+def _daemon_reader_cache():
+    """The running daemon's `readerCache` (its hits are the real ones), or None."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
+            return json.loads(resp.read()).get("readerCache")
+    except Exception:
+        return None
+
+
 def cmd_index_status(args):
-    """Show per-project index format status (read-only; spawns the jar, no daemon)."""
+    """Show per-project index format status (read-only; spawns the jar, no daemon).
+
+    On a lazy reader the text output ends with a `reader cache:` line; when a daemon is
+    running its figures replace the one-shot JVM's (which has served no queries).
+    """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
     cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index-status"]
     if args.json:
         cmd.append("--json")
-    sys.exit(subprocess.run(cmd).returncode)
+        sys.exit(subprocess.run(cmd).returncode)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    lines = r.stdout.splitlines()
+    own = [l for l in lines if l.startswith("reader cache:")]
+    if own:
+        daemon = _daemon_reader_cache()
+        replacement = reader_cache_line(daemon) if daemon else own[0]
+        lines = [replacement if l.startswith("reader cache:") else l for l in lines]
+    if lines:
+        print("\n".join(lines))
+    sys.exit(r.returncode)
 
 
 def cmd_upgrade_indexes(args):

@@ -52,6 +52,7 @@ public class WebCommand implements Callable<Integer> {
             if (clusterRuntime != null) {
                 clusterRuntime.beginServing(); // no wait: the first sync runs in the background
                 webServer.setReadiness(clusterRuntime::ready);
+                webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
             }
             webServer.start(port);
             if (searchEngine != null) searchEngine.warmUpInBackground();

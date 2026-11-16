@@ -50,6 +50,7 @@ public class WebServer {
     private final ObjectMapper mapper;
     /** False while a reader's first sync is running; see {@link #setReadiness}. */
     private volatile java.util.function.BooleanSupplier readiness = () -> true;
+    private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -79,12 +80,19 @@ public class WebServer {
         this.readiness = java.util.Objects.requireNonNull(readiness, "readiness");
     }
 
+    /** Reader cache stats reported by {@code /health} as {@code readerCache}; null result: omitted. */
+    public void setReaderCacheStats(java.util.function.Supplier<Map<String, Object>> stats) {
+        this.readerCacheStats = java.util.Objects.requireNonNull(stats, "stats");
+    }
+
     /** Health payload: HTTP 200 either way (liveness); {@code ready} tells whether the first sync is done. */
     Map<String, Object> health() {
         boolean ready = readiness.getAsBoolean();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("status", ready ? "ok" : "syncing");
         out.put("ready", ready);
+        Map<String, Object> cache = readerCacheStats.get();
+        if (cache != null) out.put("readerCache", cache);
         return out;
     }
 

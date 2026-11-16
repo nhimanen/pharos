@@ -20,4 +20,15 @@ class WebServerHealthTest {
         ready.set(true);
         assertThat(server.health()).isEqualTo(Map.of("status", "ok", "ready", true));
     }
+
+    @Test
+    void healthCarriesReaderCacheOnlyWhenThereIsOne() {
+        WebServer server = new WebServer(null, null, null, null, null);
+        assertThat(server.health()).doesNotContainKey("readerCache");
+        server.setReaderCacheStats(() -> null);
+        assertThat(server.health()).doesNotContainKey("readerCache");
+        Map<String, Object> cache = Map.of("mode", "lazy", "hits", 5L, "hitRate", 1.0);
+        server.setReaderCacheStats(() -> cache);
+        assertThat(server.health()).containsEntry("readerCache", cache).containsEntry("ready", true);
+    }
 }

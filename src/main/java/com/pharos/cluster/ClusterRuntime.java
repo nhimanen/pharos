@@ -4,6 +4,7 @@ import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.cluster.warm.LazyGenerations;
+import com.pharos.cluster.warm.WarmStats;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import com.pharos.indexer.LuceneIndexer;
@@ -17,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -118,6 +120,45 @@ public final class ClusterRuntime implements Closeable {
     /** Lazy mode's directory factory and block cache; null unless this is a lazy reader. */
     LazyGenerations lazyGenerations() {
         return lazy;
+    }
+
+    /**
+     * The block cache of this process as operators see it ({@code readerCache} of
+     * {@code index-status --json} and {@code /health}); null unless this is a lazy reader.
+     * Fields: {@code mode, cacheMaxBytes, bytesOnDisk, hits, misses, hitRate (0..1), bytesFetched,
+     * evictions, leasesOpen}, plus {@code shared}: true when this process's cache is the cache dir's
+     * shared one, false when it runs a private one (or none has been created yet).
+     */
+    public Map<String, Object> readerCacheStats() {
+        if (lazy == null) return null;
+        WarmStats st = lazy.stats().orElse(new WarmStats(0, 0, 0, 0, 0, 0, 0, 0));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("mode", config.getCluster().getReader().getMode());
+        out.put("cacheMaxBytes", lazy.cacheMaxBytes());
+        out.put("bytesOnDisk", st.bytesOnDisk());
+        out.put("hits", st.hits());
+        out.put("misses", st.misses());
+        out.put("hitRate", st.hitRate());
+        out.put("bytesFetched", st.bytesFetched());
+        out.put("evictions", st.evictions());
+        out.put("leasesOpen", st.leasesOpen());
+        out.put("shared", lazy.sharedCache());
+        return out;
+    }
+
+    /** The one-line text form of {@link #readerCacheStats}: {@code reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions}. */
+    public static String readerCacheLine(Map<String, Object> rc) {
+        return String.format(java.util.Locale.ROOT, "reader cache: %s / %s, hit rate %.1f%%, %d evictions",
+                gib(((Number) rc.get("bytesOnDisk")).longValue()), gib(((Number) rc.get("cacheMaxBytes")).longValue()),
+                100 * ((Number) rc.get("hitRate")).doubleValue(), ((Number) rc.get("evictions")).longValue());
+    }
+
+    private static String gib(long bytes) {
+        String[] units = {"B", "KiB", "MiB", "GiB", "TiB"};
+        double v = bytes;
+        int i = 0;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        return i == 0 ? bytes + " B" : String.format(java.util.Locale.ROOT, "%.1f %s", v, units[i]);
     }
 
     public IndexPublisher publisher() {
