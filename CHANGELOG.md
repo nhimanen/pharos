@@ -5,6 +5,22 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-16
+
+**Index format:** 1 (unchanged)
+
+### Fixed
+- Project-name safety: `pharos index .` registered a project named `.`, whose index directory was
+  the indexes root, so removing it could delete every project's index. Default names now come from
+  the directory name, invalid names (empty, `.`, `..`, separators, anything outside the indexes
+  directory) are refused, and deletes and writes never leave the indexes directory. Existing bad
+  registrations are reported as `invalid` and ignored; `pharos remove .` unregisters them without
+  deleting anything (see UPGRADING.md, "Invalid project names").
+- `setup.sh` printed "pharos pharos X" on its final line.
+
+### Added
+- `pharos --version` prints the installed jar's version and the CLI location.
+
 ## [1.4.0] - 2026-11-16
 
 **Index format:** 0 → 1 (format 0 still served; re-index recommended, see UPGRADING.md)

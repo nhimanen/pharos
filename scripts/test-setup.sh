@@ -145,6 +145,16 @@ t_searchable_only_installs_without_prompt() {
   check searchable_only_installs_without_prompt $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
 }
 
+# A registry entry named "." (pre-1.4.1 bug) is reported as invalid, is non-blocking, never crashes.
+t_invalid_registry_entry_warns_without_blocking() {
+  local h; h="$(new_home)"; preinstall "$h"
+  register_project "$h" . none
+  run_setup "$h" --release "$TAG"
+  [ "$(rc "$h")" = 0 ] && grep -q 'invalid project name' "$h/out.txt" \
+    && ! grep -q 'could not determine' "$h/out.txt" && ! grep -q Traceback "$h/out.txt"
+  check invalid_registry_entry_warns_without_blocking $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
+}
+
 t_upgrade_indexes_flag() {
   local h; h="$(new_home)"
   run_setup "$h" --release "$TAG"
@@ -277,6 +287,7 @@ t_corrupt_checksum_aborts_without_touching_install
 t_warning_lists_outdated_projects_and_declines_noninteractive
 t_yes_installs_despite_outdated
 t_searchable_only_installs_without_prompt
+t_invalid_registry_entry_warns_without_blocking
 t_upgrade_indexes_flag
 t_index_status_failure_fails_closed
 t_bad_skill_bundle_leaves_install_untouched

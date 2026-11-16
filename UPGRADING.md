@@ -1,5 +1,41 @@
 # Upgrading
 
+## Invalid project names (e.g. ".")
+
+### What happened
+
+Before 1.4.1, `pharos index .` registered the project under the name `.`. A project's index
+directory is `<indexes>/<name>`, so for `.` it was the indexes directory itself, and removing or
+re-indexing that "project" could delete every project's index. Names such as `..` or ones
+containing `/` had the same problem.
+
+### What 1.4.1 does
+
+- `pharos index .` now uses the directory's real name; names that are empty, `.`, `..`, contain
+  `/` or `\\`, or do not resolve to a direct child of the indexes directory are refused (use
+  `--project <name>`).
+- Deletes and writes never leave the indexes directory.
+- An existing `.` registration is ignored with a warning (`invalid` in `pharos index-status`,
+  "invalid name" in `pharos projects`); `upgrade-indexes` reports it without failing.
+
+### Removing the entry
+
+```bash
+pharos remove .
+```
+
+This only unregisters the entry (registry, link references, synonyms) and deletes nothing on disk.
+Then re-index the directory with a proper name: `pharos index --project <name> <path>`.
+
+### Stray files
+
+A `.` project wrote its files directly into the indexes directory. These may be left over there and
+can be deleted by hand: `callgraph-*.arcadedb*`, `callgraph.current`, `file-state.json`,
+`graph.stamp`, `index-format.json`. If you also have a project named `lucene`, its directory
+`indexes/lucene` may contain `segments_N` and `write.lock` files placed by the `.` project;
+those belong to the stray, not to a real index. **Never delete project subdirectories** of the
+indexes directory.
+
 ## Upgrading to 1.4.0 (index format 1)
 
 ### What changed
