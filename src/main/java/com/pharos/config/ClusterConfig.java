@@ -129,6 +129,8 @@ public class ClusterConfig {
         private java.util.List<String> prefetchExtensions = java.util.List.of("tip", "tmd", "tim", "vex", "vem");
         private int prefetchTimeoutSeconds = 30;
         private int maxConcurrentFetches = 16;
+        /** Cap of a private block cache (a second process on the cache dir); 0 derives it. */
+        private long privateCacheMaxBytes = 0;
 
         /** @throws IllegalStateException naming the offending field */
         public void validate() {
@@ -154,6 +156,10 @@ public class ClusterConfig {
                 throw new IllegalStateException("cluster.reader.prefetchTimeoutSeconds must not be negative, got "
                         + prefetchTimeoutSeconds);
             }
+            if (privateCacheMaxBytes < 0 || (privateCacheMaxBytes > 0 && privateCacheMaxBytes / 4 < blockSizeBytes)) {
+                throw new IllegalStateException("cluster.reader.privateCacheMaxBytes must be 0 (derived) or at least"
+                        + " 4 x cluster.reader.blockSizeBytes (" + 4 * blockSizeBytes + "), got " + privateCacheMaxBytes);
+            }
             if (maxConcurrentFetches < 1) {
                 throw new IllegalStateException("cluster.reader.maxConcurrentFetches must be at least 1, got "
                         + maxConcurrentFetches);
@@ -176,6 +182,17 @@ public class ClusterConfig {
         public int getPrefetchTimeoutSeconds() { return prefetchTimeoutSeconds; }
         public void setPrefetchTimeoutSeconds(int v) { this.prefetchTimeoutSeconds = v; }
         public int getMaxConcurrentFetches() { return maxConcurrentFetches; }
+        public long getPrivateCacheMaxBytes() { return privateCacheMaxBytes; }
+        public void setPrivateCacheMaxBytes(long v) { this.privateCacheMaxBytes = v; }
+
+        /**
+         * The cap of a private block cache: {@code privateCacheMaxBytes}, or when 0
+         * {@code min(cacheMaxBytes, max(4 blocks, cacheMaxBytes / 8))}.
+         */
+        public long effectivePrivateCacheMaxBytes() {
+            if (privateCacheMaxBytes > 0) return privateCacheMaxBytes;
+            return Math.min(cacheMaxBytes, Math.max(4 * blockSizeBytes, cacheMaxBytes / 8));
+        }
         public void setMaxConcurrentFetches(int v) { this.maxConcurrentFetches = v; }
     }
 

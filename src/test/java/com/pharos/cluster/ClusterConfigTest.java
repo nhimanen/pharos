@@ -182,4 +182,23 @@ class ClusterConfigTest {
                     .hasMessageContaining("cluster.reader." + c[0]);
         }
     }
+
+    @Test
+    void privateCacheCapDefaultsToAnEighthOfTheCacheWithinBounds() throws Exception {
+        ClusterConfig.ReaderConfig r = parse("{\"verbose\": true}").getReader();
+        assertThat(r.getPrivateCacheMaxBytes()).as("0 = derived").isZero();
+        assertThat(r.effectivePrivateCacheMaxBytes()).isEqualTo(1L << 30); // 8 GiB / 8
+        r = parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":8388608}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).as("at least four blocks").isEqualTo(4L << 20);
+        r = parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":4194304}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).as("never above the cache cap").isEqualTo(4L << 20);
+        r = parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":33554432}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).isEqualTo(32L << 20);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":1048576}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.privateCacheMaxBytes");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":-1}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.privateCacheMaxBytes");
+    }
 }

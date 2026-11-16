@@ -182,6 +182,7 @@ public class ReplicaSyncer implements Closeable {
                             e.toString());
                 }
             }
+            if (lazy != null) lazy.sweep();
             try {
                 syncSynonyms();
             } catch (IOException | RuntimeException e) {

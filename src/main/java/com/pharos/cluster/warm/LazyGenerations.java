@@ -47,8 +47,11 @@ import java.util.stream.Stream;
  * <p><b>Block cache.</b> Created on first use at {@code <cacheDir>/}{@value #BLOCKS_DIR} by the
  * process holding the {@value #BLOCKS_LOCK} lock on the cache dir. Another process on the same cache
  * dir (a follower, a one-shot command) gets a private cache at
- * {@code <cacheDir>/}{@value #PRIVATE_BLOCKS_DIR}{@code /<pid>-<random>}, deleted when it closes; the
- * lock holder deletes private dirs of processes that are gone. Neither name can be a shard id (those
+ * {@code <cacheDir>/}{@value #PRIVATE_BLOCKS_DIR}{@code /<pid>-<random>}, capped at
+ * {@code effectivePrivateCacheMaxBytes} and deleted when it closes; the lock holder deletes private
+ * dirs of processes that are gone at startup and on every {@link #sweep}. The syncing reader takes
+ * the shared cache as soon as it starts syncing ({@code ClusterRuntime}), so the process that
+ * prefetches always fills the shared cache. Neither name can be a shard id (those
  * start with a letter or digit), so no shard dir can collide with them.
  */
 public final class LazyGenerations implements LuceneDirectoryFactory, Closeable {
@@ -237,7 +240,8 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
                     cacheDir.resolve(BLOCKS_DIR), dir);
         }
         try {
-            blockCache = new BlockCache(dir, config.getCacheMaxBytes(), Math.toIntExact(config.getBlockSizeBytes()),
+            long cap = lock.isPresent() ? config.getCacheMaxBytes() : config.effectivePrivateCacheMaxBytes();
+            blockCache = new BlockCache(dir, cap, Math.toIntExact(config.getBlockSizeBytes()),
                     config.getMaxConcurrentFetches());
         } catch (IOException | RuntimeException e) {
             if (lock.isPresent()) lock.get().close();
@@ -251,6 +255,17 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     /** The block cache's dir; null before its first use. */
     public synchronized Path blockCacheDir() {
         return blockCache == null ? null : blockCache.dir();
+    }
+
+    /**
+     * Housekeeping for each sync pass: the holder of the shared cache deletes the private block caches
+     * of processes that are gone (they may have died without cleaning up).
+     */
+    public void sweep() {
+        synchronized (this) {
+            if (closed || blocksLock == null) return;
+        }
+        deleteStalePrivateDirs();
     }
 
     /** Private block caches of processes that no longer run. */

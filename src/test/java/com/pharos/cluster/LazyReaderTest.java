@@ -413,9 +413,33 @@ class LazyReaderTest {
                 privateDir = second.blockCacheDir();
                 assertThat(privateDir.getParent()).isEqualTo(cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR));
                 assertThat(privateDir).isDirectory();
+                assertThat(second.blockCache().maxBytes()).as("a private cache is smaller")
+                        .isEqualTo(rc.effectivePrivateCacheMaxBytes()).isLessThan(first.blockCache().maxBytes());
             }
             assertThat(privateDir).doesNotExist();
         }
+    }
+
+    /** I2: the syncing reader owns the shared cache from the start and sweeps private caches every pass. */
+    @Test
+    void syncingReaderOwnsTheSharedCacheAndSweepsStalePrivateOnes() throws Exception {
+        cluster.index(JAVA, false); // every file of sample-app is eager: nothing would create the cache
+        Node node = reader("owner", r -> { });
+        node.runtime().startServing();
+        Path cacheDir = node.config().getCluster().getCacheDir().toAbsolutePath();
+        assertThat(node.runtime().lazyGenerations().blockCacheDir())
+                .isEqualTo(cacheDir.resolve(LazyGenerations.BLOCKS_DIR));
+
+        Process gone = new ProcessBuilder("true").start();
+        gone.waitFor();
+        Path stale = cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR).resolve(gone.pid() + "-0123abcd");
+        Path alive = cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR)
+                .resolve(ProcessHandle.current().pid() + "-4567cdef");
+        Files.createDirectories(stale.resolve("ab"));
+        Files.createDirectories(alive);
+        node.runtime().syncNow();
+        assertThat(stale).doesNotExist();
+        assertThat(alive).isDirectory();
     }
 
     /** Switching a reader from lazy to full re-materialises the generation instead of serving a stub. */

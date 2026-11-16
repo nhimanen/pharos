@@ -193,6 +193,13 @@ public final class ClusterRuntime implements Closeable {
     // Holding the monitor of this.
     private void becomeOwner(SyncLock lock, ReaderLocalCache cache) {
         syncLock = lock;
+        if (lazy != null) {
+            try {
+                lazy.blockCache(); // the prefetching process takes the shared block cache, not a private one
+            } catch (IOException | RuntimeException e) {
+                log.warn("Opening the block cache in {} failed (retried on first use): {}", cacheDir(), e.toString());
+            }
+        }
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);

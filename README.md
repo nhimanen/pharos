@@ -434,6 +434,8 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
   ```
 
   `blockSizeBytes` must be a power of two between 64 KiB and 64 MiB, and `cacheMaxBytes` at least four blocks.
+
+  The block cache belongs to one process: the reader that syncs takes `<cacheDir>/.blocks`. Any other pharos process on the same `cacheDir` (an MCP server next to the daemon, a one-shot `pharos search`) gets its own private cache in `<cacheDir>/.blocks-private/`, which costs up to `privateCacheMaxBytes` more disk per such process (default 0 = `min(cacheMaxBytes, max(4 blocks, cacheMaxBytes / 8))`, i.e. 1 GiB for the defaults) and is deleted when the process exits (or by the syncing reader once that process is gone).
 - If publishing fails at the end of an index run (store unreachable, bad credentials), the local index is kept and `pharos index` exits with code **3**. Retry the upload without re-indexing:
 
   ```bash
