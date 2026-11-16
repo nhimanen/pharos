@@ -126,10 +126,12 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         }
 
         // ── KNN recall pass ───────────────────────────────────────────────────
-        List<String> vectorFields      = DocumentMapper.vectorFieldsPresent(embedder.modelId(), reader);
-        List<String> chunkVectorFields = DocumentMapper.chunkVectorFieldCandidates(embedder.modelId());
+        String vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId(), reader);
+        String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         Query filter = buildFilter(req);
-        Query knnQuery = com.pharos.search.VectorSearchStrategy.knnQuery(vectorFields, queryVec, candidateSize, filter);
+        Query knnQuery = filter != null
+                ? new KnnFloatVectorQuery(vectorField, queryVec, candidateSize, filter)
+                : new KnnFloatVectorQuery(vectorField, queryVec, candidateSize);
         TopDocs knnDocs = searcher.search(knnQuery, candidateSize);
 
         // ── Union (BM25 ∪ KNN) ────────────────────────────────────────────────
@@ -157,7 +159,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         float bm25Bonus = adaptiveBm25Bonus(req.classification());
         String intentLabel = req.classification() != null ? req.classification().intent() : "default";
 
-        TopDocs reranked = new UnifiedRescorer(chunkVectorFields, queryMultiVec, bm25Bonus)
+        TopDocs reranked = new UnifiedRescorer(chunkVectorField, queryMultiVec, bm25Bonus)
                 .rescore(searcher, unionDocs, req.limit());
 
         trace.record("unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
@@ -205,9 +207,10 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
         private final float bm25Bonus;
 
-        UnifiedRescorer(List<String> chunkVectorFields, float[][] queryMultiVec, float bm25Bonus) {
-            super(com.pharos.search.MultiFieldLateInteractionSource.create(
-                    chunkVectorFields, queryMultiVec, VectorSimilarityFunction.COSINE));
+        UnifiedRescorer(String chunkVectorField, float[][] queryMultiVec, float bm25Bonus) {
+            super(new LateInteractionFloatValuesSource(
+                    chunkVectorField, queryMultiVec,
+                    VectorSimilarityFunction.COSINE));
             this.bm25Bonus = bm25Bonus;
         }
 

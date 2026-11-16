@@ -141,8 +141,7 @@ public class EmbeddingCacheBackfiller {
         int totalVectors = 0, skippedDocs = 0, skippedMultiChunk = 0, skippedNotEligible = 0;
         IndexReader reader = luceneIndexer.openReader(projectName);
         // Legacy-model vectors live in vectorEmbedding, or in vec.legacy for indexes written by 1.4.0/1.4.1.
-        // An index can hold both (partially re-embedded), so read both.
-        for (String legacyField : DocumentMapper.vectorFieldCandidates(com.pharos.config.IndexConfig.LEGACY_MODEL_ID))
+        String legacyField = DocumentMapper.vectorFieldFor(com.pharos.config.IndexConfig.LEGACY_MODEL_ID, reader);
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
             FloatVectorValues fvv = leaf.getFloatVectorValues(legacyField);

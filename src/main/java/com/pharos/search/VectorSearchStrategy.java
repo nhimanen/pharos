@@ -38,6 +38,8 @@ public class VectorSearchStrategy {
     private static final int RESCORE_FACTOR = 3;
 
     private final EmbeddingProvider embedder;
+    /** Cached per-modelId Lucene field name for KNN queries. Resolves the legacy
+     *  fallback path automatically (see {@link DocumentMapper#vectorFieldFor(String)}). */
 
     public VectorSearchStrategy(EmbeddingProvider embedder) {
         this.embedder = embedder;
@@ -55,24 +57,28 @@ public class VectorSearchStrategy {
             return List.of();
         }
 
-        List<String> vectorFields      = DocumentMapper.vectorFieldsPresent(embedder.modelId(), reader);
-        List<String> chunkVectorFields = DocumentMapper.chunkVectorFieldCandidates(embedder.modelId());
+        String vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId(), reader);
+        String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         Query filter      = buildFilter(req);
         int   limit       = req.limit();
         int   firstPassK  = limit * RESCORE_FACTOR;
 
-        Query vectorQuery = knnQuery(vectorFields, queryVector, firstPassK, filter);
+        Query vectorQuery = filter != null
+                ? new KnnFloatVectorQuery(vectorField, queryVector, firstPassK, filter)
+                : new KnnFloatVectorQuery(vectorField, queryVector, firstPassK);
 
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs firstPass = searcher.search(vectorQuery, firstPassK);
 
         // Late-interaction rescoring when chunkVectors field is present
-        if (hasChunkVectors(reader, chunkVectorFields) && firstPass.totalHits.value() > 0) {
+        if (hasChunkVectors(reader, chunkVectorField) && firstPass.totalHits.value() > 0) {
             // Wrap single query vector as float[][] — the rescorer treats it as a 1-element
             // multi-vector, so SUM_MAX_SIM becomes MAX(cosine(queryVec, chunkVec_i)).
             float[][] queryMultiVec = new float[][] { queryVector };
-            TopDocs reranked = MultiFieldLateInteractionSource
-                    .fallbackRescorer(chunkVectorFields, queryMultiVec, VectorSimilarityFunction.COSINE)
+            TopDocs reranked = LateInteractionRescorer
+                    .withFallbackToFirstPassScore(
+                            chunkVectorField, queryMultiVec,
+                            VectorSimilarityFunction.COSINE)
                     .rescore(searcher, firstPass, limit);
             return KeywordSearchStrategy.toResults(searcher, reranked, "vector");
         }
@@ -98,7 +104,7 @@ public class VectorSearchStrategy {
      */
     public SnippetResolver buildVectorResolver(IndexReader reader, float[] queryVec) {
         if (queryVec == null) return SnippetResolver.none();
-        final List<String> chunkVectorFields = DocumentMapper.chunkVectorFieldCandidates(embedder.modelId());
+        final String chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId(), reader);
         return result -> {
             try {
                 IndexSearcher searcher = new IndexSearcher(reader);
@@ -109,11 +115,7 @@ public class VectorSearchStrategy {
                 var storedFields = searcher.storedFields();
                 var doc = storedFields.document(hits.scoreDocs[0].doc);
 
-                org.apache.lucene.util.BytesRef chunkVecsRef = null;
-                for (String f : chunkVectorFields) {
-                    chunkVecsRef = doc.getBinaryValue(f);
-                    if (chunkVecsRef != null) break;
-                }
+                org.apache.lucene.util.BytesRef chunkVecsRef = doc.getBinaryValue(chunkVectorField);
                 byte[] rangesBytes = doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES) != null
                         ? doc.getBinaryValue(DocumentMapper.F_CHUNK_LINE_RANGES).bytes : null;
                 if (chunkVecsRef == null || rangesBytes == null) return null;
@@ -147,24 +149,9 @@ public class VectorSearchStrategy {
     }
 
     /** Returns true when the index contains the per-model chunk-vectors late-interaction field. */
-    private static boolean hasChunkVectors(IndexReader reader, List<String> chunkVectorFields) {
+    private static boolean hasChunkVectors(IndexReader reader, String chunkVectorField) {
         return reader.leaves().stream().anyMatch(
-                ctx -> chunkVectorFields.stream().anyMatch(f -> ctx.reader().getFieldInfos().fieldInfo(f) != null));
-    }
-
-    /** KNN over every field present (a doc has at most one, so SHOULD-union then top-k is exact). */
-    public static Query knnQuery(List<String> fields, float[] vec, int k, Query filter) {
-        if (fields.size() == 1) {
-            return filter != null ? new KnnFloatVectorQuery(fields.get(0), vec, k, filter)
-                                  : new KnnFloatVectorQuery(fields.get(0), vec, k);
-        }
-        org.apache.lucene.search.BooleanQuery.Builder b = new org.apache.lucene.search.BooleanQuery.Builder();
-        for (String f : fields) {
-            b.add(filter != null ? new KnnFloatVectorQuery(f, vec, k, filter)
-                                 : new KnnFloatVectorQuery(f, vec, k),
-                  org.apache.lucene.search.BooleanClause.Occur.SHOULD);
-        }
-        return b.build();
+                ctx -> ctx.reader().getFieldInfos().fieldInfo(chunkVectorField) != null);
     }
 
     private static Query buildFilter(SearchRequest req) {
