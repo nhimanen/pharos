@@ -38,6 +38,7 @@ class IndexFormatWebTest {
     private final HttpClient http = HttpClient.newHttpClient();
     private Javalin app;
     private int port;
+    private WebServer server;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -61,7 +62,7 @@ class IndexFormatWebTest {
         indexDirA = luceneIndexer.getProjectIndexDir("a");
 
         SearchEngine engine = new SearchEngine(luceneIndexer, new NoOpEmbeddingProvider(), registry);
-        WebServer server = new WebServer(engine, registry, noopGraph, luceneIndexer,
+        server = new WebServer(engine, registry, noopGraph, luceneIndexer,
                 new ModuleBoundaryAnalyzer(registry, engine));
         try (ServerSocket s = new ServerSocket(0)) { port = s.getLocalPort(); }
         app = server.start(port, tmp.resolve("pharos-home"));
@@ -197,5 +198,23 @@ class IndexFormatWebTest {
     void noHeaderWhenNothingSkipped() throws Exception {
         HttpResponse<String> r = get("/api/callers?fqn=x.Y%23z()&project=a");
         assertThat(r.headers().firstValue("X-Pharos-Warnings")).isEmpty();
+    }
+
+    @Test
+    void readerSyncingNoticeIsOneEntryOfTheWarningsHeader() throws Exception {
+        server.setReadiness(() -> false);
+        HttpResponse<String> ok = get("/api/search?q=email&type=keyword&project=a");
+        assertThat(ok.statusCode()).isEqualTo(200);
+        assertThat(ok.headers().firstValue("X-Pharos-Warning")).isEmpty(); // one header only
+        assertThat(warningsHeader(ok).get(0).asText()).isEqualTo(WebServer.SYNCING_WARNING);
+
+        // kept on the error path too (409: project b is outdated)
+        HttpResponse<String> refused = get("/api/search?q=email&type=keyword&project=b");
+        assertThat(refused.statusCode()).isEqualTo(409);
+        assertThat(warningsHeader(refused).get(0).asText()).isEqualTo(WebServer.SYNCING_WARNING);
+
+        server.setReadiness(() -> true);
+        assertThat(get("/api/search?q=email&type=keyword&project=a").headers()
+                .firstValue("X-Pharos-Warnings")).isEmpty();
     }
 }

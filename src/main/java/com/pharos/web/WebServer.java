@@ -225,7 +225,7 @@ public class WebServer {
                     project, null, limit, "text", docType, scope, oversample);
             if (!readiness.getAsBoolean()) {
                 log.warn("Search '{}' answered before the first sync finished", q);
-                ctx.header("X-Pharos-Warning", SYNCING_WARNING);
+                warningsHeader(ctx, List.of(SYNCING_WARNING)); // kept on a 409/500 answer too
             }
             try {
                 SearchResponse resp = searchEngine.searchWithTrace(req, false);

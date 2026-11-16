@@ -219,10 +219,8 @@ def _api_get(path: str, params: dict = None) -> object:
             url += "?" + urllib.parse.urlencode(filtered)
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
+            # skipped incompatible projects, or a reader answering before its first sync finished
             _print_header_warnings(resp.headers.get("X-Pharos-Warnings"))
-            warning = resp.headers.get("X-Pharos-Warning")
-            if warning:  # e.g. a reader answering before its first sync finished
-                print(f"pharos: warning: {warning}", file=sys.stderr)
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
