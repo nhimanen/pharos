@@ -1,6 +1,7 @@
 package com.pharos.cli;
 
 import com.pharos.config.ProjectMeta;
+import com.pharos.indexer.ProjectNames;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.MultiModelEmbedder;
 import picocli.CommandLine.*;
@@ -73,6 +74,10 @@ public class EmbedCommand implements Callable<Integer> {
         int totalUpdated = 0;
         int failed = 0;
         for (String name : targets) {
+            if (!ProjectNames.isValid(name)) {
+                System.err.printf("Skipping invalid project name '%s' (registry entry; see UPGRADING.md)%n", name);
+                continue;
+            }
             try {
                 if (targets.size() > 1) {
                     System.out.printf("%n=== Embedding '%s' with '%s' ===%n", name, modelId);

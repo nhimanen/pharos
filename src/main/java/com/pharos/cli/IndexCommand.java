@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.indexer.ProjectNames;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -100,7 +101,12 @@ public class IndexCommand implements Callable<Integer> {
                     root = projects.get(0).path();
                 }
             }
-            return indexSingle(root, projectName != null ? projectName : root.getFileName().toString());
+            if (projectName == null) {
+                Path fn = root.toAbsolutePath().normalize().getFileName();
+                projectName = fn == null ? "" : fn.toString();
+            }
+            ProjectNames.validate(projectName);
+            return indexSingle(root, projectName);
 
         } catch (Exception e) {
             System.err.println("\nError indexing project: " + e.getMessage());

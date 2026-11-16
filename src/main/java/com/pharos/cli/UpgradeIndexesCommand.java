@@ -6,6 +6,7 @@ import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.ProgressListener;
 import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.indexer.ProjectNames;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
@@ -71,6 +72,10 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         this.interactive = interactive;
     }
 
+    private String registryPath() {
+        return registry.getPath() == null ? "registry.json" : registry.getPath().toString();
+    }
+
     private static String consolePrompt(String prompt) {
         var c = System.console();
         return c == null ? null : c.readLine("%s", prompt);
@@ -82,14 +87,23 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         List<ProjectMeta> todo = new ArrayList<>();
         List<ProjectMeta> missing = new ArrayList<>();
         int skipped = 0;
+        int invalidCount = 0;
         Set<String> known = new HashSet<>();
         for (ProjectMeta p : registry.listAll()) {
             known.add(p.getName());
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
+            if (!ProjectNames.isValid(p.getName())) {
+                System.out.printf("Ignoring invalid project name '%s': its index directory would be the "
+                        + "index root, so pharos will not touch it. Run 'pharos remove %s' to unregister "
+                        + "it safely (registry: %s); see UPGRADING.md, section \"Invalid project names\".%n",
+                        p.getName(), p.getName(), registryPath());
+                invalidCount++;
+                continue;
+            }
             switch (IndexFormat.status(IndexFormat.dir(p.getIndexPath()))) {
                 case UPGRADE_AVAILABLE, OUTDATED, NEWER -> todo.add(p);
                 case MISSING -> missing.add(p);
-                case OK -> { }
+                case OK, INVALID -> { }
             }
         }
         for (String n : names) {
@@ -100,6 +114,10 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         }
 
         boolean embed = !noEmbed && !config.getEmbeddingProviders().isEmpty();
+        if (invalidCount > 0) {
+            System.out.printf("%d invalid registration%s ignored (warning only).%n",
+                    invalidCount, invalidCount == 1 ? "" : "s");
+        }
         if (todo.isEmpty() && missing.isEmpty() && skipped == 0) {
             System.out.println("All indexes are current; nothing to upgrade.");
             return 0;

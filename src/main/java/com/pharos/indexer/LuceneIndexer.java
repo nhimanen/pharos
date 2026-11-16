@@ -48,6 +48,7 @@ public class LuceneIndexer implements Closeable {
      * the last commit, so a failed run never publishes half-done changes.
      */
     public IndexWriter openWriter(String projectName) throws IOException {
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
         Directory dir = openDirectory(luceneDir);
@@ -67,6 +68,7 @@ public class LuceneIndexer implements Closeable {
      * previous commit in place instead of publishing a partial or empty index.
      */
     public IndexWriter openWriterFresh(String projectName) throws IOException {
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
         Path luceneDir = getLucenePath(projectName);
         Files.createDirectories(luceneDir);
         Directory dir = openDirectory(luceneDir);
@@ -141,6 +143,11 @@ public class LuceneIndexer implements Closeable {
         return FSDirectory.open(luceneDir);
     }
 
+    /** The configured index root (parent of every project dir). */
+    public Path getIndexDir() {
+        return config.getIndexDir();
+    }
+
     public Path getLucenePath(String projectName) {
         return config.getIndexDir().resolve(projectName).resolve("lucene");
     }
@@ -154,6 +161,8 @@ public class LuceneIndexer implements Closeable {
      * Called by force re-index to clear incompatible or corrupt index state.
      */
     public void deleteIndex(String projectName) throws IOException {
+        // Refuse before touching anything: a name like "." resolves to the index root itself.
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
         DirectoryReader cached = openReaders.remove(projectName);
         if (cached != null) {
             try { cached.close(); } catch (IOException ignored) {}

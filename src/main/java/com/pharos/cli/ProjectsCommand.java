@@ -2,6 +2,7 @@ package com.pharos.cli;
 
 import java.nio.file.Path;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.ProjectNames;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import picocli.CommandLine.*;
@@ -42,7 +43,9 @@ public class ProjectsCommand implements Callable<Integer> {
             String lastIndexed = p.getLastIndexed() != null ? fmt.format(p.getLastIndexed()) : "never";
             System.out.printf("%-25s  %7d  %7d  %6d  %-16s  %s%n",
                     p.getName(), p.getMethodCount(), p.getClassCount(), p.getFileCount(), lastIndexed,
-                    formatLabel(IndexFormat.status(IndexFormat.dir(p.getIndexPath()))));
+                    formatLabel(ProjectNames.isValid(p.getName())
+                            ? IndexFormat.status(IndexFormat.dir(p.getIndexPath()))
+                            : IndexFormat.Status.INVALID));
             if (!p.getLinkedProjects().isEmpty()) {
                 System.out.printf("  → linked: %s%n", String.join(", ", p.getLinkedProjects()));
             }
@@ -57,6 +60,7 @@ public class ProjectsCommand implements Callable<Integer> {
             case OUTDATED -> "needs upgrade";
             case NEWER -> "newer";
             case MISSING -> "-";
+            case INVALID -> "invalid name";
         };
     }
 }

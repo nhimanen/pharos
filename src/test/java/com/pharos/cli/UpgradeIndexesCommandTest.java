@@ -237,4 +237,35 @@ class UpgradeIndexesCommandTest {
             }
         }
     }
+
+    @Test
+    void invalidRegistryNameIsSkippedAndCountedNotCrashed() throws Exception {
+        Files.createDirectories(config.getIndexDir());
+        registry.register(new ProjectMeta(".", tmp.toString(),
+                config.getIndexDir().resolve(".").toString()));
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).isZero();
+        assertThat(out.toString()).contains("invalid project name '.'").contains("registry.json");
+        assertThat(config.getIndexDir()).isDirectory();
+    }
+
+    @Test
+    void invalidRegistrationsAreWarningOnlyExitZero() throws Exception {
+        Files.createDirectories(config.getIndexDir());
+        registry.register(new ProjectMeta(".", tmp.toString(),
+                config.getIndexDir().resolve(".").toString()));
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).isZero();
+        assertThat(out.toString()).contains("1 invalid registration ignored")
+                .contains(registry.getPath().toString());
+    }
+
+    @Test
+    void invalidRegistrationPlusRealSkipStillExitsOne() throws Exception {
+        Files.createDirectories(config.getIndexDir());
+        registry.register(new ProjectMeta(".", tmp.toString(), config.getIndexDir().toString()));
+        registry.register(new ProjectMeta("ghost", tmp.toString(),
+                config.getIndexDir().resolve("ghost").toString()));
+        assertThat(run(cmd(), "--yes")).isEqualTo(1);
+    }
 }

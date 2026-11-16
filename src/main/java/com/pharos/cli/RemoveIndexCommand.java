@@ -3,6 +3,7 @@ package com.pharos.cli;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.indexer.ProjectNames;
 import picocli.CommandLine.*;
 
 import java.util.List;
@@ -48,14 +49,27 @@ public class RemoveIndexCommand implements Callable<Integer> {
             return 2;
         }
 
-        if (all) return removeAll();
-        return removeOne(projectName);
+        try {
+            if (all) return removeAll();
+            return removeOne(projectName);
+        } catch (IllegalArgumentException e) {
+            System.err.println("Error: " + e.getMessage());
+            return 1;
+        }
     }
 
     private int removeOne(String name) throws Exception {
         if (registry.find(name).isEmpty()) {
             System.err.println("Project not found: " + name);
             return 1;
+        }
+        if (!ProjectNames.isValid(name)) {
+            // Its index dir may be the indexes root: unregister only, delete nothing on disk.
+            indexManager.unregisterOnly(name);
+            System.out.println("Unregistered invalid project name '" + name + "' (registry entry, link "
+                    + "references and synonyms only). Nothing was deleted from disk; any leftover files "
+                    + "in the index directory must be removed by hand (see UPGRADING.md).");
+            return 0;
         }
         indexManager.removeProject(name);
         System.out.println("Removed project '" + name + "'.");
@@ -73,6 +87,13 @@ public class RemoveIndexCommand implements Callable<Integer> {
         int failed  = 0;
         for (ProjectMeta meta : all) {
             try {
+                if (!ProjectNames.isValid(meta.getName())) {
+                    indexManager.unregisterOnly(meta.getName());
+                    System.out.println("Unregistered invalid project name '" + meta.getName()
+                            + "' (nothing deleted from disk).");
+                    removed++;
+                    continue;
+                }
                 indexManager.removeProject(meta.getName());
                 System.out.println("Removed project '" + meta.getName() + "'.");
                 removed++;

@@ -78,6 +78,9 @@ public class ProjectRegistry {
     // Public API
     // -------------------------------------------------------------------------
 
+    /** The registry file on disk. */
+    public Path getPath() { return registryFile; }
+
     public synchronized void register(ProjectMeta meta) {
         // Persist unresolved refs to a separate file — keeps registry.json lean
         if (meta.getIndexPath() != null

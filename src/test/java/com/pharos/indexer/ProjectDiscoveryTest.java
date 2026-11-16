@@ -233,4 +233,15 @@ class ProjectDiscoveryTest {
         assertThat(ProjectDiscovery.deriveProjectName(Path.of("/repos/my-app")))
                 .isEqualTo("my-app");
     }
+
+    @Test
+    void deriveProjectName_relativeDotResolvesToDirectoryName(@org.junit.jupiter.api.io.TempDir Path tmp) {
+        Path dir = tmp.resolve("my-proj");
+        dir.toFile().mkdirs();
+        // "<dir>/sub/.." normalizes to <dir>; a bare "." must not yield "."
+        assertThat(ProjectDiscovery.deriveProjectName(dir.resolve("sub").resolve("..")))
+                .isEqualTo("my-proj");
+        assertThat(ProjectDiscovery.deriveProjectName(Path.of(".")))
+                .isNotEqualTo(".").isNotEmpty();
+    }
 }

@@ -34,7 +34,9 @@ public final class IndexFormat {
         /** Written by a newer pharos: refused. */
         NEWER("newer"),
         /** No index dir. */
-        MISSING("missing");
+        MISSING("missing"),
+        /** Registered under a name that is not a usable project name (e.g. "."): never touched. */
+        INVALID("invalid");
 
         private final String wireName;
 
