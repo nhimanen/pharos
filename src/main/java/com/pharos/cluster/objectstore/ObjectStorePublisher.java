@@ -105,6 +105,9 @@ public final class ObjectStorePublisher implements IndexPublisher {
     public Optional<Generation> publish(LocalSnapshot snapshot) throws IOException {
         // Validated before anything is read or uploaded (IllegalArgumentException).
         ShardId shard = ShardId.ofProject(snapshot.project());
+        // Defensive, before anything is read from the store or uploaded: PublishCommand refuses
+        // these states too, but every publish path (the index hook included) must.
+        checkPublishableState(shard, snapshot.shardDir());
         Path tempDir = null;
         try {
             // 1. Previous generation P and the ETag the final CAS is conditioned on.
@@ -149,14 +152,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
             //    run for the same N can never overwrite the bytes a committed manifest points at.
             tempDir = Files.createTempDirectory("pharos-publish-");
             //    The writer's live graph is the generation named by callgraph.current (legacy
-            //    callgraph.arcadedb without a pointer). It is opened read-only: openExisting never
-            //    creates a graph, and an unusable pointer fails the publish instead of silently
-            //    shipping a generation without its graph.
-            String pointerProblem = CallGraph.pointerProblem(snapshot.shardDir());
-            if (pointerProblem != null) {
-                throw new PublishException("cannot publish shard " + shard + ": " + pointerProblem
-                        + "; re-index the project (pharos index --full)");
-            }
+            //    callgraph.arcadedb without a pointer), checked above; openExisting never creates one.
             Path arcade = CallGraph.projectGraphDir(snapshot.shardDir());
             if (Files.isDirectory(arcade)) {
                 Path graphFile = tempDir.resolve(GraphViews.COMPACT_FILE);
@@ -229,6 +225,25 @@ public final class ObjectStorePublisher implements IndexPublisher {
             throw new PublishException("publishing shard " + shard + " failed: " + e.getMessage(), e);
         } finally {
             if (tempDir != null) deleteRecursively(tempDir);
+        }
+    }
+
+    /**
+     * A broken {@code callgraph.current} would ship a generation without its graph; an index
+     * format other than this build's (even an N-1 one it still serves) must be re-indexed first,
+     * so readers never receive an old format from this writer.
+     */
+    private static void checkPublishableState(ShardId shard, Path shardDir) throws PublishException {
+        String pointerProblem = CallGraph.pointerProblem(shardDir);
+        if (pointerProblem != null) {
+            throw new PublishException("cannot publish shard " + shard + ": " + pointerProblem
+                    + "; re-index the project (pharos index --full)");
+        }
+        IndexFormat.Status status = IndexFormat.status(shardDir);
+        if (status != IndexFormat.Status.OK) {
+            throw new PublishException("cannot publish shard " + shard + ": its index format is "
+                    + IndexFormat.read(shardDir).format() + " (" + status.wireName() + "), this pharos publishes "
+                    + com.pharos.indexer.IndexVersions.INDEX_FORMAT + "; re-index the project (pharos index --full)");
         }
     }
 

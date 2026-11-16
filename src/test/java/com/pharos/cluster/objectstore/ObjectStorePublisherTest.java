@@ -552,6 +552,7 @@ class ObjectStorePublisherTest {
         assertThatThrownBy(() -> publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
                 .isInstanceOf(PublishException.class)
                 .hasMessageContaining("callgraph-1.arcadedb");
+        assertThat(store.list("")).as("nothing uploaded").isEmpty();
         assertThat(store.get(layout.latestKey(SHARD))).isEmpty();
         assertThat(shardDir.resolve("callgraph-1.arcadedb")).doesNotExist();
         assertThat(shardDir.resolve(com.pharos.graph.GraphViews.ARCADE_DIR)).doesNotExist();
@@ -589,5 +590,24 @@ class ObjectStorePublisherTest {
         assertThat(m.indexFormat()).isNull();
         assertThat(m.indexFormatVersion()).isZero();
         assertThat(JSON.readTree(m.toJson()).has("indexFormatVersion")).isFalse();
+    }
+
+    @Test
+    void nonCurrentIndexFormatIsRefusedBeforeAnyUpload() throws Exception {
+        indexFull(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        long mtime = System.currentTimeMillis();
+        for (int format : new int[]{com.pharos.indexer.IndexFormat.MIN_READABLE_FORMAT,
+                                    com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1}) {
+            com.pharos.indexer.IndexFormat.write(shardDir, new com.pharos.indexer.IndexFormat.Stamp(format, "t", null));
+            Files.setLastModifiedTime(shardDir.resolve(com.pharos.indexer.IndexFormat.FILE_NAME),
+                    FileTime.fromMillis(mtime += 60_000)); // IndexFormat caches by mtime
+
+            assertThatThrownBy(() -> publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
+                    .isInstanceOf(PublishException.class)
+                    .hasMessageContaining("index format is " + format);
+            assertThat(store.list("")).as("nothing uploaded").isEmpty();
+        }
     }
 }
