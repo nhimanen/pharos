@@ -84,7 +84,7 @@ public final class ClusterRuntime implements Closeable {
         }
         syncer = s;
         Map<ShardId, Generation> served = s.served();
-        log.info("Reader {} serving {} shard(s): {}", config.getCluster().getNodeId(), served.size(), served);
+        log.info("Reader {} serving {} shard(s): {}", config.getCluster().effectiveNodeId(), served.size(), served);
         warm(served);
         s.start();
     }

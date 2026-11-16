@@ -24,7 +24,7 @@ class ClusterConfigTest {
         ClusterConfig c = parse("{\"verbose\": true}");
         assertThat(c.getRole()).isEqualTo(NodeRole.ALL);
         assertThat(c.getBackend()).isEqualTo(BackendKind.LOCAL);
-        assertThat(c.getNodeId()).isNotBlank();
+        assertThat(c.getNodeId()).as("not resolved for single node").isNull();
         assertThat(c.getRetentionGenerations()).isEqualTo(3);
     }
 

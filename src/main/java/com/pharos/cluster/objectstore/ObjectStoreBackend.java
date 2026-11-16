@@ -32,7 +32,13 @@ public final class ObjectStoreBackend implements ReplicationBackend {
     private final IndexPublisher publisher;
 
     public ObjectStoreBackend(IndexConfig config) {
-        this(config, new S3ObjectStore(config.getCluster().getObjectStore()));
+        // validated before the S3 client is built (arguments evaluate left to right)
+        this(validated(config), new S3ObjectStore(config.getCluster().getObjectStore()));
+    }
+
+    private static IndexConfig validated(IndexConfig config) {
+        config.getCluster().validate();
+        return config;
     }
 
     /** Package-private: injects the store (tests). Takes ownership of {@code store}. */
@@ -50,7 +56,7 @@ public final class ObjectStoreBackend implements ReplicationBackend {
             this.cache = new LocalFsCache(config);
             GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
                     Duration.ofMinutes(cfg.getRetentionMinutes()));
-            this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.getNodeId(),
+            this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
                     config.getSynonymsFile());
         }
     }

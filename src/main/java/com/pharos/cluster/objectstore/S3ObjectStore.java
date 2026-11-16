@@ -38,14 +38,32 @@ public class S3ObjectStore implements ObjectStore {
 
     private final S3Client s3;
     private final String bucket;
+    /** For messages: the configured endpoint, or the AWS default. */
+    private final String endpoint;
 
     public S3ObjectStore(ClusterConfig.ObjectStoreConfig cfg) {
-        this(cfg, credentialsFor(cfg));
+        this(cfg, credentialsFor(cfg, System::getenv));
     }
 
     /** Visible for tests that supply credentials directly. */
     S3ObjectStore(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         this.bucket = cfg.getBucket();
+        this.endpoint = describeEndpoint(cfg);
+        try {
+            this.s3 = buildClient(cfg, credentials);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("cannot create the S3 client for bucket '" + bucket + "' at "
+                    + endpoint + ": " + e.getMessage(), e);
+        }
+    }
+
+    static String describeEndpoint(ClusterConfig.ObjectStoreConfig cfg) {
+        return cfg.getEndpoint() == null || cfg.getEndpoint().isBlank()
+                ? "the default AWS endpoint (region " + cfg.getRegion() + ")"
+                : "endpoint '" + cfg.getEndpoint() + "'";
+    }
+
+    private static S3Client buildClient(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         var builder = S3Client.builder()
                 .httpClient(UrlConnectionHttpClient.create())
                 .region(Region.of(cfg.getRegion()))
@@ -55,16 +73,36 @@ public class S3ObjectStore implements ObjectStore {
         if (cfg.getEndpoint() != null && !cfg.getEndpoint().isBlank()) {
             builder.endpointOverride(URI.create(cfg.getEndpoint()));
         }
-        this.s3 = builder.build();
+        return builder.build();
     }
 
-    private static AwsCredentialsProvider credentialsFor(ClusterConfig.ObjectStoreConfig cfg) {
-        String ak = cfg.getAccessKeyEnv() == null ? null : System.getenv(cfg.getAccessKeyEnv());
-        String sk = cfg.getSecretKeyEnv() == null ? null : System.getenv(cfg.getSecretKeyEnv());
-        if (ak != null && !ak.isEmpty() && sk != null && !sk.isEmpty()) {
-            return StaticCredentialsProvider.create(AwsBasicCredentials.create(ak, sk));
+    /**
+     * Static credentials from the variables {@code accessKeyEnv}/{@code secretKeyEnv} name; the
+     * default AWS chain only when neither is configured. A named variable that is unset or empty
+     * fails fast instead of silently falling back to other credentials.
+     */
+    static AwsCredentialsProvider credentialsFor(ClusterConfig.ObjectStoreConfig cfg,
+                                                 java.util.function.Function<String, String> env) {
+        String akVar = blankToNull(cfg.getAccessKeyEnv());
+        String skVar = blankToNull(cfg.getSecretKeyEnv());
+        if (akVar == null && skVar == null) return DefaultCredentialsProvider.builder().build();
+        if (akVar == null || skVar == null) {
+            throw new IllegalStateException("cluster.objectStore: set both accessKeyEnv and secretKeyEnv, or neither"
+                    + " (got only " + (akVar != null ? "accessKeyEnv" : "secretKeyEnv") + ")");
         }
-        return DefaultCredentialsProvider.builder().build();
+        String ak = env.apply(akVar);
+        String sk = env.apply(skVar);
+        for (String[] v : new String[][]{{akVar, ak}, {skVar, sk}}) {
+            if (v[1] == null || v[1].isEmpty()) {
+                throw new IllegalStateException("environment variable " + v[0] + " (cluster.objectStore."
+                        + (v[0].equals(akVar) ? "accessKeyEnv" : "secretKeyEnv") + ") is not set or empty");
+            }
+        }
+        return StaticCredentialsProvider.create(AwsBasicCredentials.create(ak, sk));
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s;
     }
 
     @Override
@@ -207,7 +245,7 @@ public class S3ObjectStore implements ObjectStore {
     }
 
     private IOException wrap(String op, String key, SdkException e) {
-        return new IOException("S3 " + op + " failed for key '" + key + "' in bucket '" + bucket + "': "
-                + e.getMessage(), e);
+        return new IOException("S3 " + op + " failed for key '" + key + "' in bucket '" + bucket + "' at "
+                + endpoint + ": " + e.getMessage(), e);
     }
 }
