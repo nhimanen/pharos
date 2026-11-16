@@ -50,6 +50,11 @@ public class VectorSearchStrategy {
     }
 
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
+        return search(reader, req, null);
+    }
+
+    public List<SearchResult> search(IndexReader reader, SearchRequest req,
+                                     SearchTrace trace) throws IOException {
         if (!embedder.isAvailable()) {
             log.warn("Vector search requested but no embedding provider configured.");
             return List.of();
@@ -60,9 +65,13 @@ public class VectorSearchStrategy {
             queryVector = embedder.embedQuery(req.query());
         } catch (com.pharos.embedding.EmbeddingException e) {
             queryVector = null;   // already logged at WARN by the provider
+            if (trace != null) {
+                trace.addWarning("vector embedding failed for model " + embedder.modelId() + "; "
+                        + (req.type() == SearchRequest.SearchType.VECTOR
+                                ? "no vector results" : "results are keyword-only"));
+            }
         }
         if (queryVector == null) {
-            log.warn("Embedding returned null for query: {}", req.query());
             return List.of();
         }
 

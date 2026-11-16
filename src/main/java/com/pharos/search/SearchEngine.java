@@ -256,6 +256,7 @@ public class SearchEngine {
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
+        warnings.addAll(trace.warnings());
 
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
