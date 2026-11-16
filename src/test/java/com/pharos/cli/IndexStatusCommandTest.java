@@ -132,4 +132,14 @@ class IndexStatusCommandTest {
         finally { System.setOut(old); }
         assertThat(buf.toString()).contains("invalid name");
     }
+
+    @Test
+    void jsonReportsTheNodeRole() throws Exception {
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute("--json")).isZero();
+        assertThat(new ObjectMapper().readTree(out.toString()).get("role").asText()).isEqualTo("all");
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry, com.pharos.cluster.NodeRole.READER))
+                .execute("--json")).isZero();
+        assertThat(new ObjectMapper().readTree(out.toString()).get("role").asText()).isEqualTo("reader");
+    }
 }

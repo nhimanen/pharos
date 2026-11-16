@@ -268,4 +268,22 @@ class UpgradeIndexesCommandTest {
                 config.getIndexDir().resolve("ghost").toString()));
         assertThat(run(cmd(), "--yes")).isEqualTo(1);
     }
+
+    // ── Adaptation 7: readers receive upgrades by syncing ───────────────────────────────────
+
+    @Test
+    void readerRefusesToUpgradeAndTouchesNothing() throws Exception {
+        indexProject("b", true);
+        com.pharos.config.ClusterConfig cluster = new com.pharos.config.ClusterConfig();
+        cluster.setRole(com.pharos.cluster.NodeRole.READER);
+        cluster.setBackend(com.pharos.cluster.BackendKind.OBJECT_STORE);
+        config.setCluster(cluster);
+
+        int rc = run(cmd(), "--yes");
+
+        assertThat(rc).isEqualTo(2);
+        assertThat(err.toString()).contains("readers receive upgrades by syncing; upgrade the writer");
+        assertThat(out.toString()).doesNotContain("Re-indexing");
+        assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
+    }
 }

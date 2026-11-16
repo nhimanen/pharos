@@ -3,6 +3,7 @@ package com.pharos.cli;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.pharos.PharosVersion;
+import com.pharos.cluster.NodeRole;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.IndexFormat;
@@ -37,9 +38,19 @@ public class IndexStatusCommand implements Callable<Integer> {
     private boolean json;
 
     private final ProjectRegistry registry;
+    private final NodeRole role;
 
     public IndexStatusCommand(ProjectRegistry registry) {
+        this(registry, NodeRole.ALL);
+    }
+
+    /**
+     * @param role this node's cluster role, reported as {@code role} in {@code --json} so consumers
+     *             (setup.sh) do not advise {@code upgrade-indexes} on a reader, which refuses it
+     */
+    public IndexStatusCommand(ProjectRegistry registry, NodeRole role) {
         this.registry = registry;
+        this.role = role;
     }
 
     @Override
@@ -67,6 +78,7 @@ public class IndexStatusCommand implements Callable<Integer> {
             top.put("requiredFormat", IndexVersions.INDEX_FORMAT);
             top.put("minReadableFormat", IndexFormat.MIN_READABLE_FORMAT);
             top.put("pharosVersion", PharosVersion.get());
+            top.put("role", role.json());
             top.put("projects", rows);
             System.out.println(new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
                     .writeValueAsString(top));

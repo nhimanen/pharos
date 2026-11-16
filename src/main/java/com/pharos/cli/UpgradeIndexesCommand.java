@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.cluster.RoleGuard;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -22,7 +23,8 @@ import java.util.function.Function;
 
 /**
  * Re-indexes (full) every project whose index is {@code upgrade-available}, {@code outdated}
- * or {@code newer}, so the whole set reaches the current index format.
+ * or {@code newer}, so the whole set reaches the current index format. Refused on reader nodes
+ * (exit code 2): they receive upgraded generations by syncing from the writer.
  */
 @Command(
         name = "upgrade-indexes",
@@ -83,6 +85,12 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        try {
+            RoleGuard.requireUpgrades(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         Set<String> wanted = new HashSet<>(names);
         List<ProjectMeta> todo = new ArrayList<>();
         List<ProjectMeta> missing = new ArrayList<>();

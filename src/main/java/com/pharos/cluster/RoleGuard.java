@@ -6,6 +6,8 @@ import com.pharos.config.IndexConfig;
 public final class RoleGuard {
 
     static final String READER_INDEXING = "this node has role reader; run indexing on a writer node";
+    static final String READER_UPGRADES =
+            "this node has role reader; readers receive upgrades by syncing; upgrade the writer";
 
     private RoleGuard() {}
 
@@ -13,6 +15,16 @@ public final class RoleGuard {
     public static void requireIndexing(IndexConfig config) {
         if (config.getCluster().getRole() == NodeRole.READER) {
             throw new IllegalStateException(READER_INDEXING);
+        }
+    }
+
+    /**
+     * Index format upgrades re-index, so they happen where indexing does. A reader's generations
+     * are replaced by syncing once the writer has upgraded and re-published them.
+     */
+    public static void requireUpgrades(IndexConfig config) {
+        if (config.getCluster().getRole() == NodeRole.READER) {
+            throw new IllegalStateException(READER_UPGRADES);
         }
     }
 
