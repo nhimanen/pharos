@@ -169,6 +169,27 @@ class LegacyModelVectorFieldTest {
     }
 
     @Test
+    void vecLegacyIndexWithUnavailableModel_staysIncremental() throws Exception {
+        CountingProvider seed = new CountingProvider("legacy");
+        setUpProject(seed);
+        manager.index(root, "mig", false, true);
+        downgradeToMisnamed();
+        EmbeddingProvider offline = new FakeProvider("legacy") {
+            @Override public boolean isAvailable() { return false; }
+        };
+        ModuleGraphBuilder noopGraph = new ModuleGraphBuilder(registry) {
+            @Override
+            public synchronized List<String> incorporate(Path r, ProjectMeta meta,
+                    com.pharos.parser.MavenPomReader.PomInfo pomInfo) { return List.of(); }
+        };
+        ProjectIndexManager offlineManager = new ProjectIndexManager(config, lucene, registry, List.of(offline), noopGraph);
+        List<String> msgs = new java.util.ArrayList<>();
+        offlineManager.index(root, "mig", true, true, (stage, done, total) -> msgs.add(stage));
+        assertThat(msgs).noneMatch(m -> m.contains("full re-index"));
+        assertThat(liveMisnamed()).as("nothing could be re-embedded").isTrue();
+    }
+
+    @Test
     void healthyLegacyIndexStaysIncremental() throws Exception {
         CountingProvider provider = new CountingProvider("legacy");
         setUpProject(provider);
