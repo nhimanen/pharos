@@ -1277,7 +1277,7 @@ public class ProjectIndexManager {
      * <p>Threads count is from {@code rt.threads}; 1 collapses to a single
      * worker, equivalent to the previous serial pass.
      */
-    private void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
                                ProgressListener progress, String projectName) throws IOException {
         if (totalSlots == 0) return;
         int chunkSize = rt.chunkSize;
@@ -1364,6 +1364,17 @@ public class ProjectIndexManager {
                     throw new IOException("Embed task failed: " + cause.getMessage(), cause);
                 }
             }
+        } catch (IOException | RuntimeException abort) {
+            // Keep what was already embedded so the next run does not redo it.
+            pool.shutdown();
+            try {
+                pool.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS);
+                if (rt.cache != null) rt.cache.save();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                abort.addSuppressed(interrupted);
+            }
+            throw abort;
         } finally {
             pool.shutdown();
         }
