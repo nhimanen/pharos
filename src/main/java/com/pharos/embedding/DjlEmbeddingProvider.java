@@ -100,7 +100,13 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
         if (modelUrl.startsWith("hf://")) {
             this.tokenizerFile = prepareHuggingFaceFiles(modelUrl.substring("hf://".length()));
             try (var t = NativeInferenceGuard.enter()) {
-                this.hfModel = loadHuggingFaceModel(tokenizerFile.getParent());
+                try {
+                    this.hfModel = loadHuggingFaceModel(tokenizerFile.getParent());
+                } catch (ModelException | RuntimeException e) {
+                    throw new IOException("Failed to load model from " + tokenizerFile.getParent()
+                            + " (missing external data or corrupt files? delete that directory to re-download): "
+                            + e.getMessage(), e);
+                }
             }
             this.zooModel = null;
         } else {
@@ -171,29 +177,66 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      * the local path to tokenizer.json.
      */
     private Path prepareHuggingFaceFiles(String modelId) throws IOException {
-        String base = "https://huggingface.co/" + modelId + "/resolve/main/";
-
-        // Sanitise modelId for use as a directory name (replace / with -)
         Path modelDir = MODEL_CACHE.resolve(modelId.replace('/', '-'));
+        ensureModelFiles(hfBaseUrl + modelId + "/resolve/main/", modelDir);
+        return modelDir.resolve("tokenizer.json");
+    }
+
+    /** Base URL override for tests (package-private). */
+    static String hfBaseUrl = "https://huggingface.co/";
+
+    static final String COMPLETE_MARKER = ".complete";
+
+    /**
+     * Ensures a complete model directory. Files are downloaded to {@code <file>.part} and moved
+     * into place atomically; the {@code .complete} marker is written last. A directory without
+     * the marker is re-downloaded, except a legacy one (model.onnx + tokenizer.json, no .part
+     * files) from before markers existed, which is accepted once and marked.
+     */
+    static void ensureModelFiles(String base, Path modelDir) throws IOException {
         Files.createDirectories(modelDir);
+        Path marker = modelDir.resolve(COMPLETE_MARKER);
+        Path onnxFile = modelDir.resolve("model.onnx");
+        Path tokenizerPath = modelDir.resolve("tokenizer.json");
+        if (Files.exists(marker)) return;
 
-        Path onnxFile       = modelDir.resolve("model.onnx");
-        Path tokenizerPath  = modelDir.resolve("tokenizer.json");
-        Path configJsonFile = modelDir.resolve("config.json");
-
-        if (!Files.exists(onnxFile)) {
+        boolean hasParts;
+        try (var stream = Files.list(modelDir)) {
+            hasParts = stream.anyMatch(f -> f.getFileName().toString().endsWith(".part"));
+        }
+        boolean legacy = !hasParts && Files.exists(onnxFile) && Files.exists(tokenizerPath);
+        if (legacy) {
+            log.info("Accepting pre-marker model directory {}", modelDir);
+        } else {
+            // Unknown state: discard everything so no half-model can be loaded.
+            try (var stream = Files.list(modelDir)) {
+                for (Path f : (Iterable<Path>) stream::iterator) Files.deleteIfExists(f);
+            }
             log.info("Downloading ONNX model from {}onnx/model.onnx ...", base);
             downloadWithRedirects(base + "onnx/model.onnx", onnxFile);
-        }
-        if (!Files.exists(tokenizerPath)) {
+            // Large models keep weights in a sibling external-data file; absent (404) is normal.
+            try {
+                downloadWithRedirects(base + "onnx/model.onnx_data", modelDir.resolve("model.onnx_data"));
+            } catch (HttpStatusException e) {
+                if (e.status != 404) throw e;
+            }
             log.info("Downloading tokenizer from {}tokenizer.json ...", base);
             downloadWithRedirects(base + "tokenizer.json", tokenizerPath);
         }
+        Path configJsonFile = modelDir.resolve("config.json");
         if (!Files.exists(configJsonFile)) {
             log.info("Downloading model config from {}config.json ...", base);
             downloadWithRedirects(base + "config.json", configJsonFile);
         }
-        return tokenizerPath;
+        Files.writeString(marker, "ok\n");
+    }
+
+    static final class HttpStatusException extends IOException {
+        final int status;
+        HttpStatusException(int status, String url) {
+            super("HTTP " + status + " downloading " + url);
+            this.status = status;
+        }
     }
 
     /**
@@ -215,8 +258,17 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
             conn.setRequestProperty("User-Agent", "pharos/1.0");
             int status = conn.getResponseCode();
             if (status == HttpURLConnection.HTTP_OK) {
+                Path part = dest.resolveSibling(dest.getFileName() + ".part");
                 try (InputStream in = conn.getInputStream()) {
-                    Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(in, part, StandardCopyOption.REPLACE_EXISTING);
+                    long expected = conn.getContentLengthLong();
+                    if (expected >= 0 && Files.size(part) != expected) {
+                        throw new IOException("Truncated download of " + urlStr);
+                    }
+                    Files.move(part, dest, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException e) {
+                    Files.deleteIfExists(part);
+                    throw e;
                 }
                 return;
             } else if (status == HttpURLConnection.HTTP_MOVED_TEMP   // 302
@@ -228,7 +280,7 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
                 // Resolve relative redirects against the current URL
                 current = new URL(current, location);
             } else {
-                throw new IOException("HTTP " + status + " downloading " + urlStr);
+                throw new HttpStatusException(status, urlStr);
             }
         }
         throw new IOException("Too many redirects downloading " + urlStr);
