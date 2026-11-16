@@ -28,6 +28,22 @@ tar -czf "$REL/$TAG/pharos-skill.tar.gz" -C "$WORK/skillsrc" pharos
 echo "$TAG" > "$REL/latest"
 GOOD_SHA="$(cut -d' ' -f1 "$REL/$TAG/pharos-9.9.9.jar.sha256")"
 
+# make_variant TAG VER JARFILE SKILLTAR  -> extra fake release dir with its own checksum
+make_variant() {
+  local tag="$1" ver="$2" jar="$3" skill="$4"
+  mkdir -p "$REL/$tag"
+  cp "$jar" "$REL/$tag/pharos-$ver.jar"
+  (cd "$REL/$tag" && sha256sum "pharos-$ver.jar" > "pharos-$ver.jar.sha256")
+  cp "$REPO/pharos" "$REL/$tag/pharos"
+  cp "$SETUP" "$REL/$tag/setup.sh"
+  cp "$skill" "$REL/$tag/pharos-skill.tar.gz"
+}
+echo "not a jar" > "$WORK/fake.jar"
+make_variant v9.9.8 9.9.8 "$WORK/fake.jar" "$REL/$TAG/pharos-skill.tar.gz"
+mkdir -p "$WORK/badskill/other" && echo x > "$WORK/badskill/other/f"
+tar -czf "$WORK/badskill.tar.gz" -C "$WORK/badskill" other
+make_variant v9.9.7 9.9.7 "$JAR" "$WORK/badskill.tar.gz"
+
 new_home() { mktemp -d "$WORK/home.XXXXXX"; }
 
 # register_project HOME NAME FORMAT|none  -> registry.json entry + index dir (stamp optional)
@@ -126,10 +142,43 @@ t_upgrade_indexes_flag() {
   check upgrade_indexes_flag $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
 }
 
+t_index_status_failure_fails_closed() {
+  local h; h="$(new_home)"; preinstall "$h"
+  register_project "$h" someproj 1
+  run_setup "$h" --release v9.9.8
+  local rc1; rc1="$(rc "$h")"
+  local msg=0; grep -qi 'could not determine' "$h/out.txt" || msg=1
+  local jar1; jar1="$(cat "$h/.pharos/bin/pharos.jar")"
+  run_setup "$h" --release v9.9.8 --yes
+  [ "$rc1" = 2 ] && [ "$msg" = 0 ] && [ "$jar1" = "OLD-JAR" ] && [ "$(rc "$h")" = 0 ] \
+    && [ "$(cat "$h/.pharos/bin/pharos.jar")" = "not a jar" ]
+  check index_status_failure_fails_closed $? "rc1=$rc1 msg=$msg rc2=$(rc "$h"); $(tail -6 "$h/out.txt")"
+}
+
+t_bad_skill_bundle_leaves_install_untouched() {
+  local h; h="$(new_home)"; preinstall "$h"
+  mkdir -p "$h/.claude/skills/pharos"; echo OLD-SKILL > "$h/.claude/skills/pharos/SKILL.md"
+  run_setup "$h" --release v9.9.7 --yes
+  [ "$(rc "$h")" != 0 ] && [ "$(cat "$h/.pharos/bin/pharos.jar")" = "OLD-JAR" ] \
+    && [ "$(cat "$h/.claude/skills/pharos/SKILL.md")" = "OLD-SKILL" ]
+  check bad_skill_bundle_leaves_install_untouched $? "rc=$(rc "$h"); $(tail -4 "$h/out.txt")"
+}
+
+t_upgrade_indexes_without_yes_does_not_crash_on_empty_array() {
+  local h; h="$(new_home)"
+  run_setup "$h" --release "$TAG"
+  run_setup "$h" --upgrade-indexes
+  ! grep -q 'unbound variable' "$h/out.txt"
+  check upgrade_indexes_without_yes_no_unbound_var $? "$(tail -4 "$h/out.txt")"
+}
+
 t_release_install_verifies_and_installs
 t_corrupt_checksum_aborts_without_touching_install
 t_warning_lists_outdated_projects_and_declines_noninteractive
 t_yes_installs_despite_outdated
 t_searchable_only_installs_without_prompt
 t_upgrade_indexes_flag
+t_index_status_failure_fails_closed
+t_bad_skill_bundle_leaves_install_untouched
+t_upgrade_indexes_without_yes_does_not_crash_on_empty_array
 exit "$FAILED"

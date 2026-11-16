@@ -174,7 +174,7 @@ if [ "$UPGRADE_INDEXES" = true ]; then
   UP_ARGS=()
   [ "$ASSUME_YES" = true ] && UP_ARGS+=(--yes)
   UP_RC=0
-  java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" upgrade-indexes "${UP_ARGS[@]}" || UP_RC=$?
+  java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" upgrade-indexes ${UP_ARGS[@]+"${UP_ARGS[@]}"} || UP_RC=$?
   if [ "$WAS_RUNNING" = true ]; then
     _restart_daemon
   fi
@@ -250,14 +250,49 @@ if [ "$RESTART_ONLY" = false ]; then
   echo "Using JAR: $(basename "$NEW_JAR")"
 fi
 
+# Validate the staged files before anything is mutated.
+if [ "$RESTART_ONLY" = false ]; then
+  for f in "$NEW_JAR" "$NEW_CLI" "$NEW_SETUP"; do
+    if [ ! -s "$f" ]; then
+      echo "Error: staged file missing or empty: $f — nothing was installed." >&2
+      exit 1
+    fi
+  done
+  if [ ! -f "$NEW_SKILL_SRC/SKILL.md" ]; then
+    echo "Error: skill bundle has no pharos/SKILL.md — nothing was installed." >&2
+    exit 1
+  fi
+fi
+
 # ── 2. Upgrade warning (both modes) ───────────────────────────────────────────
 # Ask the NEW jar which registered projects its index format cannot serve.
 
+# Confirm helper: prompts unless --yes; no TTY + no --yes => exit 2 with the old install untouched.
+_confirm_or_abort() {
+  if [ "$ASSUME_YES" = true ]; then return 0; fi
+  if [ ! -t 0 ]; then
+    echo "Aborting: no terminal to confirm. Re-run with --yes to install anyway. The existing install is untouched." >&2
+    exit 2
+  fi
+  read -r -p "Continue installing? [y/N] " ANS
+  case "$ANS" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted. The existing install is untouched."; exit 2 ;;
+  esac
+}
+
 if [ "$RESTART_ONLY" = false ] && [ -f "$HOME/.pharos/registry.json" ]; then
+  [ -n "$TMP_DIR" ] || TMP_DIR="$(mktemp -d)"
+  STATUS_ERR="$TMP_DIR/index-status.err"
   STATUS_JSON=""
-  STATUS_JSON="$(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$NEW_JAR" index-status --json 2>/dev/null)" || STATUS_JSON=""
-  if [ -n "$STATUS_JSON" ]; then
-    WARN_RC=0
+  STATUS_RC=0
+  STATUS_JSON="$(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$NEW_JAR" index-status --json 2>"$STATUS_ERR")" || STATUS_RC=$?
+  WARN_RC=0
+  WARN_TEXT=""
+  CAUSE=""
+  if [ "$STATUS_RC" -ne 0 ]; then
+    CAUSE="the new jar's 'index-status --json' exited with status $STATUS_RC"
+  else
     WARN_TEXT="$(printf '%s' "$STATUS_JSON" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -298,23 +333,24 @@ if missing:
 out.append("(re-index afterwards with: ./setup.sh --upgrade-indexes)")
 print("\n".join(out))
 sys.exit(10 if blocked else 0)
-')" || WARN_RC=$?
+' 2>"$STATUS_ERR")" || WARN_RC=$?
     if [ "$WARN_RC" -ne 0 ] && [ "$WARN_RC" -ne 10 ]; then
-      echo "Warning: could not evaluate index status (python3 failed); skipping the upgrade check." >&2
-    elif [ -n "$WARN_TEXT" ]; then
-      echo "$WARN_TEXT"
-      if [ "$WARN_RC" -eq 10 ] && [ "$ASSUME_YES" = false ]; then
-        if [ ! -t 0 ]; then
-          echo "Aborting: no terminal to confirm. Re-run with --yes to install anyway. The existing install is untouched." >&2
-          exit 2
-        fi
-        read -r -p "Continue installing? [y/N] " ANS
-        case "$ANS" in
-          y|Y|yes|YES) ;;
-          *) echo "Aborted. The existing install is untouched."; exit 2 ;;
-        esac
-      fi
+      CAUSE="the output of 'index-status --json' could not be parsed"
     fi
+  fi
+  if [ -n "$CAUSE" ]; then
+    {
+      echo "WARNING: could not determine which project indexes this version can serve: $CAUSE."
+      if [ -s "$STATUS_ERR" ]; then
+        echo "  First lines of its error output:"
+        head -n 5 "$STATUS_ERR" | sed 's/^/    /'
+      fi
+      echo "  Indexed projects may become unsearchable after installing."
+    } >&2
+    _confirm_or_abort
+  elif [ -n "$WARN_TEXT" ]; then
+    echo "$WARN_TEXT"
+    if [ "$WARN_RC" -eq 10 ]; then _confirm_or_abort; fi
   fi
 fi
 
@@ -343,10 +379,16 @@ if [ "$RESTART_ONLY" = false ]; then
   CLAUDE_SKILLS="$HOME/.claude/skills"
   echo "Installing Claude skill -> $CLAUDE_SKILLS/pharos/..."
   mkdir -p "$CLAUDE_SKILLS"
-  rm -rf "$CLAUDE_SKILLS/pharos.new.$$"
+  rm -rf "$CLAUDE_SKILLS/pharos.new.$$" "$CLAUDE_SKILLS/pharos.old.$$"
   cp -r "$NEW_SKILL_SRC" "$CLAUDE_SKILLS/pharos.new.$$"
-  rm -rf "$CLAUDE_SKILLS/pharos"
-  mv "$CLAUDE_SKILLS/pharos.new.$$" "$CLAUDE_SKILLS/pharos"
+  if [ -e "$CLAUDE_SKILLS/pharos" ]; then mv "$CLAUDE_SKILLS/pharos" "$CLAUDE_SKILLS/pharos.old.$$"; fi
+  if mv "$CLAUDE_SKILLS/pharos.new.$$" "$CLAUDE_SKILLS/pharos"; then
+    rm -rf "$CLAUDE_SKILLS/pharos.old.$$"
+  else
+    echo "Error: could not install the skill; restoring the previous one." >&2
+    [ -e "$CLAUDE_SKILLS/pharos.old.$$" ] && mv "$CLAUDE_SKILLS/pharos.old.$$" "$CLAUDE_SKILLS/pharos"
+    exit 1
+  fi
 fi
 
 # ── 4. Restart daemon (always, unless --restart-only was used with no daemon) ──
