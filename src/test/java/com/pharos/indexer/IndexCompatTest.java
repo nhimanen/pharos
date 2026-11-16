@@ -139,6 +139,100 @@ class IndexCompatTest {
         }
     }
 
+    // --- the real 1.3 → 1.4 migration path: a format-0 (legacy layout) index upgraded by `pharos index`
+
+    private record Migration(IndexConfig config, LuceneIndexer luceneIndexer, ProjectRegistry registry,
+                             ProjectIndexManager manager, Path root, Path indexDir) {}
+
+    /** The format-0 fixture unzipped and registered with a copy of its source, as a 1.3 user has it. */
+    private Migration legacyInstall(String label) throws Exception {
+        Path base = tmp.resolve(label);
+        Path root = base.resolve("sample-app");
+        copyTree(Paths.get("src/test/resources/test-projects/sample-app"), root);
+        IndexConfig config = IndexConfig.defaults();
+        config.setIndexDir(base.resolve("indexes"));
+        LuceneIndexer luceneIndexer = new LuceneIndexer(config);
+        Path indexDir = luceneIndexer.getProjectIndexDir(PROJECT);
+        unzip(FIXTURES.resolve("format-0.zip"), indexDir);
+        ProjectRegistry registry = ProjectRegistry.at(base.resolve("registry.json"));
+        registry.register(new ProjectMeta(PROJECT, root.toString(), indexDir.toString()));
+        ModuleGraphBuilder noopGraph = new ModuleGraphBuilder(registry) {
+            @Override
+            public synchronized List<String> incorporate(Path r, ProjectMeta meta,
+                    com.pharos.parser.MavenPomReader.PomInfo pomInfo) {
+                return List.of();
+            }
+        };
+        ProjectIndexManager manager = new ProjectIndexManager(config, luceneIndexer, registry,
+                new NoOpEmbeddingProvider(), noopGraph);
+
+        assertThat(indexDir.resolve(IndexFormat.FILE_NAME)).as("fixture is unstamped").doesNotExist();
+        assertThat(indexDir.resolve(com.pharos.graph.CallGraph.LEGACY_DIR)).isDirectory();
+        assertThat(indexDir.resolve(com.pharos.graph.CallGraph.POINTER_FILE)).doesNotExist();
+        return new Migration(config, luceneIndexer, registry, manager, root, indexDir);
+    }
+
+    /** What a plain `pharos index <path>` does on an existing project: an incremental request. */
+    private static List<String> indexIncrementally(Migration m) throws Exception {
+        List<String> messages = new ArrayList<>();
+        m.manager().index(m.root(), PROJECT, true, false, false, false,
+                (stage, done, total) -> messages.add(stage));
+        return messages;
+    }
+
+    private static void assertMigrated(Migration m, List<String> messages) throws Exception {
+        assertThat(messages).anyMatch(s -> s.startsWith("index format changed (0 → " + IndexVersions.INDEX_FORMAT));
+        assertThat(m.indexDir().resolve(com.pharos.graph.CallGraph.POINTER_FILE)).isRegularFile();
+        assertThat(com.pharos.graph.CallGraph.pointerProblem(m.indexDir())).isNull();
+        assertThat(m.indexDir().resolve(com.pharos.graph.CallGraph.LEGACY_DIR))
+                .as("legacy graph removed").doesNotExist();
+        assertThat(IndexFormat.read(m.indexDir()).format()).isEqualTo(IndexVersions.INDEX_FORMAT);
+        assertThat(IndexFormat.status(m.indexDir())).isEqualTo(IndexFormat.Status.OK);
+
+        SearchEngine engine = new SearchEngine(m.luceneIndexer(), new NoOpEmbeddingProvider(), m.registry());
+        List<String> warnings = new ArrayList<>();
+        assertThat(engine.searchWithTrace(keyword("GreetingService"), false).results())
+                .extracting(SearchResult::id).contains(CLASS_ID);
+        assertThat(engine.findCallers(GET_NAME, PROJECT, warnings)).isNotEmpty();
+        assertThat(engine.findUsages(GET_NAME, "callers", PROJECT, warnings).callers()).isNotEmpty();
+        assertThat(warnings).isEmpty();
+    }
+
+    /** Method count of the same sources indexed from scratch by this build. */
+    private long freshBuildMethodCount() throws Exception {
+        Migration fresh = legacyInstall("fresh");
+        fresh.manager().index(fresh.root(), "fresh", false, false, false, false, ProgressListener.SILENT);
+        Path dir = fresh.luceneIndexer().getProjectIndexDir("fresh");
+        try (var g = com.pharos.graph.CallGraph.openExisting(com.pharos.graph.CallGraph.projectGraphDir(dir))) {
+            return g.methodCount();
+        }
+    }
+
+    @Test
+    void format0IndexIsUpgradedByAPlainIndexRun() throws Exception {
+        Migration m = legacyInstall("migrate");
+        assertMigrated(m, indexIncrementally(m));
+    }
+
+    @Test
+    void readerHoldingTheLegacyGraphAcrossTheUpgradeDoesNotCorruptTheNewGeneration() throws Exception {
+        Migration m = legacyInstall("migrate-reader");
+        Path legacy = m.indexDir().resolve(com.pharos.graph.CallGraph.LEGACY_DIR);
+        var reader = com.pharos.graph.CallGraph.openExisting(legacy);
+        assertThat(reader.callers(GET_NAME)).isNotEmpty();
+
+        List<String> messages = indexIncrementally(m);
+        assertThat(reader.callers(GET_NAME)).as("old reader keeps working").isNotEmpty();
+        reader.close();  // a request in flight finishing after the swap
+
+        assertMigrated(m, messages);
+        assertThat(legacy).as("closing the old reader recreates nothing").doesNotExist();
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(m.indexDir());
+        try (var g = com.pharos.graph.CallGraph.openExisting(live)) {
+            assertThat(g.methodCount()).isEqualTo(freshBuildMethodCount());
+        }
+    }
+
     /**
      * Writes {@code compat/format-<INDEX_FORMAT>} from sample-app with this build's code: the
      * Lucene index, the call graph and the stamp. No embeddings, so the fixture stays small.
