@@ -41,9 +41,31 @@ published).
 
 ### Rolling back
 
+1.4.0 is the first release, so there is no earlier release to install with `--release`: roll back
+by building the older commit from source.
+
 ```bash
-./setup.sh --release <previous-version>
+git checkout <older-commit> && ./setup.sh
 ```
-Format 0 indexes you did not re-index are untouched and work with the older release. Projects you
-already re-indexed to format 1 need to be re-indexed again by the older release if it cannot read
-format 1.
+
+A build older than 1.4.0 only knows the legacy graph dir `callgraph.arcadedb`. A 1.4.0 full re-index
+removes that dir, and an older build then silently creates an **empty** graph in its place. It also
+knows nothing about `index-format.json` or `callgraph.current`, so if you later upgrade again those
+leftovers would make 1.4.0 serve the older build's data as current. So, for **every** project you
+re-indexed with 1.4.0, after installing the older build:
+
+1. Delete these entries in the project's index dir (`~/.pharos/indexes/<name>/`):
+   `index-format.json`, `callgraph.current` and every `callgraph-*.arcadedb` (plus their sidecar
+   files `callgraph-*.arcadedb.*`).
+   ```bash
+   cd ~/.pharos/indexes/<name> && rm -rf index-format.json callgraph.current callgraph-*.arcadedb*
+   ```
+2. Re-index it with the older build:
+   ```bash
+   pharos index --full <name> <path>
+   ```
+
+Do **not** use `--force` for this: it deletes the whole project index dir, including the
+embedding caches, so every text is sent to the embedding model again.
+
+Projects you never re-indexed with 1.4.0 (still format 0) are untouched and work as before.

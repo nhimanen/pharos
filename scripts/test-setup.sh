@@ -72,12 +72,23 @@ preinstall() {
   echo "OLD-JAR" > "$1/.pharos/bin/pharos.jar"
 }
 
-run_setup() { # HOME args...
+run_setup() { # HOME args...   (REL_BASE overrides the release base URL; PATH is passed through)
   local home="$1"; shift
-  HOME="$home" PHAROS_NO_DAEMON=1 PHAROS_PORT=17999 PHAROS_RELEASE_BASE_URL="file://$REL" \
+  HOME="$home" PHAROS_NO_DAEMON=1 PHAROS_PORT=17999 PHAROS_RELEASE_BASE_URL="${REL_BASE:-file://$REL}" \
     bash "$SETUP" "$@" </dev/null >"$home/out.txt" 2>&1
   echo $? > "$home/rc"
 }
+
+# A java on PATH that logs each command line to $JAVA_LOG, then runs the real java.
+REAL_JAVA="$(command -v java)"
+mkdir -p "$WORK/stubbin"
+cat > "$WORK/stubbin/java" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${JAVA_LOG:-/dev/null}"
+exec "$REAL_JAVA" "\$@"
+STUB
+chmod +x "$WORK/stubbin/java"
+STUB_PATH="$WORK/stubbin:$PATH"
 rc() { cat "$1/rc"; }
 
 check() { # name condition-exit-status detail
@@ -172,6 +183,63 @@ t_upgrade_indexes_without_yes_does_not_crash_on_empty_array() {
   check upgrade_indexes_without_yes_no_unbound_var $? "$(tail -4 "$h/out.txt")"
 }
 
+# --upgrade-indexes goes through the installed Python client, so the JVM gets its usual flags.
+t_upgrade_indexes_delegates_to_cli() {
+  local h; h="$(new_home)"
+  run_setup "$h" --release "$TAG"
+  register_project "$h" oldish none
+  JAVA_LOG="$h/java.log" PATH="$STUB_PATH" run_setup "$h" --upgrade-indexes --yes
+  local line; line="$(grep -- 'upgrade-indexes' "$h/java.log" 2>/dev/null | head -1)"
+  [ -n "$line" ] \
+    && [[ "$line" == *"--add-opens java.base/java.nio.channels.spi=ALL-UNNAMED"* ]] \
+    && [[ "$line" == *"--add-modules jdk.incubator.vector"* ]] \
+    && [[ "$line" == *"--enable-native-access=ALL-UNNAMED"* ]] \
+    && [[ "$line" == *"-Xmx"* ]] \
+    && [[ "$line" == *"-Dpharos.home=$h/.pharos"* ]] \
+    && [[ "$line" == *"--yes"* ]]
+  check upgrade_indexes_delegates_to_cli $? "line=$line; $(tail -4 "$h/out.txt")"
+}
+
+# --release + --upgrade-indexes: install the release, then upgrade with the installed jar.
+t_release_with_upgrade_indexes_installs_then_upgrades() {
+  local h; h="$(new_home)"; preinstall "$h"
+  register_project "$h" oldish none
+  JAVA_LOG="$h/java.log" PATH="$STUB_PATH" run_setup "$h" --release "$TAG" --upgrade-indexes --yes
+  local got; got="$(sha256sum "$h/.pharos/bin/pharos.jar" | cut -d' ' -f1)"
+  [ "$got" = "$GOOD_SHA" ] && grep -q 'Upgrading indexes' "$h/out.txt" \
+    && grep -q -- "$h/.pharos/bin/pharos.jar upgrade-indexes --yes" "$h/java.log" \
+    && grep -q 'Done. pharos' "$h/out.txt"
+  check release_with_upgrade_indexes_installs_then_upgrades $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
+}
+
+# A tag that isn't vX.Y.Z (given, or resolved from "latest") never reaches a path or URL.
+t_bad_release_tag_rejected() {
+  local ok=0 t h
+  for t in "v1.4" "1.4.0" "v1.4.0/../../x" "v1.4.0;rm" "latest-ish"; do
+    h="$(new_home)"; preinstall "$h"
+    run_setup "$h" --release "$t"
+    { [ "$(rc "$h")" != 0 ] && [ "$(cat "$h/.pharos/bin/pharos.jar")" = "OLD-JAR" ] \
+        && [ ! -e "$h/.local/bin/pharos" ] && grep -q 'invalid release tag' "$h/out.txt"; } || ok=1
+  done
+  local bad="$WORK/badlatest"; mkdir -p "$bad"; echo "../$TAG" > "$bad/latest"
+  h="$(new_home)"; preinstall "$h"
+  REL_BASE="file://$bad" run_setup "$h" --release latest
+  { [ "$(rc "$h")" != 0 ] && [ "$(cat "$h/.pharos/bin/pharos.jar")" = "OLD-JAR" ] \
+      && grep -q 'invalid release tag' "$h/out.txt"; } || ok=1
+  check bad_release_tag_rejected "$ok" "rc=$(rc "$h"); $(tail -3 "$h/out.txt")"
+}
+
+# A checksum file whose line names another (valid) file must not vouch for the jar.
+t_checksum_naming_other_file_fails() {
+  local h; h="$(new_home)"; preinstall "$h"
+  make_variant v9.9.6 9.9.6 "$WORK/fake.jar" "$REL/$TAG/pharos-skill.tar.gz"
+  (cd "$REL/v9.9.6" && sha256sum setup.sh > pharos-9.9.6.jar.sha256)
+  run_setup "$h" --release v9.9.6 --yes
+  [ "$(rc "$h")" = 3 ] && [ "$(cat "$h/.pharos/bin/pharos.jar")" = "OLD-JAR" ] \
+    && grep -q 'does not name pharos-9.9.6.jar' "$h/out.txt"
+  check checksum_naming_other_file_fails $? "rc=$(rc "$h"); $(tail -3 "$h/out.txt")"
+}
+
 t_release_notes_extracts_and_validates() {
   local d="$WORK/rn"; mkdir -p "$d/scripts"
   cp "$REPO/scripts/release-notes.sh" "$d/scripts/" 2>/dev/null
@@ -211,5 +279,9 @@ t_upgrade_indexes_flag
 t_index_status_failure_fails_closed
 t_bad_skill_bundle_leaves_install_untouched
 t_upgrade_indexes_without_yes_does_not_crash_on_empty_array
+t_upgrade_indexes_delegates_to_cli
+t_release_with_upgrade_indexes_installs_then_upgrades
+t_bad_release_tag_rejected
+t_checksum_naming_other_file_fails
 t_release_notes_extracts_and_validates
 exit "$FAILED"

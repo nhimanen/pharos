@@ -15,7 +15,8 @@
 #   ./setup.sh --release latest|vX.Y.Z   # install a GitHub release (no Maven needed)
 #   ./setup.sh --yes          # skip the upgrade-warning prompt
 #   ./setup.sh --upgrade-indexes  # re-index projects whose index format is behind
-#                                 # (passes --yes through), then restart the daemon
+#                                 # (passes --yes through), then restart the daemon;
+#                                 # with --release: install first, then upgrade
 #
 # Env vars honored:
 #   PHAROS_PORT   override daemon port (default: 7171)
@@ -25,7 +26,8 @@
 #                 read from $PHAROS_RELEASE_BASE_URL/latest (a file holding a tag)
 #   PHAROS_NO_DAEMON=1       do not start/restart the daemon (used by tests)
 #
-# Exit codes: 2 = upgrade warning declined / needs --yes, 3 = checksum mismatch.
+# Exit codes: 2 = upgrade warning declined / needs --yes, 3 = checksum mismatch;
+# with --upgrade-indexes, the exit status of upgrade-indexes.
 
 set -euo pipefail
 
@@ -164,17 +166,25 @@ _install_file() { # src dest [mode]
 
 # ── --upgrade-indexes: re-index behind-format projects with the installed jar ──
 
-if [ "$UPGRADE_INDEXES" = true ]; then
-  if [ ! -f "$PHAROS_BIN/pharos.jar" ]; then
-    echo "Error: $PHAROS_BIN/pharos.jar not installed; run setup first." >&2
-    exit 1
+# Runs through the installed Python client, so the JVM gets the same flags as every other
+# pharos command (heap sizing, --add-opens, vector module, native access, pharos.home).
+# The client passes the terminal through, so the confirmation prompt still works.
+_run_upgrade_indexes() { # -> exit status of upgrade-indexes
+  if [ ! -f "$PHAROS_BIN/pharos.jar" ] || [ ! -f "$PHAROS_BIN/pharos-cli.py" ]; then
+    echo "Error: pharos is not installed in $PHAROS_BIN; run setup first." >&2
+    return 1
   fi
+  local args=()
+  [ "$ASSUME_YES" = true ] && args+=(--yes)
+  python3 "$PHAROS_BIN/pharos-cli.py" upgrade-indexes ${args[@]+"${args[@]}"}
+}
+
+# Alone, --upgrade-indexes only upgrades; with --release it runs after the install (step 5).
+if [ "$UPGRADE_INDEXES" = true ] && [ -z "$RELEASE" ]; then
   WAS_RUNNING=false
   _daemon_running && WAS_RUNNING=true
-  UP_ARGS=()
-  [ "$ASSUME_YES" = true ] && UP_ARGS+=(--yes)
   UP_RC=0
-  java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" upgrade-indexes ${UP_ARGS[@]+"${UP_ARGS[@]}"} || UP_RC=$?
+  _run_upgrade_indexes || UP_RC=$?
   if [ "$WAS_RUNNING" = true ]; then
     _restart_daemon
   fi
@@ -189,6 +199,9 @@ trap cleanup EXIT
 
 NEW_JAR="" NEW_CLI="" NEW_SETUP="" NEW_SKILL_SRC=""
 RELEASE_BASE="${PHAROS_RELEASE_BASE_URL:-https://github.com/nhimanen/pharos/releases/download}"
+
+# Release tags are plain vX.Y.Z; anything else never reaches a path or URL.
+_valid_tag() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 
 _resolve_tag() {
   local want="$1"
@@ -205,6 +218,10 @@ if [ "$RESTART_ONLY" = false ]; then
   if [ -n "$RELEASE" ]; then
     TAG="$(_resolve_tag "$RELEASE")" || { echo "Error: could not resolve release '$RELEASE'." >&2; exit 1; }
     [ -n "$TAG" ] || { echo "Error: empty release tag for '$RELEASE'." >&2; exit 1; }
+    if ! _valid_tag "$TAG"; then
+      echo "Error: invalid release tag '$TAG' (expected 'latest' or vX.Y.Z) — nothing was installed." >&2
+      exit 1
+    fi
     VER="${TAG#v}"
     TMP_DIR="$(mktemp -d)"
     echo "Downloading pharos $TAG..."
@@ -213,7 +230,16 @@ if [ "$RESTART_ONLY" = false ]; then
         || { echo "Error: failed to download $RELEASE_BASE/$TAG/$asset" >&2; exit 1; }
     done
 
-    # Verify the jar BEFORE anything under ~/.pharos/bin is touched.
+    # Verify the jar BEFORE anything under ~/.pharos/bin is touched. The checksum file must
+    # hold exactly one line, naming exactly this jar: "-c" would otherwise verify whichever
+    # file the line names.
+    SUM_FILE="$TMP_DIR/pharos-$VER.jar.sha256"
+    SUM_NAME="$(awk 'NF { n++; f = $2 } END { if (n == 1) print f }' "$SUM_FILE")"
+    SUM_NAME="${SUM_NAME#\*}"  # binary-mode marker
+    if [ "$SUM_NAME" != "pharos-$VER.jar" ]; then
+      echo "Error: pharos-$VER.jar.sha256 does not name pharos-$VER.jar — aborting; nothing was installed." >&2
+      exit 3
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
       SUM_CMD=(sha256sum -c)
     else
@@ -399,8 +425,19 @@ else
   _restart_daemon
 fi
 
+# ── 5. --release --upgrade-indexes: upgrade with the newly installed version ──
+# After the daemon restart above, so no reader of the old version is left running.
+
+UP_RC=0
+if [ "$UPGRADE_INDEXES" = true ]; then
+  echo ""
+  echo "Upgrading indexes..."
+  _run_upgrade_indexes || UP_RC=$?
+fi
+
 echo ""
 echo "Done. pharos $(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" --version 2>/dev/null || echo '(version unknown)') installed."
 echo "  JAR:    $PHAROS_BIN/pharos.jar"
 echo "  Client: $PHAROS_BIN/pharos-cli.py"
 echo "  Path:   $LOCAL_BIN/pharos"
+exit "$UP_RC"

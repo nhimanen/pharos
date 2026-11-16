@@ -40,16 +40,17 @@ jobs:
             exit 1
           fi
 
+      # Validates the CHANGELOG section (incl. its **Index format:** line) before the long build.
+      - name: Extract release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "${TAG#v}" > notes.md
+
       - name: Build and test
         run: mvn -B clean package
 
       - name: Test setup.sh release mode
         run: bash scripts/test-setup.sh
-
-      - name: Extract release notes
-        env:
-          TAG: ${{ github.ref_name }}
-        run: scripts/release-notes.sh "${TAG#v}" > notes.md
 
       - name: Build release assets
         env:

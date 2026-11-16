@@ -87,6 +87,9 @@ def _jvm_flags() -> list:
         "--add-modules", "jdk.incubator.vector",
         "-XX:+HeapDumpOnOutOfMemoryError",
         f"-XX:HeapDumpPath={PHAROS_DUMPS}",
+        # The JVM resolves user.home from the passwd entry, not $HOME: pin the pharos dir to
+        # the one this client uses, so both always read the same registry and indexes.
+        f"-Dpharos.home={PHAROS_DIR}",
         # Suppress ArcadeDB/GraalVM Truffle warning about missing JVMCI (not needed
         # for pharos — ArcadeDB queries are I/O-bound, not CPU-bound).
         "-Dpolyglot.engine.WarnInterpreterOnly=false",
