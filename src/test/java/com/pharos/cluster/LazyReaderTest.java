@@ -493,6 +493,42 @@ class LazyReaderTest {
         }
     }
 
+    /** A process that began on a private cache moves new opens to the shared one once the lock is free. */
+    @Test
+    void privateCacheProcessSwitchesToTheSharedCacheWhenItCanTakeIt() throws Exception {
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        Path cacheDir = tmp.resolve("switch-cache");
+        ReplicaSource source = new ObjectStoreReplicaSource(store, layout);
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(LazyGenerations.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        LazyGenerations first = new LazyGenerations(cacheDir, rc, source);
+        Path privateDir;
+        try (LazyGenerations second = new LazyGenerations(cacheDir, rc, source)) {
+            first.blockCache();
+            BlockCache privateCache = second.blockCache();
+            privateDir = second.blockCacheDir();
+            assertThat(privateDir.getParent()).isEqualTo(cacheDir.toAbsolutePath().resolve(LazyGenerations.PRIVATE_BLOCKS_DIR));
+            second.sweep();
+            assertThat(second.blockCacheDir()).as("the lock is still held").isEqualTo(privateDir);
+
+            first.close();
+            second.sweep();
+            assertThat(second.blockCacheDir()).isEqualTo(cacheDir.toAbsolutePath().resolve(LazyGenerations.BLOCKS_DIR));
+            assertThat(second.blockCache().maxBytes()).isEqualTo(rc.getCacheMaxBytes());
+            assertThat(second.blockCache()).isNotSameAs(privateCache);
+            assertThat(privateDir).as("retired readers may still use it").isDirectory();
+            assertThat(log.list.stream().map(ILoggingEvent::getFormattedMessage))
+                    .anySatisfy(m -> assertThat(m).contains("shared block cache", "private"));
+        } finally {
+            first.close();
+            logger.detachAppender(log);
+        }
+        assertThat(privateDir).as("deleted on close").doesNotExist();
+    }
+
     /** I2: the syncing reader owns the shared cache from the start and sweeps private caches every pass. */
     @Test
     void syncingReaderOwnsTheSharedCacheAndSweepsStalePrivateOnes() throws Exception {

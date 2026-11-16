@@ -51,7 +51,9 @@ import java.util.stream.Stream;
  * {@code effectivePrivateCacheMaxBytes} and deleted when it closes; the lock holder deletes private
  * dirs of processes that are gone at startup and on every {@link #sweep}. The syncing reader takes
  * the shared cache as soon as it starts syncing ({@code ClusterRuntime}), so the process that
- * prefetches always fills the shared cache. Neither name can be a shard id (those
+ * prefetches always fills the shared cache, and a process that began on a private cache moves to the
+ * shared one ({@link #adoptSharedCache}) once its lock is free (the private one stays open until close).
+ * Neither name can be a shard id (those
  * start with a letter or digit), so no shard dir can collide with them.
  */
 public final class LazyGenerations implements LuceneDirectoryFactory, Closeable {
@@ -88,6 +90,9 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     private BlockCache blockCache;
     private SyncLock blocksLock;
     private Path privateDir;
+    /** Private caches this process left for the shared one: retired readers may still use them. */
+    private final List<BlockCache> retiredCaches = new ArrayList<>();
+    private final List<Path> retiredDirs = new ArrayList<>();
     private boolean closed;
 
     public LazyGenerations(Path cacheDir, ClusterConfig.ReaderConfig config, ReplicaSource source) {
@@ -311,9 +316,69 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      */
     public void sweep() {
         synchronized (this) {
-            if (closed || blocksLock == null) return;
+            if (closed) return;
+            adoptSharedCache();
+            if (blocksLock == null) return;
         }
         deleteStalePrivateDirs();
+    }
+
+    /**
+     * A process on a private block cache takes the shared one once the process that held its lock is
+     * gone: opens and prefetches from then on use the shared cache. The private cache stays open (and
+     * on disk) until {@link #close}, because readers opened earlier still read through it.
+     *
+     * @return true when the switch happened
+     */
+    public synchronized boolean adoptSharedCache() {
+        if (closed || blockCache == null || blocksLock != null) return false;
+        SyncLock lock;
+        try {
+            Optional<SyncLock> acquired = SyncLock.tryAcquire(cacheDir, BLOCKS_LOCK);
+            if (acquired.isEmpty()) return false;
+            lock = acquired.get();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Taking the shared block cache {} failed; staying on the private one: {}",
+                    cacheDir.resolve(BLOCKS_DIR), e.toString());
+            return false;
+        }
+        BlockCache shared;
+        try {
+            shared = new BlockCache(cacheDir.resolve(BLOCKS_DIR), config.getCacheMaxBytes(),
+                    Math.toIntExact(config.getBlockSizeBytes()), config.getMaxConcurrentFetches());
+        } catch (IOException | RuntimeException e) {
+            try {
+                lock.close();
+            } catch (IOException ignored) {
+                // released when the process exits
+            }
+            log.warn("Opening the shared block cache {} failed; staying on the private one: {}",
+                    cacheDir.resolve(BLOCKS_DIR), e.toString());
+            return false;
+        }
+        log.info("The shared block cache {} is free: new opens use it; the private block cache {} stays until"
+                + " this process exits", cacheDir.resolve(BLOCKS_DIR), privateDir);
+        retiredCaches.add(blockCache);
+        retiredDirs.add(privateDir);
+        blockCache = shared;
+        blocksLock = lock;
+        privateDir = null;
+        return true;
+    }
+
+    /** True when this process's block cache is the shared one; false on a private cache or none yet. */
+    public synchronized boolean sharedCache() {
+        return blockCache != null && blocksLock != null;
+    }
+
+    /** Counters of this process's block cache; empty before it was first used. */
+    public synchronized Optional<WarmStats> stats() {
+        return blockCache == null ? Optional.empty() : Optional.of(blockCache.stats());
+    }
+
+    /** The cap of this process's block cache, or the configured shared cap before it exists. */
+    public synchronized long cacheMaxBytes() {
+        return blockCache == null ? config.getCacheMaxBytes() : blockCache.maxBytes();
     }
 
     /** Private block caches of processes that no longer run. */
@@ -341,11 +406,14 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         if (closed) return;
         closed = true;
         if (blockCache != null) blockCache.close();
-        if (privateDir != null) {
+        retiredCaches.forEach(BlockCache::close);
+        List<Path> privateDirs = new ArrayList<>(retiredDirs);
+        if (privateDir != null) privateDirs.add(privateDir);
+        for (Path d : privateDirs) {
             try {
-                deleteRecursively(privateDir);
+                deleteRecursively(d);
             } catch (IOException e) {
-                log.warn("Deleting the private block cache {} failed: {}", privateDir, e.toString());
+                log.warn("Deleting the private block cache {} failed: {}", d, e.toString());
             }
         }
         if (blocksLock != null) {

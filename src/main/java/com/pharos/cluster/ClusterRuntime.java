@@ -199,6 +199,7 @@ public final class ClusterRuntime implements Closeable {
         if (lazy != null) {
             try {
                 lazy.blockCache(); // the prefetching process takes the shared block cache, not a private one
+                lazy.adoptSharedCache(); // a follower taking over starts on a private one
             } catch (IOException | RuntimeException e) {
                 log.warn("Opening the block cache in {} failed (retried on first use): {}", cacheDir(), e.toString());
             }
