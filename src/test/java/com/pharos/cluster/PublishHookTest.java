@@ -75,7 +75,7 @@ class PublishHookTest {
     private void assertOneCall() {
         assertThat(calls).hasSize(1);
         LocalSnapshot s = calls.get(0);
-        assertThat(s.shard().value()).isEqualTo(PROJECT);
+        assertThat(s.project()).isEqualTo(PROJECT);
         assertThat(s.meta().getName()).isEqualTo(PROJECT);
         try (Stream<Path> files = Files.list(s.shardDir().resolve("lucene"))) {
             assertThat(files.map(p -> p.getFileName().toString()))
@@ -105,6 +105,18 @@ class PublishHookTest {
                 java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 5000));
         m.index(source, PROJECT, true, false, false, false, ProgressListener.SILENT);
         assertOneCall();
+    }
+
+    @Test
+    void roleAllIndexesProjectNameThatIsNoShardId() throws Exception {
+        // Single-node (role all, local backend): any directory name must index, even one that
+        // could never be an object-store shard id.
+        IndexConfig cfg = IndexConfig.defaults();
+        assertThat(cfg.getCluster().getRole()).isEqualTo(NodeRole.ALL);
+        ProjectIndexManager m = manager(new LocalBackend(cfg).publisher());
+        ProjectMeta meta = m.index(source, "my project", false, false, false, false, ProgressListener.SILENT);
+        assertThat(meta.getMethodCount()).isPositive();
+        assertThat(registry.find("my project")).isPresent();
     }
 
     @Test

@@ -217,7 +217,7 @@ class ReplicaSyncerTest {
         publishFull();
         syncer.syncOnce();
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("writer-registry.json")).find(PROJECT).orElseThrow();
-        assertThat(publisher.publish(new LocalSnapshot(SHARD,
+        assertThat(publisher.publish(new LocalSnapshot(SHARD.value(),
                 tmp.resolve("writer-indexes").resolve(PROJECT), meta, "none"))).contains(new Generation(2));
         ShardManifest m1 = manifest(1);
         ShardManifest m2 = manifest(2);

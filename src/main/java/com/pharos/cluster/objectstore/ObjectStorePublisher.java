@@ -88,13 +88,20 @@ public final class ObjectStorePublisher implements IndexPublisher {
         this.synonymsFile = synonymsFile;
     }
 
+    /** Object keys embed the shard id, so the project name must be a valid one. */
+    @Override
+    public void checkPublishable(String project) {
+        ShardId.ofProject(project);
+    }
+
     private record Latest(Generation generation, String manifest, String etag) {}
 
     private record LuceneFile(String name, String key, long length, String checksum) {}
 
     @Override
     public Optional<Generation> publish(LocalSnapshot snapshot) throws IOException {
-        ShardId shard = snapshot.shard();
+        // Validated before anything is read or uploaded (IllegalArgumentException).
+        ShardId shard = ShardId.ofProject(snapshot.project());
         Path tempDir = null;
         try {
             // 1. Previous generation P and the ETag the final CAS is conditioned on.

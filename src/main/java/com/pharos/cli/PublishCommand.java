@@ -5,7 +5,6 @@ import com.pharos.cluster.Generation;
 import com.pharos.cluster.LocalFsCache;
 import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.RoleGuard;
-import com.pharos.cluster.ShardId;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -60,7 +59,7 @@ public class PublishCommand implements Callable<Integer> {
             return 1;
         }
         try {
-            LocalSnapshot snapshot = new LocalSnapshot(ShardId.ofProject(projectName), shardDir, meta.get(),
+            LocalSnapshot snapshot = new LocalSnapshot(projectName, shardDir, meta.get(),
                     modelFingerprint(shardDir));
             Optional<Generation> gen = runtime.publisher().publish(snapshot);
             if (gen.isEmpty()) {

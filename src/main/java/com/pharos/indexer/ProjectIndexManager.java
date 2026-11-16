@@ -4,7 +4,6 @@ import com.pharos.analysis.ConceptMiner;
 import com.pharos.cluster.IndexPublisher;
 import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.NoOpPublisher;
-import com.pharos.cluster.ShardId;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -437,11 +436,13 @@ public class ProjectIndexManager {
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
         ProjectNames.validate(projectName, config.getIndexDir());
+        // Fail fast (before any parsing) when the publisher could never publish this name.
+        publisher.checkPublishable(projectName);
         ProjectMeta meta = indexLocally(projectRoot, projectName, incremental, force,
                 generateEmbeddings, buildSynonyms, progress);
         // Same rule as the file-state fingerprint: never load models for --no-embed.
         String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
-        publisher.publish(new LocalSnapshot(ShardId.ofProject(projectName),
+        publisher.publish(new LocalSnapshot(projectName,
                 luceneIndexer.getProjectIndexDir(projectName), meta, modelFp));
         return meta;
     }

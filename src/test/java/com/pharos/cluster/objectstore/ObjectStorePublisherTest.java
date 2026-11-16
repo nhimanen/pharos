@@ -248,7 +248,7 @@ class ObjectStorePublisherTest {
         store.putKeys.clear();
         Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
-        assertThat(publisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none")))
+        assertThat(publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
                 .contains(new Generation(3));
         JsonNode m3 = manifest(3);
         assertThat(m3.get("parentGeneration").asLong()).isEqualTo(2);
@@ -340,7 +340,7 @@ class ObjectStorePublisherTest {
         Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
 
-        assertThatThrownBy(() -> runB.publish(new LocalSnapshot(SHARD, shardDir, meta, "none")))
+        assertThatThrownBy(() -> runB.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
                 .isInstanceOf(PublishConflictException.class);
 
         List<String> graphPutsB = store.putKeys.stream().filter(k -> k.contains("/graph/gen-1@")).toList();
@@ -411,9 +411,21 @@ class ObjectStorePublisherTest {
 
     @Test
     void unsafeProjectNameRejectedBeforeUpload() throws Exception {
-        assertThatThrownBy(() -> publisher.publish(new LocalSnapshot(ShardId.ofProject("my project"),
+        assertThatThrownBy(() -> publisher.publish(new LocalSnapshot("my project",
                 tmp, new ProjectMeta("my project", tmp.toString(), tmp.toString()), "none")))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThat(store.list("")).isEmpty();
+    }
+
+    @Test
+    void writerRejectsUnsafeProjectNameBeforeIndexing() {
+        ProjectIndexManager m = manager(publisher);
+        assertThatThrownBy(() -> m.index(source, "my project", false, false, false, false,
+                ProgressListener.SILENT))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be a shard id");
+        assertThat(ProjectRegistry.at(tmp.resolve("registry.json")).find("my project")).isEmpty();
+        assertThat(tmp.resolve("indexes").resolve("my project")).doesNotExist();
         assertThat(store.list("")).isEmpty();
     }
 
@@ -426,7 +438,7 @@ class ObjectStorePublisherTest {
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
         meta.setUnresolvedRefs(new ArrayList<>(List.of(new ProjectMeta.UnresolvedRef("a.B#c()", "d", 1))));
 
-        publisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
+        publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none"));
 
         JsonNode refsEntry = fileWithRole(manifest(1), "refs");
         String refsKey = refsEntry.get("key").asText();
@@ -451,8 +463,8 @@ class ObjectStorePublisherTest {
         Set<String> gen1 = keys(manifest(1));
         Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
         ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
-        gcPublisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
-        gcPublisher.publish(new LocalSnapshot(SHARD, shardDir, meta, "none"));
+        gcPublisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none"));
+        gcPublisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none"));
 
         assertThat(store.get(layout.manifestKey(SHARD, Generation.FIRST))).isEmpty();
         Set<String> live = new HashSet<>(keys(manifest(2)));
