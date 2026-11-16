@@ -16,5 +16,13 @@ public class LocalBackend implements ReplicationBackend {
 
     @Override public LocalCache localCache() { return cache; }
 
+    @Override public ShardCatalog catalog() {
+        throw new UnsupportedOperationException("the local backend has no shard catalog");
+    }
+
+    @Override public ReplicaSource source() {
+        throw new UnsupportedOperationException("the local backend has no replica source");
+    }
+
     @Override public void close() {}
 }

@@ -9,4 +9,10 @@ public interface ReplicationBackend extends Closeable {
     IndexPublisher publisher();
 
     LocalCache localCache();
+
+    /** The published shard list (readers); unsupported by backends without replication. */
+    ShardCatalog catalog();
+
+    /** Where readers fetch generations from; unsupported by backends without replication. */
+    ReplicaSource source();
 }

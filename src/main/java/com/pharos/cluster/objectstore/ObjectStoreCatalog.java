@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
+import com.pharos.cluster.ShardCatalog;
 import com.pharos.cluster.ShardId;
 
 import java.io.IOException;
@@ -17,7 +18,7 @@ import java.util.Optional;
  * The cluster's shard list, {@code catalog/shards.json}: {@code {"shards":[{"id":"..."}]}}.
  * Updated by compare-and-set; unknown fields are preserved.
  */
-public final class ObjectStoreCatalog {
+public final class ObjectStoreCatalog implements ShardCatalog {
 
     static final int MAX_ATTEMPTS = 5;
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -30,6 +31,7 @@ public final class ObjectStoreCatalog {
         this.layout = layout;
     }
 
+    @Override
     public List<ShardId> shards() throws IOException {
         Optional<StoredObject> current = store.get(layout.catalogKey());
         if (current.isEmpty()) return List.of();

@@ -2,6 +2,7 @@ package com.pharos.cluster.objectstore;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pharos.cluster.Generation;
 import com.pharos.cluster.ShardId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -137,7 +138,7 @@ public final class GenerationGc {
                 } catch (IOException e) {
                     throw new Abort("unparseable manifest " + o.key() + ": " + e);
                 }
-                validate(shard, o.key(), gen, prefix, parsed);
+                validate(shard, o.key(), gen, parsed);
                 manifests.put(gen, new Manifest(o.key(), gen, o.lastModified(), parsed));
             }
         } catch (IOException e) {
@@ -196,22 +197,11 @@ public final class GenerationGc {
     }
 
     /** Rejects manifests that parse leniently but cannot be trusted to list their references. */
-    private static void validate(ShardId shard, String key, long keyGen, String prefix, ShardManifest m)
-            throws Abort {
-        if (m.formatVersion() != ShardManifest.FORMAT_VERSION) {
-            throw new Abort("manifest " + key + " has unsupported formatVersion " + m.formatVersion());
-        }
-        if (m.generation() != keyGen) {
-            throw new Abort("manifest " + key + " has generation " + m.generation() + ", expected " + keyGen);
-        }
-        if (!shard.value().equals(m.shard())) {
-            throw new Abort("manifest " + key + " belongs to shard " + m.shard());
-        }
-        if (m.files().isEmpty()) throw new Abort("manifest " + key + " lists no files");
-        for (ManifestFile f : m.files()) {
-            if (f == null || f.key() == null || f.key().isBlank() || !f.key().startsWith(prefix)) {
-                throw new Abort("manifest " + key + " has an invalid file entry " + f);
-            }
+    private void validate(ShardId shard, String key, long keyGen, ShardManifest m) throws Abort {
+        try {
+            ManifestValidation.check(shard, new Generation(keyGen), m, layout, key);
+        } catch (ManifestValidation.InvalidManifestException e) {
+            throw new Abort(e.getMessage());
         }
     }
 
