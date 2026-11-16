@@ -382,7 +382,7 @@ public class ReplicaSyncer implements Closeable {
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
         if (lazy != null) {
             Files.write(partial.resolve(LazyGenerations.MARKER), new byte[0]);
-            prefetch(shard, gen, manifest, lucene);
+            prefetch(shard, gen, manifest, lucene, reusable);
         }
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
         if (lazy == null) {
@@ -401,11 +401,12 @@ public class ReplicaSyncer implements Closeable {
      * opens (and closes) a reader on the generation, so a query's first open costs no fetch. Neither a
      * timeout nor a failure stops the activation: whatever is missing is fetched on first read.
      */
-    private void prefetch(ShardId shard, Generation gen, ShardManifest manifest, Path lucene) throws IOException {
+    private void prefetch(ShardId shard, Generation gen, ShardManifest manifest, Path lucene,
+                          Map<String, Path> reusable) throws IOException {
         Duration timeout = lazy.prefetchTimeout();
         long start = System.nanoTime();
         long deadline = start + timeout.toNanos();
-        LazyGenerations.Prefetch p = lazy.prefetch(manifest, lucene);
+        LazyGenerations.Prefetch p = lazy.prefetch(manifest, lucene, reusable);
         if (p.heads() == 0 && p.blocks() == 0) return;
         if (timeout.isZero()) { // configured not to wait
             log.info("Shard {}: prefetching {} heads and {} blocks of generation {} in the background", shard,

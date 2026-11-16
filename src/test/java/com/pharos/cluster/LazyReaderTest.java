@@ -529,6 +529,64 @@ class LazyReaderTest {
         assertThat(privateDir).as("deleted on close").doesNotExist();
     }
 
+    /** A file the next generation shares by object key keeps its head sidecar: it is not fetched again. */
+    @Test
+    void unchangedFileHeadIsNotRefetchedOnTheNextGeneration() throws Exception {
+        long g1 = publishWithoutCompoundFiles();
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        rc.setEagerMaxBytes(0);
+        Path cacheDir = tmp.resolve("heads-cache");
+        ReplicaSource real = new ObjectStoreReplicaSource(store, layout);
+        java.util.Map<String, Integer> headReads = new java.util.concurrent.ConcurrentHashMap<>();
+        ReplicaSource counting = new ReplicaSource() {
+            @Override public Optional<Generation> latest(ShardId s) throws IOException { return real.latest(s); }
+            @Override public ShardManifest manifest(ShardId s, Generation g) throws IOException {
+                return real.manifest(s, g);
+            }
+            @Override public void download(ManifestFile f, Path t) throws IOException { real.download(f, t); }
+            @Override public void downloadRange(ManifestFile f, long o, long l, Path t) throws IOException {
+                real.downloadRange(f, o, l, t);
+            }
+            @Override public InputStream openRange(ManifestFile f, long o, long l) throws IOException {
+                if (o == 0 && l == RemoteDirectory.HEAD_BYTES) headReads.merge(f.key(), 1, Integer::sum);
+                return real.openRange(f, o, l);
+            }
+            @Override public Optional<byte[]> synonyms() throws IOException { return real.synonyms(); }
+        };
+        ReaderLocalCache cache = new ReaderLocalCache(cacheDir);
+        try (LazyGenerations lazy = new LazyGenerations(cacheDir, rc, counting);
+             ReplicaSyncer syncer = new ReplicaSyncer(new ObjectStoreCatalog(store, layout), counting, cache,
+                     ProjectRegistry.at(tmp.resolve("heads-registry.json")), cacheDir, null,
+                     Duration.ofSeconds(10), lazy)) {
+            syncer.syncOnce();
+            assertThat(cache.active(JAVA)).contains(cacheDir.toAbsolutePath().resolve(JAVA).resolve("gen-" + g1));
+            // the same files again, as a new generation: every object key is shared
+            ProjectMeta meta = cluster.writerRegistry.find(JAVA).orElseThrow();
+            long published = cluster.writerRuntime.publisher().publish(
+                    new LocalSnapshot(JAVA, cluster.writerLucene.getProjectIndexDir(JAVA), meta, "none"))
+                    .orElseThrow().value();
+            syncer.syncOnce();
+            long g2 = syncer.served().get(SHARD).value();
+            assertThat(g2).isEqualTo(published);
+            assertThat(g2).isGreaterThan(g1);
+
+            java.util.Set<String> keys1 = new java.util.HashSet<>();
+            for (ManifestFile f : manifest(g1).files()) {
+                if (ManifestFile.LUCENE.equals(f.role()) && f.length() > RemoteDirectory.HEAD_BYTES) keys1.add(f.key());
+            }
+            List<ManifestFile> shared = manifest(g2).files().stream()
+                    .filter(f -> ManifestFile.LUCENE.equals(f.role()) && keys1.contains(f.key())
+                            && !alwaysEager(f.name())).toList();
+            assertThat(shared).as("files both generations share").isNotEmpty();
+            for (ManifestFile f : shared) {
+                assertThat(headReads.get(f.key())).as("head reads of %s", f.name()).isEqualTo(1);
+                assertThat(RemoteDirectory.headFile(cacheDir.resolve(JAVA).resolve("gen-" + g2).resolve("lucene"),
+                        f.name())).as(f.name()).isRegularFile().hasSize(RemoteDirectory.HEAD_BYTES);
+            }
+        }
+    }
+
     /** I2: the syncing reader owns the shared cache from the start and sweeps private caches every pass. */
     @Test
     void syncingReaderOwnsTheSharedCacheAndSweepsStalePrivateOnes() throws Exception {

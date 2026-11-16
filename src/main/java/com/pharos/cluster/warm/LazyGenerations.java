@@ -185,6 +185,16 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      * file and moved into place, so a sidecar is complete or absent.
      */
     public Prefetch prefetch(ShardManifest manifest, Path luceneDir) throws IOException {
+        return prefetch(manifest, luceneDir, Map.of());
+    }
+
+    /**
+     * {@link #prefetch(ShardManifest, Path)}, reusing head sidecars: {@code reusable} maps an object
+     * key to the same file in the active generation's {@code lucene/} dir, and its head sidecar there
+     * is hard-linked (copied when linking fails) instead of fetched again.
+     */
+    public Prefetch prefetch(ShardManifest manifest, Path luceneDir, Map<String, Path> reusable)
+            throws IOException {
         ShardId shard = new ShardId(manifest.shard());
         List<ManifestFile> remoteFiles = manifest.files().stream()
                 .filter(f -> ManifestFile.LUCENE.equals(f.role()) && !eager(f) && f.length() > 0)
@@ -195,7 +205,7 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         Path edges = luceneDir.resolve(RemoteDirectory.EDGES_DIR);
         Files.createDirectories(edges); // tasks never create it: a moved partial dir stays gone
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (ManifestFile f : remoteFiles) futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir)));
+        for (ManifestFile f : remoteFiles) futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir, reusable.get(f.key()))));
         int heads = futures.size();
 
         List<String> order = config.getPrefetchExtensions();
@@ -248,9 +258,10 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return name.substring(name.lastIndexOf('.') + 1);
     }
 
-    private void downloadHead(ManifestFile f, Path luceneDir) throws IOException {
+    private void downloadHead(ManifestFile f, Path luceneDir, Path previous) throws IOException {
         Path target = RemoteDirectory.headFile(luceneDir, f.name());
         int len = (int) Math.min(RemoteDirectory.HEAD_BYTES, f.length());
+        if (previous != null && reuseHead(previous, target, len)) return;
         byte[] head;
         try (java.io.InputStream in = source.openRange(f, 0, len)) {
             head = in.readNBytes(len);
@@ -265,6 +276,33 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Links (or copies) the head sidecar of {@code previous}, the same object in the active generation. */
+    private static boolean reuseHead(Path previous, Path target, int len) {
+        Path head = RemoteDirectory.headFile(previous.getParent(), previous.getFileName().toString());
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            if (!Files.isRegularFile(head) || Files.size(head) != len) return false;
+            Files.deleteIfExists(tmp);
+            try {
+                Files.createLink(tmp, head);
+            } catch (IOException | UnsupportedOperationException e) {
+                Files.copy(head, tmp);
+            }
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            return true;
+        } catch (IOException | RuntimeException e) {
+            log.debug("reusing the head {} failed, fetching it instead: {}", head, e.toString());
+            return false;
+        } finally {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {
+                // a leftover .tmp is overwritten by the next attempt
+            }
         }
     }
 
