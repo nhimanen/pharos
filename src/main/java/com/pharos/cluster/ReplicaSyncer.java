@@ -57,8 +57,18 @@ import java.util.zip.CheckedInputStream;
  *
  * <p>A failure of one shard (unreadable {@code LATEST}, invalid manifest, failed download,
  * integrity mismatch) is logged; that shard keeps serving its previous generation, and the other
- * shards continue. A complete generation dir found on disk with an identical {@code manifest.json}
- * (a restart) is adopted without downloading.
+ * shards continue. A failure to fetch the synonyms file is logged too. A complete generation dir
+ * found on disk with an identical {@code manifest.json} (a restart) is adopted without downloading.
+ *
+ * <p>Integrity: every file must have the manifest's length; the graph must match its CRC32; every
+ * downloaded Lucene file is checksummed end to end against its footer
+ * ({@link CodecUtil#checksumEntireFile}) and that checksum must match the manifest, while files
+ * hard-linked from the active generation (already verified when they were downloaded) only have
+ * their footer compared.
+ *
+ * <p>If {@code LATEST} names a generation below the served one (the bucket was wiped, or the
+ * shard rolled back), a WARN names both and the published generation is served as a new lineage:
+ * it is materialised and activated, and the old lineage's directories are pruned.
  */
 public class ReplicaSyncer implements Closeable {
 
@@ -112,7 +122,7 @@ public class ReplicaSyncer implements Closeable {
     /**
      * One pass over the catalog. Per-shard failures are logged, never thrown.
      *
-     * @throws IOException when the catalog or the synonyms file cannot be read or written
+     * @throws IOException when the catalog cannot be read
      */
     public void syncOnce() throws IOException {
         synchronized (syncLock) {
@@ -132,7 +142,11 @@ public class ReplicaSyncer implements Closeable {
                             e.toString());
                 }
             }
-            syncSynonyms();
+            try {
+                syncSynonyms();
+            } catch (IOException | RuntimeException e) {
+                log.warn("Syncing the synonyms file failed; keeping the local copy: {}", e.toString());
+            }
         }
     }
 
@@ -182,9 +196,14 @@ public class ReplicaSyncer implements Closeable {
         if (latest.isEmpty()) return;
         Generation gen = latest.get();
         Generation current = served.get(shard);
-        if (current != null && gen.compareTo(current) <= 0) {
+        if (current != null && gen.equals(current)) {
             retryRegistration(shard, current);
             return;
+        }
+        if (current != null && gen.compareTo(current) < 0) {
+            log.warn("Shard {}: LATEST points at generation {}, below the served generation {} (bucket wiped"
+                    + " or rolled back?); serving generation {} as a new lineage",
+                    shard, gen.value(), current.value(), gen.value());
         }
 
         ShardManifest manifest = source.manifest(shard, gen);
@@ -237,6 +256,7 @@ public class ReplicaSyncer implements Closeable {
         Path lucene = partial.resolve(LUCENE_DIR);
         Files.createDirectories(lucene);
         Map<String, Path> reusable = reusableLuceneFiles(shard);
+        Set<String> downloadedLucene = new HashSet<>();
         int linked = 0, downloaded = 0;
         for (ManifestFile f : manifest.files()) {
             switch (f.role()) {
@@ -246,6 +266,7 @@ public class ReplicaSyncer implements Closeable {
                         linked++;
                     } else {
                         source.download(f, target);
+                        downloadedLucene.add(f.name());
                         downloaded++;
                     }
                     checkLength(target, f);
@@ -260,7 +281,7 @@ public class ReplicaSyncer implements Closeable {
                 default -> { } // refs are not needed by readers; unknown roles are ignored
             }
         }
-        checkLuceneFooters(lucene, manifest);
+        checkLuceneChecksums(lucene, manifest, downloadedLucene);
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
         log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded) in {} ms",
@@ -323,14 +344,23 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
-    /** Lucene footer checksums must match the manifest, and the commit must be readable. */
-    private static void checkLuceneFooters(Path lucene, ShardManifest manifest) throws IOException {
+    /**
+     * Downloaded Lucene files are checksummed end to end ({@link CodecUtil#checksumEntireFile}
+     * throws when the body does not match the footer); hard-linked ones have their footer read.
+     * Either checksum must match the manifest, and the commit must be readable.
+     */
+    private static void checkLuceneChecksums(Path lucene, ShardManifest manifest, Set<String> downloaded)
+            throws IOException {
         try (Directory dir = FSDirectory.open(lucene)) {
             for (ManifestFile f : manifest.files()) {
                 if (!ManifestFile.LUCENE.equals(f.role())) continue;
                 long actual;
                 try (IndexInput in = dir.openInput(f.name(), IOContext.READONCE)) {
-                    actual = CodecUtil.retrieveChecksum(in);
+                    actual = downloaded.contains(f.name())
+                            ? CodecUtil.checksumEntireFile(in)
+                            : CodecUtil.retrieveChecksum(in);
+                } catch (org.apache.lucene.index.CorruptIndexException e) {
+                    throw new IOException("integrity check failed for " + f.key() + ": " + e.getMessage(), e);
                 }
                 if (actual != parseChecksum(f)) {
                     throw new IOException("integrity check failed for " + f.key() + ": footer checksum "

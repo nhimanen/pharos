@@ -296,6 +296,83 @@ class ReplicaSyncerTest {
         assertThat(genDir(2)).doesNotExist();
     }
 
+    /** Same length and an intact footer, a flipped byte in the body: only a full checksum sees it. */
+    @Test
+    void bodyCorruptedLuceneFileWithIntactFooterIsRejected() throws Exception {
+        publishFull();
+        ManifestFile victim = manifest(1).files().stream()
+                .filter(f -> f.role().equals(ManifestFile.LUCENE))
+                .filter(f -> !f.name().startsWith("segments") && !f.name().endsWith(".si"))
+                .filter(f -> f.length() > 256)
+                .findFirst().orElseThrow();
+        byte[] bytes = store.get(victim.key()).orElseThrow().data();
+        bytes[bytes.length / 2] ^= 0x5a; // body only: header and 16-byte footer untouched
+        store.put(victim.key(), bytes);
+
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEmpty();
+        assertThat(genDir(1)).doesNotExist();
+        assertThat(cache.active(PROJECT)).isEmpty();
+    }
+
+    @Test
+    void latestGoingBackwardsIsServedAsNewLineage() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        publishIncremental("triple");
+        syncer.syncOnce();
+        publishIncremental("quadruple");
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(3)));
+
+        // the bucket is wiped (catalog kept) and the writer publishes again from generation 1
+        for (var o : store.list(layout.shardPrefix(SHARD))) store.delete(o.key());
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("writer-registry.json")).find(PROJECT).orElseThrow();
+        assertThat(publisher.publish(new LocalSnapshot(PROJECT,
+                tmp.resolve("writer-indexes").resolve(PROJECT), meta, "none"))).contains(Generation.FIRST);
+
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+        assertThat(cache.active(PROJECT)).contains(genDir(1));
+        assertThat(readerRegistry.find(PROJECT).orElseThrow().getIndexPath()).isEqualTo(genDir(1).toString());
+        assertThat(genDirNames()).containsExactly("gen-1");
+        assertThat(numDocs(genDir(1).resolve("lucene"))).isEqualTo((int) manifest(1).docCount());
+    }
+
+    @Test
+    void synonymsFailureDoesNotStopTheSync() throws Exception {
+        publishFull();
+        ObjectStoreReplicaSource real = new ObjectStoreReplicaSource(store, layout);
+        ReplicaSource failingSynonyms = new ReplicaSource() {
+            @Override public java.util.Optional<Generation> latest(ShardId shard) throws IOException { return real.latest(shard); }
+            @Override public ShardManifest manifest(ShardId shard, Generation gen) throws IOException { return real.manifest(shard, gen); }
+            @Override public void download(ManifestFile file, Path target) throws IOException { real.download(file, target); }
+            @Override public java.util.Optional<byte[]> synonyms() throws IOException { throw new IOException("synonyms unreadable"); }
+        };
+        try (ReplicaSyncer s = new ReplicaSyncer(catalog, failingSynonyms, cache, readerRegistry, cacheDir,
+                readerSynonyms, Duration.ofSeconds(10))) {
+            s.syncOnce(); // logged, not thrown
+            assertThat(s.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+        }
+        assertThat(readerSynonyms).doesNotExist();
+    }
+
+    @Test
+    void invalidCatalogIdDoesNotStopTheSync() throws Exception {
+        publishFull();
+        byte[] withBad = new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8)
+                .replace("\"shards\" : [", "\"shards\" : [ {\"id\": \"bad id\"}, ")
+                .getBytes(StandardCharsets.UTF_8);
+        assertThat(new String(withBad, StandardCharsets.UTF_8)).contains("bad id");
+        store.put(layout.catalogKey(), withBad);
+
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+    }
+
     @Test
     void corruptedGraphIsRejected() throws Exception {
         publishFull();
