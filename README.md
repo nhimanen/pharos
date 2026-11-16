@@ -373,7 +373,7 @@ A file that grows past its limit is removed from the index on the next increment
 
 Pharos can run as one **writer** and any number of **readers** that share an S3-compatible object store (AWS S3, MinIO, …). The writer indexes as usual and, after each index run, publishes the project as a new immutable generation. Readers poll the store every `pollIntervalSeconds`, download new generations into `cacheDir`, and serve search and call-graph queries from them. Writers and readers never talk to each other. Without a `cluster` section, pharos is the single-node tool described above (`role: all`, `backend: local`).
 
-Writer node, in `~/.pharos/config.json`:
+Writer node, in `~/.pharos/config.json` (this example lists every key; a writer ignores `cacheDir` and `pollIntervalSeconds`, which only readers use):
 
 ```json
 {"cluster": {
@@ -395,6 +395,8 @@ Writer node, in `~/.pharos/config.json`:
   }}}
 ```
 
+> **Note on `pathStyle`:** the examples show `"pathStyle": false` (virtual-hosted-style URLs, as AWS S3 expects) next to a `localhost:9000` endpoint only to show every key. A MinIO endpoint such as `http://localhost:9000` needs `"pathStyle": true` (the default when the key is omitted).
+
 Reader node (same `objectStore` section; `cacheDir` is where generations are kept):
 
 ```json
@@ -415,7 +417,8 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
   }}}
 ```
 
-- Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv`, or else the AWS default credential chain. Use `"pathStyle": true` for MinIO.
+- Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv` (set both or neither; a named variable that is unset or empty is an error, not a silent fallback), or, when neither is configured, the AWS default credential chain. Use `"pathStyle": true` for MinIO.
+- `nodeId` defaults to the host name. `pollIntervalSeconds` must be positive, `retentionMinutes` non-negative, `retentionGenerations` at least 2, and `prefix` must not start with `/` or contain `.`/`..` segments.
 - The writer keeps the newest `retentionGenerations` generations, and anything younger than `retentionMinutes`; older ones are garbage-collected after a publish.
 - If publishing fails at the end of an index run (store unreachable, bad credentials), the local index is kept and `pharos index` exits with code **3**. Retry the upload without re-indexing:
 
@@ -424,6 +427,7 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
   ```
 
 - Readers refuse `index`, `link`, `embed`, `mine`, `remove-index` and `backfill-embedding-cache`. They start syncing when the daemon (`pharos web` / `mcp-server`) starts, and serve class bodies and snippets from the index, never from source files on the reader machine.
+- `pharos web` on a reader binds its port at once; until the first sync pass finishes, `/health` answers `{"status": "syncing", "ready": false}` and searches carry an `X-Pharos-Warning` header. Only one process per `cacheDir` syncs (it holds `<cacheDir>/.sync.lock`); another daemon on the same `cacheDir` (e.g. `mcp-server` next to `web`) serves the generations the lock holder downloads, and takes over syncing when that process exits. One-shot commands on a reader serve the generations already on disk.
 - Not yet on readers: the module tools (MCP `list_modules`, `get_module_deps`, `find_module_path`, `get_module_boundary` and the web UI's module views) answer "not available on reader nodes yet", and the cross-project graph is not replicated, so call paths that span projects are only found on the writer.
 
 ## How it works
