@@ -10,11 +10,14 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.NoLockFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
@@ -25,12 +28,15 @@ import java.util.TreeMap;
  * A read-only Lucene {@link org.apache.lucene.store.Directory} over the Lucene files of one published
  * generation. The file list and lengths come from the manifest. A file present in {@code eagerDir}
  * (the small files downloaded when the generation was opened) is read from there; every other file
- * is a {@link CachingRemoteIndexInput} reading blocks through the shared {@link BlockCache}.
+ * is a {@link CachingRemoteIndexInput} reading blocks through the shared {@link BlockCache}. An eager
+ * copy whose size is not the manifest's is downloaded again (with a WARN) before it is opened.
  *
  * <p>The directory owns neither the cache nor the source: closing it only closes the eager files'
  * {@link FSDirectory}. Every write, delete, sync or rename throws {@link UnsupportedOperationException}.
  */
 public final class RemoteDirectory extends BaseDirectory {
+
+    private static final Logger log = LoggerFactory.getLogger(RemoteDirectory.class);
 
     static final String READ_ONLY = "read-only remote directory";
 
@@ -81,17 +87,40 @@ public final class RemoteDirectory extends BaseDirectory {
         ManifestFile f = file(name);
         Path local = eagerDir == null ? null : eagerDir.resolve(name);
         if (local != null && Files.isRegularFile(local)) {
-            long size = Files.size(local);
-            if (size != f.length()) {
-                throw new IOException("eager copy " + local + " of shard " + shard + " generation " + generation
-                        + " file " + name + " (object key " + f.key() + ") has " + size + " bytes, the manifest says "
-                        + f.length());
-            }
+            if (Files.size(local) != f.length()) redownload(local, f);
             return eager().openInput(name, context);
         }
         CachingRemoteIndexInput.RemoteFile remote =
                 new CachingRemoteIndexInput.RemoteFile(shard, generation, f, cache, source);
         return new CachingRemoteIndexInput("CachingRemoteIndexInput(" + remote.where() + ")", remote);
+    }
+
+    /**
+     * Replaces an eager copy whose size is not the manifest's (a torn write, tampering) with a fresh
+     * download: written next to it, length-checked, then moved over it atomically. Inputs already
+     * open on the old copy keep reading it (on Linux and macOS a replaced file stays readable).
+     */
+    private synchronized void redownload(Path local, ManifestFile f) throws IOException {
+        long size = Files.size(local);
+        if (size == f.length()) return; // another thread repaired it meanwhile
+        String where = "shard " + shard + " generation " + generation + " file " + f.name() + " (object key "
+                + f.key() + ")";
+        log.warn("eager copy {} of {} has {} bytes, the manifest says {}; downloading it again",
+                local, where, size, f.length());
+        Path tmp = local.resolveSibling(f.name() + ".redownload.tmp");
+        try {
+            Files.deleteIfExists(tmp);
+            source.download(f, tmp);
+            long got = Files.size(tmp);
+            if (got != f.length()) {
+                throw new IOException("downloaded " + got + " bytes, the manifest says " + f.length());
+            }
+            Files.move(tmp, local, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException | RuntimeException e) {
+            throw new IOException("cannot repair the eager copy " + local + " of " + where + ": " + e.getMessage(), e);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
     }
 
     private ManifestFile file(String name) throws NoSuchFileException {

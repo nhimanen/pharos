@@ -617,6 +617,61 @@ class RemoteDirectoryTest {
         }
     }
 
+    /** The disk-full branch (fetchToMemory → openRange) reports a missing object like the cached one. */
+    @Test
+    void missingObjectOnTheUncachedPathFailsWithShardGenKeyInMessage() throws Exception {
+        Blob b = blob("_m.bin", 3 * KIB);
+        BlockCache cache = track(new BlockCache(tmp.resolve("no-space"), 1L << 30, KIB, 4,
+                System::currentTimeMillis, () -> 0L));
+        RemoteDirectory dir = remote(cache, null, source, b.manifest());
+        String key = b.manifest().files().get(0).key();
+        store.delete(key);
+        try (IndexInput in = dir.openInput("_m.bin", IOContext.DEFAULT)) {
+            assertThatThrownBy(in::readByte)
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("shard " + PROJECT)
+                    .hasMessageContaining("generation 7")
+                    .hasMessageContaining("_m.bin")
+                    .hasMessageContaining(key)
+                    .hasRootCauseInstanceOf(NoSuchFileException.class);
+        } finally {
+            store.put(key, b.data());
+        }
+        assertThat(cache.stats().bytesOnDisk()).isZero();
+    }
+
+    /** An eager copy of the wrong size (a torn download, tampering) is replaced, not fatal. */
+    @Test
+    void eagerFileOfTheWrongSizeIsDownloadedAgain() throws Exception {
+        Blob b = blob("_e.bin", 2 * KIB);
+        Path eager = tmp.resolve("eager-wrong");
+        Files.createDirectories(eager);
+        Files.write(eager.resolve("_e.bin"), java.util.Arrays.copyOf(b.data(), 100)); // truncated
+        RemoteDirectory dir = remote(cache(KIB), eager, source, b.manifest());
+        try (IndexInput in = dir.openInput("_e.bin", IOContext.DEFAULT)) {
+            assertThat(in).isNotInstanceOf(CachingRemoteIndexInput.class);
+            byte[] all = new byte[2 * KIB];
+            in.readBytes(all, 0, all.length);
+            assertThat(all).isEqualTo(b.data());
+        }
+        assertThat(eager.resolve("_e.bin")).hasBinaryContent(b.data());
+
+        // When the object can't be fetched either, the error names shard, generation and key.
+        Files.write(eager.resolve("_e.bin"), new byte[5]);
+        String key = b.manifest().files().get(0).key();
+        store.delete(key);
+        try {
+            RemoteDirectory again = remote(cache(KIB), eager, source, b.manifest());
+            assertThatThrownBy(() -> again.openInput("_e.bin", IOContext.DEFAULT))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("shard " + PROJECT)
+                    .hasMessageContaining("generation 7")
+                    .hasMessageContaining(key);
+        } finally {
+            store.put(key, b.data());
+        }
+    }
+
     // ---------------------------------------------------------------- read-only
 
     @Test
