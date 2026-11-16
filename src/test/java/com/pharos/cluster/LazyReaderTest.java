@@ -513,12 +513,18 @@ class LazyReaderTest {
             assertThat(privateDir.getParent()).isEqualTo(cacheDir.toAbsolutePath().resolve(LazyGenerations.PRIVATE_BLOCKS_DIR));
             second.sweep();
             assertThat(second.blockCacheDir()).as("the lock is still held").isEqualTo(privateDir);
+            privateCache.acquire(new BlockKey("some/object", 0), 1000, (k, o, l, t) -> Files.write(t, new byte[(int) l]))
+                    .close();
+            long privateBytes = privateCache.stats().bytesOnDisk();
+            assertThat(privateBytes).isPositive();
 
             first.close();
             second.sweep();
             assertThat(second.blockCacheDir()).isEqualTo(cacheDir.toAbsolutePath().resolve(LazyGenerations.BLOCKS_DIR));
             assertThat(second.blockCache().maxBytes()).isEqualTo(rc.getCacheMaxBytes());
             assertThat(second.blockCache()).isNotSameAs(privateCache);
+            assertThat(second.stats().orElseThrow().bytesOnDisk()).as("retired private cache still counted")
+                    .isEqualTo(privateBytes);
             assertThat(privateDir).as("retired readers may still use it").isDirectory();
             assertThat(log.list.stream().map(ILoggingEvent::getFormattedMessage))
                     .anySatisfy(m -> assertThat(m).contains("shared block cache", "private"));

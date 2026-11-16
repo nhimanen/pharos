@@ -246,9 +246,17 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             previous = lastPrefetch.remove(shard);
         }
         if (previous == null) return 0;
+        List<BlockCache> retired;
+        synchronized (this) {
+            retired = List.copyOf(retiredCaches);
+        }
         int n = 0;
         for (BlockKey k : previous) {
-            if (cache.cancelQueued(k, BlockCache.objectHash(k.objectKey()))) n++;
+            String hash = BlockCache.objectHash(k.objectKey());
+            if (cache.cancelQueued(k, hash)) n++;
+            for (BlockCache r : retired) {
+                if (r.cancelQueued(k, hash)) n++;
+            }
         }
         if (n > 0) log.info("Shard {}: cancelled {} queued prefetch blocks of the previous generation", shard, n);
         return n;
@@ -368,8 +376,10 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      *
      * @return true when the switch happened
      */
-    public synchronized boolean adoptSharedCache() {
-        if (closed || blockCache == null || blocksLock != null) return false;
+    public boolean adoptSharedCache() {
+        synchronized (this) {
+            if (closed || blockCache == null || blocksLock != null) return false;
+        }
         SyncLock lock;
         try {
             Optional<SyncLock> acquired = SyncLock.tryAcquire(cacheDir, BLOCKS_LOCK);
@@ -382,26 +392,45 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         }
         BlockCache shared;
         try {
-            shared = new BlockCache(cacheDir.resolve(BLOCKS_DIR), config.getCacheMaxBytes(),
+            shared = new BlockCache(cacheDir.resolve(BLOCKS_DIR), config.getCacheMaxBytes(), // scans the dir
                     Math.toIntExact(config.getBlockSizeBytes()), config.getMaxConcurrentFetches());
         } catch (IOException | RuntimeException e) {
-            try {
-                lock.close();
-            } catch (IOException ignored) {
-                // released when the process exits
-            }
+            releaseQuietly(lock);
             log.warn("Opening the shared block cache {} failed; staying on the private one: {}",
                     cacheDir.resolve(BLOCKS_DIR), e.toString());
             return false;
         }
-        log.info("The shared block cache {} is free: new opens use it; the private block cache {} stays until"
-                + " this process exits", cacheDir.resolve(BLOCKS_DIR), privateDir);
-        retiredCaches.add(blockCache);
-        retiredDirs.add(privateDir);
-        blockCache = shared;
-        blocksLock = lock;
-        privateDir = null;
+        BlockCache retiring;
+        synchronized (this) {
+            if (closed || blockCache == null || blocksLock != null) { // closed or switched meanwhile
+                shared.close();
+                releaseQuietly(lock);
+                return false;
+            }
+            log.info("The shared block cache {} is free: new opens use it; the private block cache {} stays until"
+                    + " this process exits", cacheDir.resolve(BLOCKS_DIR), privateDir);
+            retiring = blockCache;
+            retiredCaches.add(retiring);
+            retiredDirs.add(privateDir);
+            blockCache = shared;
+            blocksLock = lock;
+            privateDir = null;
+        }
+        // Prefetches still queued on the private cache would only fill a cache no new open reads.
+        List<BlockKey> queued = new ArrayList<>();
+        synchronized (lastPrefetch) {
+            lastPrefetch.values().forEach(queued::addAll);
+        }
+        for (BlockKey k : queued) retiring.cancelQueued(k, BlockCache.objectHash(k.objectKey()));
         return true;
+    }
+
+    private static void releaseQuietly(SyncLock lock) {
+        try {
+            lock.close();
+        } catch (IOException ignored) {
+            // released when the process exits
+        }
     }
 
     /** True when this process's block cache is the shared one; false on a private cache or none yet. */
@@ -409,9 +438,20 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return blockCache != null && blocksLock != null;
     }
 
-    /** Counters of this process's block cache; empty before it was first used. */
+    /**
+     * Counters of this process's block caches, the active one plus any private cache it retired for
+     * the shared one (still on disk, still read by older readers); empty before first use.
+     */
     public synchronized Optional<WarmStats> stats() {
-        return blockCache == null ? Optional.empty() : Optional.of(blockCache.stats());
+        if (blockCache == null) return Optional.empty();
+        WarmStats t = blockCache.stats();
+        for (BlockCache r : retiredCaches) {
+            WarmStats s = r.stats();
+            t = new WarmStats(t.hits() + s.hits(), t.misses() + s.misses(), t.bytesFetched() + s.bytesFetched(),
+                    t.evictions() + s.evictions(), t.bytesOnDisk() + s.bytesOnDisk(), t.leasesOpen() + s.leasesOpen(),
+                    t.writeFailures() + s.writeFailures(), t.thrashWarnings() + s.thrashWarnings());
+        }
+        return Optional.of(t);
     }
 
     /** The cap of this process's block cache, or the configured shared cap before it exists. */
