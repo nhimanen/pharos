@@ -169,4 +169,76 @@ class ReaderServingTest {
         cluster.writerRuntime.beginServing(); // no-op
         assertThat(cluster.writerRuntime.ownsSync()).isFalse();
     }
+
+    // ── Pre-PR fix 1: a restarted (e.g. downgraded) reader only activates servable generations ──
+
+    private static void restamp(Path genDir, int format) throws IOException {
+        com.pharos.indexer.IndexFormat.write(genDir, new com.pharos.indexer.IndexFormat.Stamp(format, "9.9.9", null));
+        Files.setLastModifiedTime(genDir.resolve(com.pharos.indexer.IndexFormat.FILE_NAME),
+                FileTime.fromMillis(System.currentTimeMillis() + 120_000)); // IndexFormat caches by mtime
+    }
+
+    private static ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> captureRuntimeLog() {
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        ((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class)).addAppender(appender);
+        return appender;
+    }
+
+    private static List<String> warnings(ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> a) {
+        ((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class)).detachAppender(a);
+        return a.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    /** gen-1 and gen-2 on disk, gen-2 registered; the reader runtime closed again. */
+    private Path twoGenerationsOnDisk(InMemoryObjectStore store) throws Exception {
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        addMethodAndReindex("tripleTheValue");
+        cluster.readerRuntime.syncNow();
+        cluster.readerRuntime.close();
+        Path shardRoot = cluster.readerConfig.getCluster().getCacheDir().resolve(JAVA);
+        assertThat(ClusterRuntime.registryFor(cluster.readerConfig).find(JAVA).orElseThrow().getIndexPath())
+                .isEqualTo(shardRoot.resolve("gen-2").toString());
+        assertThat(shardRoot.resolve("gen-1")).isDirectory();
+        return shardRoot;
+    }
+
+    @Test
+    void restartFallsBackToTheNewestServableGeneration() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        Path shardRoot = twoGenerationsOnDisk(store);
+        int newer = com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1;
+        restamp(shardRoot.resolve("gen-2"), newer); // published by a newer pharos, then this reader was downgraded
+
+        var log = captureRuntimeLog();
+        Reader restarted = secondReader(store);
+        List<String> warns = warnings(log);
+
+        assertThat(restarted.lucene().getProjectIndexDir(JAVA)).isEqualTo(shardRoot.resolve("gen-1").toAbsolutePath().normalize());
+        assertThat(ClusterRuntime.registryFor(cluster.readerConfig).find(JAVA).orElseThrow().getIndexPath())
+                .isEqualTo(shardRoot.resolve("gen-1").toAbsolutePath().normalize().toString());
+        assertThat(ids(restarted.engine(), "Calculator")).isNotEmpty();
+        assertThat(warns).anySatisfy(w -> assertThat(w).contains(JAVA, "gen-2", "index format " + newer,
+                "Serving gen-1 (index format " + com.pharos.indexer.IndexVersions.INDEX_FORMAT + ")"));
+    }
+
+    @Test
+    void restartWithoutAServableGenerationWarnsAndServesNothing() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        Path shardRoot = twoGenerationsOnDisk(store);
+        int newer = com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1;
+        restamp(shardRoot.resolve("gen-1"), newer);
+        restamp(shardRoot.resolve("gen-2"), newer);
+
+        var log = captureRuntimeLog();
+        Reader restarted = secondReader(store);
+        List<String> warns = warnings(log);
+
+        assertThat(restarted.lucene().getProjectIndexDir(JAVA).getFileName().toString()).isEqualTo("none");
+        assertThat(warns).anySatisfy(w -> assertThat(w).contains(JAVA, "gen-2", "index format " + newer,
+                "reads index formats", "No servable generation on disk"));
+    }
 }

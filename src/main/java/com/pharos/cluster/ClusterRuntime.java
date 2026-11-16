@@ -3,6 +3,8 @@ package com.pharos.cluster;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.indexer.IndexFormat;
+import com.pharos.indexer.IndexVersions;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.search.SourceReader;
 import org.slf4j.Logger;
@@ -49,6 +51,8 @@ public final class ClusterRuntime implements Closeable {
     private final ProjectRegistry registry;
     private final LuceneIndexer luceneIndexer;
     private final CountDownLatch firstSync = new CountDownLatch(1);
+    /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
+    private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
@@ -242,6 +246,12 @@ public final class ClusterRuntime implements Closeable {
      * Readers: activates, in the {@link ReaderLocalCache}, the generation dir every project of the
      * reader registry points at, when it is a complete {@code <cacheDir>/<project>/gen-N} dir.
      *
+     * <p>The registered generation must also be servable by this build (its {@code index-format.json};
+     * e.g. after downgrading the reader it may be newer). If it is not, the newest complete,
+     * servable {@code gen-*} of that shard is activated and re-registered instead, with a WARN; if
+     * there is none, a WARN names the shard and both formats and the shard is not served until a
+     * servable generation is synced.
+     *
      * @return the projects whose active generation changed
      */
     public List<String> activateRegistered() {
@@ -258,11 +268,32 @@ public final class ClusterRuntime implements Closeable {
                 continue;
             }
             Path dir = Path.of(meta.getIndexPath()).toAbsolutePath().normalize();
-            if (!root.resolve(name).equals(dir.getParent())
-                    || !GEN_DIR.matcher(dir.getFileName().toString()).matches()
-                    || !Files.isDirectory(dir.resolve(ReplicaSyncer.LUCENE_DIR))
-                    || !Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE))) {
+            if (!root.resolve(name).equals(dir.getParent()) || !completeGeneration(dir)) {
                 continue;
+            }
+            if (!IndexFormat.servable(IndexFormat.status(dir))) {
+                Optional<Path> fallback = newestServableGeneration(root.resolve(name));
+                if (reportedUnservable.add(dir)) {
+                    log.warn("Shard {}: registered generation {} has index format {} ({}); this reader (pharos {})"
+                            + " reads index formats {}-{}. {}", name, dir.getFileName(),
+                            IndexFormat.read(dir).format(), IndexFormat.status(dir).wireName(),
+                            com.pharos.PharosVersion.get(), IndexFormat.MIN_READABLE_FORMAT,
+                            IndexVersions.INDEX_FORMAT,
+                            fallback.map(f -> "Serving " + f.getFileName() + " (index format "
+                                            + IndexFormat.read(f).format() + ") instead.")
+                                    .orElse("No servable generation on disk: not serving this shard until"
+                                            + " one is synced (upgrade this reader, or re-publish from the writer)."));
+                }
+                if (fallback.isEmpty()) continue;
+                dir = fallback.get();
+                ProjectMeta moved = com.pharos.cluster.objectstore.ShardManifest.stripRefs(meta); // a copy
+                moved.setIndexPath(dir.toString());
+                try {
+                    registry.register(moved); // graphs resolve through the registry: keep it in step
+                } catch (RuntimeException e) {
+                    log.warn("Shard {}: re-registering {} failed; not activating it: {}", name, dir, e.toString());
+                    continue;
+                }
             }
             if (cache.active(name).filter(dir::equals).isPresent()) continue;
             cache.activate(name, dir);
@@ -270,6 +301,27 @@ public final class ClusterRuntime implements Closeable {
         }
         if (!changed.isEmpty()) log.info("Activated registered generations of {}", changed);
         return changed;
+    }
+
+    private static boolean completeGeneration(Path dir) {
+        return GEN_DIR.matcher(dir.getFileName().toString()).matches()
+                && Files.isDirectory(dir.resolve(ReplicaSyncer.LUCENE_DIR))
+                && Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE));
+    }
+
+    /** The highest-numbered complete generation dir of a shard whose index format this build serves. */
+    private static Optional<Path> newestServableGeneration(Path shardRoot) {
+        if (!Files.isDirectory(shardRoot)) return Optional.empty();
+        try (var s = Files.list(shardRoot)) {
+            return s.map(p -> p.toAbsolutePath().normalize())
+                    .filter(ClusterRuntime::completeGeneration)
+                    .filter(p -> IndexFormat.servable(IndexFormat.status(p)))
+                    .max(java.util.Comparator.comparingLong(
+                            p -> Long.parseLong(p.getFileName().toString().substring("gen-".length()))));
+        } catch (IOException e) {
+            log.warn("Listing the generations in {} failed: {}", shardRoot, e.toString());
+            return Optional.empty();
+        }
     }
 
     /** Readers: one sync pass now (in addition to the polling); a follower re-reads the registry. */
