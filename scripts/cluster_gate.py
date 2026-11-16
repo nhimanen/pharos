@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -45,35 +46,61 @@ def get_json(base, path, params, timeout=60):
     return data
 
 
+class FetchError(Exception):
+    pass
+
+
 def ids(data):
     if isinstance(data, dict):
-        return [data["__error__"]]
+        raise FetchError(data["__error__"])
     return [r.get("id") for r in data]
 
 
 def compare(args):
     queries = load_queries()
-    mismatches = 0
-    callers_checked = 0
+    st = {"compared": 0, "non_empty": 0, "empty": 0, "errors": 0, "mismatches": 0, "callers": 0}
+    empties = []
     for query, project in queries:
         p = {"q": query, "pipeline": "keyword", "limit": 10, "project": project}
-        w = ids(get_json(args.writer, "/api/search", p))
-        r = ids(get_json(args.reader, "/api/search", p))
+        try:
+            w = ids(get_json(args.writer, "/api/search", p))
+            r = ids(get_json(args.reader, "/api/search", p))
+        except FetchError as e:
+            st["errors"] += 1
+            print(f"ERROR search [{project}] {query!r}: {e}")
+            continue
+        st["compared"] += 1
         if w != r:
-            mismatches += 1
+            st["mismatches"] += 1
             print(f"MISMATCH search [{project}] {query!r}\n  writer: {w}\n  reader: {r}")
             continue
         if not w:
+            st["empty"] += 1
+            empties.append(f"[{project}] {query!r}")
             continue
+        st["non_empty"] += 1
         cp = {"fqn": w[0], "project": project}
-        wc = ids(get_json(args.writer, "/api/callers", cp))
-        rc = ids(get_json(args.reader, "/api/callers", cp))
-        callers_checked += 1
+        try:
+            wc = ids(get_json(args.writer, "/api/callers", cp))
+            rc = ids(get_json(args.reader, "/api/callers", cp))
+        except FetchError as e:
+            st["errors"] += 1
+            print(f"ERROR callers [{project}] {w[0]}: {e}")
+            continue
+        st["callers"] += 1
         if wc != rc:
-            mismatches += 1
+            st["mismatches"] += 1
             print(f"MISMATCH callers [{project}] {w[0]}\n  writer: {wc}\n  reader: {rc}")
-    print(f"queries compared: {len(queries)}, callers compared: {callers_checked}, mismatches: {mismatches}")
-    return len(queries), mismatches
+    for e in empties:
+        print(f"EMPTY top-10 on both: {e}")
+    print(f"queries total: {len(queries)}, compared: {st['compared']}, non-empty: {st['non_empty']}, "
+          f"empty: {st['empty']}, callers compared: {st['callers']}, errors: {st['errors']}, "
+          f"mismatches: {st['mismatches']}")
+    ok = (st["errors"] == 0 and st["mismatches"] == 0 and st["compared"] == len(queries)
+          and st["non_empty"] >= 0.9 * st["compared"] and st["compared"] > 0)
+    if not ok and st["errors"] == 0 and st["mismatches"] == 0:
+        print("FAIL: fewer than 90% of queries returned a non-empty top-10 (vacuous comparison)")
+    return ok
 
 
 def freshness(args):
@@ -81,6 +108,7 @@ def freshness(args):
     src_root = Path(os.environ["GATE_PHAROS_SRC"])
     poll = int(os.environ.get("GATE_POLL_INTERVAL", "10"))
     log_path = Path(os.environ.get("GATE_READER_LOG", ""))
+    reindex_log = os.environ.get("GATE_REINDEX_LOG", os.devnull)
     marker = "gateProbe" + str(int(time.time()))
     target = next(src_root.rglob("BordaMerger.java"), None) or next(src_root.rglob("*.java"))
     text = target.read_text()
@@ -90,34 +118,42 @@ def freshness(args):
     print(f"appended {marker}() to {target}")
 
     log_size_before = log_path.stat().st_size if log_path.is_file() else 0
-    rc = subprocess.run(shlex.split(reindex), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    with open(reindex_log, "w") as lf:
+        rc = subprocess.run(shlex.split(reindex), stdout=lf, stderr=subprocess.STDOUT).returncode
     if rc != 0:
-        print(f"FAIL: incremental re-index/publish exited {rc}")
+        print(f"FAIL: incremental re-index/publish exited {rc} (see {reindex_log})")
         return False
     t0 = time.monotonic()
     deadline = t0 + 3 * poll + 120
     params = {"q": marker, "pipeline": "keyword", "limit": 5, "project": "pharos"}
+    elapsed = None
     while time.monotonic() < deadline:
-        if any(marker in (i or "") for i in ids(get_json(args.reader, "/api/search", params, 10))):
+        d = get_json(args.reader, "/api/search", params, 10)
+        if not isinstance(d, dict) and any(marker in (r.get("id") or "") for r in d):
             elapsed = time.monotonic() - t0
             break
         time.sleep(0.5)
-    else:
+    if elapsed is None:
         print(f"FAIL: {marker} not visible on the reader after {deadline - t0:.0f}s")
         return False
 
-    line = ""
+    lines = []
     if log_path.is_file():
         with open(log_path, errors="replace") as f:
             f.seek(log_size_before)
-            for ln in f:
-                if "materialised generation" in ln:
-                    line = ln.strip()
-    print(f"visible after {elapsed:.1f} s (poll interval {poll} s)")
-    print(f"reader log (generation download): {line or 'no materialised-generation line found'}")
-    ok = elapsed <= poll + 30  # poll interval + generous download budget; judged against the log line
-    print("freshness " + ("OK" if ok else "SLOW (check download time in the log line above)"))
-    return True
+            lines = [ln.strip() for ln in f if "materialised generation" in ln]
+    ms = [int(m.group(1)) for ln in lines for m in [re.search(r" in (\d+) ms", ln)] if m]
+    if not ms:
+        print("FAIL: no 'materialised generation ... in N ms' line in the reader log; cannot judge")
+        return False
+    download = sum(ms) / 1000.0
+    bound = poll + download + 5
+    ok = elapsed <= bound
+    print(f"visible after {elapsed:.1f} s; poll interval {poll} s; generation download {download:.1f} s; "
+          f"bound (poll + download + 5 s slack) {bound:.1f} s -> {'OK' if ok else 'TOO SLOW'}")
+    for ln in lines:
+        print(f"reader log: {ln}")
+    return ok
 
 
 def main():
@@ -125,11 +161,11 @@ def main():
     ap.add_argument("--writer", default="http://127.0.0.1:7300")
     ap.add_argument("--reader", default="http://127.0.0.1:7301")
     args = ap.parse_args()
-    n, mism = compare(args)
-    if mism:
-        print("GATE FAILED: top-10 / callers mismatches")
+    if not compare(args):
+        print("GATE FAILED: comparison")
         return 1
     if not freshness(args):
+        print("GATE FAILED: freshness")
         return 1
     print("GATE PASSED")
     return 0

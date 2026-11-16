@@ -34,11 +34,21 @@ JAR="$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | so
 REAL_REGISTRY="$HOME/.pharos/registry.json"
 LUCENE_SRC="$(python3 -I - "$REAL_REGISTRY" <<'PY'
 import json, os, sys
-r = json.load(open(sys.argv[1]))
-print(os.path.normpath(r["lucene"]["rootPath"]))
+try:
+    r = json.load(open(sys.argv[1]))
+    print(os.path.normpath(r["lucene"]["rootPath"]))
+except (OSError, ValueError, KeyError, TypeError) as e:
+    sys.exit("cluster-gate: no usable 'lucene' entry in %s (%r)" % (sys.argv[1], e))
 PY
-)"
+)" || exit 2
 [[ -d "$LUCENE_SRC" ]] || { echo "cluster-gate: lucene rootPath not a directory: $LUCENE_SRC" >&2; exit 2; }
+
+for port in 9000 7300 7301; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    echo "cluster-gate: port $port is already in use (another MinIO or a pharos daemon?); refusing to start" >&2
+    exit 2
+  fi
+done
 
 GATE="${GATE:-$(mktemp -d -t pharos-gate.XXXXXX)}"
 mkdir -p "$GATE"
@@ -86,13 +96,17 @@ write_config reader gate-reader "$R_PH"
 
 PIDS=()
 cleanup() {
+  trap - EXIT INT TERM
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
+  for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && wait "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-jvm() {  # $1 = home dir (user.home); rest = pharos args
+jvm() {  # $1 = home dir (user.home); rest = pharos args. Always call in a subshell: ( jvm ... )
   local home="$1"; shift
-  java -Xmx"${PHAROS_HEAP:-8g}" --enable-native-access=ALL-UNNAMED \
+  exec java -Xmx"${PHAROS_HEAP:-8g}" --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector \
     -Dpolyglot.engine.WarnInterpreterOnly=false \
     -Duser.home="$home" -Dpharos.home="$home/.pharos" \
@@ -118,13 +132,13 @@ mkdir -p "$PHAROS_SRC"
 cp -r "$REPO/src" "$REPO/pom.xml" "$PHAROS_SRC/"
 
 echo "== indexing pharos + lucene on the writer (publishes to MinIO)"
-jvm "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed 2>&1 | tee "$GATE/writer-index-pharos.log" | tail -n 5
-jvm "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed 2>&1 | tee "$GATE/writer-index-lucene.log" | tail -n 5
+( jvm "$W_HOME" index "$PHAROS_SRC" --project pharos --no-embed ) 2>&1 | tee "$GATE/writer-index-pharos.log" | tail -n 5
+( jvm "$W_HOME" index "$LUCENE_SRC" --project lucene --no-embed ) 2>&1 | tee "$GATE/writer-index-lucene.log" | tail -n 5
 
 echo "== starting writer web :7300 and reader web :7301"
-jvm "$W_HOME" web --port 7300 --no-open > "$GATE/writer-web.log" 2>&1 &
+( jvm "$W_HOME" web --port 7300 --no-open ) > "$GATE/writer-web.log" 2>&1 &
 PIDS+=($!)
-jvm "$R_HOME" web --port 7301 --no-open > "$GATE/reader-web.log" 2>&1 &
+( jvm "$R_HOME" web --port 7301 --no-open ) > "$GATE/reader-web.log" 2>&1 &
 PIDS+=($!)
 wait_http http://127.0.0.1:7300/health 120
 wait_http http://127.0.0.1:7301/health 120
@@ -141,6 +155,7 @@ done
 
 # The freshness check re-indexes the edited copy on the writer with this command.
 export GATE_REINDEX_CMD="java -Xmx${PHAROS_HEAP:-8g} --enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector -Duser.home=$W_HOME -Dpharos.home=$W_PH -jar $JAR index $PHAROS_SRC --project pharos --no-embed"
+export GATE_REINDEX_LOG="$GATE/freshness-reindex.log"
 export GATE_PHAROS_SRC="$PHAROS_SRC"
 export GATE_READER_LOG="$GATE/reader-web.log"
 export GATE_POLL_INTERVAL="$POLL"

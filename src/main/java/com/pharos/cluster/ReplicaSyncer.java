@@ -232,6 +232,7 @@ public class ReplicaSyncer implements Closeable {
 
     private void materialise(ShardId shard, Generation gen, ShardManifest manifest, byte[] manifestJson,
                              Path shardRoot, Path genDir) throws IOException {
+        long startNanos = System.nanoTime();
         Path partial = shardRoot.resolve(genDir.getFileName() + PARTIAL_SUFFIX);
         Path lucene = partial.resolve(LUCENE_DIR);
         Files.createDirectories(lucene);
@@ -262,8 +263,8 @@ public class ReplicaSyncer implements Closeable {
         checkLuceneFooters(lucene, manifest);
         Files.write(partial.resolve(MANIFEST_FILE), manifestJson);
         Files.move(partial, genDir, StandardCopyOption.ATOMIC_MOVE);
-        log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded)",
-                shard, gen.value(), linked, downloaded);
+        log.info("Shard {}: materialised generation {} ({} files hard-linked, {} downloaded) in {} ms",
+                shard, gen.value(), linked, downloaded, (System.nanoTime() - startNanos) / 1_000_000);
     }
 
     /** Key → file of the active generation, from its {@code manifest.json}; empty if unreadable. */
