@@ -147,10 +147,19 @@ public final class ObjectStorePublisher implements IndexPublisher {
             // 3. Per-generation graph and refs snapshots, content-named (gen-N@crc) so a racing
             //    run for the same N can never overwrite the bytes a committed manifest points at.
             tempDir = Files.createTempDirectory("pharos-publish-");
-            Path arcade = snapshot.shardDir().resolve(GraphViews.ARCADE_DIR);
+            //    The writer's live graph is the generation named by callgraph.current (legacy
+            //    callgraph.arcadedb without a pointer). It is opened read-only: openExisting never
+            //    creates a graph, and an unusable pointer fails the publish instead of silently
+            //    shipping a generation without its graph.
+            String pointerProblem = CallGraph.pointerProblem(snapshot.shardDir());
+            if (pointerProblem != null) {
+                throw new PublishException("cannot publish shard " + shard + ": " + pointerProblem
+                        + "; re-index the project (pharos index --full)");
+            }
+            Path arcade = CallGraph.projectGraphDir(snapshot.shardDir());
             if (Files.isDirectory(arcade)) {
                 Path graphFile = tempDir.resolve(GraphViews.COMPACT_FILE);
-                try (CallGraph graph = CallGraph.open(arcade)) {
+                try (CallGraph graph = CallGraph.openExisting(arcade)) {
                     CompactGraphWriter.export(graph, graphFile);
                 }
                 String crc = crc32Hex(graphFile);

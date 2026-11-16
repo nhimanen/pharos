@@ -510,4 +510,58 @@ class ObjectStorePublisherTest {
         assertThat(store.get(layout.synonymsKey()).orElseThrow().data())
                 .isEqualTo(Files.readAllBytes(synonyms));
     }
+
+    // ── Adaptation 1: the writer's graph is read through callgraph.current ──────────────────
+
+    @Test
+    void publishReadsTheGraphGenerationNamedByThePointer() throws Exception {
+        indexFull(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        assertThat(shardDir.resolve(com.pharos.graph.CallGraph.POINTER_FILE)).isRegularFile();
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(shardDir);
+        assertThat(live.getFileName().toString()).matches("callgraph-\\d+\\.arcadedb");
+        long methods;
+        try (com.pharos.graph.CallGraph g = com.pharos.graph.CallGraph.openExisting(live)) {
+            methods = g.methodCount();
+        }
+        assertThat(methods).isPositive();
+        Set<String> before = listing(shardDir);
+
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none"));
+
+        JsonNode graph = fileWithRole(manifest(1), "graph");
+        byte[] data = store.get(graph.get("key").asText()).orElseThrow().data();
+        Path downloaded = tmp.resolve("downloaded.cgf.gz");
+        Files.write(downloaded, data);
+        try (com.pharos.graph.CompactGraph cg = com.pharos.graph.CompactGraph.read(downloaded)) {
+            assertThat(cg.methodCount()).isEqualTo(methods);
+        }
+        // the snapshot neither created a legacy graph nor a new generation
+        assertThat(shardDir.resolve(com.pharos.graph.GraphViews.ARCADE_DIR)).doesNotExist();
+        assertThat(listing(shardDir)).isEqualTo(before);
+    }
+
+    @Test
+    void brokenGraphPointerFailsThePublishBeforeTheCommitPoint() throws Exception {
+        indexFull(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        Files.writeString(shardDir.resolve(com.pharos.graph.CallGraph.POINTER_FILE), "callgraph-1.arcadedb");
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+
+        assertThatThrownBy(() -> publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
+                .isInstanceOf(PublishException.class)
+                .hasMessageContaining("callgraph-1.arcadedb");
+        assertThat(store.get(layout.latestKey(SHARD))).isEmpty();
+        assertThat(shardDir.resolve("callgraph-1.arcadedb")).doesNotExist();
+        assertThat(shardDir.resolve(com.pharos.graph.GraphViews.ARCADE_DIR)).doesNotExist();
+    }
+
+    private static Set<String> listing(Path dir) throws IOException {
+        try (Stream<Path> s = Files.list(dir)) {
+            return s.map(p -> p.getFileName().toString())
+                    .filter(n -> n.startsWith("callgraph"))
+                    .collect(Collectors.toSet());
+        }
+    }
 }

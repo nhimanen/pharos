@@ -186,13 +186,15 @@ class SingleNodeGoldenTest {
         for (ProjectMeta meta : registry.listAll().stream()
                 .sorted(Comparator.comparing(ProjectMeta::getName)).toList()) {
             Path shardDir = Path.of(meta.getIndexPath());
-            if (!Files.exists(shardDir.resolve(GraphViews.ARCADE_DIR))
+            // writer/all: the generation named by callgraph.current (legacy dir without one);
+            // reader: the generation dir's compact graph
+            if (!Files.exists(com.pharos.graph.CallGraph.projectGraphDir(shardDir))
                     && !Files.exists(shardDir.resolve(GraphViews.COMPACT_FILE))) {
                 graphs.forEach(GraphView::close);
                 throw new IllegalStateException("No call graph for project '" + meta.getName()
                         + "' at " + shardDir);
             }
-            graphs.add(GraphViews.open(shardDir));
+            graphs.add(GraphViews.open(meta));
         }
         if (graphs.isEmpty()) throw new IllegalStateException("No registered projects with call graphs");
         return graphs;
