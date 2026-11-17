@@ -120,6 +120,12 @@ public final class IndexVersions {
         if (cfg == null || cfg.getUrl() == null || cfg.getUrl().isBlank() || cfg.getDimensions() <= 0) {
             return java.util.List.of();
         }
+        // Pre-upgrade pharos only embedded with mean pooling and no prefixes; under other settings
+        // the same url:dims names different vectors, so it must not vouch for them.
+        if (cfg.getPooling() != com.pharos.config.Pooling.MEAN
+                || !nvl(cfg.getQueryPrefix()).isEmpty() || !nvl(cfg.getDocumentPrefix()).isEmpty()) {
+            return java.util.List.of();
+        }
         return java.util.List.of(cfg.getUrl() + ":" + cfg.getDimensions());
     }
 
