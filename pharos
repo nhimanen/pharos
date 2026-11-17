@@ -98,13 +98,26 @@ def _jvm_flags() -> list:
 
 # ── Daemon management ─────────────────────────────────────────────────────────
 
-def _is_daemon_running() -> bool:
-    """Return True if the daemon is responding on its health endpoint."""
+def _health_status():
+    """HTTP status of the daemon's /health (200 ready, 503 warming), or None when nothing answers."""
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
-            return resp.status == 200
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
     except Exception:
-        return False
+        return None
+
+
+def _is_daemon_running() -> bool:
+    """Return True if the daemon is responding on its health endpoint (ready or still warming:
+    a reader answers 503 until its first sync and its search models are done)."""
+    return _health_status() in (200, 503)
+
+
+def _daemon_ready() -> bool:
+    """True once the daemon reports ready (HTTP 200)."""
+    return _health_status() == 200
 
 
 DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate at daemon start once the log exceeds this
@@ -179,12 +192,19 @@ def _start_daemon():
     )
     DAEMON_PID_FILE.write_text(str(proc.pid))
 
-    # Wait up to 30s for the server to become ready
+    # Wait up to 30s for the server to become ready (a reader may still be warming after that:
+    # its requests are answered, with a warning, so go ahead once it responds at all)
     deadline = time.monotonic() + 30
+    status = None
     while time.monotonic() < deadline:
-        if _is_daemon_running():
+        status = _health_status()
+        if status == 200:
             return
         time.sleep(0.3)
+    if status == 503:
+        print("pharos daemon is still warming up (first sync or model load); continuing.",
+              file=sys.stderr, flush=True)
+        return
 
     die(f"pharos daemon failed to start within 30s.\n"
         f"Check logs: {DAEMON_LOG_FILE}")
@@ -975,10 +995,16 @@ def reader_cache_line(rc):
 
 
 def _daemon_reader_cache():
-    """The running daemon's `readerCache` (its hits are the real ones), or None."""
+    """The running daemon's `readerCache` (its hits are the real ones), or None. A warming
+    reader answers 503 with the same body."""
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
             return json.loads(resp.read()).get("readerCache")
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()).get("readerCache")
+        except Exception:
+            return None
     except Exception:
         return None
 

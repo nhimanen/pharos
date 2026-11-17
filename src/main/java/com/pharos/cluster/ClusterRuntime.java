@@ -77,6 +77,11 @@ public final class ClusterRuntime implements Closeable {
     private boolean serving;
     private volatile boolean ready;
     private boolean closed;
+    /** The search models' warm-up readiness also waits for; settled at once unless given. */
+    private java.util.concurrent.CompletionStage<?> models = java.util.concurrent.CompletableFuture.completedFuture(null);
+    // Guarded by this: the first sync is served; and the readiness line it logs once ready.
+    private boolean firstSyncServed;
+    private String servedLine;
 
     public ClusterRuntime(IndexConfig config, ReplicationBackend backend, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer) {
@@ -209,9 +214,23 @@ public final class ClusterRuntime implements Closeable {
      * @throws IOException when the lock file cannot be created
      */
     public void beginServing() throws IOException {
+        beginServing(java.util.concurrent.CompletableFuture.completedFuture(null));
+    }
+
+    /**
+     * {@link #beginServing()}, with readiness also waiting for {@code modelsLoaded}: a reader is
+     * {@link #ready} (and logs "Reader … serving N shard(s)") only once its first sync is served
+     * AND the search models have settled. Load balancers and the router send traffic on that
+     * signal, so a reader never takes queries that would stall on a multi-second model load. The
+     * stage completing exceptionally counts as settled: a model that fails to load never blocks
+     * readiness (the caller bounds a hanging load with a timeout).
+     */
+    public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded) throws IOException {
+        java.util.Objects.requireNonNull(modelsLoaded, "modelsLoaded");
         synchronized (this) {
             if (!isReader() || serving) return;
             if (closed) throw new IllegalStateException("cluster runtime is closed");
+            models = modelsLoaded;
             ReaderLocalCache cache = readerCache();
             Optional<SyncLock> lock = SyncLock.tryAcquire(cacheDir());
             serving = true;
@@ -221,6 +240,26 @@ public final class ClusterRuntime implements Closeable {
                 becomeFollower();
             }
         }
+        modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
+    }
+
+    /** The first sync is served; ready now if the models have settled too. */
+    private void firstSyncServed(String line) {
+        synchronized (this) {
+            firstSyncServed = true;
+            servedLine = line;
+        }
+        maybeBecomeReady();
+    }
+
+    private void maybeBecomeReady() {
+        String line;
+        synchronized (this) {
+            if (ready || !firstSyncServed || !models.toCompletableFuture().isDone()) return;
+            ready = true;
+            line = servedLine;
+        }
+        log.info(line);
     }
 
     /** Blocks until the first sync pass of a serving reader has finished; returns at once otherwise. */
@@ -235,7 +274,10 @@ public final class ClusterRuntime implements Closeable {
         }
     }
 
-    /** False while a serving reader's first sync pass is still running; true otherwise. */
+    /**
+     * False while a serving reader's first sync pass is still running or its search models are
+     * still loading (see {@link #beginServing(java.util.concurrent.CompletionStage)}); true otherwise.
+     */
     public boolean ready() {
         return !isReader() || ready;
     }
@@ -274,9 +316,14 @@ public final class ClusterRuntime implements Closeable {
                     config.getCluster().getPollIntervalSeconds(), e.toString());
         } finally {
             Map<ShardId, Generation> served = s.served();
-            log.info("Reader {} serving {} shard(s): {}", config.getCluster().effectiveNodeId(), served.size(), served);
             warm(served.keySet().stream().map(ShardId::value).toList());
-            ready = true;
+            String line = "Reader " + config.getCluster().effectiveNodeId() + " serving " + served.size()
+                    + " shard(s): " + served;
+            if (ready) {
+                log.info(line); // a follower that took over syncing: already ready
+            } else {
+                firstSyncServed(line);
+            }
             firstSync.countDown();
         }
         try {
@@ -290,8 +337,10 @@ public final class ClusterRuntime implements Closeable {
     private void becomeFollower() {
         log.info("Another process holds {}: not syncing here; serving the generations it registers in {}",
                 cacheDir().resolve(SyncLock.FILE), cacheDir().resolve("registry.json"));
-        warm(activateRegistered());
-        ready = true;
+        List<String> activated = activateRegistered();
+        warm(activated);
+        firstSyncServed("Reader " + config.getCluster().effectiveNodeId() + " serving " + activated.size()
+                + " shard(s): " + activated + " (following the sync lock holder)");
         firstSync.countDown();
         long interval = config.getCluster().getPollIntervalSeconds();
         follower = Executors.newSingleThreadScheduledExecutor(r -> {

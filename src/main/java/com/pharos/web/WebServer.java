@@ -73,8 +73,8 @@ public class WebServer {
     }
 
     /**
-     * Readiness reported by {@code /health} ({@code {"status":"syncing","ready":false}} until it
-     * turns true) and warned about on searches answered before it does.
+     * Readiness reported by {@code /health} (HTTP 503 {@code {"status":"warming","ready":false}}
+     * until it turns true) and warned about on searches answered before it does.
      */
     public void setReadiness(java.util.function.BooleanSupplier readiness) {
         this.readiness = java.util.Objects.requireNonNull(readiness, "readiness");
@@ -85,18 +85,28 @@ public class WebServer {
         this.readerCacheStats = java.util.Objects.requireNonNull(stats, "stats");
     }
 
-    /** Health payload: HTTP 200 either way (liveness); {@code ready} tells whether the first sync is done. */
+    /**
+     * Health payload. Served with HTTP 200 when ready and 503 while warming (a reader's first sync
+     * or model load): the 503 keeps load balancers and the router from sending traffic early. A
+     * client that only wants liveness treats any answer as "running".
+     */
     Map<String, Object> health() {
         boolean ready = readiness.getAsBoolean();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("status", ready ? "ok" : "syncing");
+        out.put("status", ready ? "ok" : "warming");
         out.put("ready", ready);
         Map<String, Object> cache = readerCacheStats.get();
         if (cache != null) out.put("readerCache", cache);
         return out;
     }
 
-    static final String SYNCING_WARNING = "reader is still running its first sync; results may be incomplete";
+    static final String SYNCING_WARNING =
+            "reader is still warming up (first sync or model load); results may be incomplete";
+
+    /** {@code /health}'s HTTP status: 503 while warming, so load balancers and the router hold traffic. */
+    int healthStatus() {
+        return readiness.getAsBoolean() ? 200 : 503;
+    }
 
     /** Module endpoints need the module graph, which reader nodes do not have yet: 501. */
     private boolean refuseOnReader(io.javalin.http.Context ctx) {
@@ -618,7 +628,10 @@ public class WebServer {
         });
 
         // Health check (used by daemon client to detect readiness)
-        app.get("/health", ctx -> ctx.json(health()));
+        app.get("/health", ctx -> {
+            Map<String, Object> h = health();
+            ctx.status(Boolean.TRUE.equals(h.get("ready")) ? 200 : 503).json(h);
+        });
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);

@@ -180,4 +180,30 @@ class WarmStatsSurfaceTest {
         assertThat(python(body, procJson.toString(), health.toString()).lines().toList())
                 .containsExactly("\"daemon\" 5", "\"process\" 973");
     }
+
+    /**
+     * A reader daemon answers 503 {"status":"warming"} until its first sync and models are done: the
+     * client counts it as running (no second daemon is started) but not ready, and still reads its
+     * readerCache.
+     */
+    @Test
+    void pythonClientTreatsAWarmingDaemonAsRunningButNotReady() throws Exception {
+        String body = "state = {'code': 503}\n"
+                + "class H(http.server.BaseHTTPRequestHandler):\n"
+                + "    def do_GET(self):\n"
+                + "        c = state['code']; self.send_response(c); self.end_headers()\n"
+                + "        self.wfile.write(json.dumps({'status': 'warming' if c == 503 else 'ok', 'ready': c == 200,\n"
+                + "                                     'readerCache': {'hits': c}}).encode())\n"
+                + "    def log_message(self, *a): pass\n"
+                + "srv = http.server.HTTPServer(('127.0.0.1', 0), H)\n"
+                + "threading.Thread(target=srv.serve_forever, daemon=True).start()\n"
+                + "mod.BASE_URL = 'http://127.0.0.1:%d' % srv.server_port\n"
+                + "print(mod._is_daemon_running(), mod._daemon_ready(), mod._daemon_reader_cache()['hits'])\n"
+                + "state['code'] = 200\n"
+                + "print(mod._is_daemon_running(), mod._daemon_ready(), mod._daemon_reader_cache()['hits'])\n"
+                + "mod.BASE_URL = 'http://127.0.0.1:1'\n"
+                + "print(mod._is_daemon_running(), mod._daemon_ready())\n";
+        assertThat(python(body).lines().toList())
+                .containsExactly("True False 503", "True True 200", "False False");
+    }
 }
