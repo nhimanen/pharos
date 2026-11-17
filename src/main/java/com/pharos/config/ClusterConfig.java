@@ -30,6 +30,7 @@ public class ClusterConfig {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String advertiseUrl;
     /** Shared secret of the cluster's internal endpoints; required on readers. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     private String token;
     private int heartbeatSeconds = 10;
     private int readerTtlSeconds = 30;
@@ -114,6 +115,13 @@ public class ClusterConfig {
         }
     }
 
+    /** Redacts the token: this is what logs and error messages show. */
+    @Override
+    public String toString() {
+        return "ClusterConfig[role=" + role + ", backend=" + backend + ", nodeId=" + nodeId
+                + ", advertiseUrl=" + advertiseUrl + ", token=" + (token == null ? "unset" : "***") + "]";
+    }
+
     public NodeRole getRole() { return role; }
     public void setRole(NodeRole role) { this.role = role; }
     public BackendKind getBackend() { return backend; }
@@ -134,10 +142,8 @@ public class ClusterConfig {
     public void setReader(ReaderConfig reader) { this.reader = reader; }
     public String getAdvertiseUrl() { return advertiseUrl; }
     public void setAdvertiseUrl(String v) { this.advertiseUrl = v; }
-    /** Never serialised: the secret must not reach any config dump or status output. */
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    /** Serialised for config persistence ({@code IndexConfig.save}); every output surface redacts it. */
     public String getToken() { return token; }
-    @com.fasterxml.jackson.annotation.JsonProperty("token")
     public void setToken(String v) { this.token = v; }
     public int getHeartbeatSeconds() { return heartbeatSeconds; }
     public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }

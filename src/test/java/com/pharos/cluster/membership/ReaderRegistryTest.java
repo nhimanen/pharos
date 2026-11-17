@@ -140,13 +140,15 @@ class ReaderRegistryTest {
         assertThat(a.live()).hasSize(2);
 
         bucketClock.advance(60); // b is dead
+        ReaderRegistry c = registry("c", List.of("p1"));
+        c.tick(); // a fresh peer makes the bucket's newest object far newer than our own
         failPuts.set(true);
         a.tick(); // cannot tell dead peers from an unreachable bucket: previous list kept
         assertThat(a.live()).extracting(ReaderHeartbeat::node).containsExactly("a", "b");
 
         failPuts.set(false);
         a.tick(); // recovered: judged against our own fresh write
-        assertThat(a.live()).extracting(ReaderHeartbeat::node).containsExactly("a");
+        assertThat(a.live()).extracting(ReaderHeartbeat::node).containsExactly("a", "c");
     }
 
     @Test
