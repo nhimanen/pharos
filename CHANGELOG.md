@@ -79,7 +79,7 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   (`DocumentMapper.vectorFieldFor` / `chunkVectorFieldFor`); named models keep `vec.<id>`.
   The first `pharos index` after upgrading re-indexes affected projects (indexes built by
   1.4.0-1.4.1 with the legacy model) in full, reusing cached embeddings (`index-status` flags such projects as
-  `needsReembed` and prints the command). `pharos embed` migrates only single-chunk documents; the next
+  `needsReembed` and prints the command). `pharos embed` migrates only single-chunk `.java` documents; the next
   `pharos index` finishes the rest. `pharos upgrade-indexes` lists these projects but does not migrate them.
   Index format unchanged.
 

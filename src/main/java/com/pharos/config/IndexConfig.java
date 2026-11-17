@@ -178,7 +178,7 @@ public class IndexConfig {
 
     /**
      * Provider block for a known model: {@code granite-r2} (recommended: CLS pooling, 768 dims,
-     * pinned revision) or {@code jina-code-v2}. Null for anything else. Never applied implicitly:
+     * pinned revision) or {@code jina-v2-code}. Null for anything else. Never applied implicitly:
      * embeddings stay off until {@code pharos embeddings enable}.
      */
     public static EmbeddingProviderConfig presetProvider(String name) {
