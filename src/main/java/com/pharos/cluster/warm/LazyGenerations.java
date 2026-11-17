@@ -177,9 +177,11 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     /**
      * Starts, on the cache's prefetch pool: the download of every remote (not eager) Lucene file's
      * head sidecar into {@code luceneDir} (see {@link RemoteDirectory#headFile}), and the fetch of
-     * every block of the remote files whose extension is one of {@code prefetchExtensions}. Those
-     * files are taken in the order of {@code prefetchExtensions}, whole, while their total stays
-     * within half the cache's cap (the rest is fetched on first read). The blocks the shard's previous
+     * every block of the remote files whose extension is one of {@code prefetchExtensions}, and of
+     * the entries with such an extension inside remote compound files ({@code .cfs}, located through
+     * the eager {@code .cfe} entry table: published segments are often single compound files). Those
+     * files and entries are taken in the order of {@code prefetchExtensions}, whole, while their
+     * blocks stay within half the cache's cap (the rest is fetched on first read). The blocks the shard's previous
      * prefetch still has queued are cancelled first. The future completes when all are done (blocks
      * cached or skipped), exceptionally when one fails or is cancelled. A head is written to a temp
      * file and moved into place, so a sidecar is complete or absent.
@@ -208,35 +210,126 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         for (ManifestFile f : remoteFiles) futures.add(cache.runOnPrefetchPool(() -> downloadHead(f, luceneDir, reusable.get(f.key()))));
         int heads = futures.size();
 
+        // What to prefetch: whole remote files with a prefetch extension, and the byte ranges of
+        // entries with one inside remote compound files (located through the eager .cfe table).
         List<String> order = config.getPrefetchExtensions();
-        List<ManifestFile> wanted = remoteFiles.stream()
-                .filter(f -> prefetchExtensions.contains(extension(f.name())))
-                .sorted(Comparator.comparingInt((ManifestFile f) -> order.indexOf(extension(f.name())))
-                        .thenComparing(ManifestFile::name))
-                .toList();
+        List<PrefetchUnit> units = new ArrayList<>();
+        for (ManifestFile f : remoteFiles) {
+            String ext = extension(f.name());
+            if (prefetchExtensions.contains(ext)) {
+                units.add(new PrefetchUnit(f, f.name(), ext, 0, f.length()));
+            } else if (ext.equals("cfs")) {
+                units.addAll(compoundUnits(shard, manifest.generation(), f, luceneDir));
+            }
+        }
+        units.sort(Comparator.comparingInt((PrefetchUnit u) -> order.indexOf(u.extension()))
+                .thenComparing(PrefetchUnit::label));
         long budget = cache.maxBytes() / 2;
         long bytes = 0;
         int blocks = 0;
         List<BlockKey> queued = new ArrayList<>();
-        for (ManifestFile f : wanted) {
-            if (bytes + f.length() > budget) {
+        Map<String, CachingRemoteIndexInput.RemoteFile> remotes = new LinkedHashMap<>();
+        Map<String, java.util.Set<Long>> taken = new java.util.HashMap<>();
+        for (PrefetchUnit u : units) {
+            CachingRemoteIndexInput.RemoteFile remote = remotes.computeIfAbsent(u.file().key(),
+                    k -> new CachingRemoteIndexInput.RemoteFile(shard, manifest.generation(), u.file(), cache, source));
+            java.util.Set<Long> seen = taken.computeIfAbsent(u.file().key(), k -> new java.util.HashSet<>());
+            List<Long> fresh = new ArrayList<>();
+            long unitBytes = 0;
+            if (u.length() > 0) {
+                for (long b = remote.blockOf(u.offset()); b <= remote.blockOf(u.offset() + u.length() - 1); b++) {
+                    if (!seen.contains(b)) {
+                        fresh.add(b);
+                        unitBytes += remote.lengthOfBlock(b);
+                    }
+                }
+            }
+            if (fresh.isEmpty()) continue;
+            if (bytes + unitBytes > budget) {
                 log.info("Shard {}: not prefetching {} of generation {} ({} bytes): the prefetch is capped at half"
-                        + " the block cache ({} bytes)", shard, f.name(), manifest.generation(), f.length(), budget);
+                        + " the block cache ({} bytes)", shard, u.label(), manifest.generation(), unitBytes, budget);
                 continue;
             }
-            CachingRemoteIndexInput.RemoteFile remote =
-                    new CachingRemoteIndexInput.RemoteFile(shard, manifest.generation(), f, cache, source);
-            List<CompletableFuture<Void>> fileBlocks = remote.prefetchAll();
-            futures.addAll(fileBlocks);
-            queued.addAll(remote.blockKeys());
-            blocks += fileBlocks.size();
-            bytes += f.length();
+            for (long b : fresh) {
+                seen.add(b);
+                futures.add(remote.prefetchBlock(b));
+                queued.add(remote.blockKey(b));
+            }
+            blocks += fresh.size();
+            bytes += unitBytes;
         }
         synchronized (lastPrefetch) {
             lastPrefetch.put(shard.value(), queued);
         }
         return new Prefetch(CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)), heads, blocks, bytes,
                 cancelled);
+    }
+
+    /** A byte range to prefetch: a whole file, or one entry of a compound file. */
+    private record PrefetchUnit(ManifestFile file, String label, String extension, long offset, long length) {}
+
+    /**
+     * The entries of remote compound file {@code cfs} whose extension is a prefetch extension, read
+     * from its eager {@code .cfe} table in {@code luceneDir}. Empty (logged) when the table is
+     * missing or unreadable: the entries are then fetched on first read, as before.
+     */
+    private List<PrefetchUnit> compoundUnits(ShardId shard, long gen, ManifestFile cfs, Path luceneDir) {
+        String cfe = cfs.name().substring(0, cfs.name().length() - "cfs".length()) + "cfe";
+        Path table = luceneDir.resolve(cfe);
+        if (!Files.isRegularFile(table)) return List.of();
+        List<PrefetchUnit> out = new ArrayList<>();
+        try {
+            for (CompoundEntry e : readCompoundEntries(table)) {
+                String ext = extension(e.name());
+                if (!prefetchExtensions.contains(ext)) continue;
+                if (e.offset() < 0 || e.length() < 0 || e.offset() + e.length() > cfs.length()) {
+                    throw new IOException("entry " + e.name() + " [" + e.offset() + "+" + e.length()
+                            + ") lies outside the " + cfs.length() + "-byte " + cfs.name());
+                }
+                out.add(new PrefetchUnit(cfs, cfs.name() + ":" + e.name(), ext, e.offset(), e.length()));
+            }
+        } catch (IOException | RuntimeException e) {
+            log.warn("Shard {}: cannot read the compound entry table {} of generation {} ({}); its entries are"
+                    + " fetched on first read instead of prefetched", shard, cfe, gen, e.toString());
+            return List.of();
+        }
+        return out;
+    }
+
+    /** One entry of a {@code .cfe} table: the sub-file's name and its byte range in the {@code .cfs}. */
+    record CompoundEntry(String name, long offset, long length) {}
+
+    /**
+     * Reads a Lucene 9/10 compound entry table ({@code Lucene90CompoundEntries}: index header, vint
+     * count, then per entry name, offset and length) and verifies its checksum footer.
+     */
+    static List<CompoundEntry> readCompoundEntries(Path cfe) throws IOException {
+        try (Directory d = new org.apache.lucene.store.NIOFSDirectory(cfe.getParent());
+             org.apache.lucene.store.ChecksumIndexInput in =
+                     d.openChecksumInput(cfe.getFileName().toString())) {
+            List<CompoundEntry> out = new ArrayList<>();
+            Throwable failure = null;
+            try {
+                org.apache.lucene.codecs.CodecUtil.checkHeader(in, "Lucene90CompoundEntries", 0, 0);
+                byte[] id = new byte[org.apache.lucene.util.StringHelper.ID_LENGTH];
+                in.readBytes(id, 0, id.length);
+                int suffixLength = in.readByte() & 0xFF;
+                byte[] suffix = new byte[suffixLength];
+                in.readBytes(suffix, 0, suffixLength);
+                int n = in.readVInt();
+                for (int i = 0; i < n; i++) {
+                    String name = in.readString();
+                    long offset = in.readLong();
+                    long length = in.readLong();
+                    out.add(new CompoundEntry(name, offset, length));
+                }
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                org.apache.lucene.codecs.CodecUtil.checkFooter(in, failure);
+            }
+            return out;
+        }
     }
 
     /** Cancels the still-queued blocks of the shard's previous prefetch; returns how many. */

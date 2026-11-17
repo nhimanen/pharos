@@ -477,6 +477,26 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             return out;
         }
 
+        /** Index of the block holding byte {@code abs}. */
+        long blockOf(long abs) {
+            return abs / blockSize;
+        }
+
+        /** Length of block {@code index} (the last one may be short). */
+        long lengthOfBlock(long index) {
+            return blockLength(index);
+        }
+
+        /** Starts prefetching one block; see {@link BlockCache#prefetch}. */
+        java.util.concurrent.CompletableFuture<Void> prefetchBlock(long index) {
+            return cache.prefetch(new BlockKey(file.key(), index), objectHash, blockLength(index), this);
+        }
+
+        /** The key of block {@code index}. */
+        BlockKey blockKey(long index) {
+            return new BlockKey(file.key(), index);
+        }
+
         /** Starts prefetching every block of the file; one future per block (see {@link BlockCache#prefetch}). */
         java.util.List<java.util.concurrent.CompletableFuture<Void>> prefetchAll() {
             long blocks = (length + blockSize - 1) / blockSize;
