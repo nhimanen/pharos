@@ -5,7 +5,7 @@
 **Goal:** A cluster can run with no bucket. Readers fetch the same manifests and content-named files directly from the writer that owns a shard, over HTTP with `Range` support.
 
 **Architecture:** A new `ReplicaSource`, `PeerReplicaSource`, plus a writer replication endpoint. They reuse the Phase 1 manifest format and the Phase 2 block cache unchanged.
-- The catalog is a static writer → shard map in config. Each writer serves `/replication/catalog`.
+- **Writers are discovered dynamically (user decision, 2026-11-17)**, not listed in a static map. A reader resolves `cluster.peers.discovery` periodically (DNS name, or seed URLs) and asks each writer which shards it owns via `/replication/catalog`.
 - Readers long-poll `latest`.
 - A reader may fetch a file from a peer reader that already holds the generation. The manifest checksums verify those bytes.
 
@@ -20,8 +20,8 @@
 - **Phase 5 gate (spec):** "Same Phase 1–2 gates with no bucket; kill the writer and readers keep serving their cached generation."
 - **Writer endpoint (spec):** `GET /replication/<shard>/latest`, `/manifests/gen-N.json` and `/files/<name>` with `Range` support, served from the writer's local index directory. Files of retained generations stay on disk under GC's retention rule: the last 3 generations plus 1 hour.
 - **Reader (spec):** `PeerReplicaSource` implements `latest`, `manifest` and `open`. `LocalCache`, warming and the reopen path are unchanged. "Readers long-poll `latest` instead of polling every 10 s."
-- **Catalog and leases (spec):**
-  - The catalog is a static writer → shard map in config, and each writer serves `/replication/catalog`.
+- **Catalog and leases (spec, amended):**
+  - The spec's static writer → shard map is replaced by dynamic discovery (user decision, 2026-11-17). Each writer still serves `/replication/catalog`, listing the shards it owns, and readers merge these into a live catalog.
   - Readers register with the writers they pull from.
   - "there is no automatic writer takeover in this mode."
 - **Writer load (spec):** "cap concurrent transfers per writer, and let readers fetch files from a peer reader that already holds the generation (manifest checksums verify them)."
@@ -29,7 +29,8 @@
 - **Security (spec):** "TLS plus a shared cluster token on the replication endpoint." Reuse `cluster.token` from Phase 3.
 - **Config:**
   - `cluster.backend: peer-pull`.
-  - `cluster.peers.writers: [{node, url, shards}]`.
+  - `cluster.peers.discovery`: either `dns:<name>[:port]` (every A/AAAA record is a writer, such as a Kubernetes headless service) or `seeds:<url>,<url>` (each seed's `/replication/peers` lists the writers it knows; writers gossip their peer lists).
+  - `cluster.peers.refreshSeconds` (default 15): how often a reader re-resolves discovery and re-reads each writer's catalog. A writer missing for 3 refreshes is dropped.
   - `cluster.peers.maxTransfersPerWriter` (default 8).
   - `cluster.peers.longPollSeconds` (default 30).
   - `cluster.tls.{keystore, truststore, password env}`.
@@ -40,6 +41,8 @@
 **Out of scope:** writer takeover in peer mode (the spec says there is none), and mixing bucket and peer sources for one shard.
 
 ## Review Focus
+
+0. **Two discovered writers claim the same shard** (misconfiguration, or a writer moved without stopping the old one). Readers sync from the writer with the higher `LATEST` generation, report the conflict in `/health` and the Cluster status as `shard X claimed by A and B`, and never alternate between them on each refresh. Test owned by Task 2.
 
 1. **The writer prunes a generation while a reader is mid-fetch of one of its files.** Retention keeps files of the last 3 generations plus 1 hour on the writer. A request for a pruned file gets 410 with the current generation, and the reader re-syncs to `LATEST` instead of retrying forever. Test owned by Task 1.
 2. **A peer reader serves a corrupted or stale file.** The checksum check against the manifest rejects it, the reader falls back to the writer, and the peer is marked suspect. Test owned by Task 3.
@@ -71,15 +74,18 @@
 - [ ] Run the focused tests.
 - [ ] **Commit** `cluster: writer replication endpoint`.
 
-### Task 2: `PeerReplicaSource` and the peer-pull backend
+### Task 2: `PeerReplicaSource`, writer discovery and the peer-pull backend
 
-**Files:** `cluster/peer/PeerReplicaSource.java`, `PeerCatalog.java` (static map from config plus `/replication/catalog`), `cluster/Backends.java` (`peer-pull`), `cluster/ReplicaSyncer.java` (long-poll mode), `config/ClusterConfig.java`
+**Files:** `cluster/peer/PeerReplicaSource.java`, `PeerDiscovery.java` (DNS re-resolution with JDK `InetAddress`, ignoring the JVM DNS cache TTL via `networkaddress.cache.ttl` or a direct lookup each refresh; seed URLs with gossip via `/replication/peers`), `PeerCatalog.java` (merges every discovered writer's `/replication/catalog`; conflict handling), `cluster/Backends.java` (`peer-pull`), `cluster/ReplicaSyncer.java` (long-poll mode), `config/ClusterConfig.java`
 
 **Interfaces:**
 - `PeerReplicaSource implements ReplicaSource`: `latest`, `manifest`, `download`, `downloadRange` and `openRange` over the endpoint, with backoff and jitter on 503 and connection errors.
 - In peer mode the syncer long-polls each shard's writer instead of sleeping for `pollInterval`.
 
 - [ ] **Tests:**
+  - `writersDiscoveredByDnsAndSeeds`: a fake resolver returns 1, then 3, then 2 writers; the catalog follows within one refresh.
+  - `writerJoinsAndLeaves`: a new writer's shards become syncable; a writer gone for 3 refreshes is dropped while its cached generations keep serving.
+  - `conflictingClaimsPickHigherGenerationAndAreReported`: Review Focus 0.
   - `roundTripPublishSyncSearch`: an in-JVM writer and reader with no `ObjectStore`.
   - `lazyModeWorksOverPeer`: the Phase 2 block cache works over HTTP ranges.
   - `writerDownAtStartServesOnDiskGenerations`: Review Focus 3.
@@ -112,7 +118,8 @@
 **Files:** `scripts/cluster-gate-phase5.sh`, a reuse of the Phase 1 and 2 gate scripts with `--backend peer-pull`, and `docs/superpowers/gates/<date>-phase-5.md`
 
 **Gate procedure:**
-1. Re-run the Phase 1 gate with no MinIO, using the same pass criteria.
+1. Re-run the Phase 1 gate with no MinIO, using the same pass criteria. Readers find the writer only through `cluster.peers.discovery` (seed URL), never a static map.
+   - Add a second writer for a new project mid-run: readers discover it and serve its shard within 2 refreshes, with 0 failed queries.
 2. Re-run the Phase 2 gate the same way.
 3. **Writer down.** With two readers serving pharos and lucene, `kill -9` the writer.
    - **Pass:** queries keep working for 2 minutes at about 10 QPS, with 0 failures.
