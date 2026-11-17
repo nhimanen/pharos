@@ -15,9 +15,9 @@
 
 **Base:** branch `feat/cluster-phase-4` from `feat/cluster-phase-3` after Phase 3's gate passes. **Refresh this plan before execution:** check the Interfaces blocks against what Phases 2 and 3 actually built (`ReaderRegistry`, `ReaderHeartbeat`, `ShardRouter`, `/internal/*`, `readerCache`).
 
-## Decision to confirm before execution: where writers get source code
+## Decision (confirmed by the user, 2026-11-17): where writers get source code
 
-The spec makes writers interchangeable, so after a takeover a different machine indexes the shard. That machine needs the project's source, and the spec doesn't say how it gets it. This plan proposes the following (Task 1):
+The spec makes writers interchangeable, so after a takeover a different machine indexes the shard. That machine needs the project's source, and the spec doesn't say how it gets it. Confirmed: git with polling, or a shared directory, configurable per deployment (Task 1):
 
 - Each catalog shard entry gains `source: {kind: "path" | "git", location, ref}`.
 - `path` is a directory every writer can read, such as a shared volume or a Kubernetes PVC.
@@ -159,7 +159,8 @@ The spec makes writers interchangeable, so after a takeover a different machine 
 
 **Interfaces:**
 - **Status JSON:**
-  - `layout: {shards[{shard, specVersion, keys, docCount, sizeBytes, generation, ageSeconds, writer, readers[]}], writers[...], readers[...]}`, with reader entries embedding the `readerCache` fields.
+  - `layout: {shards[{shard, specVersion, keys, docCount, sizeBytes, generation, ageSeconds, writer, readers[], backlog}], writers[...], readers[...]}`, with reader entries embedding the `readerCache` fields.
+  - **Indexing backlog (user request):** each shard's `backlog` is `{sourceRevision, publishedRevision, pending: bool, oldestUnpublishedChangeAgeSeconds}`. Each writer's `indexing` is `{shard, phase: parse|embed|commit|publish, progress: 0..1, startedAt}` or null. A cluster-level `backlogSummary` gives `{shardsPending, oldestPendingAgeSeconds}`. Writers report these fields in their heartbeats (Task 4), and `SourceCheckout.changedSince` supplies the revisions (Task 1).
   - `health[]`.
   - `proposals[{id, kind, target, reason, metrics, action, since}]`.
   - Lists are sorted. A proposal id is `sha1(kind + target)`.
@@ -185,12 +186,14 @@ The spec makes writers interchangeable, so after a takeover a different machine 
 - **Node table:** role, shards, docs, size, cache bytes of cap, hit rate, QPS, warm p95, heartbeat age.
 - **Sharding table:** spec version and keys; one row per shard.
 - **Scale panel:** live writer and reader counts and the proposals in force, each with its reason and metrics.
+- **Indexing backlog panel (user request):** shards with unpublished source changes, sorted oldest first, showing the source revision against the published revision and how long each change has waited. Each writer's current job is shown with its phase and a progress bar. A shard with a pending change is marked on its chip in the layout diagram.
 - Data comes from `/cluster/status`. `/cluster/events` triggers a refetch, with a 10 s poll as fallback.
 - On a single node, the page shows one node holding every shard.
 
 - [ ] **Tests:**
   - A frontend unit test for the status-to-view mapping, if the stack has a test runner. Otherwise a Java test that the page and its assets are served and that the status fixture renders without script errors, using the existing web test harness.
   - A golden JSON fixture of `/cluster/status` used by both.
+  - The backlog panel renders pending shards oldest first and a writer's job progress from the fixture.
 - [ ] Implement.
 - [ ] Check visually in a browser against a local three-node fixture, and record screenshots in the report.
 - [ ] **Commit** `web: Cluster page`.
@@ -209,6 +212,7 @@ The spec makes writers interchangeable, so after a takeover a different machine 
 3. **Scale.** Go from 1 writer to 4 (one per shard), then back to 1, while sources change every 30 s.
    - **Pass:** every source change is published exactly once. Generations are consecutive per shard, with no gaps or duplicates (checked from the manifests' `parentGeneration`). There are 0 failed queries.
    - **Pass:** the Cluster page, scraped through `/cluster/status`, shows each writer count change within one heartbeat interval.
+   - **Pass:** each source change appears in the backlog (`pending: true`) within one writer poll interval, and clears within one heartbeat of its publish.
 4. **Proposals.** Drive the reader load above its target for the configured window (shortened for the gate through config).
    - **Pass:** an "add readers" proposal appears on `/cluster/status`, is streamed on `/cluster/events` and is delivered to a local webhook sink.
 5. **Safety.** Marker check; kill processes by PID; leave :7171 alone.
