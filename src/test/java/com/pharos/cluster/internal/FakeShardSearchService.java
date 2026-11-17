@@ -17,6 +17,13 @@ public class FakeShardSearchService implements ShardSearchService {
     public final AtomicInteger calls = new AtomicInteger();
     /** When set, every call fails with it (a 500). */
     public volatile RuntimeException failure;
+    /** When set, the work answers with this generation although {@link #servedGeneration} said another: a swap in between. */
+    public volatile Long generationDuringWork;
+
+    private long workGeneration(String shard) {
+        Long g = generationDuringWork;
+        return g != null ? g : generations.get(shard);
+    }
 
     public FakeShardSearchService serving(String shard, long generation) {
         generations.put(shard, generation);
@@ -37,7 +44,7 @@ public class FakeShardSearchService implements ShardSearchService {
     @Override
     public TermStatsResponse termStats(TermStatsRequest r) {
         enter();
-        return new TermStatsResponse(generations.get(r.shard()),
+        return new TermStatsResponse(workGeneration(r.shard()),
                 new GlobalStats(Map.of("body", new GlobalStats.FieldStats(10, 100, 50)),
                         List.of(new GlobalStats.TermStat("body", "foo", 3, 7))));
     }
@@ -46,18 +53,18 @@ public class FakeShardSearchService implements ShardSearchService {
     public ShardSearchResponse searchRaw(ShardSearchRequest r) {
         enter();
         RawCandidate c = new RawCandidate(1.5f, 4, "A.java", "method", "service", "public", null);
-        return new ShardSearchResponse(generations.get(r.shard()), 9, List.of(c));
+        return new ShardSearchResponse(workGeneration(r.shard()), 9, List.of(c));
     }
 
     @Override
     public SnippetsResponse snippets(SnippetsRequest r) {
         enter();
-        return new SnippetsResponse(r.generation(), Map.of("id1", new Snippet("text", 1, 2)));
+        return new SnippetsResponse(generationDuringWork != null ? generationDuringWork : r.generation(), Map.of("id1", new Snippet("text", 1, 2)));
     }
 
     @Override
-    public Map<String, List<String>> callees(CalleesRequest r) {
+    public CalleesResponse callees(CalleesRequest r) {
         enter();
-        return Map.of("a.B#c()", List.of("a.B#d()"));
+        return new CalleesResponse(generationDuringWork != null ? generationDuringWork : r.generation(), Map.of("a.B#c()", List.of("a.B#d()")));
     }
 }

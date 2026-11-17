@@ -120,6 +120,17 @@ public class ClusterConfig {
             if (advertiseUrl == null || advertiseUrl.isBlank()) {
                 throw new IllegalStateException("cluster.advertiseUrl is required on a reader (the base URL other nodes reach it at)");
             }
+            try {
+                java.net.URI u = new java.net.URI(advertiseUrl.trim());
+                String scheme = u.getScheme();
+                if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
+                        || u.getHost() == null) {
+                    throw new IllegalStateException("cluster.advertiseUrl must be an http:// or https:// URL with a host, got '"
+                            + advertiseUrl + "'");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new IllegalStateException("cluster.advertiseUrl is not a valid URL: '" + advertiseUrl + "'");
+            }
             if (token == null || token.isBlank()) {
                 throw new IllegalStateException("cluster.token is required on a reader (shared secret of the cluster)");
             }

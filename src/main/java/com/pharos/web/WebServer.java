@@ -185,6 +185,7 @@ public class WebServer {
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
+            if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──

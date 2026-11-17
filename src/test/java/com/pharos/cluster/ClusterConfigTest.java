@@ -295,4 +295,15 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"connectTimeoutMillis\":0}}"))
                 .hasMessageContaining("cluster.connectTimeoutMillis");
     }
+
+    @Test
+    void advertiseUrlMustBeHttpOrHttps() {
+        String reader = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                + "\"token\":\"t\",\"advertiseUrl\":\"%s\"}}";
+        for (String bad : new String[]{"r:7171", "ftp://r:7171", "file:///x", "http://", "not a url"}) {
+            assertThatThrownBy(() -> parse(reader.formatted(bad)))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.advertiseUrl");
+        }
+        assertThatCode(() -> parse(reader.formatted("https://r.example:7171"))).doesNotThrowAnyException();
+    }
 }

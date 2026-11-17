@@ -1,5 +1,6 @@
 package com.pharos.cluster.internal;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -18,6 +19,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.ToLongFunction;
 
 /**
  * Calls a reader's {@code /internal/*} endpoints. {@link #call} tries the route's first candidate
@@ -28,28 +30,44 @@ import java.util.function.Function;
  */
 public final class ShardClient {
 
-    /** One internal endpoint with its response type. */
-    public record Endpoint<Q, R>(String path, Class<R> responseType) {}
+    /**
+     * One internal endpoint: its response type, the generation a request pins (null: none) and the
+     * generation a response was read from.
+     */
+    public record Endpoint<Q, R>(String path, Class<R> responseType, Function<Q, Long> requestedGeneration,
+                                 ToLongFunction<R> servedGeneration) {}
 
     public static final Endpoint<TermStatsRequest, TermStatsResponse> TERM_STATS =
-            new Endpoint<>("/internal/term-stats", TermStatsResponse.class);
+            new Endpoint<>("/internal/term-stats", TermStatsResponse.class, q -> null, TermStatsResponse::generation);
     public static final Endpoint<ShardSearchRequest, ShardSearchResponse> SHARD_SEARCH =
-            new Endpoint<>("/internal/shard-search", ShardSearchResponse.class);
+            new Endpoint<>("/internal/shard-search", ShardSearchResponse.class, ShardSearchRequest::generation,
+                    ShardSearchResponse::generation);
     public static final Endpoint<SnippetsRequest, SnippetsResponse> SNIPPETS =
-            new Endpoint<>("/internal/snippets", SnippetsResponse.class);
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    public static final Endpoint<CalleesRequest, Map<String, List<String>>> CALLEES =
-            new Endpoint<>("/internal/callees", (Class) Map.class);
+            new Endpoint<>("/internal/snippets", SnippetsResponse.class, SnippetsRequest::generation,
+                    SnippetsResponse::generation);
+    public static final Endpoint<CalleesRequest, CalleesResponse> CALLEES =
+            new Endpoint<>("/internal/callees", CalleesResponse.class, CalleesRequest::generation,
+                    CalleesResponse::generation);
+
+    /** Largest response body accepted by default. */
+    public static final int DEFAULT_MAX_RESPONSE_BYTES = 64 << 20;
 
     private final ReaderHealth health;
     private final String token;
     private final Duration requestTimeout;
+    private final int maxResponseBytes;
     private final HttpClient http;
     private final ObjectMapper mapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private final Map<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
 
     public ShardClient(ReaderHealth health, String token, Duration connectTimeout, Duration requestTimeout) {
+        this(health, token, connectTimeout, requestTimeout, DEFAULT_MAX_RESPONSE_BYTES);
+    }
+
+    public ShardClient(ReaderHealth health, String token, Duration connectTimeout, Duration requestTimeout,
+                       int maxResponseBytes) {
+        this.maxResponseBytes = maxResponseBytes;
         this.health = health;
         this.token = token;
         this.requestTimeout = requestTimeout;
@@ -76,6 +94,8 @@ public final class ShardClient {
             } catch (RetryableFailure f) {
                 health.markSuspect(reader.node());
                 last = f;
+            } catch (NotServedException n) { // a replica that dropped the shard: not a sick reader
+                last = n;
             }
         }
         throw new ShardUnavailableException(route.shard(), last == null ? null : last.getMessage(), last);
@@ -83,45 +103,58 @@ public final class ShardClient {
 
     /** One call to one reader, no retry: how a query keeps its later calls on the reader it pinned. */
     public <Q, R> R callOn(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request) {
+        byte[] payload;
+        try {
+            payload = mapper.writeValueAsBytes(request);
+        } catch (JsonProcessingException e) { // a local bug: the reader is not at fault
+            throw new ShardCallException("cannot serialise the request for " + endpoint.path() + ": " + e.getOriginalMessage());
+        }
         AtomicInteger counter = inFlight.computeIfAbsent(reader.node(), n -> new AtomicInteger());
         counter.incrementAndGet();
         try {
-            HttpResponse<byte[]> resp;
+            int status;
+            byte[] body;
             try {
                 HttpRequest req = HttpRequest.newBuilder(URI.create(reader.advertiseUrl() + endpoint.path()))
                         .timeout(requestTimeout)
                         .header("Content-Type", "application/json")
                         .header(InternalApi.TOKEN_HEADER, token)
-                        .POST(HttpRequest.BodyPublishers.ofByteArray(mapper.writeValueAsBytes(request)))
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(payload))
                         .build();
-                resp = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
+                HttpResponse<java.io.InputStream> resp = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+                status = resp.statusCode();
+                try (java.io.InputStream in = resp.body()) {
+                    body = in.readNBytes(maxResponseBytes + 1);
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new ShardCallException("interrupted calling " + reader.node());
-            } catch (IOException e) { // connect error, timeout, reset
+            } catch (IOException | IllegalArgumentException e) { // connect error, timeout, reset, bad advertiseUrl
                 throw new RetryableFailure(reader.node() + ": " + e);
             }
-            int status = resp.statusCode();
+            if (body.length > maxResponseBytes) {
+                throw new ShardCallException(reader.node() + " sent a response too large (over " + maxResponseBytes + " bytes)");
+            }
             if (status >= 500) throw new RetryableFailure(reader.node() + " answered " + status);
             if (status == 409) {
                 health.markHealthy(reader.node());
-                throw new GenerationMismatchException(reader.node(), servedGeneration(resp.body()));
+                throw new GenerationMismatchException(reader.node(), servedGeneration(body));
             }
+            if (status == 404) throw new NotServedException(reader.node() + " does not serve the shard");
             if (status != 200) throw new ShardCallException(reader.node() + " answered " + status + " for " + endpoint.path());
-            health.markHealthy(reader.node());
+            R response;
             try {
-                if (endpoint == CALLEES) {
-                    @SuppressWarnings("unchecked")
-                    R r = (R) mapper.readValue(resp.body(),
-                            mapper.getTypeFactory().constructMapType(Map.class,
-                                    mapper.getTypeFactory().constructType(String.class),
-                                    mapper.getTypeFactory().constructCollectionType(List.class, String.class)));
-                    return r;
-                }
-                return mapper.readValue(resp.body(), endpoint.responseType());
+                response = mapper.readValue(body, endpoint.responseType());
             } catch (IOException e) {
                 throw new RetryableFailure(reader.node() + " sent an unreadable response: " + e.getMessage());
             }
+            health.markHealthy(reader.node());
+            Long wanted = endpoint.requestedGeneration().apply(request);
+            long served = endpoint.servedGeneration().applyAsLong(response);
+            if (wanted != null && wanted != served) { // a swap landed between the reader's check and its work
+                throw new GenerationMismatchException(reader.node(), served);
+            }
+            return response;
         } finally {
             counter.decrementAndGet();
         }
@@ -134,6 +167,11 @@ public final class ShardClient {
         } catch (IOException e) {
             return -1;
         }
+    }
+
+    /** A 404: the reader does not hold the shard (any more); another replica may. */
+    private static final class NotServedException extends ShardCallException {
+        NotServedException(String message) { super(message); }
     }
 
     /** Internal: a failure another replica may not share. {@link #callOn} callers see {@link ShardCallException} instead. */

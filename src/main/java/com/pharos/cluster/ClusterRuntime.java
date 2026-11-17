@@ -254,6 +254,15 @@ public final class ClusterRuntime implements Closeable {
         return backend.publisher();
     }
 
+    /**
+     * The {@code /internal/*} API of this reader, token-guarded; null on other roles. Its shard
+     * search service is set once the raw retrieval exists ({@code InternalApi#service}); until then
+     * the endpoints answer 503 and coordinators fail over.
+     */
+    public com.pharos.cluster.internal.InternalApi internalApi() {
+        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().getToken()) : null;
+    }
+
     private boolean isReader() {
         return config.getCluster().getRole() == NodeRole.READER;
     }

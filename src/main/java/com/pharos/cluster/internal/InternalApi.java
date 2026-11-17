@@ -25,18 +25,29 @@ public final class InternalApi {
     public static final String TOKEN_HEADER = "X-Pharos-Cluster-Token";
     private static final Logger log = LoggerFactory.getLogger(InternalApi.class);
 
-    private final ShardSearchService service;
+    /** Largest request body (bytes) and collection sizes accepted on {@code /internal/*}. */
+    public static final int MAX_BODY_BYTES = 4 << 20;
+    public static final int MAX_ITEMS = 10_000;
+    public static final int MAX_VECTOR_LENGTH = 4096;
+
+    /** Null until the shard search is wired: authenticated calls then get 503 and fail over. */
+    private volatile ShardSearchService service;
     private final byte[] tokenDigest;
     private final ObjectMapper mapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     /** @throws IllegalArgumentException when {@code token} is null or blank: a reader never starts open */
-    public InternalApi(ShardSearchService service, String token) {
+    public InternalApi(String token) {
         if (token == null || token.isBlank()) {
             throw new IllegalArgumentException("cluster.token is required to serve /internal/* (shared secret of the cluster)");
         }
-        this.service = Objects.requireNonNull(service, "service");
         this.tokenDigest = sha256(token);
+    }
+
+    /** Wires the work behind the endpoints; until then they answer 503 after authenticating. */
+    public InternalApi service(ShardSearchService service) {
+        this.service = Objects.requireNonNull(service, "service");
+        return this;
     }
 
     private static byte[] sha256(String s) {
@@ -59,30 +70,51 @@ public final class InternalApi {
             if (!authorized(ctx)) {
                 ctx.status(401).contentType("application/json").result("{\"error\":\"unauthorized\"}");
                 ctx.skipRemainingHandlers();
+            } else if (ctx.contentLength() > MAX_BODY_BYTES) {
+                ctx.status(413).contentType("application/json").result("{\"error\":\"request too large\"}");
+                ctx.skipRemainingHandlers();
+            } else if (service == null) {
+                ctx.status(503).contentType("application/json").result("{\"error\":\"shard search not available\"}");
+                ctx.skipRemainingHandlers();
             }
         });
         app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard, null,
-                false, service::termStats));
+                false, TermStatsResponse::generation, InternalApi::check, r -> service.termStats(r)));
         app.post("/internal/shard-search", ctx -> handle(ctx, ShardSearchRequest.class, ShardSearchRequest::shard,
-                ShardSearchRequest::generation, false, service::searchRaw));
+                ShardSearchRequest::generation, false, ShardSearchResponse::generation, InternalApi::check,
+                r -> service.searchRaw(r)));
         app.post("/internal/snippets", ctx -> handle(ctx, SnippetsRequest.class, SnippetsRequest::shard,
-                SnippetsRequest::generation, true, service::snippets));
+                SnippetsRequest::generation, true, SnippetsResponse::generation, InternalApi::check,
+                r -> service.snippets(r)));
         app.post("/internal/callees", ctx -> handle(ctx, CalleesRequest.class, CalleesRequest::shard,
-                CalleesRequest::generation, true, service::callees));
+                CalleesRequest::generation, true, CalleesResponse::generation, InternalApi::check,
+                r -> service.callees(r)));
     }
 
     @FunctionalInterface
     private interface Work<Q, R> { R apply(Q q) throws Exception; }
 
     private <Q, R> void handle(Context ctx, Class<Q> type, Function<Q, String> shardOf,
-                                Function<Q, Long> generationOf, boolean generationRequired, Work<Q, R> work) throws Exception {
+                                Function<Q, Long> generationOf, boolean generationRequired,
+                                java.util.function.ToLongFunction<R> responseGeneration, Function<Q, String> validator,
+                                Work<Q, R> work) throws Exception {
         Q req;
         ShardId shard;
         try {
-            req = mapper.readValue(ctx.bodyAsBytes(), type);
+            byte[] raw = ctx.bodyAsBytes();
+            if (raw.length > MAX_BODY_BYTES) {
+                error(ctx, 413, "request too large");
+                return;
+            }
+            req = mapper.readValue(raw, type);
             shard = new ShardId(shardOf.apply(req));
         } catch (Exception e) { // malformed JSON, missing or invalid shard id
             error(ctx, 400, "bad request: " + e.getClass().getSimpleName());
+            return;
+        }
+        String invalid = validator.apply(req);
+        if (invalid != null) {
+            error(ctx, 400, invalid);
             return;
         }
         Long wanted = generationOf == null ? null : generationOf.apply(req);
@@ -102,11 +134,39 @@ public final class InternalApi {
             return;
         }
         try {
-            ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(work.apply(req)));
+            R response = work.apply(req);
+            long read = responseGeneration.applyAsLong(response);
+            if (wanted != null && wanted != read) { // a swap landed between the check above and the work
+                ctx.status(409).contentType("application/json")
+                        .result(mapper.writeValueAsBytes(Map.of("error", "generation mismatch", "servedGeneration", read)));
+                return;
+            }
+            ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
         } catch (Exception e) {
             log.warn("internal call on shard '{}' failed: {}", shard, e.toString());
             error(ctx, 500, "internal error");
         }
+    }
+
+    /** Collection and vector caps; the returned text is the 400 message, null when the request is fine. */
+    private static String check(Object req) {
+        if (req instanceof TermStatsRequest r) {
+            if (size(r.fields()) > MAX_ITEMS || size(r.terms()) > MAX_ITEMS) return "too many fields or terms";
+        } else if (req instanceof ShardSearchRequest r) {
+            if (r.queryVector() != null && r.queryVector().length > MAX_VECTOR_LENGTH) return "query vector too long";
+            if (r.globalStats() != null && (r.globalStats().terms() != null && r.globalStats().terms().size() > MAX_ITEMS))
+                return "too many terms";
+        } else if (req instanceof SnippetsRequest r) {
+            if (size(r.ids()) > MAX_ITEMS) return "too many ids";
+            if (r.queryVector() != null && r.queryVector().length > MAX_VECTOR_LENGTH) return "query vector too long";
+        } else if (req instanceof CalleesRequest r) {
+            if (size(r.fqns()) > MAX_ITEMS) return "too many fqns";
+        }
+        return null;
+    }
+
+    private static int size(java.util.Collection<?> c) {
+        return c == null ? 0 : c.size();
     }
 
     private void error(Context ctx, int status, String message) throws Exception {
