@@ -208,13 +208,17 @@
 **Gate procedure.** Run everything under `systemd-run --user --scope -p MemoryMax=10G`, using the MinIO binary and heap conventions from the Phase 1 gate.
 
 1. **Writer.** It indexes lucene with `--no-embed` and pharos **with** embeddings (jina, the vector path) and publishes both to MinIO.
-2. **Cold.** 20 trials. Each trial empties the reader's block cache and generation dirs, starts the reader, and waits for "serving 2 shard(s)". It then times one query, the trial's own, chosen from 20 distinct lucene BM25 queries in `eval/benchmark.py`, plus one vector query on pharos.
+2. **Cold.** 20 trials. Each trial empties the reader's block cache and generation dirs and starts the reader. It waits until the reader is ready: `/health` answers 200 and "serving 2 shard(s)" is logged. A reader becomes ready only once its first sync is served AND its search models have loaded (decision of 2026-11-17, below). It then times the first answered query, the trial's own, chosen from 20 distinct lucene BM25 queries in `eval/benchmark.py`, plus one vector query on pharos.
    - **Pass:** cold first-query p95 < 3 s for lucene. Report the vector p95 too, but it is not gated.
-   - Report the time from reader start to serving.
+   - Report the time from reader start to ready.
 3. **Warm.** The same 99 queries as the Phase 1 gate run against a lazy reader with a warm cache and against a full-mode reader (local files). Interleave 3 runs per side.
    - **Pass:** lazy warm p95 ≤ 1.10 × full-mode p95.
-   - **Pass (strict):** against the same full copy opened with `NIOFSDirectory`, top-10 doc ids, order and scores are bitwise identical on all 99 queries, plus stored fields.
-   - **Pass (production copy, MMap):** non-vector queries are identical. Vector and hybrid scores agree within 4 ulp or 1e-6 relative, and top-10 matches except for swaps between results whose scores tie within that tolerance. Lucene scores vectors differently on mmap inputs (evaluation order), so near-ties can swap. That is documented, not a bug.
+   - **Pass (strict, production copy):** against the full copy opened with the default `MMapDirectory`, top-10 doc ids, order and scores are bitwise identical on all 99 queries (plus vector and hybrid on the pharos ones), plus stored fields.
+   - **Pass (float tolerance, NIOFS copy):** against the same full copy reopened with `NIOFSDirectory` (`-Dpharos.lucene.directory=niofs`), non-vector queries are identical. Vector and hybrid scores agree within 4 ulp or 1e-6 relative, and top-10 matches except for swaps between results whose scores tie within that tolerance. Lucene scores vectors in a different evaluation order on mmap inputs than on heap-copied ones, so near-ties can swap. That is documented, not a bug.
+
+   **Decisions of 2026-11-17 (after the first gate run).**
+   - **Strict copy.** The strict rule first compared against NIOFS, on the Task 3 premise that lazy reads score like NIOFS. On the published indexes, the lazy reader is bitwise identical to MMap on 189/189 answers and 1 ulp off NIOFS on one. In one process, MMap and NIOFS KNN scores differ in 2 407 of 9 000. So the strict rule now compares against MMap, the production copy, and NIOFS moved to the tolerance rule.
+   - **Cold start.** The first cold run measured 5.09 s p95. That was dominated by the ~5 s query-model warm-up every first search waited on: the full-mode control measured 5.25 s, and after the models were loaded the first query took 0.76 s. A reader must therefore not report ready, or receive traffic, before its models have loaded (`/health` 503 `warming`). Cold time is measured to the first answered query after ready.
 4. **Cap.** Set `cacheMaxBytes` to 50% of the lucene shard's Lucene bytes, rounded down to a block multiple, and run all 99 queries twice. Sample `bytesOnDisk` from `/health` every second.
    - **Pass:** the maximum sample ≤ `cacheMaxBytes + maxConcurrentFetches × blockSizeBytes`.
    - **Pass:** top-10 identical to full mode under the same rules as step 3.

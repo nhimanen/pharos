@@ -5,16 +5,19 @@ already started MinIO on 127.0.0.1:9000 and published lucene (--no-embed) and ph
 This script starts the reader JVMs itself, one configuration at a time, and stops them by PID:
 
   cold  N trials. Each trial deletes the reader's home (block cache, generation dirs, registry),
-        starts a lazy reader, waits for "serving 2 shard(s)" and /health ready, then times one
-        lucene BM25 query (the trial's own, from 20 distinct lucene queries of eval/benchmark.py)
-        and one vector query on pharos. Pass: lucene first-query p95 < 3 s (vector reported only).
+        starts a lazy reader, waits until it is ready (/health 200, which a reader answers only once
+        its first sync is served AND its search models have loaded; the "serving 2 shard(s)" line
+        is logged at that moment), then times the first answered query: one lucene BM25 query (the
+        trial's own, from 20 distinct lucene queries of eval/benchmark.py), then one vector query on
+        pharos. Pass: lucene first-query p95 < 3 s (vector reported only). Start->ready is reported.
   warm  A lazy reader (warm cache) and a full-mode reader (MMap, production) run side by side; the
         99 pharos+lucene benchmark queries (keyword) run 3 times per side, interleaved. Pass: lazy
         p95 <= 1.10 x full p95. Then top-10 checks, keyword on all 99 plus vector and hybrid on the
-        pharos queries: against the full copy re-opened with NIOFSDirectory
-        (-Dpharos.lucene.directory=niofs) every result (ids, order, score bits, stored fields) is
-        identical; against MMap, non-vector results are identical and vector/hybrid scores agree
-        within 4 ulp (float32) or 1e-6 relative, with id swaps only among such near-ties.
+        pharos queries: against the production full copy (default MMapDirectory) every result (ids,
+        order, score bits, stored fields) is identical; against the same copy re-opened with
+        NIOFSDirectory (-Dpharos.lucene.directory=niofs), non-vector results are identical and
+        vector/hybrid scores agree within 4 ulp (float32) or 1e-6 relative, with id swaps only among
+        such near-ties (Lucene scores vectors on mmap and heap inputs in different evaluation orders).
   cap   cacheMaxBytes = 50% of the lucene shard's Lucene bytes, rounded down to a block multiple
         (the block size is halved from the default until the cap holds >= 4 blocks, as config
         validation requires); all queries run twice while /health bytesOnDisk is sampled every
@@ -124,7 +127,7 @@ def compare_strict(a, b):
 
 
 def compare_tolerant(a, b, limit=LIMIT):
-    """MMap rule. Returns (reason or None, swaps, max_ulps): scores near() rank by rank; ids may differ
+    """Float-tolerance rule (NIOFS copy). Returns (reason or None, swaps, max_ulps): scores near() rank by rank; ids may differ
     only within groups of consecutive near-tied scores (the group touching the last rank of a full
     page may also exchange ids with ranks past the page); shared ids carry identical other fields."""
     if len(a) != len(b):
@@ -324,9 +327,11 @@ def save(phase, data):
 
 COLD_VARIANTS = {
     # name: (reader mode, wait for the search models before the first query, gated)
-    "cold": ("lazy", False, True),          # the gate as specified
-    "cold-models": ("lazy", True, False),   # diagnostic: first query after the model warm-up
-    "cold-full": ("full", False, False),    # control: full-mode reader (local files), as specified
+    "cold": ("lazy", False, True),          # the gate: first answered query after ready
+    "cold-full": ("full", False, False),    # control: full-mode reader (local files)
+    # diagnostic from before readiness waited for the models: ready, then also wait for the
+    # "Search models ready" line (now logged before ready, so this equals "cold")
+    "cold-models": ("lazy", True, False),
 }
 
 
@@ -398,7 +403,7 @@ def run_all(reader, qs):
 
 
 def check(a_res, b_res, rule):
-    """Compares two result maps; rule 'strict' everywhere, or 'mmap' (strict on keyword)."""
+    """Compares two result maps; rule 'strict' everywhere, or 'tolerant' (strict on keyword)."""
     st = {"compared": 0, "identical": 0, "tolerant": 0, "swaps": 0, "max_ulps": 0, "failures": []}
     for k, a in a_res.items():
         b = b_res[k]
@@ -478,9 +483,9 @@ def phase_warm():
         for pl in ("vector", "hybrid"):
             lv, fv = out["timings"]["lazy"][pl], out["timings"]["full"][pl]
             print(f"   {pl} p95 lazy {lv['p95'] * 1000:.1f} ms vs full {fv['p95'] * 1000:.1f} ms (not gated)")
-        mm = check(lazy_res, full_res, "mmap")
-        mmap_ok = report_check("TOP10 lazy vs full MMap (keyword identical; vector/hybrid tolerant)", mm)
-        out["mmap"] = mm
+        mm = check(lazy_res, full_res, "strict")
+        strict_ok = report_check("TOP10 lazy vs full MMap (bitwise, stored fields)", mm)
+        out["strict"] = mm
 
         full.stop()
         niofs = Reader("full", 7302, mode="full", niofs=True)  # same home: the same full copy
@@ -493,9 +498,9 @@ def phase_warm():
             niofs.stop()
         (gate / "ref-full-niofs.json").write_text(json.dumps(niofs_res))
         _, lazy_res2 = run_all(lazy, qs)
-        stv = check(lazy_res2, niofs_res, "strict")
-        strict_ok = report_check("TOP10 lazy vs full NIOFS (bitwise, stored fields)", stv)
-        out["strict"] = stv
+        stv = check(lazy_res2, niofs_res, "tolerant")
+        niofs_ok = report_check("TOP10 lazy vs full NIOFS (keyword identical; vector/hybrid tolerant)", stv)
+        out["niofs"] = stv
         non_empty = sum(1 for v in niofs_res.values() if v)
         out["non_empty"] = non_empty
         print(f"   non-empty answers {non_empty}/{len(niofs_res)}")
@@ -505,7 +510,8 @@ def phase_warm():
     finally:
         lazy.stop()
         full.stop()
-    out["pass"] = {"warm_p95": warm_ok, "strict": strict_ok, "mmap": mmap_ok, "non_vacuous": vac_ok}
+    out["pass"] = {"warm_p95": warm_ok, "strict_mmap": strict_ok, "tolerant_niofs": niofs_ok,
+                   "non_vacuous": vac_ok}
     save("warm", out)
     return all(out["pass"].values())
 
@@ -565,13 +571,13 @@ def phase_cap():
           f" misses {rc.get('misses')}, bytesFetched {rc.get('bytesFetched')}")
     if mx is not None and mx > cap:
         print(f"   note: max sample exceeds cacheMaxBytes by {mx - cap} bytes (in-flight allowance {fetches * block})")
-    ok_s = report_check("CAP TOP10 vs full NIOFS (bitwise), pass 1", check(res1, refs["niofs"], "strict"))
-    st2 = check(res2, refs["niofs"], "strict")
-    ok_s2 = report_check("CAP TOP10 vs full NIOFS (bitwise), pass 2", st2)
-    stm = check(res2, refs["mmap"], "mmap")
-    ok_m = report_check("CAP TOP10 vs full MMap (tolerant), pass 2", stm)
-    out["strict_pass2"], out["mmap_pass2"] = st2, stm
-    out["pass"] = {"cap": cap_ok, "strict": ok_s and ok_s2, "mmap": ok_m}
+    ok_s = report_check("CAP TOP10 vs full MMap (bitwise), pass 1", check(res1, refs["mmap"], "strict"))
+    st2 = check(res2, refs["mmap"], "strict")
+    ok_s2 = report_check("CAP TOP10 vs full MMap (bitwise), pass 2", st2)
+    stn = check(res2, refs["niofs"], "tolerant")
+    ok_n = report_check("CAP TOP10 vs full NIOFS (tolerant), pass 2", stn)
+    out["strict_mmap_pass2"], out["tolerant_niofs_pass2"] = st2, stn
+    out["pass"] = {"cap": cap_ok, "strict_mmap": ok_s and ok_s2, "tolerant_niofs": ok_n}
     save("cap", out)
     return all(out["pass"].values())
 
