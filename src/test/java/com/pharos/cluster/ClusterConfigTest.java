@@ -256,4 +256,14 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"heartbeatSeconds\":30,\"readerTtlSeconds\":30}}"))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.readerTtlSeconds");
     }
+
+    @Test
+    void tokenIsNeverSerialised() throws Exception {
+        ClusterConfig c = parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\",\"token\":\"s3cr3t-value\""));
+        assertThat(c.getToken()).isEqualTo("s3cr3t-value");
+        IndexConfig cfg = IndexConfig.defaults();
+        cfg.setCluster(c);
+        assertThat(mapper.writeValueAsString(cfg)).doesNotContain("s3cr3t-value").doesNotContain("\"token\"");
+        assertThat(mapper.writeValueAsString(c)).doesNotContain("s3cr3t-value");
+    }
 }

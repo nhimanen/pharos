@@ -98,8 +98,9 @@ class WebServerHealthTest {
     @Test
     void readersPayloadListsLiveReaders() {
         WebServer server = new WebServer(null, null, null, null, null);
-        server.setLiveReaders(() -> java.util.List.of(new com.pharos.cluster.membership.ReaderHeartbeat(
-                "r1", "http://r1:7171", java.util.List.of("p1"), true, null, 0, 0, 7)));
+        server.setLiveReaders(() -> java.util.List.of(new com.pharos.cluster.membership.ReaderRegistry.LiveReader(
+                new com.pharos.cluster.membership.ReaderHeartbeat(
+                        "r1", "http://r1:7171", java.util.List.of("p1"), true, null, 0, 0, 1L), 7)));
         @SuppressWarnings("unchecked")
         var rows = (java.util.List<Map<String, Object>>) server.readersPayload().get("readers");
         assertThat(rows).hasSize(1);

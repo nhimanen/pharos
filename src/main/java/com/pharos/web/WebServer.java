@@ -53,7 +53,7 @@ public class WebServer {
     private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
-    private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderHeartbeat>> liveReaders = null;
+    private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
@@ -102,20 +102,21 @@ public class WebServer {
     public com.pharos.cluster.membership.LoadCounter load() { return load; }
 
     /** Source of {@code GET /cluster/readers}; without one the endpoint answers 404. */
-    public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderHeartbeat>> s) {
+    public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> s) {
         this.liveReaders = java.util.Objects.requireNonNull(s, "s");
     }
 
     /** {@code {readers:[{node, advertiseUrl, shards, draining, ageSeconds}]}}. */
     Map<String, Object> readersPayload() {
         java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
-        for (var h : liveReaders.get()) {
+        for (var l : liveReaders.get()) {
+            var h = l.heartbeat();
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("node", h.node());
             r.put("advertiseUrl", h.advertiseUrl());
             r.put("shards", h.shards());
             r.put("draining", h.draining());
-            r.put("ageSeconds", h.ageSeconds());
+            r.put("ageSeconds", l.ageSeconds());
             rows.add(r);
         }
         return Map.of("readers", rows);

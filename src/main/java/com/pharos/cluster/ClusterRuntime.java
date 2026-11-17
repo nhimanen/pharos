@@ -209,10 +209,10 @@ public final class ClusterRuntime implements Closeable {
     }
 
     /** The live readers of the cluster; empty unless this reader is serving with a registry. */
-    public List<com.pharos.cluster.membership.ReaderHeartbeat> liveReaders() {
+    public List<com.pharos.cluster.membership.ReaderRegistry.LiveReader> liveReaders() {
         com.pharos.cluster.membership.ReaderRegistry r;
         synchronized (this) { r = readerRegistry; }
-        return r == null ? List.of() : r.live();
+        return r == null ? List.of() : r.liveWithAge();
     }
 
     /** Marks this reader draining in the bucket (readers with a registry only). */
@@ -234,7 +234,7 @@ public final class ClusterRuntime implements Closeable {
             shards.addAll(names);
         }
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
-                false, readerCacheStats(), load.inFlight(), load.qps(), 0);
+                false, readerCacheStats(), load.inFlight(), load.qps(), 0L);
     }
 
     // Holding the monitor of this.
