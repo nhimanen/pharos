@@ -153,6 +153,35 @@ The spec makes writers interchangeable, so after a takeover a different machine 
 - [ ] Run the focused tests, then `mvn test`.
 - [ ] **Commit** `cluster: writer work queue with fair-share balancing`.
 
+### Task 4b: Writer disk guard (user request, 2026-11-17)
+
+A writer must never run out of disk. Running out mid-index can corrupt a Lucene commit, an ArcadeDB graph or the embedding cache, and on a shared node it also starves other processes.
+
+**Files:** `cluster/writer/DiskGuard.java`, `config/ClusterConfig.java` (`writer.disk.minFreeBytes`, default 5 GiB; `writer.disk.minFreePercent`, default 10; `writer.disk.checkSeconds`, default 15), plus the work loop (Task 4), the writer heartbeat and `/health`
+
+**Interfaces:**
+- `DiskGuard(Path dataDir, …)` watches the file store of the writer's index directory (and its source checkout and model cache when those sit on other file stores). Low means free space is below either threshold.
+- `boolean admits(EstimatedRun)`: before starting a shard's index run, the guard estimates the run's peak extra space and refuses if the run would cross the threshold. The estimate is about 2× the shard's current index size for a full run (a full re-index writes a new generation next to the old one), the changed files' share for an incremental run, plus the graph generation and the spool.
+- While low, the writer:
+  - starts no new index runs;
+  - finishes or aborts the current run at a safe point (abort deletes the uncommitted segments and the partial graph generation; never a half commit);
+  - releases leases of shards it cannot index, so a writer with space can take them (Task 4's balancer skips low writers);
+  - keeps renewing leases for shards whose last publish is still served.
+- It recovers automatically when space returns above the threshold plus a hysteresis margin (default 1 GiB) to avoid flapping.
+- **Heartbeat and status:** the writer heartbeat gains `disk: {freeBytes, totalBytes, low: bool}`. Task 5 adds a health entry `writer X low on disk` and a proposal `add writer capacity / free disk on X`. The Cluster page (Task 6) shows each writer's free disk and marks low writers.
+- Before deleting anything, garbage collection of old local generations, retired graph generations and stale spools runs first when the disk is low, within the retention rules.
+
+- [ ] **Tests** (with an injectable `FileStore` / free-space supplier):
+  - `refusesRunThatWouldCrossThreshold`
+  - `lowDiskAbortsAtSafePointWithoutHalfCommit`: the previous generation stays intact and publishable.
+  - `lowWriterReleasesLeasesAndAnotherTakesThem`
+  - `recoversWithHysteresis`
+  - `gcRunsBeforeRefusing`
+  - `heartbeatReportsDisk`
+- [ ] Implement.
+- [ ] Run the focused tests, then `mvn test`.
+- [ ] **Commit** `cluster: writer disk guard`.
+
 ### Task 5: `/cluster/status`, proposals, events and webhook
 
 **Files:** `cluster/status/ClusterStatus.java` (records), `StatusBuilder.java` (a pure function of the catalog, heartbeats and config), `Proposals.java` (rules with hysteresis state kept in a small object in the bucket, so every node agrees), `StatusEvents.java` (SSE plus the webhook with retry and backoff), `web/WebServer.java` routes, `config` (`status.targets.{warmP95Millis, qpsPerReader, backlog}`, `status.webhookUrl`)
@@ -215,8 +244,10 @@ The spec makes writers interchangeable, so after a takeover a different machine 
    - **Pass:** each source change appears in the backlog (`pending: true`) within one writer poll interval, and clears within one heartbeat of its publish.
 4. **Proposals.** Drive the reader load above its target for the configured window (shortened for the gate through config).
    - **Pass:** an "add readers" proposal appears on `/cluster/status`, is streamed on `/cluster/events` and is delivered to a local webhook sink.
-5. **Safety.** Marker check; kill processes by PID; leave :7171 alone.
-6. **If it passes,** flip the `writer.workQueue` default to `true` for `role: writer` and document it.
+5. **Disk guard (Task 4b).** Run one writer on a small filesystem (a loop-mounted image or a tmpfs sized just above the threshold) and index into it.
+   - **Pass:** the writer refuses or aborts before crossing the threshold, the shard's last generation stays served, another writer takes the shard's lease, `/cluster/status` shows the low-disk entry, and the low writer recovers once space is freed.
+6. **Safety.** Marker check; kill processes by PID; leave :7171 alone.
+7. **If it passes,** flip the `writer.workQueue` default to `true` for `role: writer` and document it.
 
 - [ ] Write the scripts.
 - [ ] Run the gate and record the numbers.
