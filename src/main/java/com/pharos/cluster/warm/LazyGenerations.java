@@ -565,6 +565,21 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         }
     }
 
+    /**
+     * A shard this reader stops serving: cancels its still-queued prefetch blocks. Blocks already
+     * running finish into the block cache (not the shard dir), so nothing writes into a deleted dir.
+     *
+     * @return how many queued blocks were cancelled
+     */
+    public int cancelShard(String shard) {
+        BlockCache cache;
+        synchronized (this) {
+            if (closed || blockCache == null) return 0;
+            cache = blockCache;
+        }
+        return cancelPrevious(shard, cache);
+    }
+
     /** Cancels the still-queued blocks of the shard's previous prefetch; returns how many. */
     private int cancelPrevious(String shard, BlockCache cache) {
         List<BlockKey> previous;

@@ -265,4 +265,15 @@ class ClusterConfigTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(c::validate)
                 .hasMessageContaining("cluster.retireGraceSeconds");
     }
+
+    @Test
+    void retireGraceMustBeTwicePollInterval() {
+        ClusterConfig c = new ClusterConfig();
+        c.setPollIntervalSeconds(60);
+        c.setRetireGraceSeconds(119);
+        org.assertj.core.api.Assertions.assertThatThrownBy(c::validate)
+                .hasMessageContaining("cluster.retireGraceSeconds").hasMessageContaining("cluster.pollIntervalSeconds");
+        c.setRetireGraceSeconds(120);
+        c.validate();
+    }
 }

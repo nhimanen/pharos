@@ -87,6 +87,10 @@ public class ClusterConfig {
         if (retireGraceSeconds <= 0) {
             throw new IllegalStateException("cluster.retireGraceSeconds must be positive, got " + retireGraceSeconds);
         }
+        if (retireGraceSeconds < 2L * pollIntervalSeconds) {
+            throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
+                    + ") must be at least twice cluster.pollIntervalSeconds (" + pollIntervalSeconds + ")");
+        }
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
         }

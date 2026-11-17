@@ -46,14 +46,25 @@ class ReaderServingTest {
     private ReaderLocalCache lastCache;
 
     private Reader secondReader(InMemoryObjectStore store) {
-        ReplicationBackend backend = TestBackends.objectStore(cluster.readerConfig, store);
+        return secondReader(store, cluster.readerConfig);
+    }
+
+    /** A follower with its own, independent config (same home, so the same cache dir). */
+    private Reader independentFollower(InMemoryObjectStore store, List<String> pin) {
+        com.pharos.config.IndexConfig own = ClusterFixture.config(tmp.resolve("reader"), NodeRole.READER, "test-bucket");
+        own.getCluster().getReader().setShards(pin);
+        return secondReader(store, own);
+    }
+
+    private Reader secondReader(InMemoryObjectStore store, com.pharos.config.IndexConfig cfg) {
+        ReplicationBackend backend = TestBackends.objectStore(cfg, store);
         lastCache = (ReaderLocalCache) backend.localCache();
-        ProjectRegistry registry = ClusterRuntime.registryFor(cluster.readerConfig);
-        LuceneIndexer lucene = new LuceneIndexer(cluster.readerConfig, backend.localCache());
-        ClusterRuntime runtime = new ClusterRuntime(cluster.readerConfig, backend, registry, lucene);
+        ProjectRegistry registry = ClusterRuntime.registryFor(cfg);
+        LuceneIndexer lucene = new LuceneIndexer(cfg, backend.localCache());
+        ClusterRuntime runtime = new ClusterRuntime(cfg, backend, registry, lucene);
         extra.add(lucene);
         extra.add(runtime);
-        return new Reader(runtime, new SearchEngine(lucene, EmbeddingProvider.create(cluster.readerConfig), registry),
+        return new Reader(runtime, new SearchEngine(lucene, EmbeddingProvider.create(cfg), registry),
                 lucene);
     }
 
@@ -310,22 +321,45 @@ class ReaderServingTest {
     }
 
     @Test
-    void followerStopsServingAShardTheOwnerPinnedAway() throws Exception {
+    void unpinnedFollowerStopsServingAShardTheOwnerPinnedAway() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
         cluster = new ClusterFixture(tmp, store, store, "test-bucket");
         cluster.index(JAVA, false);
         cluster.readerRuntime.startServing();
-        Reader second = secondReader(store);
-        second.runtime().startServing();
+        Reader follower = independentFollower(store, List.of()); // its own config: no pin
+        follower.runtime().startServing();
+        assertThat(follower.runtime().ownsSync()).isFalse();
         assertThat(lastCache.active(JAVA)).isPresent();
         Path dir = lastCache.active(JAVA).orElseThrow();
 
-        cluster.readerConfig.getCluster().getReader().setShards(List.of("elsewhere"));
+        cluster.readerConfig.getCluster().getReader().setShards(List.of("elsewhere")); // only the owner
         cluster.readerRuntime.repin();
-        cluster.readerRuntime.syncNow(); // owner unregisters; its dir delete is a grace period away
-        second.runtime().followerTick();
+        cluster.readerRuntime.syncNow();
+        follower.runtime().followerTick();
 
-        assertThat(lastCache.active(JAVA)).as("follower deactivated it").isEmpty();
-        assertThat(dir).as("owner has not deleted it yet").isDirectory();
+        assertThat(lastCache.active(JAVA)).as("follower deactivated it via the registry").isEmpty();
+        assertThat(dir).as("grace not elapsed").isDirectory();
+    }
+
+    @Test
+    void pinnedFollowerDeactivatesAShardTheRegistryStillLists() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        Reader follower = independentFollower(store, List.of());
+        follower.runtime().startServing();
+        assertThat(lastCache.active(JAVA)).isPresent();
+
+        Path dir = lastCache.active(JAVA).orElseThrow();
+
+        // a follower pinned elsewhere, holding the shard active (as after a pin change), registry still lists it
+        Reader pinned = independentFollower(store, List.of("elsewhere"));
+        pinned.runtime().startServing();
+        assertThat(lastCache.active(JAVA)).as("a pinned follower never activates it").isEmpty();
+        lastCache.activate(JAVA, dir);
+        pinned.runtime().followerTick();
+        assertThat(cluster.readerRegistry.find(JAVA)).isPresent();
+        assertThat(lastCache.active(JAVA)).isEmpty();
     }
 }

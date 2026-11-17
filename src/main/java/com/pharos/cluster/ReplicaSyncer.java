@@ -287,6 +287,7 @@ public class ReplicaSyncer implements Closeable {
             }
             cache.deactivate(shard.value());
             if (active != null) GraphViews.evict(active);
+            if (lazy != null) lazy.cancelShard(shard.value());
             served.remove(shard);
             registered.remove(shard);
             refused.remove(shard);

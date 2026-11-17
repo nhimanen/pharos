@@ -83,6 +83,7 @@ final class ClusterFixture implements AutoCloseable {
         c.setToken("test-token");
         c.setCacheDir(home.resolve("cluster-cache"));
         c.setPollIntervalSeconds(3600); // tests drive syncs explicitly
+        c.setRetireGraceSeconds(7200);
         c.getObjectStore().setBucket(bucket);
         c.getObjectStore().setPrefix("pharos");
         c.validate();

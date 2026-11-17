@@ -480,6 +480,8 @@ public final class ClusterRuntime implements Closeable {
         for (ProjectMeta meta : registry.listAll()) {
             String name = meta.getName();
             if (name == null || meta.getIndexPath() == null) continue;
+            List<String> onlyPinned = config.getCluster().getReader().getShards();
+            if (!onlyPinned.isEmpty() && !onlyPinned.contains(name)) continue;
             try {
                 new ShardId(name);
             } catch (IllegalArgumentException e) {
