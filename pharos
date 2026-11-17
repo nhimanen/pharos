@@ -979,6 +979,27 @@ def cmd_embed(args):
     sys.exit(subprocess.run(cmd).returncode)
 
 
+def _embeddings_command(args) -> list:
+    """Java argv for `pharos embeddings <action> ...` (pure; unit-tested)."""
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "embeddings", args.action]
+    if args.action == "enable":
+        cmd.append("--model=" + args.model)
+        if args.force:
+            cmd.append("--force")
+    return cmd
+
+
+def cmd_embeddings(args):
+    """Turn semantic search on/off or show its state (edits ~/.pharos/config.json only).
+
+    Spawns its own JVM; never embeds or downloads. The daemon keeps its old config until
+    restarted, which the command output says.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    sys.exit(subprocess.run(_embeddings_command(args)).returncode)
+
+
 def _resolve_index_dir() -> Path:
     """Read indexDir from ~/.pharos/config.json, falling back to the default."""
     config_file = PHAROS_DIR / "config.json"
@@ -1185,6 +1206,7 @@ COMMANDS
   index-status    Show each project's index format status (--json for machines)
   upgrade-indexes Re-index projects whose index format is not current
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
+  embeddings                Enable/disable semantic search (enable|disable|status)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
 
@@ -1617,6 +1639,34 @@ NOTES
     p_embed.add_argument("--force", action="store_true",
                          help="Overwrite vectors even when the field is already present on a doc")
     p_embed.set_defaults(func=cmd_embed)
+
+    # embeddings
+    p_emb = sub.add_parser(
+        "embeddings",
+        help="Enable/disable semantic (vector) search, or show its status",
+        description="""\
+Semantic search is OFF by default. `enable` writes an embedding provider to
+~/.pharos/config.json (granite-r2 by default, the recommended model; or
+jina-code-v2). It never downloads or embeds anything itself.
+
+COST: about a 600 MB model download on first use and a CPU-heavy first embed
+(hours for a large project on CPU). Afterwards run `pharos embed --model=<id> <project>`.
+
+EXAMPLES
+  pharos embeddings enable
+  pharos embeddings enable --model jina-code-v2
+  pharos embeddings enable --model granite-r2 --force   # replace jina, then re-embed
+  pharos embeddings status
+  pharos embeddings disable
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_emb.add_argument("action", choices=["enable", "disable", "status"])
+    p_emb.add_argument("--model", default="granite-r2", choices=["granite-r2", "jina-code-v2"],
+                       help="Model for `enable` (default: granite-r2)")
+    p_emb.add_argument("--force", action="store_true",
+                       help="`enable`: replace a different, already configured provider")
+    p_emb.set_defaults(func=cmd_embeddings)
 
     # invalidate-embeddings
     p_inv = sub.add_parser(

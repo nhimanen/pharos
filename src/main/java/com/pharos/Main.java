@@ -183,6 +183,8 @@ public class Main {
                 return (K) new IndexStatusCommand(registry);
             if (cls == UpgradeIndexesCommand.class)
                 return (K) new UpgradeIndexesCommand(indexManager, registry, config);
+            if (cls == EmbeddingsCommand.class)
+                return (K) new EmbeddingsCommand(IndexConfig.DEFAULT_BASE, registry);
             if (cls == MineCommand.class)
                 return (K) new MineCommand(registry, luceneIndexer);
             if (cls == EmbedCommand.class)

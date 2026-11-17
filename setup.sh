@@ -446,4 +446,6 @@ echo "Done. $(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" --
 echo "  JAR:    $PHAROS_BIN/pharos.jar"
 echo "  Client: $PHAROS_BIN/pharos-cli.py"
 echo "  Path:   $LOCAL_BIN/pharos"
+echo ""
+echo "Semantic search is off; enable with \`pharos embeddings enable\`."
 exit "$UP_RC"

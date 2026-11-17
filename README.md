@@ -213,9 +213,20 @@ All MCP tools return structured JSON. Key tools:
 
 ## Embedding configuration
 
-**New installs** (no `~/.pharos/config.json`, `registry.json` or `indexes/` yet) get a built-in default: **granite-embedding-english-r2** via DJL (768-dim, CLS pooling, local, no API key), pinned to a model commit. The first run writes that choice to `~/.pharos/config.json` so it stays stable once projects are indexed. **Existing installs are never switched**: a config that names jina (old-style `embeddingModelUrl`, or an explicit `embeddingProviders` entry) keeps jina, and a config or home without any embedding settings stays keyword-only. To enable or change vector search, edit `embeddingProviders[]` in `~/.pharos/config.json`. Legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
+Vector search is **off by default** for everyone, new installs included: nothing is downloaded or embedded until you opt in. The recommended model is **granite-embedding-english-r2**. Turn it on with:
 
-### Default: granite-embedding-english-r2 via DJL (local, no API key)
+```bash
+pharos embeddings enable                 # writes the granite-r2 provider to ~/.pharos/config.json
+pharos embeddings enable --model jina-code-v2   # or the jina provider
+pharos embeddings status                 # configured model, fingerprint, which projects have vectors
+pharos embeddings disable                # back to keyword-only
+```
+
+`enable` only edits `config.json` and prints the cost first (about a 600 MB model download on first use, and a CPU-heavy first embed); it never embeds by itself. Afterwards restart the daemon and run `pharos embed --model=granite-r2 <project>` (or `pharos index --full <project>`). It refuses to replace a different, already configured provider unless you pass `--force`. Existing jina users keep jina; to switch: `pharos embeddings enable --model granite-r2 --force`, then re-embed (caches do not carry over between models). Legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
+
+### Recommended: granite-embedding-english-r2 via DJL (local, no API key)
+
+What `pharos embeddings enable` writes:
 
 ```json
 {

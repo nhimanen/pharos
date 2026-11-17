@@ -7,9 +7,10 @@ Date: 2026-11-17 (run finished 02:52). Spec: `docs/superpowers/specs/2026-11-16-
 - Pre-registered rule verdict: **OPT-IN ONLY**. hybrid-reranked MRR@10 is a tie (-0.009, B < A, so the
   rule's first clause fails); hybrid is +0.068; vector is +0.049 with 95% CI [-0.017, +0.116] (does not
   exclude 0).
-- **User decision (overrides the rule): granite-r2 becomes the built-in default for NEW installs only.**
-  Existing configs that name jina (old-style `embeddingModelUrl`, migrated to modelId `legacy`, or explicit
-  `embeddingProviders` entries) keep jina; no forced re-embed.
+- **User decision (overrides the rule): granite-r2 becomes the RECOMMENDED model, not a default.** Pharos never
+  had a built-in embedding default (vector search is off until configured), so nothing changes for anyone:
+  new installs stay keyword-only and existing jina configs keep jina. `pharos embeddings enable` writes
+  granite-r2 (pinned commit, CLS pooling) when someone turns embeddings on; `--model jina-code-v2` writes jina.
 - Reasoning: the `auto` search type mostly dispatches to `hybrid-rrf`, where granite is significantly better
   (MRR@10 +0.056, CI [+0.002, +0.112]); plain `hybrid` is also significantly better (+0.068, CI [+0.008, +0.129]).
   The only pipeline where the rule fails (hybrid-reranked) is a tie within noise.

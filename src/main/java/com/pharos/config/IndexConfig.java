@@ -164,25 +164,36 @@ public class IndexConfig {
         return new IndexConfig();
     }
 
-    /** Model id of the built-in default embedding provider (new installs only). */
-    public static final String BUILT_IN_MODEL_ID = "granite-r2";
+    /** Model id of the recommended embedding model (written by {@code pharos embeddings enable}). */
+    public static final String RECOMMENDED_MODEL_ID = "granite-r2";
 
     /**
-     * Pinned commit of {@code onnx-community/granite-embedding-english-r2-ONNX} that the
-     * A/B (docs/superpowers/gates/2026-11-16-embedding-ab.md) approximates; bump deliberately.
+     * Pinned commit of {@code onnx-community/granite-embedding-english-r2-ONNX}; bump deliberately.
+     * Basis for the recommendation: docs/superpowers/gates/2026-11-16-embedding-ab.md.
      */
-    static final String BUILT_IN_MODEL_URL =
+    static final String GRANITE_URL =
             "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23";
 
-    /** The built-in default provider: granite-embedding-english-r2, CLS pooling, 768 dims. */
-    public static EmbeddingProviderConfig builtInEmbeddingProvider() {
+    /**
+     * Provider block for a known model: {@code granite-r2} (recommended: CLS pooling, 768 dims,
+     * pinned revision) or {@code jina-code-v2}. Null for anything else. Never applied implicitly:
+     * embeddings stay off until {@code pharos embeddings enable}.
+     */
+    public static EmbeddingProviderConfig presetProvider(String name) {
         EmbeddingProviderConfig p = new EmbeddingProviderConfig();
         p.setType("djl");
-        p.setModelId(BUILT_IN_MODEL_ID);
-        p.setUrl(BUILT_IN_MODEL_URL);
         p.setDimensions(768);
         p.setMaxTokens(512);
-        p.setPooling(Pooling.CLS);
+        if (RECOMMENDED_MODEL_ID.equals(name)) {
+            p.setModelId(RECOMMENDED_MODEL_ID);
+            p.setUrl(GRANITE_URL);
+            p.setPooling(Pooling.CLS);
+        } else if ("jina-code-v2".equals(name)) {
+            p.setModelId("jina-code-v2");
+            p.setUrl("hf://jinaai/jina-embeddings-v2-base-code");
+        } else {
+            return null;
+        }
         return p;
     }
 
@@ -190,30 +201,11 @@ public class IndexConfig {
         return loadFrom(DEFAULT_BASE);
     }
 
-    /**
-     * Loads {@code <home>/config.json}. The built-in embedding default applies only to a
-     * <em>new install</em>: no config.json, no registry.json and no indexes directory under
-     * {@code home}. Any existing config (even one without embedding settings) and any home that
-     * already holds projects keeps exactly what it names, so existing vectors stay searchable.
-     */
-    static IndexConfig loadFrom(Path home) {
+    /** Loads {@code <home>/config.json}; with none, returns the keyword-only defaults (writes nothing). */
+    public static IndexConfig loadFrom(Path home) {
         Path configFile = home.resolve("config.json");
         if (!Files.exists(configFile)) {
-            IndexConfig fresh = defaults();
-            if (!Files.exists(home.resolve("registry.json")) && !Files.exists(home.resolve("indexes"))) {
-                fresh.embeddingProviders.add(builtInEmbeddingProvider());
-                fresh.searchEmbeddingModel = BUILT_IN_MODEL_ID;
-                // Persist the choice: once the first project is indexed, registry.json/indexes
-                // exist and this home would no longer look new, silently dropping the model the
-                // vectors were built with.
-                try {
-                    Files.createDirectories(home);
-                    createMapper().writerWithDefaultPrettyPrinter().writeValue(configFile.toFile(), fresh);
-                } catch (IOException e) {
-                    log.warn("Could not persist the default embedding config to {}: {}", configFile, e.getMessage());
-                }
-            }
-            return fresh;
+            return defaults();
         }
         try {
             ObjectMapper mapper = createMapper();

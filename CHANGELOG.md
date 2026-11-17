@@ -7,16 +7,17 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 **Index format:** 1 (unchanged)
 
-### Changed
-- **New installs default to granite-embedding-english-r2** (`onnx-community/granite-embedding-english-r2-ONNX`,
-  pinned to a commit, CLS pooling, 768 dims) instead of having vector search disabled. "New install" means no
-  `config.json`, `registry.json` or `indexes/` under the pharos home; the first load writes the choice to
-  `config.json`. **Existing installs keep what they have**: jina configs (old-style `embeddingModelUrl` /
-  `legacy`, or explicit providers) are untouched, and a config with no embedding settings stays keyword-only.
-  No re-embed is forced. Basis: embedding A/B (`docs/superpowers/gates/2026-11-16-embedding-ab.md`). Peak RSS
-  is about 2.8 GB vs 2.3 GB and CPU embedding is slower.
-- To switch an existing install, see UPGRADING.md ("Switching to granite-r2 (optional)"). Embedding caches
-  do not carry over between models.
+### Added (embeddings opt-in)
+- `pharos embeddings enable|disable|status` (Java CLI and `./pharos`). **No default changes for anyone:**
+  semantic search stays off until you enable it, and `enable` never downloads or embeds by itself (it prints
+  the cost, about 600 MB download and a CPU-heavy first embed). **granite-embedding-english-r2 is now the
+  recommended model** (`enable` default; CLS pooling, 768 dims, pinned commit) based on the embedding A/B
+  (`docs/superpowers/gates/2026-11-16-embedding-ab.md`): hybrid-rrf MRR@10 +0.056 [+0.002, +0.112], hybrid
+  +0.068 [+0.008, +0.129], tie with the cross-encoder reranker (-0.009); peak RSS about 2.8 GB vs 2.3 GB and
+  slower CPU embedding. Existing jina installs keep jina; switch with
+  `pharos embeddings enable --model granite-r2 --force` plus a re-embed (embedding caches do not carry over).
+  `enable` refuses to replace a different provider without `--force`. `setup.sh` prints a hint that semantic
+  search is off.
 
 ### Added
 - Embedding pooling (`pooling`: `mean` or `cls`) and `queryPrefix` / `documentPrefix` per provider.

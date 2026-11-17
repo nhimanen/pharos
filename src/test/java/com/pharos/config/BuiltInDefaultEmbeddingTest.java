@@ -15,32 +15,28 @@ class BuiltInDefaultEmbeddingTest {
     @TempDir Path home;
 
     @Test
-    void freshInstallGetsPinnedGraniteWithClsFingerprint() {
+    void freshHomeStaysKeywordOnlyAndWritesNothing() throws Exception {
         IndexConfig c = IndexConfig.loadFrom(home);
-        assertThat(c.getEmbeddingProviders()).hasSize(1);
-        EmbeddingProviderConfig p = c.getEmbeddingProviders().get(0);
+        assertThat(c.getEmbeddingProviders()).isEmpty();
+        assertThat(c.getSearchEmbeddingModel()).isNull();
+        assertThat(home.resolve("config.json")).doesNotExist();
+        try (var files = Files.list(home)) { assertThat(files).isEmpty(); }
+    }
+
+    @Test
+    void recommendedPresetIsPinnedGraniteWithCls() {
+        EmbeddingProviderConfig p = IndexConfig.presetProvider("granite-r2");
         assertThat(p.getModelId()).isEqualTo("granite-r2");
         assertThat(p.getType()).isEqualTo("djl");
-        assertThat(p.getUrl()).matches("hf://onnx-community/granite-embedding-english-r2-ONNX@[0-9a-f]{40}");
+        assertThat(p.getUrl()).isEqualTo("hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23");
         assertThat(p.getDimensions()).isEqualTo(768);
         assertThat(p.getMaxTokens()).isEqualTo(512);
         assertThat(p.getPooling()).isEqualTo(Pooling.CLS);
         p.validate();
-        assertThat(c.getSearchEmbeddingModel()).isEqualTo("granite-r2");
         assertThat(IndexVersions.modelFingerprint(p)).contains(":pool=cls:");
-    }
-
-    @Test
-    void freshInstallChoiceIsPersistedAndSurvivesTheHomeFillingUp() throws Exception {
-        IndexConfig.loadFrom(home);
-        assertThat(home.resolve("config.json")).exists();
-        Files.writeString(home.resolve("registry.json"), "{}");   // first project got indexed
-        Files.createDirectories(home.resolve("indexes"));
-        IndexConfig again = IndexConfig.loadFrom(home);
-        assertThat(again.getEmbeddingProviders()).hasSize(1);
-        assertThat(again.getEmbeddingProviders().get(0).getModelId()).isEqualTo("granite-r2");
-        assertThat(again.getEmbeddingProviders().get(0).getPooling()).isEqualTo(Pooling.CLS);
-        assertThat(again.getSearchEmbeddingModel()).isEqualTo("granite-r2");
+        assertThat(IndexConfig.presetProvider("jina-code-v2").getUrl())
+                .isEqualTo("hf://jinaai/jina-embeddings-v2-base-code");
+        assertThat(IndexConfig.presetProvider("nope")).isNull();
     }
 
     @Test

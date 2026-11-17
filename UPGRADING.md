@@ -46,10 +46,20 @@ directory. If you also have a project named `lucene`, the `.` project may have p
 
 ## Switching to granite-r2 (optional)
 
-New installs use granite-embedding-english-r2 by default. An existing install keeps its current model
-(jina, or keyword-only); nothing changes on upgrade and no re-embed happens. The index format is unchanged.
+Nothing changes on upgrade: no default model changed, no re-embed happens, and the index format is unchanged.
+Semantic search is off unless you configured it; existing jina installs keep jina. granite-embedding-english-r2
+is the *recommended* model when you do enable embeddings (see the A/B in the CHANGELOG).
 
-To switch, replace the embedding settings in `~/.pharos/config.json`:
+To enable it (or to switch a jina install):
+
+```bash
+pharos embeddings enable                 # fresh: writes the granite-r2 provider
+pharos embeddings enable --force         # replaces an existing jina provider
+pharos daemon restart
+pharos embed --model=granite-r2 <project>   # or: pharos index --full <project>
+```
+
+The block written to `~/.pharos/config.json` (you can also paste it by hand):
 
 ```json
 {
@@ -67,14 +77,10 @@ To switch, replace the embedding settings in `~/.pharos/config.json`:
 }
 ```
 
-Then re-embed: `pharos index --full <project>` per project, or keep the old vectors and add the new ones
-alongside with `pharos embed --model=granite-r2 --all` (list both providers in `embeddingProviders` and set
-`searchEmbeddingModel` to the one to search). Embedding caches are per model and do not carry over, so the first
-run embeds everything: expect hours for a large project on CPU (10.9 h for the lucene source tree in the A/B,
-against about 30 min for jina from cache). Peak memory is about 2.8 GB (jina about 2.3 GB).
-
-To stay on jina, change nothing; to pin it explicitly, keep your `embeddingProviders` entry for
-`hf://jinaai/jina-embeddings-v2-base-code`.
+`enable` only edits the config and never embeds. Embedding caches are per model and do not carry over, so the
+first embed covers everything: expect hours for a large project on CPU (10.9 h for the lucene source tree in the
+A/B, against about 30 min for jina from cache). Peak memory is about 2.8 GB (jina about 2.3 GB). To stay on jina
+change nothing; `pharos embeddings status` shows what is configured and which projects have vectors.
 
 ## Upgrading to 1.4.0 (index format 1)
 
