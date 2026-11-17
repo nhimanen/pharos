@@ -18,7 +18,7 @@ import java.util.List;
  *     "embeddingProviders": [
  *       {
  *         "type": "djl",
- *         "modelId": "jina-code-v2",
+ *         "modelId": "jina-v2-code",
  *         "url": "hf://jinaai/jina-embeddings-v2-base-code",
  *         "dimensions": 768,
  *         "maxTokens": 512
@@ -54,7 +54,7 @@ public class EmbeddingProviderConfig {
 
     /**
      * Stable identifier used to derive Lucene field names and persist per-project
-     * embedding metadata. Choose a short, human-readable alias (e.g. {@code "jina-code-v2"},
+     * embedding metadata. Choose a short, human-readable alias (e.g. {@code "jina-v2-code"},
      * {@code "qwen3-emb-1024"}). Must be unique within a config.
      */
     private String modelId;

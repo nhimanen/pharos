@@ -37,9 +37,20 @@ public class IndexStatusCommand implements Callable<Integer> {
     private boolean json;
 
     private final ProjectRegistry registry;
+    private final boolean embeddingsConfigured;
 
+    /** For callers that do not know the config: reports {@code needsReembed} as if embeddings were on. */
     public IndexStatusCommand(ProjectRegistry registry) {
+        this(registry, true);
+    }
+
+    /**
+     * @param embeddingsConfigured whether an embedding provider is configured; without one, nothing
+     *                             re-embeds, so {@code needsReembed} is always false
+     */
+    public IndexStatusCommand(ProjectRegistry registry, boolean embeddingsConfigured) {
         this.registry = registry;
+        this.embeddingsConfigured = embeddingsConfigured;
     }
 
     @Override
@@ -60,7 +71,7 @@ public class IndexStatusCommand implements Callable<Integer> {
             r.put("indexBytes", sizeOf(dir));
             // Status values stay as-is; this flag marks projects whose vectors pharos 1.4.0-1.4.1 stored
             // under vec.legacy (never searched) and that the next 'pharos index' re-embeds.
-            r.put("needsReembed", dir != null && com.pharos.indexer.LegacyVectorFields
+            r.put("needsReembed", embeddingsConfigured && dir != null && com.pharos.indexer.LegacyVectorFields
                     .hasLiveMisnamedVectors(dir.resolve("lucene")));
             r.put("lastIndexed", p.getLastIndexed() == null ? null : p.getLastIndexed().toString());
             rows.add(r);
@@ -94,7 +105,8 @@ public class IndexStatusCommand implements Callable<Integer> {
         }
         for (Map<String, Object> r : rows) {
             if (Boolean.TRUE.equals(r.get("needsReembed"))) {
-                System.out.printf("note: %s: vectors need re-embed (run: pharos index %s)%n", r.get("name"), r.get("name"));
+                System.out.printf("note: %s: vectors need re-embed (run: %s)%n", r.get("name"),
+                        com.pharos.indexer.ReindexHint.fullIndexCommand((String) r.get("name"), (String) r.get("rootPath")));
             }
         }
         return 0;

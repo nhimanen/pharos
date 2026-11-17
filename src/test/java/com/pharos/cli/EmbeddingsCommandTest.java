@@ -63,16 +63,16 @@ class EmbeddingsCommandTest {
         assertThat(p.get("maxTokens").asInt()).isEqualTo(512);
         assertThat(p.get("pooling").asText()).isEqualTo("cls");
         assertThat(config().get("searchEmbeddingModel").asText()).isEqualTo("granite-r2");
-        assertThat(out.toString()).contains("600 MB").contains("pharos embed");
+        assertThat(out.toString()).contains("600 MB").contains("pharos index --full <root path>");
         // loads back through the real loader
         assertThat(IndexConfig.loadFrom(home).getEmbeddingProviders().get(0).getModelId()).isEqualTo("granite-r2");
     }
 
     @Test
     void enableJinaWritesJinaConfig() throws Exception {
-        assertThat(run("enable", "--model", "jina-code-v2")).isZero();
+        assertThat(run("enable", "--model", "jina-v2-code")).isZero();
         JsonNode p = config().get("embeddingProviders").get(0);
-        assertThat(p.get("modelId").asText()).isEqualTo("jina-code-v2");
+        assertThat(p.get("modelId").asText()).isEqualTo("jina-v2-code");
         assertThat(p.get("url").asText()).isEqualTo("hf://jinaai/jina-embeddings-v2-base-code");
         assertThat(p.has("pooling")).isFalse();
     }
@@ -155,15 +155,16 @@ class EmbeddingsCommandTest {
     void statusShowsModelFingerprintAndWhichProjectsHaveVectors() throws Exception {
         run("enable");
         out.reset();
-        ProjectMeta a = new ProjectMeta("alpha", home.resolve("a").toString(), home.resolve("ia").toString());
-        a.setEmbeddedModels(List.of("granite-r2"));
-        ProjectMeta b = new ProjectMeta("beta", home.resolve("b").toString(), home.resolve("ib").toString());
-        registry.register(a);
+        VectorIndexFixture.register(registry, home, "alpha", "vec.granite-r2");
+        ProjectMeta b = VectorIndexFixture.register(registry, home, "beta");
+        // embeddedModels is bookkeeping, not evidence: the index has no vectors for it
+        b.setEmbeddedModels(List.of("granite-r2"));
         registry.register(b);
         assertThat(run("status")).isZero();
         String o = out.toString();
         assertThat(o).contains("granite-r2").contains("pool=cls").contains(GRANITE_URL);
         assertThat(o).containsPattern("alpha\\s+yes").containsPattern("beta\\s+no");
+        assertThat(o).contains("pharos index --full --single --project beta " + home.resolve("src-beta"));
     }
 
     @Test
@@ -215,12 +216,69 @@ class EmbeddingsCommandTest {
     }
 
     @Test
-    void statusWithLegacyConfigShowsLegacyModelAndVectors() throws Exception {
+    void statusWithLegacyConfigReadsVectorsFromTheIndex() throws Exception {
         Files.writeString(home.resolve("config.json"),
                 "{\"embeddingModelUrl\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"embeddingDimensions\":768}");
-        registry.register(new ProjectMeta("old", home.resolve("o").toString(), home.resolve("io").toString()));
+        VectorIndexFixture.register(registry, home, "old");                        // keyword-only
+        VectorIndexFixture.register(registry, home, "oldvec", "vectorEmbedding");  // legacy field, searched
+        VectorIndexFixture.register(registry, home, "misnamed", "vec.legacy");     // 1.4.0-1.4.1 field, not searched
         assertThat(run("status")).isZero();
-        assertThat(out.toString()).contains("legacy").contains("hf://jinaai/jina-embeddings-v2-base-code")
-                .containsPattern("old\\s+yes");
+        String o = out.toString();
+        assertThat(o).contains("legacy").contains("hf://jinaai/jina-embeddings-v2-base-code");
+        assertThat(o).containsPattern("old\\s+no").containsPattern("oldvec\\s+yes").containsPattern("misnamed\\s+no");
+    }
+
+    @Test
+    void enableJinaOnEquivalentJinaSetupIsAlreadyConfigured() throws Exception {
+        String[] equivalent = {
+                // old single-key config (the user's own form)
+                "{\"embeddingModelUrl\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"embeddingDimensions\":768}",
+                // README (pre-1.5.0) provider block
+                "{\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"jina-v2-code\","
+                        + "\"url\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"dimensions\":768}]}",
+                // other id, pinned revision
+                "{\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"jina-code-v2\","
+                        + "\"url\":\"hf://jinaai/jina-embeddings-v2-base-code@abcdef1\",\"dimensions\":768}]}"};
+        for (String cfg : equivalent) {
+            Files.writeString(home.resolve("config.json"), cfg);
+            out.reset();
+            err.reset();
+            assertThat(run("enable", "--model", "jina-v2-code")).as(cfg).isZero();
+            assertThat(out.toString()).contains("already configured");
+            assertThat(err.toString()).doesNotContain("different model");
+            assertThat(Files.readString(home.resolve("config.json"))).isEqualTo(cfg);
+        }
+    }
+
+    @Test
+    void enableGraniteOnUnpinnedGraniteIsAlreadyConfigured() throws Exception {
+        String cfg = "{\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"granite-r2\","
+                + "\"url\":\"hf://onnx-community/granite-embedding-english-r2-ONNX\",\"dimensions\":768,"
+                + "\"pooling\":\"cls\"}]}";
+        Files.writeString(home.resolve("config.json"), cfg);
+        assertThat(run("enable")).isZero();
+        assertThat(out.toString()).contains("already configured");
+    }
+
+    @Test
+    void differentModelHintNamesIndexFullWithRootPath() throws Exception {
+        Files.writeString(home.resolve("config.json"),
+                "{\"embeddingModelUrl\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"embeddingDimensions\":768}");
+        assertThat(run("enable")).isNotZero();
+        assertThat(err.toString()).contains("pharos index --full <root path>").doesNotContain("<project>");
+    }
+
+    @Test
+    void statusAndDisableWorkWithAnInvalidEmbeddingConfig() throws Exception {
+        // valid JSON, invalid provider: IndexConfig.load() rejects it
+        String bad = "{\"verbose\":true,\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"x\","
+                + "\"url\":\"hf://a/b\",\"dimensions\":-1}]}";
+        Files.writeString(home.resolve("config.json"), bad);
+        assertThat(run("status")).isNotZero();
+        assertThat(err.toString()).contains(home.resolve("config.json").toString())
+                .contains("pharos embeddings disable");
+        assertThat(run("disable")).isZero();
+        assertThat(IndexConfig.loadFrom(home).getEmbeddingProviders()).isEmpty();
+        assertThat(config().get("verbose").asBoolean()).isTrue();
     }
 }

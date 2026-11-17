@@ -132,4 +132,28 @@ class IndexStatusCommandTest {
         finally { System.setOut(old); }
         assertThat(buf.toString()).contains("invalid name");
     }
+
+    @Test
+    void needsReembedHintPrintsTheRootPathAndKeepsTheName() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(new CommandLine(new IndexStatusCommand(registry, true)).execute()).isZero();
+        assertThat(out.toString())
+                .contains("pharos index --full --single --project mis " + tmp.resolve("src-mis"))
+                .doesNotContain("pharos index mis");
+    }
+
+    @Test
+    void needsReembedOnlyWhenAnEmbeddingProviderIsConfigured() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(new CommandLine(new IndexStatusCommand(registry, false)).execute("--json")).isZero();
+        JsonNode j = new ObjectMapper().readTree(out.toString());
+        j.get("projects").forEach(p -> assertThat(p.get("needsReembed").asBoolean()).as(p.toString()).isFalse());
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry, true)).execute("--json")).isZero();
+        boolean any = false;
+        for (JsonNode p : new ObjectMapper().readTree(out.toString()).get("projects")) {
+            if (p.get("name").asText().equals("mis")) any = p.get("needsReembed").asBoolean();
+        }
+        assertThat(any).isTrue();
+    }
 }

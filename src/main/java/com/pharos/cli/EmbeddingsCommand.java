@@ -8,7 +8,12 @@ import com.pharos.config.EmbeddingProviderConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.indexer.DocumentMapper;
+import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
+import com.pharos.indexer.LegacyVectorFields;
+import com.pharos.indexer.ProjectNames;
+import com.pharos.indexer.ReindexHint;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -86,6 +91,12 @@ public class EmbeddingsCommand implements Runnable {
         }
     }
 
+    /** How to get out of a config.json that pharos refuses to load. */
+    public static String fixConfigHint(Path home) {
+        return "Fix " + home.resolve("config.json") + " by hand, or run `pharos embeddings disable` to remove"
+                + " all embedding settings from it (other keys are kept).";
+    }
+
     private ObjectNode readConfigOrReport() throws java.io.IOException {
         try {
             return readConfig();
@@ -99,7 +110,7 @@ public class EmbeddingsCommand implements Runnable {
             description = "Write an embedding provider to config.json (does not download or embed)")
     static class Enable extends Sub {
         @Option(names = "--model", defaultValue = "granite-r2",
-                description = "granite-r2 (recommended, default) or jina-code-v2")
+                description = "granite-r2 (recommended, default) or jina-v2-code")
         String model;
 
         @Option(names = "--force", description = "Replace a different, already configured provider")
@@ -109,7 +120,7 @@ public class EmbeddingsCommand implements Runnable {
         public Integer call() throws Exception {
             EmbeddingProviderConfig preset = IndexConfig.presetProvider(model);
             if (preset == null) {
-                System.err.println("Unknown model '" + model + "' (use granite-r2 or jina-code-v2).");
+                System.err.println("Unknown model '" + model + "' (use granite-r2 or jina-v2-code).");
                 return 2;
             }
             ObjectNode cfg = parent.readConfigOrReport();
@@ -119,9 +130,17 @@ public class EmbeddingsCommand implements Runnable {
             boolean hasProviders = cfg.has("embeddingProviders") && cfg.get("embeddingProviders").size() > 0;
             boolean hasLegacy = !hasProviders && cfg.hasNonNull("embeddingModelUrl")
                     && !cfg.get("embeddingModelUrl").asText().isBlank();
-            if (hasProviders && cfg.get("embeddingProviders").size() == 1
-                    && sameModel(cfg.get("embeddingProviders").get(0), target)) {
-                System.out.println("Embeddings are already enabled with " + preset.getModelId() + "; nothing to do.");
+            // Same weights under another id, an old single-key config or a pinned/unpinned URL:
+            // replacing it would only force a pointless re-embed.
+            String currentUrl = hasProviders && cfg.get("embeddingProviders").size() == 1
+                    ? cfg.get("embeddingProviders").get(0).path("url").asText(null)
+                    : hasLegacy ? cfg.get("embeddingModelUrl").asText() : null;
+            if (currentUrl != null && sameModel(currentUrl, preset.getUrl())) {
+                String currentId = hasProviders
+                        ? cfg.get("embeddingProviders").get(0).path("modelId").asText("?")
+                        : IndexConfig.LEGACY_MODEL_ID;
+                System.out.println("Embeddings are already configured with this model (" + currentId + ", "
+                        + currentUrl + "); nothing to do.");
                 return 0;
             }
             if ((hasProviders || hasLegacy) && !force) {
@@ -130,9 +149,9 @@ public class EmbeddingsCommand implements Runnable {
                         : "legacy (" + cfg.get("embeddingModelUrl").asText() + ")";
                 System.err.println("Embeddings are already configured with a different model: " + current + ".");
                 System.err.println("Re-run with --force to replace it. Vectors already in your indexes stay,"
-                        + " but they were built with the old model: re-embed afterwards"
-                        + " (`pharos index --full <project>` or `pharos embed --model=" + preset.getModelId()
-                        + " <project>`).");
+                        + " but they were built with the old model: re-index each project afterwards with"
+                        + " `pharos index --full <root path>` (`pharos embeddings status` prints the command"
+                        + " per project).");
                 return 1;
             }
 
@@ -157,15 +176,21 @@ public class EmbeddingsCommand implements Runnable {
             parent.writeConfig(cfg);
 
             System.out.println("Wrote " + parent.home.resolve("config.json") + ".");
-            System.out.println("Next: restart the daemon (`pharos daemon restart`), then embed a project with"
-                    + " `pharos embed --model=" + preset.getModelId() + " <project>`"
-                    + " (or `pharos index --full <project>`).");
+            System.out.println("Next: restart the daemon (`pharos daemon restart`), then re-index each project with"
+                    + " `pharos index --full <root path>` to embed it (`pharos embeddings status` prints the"
+                    + " exact command per project).");
             return 0;
         }
 
-        private static boolean sameModel(com.fasterxml.jackson.databind.JsonNode existing, ObjectNode target) {
-            return existing.path("modelId").asText().equals(target.path("modelId").asText())
-                    && existing.path("url").asText().equals(target.path("url").asText());
+        /** Same model repo: URLs equal once a {@code @<sha>} revision pin is dropped. */
+        static boolean sameModel(String a, String b) {
+            return a != null && b != null && stripRevision(a).equals(stripRevision(b));
+        }
+
+        private static String stripRevision(String url) {
+            String u = url.trim();
+            int at = u.lastIndexOf('@');
+            return at > u.indexOf("://") + 2 ? u.substring(0, at) : u;
         }
     }
 
@@ -200,6 +225,7 @@ public class EmbeddingsCommand implements Runnable {
                 cfg = IndexConfig.loadFrom(parent.home);
             } catch (RuntimeException e) {
                 System.err.println("Invalid embedding config: " + e.getMessage());
+                System.err.println(fixConfigHint(parent.home));
                 return 1;
             }
             if (cfg.getEmbeddingProviders().isEmpty()) {
@@ -218,15 +244,22 @@ public class EmbeddingsCommand implements Runnable {
             var projects = parent.registry.listAll();
             if (projects.isEmpty()) System.out.println("  (no projects indexed)");
             for (ProjectMeta m : projects) {
+                if (!ProjectNames.isValid(m.getName())) {
+                    System.out.printf("  %-24s invalid name (see UPGRADING.md)%n", m.getName());
+                    continue;
+                }
+                // Evidence from the index itself, not the registry's embeddedModels or the
+                // search-side legacy allowance: both said "yes" for keyword-only projects.
+                Path lucene = IndexFormat.dir(m.getIndexPath()) == null ? null
+                        : IndexFormat.dir(m.getIndexPath()).resolve("lucene");
                 StringBuilder has = new StringBuilder();
                 for (EmbeddingProviderConfig p : cfg.getEmbeddingProviders()) {
-                    boolean yes = m.getEmbeddedModels().contains(p.getModelId())
-                            || (m.getEmbeddedModels().isEmpty() && IndexConfig.LEGACY_MODEL_ID.equals(p.getModelId()));
-                    if (yes) has.append(has.length() > 0 ? "," : "").append(p.getModelId());
+                    if (LegacyVectorFields.hasLiveVectors(lucene, DocumentMapper.vectorFieldFor(p.getModelId()))) {
+                        has.append(has.length() > 0 ? "," : "").append(p.getModelId());
+                    }
                 }
-                System.out.printf("  %-24s %s%n", m.getName(),
-                        has.length() > 0 ? "yes (" + has + ")" : "no  (run `pharos embed --model="
-                                + cfg.getEmbeddingProviders().get(0).getModelId() + " " + m.getName() + "`)");
+                System.out.printf("  %-24s %s%n", m.getName(), has.length() > 0 ? "yes (" + has + ")"
+                        : "no   (run `" + ReindexHint.fullIndexCommand(m.getName(), m.getRootPath()) + "`)");
             }
             return 0;
         }

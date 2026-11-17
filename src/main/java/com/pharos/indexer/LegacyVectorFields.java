@@ -28,18 +28,10 @@ public final class LegacyVectorFields {
     public static final String MISNAMED_CHUNKS = DocumentMapper.chunkVectorFieldName(com.pharos.config.IndexConfig.LEGACY_MODEL_ID);
 
     public static boolean hasLiveMisnamedVectors(IndexReader reader) throws IOException {
+        if (hasLiveVectors(reader, MISNAMED_VECTOR)) return true;
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
             Bits live = leaf.getLiveDocs();
-            if (leaf.getFieldInfos().fieldInfo(MISNAMED_VECTOR) != null) {
-                FloatVectorValues v = leaf.getFloatVectorValues(MISNAMED_VECTOR);
-                if (v != null) {
-                    KnnVectorValues.DocIndexIterator it = v.iterator();
-                    for (int d = it.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = it.nextDoc()) {
-                        if (live == null || live.get(d)) return true;
-                    }
-                }
-            }
             if (leaf.getFieldInfos().fieldInfo(MISNAMED_CHUNKS) != null) {
                 BinaryDocValues b = leaf.getBinaryDocValues(MISNAMED_CHUNKS);
                 if (b != null) {
@@ -50,6 +42,39 @@ public final class LegacyVectorFields {
             }
         }
         return false;
+    }
+
+    /** True when at least one live document carries a KNN vector in {@code field}. */
+    public static boolean hasLiveVectors(IndexReader reader, String field) throws IOException {
+        for (LeafReaderContext ctx : reader.leaves()) {
+            LeafReader leaf = ctx.reader();
+            if (leaf.getFieldInfos().fieldInfo(field) == null) continue;
+            FloatVectorValues v = leaf.getFloatVectorValues(field);
+            if (v == null) continue;
+            Bits live = leaf.getLiveDocs();
+            KnnVectorValues.DocIndexIterator it = v.iterator();
+            for (int d = it.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = it.nextDoc()) {
+                if (live == null || live.get(d)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Read-only: does the project's Lucene dir hold live vectors in {@code field}? False when there
+     * is no index or it cannot be read. This, not the registry's {@code embeddedModels}, is the
+     * evidence that a project can answer vector search for a model.
+     */
+    public static boolean hasLiveVectors(Path luceneDir, String field) {
+        if (luceneDir == null || !Files.isDirectory(luceneDir)) return false;
+        try (NIOFSDirectory dir = new NIOFSDirectory(luceneDir);
+             DirectoryReader r = DirectoryReader.indexExists(dir) ? DirectoryReader.open(dir) : null) {
+            return r != null && hasLiveVectors(r, field);
+        } catch (IOException | RuntimeException e) {
+            org.slf4j.LoggerFactory.getLogger(LegacyVectorFields.class)
+                    .warn("Could not check {} for vectors: {}", luceneDir, e.toString());
+            return false;
+        }
     }
 
     /** Read-only check of a project's Lucene dir; false when there is no index. */

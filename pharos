@@ -93,6 +93,8 @@ def _jvm_flags() -> list:
         # Suppress ArcadeDB/GraalVM Truffle warning about missing JVMCI (not needed
         # for pharos — ArcadeDB queries are I/O-bound, not CPU-bound).
         "-Dpolyglot.engine.WarnInterpreterOnly=false",
+        # DJL telemetry otherwise probes the EC2 instance-metadata endpoint on model load.
+        "-DOPT_OUT_TRACKING=true",
     ]
     return flags
 
@@ -1618,6 +1620,10 @@ command instead of paying the full parse + graph cost again.
 Idempotent: re-running with the same --model for a project that already
 carries that field is a no-op. Use --force to recompute and overwrite.
 
+Needs an index that already has vectors: on a keyword-only index (e.g. right
+after `pharos embeddings enable`) it fails; embed such a project with
+`pharos index --full <root path>` instead.
+
 EXAMPLES
   pharos embed --model=qwen3-emb-1024 myproject
   pharos embed --model=text-embedding-3-small --all
@@ -1647,14 +1653,16 @@ NOTES
         description="""\
 Semantic search is OFF by default. `enable` writes an embedding provider to
 ~/.pharos/config.json (granite-r2 by default, the recommended model; or
-jina-code-v2). It never downloads or embeds anything itself.
+jina-v2-code). It never downloads or embeds anything itself.
 
 COST: about a 600 MB model download on first use and a CPU-heavy first embed
-(hours for a large project on CPU). Afterwards run `pharos embed --model=<id> <project>`.
+(hours for a large project on CPU). Afterwards restart the daemon and re-index each
+project with `pharos index --full <root path>` (`pharos embeddings status` prints
+the exact command per project).
 
 EXAMPLES
   pharos embeddings enable
-  pharos embeddings enable --model jina-code-v2
+  pharos embeddings enable --model jina-v2-code
   pharos embeddings enable --model granite-r2 --force   # replace jina, then re-embed
   pharos embeddings status
   pharos embeddings disable
@@ -1662,7 +1670,7 @@ EXAMPLES
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_emb.add_argument("action", choices=["enable", "disable", "status"])
-    p_emb.add_argument("--model", default="granite-r2", choices=["granite-r2", "jina-code-v2"],
+    p_emb.add_argument("--model", default="granite-r2", choices=["granite-r2", "jina-v2-code"],
                        help="Model for `enable` (default: granite-r2)")
     p_emb.add_argument("--force", action="store_true",
                        help="`enable`: replace a different, already configured provider")

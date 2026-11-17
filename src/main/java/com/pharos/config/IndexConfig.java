@@ -166,6 +166,8 @@ public class IndexConfig {
 
     /** Model id of the recommended embedding model (written by {@code pharos embeddings enable}). */
     public static final String RECOMMENDED_MODEL_ID = "granite-r2";
+    /** The jina preset's id: the one README documented for the jina provider block before 1.5.0. */
+    public static final String JINA_MODEL_ID = "jina-v2-code";
 
     /**
      * Pinned commit of {@code onnx-community/granite-embedding-english-r2-ONNX}; bump deliberately.
@@ -188,8 +190,8 @@ public class IndexConfig {
             p.setModelId(RECOMMENDED_MODEL_ID);
             p.setUrl(GRANITE_URL);
             p.setPooling(Pooling.CLS);
-        } else if ("jina-code-v2".equals(name)) {
-            p.setModelId("jina-code-v2");
+        } else if (JINA_MODEL_ID.equals(name)) {
+            p.setModelId(JINA_MODEL_ID);
             p.setUrl("hf://jinaai/jina-embeddings-v2-base-code");
         } else {
             return null;

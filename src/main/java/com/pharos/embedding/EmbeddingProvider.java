@@ -226,7 +226,7 @@ public interface EmbeddingProvider {
         List<EmbeddingProviderConfig> cfgs = config.getEmbeddingProviders();
         if (cfgs == null || cfgs.isEmpty()) {
             log.info("No embedding providers configured — vector search disabled. " +
-                    "Add an entry to 'embeddingProviders' in ~/.pharos/config.json to enable.");
+                    "Run `pharos embeddings enable` to turn on semantic search.");
             return List.of();
         }
         // Lazy: the model is loaded the first time something embeds (or asks isAvailable()),

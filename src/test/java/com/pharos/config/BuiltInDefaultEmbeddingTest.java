@@ -34,7 +34,7 @@ class BuiltInDefaultEmbeddingTest {
         assertThat(p.getPooling()).isEqualTo(Pooling.CLS);
         p.validate();
         assertThat(IndexVersions.modelFingerprint(p)).contains(":pool=cls:");
-        assertThat(IndexConfig.presetProvider("jina-code-v2").getUrl())
+        assertThat(IndexConfig.presetProvider("jina-v2-code").getUrl())
                 .isEqualTo("hf://jinaai/jina-embeddings-v2-base-code");
         assertThat(IndexConfig.presetProvider("nope")).isNull();
     }

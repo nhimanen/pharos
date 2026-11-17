@@ -698,7 +698,7 @@ public class DocumentMapper {
      *
      * <p>Examples:
      * <pre>
-     *   "jina-code-v2"                      → "vec.jina-code-v2"
+     *   "jina-v2-code"                      → "vec.jina-v2-code"
      *   "Qwen/Qwen3-Embedding-4B@1024"      → "vec.qwen_qwen3-embedding-4b_1024"
      * </pre>
      */

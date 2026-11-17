@@ -4,6 +4,7 @@ import importlib.util
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -21,6 +22,8 @@ def load():
 class EmbeddingsCli(unittest.TestCase):
     def setUp(self):
         self.p = load()
+        # _jvm_flags() creates the dumps dir: keep it out of the real ~/.pharos
+        self.p.PHAROS_DUMPS = pathlib.Path(tempfile.mkdtemp())
 
     def parse(self, *argv):
         with mock.patch.object(sys, "argv", ["pharos", *argv]), \
@@ -40,10 +43,10 @@ class EmbeddingsCli(unittest.TestCase):
         self.assertEqual(cmd[-3:], ["embeddings", "enable", "--model=granite-r2"])
 
     def test_enable_jina_force(self):
-        args = self.parse("embeddings", "enable", "--model", "jina-code-v2", "--force")
+        args = self.parse("embeddings", "enable", "--model", "jina-v2-code", "--force")
         cmd = self.p._embeddings_command(args)
-        self.assertEqual(cmd[-3:], ["enable", "--model=jina-code-v2", "--force"])
-        self.assertIn("--model=jina-code-v2", cmd)
+        self.assertEqual(cmd[-3:], ["enable", "--model=jina-v2-code", "--force"])
+        self.assertIn("--model=jina-v2-code", cmd)
         self.assertEqual(cmd[-1], "--force")
 
     def test_disable_and_status_take_no_model(self):
@@ -59,6 +62,14 @@ class EmbeddingsCli(unittest.TestCase):
             self.p.cmd_embeddings(args)
         self.assertEqual(ex.exception.code, 0)
         self.assertEqual(run.call_args[0][0][-2:], ["embeddings", "status"])
+
+    def test_jvm_flags_opt_out_of_djl_tracking(self):
+        # DJL's telemetry probes the EC2 metadata endpoint on every model load otherwise
+        self.assertIn("-DOPT_OUT_TRACKING=true", self.p._jvm_flags())
+
+    def test_jina_preset_is_the_readme_id(self):
+        args = self.parse("embeddings", "enable", "--model", "jina-v2-code")
+        self.assertEqual(self.p._embeddings_command(args)[-1], "--model=jina-v2-code")
 
     def test_bad_model_rejected_by_parser(self):
         with mock.patch.object(sys, "argv", ["pharos", "embeddings", "enable", "--model", "nope"]), \
