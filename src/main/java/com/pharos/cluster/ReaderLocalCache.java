@@ -34,6 +34,11 @@ public class ReaderLocalCache implements LocalCache {
         if (previous != null) GraphViews.evict(previous);
     }
 
+    /** Projects with an active generation. */
+    public java.util.Set<String> activeProjects() {
+        return java.util.Set.copyOf(active.keySet());
+    }
+
     /** The active generation dir, or {@code <cacheDir>/<project>/none} (never created) before the first. */
     @Override
     public Path shardDir(String project) {

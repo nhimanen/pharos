@@ -256,4 +256,13 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"heartbeatSeconds\":30,\"readerTtlSeconds\":30}}"))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.readerTtlSeconds");
     }
+
+    @Test
+    void retireGraceSecondsDefaultsAndValidates() {
+        ClusterConfig c = new ClusterConfig();
+        org.assertj.core.api.Assertions.assertThat(c.getRetireGraceSeconds()).isEqualTo(120);
+        c.setRetireGraceSeconds(0);
+        org.assertj.core.api.Assertions.assertThatThrownBy(c::validate)
+                .hasMessageContaining("cluster.retireGraceSeconds");
+    }
 }

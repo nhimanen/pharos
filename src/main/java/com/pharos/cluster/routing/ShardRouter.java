@@ -6,7 +6,6 @@ import com.pharos.cluster.membership.ReaderHealth;
 import com.pharos.cluster.membership.ReaderHeartbeat;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -17,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 
 /**
  * Picks, per shard, the live readers that may serve it. A reader's heartbeat lists the shards it
@@ -32,6 +32,7 @@ public final class ShardRouter {
     private final ShardCatalog catalog;
     private final ReaderHealth health;
     private final Predicate<ShardId> local;
+    private final ToIntFunction<String> coordinatorInFlight;
     private final Map<ShardId, AtomicLong> rotation = new ConcurrentHashMap<>();
 
     /**
@@ -40,6 +41,16 @@ public final class ShardRouter {
      */
     public ShardRouter(Supplier<List<ReaderHeartbeat>> live, ShardCatalog catalog, ReaderHealth health,
                        Predicate<ShardId> local) {
+        this(live, catalog, health, local, node -> 0); // TODO(Task 5): pass the fan-out client's per-node in-flight count
+    }
+
+    /**
+     * @param coordinatorInFlight calls this coordinator currently has open to a node; added to the
+     *                            heartbeat's {@code inFlight} (which lags by a heartbeat) when ordering
+     */
+    public ShardRouter(Supplier<List<ReaderHeartbeat>> live, ShardCatalog catalog, ReaderHealth health,
+                       Predicate<ShardId> local, ToIntFunction<String> coordinatorInFlight) {
+        this.coordinatorInFlight = coordinatorInFlight;
         this.live = live;
         this.catalog = catalog;
         this.health = health;
@@ -53,10 +64,16 @@ public final class ShardRouter {
             try {
                 for (ShardId s : catalog.shards()) names.add(s.value());
             } catch (IOException e) {
-                throw new UncheckedIOException("unreadable shard catalog: " + e.getMessage(), e);
+                throw new CatalogUnavailableException("unreadable shard catalog: " + e.getMessage(), e);
             }
         } else {
-            for (String p : projects) names.add(new ShardId(p).value());
+            for (String p : projects) {
+                try {
+                    names.add(new ShardId(p).value());
+                } catch (IllegalArgumentException e) {
+                    throw new InvalidProjectException(e.getMessage(), e);
+                }
+            }
         }
         List<ReaderHeartbeat> readers = live.get();
         List<Route> routes = new ArrayList<>(names.size());
@@ -80,12 +97,13 @@ public final class ShardRouter {
                 eligible.add(r);
             }
         }
-        eligible.sort(Comparator.comparingInt(ReaderHeartbeat::inFlight).thenComparing(ReaderHeartbeat::node));
+        ToIntFunction<ReaderHeartbeat> load = r -> r.inFlight() + coordinatorInFlight.applyAsInt(r.node());
+        eligible.sort(Comparator.comparingInt(load).thenComparing(ReaderHeartbeat::node));
         long turn = rotation.computeIfAbsent(shard, s -> new AtomicLong()).getAndIncrement();
         List<ReaderHeartbeat> out = new ArrayList<>(eligible.size());
         for (int i = 0; i < eligible.size(); ) {
             int j = i;
-            while (j < eligible.size() && eligible.get(j).inFlight() == eligible.get(i).inFlight()) j++;
+            while (j < eligible.size() && load.applyAsInt(eligible.get(j)) == load.applyAsInt(eligible.get(i))) j++;
             int size = j - i;
             int shift = (int) Math.floorMod(turn, (long) size);
             for (int k = 0; k < size; k++) out.add(eligible.get(i + (k + shift) % size));

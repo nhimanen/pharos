@@ -43,8 +43,11 @@ class ReaderServingTest {
     /** A second reader process on the same cache dir: same config, its own backend, registry, indexer. */
     private record Reader(ClusterRuntime runtime, SearchEngine engine, LuceneIndexer lucene) {}
 
+    private ReaderLocalCache lastCache;
+
     private Reader secondReader(InMemoryObjectStore store) {
         ReplicationBackend backend = TestBackends.objectStore(cluster.readerConfig, store);
+        lastCache = (ReaderLocalCache) backend.localCache();
         ProjectRegistry registry = ClusterRuntime.registryFor(cluster.readerConfig);
         LuceneIndexer lucene = new LuceneIndexer(cluster.readerConfig, backend.localCache());
         ClusterRuntime runtime = new ClusterRuntime(cluster.readerConfig, backend, registry, lucene);
@@ -304,5 +307,25 @@ class ReaderServingTest {
         assertThat(restarted.lucene().getProjectIndexDir(JAVA).getFileName().toString()).isEqualTo("none");
         assertThat(warns).anySatisfy(w -> assertThat(w).contains(JAVA, "gen-2", "index format " + newer,
                 "reads index formats", "No servable generation on disk"));
+    }
+
+    @Test
+    void followerStopsServingAShardTheOwnerPinnedAway() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        Reader second = secondReader(store);
+        second.runtime().startServing();
+        assertThat(lastCache.active(JAVA)).isPresent();
+        Path dir = lastCache.active(JAVA).orElseThrow();
+
+        cluster.readerConfig.getCluster().getReader().setShards(List.of("elsewhere"));
+        cluster.readerRuntime.repin();
+        cluster.readerRuntime.syncNow(); // owner unregisters; its dir delete is a grace period away
+        second.runtime().followerTick();
+
+        assertThat(lastCache.active(JAVA)).as("follower deactivated it").isEmpty();
+        assertThat(dir).as("owner has not deleted it yet").isDirectory();
     }
 }

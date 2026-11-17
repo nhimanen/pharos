@@ -377,6 +377,7 @@ public final class ClusterRuntime implements Closeable {
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
+        s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
         s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
@@ -426,6 +427,13 @@ public final class ClusterRuntime implements Closeable {
             return t;
         });
         follower.scheduleWithFixedDelay(this::followerTick, interval, interval, TimeUnit.SECONDS);
+    }
+
+    /** Re-reads {@code cluster.reader.shards} into the sync owner's pin (takes effect on its next pass). */
+    public void repin() {
+        ReplicaSyncer s;
+        synchronized (this) { s = syncer; }
+        if (s != null) s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
     }
 
     /** Follower poll: pick up what the lock holder registered; take over once it is gone. */
@@ -508,6 +516,16 @@ public final class ClusterRuntime implements Closeable {
             if (cache.active(name).filter(dir::equals).isPresent()) continue;
             cache.activate(name, dir);
             changed.add(name);
+        }
+        // A shard the sync owner unregistered (or that the pin excludes) must stop being served here
+        // before the owner deletes its directory.
+        java.util.Set<String> registered = new java.util.HashSet<>();
+        registry.listAll().forEach(m -> { if (m.getName() != null) registered.add(m.getName()); });
+        List<String> pin = config.getCluster().getReader().getShards();
+        for (String name : cache.activeProjects()) {
+            if (registered.contains(name) && (pin.isEmpty() || pin.contains(name))) continue;
+            cache.deactivate(name);
+            log.info("Shard {} is no longer registered for this reader: stopped serving it", name);
         }
         if (!changed.isEmpty()) log.info("Activated registered generations of {}", changed);
         return changed;

@@ -104,4 +104,25 @@ class ShardRouterTest {
         assertThat(router().servesLocally(new ShardId("a"))).isTrue();
         assertThat(router().servesLocally(new ShardId("b"))).isFalse();
     }
+
+    @Test
+    void invalidProjectIsTyped() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> router().route(List.of("../x")))
+                .isInstanceOf(InvalidProjectException.class);
+    }
+
+    @Test
+    void unreadableCatalogIsTyped() {
+        ShardCatalog broken = () -> { throw new java.io.IOException("boom"); };
+        ShardRouter r = new ShardRouter(() -> live, broken, health, s -> true);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> r.route(List.of()))
+                .isInstanceOf(CatalogUnavailableException.class);
+    }
+
+    @Test
+    void coordinatorsOwnInFlightCountsInTheOrdering() {
+        live = List.of(hb("r1", false, 1, "a"), hb("r2", false, 1, "a"));
+        ShardRouter r = new ShardRouter(() -> live, catalog, health, s -> true, node -> node.equals("r1") ? 3 : 0);
+        for (int i = 0; i < 6; i++) assertThat(nodes(r.route(List.of("a")).get(0))).containsExactly("r2", "r1");
+    }
 }

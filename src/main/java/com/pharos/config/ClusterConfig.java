@@ -21,6 +21,12 @@ public class ClusterConfig {
     /** Host name looked up on first use only: {@code getLocalHost()} can stall for seconds. */
     private transient String resolvedNodeId;
     private int pollIntervalSeconds = 10;
+    /**
+     * Readers: how long a shard's directory is kept after the reader stops serving it (pinned away),
+     * so queries and fan-out calls already reading it finish. Keep it at least as long as the longest
+     * query or fan-out timeout; the effective value is never below {@code pollIntervalSeconds}.
+     */
+    private int retireGraceSeconds = 120;
     private Path cacheDir = IndexConfig.DEFAULT_BASE.resolve("cluster-cache");
     private int retentionGenerations = 3;
     private int retentionMinutes = 60;
@@ -78,6 +84,9 @@ public class ClusterConfig {
         if (pollIntervalSeconds <= 0) {
             throw new IllegalStateException("cluster.pollIntervalSeconds must be positive, got " + pollIntervalSeconds);
         }
+        if (retireGraceSeconds <= 0) {
+            throw new IllegalStateException("cluster.retireGraceSeconds must be positive, got " + retireGraceSeconds);
+        }
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
         }
@@ -128,6 +137,8 @@ public class ClusterConfig {
     public void setBackend(BackendKind backend) { this.backend = backend; }
     public String getNodeId() { return nodeId; }
     public void setNodeId(String nodeId) { this.nodeId = nodeId; }
+    public int getRetireGraceSeconds() { return retireGraceSeconds; }
+    public void setRetireGraceSeconds(int v) { this.retireGraceSeconds = v; }
     public int getPollIntervalSeconds() { return pollIntervalSeconds; }
     public void setPollIntervalSeconds(int v) { this.pollIntervalSeconds = v; }
     public Path getCacheDir() { return cacheDir; }
