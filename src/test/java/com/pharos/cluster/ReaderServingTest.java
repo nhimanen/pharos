@@ -361,5 +361,6 @@ class ReaderServingTest {
         pinned.runtime().followerTick();
         assertThat(cluster.readerRegistry.find(JAVA)).isPresent();
         assertThat(lastCache.active(JAVA)).isEmpty();
+        assertThat(dir).as("deactivating keeps the directory for the retire grace").isDirectory();
     }
 }
