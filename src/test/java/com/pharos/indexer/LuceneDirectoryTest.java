@@ -37,4 +37,19 @@ class LuceneDirectoryTest {
         }
         assertThat(opened).containsExactly(tmp);
     }
+
+    @Test
+    void niofsPropertySwapsTheDefaultForDiagnostics() throws Exception {
+        String before = System.getProperty(LuceneDirectoryFactory.DIRECTORY_PROPERTY);
+        System.setProperty(LuceneDirectoryFactory.DIRECTORY_PROPERTY, "niofs");
+        try (Directory dir = LuceneDirectoryFactory.DEFAULT.open(tmp)) {
+            assertThat(dir).isInstanceOf(org.apache.lucene.store.NIOFSDirectory.class);
+        } finally {
+            if (before == null) System.clearProperty(LuceneDirectoryFactory.DIRECTORY_PROPERTY);
+            else System.setProperty(LuceneDirectoryFactory.DIRECTORY_PROPERTY, before);
+        }
+        try (Directory dir = LuceneDirectoryFactory.DEFAULT.open(tmp)) {
+            assertThat(dir).isInstanceOf(MMapDirectory.class);
+        }
+    }
 }
