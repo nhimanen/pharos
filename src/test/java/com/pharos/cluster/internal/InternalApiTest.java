@@ -1,0 +1,284 @@
+package com.pharos.cluster.internal;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pharos.cluster.NodeRole;
+import com.pharos.cluster.routing.ShardRouter.Route;
+import com.pharos.cluster.ShardId;
+import com.pharos.cluster.membership.ReaderHealth;
+import com.pharos.cluster.membership.ReaderHeartbeat;
+import com.pharos.config.ClusterConfig;
+import com.pharos.search.SearchRequest;
+import com.pharos.web.WebServer;
+import io.javalin.Javalin;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class InternalApiTest {
+
+    private static final String TOKEN = "s3cret-token";
+    private static final String[] PATHS = {"/internal/term-stats", "/internal/shard-search",
+            "/internal/snippets", "/internal/callees"};
+
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final HttpClient http = HttpClient.newHttpClient();
+    private final List<Javalin> apps = new ArrayList<>();
+
+    @TempDir Path tmp;
+
+    @AfterEach
+    void stop() {
+        apps.forEach(Javalin::stop);
+    }
+
+    private Javalin serve(FakeShardSearchService svc) {
+        Javalin app = Javalin.create();
+        new InternalApi(svc, TOKEN).mount(app);
+        app.start(0);
+        apps.add(app);
+        return app;
+    }
+
+    private HttpResponse<String> post(Javalin app, String path, String token, String body) throws Exception {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("http://localhost:" + app.port() + path))
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .header("Content-Type", "application/json");
+        if (token != null) b.header(InternalApi.TOKEN_HEADER, token);
+        return http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static String bodyFor(String path, Long generation) {
+        String g = generation == null ? "" : ",\"generation\":" + generation;
+        return switch (path) {
+            case "/internal/term-stats" -> "{\"shard\":\"java\",\"fields\":[\"body\"],\"terms\":[]}";
+            case "/internal/shard-search" -> "{\"shard\":\"java\",\"retriever\":\"keyword\"" + g + "}";
+            case "/internal/snippets" -> "{\"shard\":\"java\",\"ids\":[\"id1\"],\"query\":\"q\"" + g + "}";
+            default -> "{\"shard\":\"java\",\"fqns\":[\"a.B#c()\"]" + g + "}";
+        };
+    }
+
+    @Test
+    void noTokenIs401AndHandlerNotInvoked() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        for (String p : PATHS) {
+            HttpResponse<String> r = post(app, p, null, bodyFor(p, 5L));
+            assertThat(r.statusCode()).as(p).isEqualTo(401);
+            assertThat(r.body()).doesNotContain(TOKEN);
+        }
+        assertThat(svc.calls).hasValue(0);
+    }
+
+    @Test
+    void wrongTokenIs401() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        for (String p : PATHS) {
+            assertThat(post(app, p, "wrong", bodyFor(p, 5L)).statusCode()).as(p).isEqualTo(401);
+            assertThat(post(app, p, TOKEN + "x", bodyFor(p, 5L)).statusCode()).as(p + " longer").isEqualTo(401);
+            assertThat(post(app, p, "", bodyFor(p, 5L)).statusCode()).as(p + " empty").isEqualTo(401);
+        }
+        assertThat(svc.calls).hasValue(0);
+    }
+
+    @Test
+    void validTokenReachesEveryHandler() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        for (String p : PATHS) {
+            HttpResponse<String> r = post(app, p, TOKEN, bodyFor(p, 5L));
+            assertThat(r.statusCode()).as(p + " " + r.body()).isEqualTo(200);
+        }
+        assertThat(svc.calls).hasValue(4);
+    }
+
+    @Test
+    void generationMismatchIs409WithServedGeneration() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        for (String p : new String[]{"/internal/shard-search", "/internal/snippets", "/internal/callees"}) {
+            HttpResponse<String> r = post(app, p, TOKEN, bodyFor(p, 4L));
+            assertThat(r.statusCode()).as(p).isEqualTo(409);
+            assertThat(mapper.readTree(r.body()).get("servedGeneration").asLong()).isEqualTo(5);
+        }
+        assertThat(svc.calls).as("no work on a mismatch").hasValue(0);
+        // shard-search without a generation is answered with whatever is served
+        HttpResponse<String> any = post(app, "/internal/shard-search", TOKEN, bodyFor("/internal/shard-search", null));
+        assertThat(any.statusCode()).isEqualTo(200);
+        assertThat(mapper.readTree(any.body()).get("generation").asLong()).isEqualTo(5);
+    }
+
+    @Test
+    void unservedShardIs404AndBadBodyIs400() throws Exception {
+        Javalin app = serve(new FakeShardSearchService().serving("other", 1));
+        assertThat(post(app, "/internal/shard-search", TOKEN, bodyFor("/internal/shard-search", 1L)).statusCode())
+                .isEqualTo(404);
+        assertThat(post(app, "/internal/shard-search", TOKEN, "{not json").statusCode()).isEqualTo(400);
+        assertThat(post(app, "/internal/shard-search", TOKEN, "{\"shard\":\"../x\",\"retriever\":\"keyword\"}")
+                .statusCode()).isEqualTo(400);
+    }
+
+    @Test
+    void searchRequestRoundTripsOverTheWire() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        ReaderHeartbeat reader = reader("n1", app.port());
+        ShardClient client = new ShardClient(new ReaderHealth(30), TOKEN, Duration.ofSeconds(1), Duration.ofSeconds(5));
+        SearchRequest req = new SearchRequest("q", SearchRequest.SearchType.KEYWORD, null, List.of("java"), 10,
+                "json", null, null, 0);
+        ShardSearchResponse resp = client.call(new Route(new ShardId("java"), List.of(reader)), ShardClient.SHARD_SEARCH,
+                hb -> new ShardSearchRequest("java", 5L, "keyword", req, new float[]{0.5f, 1f}, null));
+        assertThat(resp.generation()).isEqualTo(5);
+        assertThat(resp.candidates()).hasSize(1);
+        assertThat(resp.candidates().get(0).inDegree()).isEqualTo(4);
+        assertThat(resp.maxInDegree()).isEqualTo(9);
+    }
+
+    private ReaderHeartbeat reader(String node, int port) {
+        return new ReaderHeartbeat(node, "http://localhost:" + port, List.of("java"), false, null, 0, 0, 0);
+    }
+
+    private static int deadPort() throws Exception {
+        try (ServerSocket s = new ServerSocket(0)) {
+            return s.getLocalPort();
+        }
+    }
+
+    private ShardClient client(ReaderHealth health) {
+        return new ShardClient(health, TOKEN, Duration.ofMillis(500), Duration.ofSeconds(5));
+    }
+
+    private static final java.util.function.Function<ReaderHeartbeat, TermStatsRequest> STATS =
+            hb -> new TermStatsRequest("java", List.of("body"), List.of());
+
+    @Test
+    void retriesOnceOnAnotherReplicaAfterConnectError() throws Exception {
+        FakeShardSearchService good = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(good);
+        ReaderHealth health = new ReaderHealth(30);
+        ReaderHeartbeat dead = reader("dead", deadPort());
+        ReaderHeartbeat live = reader("live", app.port());
+
+        TermStatsResponse r = client(health).call(new Route(new ShardId("java"), List.of(dead, live)),
+                ShardClient.TERM_STATS, STATS);
+
+        assertThat(r.generation()).isEqualTo(5);
+        assertThat(health.isSuspect("dead")).isTrue();
+        assertThat(health.isSuspect("live")).isFalse();
+    }
+
+    @Test
+    void retriesOnceOnAnotherReplicaAfter5xx() throws Exception {
+        FakeShardSearchService broken = new FakeShardSearchService().serving("java", 5);
+        broken.failure = new IllegalStateException("boom");
+        FakeShardSearchService good = new FakeShardSearchService().serving("java", 5);
+        Javalin a = serve(broken);
+        Javalin b = serve(good);
+        ReaderHealth health = new ReaderHealth(30);
+
+        TermStatsResponse r = client(health).call(
+                new Route(new ShardId("java"), List.of(reader("bad", a.port()), reader("good", b.port()))),
+                ShardClient.TERM_STATS, STATS);
+
+        assertThat(r.generation()).isEqualTo(5);
+        assertThat(broken.calls).hasValue(1);
+        assertThat(good.calls).hasValue(1);
+        assertThat(health.isSuspect("bad")).isTrue();
+    }
+
+    @Test
+    void unavailableWhenNoReplicaLeft() throws Exception {
+        ReaderHealth health = new ReaderHealth(30);
+        Route one = new Route(new ShardId("java"), List.of(reader("d1", deadPort())));
+        assertThatThrownBy(() -> client(health).call(one, ShardClient.TERM_STATS, STATS))
+                .isInstanceOf(ShardUnavailableException.class)
+                .satisfies(e -> assertThat(((ShardUnavailableException) e).shard()).isEqualTo(new ShardId("java")));
+
+        Route two = new Route(new ShardId("java"),
+                List.of(reader("d1", deadPort()), reader("d2", deadPort())));
+        assertThatThrownBy(() -> client(health).call(two, ShardClient.TERM_STATS, STATS))
+                .isInstanceOf(ShardUnavailableException.class);
+
+        Route none = new Route(new ShardId("java"), List.of());
+        assertThatThrownBy(() -> client(health).call(none, ShardClient.TERM_STATS, STATS))
+                .isInstanceOf(ShardUnavailableException.class);
+    }
+
+    @Test
+    void generationMismatchSurfacesAndDoesNotMarkSuspect() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        ReaderHealth health = new ReaderHealth(30);
+        assertThatThrownBy(() -> client(health).call(
+                new Route(new ShardId("java"), List.of(reader("n1", app.port()))), ShardClient.CALLEES,
+                hb -> new CalleesRequest("java", 4L, List.of("a.B#c()"))))
+                .isInstanceOfSatisfying(GenerationMismatchException.class,
+                        e -> assertThat(e.servedGeneration()).isEqualTo(5));
+        assertThat(health.isSuspect("n1")).isFalse();
+    }
+
+    @Test
+    void wrongClientTokenIsNotRetriedOrSuspect() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        Javalin app = serve(svc);
+        ReaderHealth health = new ReaderHealth(30);
+        ShardClient bad = new ShardClient(health, "nope", Duration.ofMillis(500), Duration.ofSeconds(5));
+        assertThatThrownBy(() -> bad.call(new Route(new ShardId("java"), List.of(reader("n1", app.port()))),
+                ShardClient.TERM_STATS, STATS)).isInstanceOf(ShardCallException.class)
+                .hasMessageContaining("401");
+        assertThat(health.isSuspect("n1")).isFalse();
+    }
+
+    @Test
+    void readerWithoutTokenFailsStartup() {
+        assertThatThrownBy(() -> new InternalApi(new FakeShardSearchService(), null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("cluster.token");
+        assertThatThrownBy(() -> new InternalApi(new FakeShardSearchService(), " "))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        ClusterConfig c = new ClusterConfig();
+        c.setRole(NodeRole.READER);
+        c.setBackend(com.pharos.cluster.BackendKind.OBJECT_STORE);
+        c.getObjectStore().setBucket("b");
+        c.setAdvertiseUrl("http://r:7171");
+        assertThatThrownBy(c::validate).hasMessageContaining("cluster.token");
+    }
+
+    @Test
+    void internalRoutesAbsentOnRoleAll() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        WebServer server = new WebServer(null, null, null, null, null, NodeRole.ALL);
+        server.setInternalApi(new InternalApi(svc, TOKEN));
+        Javalin app = server.start(0, tmp);
+        apps.add(app);
+        for (String p : PATHS) {
+            assertThat(post(app, p, TOKEN, bodyFor(p, 5L)).statusCode()).as(p).isEqualTo(404);
+        }
+        assertThat(svc.calls).hasValue(0);
+    }
+
+    @Test
+    void internalRoutesPresentOnReader() throws Exception {
+        FakeShardSearchService svc = new FakeShardSearchService().serving("java", 5);
+        WebServer server = new WebServer(null, null, null, null, null, NodeRole.READER);
+        server.setInternalApi(new InternalApi(svc, TOKEN));
+        Javalin app = server.start(0, tmp);
+        apps.add(app);
+        assertThat(post(app, "/internal/term-stats", null, bodyFor(PATHS[0], null)).statusCode()).isEqualTo(401);
+        assertThat(post(app, "/internal/term-stats", TOKEN, bodyFor(PATHS[0], null)).statusCode()).isEqualTo(200);
+    }
+}

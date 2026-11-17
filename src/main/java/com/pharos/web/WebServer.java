@@ -54,6 +54,7 @@ public class WebServer {
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
     private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
+    private volatile com.pharos.cluster.internal.InternalApi internalApi = null;
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
@@ -100,6 +101,18 @@ public class WebServer {
 
     /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
     public com.pharos.cluster.membership.LoadCounter load() { return load; }
+
+    /**
+     * The {@code /internal/*} shard API. Mounted on reader nodes only: on any other role the API is
+     * ignored and the routes stay absent (404).
+     */
+    public void setInternalApi(com.pharos.cluster.internal.InternalApi api) {
+        if (!readerNode) {
+            log.warn("ignoring the internal shard API: /internal/* is served by reader nodes only");
+            return;
+        }
+        this.internalApi = java.util.Objects.requireNonNull(api, "api");
+    }
 
     /** Source of {@code GET /cluster/readers}; without one the endpoint answers 404. */
     public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> s) {
@@ -694,6 +707,8 @@ public class WebServer {
             }
             ctx.json(readersPayload());
         });
+
+        if (readerNode && internalApi != null) internalApi.mount(app);
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
