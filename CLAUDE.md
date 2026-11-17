@@ -72,7 +72,7 @@ Source files flow through four sequential stages:
 
 2. **Graph** (`graph/`) — `CallGraphBuilder` turns parsed call references into a JGraphT `DefaultDirectedGraph` stored as `<index-dir>/<project>/graph.graphml`. `ModuleGraphBuilder` maintains `~/.pharos/module-graph.graphml`; `ProjectIndexManager.updateModuleGraph` detects the build system (first match wins: Maven → Gradle → Python → Node.js → CMake → Go) and every reader returns the shared `MavenPomReader.PomInfo` shape, so a new language's reader (e.g. `GoModReader` for `go.mod`) just joins that chain.
 
-3. **Embed** (`embedding/`) — Optional DJL + ONNX Runtime step that produces 384-dim float vectors. Falls back to `NoOpEmbeddingProvider` when unavailable.
+3. **Embed** (`embedding/`) — Optional DJL + ONNX Runtime step that produces float vectors (768-dim for the default). Falls back to `NoOpEmbeddingProvider` when unavailable. **Default model:** `IndexConfig.builtInEmbeddingProvider()` = granite-r2 (`hf://onnx-community/granite-embedding-english-r2-ONNX@<sha>`, CLS pooling), applied by `IndexConfig.loadFrom` to *new installs only* (no config.json/registry.json/indexes under the pharos home) and persisted to config.json on first load. Existing configs, including jina ones (`legacy` or explicit), are never switched; an existing config with no embedding settings stays keyword-only. `hf://owner/name@<sha>` pins a model revision (download URL and cache dir name include it).
 
 4. **Index** (`indexer/`) — `DocumentMapper` converts parsed objects to Lucene documents with `TextField` (BM25) and `KnnFloatVectorField` (vector search). `LuceneIndexer` manages per-project `FSDirectory` instances with cached `DirectoryReader`s.
 

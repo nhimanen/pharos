@@ -213,9 +213,29 @@ All MCP tools return structured JSON. Key tools:
 
 ## Embedding configuration
 
-Vector search is **disabled by default**. To enable it, add at least one provider to `embeddingProviders[]` in `~/.pharos/config.json`. The list is the new shape — legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
+**New installs** (no `~/.pharos/config.json`, `registry.json` or `indexes/` yet) get a built-in default: **granite-embedding-english-r2** via DJL (768-dim, CLS pooling, local, no API key), pinned to a model commit. The first run writes that choice to `~/.pharos/config.json` so it stays stable once projects are indexed. **Existing installs are never switched**: a config that names jina (old-style `embeddingModelUrl`, or an explicit `embeddingProviders` entry) keeps jina, and a config or home without any embedding settings stays keyword-only. To enable or change vector search, edit `embeddingProviders[]` in `~/.pharos/config.json`. Legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
 
-### Recommended: Jina v2 Code via DJL (local, no API key)
+### Default: granite-embedding-english-r2 via DJL (local, no API key)
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "granite-r2",
+      "type": "djl",
+      "url": "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+      "dimensions": 768,
+      "maxTokens": 512,
+      "pooling": "cls"
+    }
+  ],
+  "searchEmbeddingModel": "granite-r2"
+}
+```
+
+On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches it in `~/.djl.ai/pharos/` (the revision is part of the directory name). `hf://owner/name@<sha>` pins any HuggingFace model to a commit (7-40 hex chars); without `@<sha>` it follows `main`. In an A/B on 99 queries over the pharos and lucene projects, granite-r2 beat jina on the `auto` pipeline's main path (hybrid-rrf MRR@10 +0.056, 95% CI [+0.002, +0.112]) and on hybrid (+0.068, [+0.008, +0.129]); with the cross-encoder reranker it was a tie (-0.009). Details: `docs/superpowers/gates/2026-11-16-embedding-ab.md`. Trade-offs: peak RSS is higher (about 2.8 GB vs 2.3 GB) and CPU embedding is much slower (10.9 h vs about 30 min for the lucene project on one CPU, which is why a full re-embed is a deliberate step).
+
+### Jina v2 Code via DJL (existing installs keep this)
 
 ```json
 {
@@ -232,7 +252,7 @@ Vector search is **disabled by default**. To enable it, add at least one provide
 }
 ```
 
-On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches it in `~/.djl.ai/pharos/`. Subsequent runs load from cache. This is the recommended setup for code search — 768-dim, 8 192-token context window.
+768-dim, 8 192-token context window, mean pooling (the default).
 
 ### Alternative: MiniLM via DJL model zoo
 

@@ -164,10 +164,56 @@ public class IndexConfig {
         return new IndexConfig();
     }
 
+    /** Model id of the built-in default embedding provider (new installs only). */
+    public static final String BUILT_IN_MODEL_ID = "granite-r2";
+
+    /**
+     * Pinned commit of {@code onnx-community/granite-embedding-english-r2-ONNX} that the
+     * A/B (docs/superpowers/gates/2026-11-16-embedding-ab.md) approximates; bump deliberately.
+     */
+    static final String BUILT_IN_MODEL_URL =
+            "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23";
+
+    /** The built-in default provider: granite-embedding-english-r2, CLS pooling, 768 dims. */
+    public static EmbeddingProviderConfig builtInEmbeddingProvider() {
+        EmbeddingProviderConfig p = new EmbeddingProviderConfig();
+        p.setType("djl");
+        p.setModelId(BUILT_IN_MODEL_ID);
+        p.setUrl(BUILT_IN_MODEL_URL);
+        p.setDimensions(768);
+        p.setMaxTokens(512);
+        p.setPooling(Pooling.CLS);
+        return p;
+    }
+
     public static IndexConfig load() {
-        Path configFile = DEFAULT_BASE.resolve("config.json");
+        return loadFrom(DEFAULT_BASE);
+    }
+
+    /**
+     * Loads {@code <home>/config.json}. The built-in embedding default applies only to a
+     * <em>new install</em>: no config.json, no registry.json and no indexes directory under
+     * {@code home}. Any existing config (even one without embedding settings) and any home that
+     * already holds projects keeps exactly what it names, so existing vectors stay searchable.
+     */
+    static IndexConfig loadFrom(Path home) {
+        Path configFile = home.resolve("config.json");
         if (!Files.exists(configFile)) {
-            return defaults();
+            IndexConfig fresh = defaults();
+            if (!Files.exists(home.resolve("registry.json")) && !Files.exists(home.resolve("indexes"))) {
+                fresh.embeddingProviders.add(builtInEmbeddingProvider());
+                fresh.searchEmbeddingModel = BUILT_IN_MODEL_ID;
+                // Persist the choice: once the first project is indexed, registry.json/indexes
+                // exist and this home would no longer look new, silently dropping the model the
+                // vectors were built with.
+                try {
+                    Files.createDirectories(home);
+                    createMapper().writerWithDefaultPrettyPrinter().writeValue(configFile.toFile(), fresh);
+                } catch (IOException e) {
+                    log.warn("Could not persist the default embedding config to {}: {}", configFile, e.getMessage());
+                }
+            }
+            return fresh;
         }
         try {
             ObjectMapper mapper = createMapper();

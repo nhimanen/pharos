@@ -5,6 +5,24 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 ## [Unreleased]
 
+**Index format:** 1 (unchanged)
+
+### Changed
+- **New installs default to granite-embedding-english-r2** (`onnx-community/granite-embedding-english-r2-ONNX`,
+  pinned to a commit, CLS pooling, 768 dims) instead of having vector search disabled. "New install" means no
+  `config.json`, `registry.json` or `indexes/` under the pharos home; the first load writes the choice to
+  `config.json`. **Existing installs keep what they have**: jina configs (old-style `embeddingModelUrl` /
+  `legacy`, or explicit providers) are untouched, and a config with no embedding settings stays keyword-only.
+  No re-embed is forced. Basis: embedding A/B (`docs/superpowers/gates/2026-11-16-embedding-ab.md`). Peak RSS
+  is about 2.8 GB vs 2.3 GB and CPU embedding is slower.
+- To switch an existing install, see UPGRADING.md ("Switching to granite-r2 (optional)"). Embedding caches
+  do not carry over between models.
+
+### Added
+- Embedding pooling (`pooling`: `mean` or `cls`) and `queryPrefix` / `documentPrefix` per provider.
+- `hf://owner/name@<sha>` pins a HuggingFace model to a commit (7-40 hex chars).
+- External ONNX weights (`model.onnx_data`) are downloaded when a repo has them.
+
 ### Fixed
 - Vector search returned nothing (hybrid silently fell back to keyword) for configs using the old
   single-model form (`embeddingModelUrl`), or any provider with model id `legacy`: indexing wrote

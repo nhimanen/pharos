@@ -44,6 +44,38 @@ directory. If you also have a project named `lucene`, the `.` project may have p
 `lucene` index lives one level down, in `indexes/lucene/lucene/`: never touch that folder.
 **Never delete project subdirectories** of the indexes directory.
 
+## Switching to granite-r2 (optional)
+
+New installs use granite-embedding-english-r2 by default. An existing install keeps its current model
+(jina, or keyword-only); nothing changes on upgrade and no re-embed happens. The index format is unchanged.
+
+To switch, replace the embedding settings in `~/.pharos/config.json`:
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "granite-r2",
+      "type": "djl",
+      "url": "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+      "dimensions": 768,
+      "maxTokens": 512,
+      "pooling": "cls"
+    }
+  ],
+  "searchEmbeddingModel": "granite-r2"
+}
+```
+
+Then re-embed: `pharos index --full <project>` per project, or keep the old vectors and add the new ones
+alongside with `pharos embed --model=granite-r2 --all` (list both providers in `embeddingProviders` and set
+`searchEmbeddingModel` to the one to search). Embedding caches are per model and do not carry over, so the first
+run embeds everything: expect hours for a large project on CPU (10.9 h for the lucene source tree in the A/B,
+against about 30 min for jina from cache). Peak memory is about 2.8 GB (jina about 2.3 GB).
+
+To stay on jina, change nothing; to pin it explicitly, keep your `embeddingProviders` entry for
+`hf://jinaai/jina-embeddings-v2-base-code`.
+
 ## Upgrading to 1.4.0 (index format 1)
 
 ### What changed
