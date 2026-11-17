@@ -297,4 +297,10 @@ t_release_with_upgrade_indexes_installs_then_upgrades
 t_bad_release_tag_rejected
 t_checksum_naming_other_file_fails
 t_release_notes_extracts_and_validates
+t_python_cli_embeddings() {
+  python3 -I "$REPO/scripts/test_pharos_cli.py" >"$WORK/pycli.log" 2>&1
+  check python_cli_embeddings $? "$(tail -5 "$WORK/pycli.log")"
+}
+t_python_cli_embeddings
+
 exit "$FAILED"

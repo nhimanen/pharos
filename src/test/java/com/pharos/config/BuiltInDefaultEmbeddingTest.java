@@ -9,7 +9,7 @@ import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Built-in granite-r2 default applies to new installs only; existing configs keep their model. */
+/** Nothing enables embeddings implicitly: fresh and existing homes load exactly what they name. */
 class BuiltInDefaultEmbeddingTest {
 
     @TempDir Path home;

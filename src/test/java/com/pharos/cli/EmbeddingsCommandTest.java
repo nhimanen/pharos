@@ -12,12 +12,15 @@ import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintStream;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EmbeddingsCommandTest {
     static final String GRANITE_URL =
@@ -161,5 +164,63 @@ class EmbeddingsCommandTest {
         String o = out.toString();
         assertThat(o).contains("granite-r2").contains("pool=cls").contains(GRANITE_URL);
         assertThat(o).containsPattern("alpha\\s+yes").containsPattern("beta\\s+no");
+    }
+
+    @Test
+    void failedWriteLeavesOriginalConfigByteIdentical() throws Exception {
+        String orig = "{\"verbose\":true,\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"jina-code-v2\","
+                + "\"url\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"dimensions\":768}]}";
+        Files.writeString(home.resolve("config.json"), orig);
+        EmbeddingsCommand.beforeMove = tmp -> { throw new UncheckedIOException(new IOException("boom")); };
+        try {
+            assertThatThrownBy(() -> run("enable", "--force")).isNotNull();
+        } catch (AssertionError ignored) {
+            // execute() returns nonzero instead of throwing; either way the file must be intact
+        } finally {
+            EmbeddingsCommand.beforeMove = p -> { };
+        }
+        assertThat(Files.readString(home.resolve("config.json"))).isEqualTo(orig);
+        assertThat(home.resolve("config.json.tmp")).doesNotExist();
+    }
+
+    @Test
+    void emptyOrNonObjectConfigIsReportedNotCrashed() throws Exception {
+        for (String bad : new String[]{"", "[]", "\"x\"", "42"}) {
+            Files.writeString(home.resolve("config.json"), bad);
+            err.reset();
+            assertThat(run("enable")).isNotZero();
+            assertThat(err.toString()).contains("config.json is not a JSON object");
+            assertThat(run("disable")).isNotZero();
+            assertThat(Files.readString(home.resolve("config.json"))).isEqualTo(bad);
+        }
+    }
+
+    @Test
+    void forceListsTheProvidersItRemoves() throws Exception {
+        Files.writeString(home.resolve("config.json"),
+                "{\"embeddingProviders\":[{\"type\":\"djl\",\"modelId\":\"a\",\"url\":\"hf://x/a\",\"dimensions\":8},"
+                        + "{\"type\":\"djl\",\"modelId\":\"b\",\"url\":\"hf://x/b\",\"dimensions\":8}]}");
+        assertThat(run("enable", "--force")).isZero();
+        assertThat(out.toString()).contains("a  hf://x/a").contains("b  hf://x/b");
+        assertThat(config().get("embeddingProviders")).hasSize(1);
+    }
+
+    @Test
+    void nestedUnknownKeysSurviveEnableAndDisable() throws Exception {
+        Files.writeString(home.resolve("config.json"), "{\"cluster\":{\"token\":\"s3cret\",\"nodes\":[1,2]}}");
+        assertThat(run("enable")).isZero();
+        assertThat(config().get("cluster").get("token").asText()).isEqualTo("s3cret");
+        assertThat(run("disable")).isZero();
+        assertThat(config().get("cluster").get("nodes")).hasSize(2);
+    }
+
+    @Test
+    void statusWithLegacyConfigShowsLegacyModelAndVectors() throws Exception {
+        Files.writeString(home.resolve("config.json"),
+                "{\"embeddingModelUrl\":\"hf://jinaai/jina-embeddings-v2-base-code\",\"embeddingDimensions\":768}");
+        registry.register(new ProjectMeta("old", home.resolve("o").toString(), home.resolve("io").toString()));
+        assertThat(run("status")).isZero();
+        assertThat(out.toString()).contains("legacy").contains("hf://jinaai/jina-embeddings-v2-base-code")
+                .containsPattern("old\\s+yes");
     }
 }

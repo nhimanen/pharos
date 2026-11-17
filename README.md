@@ -252,14 +252,14 @@ On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches
 {
   "embeddingProviders": [
     {
-      "modelId": "jina-v2-code",
+      "modelId": "jina-code-v2",
       "type": "djl",
       "url": "hf://jinaai/jina-embeddings-v2-base-code",
       "dimensions": 768,
       "maxTokens": 512
     }
   ],
-  "searchEmbeddingModel": "jina-v2-code"
+  "searchEmbeddingModel": "jina-code-v2"
 }
 ```
 

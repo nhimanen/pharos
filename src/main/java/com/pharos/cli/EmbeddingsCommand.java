@@ -12,6 +12,7 @@ import com.pharos.indexer.IndexVersions;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.Callable;
@@ -56,15 +57,42 @@ public class EmbeddingsCommand implements Runnable {
         @picocli.CommandLine.ParentCommand EmbeddingsCommand parent;
     }
 
+    /** Test hook: runs after the temp file is fully written, before it replaces config.json. */
+    static java.util.function.Consumer<Path> beforeMove = p -> { };
+
     private ObjectNode readConfig() throws java.io.IOException {
         Path f = home.resolve("config.json");
         if (!Files.exists(f)) return MAPPER.createObjectNode();
-        return (ObjectNode) MAPPER.readTree(f.toFile());
+        var node = MAPPER.readTree(f.toFile());
+        if (node == null || !node.isObject()) {
+            throw new IllegalArgumentException("config.json is not a JSON object: " + f);
+        }
+        return (ObjectNode) node;
     }
 
+    /** Atomic: temp file in the same directory, then move over config.json (same as ProjectRegistry). */
     private void writeConfig(ObjectNode cfg) throws java.io.IOException {
         Files.createDirectories(home);
-        MAPPER.writeValue(home.resolve("config.json").toFile(), cfg);
+        Path target = home.resolve("config.json");
+        Path tmp = home.resolve("config.json.tmp");
+        try {
+            MAPPER.writeValue(tmp.toFile(), cfg);
+            beforeMove.accept(tmp);
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException | RuntimeException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+    }
+
+    private ObjectNode readConfigOrReport() throws java.io.IOException {
+        try {
+            return readConfig();
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            return null;
+        }
     }
 
     @Command(name = "enable", mixinStandardHelpOptions = true,
@@ -84,7 +112,8 @@ public class EmbeddingsCommand implements Runnable {
                 System.err.println("Unknown model '" + model + "' (use granite-r2 or jina-code-v2).");
                 return 2;
             }
-            ObjectNode cfg = parent.readConfig();
+            ObjectNode cfg = parent.readConfigOrReport();
+            if (cfg == null) return 1;
             ObjectNode target = MAPPER.valueToTree(preset);
 
             boolean hasProviders = cfg.has("embeddingProviders") && cfg.get("embeddingProviders").size() > 0;
@@ -113,6 +142,14 @@ public class EmbeddingsCommand implements Runnable {
                     + " (hours for a large project on CPU; peak memory about 2.8 GB). Nothing is downloaded"
                     + " or embedded now.");
 
+            if (hasProviders) {
+                System.out.println("Replacing configured provider(s):");
+                for (var old : cfg.get("embeddingProviders")) {
+                    System.out.println("  - " + old.path("modelId").asText("?") + "  " + old.path("url").asText("?"));
+                }
+            } else if (hasLegacy) {
+                System.out.println("Replacing legacy embeddingModelUrl: " + cfg.get("embeddingModelUrl").asText());
+            }
             for (String k : EMBEDDING_KEYS) cfg.remove(k);
             ArrayNode providers = cfg.putArray("embeddingProviders");
             providers.add(target);
@@ -141,7 +178,8 @@ public class EmbeddingsCommand implements Runnable {
                 System.out.println("Embeddings are already off.");
                 return 0;
             }
-            ObjectNode cfg = parent.readConfig();
+            ObjectNode cfg = parent.readConfigOrReport();
+            if (cfg == null) return 1;
             boolean changed = false;
             for (String k : EMBEDDING_KEYS) changed |= cfg.remove(k) != null;
             if (changed) parent.writeConfig(cfg);
