@@ -640,6 +640,32 @@ class RemoteDirectoryTest {
         assertThat(cache.stats().bytesOnDisk()).isZero();
     }
 
+    /**
+     * A ranged body that ends early (connection closed mid-body, no SDK error) is an EOF on the
+     * uncached path: the block is never served short, and nothing is cached.
+     */
+    @Test
+    void midBodyTruncationOnTheUncachedPathIsEof() throws Exception {
+        Blob b = blob("_t.bin", 3 * KIB);
+        BlockCache cache = track(new BlockCache(tmp.resolve("no-space-trunc"), 1L << 30, KIB, 4,
+                System::currentTimeMillis, () -> 0L));
+        ReplicaSource truncating = new DelegatingSource(source) {
+            @Override
+            public InputStream openRange(ManifestFile file, long offset, long length) throws IOException {
+                try (InputStream in = super.openRange(file, offset, length)) {
+                    return new java.io.ByteArrayInputStream(in.readNBytes((int) (length / 2)));
+                }
+            }
+        };
+        RemoteDirectory dir = remote(cache, null, truncating, b.manifest());
+        try (IndexInput in = dir.openInput("_t.bin", IOContext.DEFAULT)) {
+            assertThatThrownBy(in::readByte)
+                    .isInstanceOf(IOException.class)
+                    .hasStackTraceContaining("short range body");
+        }
+        assertThat(cache.stats().bytesOnDisk()).isZero();
+    }
+
     /** An eager copy of the wrong size (a torn download, tampering) is replaced, not fatal. */
     @Test
     void eagerFileOfTheWrongSizeIsDownloadedAgain() throws Exception {

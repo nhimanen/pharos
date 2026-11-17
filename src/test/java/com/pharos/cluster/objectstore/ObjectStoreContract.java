@@ -146,6 +146,27 @@ public abstract class ObjectStoreContract {
         assertThat(t).doesNotExist();
     }
 
+    /** S3 answers 416 when the range starts at or past the end; that is an EOF, not a generic failure. */
+    @Test
+    void rangeStartingAtOrPastEndIsEof() throws IOException {
+        putRangeObject("range/416");
+        for (long offset : new long[] {10_000, 10_001, 20_000}) {
+            Path t = tmp.resolve("416-" + offset + ".bin");
+            assertThatThrownBy(() -> store().downloadRange("range/416", offset, 1, t))
+                    .as("offset %d", offset).isInstanceOf(EOFException.class);
+            assertThat(t).doesNotExist();
+        }
+    }
+
+    /** A range ending exactly at the last byte is complete (206 with the full requested length). */
+    @Test
+    void rangeEndingAtLastByteIsComplete() throws IOException {
+        byte[] data = putRangeObject("range/tail");
+        Path t = tmp.resolve("tail.bin");
+        store().downloadRange("range/tail", 9_000, 1_000, t);
+        assertThat(Files.readAllBytes(t)).isEqualTo(java.util.Arrays.copyOfRange(data, 9_000, 10_000));
+    }
+
     @Test
     void rangeOfMissingKeyIsNoSuchFile() {
         Path t = tmp.resolve("missing.bin");
@@ -214,6 +235,12 @@ public abstract class ObjectStoreContract {
         putRangeObject("orange/short");
         assertThatThrownBy(() -> readRange("orange/short", 9990, 11)).isInstanceOf(EOFException.class);
         assertThatThrownBy(() -> readRange("orange/short", 10_001, 1)).isInstanceOf(EOFException.class);
+    }
+
+    @Test
+    void openRangeStartingAtEndIsEof() throws IOException {
+        putRangeObject("orange/416");
+        assertThatThrownBy(() -> readRange("orange/416", 10_000, 1)).isInstanceOf(EOFException.class);
     }
 
     @Test
