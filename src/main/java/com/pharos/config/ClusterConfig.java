@@ -40,6 +40,10 @@ public class ClusterConfig {
     private String token;
     private int heartbeatSeconds = 10;
     private int readerTtlSeconds = 30;
+    /** Timeout of one internal shard call (term statistics, shard search, snippets, callees). */
+    private int fanoutTimeoutMillis = 5000;
+    /** Connect timeout of an internal shard call; a dead reader fails this fast. */
+    private int connectTimeoutMillis = 1000;
 
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
@@ -90,6 +94,17 @@ public class ClusterConfig {
         if (retireGraceSeconds < 2L * pollIntervalSeconds) {
             throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
                     + ") must be at least twice cluster.pollIntervalSeconds (" + pollIntervalSeconds + ")");
+        }
+        if (fanoutTimeoutMillis <= 0) {
+            throw new IllegalStateException("cluster.fanoutTimeoutMillis must be positive, got " + fanoutTimeoutMillis);
+        }
+        if (connectTimeoutMillis <= 0) {
+            throw new IllegalStateException("cluster.connectTimeoutMillis must be positive, got " + connectTimeoutMillis);
+        }
+        if (retireGraceSeconds * 1000L < fanoutTimeoutMillis) {
+            throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
+                    + " s) must cover cluster.fanoutTimeoutMillis (" + fanoutTimeoutMillis
+                    + " ms): a retired shard directory must outlive the longest shard call");
         }
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
@@ -162,6 +177,10 @@ public class ClusterConfig {
     public void setToken(String v) { this.token = v; }
     public int getHeartbeatSeconds() { return heartbeatSeconds; }
     public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }
+    public int getFanoutTimeoutMillis() { return fanoutTimeoutMillis; }
+    public void setFanoutTimeoutMillis(int v) { this.fanoutTimeoutMillis = v; }
+    public int getConnectTimeoutMillis() { return connectTimeoutMillis; }
+    public void setConnectTimeoutMillis(int v) { this.connectTimeoutMillis = v; }
     public int getReaderTtlSeconds() { return readerTtlSeconds; }
     public void setReaderTtlSeconds(int v) { this.readerTtlSeconds = v; }
 

@@ -276,4 +276,23 @@ class ClusterConfigTest {
         c.setRetireGraceSeconds(120);
         c.validate();
     }
+
+    @Test
+    void retireGraceMustCoverFanoutTimeout() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"retireGraceSeconds\":20,\"fanoutTimeoutMillis\":25000}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.retireGraceSeconds")
+                .hasMessageContaining("cluster.fanoutTimeoutMillis");
+        assertThatCode(() -> parse("{\"cluster\":{\"retireGraceSeconds\":25,\"fanoutTimeoutMillis\":25000}}"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void fanoutTimeoutsHaveDefaultsAndMustBePositive() throws Exception {
+        ClusterConfig c = parse("{}");
+        assertThat(c.getFanoutTimeoutMillis()).isEqualTo(5000);
+        assertThat(c.getConnectTimeoutMillis()).isEqualTo(1000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"connectTimeoutMillis\":0}}"))
+                .hasMessageContaining("cluster.connectTimeoutMillis");
+    }
 }

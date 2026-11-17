@@ -37,6 +37,13 @@ directory. If you also have a project named `lucene`, the `.` project may have p
 `lucene` index lives one level down, in `indexes/lucene/lucene/`: never touch that folder.
 **Never delete project subdirectories** of the indexes directory.
 
+## Cluster readers: `retireGraceSeconds` rules
+
+`cluster.retireGraceSeconds` (default 120) must be at least `2 x cluster.pollIntervalSeconds` and at
+least `cluster.fanoutTimeoutMillis / 1000` (default 5 s). A reader whose config breaks either rule
+refuses to start and names both fields; raise `retireGraceSeconds` (or lower the other value).
+Readers also need `cluster.token` (already required) for the new `/internal/*` shard API.
+
 ## Upgrading to 1.4.0 (index format 1)
 
 ### What changed

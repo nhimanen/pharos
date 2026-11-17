@@ -41,6 +41,14 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 - A lazy reader held on an older generation by a refused newer one downloads the rest of it in
   the background, so the bucket's GC can't strand it; switching a reader from lazy to full deletes
   the unused block cache.
+- Cluster readers serve an internal shard API (`/internal/term-stats`, `/shard-search`, `/snippets`,
+  `/callees`) guarded by `cluster.token` (`X-Pharos-Cluster-Token`, constant-time compare, 401 without it).
+  New config: `cluster.fanoutTimeoutMillis` (5000), `cluster.connectTimeoutMillis` (1000).
+
+### Changed
+- Config validation: `cluster.retireGraceSeconds` must be at least `2 x cluster.pollIntervalSeconds`
+  and at least `cluster.fanoutTimeoutMillis` (in seconds); a reader config that violated either now
+  fails at startup with a message naming both fields (see UPGRADING.md).
 
 ## [1.4.1] - 2026-11-16
 
