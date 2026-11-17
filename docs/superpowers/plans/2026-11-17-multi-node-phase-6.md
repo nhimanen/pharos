@@ -111,7 +111,7 @@
 
 ### Task 4: Resharding job
 
-**Files:** `cluster/sharding/ReshardJob.java` (runs on writers under a per-project reshard lease), `cli/ReshardCommand.java` (`pharos reshard <project> --spec "[project, hash(path) % 4]"` and `--status`), and the catalog flip by CAS
+**Files:** `cluster/sharding/ReshardJob.java` (runs on writers under a per-project reshard lease), `cli/ReshardCommand.java` (`pharos reshard <project> --spec "[project, ring(path, shards=4)]"` and `--status`), and the catalog flip by CAS
 
 **Behaviour:**
 1. Write the new spec version as `staged`.
