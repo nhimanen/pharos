@@ -701,4 +701,44 @@ class ReplicaSyncerTest {
             assertThat(genDirNames()).containsExactly("gen-3", "gen-4");
         }
     }
+
+    // ---- pinning ----
+
+    @Test
+    void pinnedReaderSyncsOnlyItsShards() throws Exception {
+        publishFull();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEmpty();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
+        assertThat(cacheDir.resolve(PROJECT)).doesNotExist();
+    }
+
+    @Test
+    void unpinningSyncsTheRest() throws Exception {
+        publishFull();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        syncer.pin(java.util.Set.of());
+        syncer.syncOnce();
+        assertThat(syncer.served()).containsKey(SHARD);
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+    }
+
+    @Test
+    void repinningAwayUnregistersAndPrunesAfterGrace() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        Path dir = genDir(1);
+        assertThat(dir).isDirectory();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEmpty();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
+        assertThat(dir).as("kept one pass for in-flight queries").isDirectory();
+        syncer.syncOnce();
+        assertThat(dir).doesNotExist();
+    }
 }

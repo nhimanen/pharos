@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -125,6 +126,10 @@ public class ReplicaSyncer implements Closeable {
     private final Map<ShardId, Generation> registered = new HashMap<>();
     /** Generation last refused per shard by the format gate; its WARN is not repeated every poll. */
     private final Map<ShardId, Generation> refused = new HashMap<>();
+    /** Shards this reader is pinned to; empty serves every catalog shard. */
+    private volatile Set<ShardId> pinned = Set.of();
+    /** Shards dropped by pinning: unregistered, directories removed one pass later (in-flight queries). */
+    private final Set<ShardId> retired = new HashSet<>();
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
     private ScheduledExecutorService scheduler;
@@ -158,6 +163,11 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
+    /** Pins this reader to {@code shards}; empty serves all. Takes effect on the next pass. */
+    public void pin(Collection<ShardId> shards) {
+        this.pinned = Set.copyOf(shards);
+    }
+
     /** Generation currently served per shard. */
     public Map<ShardId, Generation> served() {
         return Map.copyOf(served);
@@ -176,8 +186,12 @@ public class ReplicaSyncer implements Closeable {
             } catch (RuntimeException e) {
                 throw new IOException("unreadable shard catalog: " + e.getMessage(), e);
             }
+            Set<ShardId> pin = pinned;
+            if (!pin.isEmpty()) shards = shards.stream().filter(pin::contains).toList();
+            dropUnwanted(shards);
             for (ShardId shard : shards) {
                 if (closed) return;
+                retired.remove(shard);
                 try {
                     syncShard(shard);
                 } catch (IOException | RuntimeException e) {
@@ -212,6 +226,41 @@ public class ReplicaSyncer implements Closeable {
             });
             scheduler.scheduleWithFixedDelay(this::syncQuietly, initialDelay.toMillis(), pollInterval.toMillis(),
                     TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Stops serving shards no longer wanted (pinned away, or gone from the catalog): unregisters and
+     * deactivates them at once, and deletes their directories on the next pass so queries already
+     * reading them finish.
+     */
+    private void dropUnwanted(List<ShardId> wanted) {
+        Set<ShardId> keep = new HashSet<>(wanted);
+        for (ShardId shard : retired.toArray(ShardId[]::new)) {
+            if (keep.contains(shard)) continue;
+            try {
+                deleteRecursively(cacheDir.resolve(shard.value()));
+                retired.remove(shard);
+            } catch (IOException | RuntimeException e) {
+                log.warn("Shard {}: removing its cache dir failed (retried next pass): {}", shard, e.toString());
+            }
+        }
+        for (ShardId shard : served.keySet()) {
+            if (keep.contains(shard)) continue;
+            Path active = cache.active(shard.value()).orElse(null);
+            try {
+                registry.unregister(shard.value());
+            } catch (RuntimeException e) {
+                log.warn("Shard {}: unregistering failed (retried next pass): {}", shard, e.toString());
+                continue;
+            }
+            cache.deactivate(shard.value());
+            if (active != null) GraphViews.evict(active);
+            served.remove(shard);
+            registered.remove(shard);
+            refused.remove(shard);
+            retired.add(shard);
+            log.info("Shard {} is no longer served by this reader", shard);
         }
     }
 

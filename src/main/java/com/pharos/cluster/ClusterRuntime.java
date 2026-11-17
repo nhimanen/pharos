@@ -224,15 +224,16 @@ public final class ClusterRuntime implements Closeable {
 
     private com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {
         ClusterConfig c = config.getCluster();
-        List<String> shards = new ArrayList<>(c.getReader().getShards());
-        if (shards.isEmpty()) {
-            java.util.TreeSet<String> names = new java.util.TreeSet<>();
-            synchronized (this) {
-                if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
-            }
-            registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
-            shards.addAll(names);
+        // The shards actually held, so routing never guesses what "all" means; a pinned reader
+        // advertises only what it holds of its pin.
+        java.util.TreeSet<String> names = new java.util.TreeSet<>();
+        synchronized (this) {
+            if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
         }
+        registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
+        List<String> pin = c.getReader().getShards();
+        if (!pin.isEmpty()) names.retainAll(pin);
+        List<String> shards = new ArrayList<>(names);
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 false, readerCacheStats(), load.inFlight(), load.qps(), 0L);
     }
@@ -376,6 +377,7 @@ public final class ClusterRuntime implements Closeable {
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
+        s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);

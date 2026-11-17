@@ -28,6 +28,12 @@ public class ReaderLocalCache implements LocalCache {
         if (previous != null && !previous.equals(generationDir)) GraphViews.evict(previous);
     }
 
+    /** Stops serving {@code project}; its generation dirs stay until the caller removes them. */
+    public void deactivate(String project) {
+        Path previous = active.remove(project);
+        if (previous != null) GraphViews.evict(previous);
+    }
+
     /** The active generation dir, or {@code <cacheDir>/<project>/none} (never created) before the first. */
     @Override
     public Path shardDir(String project) {
