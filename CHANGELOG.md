@@ -3,7 +3,7 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.5.0] - 2026-11-17
 
 **Index format:** 1 (unchanged)
 
@@ -27,13 +27,50 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   +0.068 [+0.008, +0.129], tie with the cross-encoder reranker (-0.009); peak RSS about 2.8 GB vs 2.3 GB and
   slower CPU embedding. Existing jina installs keep jina; switch with
   `pharos embeddings enable --model granite-r2 --force` plus a re-embed (embedding caches do not carry over).
-  `enable` refuses to replace a different provider without `--force`. `setup.sh` prints a hint that semantic
-  search is off.
+  `enable` refuses to replace a different provider without `--force`; asking for the model that is already
+  configured (same URL ignoring an `@<sha>` pin, including the old `embeddingModelUrl` form) reports "already
+  configured" and exits 0. `setup.sh` prints a hint that semantic search is off only when no embedding provider is
+  configured.
+- **Opt-in flow: `pharos index --full <root path>` embeds a project.** `enable` and `embeddings status` print it
+  (status prints the exact command per project without vectors: `pharos index --full --single --project <name>
+  <root path>`; `index` takes the project's directory, not its name). `pharos embed` is not the opt-in path: it
+  only adds a model next to vectors an index already has. On an index with no vector fields it now fails with
+  "this index has no vectors yet; run `pharos index --full …` to embed it" (nonzero exit), and it records a model
+  in the project's `embeddedModels` only when the index holds that model's vectors afterwards (before, a run that
+  embedded 0 documents registered the model anyway).
+- The jina preset id is **`jina-v2-code`** (`pharos embeddings enable --model jina-v2-code`), the id README
+  documented for the jina provider block before 1.5.0; the `jina-code-v2` spelling used during 1.5.0 development
+  is gone. Existing configs keep whatever id they have (the vector field is `vec.<id>`).
+
+### Changed
+- DJL 0.28 → 0.40 (its tokenizers parse list-form BPE merges, which granite-r2's `tokenizer.json` uses). jina
+  vectors are byte-identical, so existing caches and indexes stay valid.
+- Embedding failures are loud: a broken model logs a WARN and aborts the embedding pass (a batch whose every text
+  fails is retried with a canary text first; only a failing canary aborts), while a single failing text is
+  tolerated and logged. The embedding cache is saved on abort. Search warns when the query cannot be embedded and
+  results fall back to keyword-only.
+- `hybrid-reranked` scores are now on the RRF scale (first-stage rank fused with cross-encoder rank), not
+  cross-encoder probabilities; tools that thresholded the old scores need new thresholds.
+- `embeddings status` reads vectors from each project's Lucene index (live documents in the model's vector field)
+  instead of trusting the registry; it no longer reports "yes (legacy)" for keyword-only projects.
+- `index-status` sets `needsReembed` only when an embedding provider is configured; its hint and
+  `upgrade-indexes`' hints print the registered root path (`pharos index --full --single --project <name> <root
+  path>`) instead of passing the project name where `index` needs a path.
+- `upgrade-indexes` lists projects with legacy-model vectors and the exact `pharos index …` command for each; it
+  does not run them (exit codes unchanged).
+- A `config.json` that fails validation no longer locks you out: `pharos embeddings disable|status` still run,
+  and every other command prints the error plus how to fix the file.
+- Legacy (`url:dims`) embedding-cache and file-state fingerprints are accepted only when the provider uses mean
+  pooling and no prefixes, the only settings older pharos versions embedded with.
+- The CLI, the daemon and `setup.sh` run the JVM with `-DOPT_OUT_TRACKING=true` (and `Main` sets it when unset):
+  DJL's telemetry otherwise calls the EC2 instance-metadata endpoint.
 
 ### Added
 - Embedding pooling (`pooling`: `mean` or `cls`) and `queryPrefix` / `documentPrefix` per provider.
 - `hf://owner/name@<sha>` pins a HuggingFace model to a commit (7-40 hex chars).
-- External ONNX weights (`model.onnx_data`) are downloaded when a repo has them.
+- External ONNX weights (`model.onnx_data`) are downloaded when a repo has them. Model caches downloaded by
+  earlier versions are probed once for a missing `model.onnx_data` and completed; offline, the probe is skipped
+  and retried on the next start.
 
 ### Fixed
 - Vector search returned nothing (hybrid silently fell back to keyword) for configs using the old
@@ -41,8 +78,10 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `vec.legacy` while search reads `vectorEmbedding`. Writers and readers now share one mapping
   (`DocumentMapper.vectorFieldFor` / `chunkVectorFieldFor`); named models keep `vec.<id>`.
   The first `pharos index` after upgrading re-indexes affected projects (indexes built by
-  1.4.0-1.4.1 with the legacy model) in full, reusing cached embeddings. `pharos embed`
-  migrates them too, and `index-status` flags such projects (`needsReembed`). Index format unchanged.
+  1.4.0-1.4.1 with the legacy model) in full, reusing cached embeddings (`index-status` flags such projects as
+  `needsReembed` and prints the command). `pharos embed` migrates only single-chunk documents; the next
+  `pharos index` finishes the rest. `pharos upgrade-indexes` lists these projects but does not migrate them.
+  Index format unchanged.
 
 ## [1.4.1] - 2026-11-16
 
