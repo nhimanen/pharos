@@ -71,6 +71,8 @@ public final class ClusterRuntime implements Closeable {
     /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    private com.pharos.cluster.membership.ReaderRegistry readerRegistry;
+    private volatile com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
     private ScheduledExecutorService follower;
@@ -201,6 +203,52 @@ public final class ClusterRuntime implements Closeable {
         return java.util.OptionalLong.of(Long.parseLong(dirName.substring("gen-".length())));
     }
 
+    /** Where the heartbeat takes {@code inFlight}/{@code qps} from (the web server's counter). */
+    public void setLoad(com.pharos.cluster.membership.LoadCounter load) {
+        this.load = Objects.requireNonNull(load, "load");
+    }
+
+    /** The live readers of the cluster; empty unless this reader is serving with a registry. */
+    public List<com.pharos.cluster.membership.ReaderHeartbeat> liveReaders() {
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        return r == null ? List.of() : r.live();
+    }
+
+    /** Marks this reader draining in the bucket (readers with a registry only). */
+    public void drain() {
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        if (r != null) r.drain();
+    }
+
+    private com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {
+        ClusterConfig c = config.getCluster();
+        List<String> shards = new ArrayList<>(c.getReader().getShards());
+        if (shards.isEmpty()) {
+            java.util.TreeSet<String> names = new java.util.TreeSet<>();
+            synchronized (this) {
+                if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
+            }
+            registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
+            shards.addAll(names);
+        }
+        return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
+                false, readerCacheStats(), load.inFlight(), load.qps(), 0);
+    }
+
+    // Holding the monitor of this.
+    private void startMembership() {
+        if (!(backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os)) return;
+        try {
+            readerRegistry = new com.pharos.cluster.membership.ReaderRegistry(os.store(), os.layout(),
+                    config.getCluster(), this::selfHeartbeat);
+            readerRegistry.start();
+        } catch (RuntimeException e) {
+            log.warn("Starting reader membership failed: {}", e.toString());
+        }
+    }
+
     public IndexPublisher publisher() {
         return backend.publisher();
     }
@@ -263,6 +311,7 @@ public final class ClusterRuntime implements Closeable {
             } else {
                 becomeFollower();
             }
+            startMembership();
         }
         modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
     }
@@ -521,9 +570,12 @@ public final class ClusterRuntime implements Closeable {
         SyncLock lock;
         ScheduledExecutorService f;
         Thread first;
+        com.pharos.cluster.membership.ReaderRegistry members;
         synchronized (this) {
             if (closed) return;
             closed = true;
+            members = readerRegistry;
+            readerRegistry = null;
             s = syncer;
             syncer = null;
             lock = syncLock;
@@ -532,6 +584,7 @@ public final class ClusterRuntime implements Closeable {
             follower = null;
             first = firstSyncThread;
         }
+        if (members != null) members.close();
         if (f != null) f.shutdownNow();
         if (s != null) s.close();
         if (first != null && first != Thread.currentThread()) {

@@ -57,12 +57,14 @@ public class WebCommand implements Callable<Integer> {
             // readiness waits for both (a hanging load is bounded by MODEL_WARMUP_TIMEOUT).
             if (searchEngine != null) searchEngine.warmUpInBackground();
             if (clusterRuntime != null) {
+                clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
                 clusterRuntime.beginServing(searchEngine != null
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
                         : java.util.concurrent.CompletableFuture.completedFuture(null)); // no wait
                 webServer.setReadiness(clusterRuntime::ready);
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
                 webServer.setDegradation(clusterRuntime::degradation);
+                webServer.setLiveReaders(clusterRuntime::liveReaders);
             }
             webServer.start(port);
             if (!noOpen) {

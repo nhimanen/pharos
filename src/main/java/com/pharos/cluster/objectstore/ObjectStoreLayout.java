@@ -18,6 +18,11 @@ public final class ObjectStoreLayout {
 
     public String catalogKey() { return root + "catalog/shards.json"; }
 
+    /** Heartbeat of reader {@code node}: {@code catalog/readers/<node>.json}. */
+    public String readerKey(String node) { return readersPrefix() + node + ".json"; }
+
+    public String readersPrefix() { return root + "catalog/readers/"; }
+
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
     public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }

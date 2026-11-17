@@ -53,6 +53,8 @@ public class WebServer {
     private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
+    private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderHeartbeat>> liveReaders = null;
+    private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -94,6 +96,29 @@ public class WebServer {
      */
     public void setDegradation(java.util.function.Supplier<String> reason) {
         this.degradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
+    public com.pharos.cluster.membership.LoadCounter load() { return load; }
+
+    /** Source of {@code GET /cluster/readers}; without one the endpoint answers 404. */
+    public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderHeartbeat>> s) {
+        this.liveReaders = java.util.Objects.requireNonNull(s, "s");
+    }
+
+    /** {@code {readers:[{node, advertiseUrl, shards, draining, ageSeconds}]}}. */
+    Map<String, Object> readersPayload() {
+        java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (var h : liveReaders.get()) {
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("node", h.node());
+            r.put("advertiseUrl", h.advertiseUrl());
+            r.put("shards", h.shards());
+            r.put("draining", h.draining());
+            r.put("ageSeconds", h.ageSeconds());
+            rows.add(r);
+        }
+        return Map.of("readers", rows);
     }
 
     /** One {@code /health} answer: the HTTP status and the payload, from one read of each signal. */
@@ -153,9 +178,15 @@ public class WebServer {
         app.before(ctx -> {
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
+                ctx.attribute("load.counted", Boolean.TRUE);
+                load.begin();
             }
         });
         app.after(ctx -> {
+            if (ctx.attribute("load.counted") != null) {
+                ctx.attribute("load.counted", null);
+                load.end();
+            }
             Long start = ctx.attribute("usage.start");
             if (start == null) return;          // not an /api/* call, or before-handler skipped it
             long latency = System.currentTimeMillis() - start;
@@ -653,6 +684,14 @@ public class WebServer {
         app.get("/health", ctx -> {
             HealthAnswer h = healthAnswer(); // status and body from the same reads
             ctx.status(h.status()).json(h.body());
+        });
+
+        app.get("/cluster/readers", ctx -> {
+            if (liveReaders == null) {
+                ctx.status(404).result("not a cluster reader");
+                return;
+            }
+            ctx.json(readersPayload());
         });
 
         app.start(port);

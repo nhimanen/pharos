@@ -219,4 +219,41 @@ class ClusterConfigTest {
                 + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":5}}}");
         assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
     }
+
+    private static final String READER = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+            + "\"objectStore\":{\"bucket\":\"b\"}%s}}";
+
+    @Test
+    void readerNeedsAdvertiseUrl() {
+        assertThatThrownBy(() -> parse(READER.formatted(",\"token\":\"t\"")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.advertiseUrl");
+    }
+
+    @Test
+    void readerNeedsToken() {
+        assertThatThrownBy(() -> parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\"")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.token");
+    }
+
+    @Test
+    void readerMembershipDefaultsAndShards() throws Exception {
+        ClusterConfig c = parse(READER.formatted(
+                ",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\",\"reader\":{\"shards\":[\"a\",\"b-1\"]}"));
+        assertThat(c.getHeartbeatSeconds()).isEqualTo(10);
+        assertThat(c.getReaderTtlSeconds()).isEqualTo(30);
+        assertThat(c.getReader().getShards()).containsExactly("a", "b-1");
+    }
+
+    @Test
+    void readerShardsMustBeValidShardIds() {
+        assertThatThrownBy(() -> parse(READER.formatted(
+                ",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\",\"reader\":{\"shards\":[\"ok\",\"../x\"]}")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
+    }
+
+    @Test
+    void ttlMustExceedHeartbeat() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"heartbeatSeconds\":30,\"readerTtlSeconds\":30}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.readerTtlSeconds");
+    }
 }

@@ -79,6 +79,8 @@ final class ClusterFixture implements AutoCloseable {
         c.setRole(role);
         c.setBackend(role == NodeRole.ALL ? BackendKind.LOCAL : BackendKind.OBJECT_STORE);
         c.setNodeId(role.json() + "-1");
+        c.setAdvertiseUrl("http://" + role.json() + "-1:7171");
+        c.setToken("test-token");
         c.setCacheDir(home.resolve("cluster-cache"));
         c.setPollIntervalSeconds(3600); // tests drive syncs explicitly
         c.getObjectStore().setBucket(bucket);

@@ -26,6 +26,14 @@ public class ClusterConfig {
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
     private ReaderConfig reader = new ReaderConfig();
+    /** Base URL other nodes reach this reader at; required on readers. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String advertiseUrl;
+    /** Shared secret of the cluster's internal endpoints; required on readers. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String token;
+    private int heartbeatSeconds = 10;
+    private int readerTtlSeconds = 30;
 
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
@@ -73,6 +81,21 @@ public class ClusterConfig {
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
         }
+        if (heartbeatSeconds <= 0) {
+            throw new IllegalStateException("cluster.heartbeatSeconds must be positive, got " + heartbeatSeconds);
+        }
+        if (readerTtlSeconds <= heartbeatSeconds) {
+            throw new IllegalStateException("cluster.readerTtlSeconds must exceed cluster.heartbeatSeconds ("
+                    + heartbeatSeconds + "), got " + readerTtlSeconds);
+        }
+        if (role == NodeRole.READER) {
+            if (advertiseUrl == null || advertiseUrl.isBlank()) {
+                throw new IllegalStateException("cluster.advertiseUrl is required on a reader (the base URL other nodes reach it at)");
+            }
+            if (token == null || token.isBlank()) {
+                throw new IllegalStateException("cluster.token is required on a reader (shared secret of the cluster)");
+            }
+        }
         if (reader == null) reader = new ReaderConfig();
         reader.validate();
         if (backend == BackendKind.OBJECT_STORE) {
@@ -110,6 +133,14 @@ public class ClusterConfig {
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
+    public String getAdvertiseUrl() { return advertiseUrl; }
+    public void setAdvertiseUrl(String v) { this.advertiseUrl = v; }
+    public String getToken() { return token; }
+    public void setToken(String v) { this.token = v; }
+    public int getHeartbeatSeconds() { return heartbeatSeconds; }
+    public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }
+    public int getReaderTtlSeconds() { return readerTtlSeconds; }
+    public void setReaderTtlSeconds(int v) { this.readerTtlSeconds = v; }
 
     /**
      * {@code cluster.reader}: how a reader node serves a generation. {@code lazy} (the default) keeps
@@ -132,9 +163,19 @@ public class ClusterConfig {
         private int maxConcurrentFetches = 16;
         /** Cap of a private block cache (a second process on the cache dir); 0 derives it. */
         private long privateCacheMaxBytes = 0;
+        /** Project names this reader is pinned to; empty means every shard. */
+        private java.util.List<String> shards = java.util.List.of();
 
         /** @throws IllegalStateException naming the offending field */
         public void validate() {
+            if (shards == null) shards = java.util.List.of();
+            for (String s : shards) {
+                try {
+                    new com.pharos.cluster.ShardId(s);
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalStateException("cluster.reader.shards: " + e.getMessage());
+                }
+            }
             if (!LAZY.equals(mode) && !FULL.equals(mode)) {
                 throw new IllegalStateException("cluster.reader.mode must be 'lazy' or 'full', got '" + mode + "'");
             }
@@ -182,6 +223,8 @@ public class ClusterConfig {
         public void setPrefetchExtensions(java.util.List<String> v) { this.prefetchExtensions = v; }
         public int getPrefetchTimeoutSeconds() { return prefetchTimeoutSeconds; }
         public void setPrefetchTimeoutSeconds(int v) { this.prefetchTimeoutSeconds = v; }
+        public java.util.List<String> getShards() { return shards; }
+        public void setShards(java.util.List<String> v) { this.shards = v == null ? java.util.List.of() : java.util.List.copyOf(v); }
         public int getMaxConcurrentFetches() { return maxConcurrentFetches; }
         public long getPrivateCacheMaxBytes() { return privateCacheMaxBytes; }
         public void setPrivateCacheMaxBytes(long v) { this.privateCacheMaxBytes = v; }
