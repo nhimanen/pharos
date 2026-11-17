@@ -61,6 +61,20 @@ class SearchModelMismatchTest {
     }
 
     @Test
+    void vectorSearch_onKeywordOnlyProject_suggestsFullIndexNotEmbed() {
+        // The opt-in flow: embeddings just enabled, project indexed keyword-only. `pharos embed`
+        // cannot help there (it needs existing vectors); a full index of the root path does.
+        registry.register(new ProjectMeta("proj-k", "/src/proj-k", tempDir.resolve("indexes/proj-k").toString()));
+        SearchEngine engine = new SearchEngine(luceneIndexer, new StubProvider("granite-r2"), registry);
+        SearchRequest req = new SearchRequest("test", SearchRequest.SearchType.VECTOR, "proj-k", null, 10, "text",
+                null, null, 0);
+        assertThatThrownBy(() -> engine.searchWithTrace(req, false))
+                .isInstanceOf(VectorModelUnavailableException.class)
+                .hasMessageContaining("pharos index --full --single --project proj-k /src/proj-k")
+                .hasMessageNotContaining("pharos embed");
+    }
+
+    @Test
     void keywordSearch_doesNotTriggerVectorValidation() {
         // A project that has NO vectors for the configured model should still
         // serve a pure-keyword query without complaint.

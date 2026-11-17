@@ -151,6 +151,12 @@ public class MultiModelEmbedder {
         List<DocSnapshot> snapshots = new ArrayList<>();
         IndexReader reader = luceneIndexer.openReader(projectName);
         Set<String> vecFieldNames = collectVectorFieldNames(reader);
+        // This command rewrites vector-bearing docs only (phase 1 walks the vector iterators), so
+        // on a keyword-only index it would update nothing; the full index run is what embeds it.
+        if (vecFieldNames.isEmpty()) {
+            throw new IllegalStateException("Project '" + projectName + "': this index has no vectors yet; run `"
+                    + ReindexHint.fullIndexCommand(projectName, meta.getRootPath()) + "` to embed it.");
+        }
 
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
@@ -304,8 +310,11 @@ public class MultiModelEmbedder {
         if (cache != null) cache.save();
 
         // ── Phase 3: bookkeeping ─────────────────────────────────────────────
+        // Record the model only when the index now holds its vectors: registering it after an
+        // empty run made search treat the project as embedded with a field that does not exist.
+        boolean hasModelVectors = updated > 0 || skippedExisting > 0;
         List<String> embedded = new ArrayList<>(meta.getEmbeddedModels());
-        if (!embedded.contains(modelId)) {
+        if (hasModelVectors && !embedded.contains(modelId)) {
             embedded.add(modelId);
             meta.setEmbeddedModels(embedded);
             registry.register(meta);
@@ -315,6 +324,11 @@ public class MultiModelEmbedder {
                 "%d multi-chunk skipped, %d non-java skipped, %d missing-file skipped, %d no-match skipped%n",
                 modelId, projectName, updated, skippedExisting, skippedMultiChunk,
                 skippedNonJava, skippedMissingFile, skippedNoMatch);
+        if (skippedMultiChunk > 0 || skippedNonJava > 0) {
+            System.out.printf("  %d doc(s) need a full re-index for '%s': %s%n",
+                    skippedMultiChunk + skippedNonJava, modelId,
+                    ReindexHint.fullIndexCommand(projectName, meta.getRootPath()));
+        }
         return updated;
     }
 

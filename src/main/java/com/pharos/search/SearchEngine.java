@@ -1001,11 +1001,16 @@ public class SearchEngine {
                 String available = embeddedModels.isEmpty()
                         ? "<legacy / none recorded>"
                         : String.join(", ", embeddedModels);
+                // `pharos embed` only adds a model next to existing vectors; a project with none
+                // (keyword-only, e.g. right after `pharos embeddings enable`) needs a full index.
+                String fullIndex = com.pharos.indexer.ReindexHint.fullIndexCommand(p, meta.getRootPath());
+                String fix = embeddedModels.isEmpty()
+                        ? fullIndex
+                        : "pharos embed --model=" + modelId + " " + p + " (or " + fullIndex + ")";
                 throw new VectorModelUnavailableException(String.format(
                         "Project '%s' has no vectors for search embedding model '%s'. " +
-                        "Available model(s): %s. " +
-                        "Run: pharos embed --model=%s %s",
-                        p, modelId, available, modelId, p));
+                        "Available model(s): %s. Run: %s",
+                        p, modelId, available, fix));
             }
         }
     }
