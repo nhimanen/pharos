@@ -7,6 +7,17 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 **Index format:** 1 (unchanged)
 
+### Fixed (cross-encoder reranking lowered quality)
+- `hybrid-reranked` scored below plain `hybrid`. Three causes, all fixed: the reranker passage never contained the
+  class or camelCase method name (it now starts with `ClassName.methodName`); `CrossEncoderReranker` and
+  `CrossEncoderMerger` replaced the first-stage score with a saturated cross-encoder probability (they now fuse
+  first-stage rank and cross-encoder rank with equal-weight RRF, k=60); and `hybrid-reranked` reranked a smaller
+  pool than `hybrid` (it now gets the same adaptive oversample). Measured on the real daemons (99 queries,
+  MRR@10 / P@1): jina hybrid 0.588 / 0.495, hybrid-reranked 0.579 -> **0.647** / 0.444 -> **0.566**;
+  granite hybrid 0.664 / 0.566, hybrid-reranked 0.569 -> **0.661** / 0.414 -> **0.556**.
+  `auto` no longer dispatches to the reranked child (`_auto-hybrid-rrf` instead): reranked did not reach hybrid on
+  both models (granite -0.003, within noise).
+
 ### Added (embeddings opt-in)
 - `pharos embeddings enable|disable|status` (Java CLI and `./pharos`). **No default changes for anyone:**
   semantic search stays off until you enable it, and `enable` never downloads or embeds by itself (it prints

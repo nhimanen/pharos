@@ -252,3 +252,28 @@ Paired bootstrap: 10000 resamples, seed 20261116, 95% percentile CI of (B - A). 
 - vector          MRR@10: A=0.5481 B=0.5975 diff=+0.0494 CI95=[-0.0171, +0.1162] -> CI excludes 0 on positive side: False
 
 **DECISION: OPT-IN ONLY**
+
+## Reranker fix
+
+Fix: the cross-encoder passage starts with `ClassName.methodName`; `CrossEncoderReranker`/`CrossEncoderMerger` fuse
+first-stage rank and cross-encoder rank by equal-weight RRF (k=60) instead of replacing the score; `hybrid-reranked`
+uses the same adaptive oversample as `hybrid`. Real run: patched jar against read-only copies of the A/B homes,
+daemons on 7193/7194, fresh bench cache, 99 queries, pipelines hybrid and hybrid-reranked.
+
+| model | pipeline | MRR@10 before | MRR@10 after | P@1 before | P@1 after |
+|---|---|---|---|---|---|
+| jina | hybrid | 0.5957 | 0.5876 | 0.4848 | 0.4949 |
+| jina | hybrid-reranked | 0.5785 | **0.6466** | 0.4444 | **0.5657** |
+| granite | hybrid | 0.6637 | 0.6637 | 0.5657 | 0.5657 |
+| granite | hybrid-reranked | 0.5690 | **0.6612** | 0.4141 | **0.5556** |
+
+Reranked minus hybrid (paired bootstrap 95% CI, after the fix): jina +0.059 [+0.017, +0.102]; granite -0.0025
+[-0.044, +0.038]. The jina hybrid number moved slightly from the original run (0.5957 to 0.5876) although hybrid
+code is unchanged, probably nondeterminism in the jina run (not investigated). Category A (exact name) is 0.972 for
+both pipelines on both models; category F (config) granite 0.581 hybrid vs 0.548 reranked, jina 0.456 vs 0.573.
+
+The offline replay predicted granite 0.677 and jina 0.660; the real run gives 0.661 and 0.647.
+
+**`auto` routing decision:** the rule was keep `HYBRID_RERANKED -> _auto-hybrid-rrf-reranked` only if reranked
+MRR@10 >= hybrid for both models. Granite misses by 0.0025 (not significant), so `auto` now dispatches to
+`_auto-hybrid-rrf`. `hybrid-reranked` itself stays available as an explicit pipeline.
