@@ -11,7 +11,7 @@ This script starts the reader JVMs itself, one configuration at a time, and stop
         trial's own, from 20 distinct lucene queries of eval/benchmark.py), then one vector query on
         pharos. Pass: lucene first-query p95 < 3 s (vector reported only). Start->ready is reported.
   warm  A lazy reader (warm cache) and a full-mode reader (MMap, production) run side by side; the
-        99 pharos+lucene benchmark queries (keyword) run 3 times per side, interleaved. Pass: lazy
+        99 pharos+lucene benchmark queries (keyword) run 3 times per side, interleaved query by query. Pass: lazy
         p95 <= 1.10 x full p95. Then top-10 checks, keyword on all 99 plus vector and hybrid on the
         pharos queries: against the production full copy (default MMapDirectory) every result (ids,
         order, score bits, stored fields) is identical; against the same copy re-opened with
@@ -457,20 +457,22 @@ def phase_warm():
         run_all(lazy, qs)  # warm the block cache (and both JVMs)
         run_all(full, qs)
         out["lazy_after_warmup"] = health(lazy.base).get("readerCache")
+        # 3 runs per side, interleaved query by query (the side that goes first alternates), so
+        # load from other processes on a shared host lands on both sides alike.
         timed = {"lazy": {}, "full": {}}
+        sides = {"lazy": lazy, "full": full}
         for run in range(3):
-            order = (("lazy", lazy), ("full", full)) if run % 2 == 0 else (("full", full), ("lazy", lazy))
-            for side, rd in order:
-                t, res = run_all(rd, qs)
-                for pl, v in t.items():
-                    timed[side].setdefault(pl, []).extend(v)
-                if run == 2:
-                    (gate / f"ref-{side}-mmap.json" if side == "full" else gate / "ref-lazy.json").write_text(
-                        json.dumps(res))
-                    if side == "lazy":
-                        lazy_res = res
-                    else:
-                        full_res = res
+            res = {"lazy": {}, "full": {}}
+            for i, (q, p, pl) in enumerate(qs):
+                order = ("lazy", "full") if (run + i) % 2 == 0 else ("full", "lazy")
+                for side in order:
+                    dt, r = search(sides[side].base, q, p, pl)
+                    timed[side].setdefault(pl, []).append(dt)
+                    res[side][f"{pl}|{p}|{q}"] = r
+            if run == 2:
+                lazy_res, full_res = res["lazy"], res["full"]
+                (gate / "ref-full-mmap.json").write_text(json.dumps(full_res))
+                (gate / "ref-lazy.json").write_text(json.dumps(lazy_res))
         out["lazy_cache"] = health(lazy.base).get("readerCache")
         out["timings"] = {s: {pl: summary(v) for pl, v in d.items()} for s, d in timed.items()}
         lk, fk = out["timings"]["lazy"]["keyword"], out["timings"]["full"]["keyword"]
