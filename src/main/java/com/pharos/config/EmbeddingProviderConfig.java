@@ -164,14 +164,35 @@ public class EmbeddingProviderConfig {
     private static final java.util.regex.Pattern HF_REPO_ID =
             java.util.regex.Pattern.compile("^[A-Za-z0-9][\\w.-]*/[\\w.-]+$");
 
-    // TODO(Task 5): this rejects '@'; allow an optional "@<sha>" revision suffix if hf://<repo>@<sha> pinning lands.
-    /** True for {@code owner/name} repo ids that cannot traverse directories. */
+    private static final java.util.regex.Pattern HF_REVISION =
+            java.util.regex.Pattern.compile("^[0-9a-fA-F]{7,40}$");
+
+    /**
+     * True for {@code owner/name} or {@code owner/name@<sha>} repo ids that cannot traverse
+     * directories. The optional revision pins the download to a commit (7-40 hex chars).
+     */
     public static boolean isValidHfRepoId(String id) {
-        if (id == null || !HF_REPO_ID.matcher(id).matches()) return false;
-        for (String seg : id.split("/")) {
+        if (id == null) return false;
+        int at = id.indexOf('@');
+        String repo = at < 0 ? id : id.substring(0, at);
+        if (at >= 0 && !HF_REVISION.matcher(id.substring(at + 1)).matches()) return false;
+        if (!HF_REPO_ID.matcher(repo).matches()) return false;
+        for (String seg : repo.split("/")) {
             if (seg.equals(".") || seg.equals("..")) return false;
         }
         return true;
+    }
+
+    /** The {@code owner/name} part of {@code owner/name[@sha]}. */
+    public static String hfRepo(String id) {
+        int at = id.indexOf('@');
+        return at < 0 ? id : id.substring(0, at);
+    }
+
+    /** The pinned revision of {@code owner/name@sha}, or {@code "main"} when unpinned. */
+    public static String hfRevision(String id) {
+        int at = id.indexOf('@');
+        return at < 0 ? "main" : id.substring(at + 1);
     }
 
     /**
@@ -201,7 +222,7 @@ public class EmbeddingProviderConfig {
                 && !isValidHfRepoId(url.substring("hf://".length()))) {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].url='" + url
-                    + "' is not a valid HuggingFace repo id (expected hf://owner/name)");
+                    + "' is not a valid HuggingFace repo id (expected hf://owner/name or hf://owner/name@<7-40 hex commit sha>)");
         }
         if ("openai".equals(type) && (model == null || model.isBlank())) {
             throw new IllegalArgumentException(

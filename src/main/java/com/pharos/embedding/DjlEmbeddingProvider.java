@@ -180,14 +180,20 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
      */
     private Path prepareHuggingFaceFiles(String modelId) throws IOException {
         Path modelDir = resolveModelDir(MODEL_CACHE, modelId);
-        ensureModelFiles(hfBaseUrl + modelId + "/resolve/main/", modelDir);
+        ensureModelFiles(hfDownloadBase(modelId), modelDir);
         return modelDir.resolve("tokenizer.json");
     }
 
     /**
-     * Maps a repo id to its cache directory, refusing ids that could escape the cache root
+     * Maps a repo id ({@code owner/name} or pinned {@code owner/name@sha}) to its cache directory
+     * (the revision is part of the name, so changing a pin re-downloads), refusing ids that could escape the cache root
      * (the marker-less path deletes files in this directory).
      */
+    static String hfDownloadBase(String repoId) {
+        return hfBaseUrl + com.pharos.config.EmbeddingProviderConfig.hfRepo(repoId) + "/resolve/"
+                + com.pharos.config.EmbeddingProviderConfig.hfRevision(repoId) + "/";
+    }
+
     static Path resolveModelDir(Path cacheRoot, String repoId) {
         if (!com.pharos.config.EmbeddingProviderConfig.isValidHfRepoId(repoId)) {
             throw new IllegalArgumentException("Invalid HuggingFace repo id '" + repoId

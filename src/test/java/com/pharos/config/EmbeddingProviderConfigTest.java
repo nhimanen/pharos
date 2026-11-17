@@ -159,4 +159,29 @@ class EmbeddingProviderConfigTest {
         ok.setUrl("hf://jinaai/jina-embeddings-v2-base-code");
         ok.validate();
     }
+
+    @org.junit.jupiter.api.Test
+    void pinnedHfRepoIds() {
+        String sha = "2a49b9c076aa627b14bc528b36b67462808ccc23";
+        for (String ok : new String[]{"a/b", "a/b@" + sha, "a/b@2a49b9c", "A1/b.c-d_e@ABCDEF1"}) {
+            org.junit.jupiter.api.Assertions.assertTrue(EmbeddingProviderConfig.isValidHfRepoId(ok), ok);
+        }
+        for (String bad : new String[]{"a/b@", "a/b@abc12", "a/b@" + sha + "0", "a/b@xyz1234", "a/b@../..",
+                "a/b@main", "a@2a49b9c", "a/b@2a49b9c@2a49b9c", "../b@2a49b9c"}) {
+            org.junit.jupiter.api.Assertions.assertFalse(EmbeddingProviderConfig.isValidHfRepoId(bad), bad);
+        }
+        org.junit.jupiter.api.Assertions.assertEquals("a/b", EmbeddingProviderConfig.hfRepo("a/b@2a49b9c"));
+        org.junit.jupiter.api.Assertions.assertEquals("2a49b9c", EmbeddingProviderConfig.hfRevision("a/b@2a49b9c"));
+        org.junit.jupiter.api.Assertions.assertEquals("main", EmbeddingProviderConfig.hfRevision("a/b"));
+    }
+
+    @org.junit.jupiter.api.Test
+    void validateAcceptsPinnedAndRejectsBadPinnedUrl() {
+        EmbeddingProviderConfig c = new EmbeddingProviderConfig();
+        c.setType("djl"); c.setModelId("m"); c.setDimensions(8);
+        c.setUrl("hf://a/b@2a49b9c");
+        c.validate();
+        c.setUrl("hf://a/b@nothex!");
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, c::validate);
+    }
 }

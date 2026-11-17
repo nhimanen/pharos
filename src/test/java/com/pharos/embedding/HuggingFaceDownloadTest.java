@@ -14,12 +14,14 @@ class HuggingFaceDownloadTest {
     String base;
     int dataStatus = 200;
     boolean truncateOnnx = false;
+    final java.util.List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     @BeforeEach
     void start() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
             String path = ex.getRequestURI().getPath();
+            seen.add(path);
             byte[] body;
             int status = 200;
             if (path.endsWith("onnx/model.onnx")) body = "MODEL".getBytes();
@@ -173,5 +175,39 @@ class HuggingFaceDownloadTest {
         DjlEmbeddingProvider.ensureModelFiles(base, dir);          // reachable on the next start
         assertTrue(Files.exists(dir.resolve(".complete")));
         assertEquals("DATA", Files.readString(dir.resolve("model.onnx_data")));
+    }
+
+    @Test
+    void pinnedRevisionIsUsedInDownloadUrlsAndCacheDir(@TempDir Path cache) throws Exception {
+        String saved = DjlEmbeddingProvider.hfBaseUrl;
+        try {
+            DjlEmbeddingProvider.hfBaseUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/";
+            String id = "onnx-community/granite@2a49b9c";
+            DjlEmbeddingProvider.ensureModelFiles(DjlEmbeddingProvider.hfDownloadBase(id),
+                    DjlEmbeddingProvider.resolveModelDir(cache, id));
+            assertFalse(seen.isEmpty());
+            for (String p : seen) {
+                assertTrue(p.startsWith("/onnx-community/granite/resolve/2a49b9c/"), p);
+            }
+            Path dir = DjlEmbeddingProvider.resolveModelDir(cache, id);
+            assertTrue(Files.exists(dir.resolve(".complete")));
+            assertEquals(cache.normalize(), dir.getParent());
+            // a different pin is a different directory (re-download), unpinned is unchanged
+            assertNotEquals(dir, DjlEmbeddingProvider.resolveModelDir(cache, "onnx-community/granite@3b50d8e"));
+            assertEquals(cache.resolve("onnx-community-granite"),
+                    DjlEmbeddingProvider.resolveModelDir(cache, "onnx-community/granite"));
+            assertEquals("http://127.0.0.1:" + server.getAddress().getPort() + "/a/b/resolve/main/",
+                    DjlEmbeddingProvider.hfDownloadBase("a/b"));
+        } finally {
+            DjlEmbeddingProvider.hfBaseUrl = saved;
+        }
+    }
+
+    @Test
+    void badRevisionsCannotEscapeTheCache(@TempDir Path cache) {
+        for (String bad : new String[]{"a/b@", "a/b@../x", "a/b@xyz1234", "a/b@abc12", "a/b@/..", "a/b@" + "a".repeat(41)}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> DjlEmbeddingProvider.resolveModelDir(cache, bad), "id: '" + bad + "'");
+        }
     }
 }
