@@ -166,6 +166,17 @@ public class SearchEngine {
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry, CrossEncoder crossEncoder,
                         QueryRouter queryRouter) {
+        this(luceneIndexer, embedder, registry, crossEncoder, queryRouter,
+                com.pharos.config.IndexConfig.DEFAULT_BASE);
+    }
+
+    /**
+     * @param configBase where {@code synonyms.txt} and {@code pipelines.yaml} are read from
+     *                   (the pharos home by default); tests pass their own to stay hermetic
+     */
+    public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
+                        ProjectRegistry registry, CrossEncoder crossEncoder,
+                        QueryRouter queryRouter, java.nio.file.Path configBase) {
         this.luceneIndexer = luceneIndexer;
         this.registry      = registry;
         this.embedder      = embedder;
@@ -173,14 +184,15 @@ public class SearchEngine {
         this.modelConfigured = !(embedder instanceof com.pharos.embedding.NoOpEmbeddingProvider);
         this.modelState = modelConfigured ? ModelState.LOADING : ModelState.NONE;
 
-        KeywordSearchStrategy kw  = new KeywordSearchStrategy();
+        KeywordSearchStrategy kw  = new KeywordSearchStrategy(
+                configBase.resolve("synonyms.txt"), new org.apache.lucene.search.SearcherFactory());
         this.keywordStrategy = kw;
         VectorSearchStrategy  vec = new VectorSearchStrategy(embedder);
         this.vectorStrategy  = vec;
         this.zeroResultAdvisor = new ZeroResultAdvisor(luceneIndexer, registry, kw);
 
         this.builtPipelines = memoize(() ->
-                new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs()));
+                new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs(configBase)));
     }
 
     /** Returns the ordered list of available pipelines for UI display. */
@@ -958,10 +970,10 @@ public class SearchEngine {
      * otherwise falls back to the bundled {@code pipelines.yaml} on the classpath.
      * This lets operators customise or extend the pipeline set without recompiling.
      */
-    private static List<PipelineConfig> loadPipelineConfigs() {
+    private static List<PipelineConfig> loadPipelineConfigs(java.nio.file.Path configBase) {
         ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
         try {
-            java.nio.file.Path external = com.pharos.config.IndexConfig.DEFAULT_BASE.resolve("pipelines.yaml");
+            java.nio.file.Path external = configBase.resolve("pipelines.yaml");
             java.io.InputStream in;
             if (java.nio.file.Files.isReadable(external)) {
                 log.info("Loading pipeline config from {}", external);

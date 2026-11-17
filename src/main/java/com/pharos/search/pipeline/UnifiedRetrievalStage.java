@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.*;
+import org.apache.lucene.search.similarities.BM25Similarity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -110,11 +111,14 @@ public class UnifiedRetrievalStage implements RetrievalStage {
     @Override
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                         SearchTrace trace) throws IOException {
-        Raw raw = retrieveRaw(searcherFactory.newSearcher(reader, null), req, null, true, trace);
-        return CandidateShaper.shape(raw.candidates(), TYPE, raw.intent());
+        RawRetrieval raw = retrieveRaw(searcherFactory.newSearcher(reader, null), req, null, true, trace);
+        return CandidateShaper.shape(raw.candidates(), TYPE, raw.shapingIntent());
     }
 
-    /** Raw candidates, the query embedded here (BM25 only when the embedder is unavailable). */
+    /**
+     * Raw candidates, the query embedded here (BM25 only when the embedder is unavailable). Sets the
+     * BM25 similarity on {@code searcher}: use one searcher per call.
+     */
     @Override
     public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req,
                                           SearchTrace trace) throws IOException {
@@ -123,29 +127,33 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
     /**
      * Raw candidates for an already embedded query (a shard serving a coordinator, which embeds
-     * once); {@code queryVec == null} means BM25 only. Shape them with
-     * {@link #shapingIntent}{@code (req, queryVec != null)}.
+     * once); {@code queryVec == null} means BM25 only. Returns the intent to shape them with, which
+     * depends on whether the vector pass ran. Sets the BM25 similarity on {@code searcher}: use one
+     * searcher per call.
      */
-    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] queryVec,
-                                          SearchTrace trace) throws IOException {
-        return retrieveRaw(searcher, req, queryVec, false, trace).candidates();
+    public RawRetrieval retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] queryVec,
+                                    SearchTrace trace) throws IOException {
+        return retrieveRaw(searcher, req, queryVec, false, trace);
     }
 
     /**
-     * The intent the raw candidates are shaped with: the router's intent ({@code "default"} without
-     * a classification) when the vector pass ran, none for the BM25-only fallback.
+     * Raw candidates and the intent {@link CandidateShaper#shape} must use for them: the router's
+     * intent ({@code "default"} without a classification) when the vector pass ran, none for the
+     * BM25-only fallback.
      */
-    public static String shapingIntent(SearchRequest req, boolean vectorPass) {
-        if (!vectorPass) return null;
+    public record RawRetrieval(List<RawCandidate> candidates, String shapingIntent) {}
+
+    private static String vectorPassIntent(SearchRequest req) {
         return req.classification() != null ? req.classification().intent() : "default";
     }
 
-    private record Raw(List<RawCandidate> candidates, String intent) {}
-
-    private Raw retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] givenVec,
+    private RawRetrieval retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] givenVec,
                             boolean embedHere, SearchTrace trace) throws IOException {
         long t0 = System.currentTimeMillis();
         int  candidateSize = req.limit() * OVERSAMPLE;
+        // The BM25 recall pass scores with plain BM25 (an IndexSearcher's default), whatever the
+        // searcher was set to before.
+        searcher.setSimilarity(new BM25Similarity());
 
         // ── BM25 recall pass ──────────────────────────────────────────────────
         Query bm25Query = keywordStrategy.buildQuery(new SearchRequest(
@@ -199,22 +207,22 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
         // Adaptive BM25 bonus from QueryRouter classification — or default if no router ran
         float bm25Bonus = adaptiveBm25Bonus(req.classification());
-        String intentLabel = shapingIntent(req, true);
+        String intentLabel = vectorPassIntent(req);
 
         TopDocs reranked = new UnifiedRescorer(chunkVectorField, queryMultiVec, bm25Bonus)
                 .rescore(searcher, unionDocs, req.limit());
 
         traceStep(trace, "unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
-        return new Raw(KeywordSearchStrategy.rawCandidates(searcher, reranked, TYPE), intentLabel);
+        return new RawRetrieval(KeywordSearchStrategy.rawCandidates(searcher, reranked, TYPE), intentLabel);
     }
 
     /** The BM25 recall pass trimmed to the limit, shaped without an intent. */
-    private static Raw bm25Only(IndexSearcher searcher, SearchRequest req, TopDocs bm25Docs)
+    private static RawRetrieval bm25Only(IndexSearcher searcher, SearchRequest req, TopDocs bm25Docs)
             throws IOException {
         int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);
         TopDocs trimmed = new TopDocs(bm25Docs.totalHits,
                 Arrays.copyOf(bm25Docs.scoreDocs, n));
-        return new Raw(KeywordSearchStrategy.rawCandidates(searcher, trimmed, TYPE), null);
+        return new RawRetrieval(KeywordSearchStrategy.rawCandidates(searcher, trimmed, TYPE), null);
     }
 
     private static void traceStep(SearchTrace trace, String step, long t0) {

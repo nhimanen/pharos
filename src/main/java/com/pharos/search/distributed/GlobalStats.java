@@ -78,8 +78,8 @@ public record GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms) 
     }
 
     /**
-     * One shard's statistics: collection statistics of {@code fields} (fields without indexed terms
-     * are left out) and the frequencies of {@code terms} (terms absent from the shard are left out).
+     * One shard's statistics: collection statistics of {@code fields} (all zeros for a field without
+     * indexed terms) and the frequencies of {@code terms} (terms absent from the shard are left out).
      * Read straight from the shard's reader, never from an overriding searcher.
      */
     public static GlobalStats of(IndexSearcher shard, Collection<String> fields, Collection<Term> terms)
@@ -89,9 +89,9 @@ public record GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms) 
         Map<String, FieldStats> outFields = new LinkedHashMap<>();
         for (String field : new TreeSet<>(fields)) {
             CollectionStatistics cs = local.collectionStatistics(field);
-            if (cs != null) {
-                outFields.put(field, new FieldStats(cs.docCount(), cs.sumTotalTermFreq(), cs.sumDocFreq()));
-            }
+            // a field without indexed terms is reported as all zeros, so the sum still covers it
+            outFields.put(field, cs == null ? new FieldStats(0, 0, 0)
+                    : new FieldStats(cs.docCount(), cs.sumTotalTermFreq(), cs.sumDocFreq()));
         }
         List<TermStat> outTerms = new ArrayList<>();
         for (Term t : new LinkedHashSet<>(terms)) {

@@ -17,7 +17,8 @@ public interface RetrievalStage {
     /**
      * Retrieval without the shaping second pass ({@link com.pharos.search.distributed.CandidateShaper}):
      * unboosted scores plus the shaping inputs, scored with {@code searcher}'s term and collection
-     * statistics. Only the keyword, vector and unified stages support it.
+     * statistics. Stages may set the similarity they score with on {@code searcher}: use one
+     * searcher per call. Only the keyword, vector and unified stages support it.
      */
     default List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, SearchTrace trace)
             throws IOException {

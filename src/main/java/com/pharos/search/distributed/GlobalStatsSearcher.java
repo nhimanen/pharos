@@ -6,10 +6,13 @@ import org.apache.lucene.search.CollectionStatistics;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.SearcherFactory;
 import org.apache.lucene.search.TermStatistics;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * An {@link IndexSearcher} over one shard that scores with corpus-wide statistics: term and
@@ -18,14 +21,18 @@ import java.util.Map;
  *
  * <p>Terms and fields the stats don't cover fall back to the shard's own statistics; the coordinator
  * collects every scoring term of the query ({@link GlobalStats#queryTerms}) so this only happens for
- * multi-term queries rewritten on the shard. {@code maxDoc} is not on the wire: collection statistics
+ * multi-term queries rewritten on the shard. Each fallback is counted ({@link #localFallbacks}) and
+ * logged at debug, so a coordinator that misses terms shows up. {@code maxDoc} is not on the wire: collection statistics
  * report {@code docCount} as {@code maxDoc}, which no similarity pharos uses reads (BM25 and
  * {@code SimilarityBase} score with {@code docCount}).
  */
 public class GlobalStatsSearcher extends IndexSearcher {
 
+    private static final Logger log = LoggerFactory.getLogger(GlobalStatsSearcher.class);
+
     private final Map<String, GlobalStats.FieldStats> fields;
     private final Map<String, Map<String, GlobalStats.TermStat>> terms = new HashMap<>();
+    private final AtomicLong localFallbacks = new AtomicLong();
 
     public GlobalStatsSearcher(IndexReader reader, GlobalStats stats) {
         super(reader);
@@ -49,16 +56,32 @@ public class GlobalStatsSearcher extends IndexSearcher {
     public TermStatistics termStatistics(Term term, int docFreq, long totalTermFreq) throws IOException {
         Map<String, GlobalStats.TermStat> byText = terms.get(term.field());
         GlobalStats.TermStat global = byText == null ? null : byText.get(term.text());
-        if (global == null) return super.termStatistics(term, docFreq, totalTermFreq);
+        if (global == null) {
+            fellBack("term", term.field() + ":" + term.text());
+            return super.termStatistics(term, docFreq, totalTermFreq);
+        }
         return new TermStatistics(term.bytes(), global.docFreq(), global.totalTermFreq());
     }
 
     @Override
     public CollectionStatistics collectionStatistics(String field) throws IOException {
         GlobalStats.FieldStats global = fields.get(field);
-        if (global == null) return super.collectionStatistics(field);
+        if (global == null) {
+            fellBack("field", field);
+            return super.collectionStatistics(field);
+        }
         if (global.docCount() == 0) return null;
         return new CollectionStatistics(field, global.docCount(), global.docCount(),
                 global.sumTotalTermFreq(), global.sumDocFreq());
+    }
+
+    /** How many term or field statistics this searcher answered from the shard's own stats. */
+    public long localFallbacks() {
+        return localFallbacks.get();
+    }
+
+    private void fellBack(String kind, String what) {
+        localFallbacks.incrementAndGet();
+        log.debug("No global statistics for {} {}: using the shard's own", kind, what);
     }
 }

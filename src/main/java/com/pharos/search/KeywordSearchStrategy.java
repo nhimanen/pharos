@@ -186,7 +186,8 @@ public class KeywordSearchStrategy {
         this(synonymFile, new SearcherFactory());
     }
 
-    private KeywordSearchStrategy(Path synonymFile, SearcherFactory searcherFactory) {
+    /** {@code synonymFile} is watched for changes; it need not exist (no synonyms then). */
+    public KeywordSearchStrategy(Path synonymFile, SearcherFactory searcherFactory) {
         this.synonymFile = synonymFile;
         this.searcherFactory = searcherFactory;
         reloadAnalyzer();
@@ -234,8 +235,8 @@ public class KeywordSearchStrategy {
 
     /**
      * Raw BM25 retrieval: the top {@code req.limit()} hits with their unboosted scores. Sets this
-     * strategy's per-field similarity on {@code searcher}, whose term and collection statistics
-     * (local, or global ones) the scores use.
+     * strategy's per-field similarity on {@code searcher} (so use one searcher per call), whose term
+     * and collection statistics (local, or global ones) the scores use.
      */
     public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req) throws IOException {
         reloadIfChanged();

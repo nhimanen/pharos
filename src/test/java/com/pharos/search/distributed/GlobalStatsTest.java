@@ -92,6 +92,22 @@ class GlobalStatsTest {
     }
 
     @Test
+    void uncoveredTermsFallBackToLocalStatsAndAreCounted() throws Exception {
+        IndexReader a = shard("a", 0, 40);
+        SearchRequest req = request("parse query");
+        Query query = keyword.buildQuery(req);
+
+        GlobalStatsSearcher covered = new GlobalStatsSearcher(a, GlobalStats.merge(List.of(response(a, query))));
+        keyword.retrieveRaw(covered, req);
+        assertThat(covered.localFallbacks()).isZero();
+
+        GlobalStatsSearcher empty = new GlobalStatsSearcher(a, new GlobalStats(Map.of(), List.of()));
+        Map<String, Float> fallback = scores(keyword.retrieveRaw(empty, req));
+        assertThat(empty.localFallbacks()).isPositive();
+        assertThat(fallback).isEqualTo(scores(keyword.retrieveRaw(new IndexSearcher(a), req)));
+    }
+
+    @Test
     void mergeSumsFieldAndTermStatsAcrossShards() throws Exception {
         GlobalStats one = new GlobalStats(
                 Map.of("body", new GlobalStats.FieldStats(10, 100, 50)),
