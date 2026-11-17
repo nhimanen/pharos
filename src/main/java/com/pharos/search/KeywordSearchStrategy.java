@@ -3,6 +3,8 @@ package com.pharos.search;
 import com.pharos.config.IndexConfig;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.search.distributed.CandidateShaper;
+import com.pharos.search.distributed.RawCandidate;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -30,11 +32,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * BM25 keyword search using MultiFieldQueryParser with field-level boosting.
@@ -50,7 +50,7 @@ import java.util.stream.Collectors;
  * - javadoc: 2.0x   (kept at original; single-term name matches (4x) already beat
  *                    single-term javadoc (2x); phrase matches over all terms legitimately win)
  *
- * Post-BM25 multipliers (applied in toResults()):
+ * Post-BM25 multipliers (applied by {@link CandidateShaper#shape}):
  * - docType=class:            ×1.8 so class documents rank above individual methods
  * - access=public:            ×1.0 (base)
  * - access=protected:         ×0.85
@@ -67,14 +67,6 @@ import java.util.stream.Collectors;
 public class KeywordSearchStrategy {
 
     private static final Logger log = LoggerFactory.getLogger(KeywordSearchStrategy.class);
-
-    /**
-     * Weight applied to the graph-derived boost on top of BM25 score.
-     * Final score = bm25 * (1 + GRAPH_BOOST_WEIGHT * log(1+inDeg)/log(1+maxInDeg))
-     * At 0.3, a method called by 100 others gets ~30% score lift over a method never
-     * called. Keeps relevance dominant while surfacing hub methods.
-     */
-    private static final float GRAPH_BOOST_WEIGHT = 0.3f;
 
     /**
      * Score multiplier applied to the min-should-match-tier SHOULD clause.
@@ -174,17 +166,29 @@ public class KeywordSearchStrategy {
      */
     private final Path synonymFile;
 
+    /** Creates the searcher of every search; a plain {@link IndexSearcher} unless injected. */
+    private final SearcherFactory searcherFactory;
+
     private Analyzer analyzer;
     /** Last-modified timestamp of synonyms.txt at the time the analyzer was built. */
     private long synonymFileLastModified = -1;
 
     public KeywordSearchStrategy() {
-        this(IndexConfig.DEFAULT_BASE.resolve("synonyms.txt"));
+        this(new SearcherFactory());
+    }
+
+    public KeywordSearchStrategy(SearcherFactory searcherFactory) {
+        this(IndexConfig.DEFAULT_BASE.resolve("synonyms.txt"), searcherFactory);
     }
 
     /** Package-private constructor for tests that need a custom synonym file path. */
     KeywordSearchStrategy(Path synonymFile) {
+        this(synonymFile, new SearcherFactory());
+    }
+
+    private KeywordSearchStrategy(Path synonymFile, SearcherFactory searcherFactory) {
         this.synonymFile = synonymFile;
+        this.searcherFactory = searcherFactory;
         reloadAnalyzer();
     }
 
@@ -220,17 +224,33 @@ public class KeywordSearchStrategy {
         }
     }
 
+    /** Search type of keyword results. */
+    public static final String TYPE = "keyword";
+
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
+        return CandidateShaper.shape(
+                retrieveRaw(searcherFactory.newSearcher(reader, null), req), TYPE, shapingIntent(req));
+    }
+
+    /**
+     * Raw BM25 retrieval: the top {@code req.limit()} hits with their unboosted scores. Sets this
+     * strategy's per-field similarity on {@code searcher}, whose term and collection statistics
+     * (local, or global ones) the scores use.
+     */
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req) throws IOException {
         reloadIfChanged();
-        IndexSearcher searcher = new IndexSearcher(reader);
         searcher.setSimilarity(PER_FIELD_SIMILARITY);
 
         Query query = buildQuery(req);
         if (query == null) return List.of();
 
-        String intent = req.classification() != null ? req.classification().intent() : null;
         TopDocs hits = searcher.search(query, req.limit());
-        return toResults(searcher, hits, "keyword", intent);
+        return rawCandidates(searcher, hits, TYPE);
+    }
+
+    /** The intent {@link #search} shapes with: the router's classification, if any. */
+    public static String shapingIntent(SearchRequest req) {
+        return req.classification() != null ? req.classification().intent() : null;
     }
 
     /**
@@ -516,47 +536,38 @@ public class KeywordSearchStrategy {
 
     /**
      * Converts TopDocs to SearchResult list, applying in-degree boost, source-path penalty,
-     * doc-type bonus, {@link #classTypeBonus} (using {@code intent}), and access multiplier.
+     * doc-type bonus, classType bonus (using {@code intent}), and access multiplier
+     * ({@link CandidateShaper#shape} over {@link #rawCandidates}).
      *
      * @param intent the detected query intent (e.g. {@code "INTERFACE"}, {@code "IMPLEMENTATION"});
      *               null disables classType boosting
      */
     public static List<SearchResult> toResults(IndexSearcher searcher, TopDocs hits,
                                                String type, String intent) throws IOException {
+        return CandidateShaper.shape(rawCandidates(searcher, hits, type), type, intent);
+    }
+
+    /**
+     * Loads the stored fields of {@code hits} as raw candidates: the hit's score unboosted, plus the
+     * inputs {@link CandidateShaper} needs. {@code type} is the search type of the raw results.
+     */
+    public static List<RawCandidate> rawCandidates(IndexSearcher searcher, TopDocs hits, String type)
+            throws IOException {
         if (hits.scoreDocs.length == 0) return List.of();
 
         StoredFields storedFields = searcher.storedFields();
-
-        // First pass: load all docs + find max in-degree for normalization
-        record RawHit(Document doc, float rawScore) {}
-        List<RawHit> rawHits = new ArrayList<>(hits.scoreDocs.length);
-        int maxInDegree = 1; // avoid division by zero
+        List<RawCandidate> raw = new ArrayList<>(hits.scoreDocs.length);
         for (ScoreDoc sd : hits.scoreDocs) {
             Document doc = storedFields.document(sd.doc);
-            int inDeg = getInt(doc, DocumentMapper.F_IN_DEGREE);
-            if (inDeg > maxInDegree) maxInDegree = inDeg;
-            rawHits.add(new RawHit(doc, sd.score));
+            raw.add(new RawCandidate(sd.score,
+                    getInt(doc, DocumentMapper.F_IN_DEGREE),
+                    doc.get(DocumentMapper.F_FILE_PATH),
+                    doc.get(DocumentMapper.F_DOC_TYPE),
+                    doc.get(DocumentMapper.F_CLASS_TYPE),
+                    doc.get(DocumentMapper.F_ACCESS),
+                    docToResult(doc, sd.score, type)));
         }
-
-        // Second pass: apply log-normalized in-degree boost + source-path penalty
-        //   + doc-type bonus (class > method) + classType bonus + access multiplier, then re-sort
-        final int maxDeg = maxInDegree;
-        return rawHits.stream()
-                .map(hit -> {
-                    int inDeg = getInt(hit.doc(), DocumentMapper.F_IN_DEGREE);
-                    float normBoost = (float) (Math.log1p(inDeg) / Math.log1p(maxDeg));
-                    String filePath  = hit.doc().get(DocumentMapper.F_FILE_PATH);
-                    float penalty    = sourcePathPenalty(filePath);
-                    float typeBonus  = docTypeBonus(hit.doc().get(DocumentMapper.F_DOC_TYPE), filePath);
-                    float ctBonus    = classTypeBonus(hit.doc().get(DocumentMapper.F_CLASS_TYPE), intent);
-                    float accessMult = accessMultiplier(hit.doc().get(DocumentMapper.F_ACCESS));
-                    float boostedScore = hit.rawScore()
-                            * (1.0f + GRAPH_BOOST_WEIGHT * normBoost)
-                            * penalty * typeBonus * ctBonus * accessMult;
-                    return docToResult(hit.doc(), boostedScore, type);
-                })
-                .sorted(Comparator.comparingDouble(SearchResult::score).reversed())
-                .collect(Collectors.toList());
+        return raw;
     }
 
     static SearchResult docToResult(Document doc, float score, String searchType) {
@@ -583,123 +594,20 @@ public class KeywordSearchStrategy {
         );
     }
 
-    /**
-     * Penalizes test, benchmark, and non-source files so production classes
-     * rank above ancillary code that matches the same tokens.
-     *
-     * Multipliers (applied after BM25 + graph boost):
-     *   /src/test/   → 0.50   (unit/integration tests)
-     *   /benchmark/  → 0.30   (JMH benchmarks — heavy false-positive source)
-     *   /jmh/        → 0.30
-     *   .md / .txt   → 0.20   (documentation files)
-     *   otherwise    → 1.00
-     */
-    /**
-     * Bonus multiplier by document type so the ranking order is:
-     *   class &gt; method/chunk
-     * Applied on top of BM25 so a class whose name matches the query always
-     * ranks above individual methods in that class for the same BM25 score.
-     */
     static float docTypeBonus(String docType, String filePath) {
-        if (!"class".equals(docType)) return 1.0f;
-        if (filePath != null) {
-            String p = filePath.replace('\\', '/');
-            if (p.contains("/src/test/") || p.contains("/test/")) return 1.0f; // test classes don't get class bonus
-        }
-        return 1.8f;
+        return CandidateShaper.docTypeBonus(docType, filePath);
     }
 
-    /**
-     * Multiplier by {@link com.pharos.indexer.DocumentMapper#F_CLASS_TYPE} and query intent.
-     *
-     * <p>Intent → classType boost table:
-     * <pre>
-     *   INTERFACE:    interface 3.0×, abstract 1.8×, class 0.7×
-     *   ABSTRACT:     abstract 3.0×, interface 1.8×, class 0.7×
-     *   ENUM:         enum 3.0×, class 0.8×, other 0.6×
-     *   RECORD:       record 3.0×, class 0.8×, other 0.6×
-     *   ANNOTATION:   annotation 3.0×, interface 0.9×, class 0.7×
-     *   IMPLEMENTATION: class 2.5×, enum/record 1.5×, abstract 0.7×, interface 0.4×
-     * </pre>
-     *
-     * <p>Returns 1.0 for all other intents or when {@code classType} is null
-     * (method documents do not have a classType field).
-     */
     static float classTypeBonus(String classType, String intent) {
-        if (classType == null || intent == null) return 1.0f;
-        return switch (intent) {
-            // Java interface: pure interfaces get maximum boost; abstract classes still relevant
-            case "INTERFACE" -> switch (classType) {
-                case "interface"   -> 3.0f;
-                case "abstract"    -> 1.8f;
-                case "class"       -> 0.7f;
-                default            -> 1.0f;
-            };
-            // Abstract class: abstract types get maximum boost; interfaces also conceptually valid
-            case "ABSTRACT" -> switch (classType) {
-                case "abstract"    -> 3.0f;
-                case "interface"   -> 1.8f;
-                case "class"       -> 0.7f;
-                default            -> 1.0f;
-            };
-            // Enum: strongly filter to enum types; other class types unlikely to be relevant
-            case "ENUM" -> switch (classType) {
-                case "enum"        -> 3.0f;
-                case "class"       -> 0.8f;
-                default            -> 0.6f;
-            };
-            // Record: strongly filter to record types
-            case "RECORD" -> switch (classType) {
-                case "record"      -> 3.0f;
-                case "class"       -> 0.8f;
-                default            -> 0.6f;
-            };
-            // Annotation: strongly filter to annotation types
-            case "ANNOTATION" -> switch (classType) {
-                case "annotation"  -> 3.0f;
-                case "interface"   -> 0.9f;  // annotations are @interface internally
-                case "class"       -> 0.7f;
-                default            -> 0.6f;
-            };
-            // Concrete implementation: boost non-abstract classes
-            case "IMPLEMENTATION" -> switch (classType) {
-                case "class"       -> 2.5f;
-                case "enum",
-                     "record"      -> 1.5f;  // enums/records are concrete, still valid
-                case "abstract"    -> 0.7f;
-                case "interface"   -> 0.4f;
-                default            -> 1.0f;
-            };
-            default -> 1.0f;
-        };
+        return CandidateShaper.classTypeBonus(classType, intent);
     }
 
-    /**
-     * Multiplier by access modifier so the ranking order is:
-     *   public &gt; protected &gt; package-private &gt; private
-     * Private implementation details rank last unless the BM25 score is
-     * substantially higher (i.e. the query is very specific to that method).
-     */
     static float accessMultiplier(String access) {
-        if (access == null || access.isBlank()) return 0.75f; // package-private
-        return switch (access.toLowerCase()) {
-            case "public"    -> 1.00f;
-            case "protected" -> 0.85f;
-            case "private"   -> 0.50f;
-            default          -> 0.75f; // package-private or unrecognised
-        };
+        return CandidateShaper.accessMultiplier(access);
     }
 
     static float sourcePathPenalty(String filePath) {
-        if (filePath == null) return 1.0f;
-        String p = filePath.replace('\\', '/');
-        if (p.contains("/benchmark/")) return 0.25f;
-        if (p.contains("/jmh/"))        return 0.25f;
-        if (p.contains("/src/test/"))   return 0.30f; // stronger — tests are rarely the target
-        if (p.contains("/test/"))       return 0.30f;
-        if (p.contains("/.github/"))    return 0.10f;
-        if (p.endsWith(".md") || p.endsWith(".txt") || p.endsWith(".sh") || p.endsWith(".yml")) return 0.10f;
-        return 1.0f;
+        return CandidateShaper.sourcePathPenalty(filePath);
     }
 
     private static int getInt(Document doc, String field) {
