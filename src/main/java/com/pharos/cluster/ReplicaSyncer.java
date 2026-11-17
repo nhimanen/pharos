@@ -9,7 +9,6 @@ import com.pharos.graph.GraphViews;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
@@ -438,8 +437,8 @@ public class ReplicaSyncer implements Closeable {
             throws IOException {
         long start = System.nanoTime();
         CompletableFuture<Void> open = CompletableFuture.runAsync(() -> {
-            try (Directory dir = lazy.open(lucene); DirectoryReader reader = DirectoryReader.open(dir)) {
-                reader.maxDoc();
+            try (Directory dir = lazy.open(lucene)) {
+                com.pharos.indexer.LuceneIndexer.warmOpen(dir);
             } catch (IOException e) {
                 throw new java.io.UncheckedIOException(e);
             }

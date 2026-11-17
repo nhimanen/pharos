@@ -259,6 +259,18 @@ public class LuceneIndexer implements Closeable {
     }
 
     /**
+     * Opens and immediately closes a reader on {@code dir}, so a lazy reader generation pays its
+     * open cost (codec headers, footers, segment metadata) before it is activated. The reader is
+     * never cached or used to serve queries; serving readers come only from {@link #openReader}.
+     * Kept here so that this class stays the only place that opens Lucene readers.
+     */
+    public static void warmOpen(Directory dir) throws IOException {
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+            reader.maxDoc();
+        }
+    }
+
+    /**
      * Builds the per-field analyzer used at <b>index time</b>:
      * - StandardAnalyzer for full-text fields (body, javadoc, signature, methodName, className)
      * - KeywordAnalyzer (default) for exact-match fields (id, project, filePath, etc.)

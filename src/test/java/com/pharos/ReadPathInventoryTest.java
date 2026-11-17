@@ -72,9 +72,12 @@ class ReadPathInventoryTest {
     @Test
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
         assertThat(files("DirectoryReader.open(")).containsExactly("indexer/LuceneIndexer.java");
+        // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory::open).
+        assertThat(files("FSDirectory::open")).containsExactly("indexer/LuceneDirectoryFactory.java");
         assertThat(files("FSDirectory.open(")).containsExactlyInAnyOrder(
-                "indexer/LuceneIndexer.java",
                 "cluster/ReplicaSyncer.java",                     // reader: verify before serving
-                "cluster/objectstore/ObjectStorePublisher.java"); // writer: read the commit to upload
+                "cluster/objectstore/ObjectStorePublisher.java",  // writer: read the commit to upload
+                "cluster/warm/LazyGenerations.java",              // reader factory: full-copy generations
+                "cluster/warm/RemoteDirectory.java");             // lazy generation: local eager files, checksums
     }
 }
