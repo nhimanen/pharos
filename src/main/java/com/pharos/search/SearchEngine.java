@@ -888,7 +888,7 @@ public class SearchEngine {
     private static int adaptiveOversample(SearchRequest.SearchType resolvedType, String query) {
         return switch (resolvedType) {
             case KEYWORD -> 1;
-            case HYBRID  -> queryHasCamelCase(query) ? 1 : 3;
+            case HYBRID, HYBRID_RERANKED -> queryHasCamelCase(query) ? 1 : 3;
             default      -> 0; // VECTOR, UNIFIED, HYBRID_* — handle internally
         };
     }
