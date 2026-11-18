@@ -131,7 +131,15 @@ class BlockCacheStressTest {
         assertThat(st.hits() + st.misses()).isEqualTo(acquires.get());
         assertThat(st.evictions()).as("the cap forced evictions").isPositive();
         assertThat(st.bytesOnDisk()).isLessThanOrEqualTo(6L * BS);
-        assertThat(st.bytesOnDisk()).isEqualTo(blockBytesOnDisk(dir.resolve("c")));
+        // A fetch thread deletes the files its fetch evicted after completing the flight (outside the
+        // lock), so the last deletes may still be running when every acquire has returned.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        long onDisk = blockBytesOnDisk(dir.resolve("c"));
+        while (onDisk != st.bytesOnDisk() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+            onDisk = blockBytesOnDisk(dir.resolve("c"));
+        }
+        assertThat(st.bytesOnDisk()).isEqualTo(onDisk);
         cache.close();
     }
 
@@ -152,6 +160,8 @@ class BlockCacheStressTest {
             return s.filter(p -> p.getFileName().toString().endsWith(".blk")).mapToLong(p -> {
                 try {
                     return Files.size(p);
+                } catch (java.nio.file.NoSuchFileException gone) {
+                    return 0; // deleted by an eviction during the walk
                 } catch (IOException e) {
                     throw new java.io.UncheckedIOException(e);
                 }
