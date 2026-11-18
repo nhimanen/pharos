@@ -10,7 +10,8 @@ import java.util.OptionalLong;
  * arrives with the pipeline split (Task 4). Requests carry the expected generation: an implementation
  * may refuse early when it already serves another, and must report the generation it actually read
  * (a swap can land between the check and the work; {@link InternalApi} and {@link ShardClient}
- * compare it with the requested one).
+ * compare it with the requested one). An implementation that analyses queries refuses a request whose
+ * synonyms hash differs from its own with {@link SynonymsMismatchException} (answered 409).
  */
 public interface ShardSearchService {
 
@@ -24,4 +25,7 @@ public interface ShardSearchService {
     SnippetsResponse snippets(SnippetsRequest request) throws Exception;
 
     CalleesResponse callees(CalleesRequest request) throws Exception;
+
+    /** One call-graph or lookup operation ({@link GraphRequest}) on the shard. */
+    GraphResponse graph(GraphRequest request) throws Exception;
 }

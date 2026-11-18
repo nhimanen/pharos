@@ -26,27 +26,38 @@ import java.util.stream.Stream;
  * A writer and a reader node in one JVM, in separate temp dirs, sharing one object store
  * (through one store instance each). Both nodes are wired like {@code Main} wires them.
  */
-final class ClusterFixture implements AutoCloseable {
+public final class ClusterFixture implements AutoCloseable {
 
-    static final String JAVA = "sample-app";
-    static final String PY = "sample-python-app";
+    public static final String JAVA = "sample-app";
+    public static final String PY = "sample-python-app";
 
-    final Path source;
-    final IndexConfig writerConfig;
-    final IndexConfig readerConfig;
+    public final Path source;
+    public final IndexConfig writerConfig;
+    public final IndexConfig readerConfig;
     final ReplicationBackend writerBackend;
     final ReplicationBackend readerBackend;
-    final ProjectRegistry writerRegistry;
+    public final ProjectRegistry writerRegistry;
     final ProjectRegistry readerRegistry;
-    final LuceneIndexer writerLucene;
+    public final LuceneIndexer writerLucene;
     final LuceneIndexer readerLucene;
     final ClusterRuntime writerRuntime;
     final ClusterRuntime readerRuntime;
     final ProjectIndexManager writerManager;
     final SearchEngine writerEngine;
     final SearchEngine readerEngine;
+    /** True when an embedder was given: indexing then embeds. */
+    private final boolean embed;
 
     ClusterFixture(Path tmp, ObjectStore writerStore, ObjectStore readerStore, String bucket) throws IOException {
+        this(tmp, writerStore, readerStore, bucket, null);
+    }
+
+    /**
+     * @param embedder the writer's (and the fixture reader's) embedder; null: the configured one
+     *                 (a no-op, so no vectors are indexed)
+     */
+    public ClusterFixture(Path tmp, ObjectStore writerStore, ObjectStore readerStore, String bucket,
+                          EmbeddingProvider embedder) throws IOException {
         source = tmp.resolve("src");
         copy(Path.of("src/test/resources/test-projects").resolve(JAVA), source.resolve(JAVA));
         copy(Path.of("src/test/resources/test-projects").resolve(PY), source.resolve(PY));
@@ -58,7 +69,9 @@ final class ClusterFixture implements AutoCloseable {
         writerRegistry = ProjectRegistry.at(tmp.resolve("writer").resolve("registry.json"));
         writerLucene = new LuceneIndexer(writerConfig, writerBackend.localCache());
         writerRuntime = new ClusterRuntime(writerConfig, writerBackend, writerRegistry, writerLucene);
-        EmbeddingProvider writerEmbedder = EmbeddingProvider.create(writerConfig); // NoOp: no model URL
+        embed = embedder != null;
+        EmbeddingProvider writerEmbedder = embedder != null ? embedder
+                : EmbeddingProvider.create(writerConfig); // NoOp: no model URL
         writerManager = new ProjectIndexManager(writerConfig, writerLucene, writerRegistry,
                 List.of(writerEmbedder), noopModules(writerRegistry),
                 List.of(new JavaCodeParser(), new PythonCodeParser()), writerRuntime.publisher());
@@ -68,10 +81,11 @@ final class ClusterFixture implements AutoCloseable {
         readerRegistry = ClusterRuntime.registryFor(readerConfig);
         readerLucene = new LuceneIndexer(readerConfig, readerBackend.localCache());
         readerRuntime = new ClusterRuntime(readerConfig, readerBackend, readerRegistry, readerLucene);
-        readerEngine = new SearchEngine(readerLucene, EmbeddingProvider.create(readerConfig), readerRegistry);
+        readerEngine = new SearchEngine(readerLucene,
+                embedder != null ? embedder : EmbeddingProvider.create(readerConfig), readerRegistry);
     }
 
-    static IndexConfig config(Path home, NodeRole role, String bucket) {
+    public static IndexConfig config(Path home, NodeRole role, String bucket) {
         IndexConfig config = IndexConfig.defaults();
         config.setIndexDir(home.resolve("indexes"));
         config.setSynonymsFile(home.resolve("synonyms.txt"));
@@ -91,7 +105,7 @@ final class ClusterFixture implements AutoCloseable {
         return config;
     }
 
-    static ModuleGraphBuilder noopModules(ProjectRegistry registry) {
+    public static ModuleGraphBuilder noopModules(ProjectRegistry registry) {
         return new ModuleGraphBuilder(registry) {
             @Override
             public synchronized List<String> incorporate(
@@ -101,12 +115,46 @@ final class ClusterFixture implements AutoCloseable {
         };
     }
 
-    void index(String project, boolean incremental) throws IOException {
-        writerManager.index(source.resolve(project), project, incremental, false, false, false,
+    public void index(String project, boolean incremental) throws IOException {
+        writerManager.index(source.resolve(project), project, incremental, false, embed, false,
                 ProgressListener.SILENT);
     }
 
-    void indexBoth() throws IOException {
+    /** Indexes {@code root} as {@code project} on the writer (and publishes it). */
+    public void indexSource(Path root, String project) throws IOException {
+        writerManager.index(root, project, false, false, embed, false, ProgressListener.SILENT);
+    }
+
+    /**
+     * A reader node of this cluster's bucket in its own home, as {@code Main} wires a serving
+     * reader: its backend over {@code store}, registry, indexer and runtime. Not started.
+     */
+    public static ReaderParts reader(Path home, ObjectStore store, String bucket, String nodeId, List<String> pin) {
+        IndexConfig config = config(home, NodeRole.READER, bucket);
+        config.getCluster().setNodeId(nodeId);
+        config.getCluster().getReader().setShards(pin);
+        config.getCluster().setHeartbeatSeconds(1);
+        config.getCluster().setReaderTtlSeconds(30);
+        config.getCluster().setFanoutTimeoutMillis(3000);
+        config.getCluster().setConnectTimeoutMillis(500);
+        config.getCluster().validate();
+        ReplicationBackend backend = TestBackends.objectStore(config, store);
+        ProjectRegistry registry = ClusterRuntime.registryFor(config);
+        LuceneIndexer lucene = new LuceneIndexer(config, backend.localCache());
+        return new ReaderParts(config, registry, lucene, new ClusterRuntime(config, backend, registry, lucene));
+    }
+
+    /** What {@link #reader} builds. */
+    public record ReaderParts(IndexConfig config, ProjectRegistry registry, LuceneIndexer lucene,
+                              ClusterRuntime runtime) {}
+
+    /** Closes the writer side only (for fixtures whose reader was never used). */
+    public void closeWriter() throws IOException {
+        writerRuntime.close();
+        writerLucene.close();
+    }
+
+    public void indexBoth() throws IOException {
         index(JAVA, false);
         index(PY, false);
     }

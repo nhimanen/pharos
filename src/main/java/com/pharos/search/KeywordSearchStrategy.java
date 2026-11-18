@@ -225,6 +225,33 @@ public class KeywordSearchStrategy {
         }
     }
 
+    /** Hash of the synonyms file the analyzer was last built from; recomputed when it changes. */
+    private volatile String synonymsHash;
+    private volatile long synonymsHashOf = Long.MIN_VALUE;
+
+    /**
+     * Identifies the synonyms this strategy analyses queries with: the SHA-256 of {@code synonyms.txt}
+     * (hex), or {@code "none"} without one. A coordinator ships it to shards, which refuse a request
+     * analysed with other synonyms: query terms and their statistics would not match.
+     */
+    public String synonymsHash() {
+        reloadIfChanged();
+        long stamp = synonymFileLastModified;
+        String h = synonymsHash;
+        if (h != null && synonymsHashOf == stamp) return h;
+        try {
+            h = Files.exists(synonymFile)
+                    ? java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(Files.readAllBytes(synonymFile)))
+                    : "none";
+        } catch (IOException | java.security.NoSuchAlgorithmException e) {
+            h = "unreadable";
+        }
+        synonymsHash = h;
+        synonymsHashOf = stamp;
+        return h;
+    }
+
     /** Search type of keyword results. */
     public static final String TYPE = "keyword";
 
@@ -571,7 +598,7 @@ public class KeywordSearchStrategy {
         return raw;
     }
 
-    static SearchResult docToResult(Document doc, float score, String searchType) {
+    public static SearchResult docToResult(Document doc, float score, String searchType) {
         String docType = doc.get(DocumentMapper.F_DOC_TYPE);
         if (docType == null) docType = "method"; // backwards compat with pre-docType indexes
         return new SearchResult(

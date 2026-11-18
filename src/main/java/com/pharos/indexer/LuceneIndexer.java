@@ -145,6 +145,21 @@ public class LuceneIndexer implements Closeable {
         return reader;
     }
 
+    /**
+     * A project's reader together with the lucene directory it was opened on, taken atomically: a
+     * reader node's generation dir ({@code .../gen-N/lucene}) names the generation the reader reads.
+     */
+    public record PinnedReader(Path luceneDir, DirectoryReader reader) {}
+
+    /**
+     * {@link #openReader}, also returning the directory the returned reader reads, under the same
+     * lock, so an activation in between cannot pair a reader with another generation's path.
+     */
+    public synchronized PinnedReader openPinnedReader(String projectName) throws IOException {
+        DirectoryReader reader = openReader(projectName);
+        return new PinnedReader(openReaders.get(projectName).path(), reader);
+    }
+
     /** Schedules {@code old} to be closed after the retire delay; caller holds {@code this}. */
     private void retire(DirectoryReader old) {
         retired.add(old);

@@ -72,6 +72,12 @@ public final class ClusterRuntime implements Closeable {
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private com.pharos.cluster.membership.ReaderRegistry readerRegistry;
+    /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
+    private com.pharos.search.distributed.DistributedSearch distributed;
+    /** Parallel shard calls of one coordinator (all queries share the pool). */
+    static final int FANOUT_PARALLELISM = 32;
+    /** How long the coordinator reuses the shard catalog for "every project" queries. */
+    static final Duration CATALOG_CACHE = Duration.ofSeconds(5);
     private volatile com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
@@ -261,6 +267,72 @@ public final class ClusterRuntime implements Closeable {
      */
     public com.pharos.cluster.internal.InternalApi internalApi() {
         return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().getToken()) : null;
+    }
+
+    /**
+     * Readers: the {@code /internal/*} API with {@code engine}'s shard search behind it, and the
+     * engine made a coordinator for shards this reader does not hold (Phase 3 fan-out): it routes over
+     * the live readers of the bucket, with suspect marking, the cluster token and the configured
+     * fan-out and connect timeouts. A query whose shards are all held here keeps the local path.
+     * Null on other roles, which never build a Phase 3 class.
+     */
+    public com.pharos.cluster.internal.InternalApi internalApi(com.pharos.search.SearchEngine engine) {
+        if (!isReader()) return null;
+        ClusterConfig c = config.getCluster();
+        com.pharos.search.distributed.LocalShardService service = engine.shardService(this::servesShard);
+        var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
+        var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
+                Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));
+        var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, cachedCatalog(), health,
+                id -> servesShard(id.value()), client::inFlight);
+        var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),
+                engine.vectorStrategy(), FANOUT_PARALLELISM, Duration.ofMillis(c.getFanoutTimeoutMillis()));
+        com.pharos.search.distributed.DistributedSearch previous;
+        synchronized (this) {
+            previous = distributed;
+            distributed = ds;
+        }
+        if (previous != null) previous.close();
+        engine.setDistributed(ds);
+        return new com.pharos.cluster.internal.InternalApi(c.getToken()).service(service);
+    }
+
+    /** True when this reader serves {@code shard}: it has an active generation of it. */
+    public boolean servesShard(String shard) {
+        return backend.localCache() instanceof ReaderLocalCache cache && cache.active(shard).isPresent();
+    }
+
+    private List<com.pharos.cluster.membership.ReaderHeartbeat> liveHeartbeats() {
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        return r == null ? List.of() : r.live();
+    }
+
+    /** The backend's catalog, re-read at most every {@link #CATALOG_CACHE}. */
+    private ShardCatalog cachedCatalog() {
+        ShardCatalog base = backend.catalog();
+        return new ShardCatalog() {
+            private List<ShardId> cached;
+            private long readAt;
+
+            @Override
+            public synchronized List<ShardId> shards() throws IOException {
+                long now = System.nanoTime();
+                if (cached == null || now - readAt >= CATALOG_CACHE.toNanos()) {
+                    try {
+                        cached = List.copyOf(base.shards());
+                        readAt = now;
+                    } catch (IOException | RuntimeException e) {
+                        // A bucket outage must not stop queries this reader could answer: keep the
+                        // last catalog read; only a reader that never read it answers 503.
+                        if (cached == null) throw e;
+                        log.warn("Reading the shard catalog failed; routing with the one read {} s ago: {}",
+                                (now - readAt) / 1_000_000_000L, e.toString());
+                    }
+                }
+                return cached;
+            }
+        };
     }
 
     private boolean isReader() {
@@ -616,6 +688,12 @@ public final class ClusterRuntime implements Closeable {
             first = firstSyncThread;
         }
         if (members != null) members.close();
+        com.pharos.search.distributed.DistributedSearch ds;
+        synchronized (this) {
+            ds = distributed;
+            distributed = null;
+        }
+        if (ds != null) ds.close();
         if (f != null) f.shutdownNow();
         if (s != null) s.close();
         if (first != null && first != Thread.currentThread()) {

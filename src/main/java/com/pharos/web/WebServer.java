@@ -234,6 +234,13 @@ public class WebServer {
             ctx.status(409).json(body);
         });
 
+        // Fan-out routing (reader nodes): a project name that is no shard id → 400; the shard
+        // catalog unreadable → 503
+        app.exception(com.pharos.cluster.routing.InvalidProjectException.class, (e, ctx) ->
+                ctx.status(400).json(Map.of("error", e.getMessage())));
+        app.exception(com.pharos.cluster.routing.CatalogUnavailableException.class, (e, ctx) ->
+                ctx.status(503).json(Map.of("error", e.getMessage())));
+
         // Project without a call graph (never indexed with one, or a failed build) → 404
         app.exception(com.pharos.graph.GraphNotFoundException.class, (e, ctx) ->
                 ctx.status(404).json(Map.of("error", e.getMessage())));
@@ -357,7 +364,8 @@ public class WebServer {
                 } else {
                     ctx.json(results);
                 }
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
@@ -439,7 +447,8 @@ public class WebServer {
                     recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
                 }
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
@@ -494,7 +503,8 @@ public class WebServer {
                 var res = searchEngine.findTransitiveCallers(fqn, depth, maxCallers, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
@@ -512,7 +522,8 @@ public class WebServer {
                 var res = searchEngine.findUsages(fqn, kind, null, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
@@ -532,7 +543,8 @@ public class WebServer {
                 var res = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
@@ -547,7 +559,9 @@ public class WebServer {
             if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
             List<String> path = List.of();
             List<String> warnings = new ArrayList<>();
-            for (ProjectMeta meta : registry.listAll()) {
+            java.util.Optional<List<String>> fanned = searchEngine.fannedOutCallPath(from, to, warnings);
+            if (fanned.isPresent()) path = fanned.get();
+            else for (ProjectMeta meta : registry.listAll()) {
                 try (GraphView g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
@@ -670,7 +684,8 @@ public class WebServer {
                 res.put("exitPoints", exits);
                 res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());

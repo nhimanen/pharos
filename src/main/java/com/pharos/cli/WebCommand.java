@@ -65,7 +65,9 @@ public class WebCommand implements Callable<Integer> {
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
                 webServer.setDegradation(clusterRuntime::degradation);
                 webServer.setLiveReaders(clusterRuntime::liveReaders);
-                com.pharos.cluster.internal.InternalApi internal = clusterRuntime.internalApi();
+                // With the engine, this reader also coordinates queries over shards it does not hold.
+                com.pharos.cluster.internal.InternalApi internal = searchEngine != null
+                        ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();
                 if (internal != null) webServer.setInternalApi(internal);
             }
             webServer.start(port);

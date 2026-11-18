@@ -29,6 +29,8 @@ public final class InternalApi {
     public static final int MAX_BODY_BYTES = 4 << 20;
     public static final int MAX_ITEMS = 10_000;
     public static final int MAX_VECTOR_LENGTH = 4096;
+    /** The {@code error} of a 409 refusing a request analysed with other synonyms. */
+    public static final String SYNONYMS_MISMATCH = "synonyms mismatch";
 
     /** Null until the shard search is wired: authenticated calls then get 503 and fail over. */
     private volatile ShardSearchService service;
@@ -89,6 +91,9 @@ public final class InternalApi {
         app.post("/internal/callees", ctx -> handle(ctx, CalleesRequest.class, CalleesRequest::shard,
                 CalleesRequest::generation, true, CalleesResponse::generation, InternalApi::check,
                 r -> service.callees(r)));
+        app.post("/internal/graph", ctx -> handle(ctx, GraphRequest.class, GraphRequest::shard,
+                GraphRequest::generation, false, GraphResponse::generation, InternalApi::check,
+                r -> service.graph(r)));
     }
 
     @FunctionalInterface
@@ -142,6 +147,9 @@ public final class InternalApi {
                 return;
             }
             ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
+        } catch (SynonymsMismatchException e) {
+            ctx.status(409).contentType("application/json")
+                    .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));
         } catch (Exception e) {
             log.warn("internal call on shard '{}' failed: {}", shard, e.toString());
             error(ctx, 500, "internal error");
@@ -161,6 +169,9 @@ public final class InternalApi {
             if (r.queryVector() != null && r.queryVector().length > MAX_VECTOR_LENGTH) return "query vector too long";
         } else if (req instanceof CalleesRequest r) {
             if (size(r.fqns()) > MAX_ITEMS) return "too many fqns";
+        } else if (req instanceof GraphRequest r) {
+            if (size(r.fqns()) > MAX_ITEMS) return "too many fqns";
+            if (r.limit() < 0 || r.limit() > MAX_ITEMS) return "limit out of range";
         }
         return null;
     }

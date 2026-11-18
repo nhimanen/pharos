@@ -80,9 +80,34 @@ public final class ShardClient {
         return n == null ? 0 : n.get();
     }
 
+    /** A response together with the reader that gave it (the reader a query pins for the shard). */
+    public record Answer<R>(ReaderHeartbeat reader, R response) {}
+
+    public static final Endpoint<GraphRequest, GraphResponse> GRAPH =
+            new Endpoint<>("/internal/graph", GraphResponse.class, GraphRequest::generation,
+                    GraphResponse::generation);
+
     /** Calls the route's candidates in order, at most two attempts. */
     public <Q, R> R call(Route route, Endpoint<Q, R> endpoint, Function<ReaderHeartbeat, Q> request) {
-        List<ReaderHeartbeat> candidates = route.candidates();
+        return callPreferring(route, null, endpoint, request).response();
+    }
+
+    /**
+     * Like {@link #call}, trying {@code preferred} first when it is set (the reader a query pinned
+     * for the shard; it need not still be among the route's candidates), then the route's other
+     * candidates, at most two attempts in all. A connection error, timeout or 5xx marks the reader
+     * suspect and moves on; a 404 (shard not served there) or a synonyms mismatch moves on without
+     * marking it; a generation mismatch (409) is thrown at once.
+     *
+     * @throws ShardUnavailableException when no attempt answered
+     */
+    public <Q, R> Answer<R> callPreferring(Route route, ReaderHeartbeat preferred, Endpoint<Q, R> endpoint,
+                                           Function<ReaderHeartbeat, Q> request) {
+        List<ReaderHeartbeat> candidates = new java.util.ArrayList<>(route.candidates().size() + 1);
+        if (preferred != null) candidates.add(preferred);
+        for (ReaderHeartbeat r : route.candidates()) {
+            if (preferred == null || !r.node().equals(preferred.node())) candidates.add(r);
+        }
         if (candidates.isEmpty()) {
             throw new ShardUnavailableException(route.shard(), "no live reader serves it", null);
         }
@@ -90,11 +115,11 @@ public final class ShardClient {
         for (int i = 0; i < Math.min(2, candidates.size()); i++) {
             ReaderHeartbeat reader = candidates.get(i);
             try {
-                return callOn(reader, endpoint, request.apply(reader));
+                return new Answer<>(reader, callOn(reader, endpoint, request.apply(reader)));
             } catch (RetryableFailure f) {
                 health.markSuspect(reader.node());
                 last = f;
-            } catch (NotServedException n) { // a replica that dropped the shard: not a sick reader
+            } catch (NotServedException | SynonymsMismatchException n) { // not a sick reader
                 last = n;
             }
         }
@@ -121,11 +146,24 @@ public final class ShardClient {
                         .header(InternalApi.TOKEN_HEADER, token)
                         .POST(HttpRequest.BodyPublishers.ofByteArray(payload))
                         .build();
-                HttpResponse<java.io.InputStream> resp = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
-                status = resp.statusCode();
-                try (java.io.InputStream in = resp.body()) {
-                    body = in.readNBytes(maxResponseBytes + 1);
+                // The JDK's request timeout ends once the headers arrive: the whole exchange, body
+                // included, is bounded here by the same duration (twice it, so a slow connect still fits).
+                java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> pending =
+                        http.sendAsync(req, info -> new CappedBody(maxResponseBytes + 1));
+                HttpResponse<byte[]> resp;
+                try {
+                    resp = pending.get(requestTimeout.toMillis() * 2, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.TimeoutException e) {
+                    pending.cancel(true);
+                    throw new IOException("no complete response within " + requestTimeout.toMillis() * 2 + " ms");
+                } catch (java.util.concurrent.ExecutionException e) {
+                    Throwable c = e.getCause();
+                    if (c instanceof IOException io) throw io;
+                    if (c instanceof IllegalArgumentException iae) throw iae;
+                    throw new IOException(String.valueOf(c), c);
                 }
+                status = resp.statusCode();
+                body = resp.body();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new ShardCallException("interrupted calling " + reader.node());
@@ -138,6 +176,10 @@ public final class ShardClient {
             if (status >= 500) throw new RetryableFailure(reader.node() + " answered " + status);
             if (status == 409) {
                 health.markHealthy(reader.node());
+                if (InternalApi.SYNONYMS_MISMATCH.equals(errorOf(body))) {
+                    throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
+                            + " (synonyms.txt differs from this coordinator's)");
+                }
                 throw new GenerationMismatchException(reader.node(), servedGeneration(body));
             }
             if (status == 404) throw new NotServedException(reader.node() + " does not serve the shard");
@@ -158,6 +200,53 @@ public final class ShardClient {
         } finally {
             counter.decrementAndGet();
         }
+    }
+
+    private String errorOf(byte[] body) {
+        try {
+            return mapper.readTree(body).path("error").asText(null);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Collects a response body up to {@code cap} bytes and then stops reading (the caller rejects
+     * a body that reached the cap), so a runaway reader cannot fill the heap.
+     */
+    private static final class CappedBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final int cap;
+        private final java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        private final java.util.concurrent.CompletableFuture<byte[]> result = new java.util.concurrent.CompletableFuture<>();
+        private java.util.concurrent.Flow.Subscription subscription;
+
+        CappedBody(int cap) { this.cap = cap; }
+
+        @Override public java.util.concurrent.CompletionStage<byte[]> getBody() { return result; }
+
+        @Override public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+            subscription = s;
+            s.request(Long.MAX_VALUE);
+        }
+
+        @Override public void onNext(List<java.nio.ByteBuffer> items) {
+            if (result.isDone()) return;
+            for (java.nio.ByteBuffer b : items) {
+                int n = Math.min(b.remaining(), cap - out.size());
+                byte[] chunk = new byte[n];
+                b.get(chunk);
+                out.write(chunk, 0, n);
+                if (out.size() >= cap) {
+                    subscription.cancel();
+                    result.complete(out.toByteArray());
+                    return;
+                }
+            }
+        }
+
+        @Override public void onError(Throwable t) { result.completeExceptionally(t); }
+
+        @Override public void onComplete() { result.complete(out.toByteArray()); }
     }
 
     private long servedGeneration(byte[] body) {

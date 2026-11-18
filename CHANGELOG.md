@@ -44,6 +44,17 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 - Cluster readers serve an internal shard API (`/internal/term-stats`, `/shard-search`, `/snippets`,
   `/callees`) guarded by `cluster.token` (`X-Pharos-Cluster-Token`, constant-time compare, 401 without it).
   New config: `cluster.fanoutTimeoutMillis` (5000), `cluster.connectTimeoutMillis` (1000).
+- Fan-out (readers): a reader that does not hold every shard a query needs coordinates it. It
+  classifies and embeds the query once, gathers BM25 term statistics from every shard (so keyword
+  ranking equals a single node's), fetches raw candidates from the readers serving the other shards
+  (`/internal/shard-search`), and applies graph boost, fusion and reranking once over the merged
+  lists; snippets and neighbourhood expansion come from the owning shard. Each query pins one reader
+  and generation per shard. A reader holding every requested shard searches locally, unchanged.
+  Graph and lookup tools (callers, callees, usages, call chains, call paths, method/class lookup)
+  reach shards held elsewhere through `/internal/graph`. A shard no reader can answer for is named
+  in the response warnings (`shard <name> unavailable: <reason>; results exclude it`); the other
+  shards still answer. Coordinator and shard must use the same `synonyms.txt` (a shard refuses
+  otherwise, 409). An invalid project name answers 400 and an unreadable shard catalog 503.
 
 ### Changed
 - Config validation: `cluster.retireGraceSeconds` must be at least `2 x cluster.pollIntervalSeconds`

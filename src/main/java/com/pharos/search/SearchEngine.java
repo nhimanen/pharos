@@ -146,6 +146,12 @@ public class SearchEngine {
      */
     public record ModelWarmup(ModelState state, String failure, long millis) {}
 
+    /**
+     * The fan-out coordinator of a reader node (Phase 3); null on every other node, which always
+     * searches locally. Even when set, a query whose shards are all held here runs the local path.
+     */
+    private volatile com.pharos.search.distributed.DistributedSearch distributed;
+
     /** True when an embedding model is configured (a bare no-op provider means none is). */
     private final boolean modelConfigured;
     private final java.util.concurrent.CompletableFuture<ModelWarmup> warmup =
@@ -193,6 +199,50 @@ public class SearchEngine {
 
         this.builtPipelines = memoize(() ->
                 new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs(configBase)));
+    }
+
+    /** Makes this engine a coordinator for shards it does not hold (reader nodes only). */
+    public void setDistributed(com.pharos.search.distributed.DistributedSearch distributed) {
+        this.distributed = distributed;
+    }
+
+    /**
+     * The shard side of fan-out over this engine's index, analysers and embedder: what a reader's
+     * {@code /internal/*} endpoints and a coordinator's own shards run.
+     *
+     * @param serves whether this node holds a shard
+     */
+    public com.pharos.search.distributed.LocalShardService shardService(java.util.function.Predicate<String> serves) {
+        return new com.pharos.search.distributed.LocalShardService(luceneIndexer, serves, keywordStrategy,
+                vectorStrategy, new com.pharos.search.pipeline.UnifiedRetrievalStage(keywordStrategy, embedder));
+    }
+
+    /** The query embedder (the coordinator embeds each query once and sends the vector). */
+    public EmbeddingProvider embedder() {
+        return embedder;
+    }
+
+    /** The vector strategy (snippet hints of a coordinator's own shards). */
+    public VectorSearchStrategy vectorStrategy() {
+        return vectorStrategy;
+    }
+
+    /** The projects a request names, in order; empty for "every project". */
+    private static List<String> requestedProjects(SearchRequest req) {
+        if (req.project() != null && !req.project().isEmpty()) return List.of(req.project());
+        if (req.projects() != null && !req.projects().isEmpty()) return req.projects();
+        return List.of();
+    }
+
+    /**
+     * The fan-out of a graph or lookup call over {@code project} (null: every shard), or null when
+     * this node holds every shard involved (then the local code runs, unchanged).
+     */
+    private com.pharos.search.distributed.DistributedSearch.Query graphFanOut(String project) {
+        com.pharos.search.distributed.DistributedSearch ds = distributed;
+        if (ds == null) return null;
+        var q = ds.open(project == null || project.isEmpty() ? List.of() : List.of(project));
+        return q.fansOut() ? q : null;
     }
 
     /** Returns the ordered list of available pipelines for UI display. */
@@ -257,7 +307,21 @@ public class SearchEngine {
         if (modelState == ModelState.FAILED && requiresVectors(req.type())) {
             warnings.add("vector search unavailable: " + modelFailure + "; vector results are missing");
         }
-        List<String> projects = resolveUsable(req, warnings);
+        List<String> projects;
+        com.pharos.search.distributed.DistributedSearch ds = distributed;
+        com.pharos.search.distributed.DistributedSearch.Query fanout = ds == null ? null : ds.open(requestedProjects(req));
+        if (fanout != null && fanout.fansOut()) {
+            return searchFannedOut(req, hints, expand, trace, warnings, fanout);
+        } else if (fanout != null && !fanout.unservedShards().isEmpty()) {
+            // Shards nobody serves are named, never silently dropped; the held ones search locally.
+            warnings.addAll(fanout.warnings());
+            java.util.Set<String> held = java.util.Set.copyOf(fanout.localShards());
+            boolean explicit = !requestedProjects(req).isEmpty();
+            List<String> heldProjects = resolveProjects(req).stream().filter(held::contains).toList();
+            projects = usable(heldProjects, explicit && heldProjects.size() == 1, warnings);
+        } else {
+            projects = resolveUsable(req, warnings);
+        }
         if (projects.isEmpty()) {
             if (warnings.isEmpty()) {
                 log.warn("No indexed projects found. Run 'pharos index <path>' first.");
@@ -351,6 +415,52 @@ public class SearchEngine {
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
         return new SearchResponse(expanded, trace, resolvedTypeName, null, kwResolver, vecResolver, List.copyOf(warnings));
+    }
+
+    /**
+     * The coordinator path of {@link #searchWithTrace}: the same pipeline, with every retrieval stage
+     * fanned out over the query's shards ({@link com.pharos.search.distributed.DistributedSearch}),
+     * then the same boosts, snippets and expansion as the local path. Shards left out are named in
+     * the warnings.
+     */
+    private SearchResponse searchFannedOut(SearchRequest req, QueryHints hints, boolean expand, SearchTrace trace,
+                                           List<String> warnings,
+                                           com.pharos.search.distributed.DistributedSearch.Query fanout)
+            throws IOException {
+        SearchRequest.SearchType resolvedType = req.type();
+        final String resolvedTypeName = resolvedType.name().toLowerCase();
+        if (req.oversampleFactor() == 0) {
+            int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
+            if (adaptive > 0) {
+                req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+            }
+        }
+        Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
+        SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
+                pipelines.get(SearchRequest.SearchType.HYBRID));
+        // Mergers and rerankers read result fields only: they get no reader here.
+        List<SearchResult> primary = pipeline.execute(null, req, trace, fanout.runner());
+        primary = applyProjectAffinityBoost(primary, req.project());
+        primary = applyQueryHintBoosts(primary, hints);
+
+        if (primary.isEmpty()) {
+            warnings.addAll(fanout.warnings());
+            return new SearchResponse(List.of(), trace, resolvedTypeName, null, null, null, List.copyOf(warnings));
+        }
+        SnippetResolver kwResolver = keywordStrategy.buildKeywordResolver(
+                keywordStrategy.buildQuery(new SearchRequest(
+                        hints.cleanedQuery(), resolvedType, req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())));
+        SnippetResolver vecResolver = fanout.vectorResolver(primary, hints.cleanedQuery());
+        if (expand) {
+            long tExpand = System.currentTimeMillis();
+            primary = fanout.expand(primary);
+            trace.record("neighborhood expansion", tExpand);
+        }
+        warnings.addAll(fanout.warnings());
+        return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver,
+                List.copyOf(warnings));
     }
 
     /**
@@ -615,6 +725,12 @@ public class SearchEngine {
     }
 
     private SearchResult getByFqn(String fqn, List<String> warnings) throws IOException {
+        var fanout = graphFanOut(null);
+        if (fanout != null) {
+            SearchResult r = fanout.docs(List.of(fqn)).get(fqn);
+            warnings.addAll(fanout.warnings());
+            return r;
+        }
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return null;
 
@@ -648,6 +764,12 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public Map<String, SearchResult> getByFqns(List<String> fqns, List<String> warnings) throws IOException {
         if (fqns.isEmpty()) return Map.of();
+        var fanout = graphFanOut(null);
+        if (fanout != null) {
+            Map<String, SearchResult> r = fanout.docs(fqns);
+            warnings.addAll(fanout.warnings());
+            return r;
+        }
 
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return Map.of();
@@ -693,9 +815,13 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
                                           int maxBodyChars, List<String> warnings) throws IOException {
-        List<GraphView> graphs = openAllGraphs(null, warnings);
+        var fanout = graphFanOut(null);
+        List<GraphView> graphs = fanout != null ? List.of() : openAllGraphs(null, warnings);
         try {
-            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, direction, 50);
+            BfsResult bfs = fanout != null
+                    ? bfsLevels(level -> fanout.neighbors(level, direction), rootFqn, depth, 50)
+                    : bfsCallGraph(graphs, rootFqn, depth, direction, 50);
+            if (fanout != null) warnings.addAll(fanout.warnings());
 
             // Bulk-fetch bodies — one Lucene query for all visited FQNs.
             Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()), warnings);
@@ -801,6 +927,59 @@ public class SearchEngine {
         return new BfsResult(fqnDepth, fqnChildren, truncated);
     }
 
+    /**
+     * {@link #bfsCallGraph} for a fan-out: the same traversal (FIFO order is level order), with the
+     * neighbours of a whole level fetched in one call per shard.
+     */
+    private static BfsResult bfsLevels(java.util.function.Function<List<String>, Map<String, Set<String>>> neighbors,
+                                       String rootFqn, int depth, int maxNodes) {
+        Map<String, Integer>      fqnDepth    = new LinkedHashMap<>();
+        Map<String, List<String>> fqnChildren = new LinkedHashMap<>();
+        boolean truncated = false;
+        fqnDepth.put(rootFqn, 0);
+        List<String> level = List.of(rootFqn);
+        outer:
+        while (!level.isEmpty()) {
+            int d = fqnDepth.get(level.get(0));
+            if (d >= depth) break;
+            Map<String, Set<String>> nb = neighbors.apply(level);
+            List<String> next = new ArrayList<>();
+            for (String current : level) {
+                List<String> children = new ArrayList<>(nb.getOrDefault(current, Set.of()));
+                fqnChildren.put(current, children);
+                for (String neighbor : children) {
+                    if (fqnDepth.containsKey(neighbor)) continue;
+                    if (fqnDepth.size() >= maxNodes) { truncated = true; break outer; }
+                    fqnDepth.put(neighbor, d + 1);
+                    next.add(neighbor);
+                }
+            }
+            level = next;
+        }
+        return new BfsResult(fqnDepth, fqnChildren, truncated);
+    }
+
+    /**
+     * Callers (or callees) of {@code fqn} over a fan-out's call graphs; empty when this node holds
+     * every shard (the caller then reads its local graphs as before).
+     */
+    public java.util.Optional<Set<String>> fannedOutNeighbors(String fqn, boolean callers, List<String> warnings) {
+        var fanout = graphFanOut(null);
+        if (fanout == null) return java.util.Optional.empty();
+        Set<String> r = fanout.neighbors(List.of(fqn), callers ? "callers" : "callees").getOrDefault(fqn, Set.of());
+        warnings.addAll(fanout.warnings());
+        return java.util.Optional.of(r);
+    }
+
+    /** The shortest call path over a fan-out's shards (first found in shard order); empty when all are held here. */
+    public java.util.Optional<List<String>> fannedOutCallPath(String from, String to, List<String> warnings) {
+        var fanout = graphFanOut(null);
+        if (fanout == null) return java.util.Optional.empty();
+        List<String> p = fanout.callPath(from, to);
+        warnings.addAll(fanout.warnings());
+        return java.util.Optional.of(p);
+    }
+
     // -------------------------------------------------------------------------
     // Transitive callers — lightweight impact-analysis variant (no body fetch)
     // -------------------------------------------------------------------------
@@ -829,11 +1008,15 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
                                                           int maxCallers, List<String> warnings) throws IOException {
-        List<GraphView> graphs = openAllGraphs(null, warnings);
+        var fanout = graphFanOut(null);
+        List<GraphView> graphs = fanout != null ? List.of() : openAllGraphs(null, warnings);
         try {
             // +1 to include root in the cap budget, then exclude it from results
-            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, "callers",
+            BfsResult bfs = fanout != null
+                    ? bfsLevels(level -> fanout.neighbors(level, "callers"), rootFqn, depth, Math.max(1, maxCallers + 1))
+                    : bfsCallGraph(graphs, rootFqn, depth, "callers",
                     Math.max(1, maxCallers + 1));
+            if (fanout != null) warnings.addAll(fanout.warnings());
 
             List<Map.Entry<String, Integer>> callers = bfs.fqnDepth().entrySet().stream()
                     .filter(e -> !e.getKey().equals(rootFqn))   // exclude root itself
@@ -1022,6 +1205,12 @@ public class SearchEngine {
 
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public List<SearchResult> findCallers(String calleeFqn, String project, List<String> warnings) throws IOException {
+        var fanout = graphFanOut(project);
+        if (fanout != null) {
+            List<SearchResult> r = fanout.callers(calleeFqn, 100);
+            warnings.addAll(fanout.warnings());
+            return r;
+        }
         SearchRequest req = SearchRequest.keyword("", project, 100);
         List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) return List.of();
@@ -1043,6 +1232,13 @@ public class SearchEngine {
     public List<SearchResult> findCallees(String callerFqn, String project, List<String> warnings) throws IOException {
         SearchResult caller = getMethodByFqn(callerFqn, warnings);
         if (caller == null) return List.of();
+        var fanout = graphFanOut(project);
+        if (fanout != null) { // callee fqns from the shard holding the caller, their documents from any shard
+            List<String> called = fanout.calleeFqns(callerFqn);
+            warnings.addAll(fanout.warnings());
+            Map<String, SearchResult> docs = getByFqns(called, warnings);
+            return called.stream().map(docs::get).filter(r -> r != null).collect(Collectors.toList());
+        }
 
         // The calledMethods field stores FQNs; we look them up directly
         // For now return the caller with its callees via a direct document lookup
@@ -1215,6 +1411,16 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
+        var fanout = graphFanOut(project);
+        if (fanout != null) {
+            Map<String, List<String>> u = fanout.usages(fqn, kind);
+            warnings.addAll(fanout.warnings());
+            return new UsageResult(fqn, u.getOrDefault("callers", List.of()),
+                    u.getOrDefault("subclasses", List.of()), u.getOrDefault("superTypes", List.of()),
+                    u.getOrDefault("fieldReaders", List.of()), u.getOrDefault("fieldWriters", List.of()),
+                    u.getOrDefault("annotatedWith", List.of()), u.getOrDefault("methodsReturning", List.of()),
+                    u.getOrDefault("methodsTaking", List.of()));
+        }
         List<GraphView> graphs = openAllGraphs(project, warnings);
         try {
             for (GraphView g : graphs) {

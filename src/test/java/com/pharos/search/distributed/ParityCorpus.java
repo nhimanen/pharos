@@ -53,7 +53,7 @@ final class ParityCorpus {
     static final String PHAROS = "pharos";
 
     /** eval/benchmark.py QUERIES whose project is pharos (category + index in the comment). */
-    private static final List<String> PHAROS_QUERIES = List.of(
+    static final List<String> PHAROS_QUERIES = List.of(
             "BordaMerger", // A21
             "CrossEncoderProvider", // A22
             "CallGraphBuilder", // A23

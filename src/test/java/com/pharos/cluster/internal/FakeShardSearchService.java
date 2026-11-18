@@ -67,4 +67,11 @@ public class FakeShardSearchService implements ShardSearchService {
         enter();
         return new CalleesResponse(generationDuringWork != null ? generationDuringWork : r.generation(), Map.of("a.B#c()", List.of("a.B#d()")));
     }
+
+    @Override
+    public GraphResponse graph(GraphRequest r) {
+        enter();
+        return new GraphResponse(generationDuringWork != null ? generationDuringWork : workGeneration(r.shard()),
+                Map.of("a.B#c()", List.of("a.B#d()")), null, null);
+    }
 }

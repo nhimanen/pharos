@@ -145,6 +145,18 @@ public class McpServer {
             result.putArray("content").addObject().put("type", "text").put("text", e.getMessage());
             result.put("isError", true);
             return successResponse(id, result);
+        } catch (com.pharos.cluster.routing.InvalidProjectException e) {
+            // the caller's fault, as HTTP 400: JSON-RPC "invalid params"
+            log.warn("tool={} args={} status=invalid-project error={}", toolName, arguments, e.getMessage());
+            return errorResponse(id, -32602, "Invalid params: " + e.getMessage());
+        } catch (com.pharos.cluster.routing.CatalogUnavailableException e) {
+            // transient, as HTTP 503: a tool error the client may retry
+            log.warn("tool={} args={} status=catalog-unavailable error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text")
+                    .put("text", "unavailable (503): " + e.getMessage() + "; retry shortly");
+            result.put("isError", true);
+            return successResponse(id, result);
         } catch (Exception e) {
             long ms = System.currentTimeMillis() - start;
             log.warn("tool={} args={} status=error latency_ms={} error={}",

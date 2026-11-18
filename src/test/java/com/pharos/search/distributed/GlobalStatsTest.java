@@ -107,6 +107,61 @@ class GlobalStatsTest {
         assertThat(fallback).isEqualTo(scores(keyword.retrieveRaw(new IndexSearcher(a), req)));
     }
 
+    /**
+     * Known gap (documented in {@link GlobalStatsSearcher}): {@code SynonymQuery} asks the searcher for a
+     * term's statistics only when the term occurs in the shard, so a synonym present only on another
+     * shard drops out of the combined statistics there: its scores differ from a {@code MultiReader}'s.
+     * Plain term queries over the same shards are exact. If Lucene ever asks for every term, this test
+     * fails and the gap can be closed.
+     */
+    @Test
+    void synonymTermOnlyOnAnotherShardDivergesFromMultiReader() throws Exception {
+        IndexReader a = textShard("alpha one", "alpha two", "alpha alpha three", "other four");
+        IndexReader b = textShard("beta five", "beta beta six", "alpha beta seven", "beta eight", "beta nine",
+                "beta ten", "beta eleven"); // beta: docFreq 6 > alpha 4, so the max the pseudo-term uses differs
+        MultiReader both = new MultiReader(new IndexReader[]{a, b}, false);
+        open.add(both::close);
+        Query synonyms = new org.apache.lucene.search.SynonymQuery.Builder("body")
+                .addTerm(new Term("body", "alpha")).addTerm(new Term("body", "beta")).build();
+        Query alphaOnly = new org.apache.lucene.search.TermQuery(new Term("body", "alpha"));
+
+        for (Query q : List.of(alphaOnly, synonyms)) {
+            Set<Term> terms = GlobalStats.queryTerms(q);
+            GlobalStats stats = GlobalStats.merge(List.of(
+                    new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(a), terms)),
+                    new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(b), terms))));
+            float[] multi = topScores(new IndexSearcher(both), q, a.maxDoc());
+            float[] global = topScores(new GlobalStatsSearcher(a, stats), q, a.maxDoc());
+            if (q == alphaOnly) {
+                assertThat(global).as("term query: exact").isEqualTo(multi);
+            } else {
+                assertThat(global).as("synonym query: 'beta' exists only on b, so a scores without its stats")
+                        .isNotEqualTo(multi);
+            }
+        }
+    }
+
+    /** Scores of shard-a documents (the first {@code n} doc ids), by doc id. */
+    private static float[] topScores(IndexSearcher s, Query q, int n) throws IOException {
+        float[] out = new float[n];
+        for (var sd : s.search(q, 100).scoreDocs) if (sd.doc < n) out[sd.doc] = sd.score;
+        return out;
+    }
+
+    private IndexReader textShard(String... bodies) throws IOException {
+        Directory dir = new ByteBuffersDirectory();
+        try (IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(new org.apache.lucene.analysis.standard.StandardAnalyzer()))) {
+            for (String body : bodies) {
+                Document d = new Document();
+                d.add(new TextField("body", body, Field.Store.NO));
+                w.addDocument(d);
+            }
+        }
+        DirectoryReader r = DirectoryReader.open(dir);
+        open.add(r::close);
+        return r;
+    }
+
     @Test
     void mergeSumsFieldAndTermStatsAcrossShards() throws Exception {
         GlobalStats one = new GlobalStats(

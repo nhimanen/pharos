@@ -25,6 +25,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * logged at debug, so a coordinator that misses terms shows up. {@code maxDoc} is not on the wire: collection statistics
  * report {@code docCount} as {@code maxDoc}, which no similarity pharos uses reads (BM25 and
  * {@code SimilarityBase} score with {@code docCount}).
+ *
+ * <p><b>Known gap: synonyms across shards.</b> {@code SynonymQuery} (and {@code MultiPhraseQuery})
+ * ask the searcher for a term's statistics only when that term occurs in the shard being searched
+ * (Lucene 10.4 {@code SynonymWeight}: {@code if (ts.docFreq() > 0)}). A synonym that exists only on
+ * another shard therefore drops out of the pseudo-term's statistics here (its {@code docFreq} is the
+ * max over the synonyms), while a {@code MultiReader} over all shards counts it: such documents can
+ * score differently from a single node. Plain term, boolean and phrase queries are exact. The
+ * keyword pipeline builds {@code SynonymQuery} only with a {@code synonyms.txt}; the gap is pinned
+ * by {@code GlobalStatsTest#synonymTermOnlyOnAnotherShardDivergesFromMultiReader}.
  */
 public class GlobalStatsSearcher extends IndexSearcher {
 

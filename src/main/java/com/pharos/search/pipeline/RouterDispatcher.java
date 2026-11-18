@@ -47,10 +47,15 @@ public final class RouterDispatcher implements RetrievalStage {
     @Override
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                        SearchTrace trace) throws IOException {
+        return select(req).execute(reader, req, trace);
+    }
+
+    /** The child pipeline {@code req}'s classification selects. */
+    public SearchPipeline select(SearchRequest req) {
         QueryClassification c = req.classification();
         SearchRequest.SearchType target = (c != null) ? c.type() : defaultType;
         SearchPipeline child = children.getOrDefault(target, children.get(defaultType));
         if (child == null) child = children.values().iterator().next(); // last resort
-        return child.execute(reader, req, trace);
+        return child;
     }
 }

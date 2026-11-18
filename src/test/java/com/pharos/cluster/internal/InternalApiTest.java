@@ -385,4 +385,61 @@ class InternalApiTest {
                 ShardClient.TERM_STATS, STATS)).isInstanceOf(ShardCallException.class).hasMessageContaining("too large");
         assertThat(health.isSuspect("n1")).isFalse();
     }
+
+    /** Carried from Task 3: the JDK's request timeout ends at the headers; a stalled body is bounded too. */
+    @Test
+    void stalledResponseBodyIsBoundedAndMarksSuspect() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            Thread t = new Thread(() -> {
+                try (var socket = server.accept()) {
+                    var in = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream()));
+                    String line;
+                    int contentLength = 0;
+                    while ((line = in.readLine()) != null && !line.isEmpty()) {
+                        if (line.toLowerCase().startsWith("content-length:")) contentLength = Integer.parseInt(line.substring(15).trim());
+                    }
+                    for (int i = 0; i < contentLength; i++) in.read();
+                    var out = socket.getOutputStream();
+                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"gen"
+                            .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    out.flush();
+                    Thread.sleep(10_000); // headers sent, the body never completes
+                } catch (Exception ignored) {
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+            ReaderHealth health = new ReaderHealth(30);
+            ShardClient c = new ShardClient(health, TOKEN, Duration.ofMillis(500), Duration.ofMillis(300));
+            long t0 = System.nanoTime();
+            assertThatThrownBy(() -> c.call(new Route(new ShardId("java"), List.of(reader("stall", server.getLocalPort()))),
+                    ShardClient.TERM_STATS, STATS)).isInstanceOf(ShardUnavailableException.class);
+            assertThat((System.nanoTime() - t0) / 1_000_000).as("ms until given up").isLessThan(3_000);
+            assertThat(health.isSuspect("stall")).isTrue();
+        }
+    }
+
+    /** A reader analysing with other synonyms answers 409 "synonyms mismatch"; the client tries the next replica, marks nobody suspect. */
+    @Test
+    void synonymsMismatchIsRefusedAndRetriedElsewhereWithoutSuspect() throws Exception {
+        FakeShardSearchService other = new FakeShardSearchService() {
+            @Override public TermStatsResponse termStats(TermStatsRequest r) {
+                throw new SynonymsMismatchException("hash differs");
+            }
+        }.serving("java", 5);
+        Javalin mismatched = serve(other);
+        HttpResponse<String> raw = post(mismatched, "/internal/term-stats", TOKEN, bodyFor("/internal/term-stats", null));
+        assertThat(raw.statusCode()).isEqualTo(409);
+        assertThat(mapper.readTree(raw.body()).get("error").asText()).isEqualTo(InternalApi.SYNONYMS_MISMATCH);
+
+        Javalin good = serve(new FakeShardSearchService().serving("java", 7));
+        ReaderHealth health = new ReaderHealth(30);
+        ShardClient.Answer<TermStatsResponse> a = client(health).callPreferring(new Route(new ShardId("java"),
+                List.of(reader("syn", mismatched.port()), reader("ok", good.port()))), null, ShardClient.TERM_STATS, STATS);
+        assertThat(a.response().generation()).isEqualTo(7);
+        assertThat(a.reader().node()).isEqualTo("ok");
+        assertThat(health.isSuspect("syn")).isFalse();
+        assertThatThrownBy(() -> client(health).call(new Route(new ShardId("java"), List.of(reader("syn", mismatched.port()))),
+                ShardClient.TERM_STATS, STATS)).isInstanceOf(ShardUnavailableException.class).hasMessageContaining("synonyms");
+    }
 }

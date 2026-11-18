@@ -41,7 +41,7 @@ public final class ShardRouter {
      */
     public ShardRouter(Supplier<List<ReaderHeartbeat>> live, ShardCatalog catalog, ReaderHealth health,
                        Predicate<ShardId> local) {
-        this(live, catalog, health, local, node -> 0); // TODO(Task 5): pass the fan-out client's per-node in-flight count
+        this(live, catalog, health, local, node -> 0); // a coordinator passes ShardClient::inFlight (ClusterRuntime)
     }
 
     /**
