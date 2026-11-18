@@ -215,6 +215,28 @@ public class SearchEngine {
         this.distributed = distributed;
     }
 
+    /** Why a shard held here is degraded (null when it is not); readers only. */
+    private volatile Function<String, String> localDegradation = shard -> null;
+
+    /**
+     * Reader nodes: why a shard this node holds is degraded (null when it is not). A search that
+     * reads such a shard here carries a warning naming it.
+     */
+    public void setLocalDegradation(Function<String, String> reason) {
+        this.localDegradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /** One warning per shard of {@code shards} that is degraded on this node. */
+    private void warnDegraded(java.util.Collection<String> shards, List<String> warnings) {
+        Function<String, String> why = localDegradation;
+        for (String shard : shards) {
+            String reason = why.apply(shard);
+            if (reason == null) continue;
+            String w = "shard " + shard + " is degraded on this reader: " + reason + "; its results may be incomplete";
+            if (!warnings.contains(w)) warnings.add(w);
+        }
+    }
+
     /**
      * The shard side of fan-out over this engine's index, analysers and embedder: what a reader's
      * {@code /internal/*} endpoints and a coordinator's own shards run.
@@ -368,6 +390,7 @@ public class SearchEngine {
         }
         if (fanout != null && fanout.fansOut()) {
             try (DistributedSearch.Query q = fanout) {
+                warnDegraded(q.localShards(), warnings);
                 return searchFannedOut(req, hints, expand, trace, warnings, q);
             }
         }
@@ -382,6 +405,7 @@ public class SearchEngine {
         } else {
             projects = resolveUsable(req, warnings);
         }
+        warnDegraded(projects, warnings);
         if (projects.isEmpty()) {
             if (warnings.isEmpty()) {
                 log.warn("No indexed projects found. Run 'pharos index <path>' first.");

@@ -195,6 +195,16 @@ class LazyReaderTest {
         return name.substring(name.lastIndexOf('.') + 1);
     }
 
+    /** The warnings of an unscoped keyword search (repeated: its blocks are cached by the first one). */
+    private static List<String> warnings(SearchEngine engine) {
+        try {
+            return engine.searchWithTrace(new SearchRequest("Calculator", SearchRequest.SearchType.KEYWORD, null, null,
+                    10, "text", null, null, 0), false).warnings();
+        } catch (IOException | RuntimeException e) {
+            return List.of("search failed: " + e);
+        }
+    }
+
     private static List<String> ids(SearchEngine engine, String query) throws IOException {
         return engine.search(new SearchRequest(query, SearchRequest.SearchType.KEYWORD, JAVA, null, 10,
                 "text", null, null, 0)).stream().map(SearchResult::id).toList();
@@ -744,8 +754,9 @@ class LazyReaderTest {
 
     /**
      * Final review I1(b): GC removed objects of the generation a lagging lazy reader still serves.
-     * The miss logs one ERROR per generation and /health answers 503 degraded (routers drain the
-     * node) until a newer generation is activated.
+     * The miss logs one ERROR per generation and /health answers 200 degraded naming the shard until
+     * a newer generation is activated (Phase 2 follow-up M3: the node stays routable for its other
+     * shards); queries searching the shard here carry a warning.
      */
     @Test
     void missingObjectOfTheServedGenerationDegradesHealthUntilANewerOneActivates() throws Exception {
@@ -757,9 +768,11 @@ class LazyReaderTest {
         logger.addAppender(log);
         com.pharos.web.WebServer web = new com.pharos.web.WebServer(null, null, null, null, null);
         web.setDegradation(node.runtime()::degradation);
+        web.setDegradedShards(node.runtime()::degradedShards);
         io.javalin.Javalin app = web.start(0);
         try {
             node.runtime().startServing();
+            node.runtime().internalApi(node.engine()); // the reader's engine wiring (WebCommand)
             assertThat(node.runtime().degradation()).isNull();
             assertThat(status(app)).isEqualTo(200);
 
@@ -780,18 +793,31 @@ class LazyReaderTest {
                 }
             }
             assertThat(node.runtime().degradation()).contains(JAVA, "generation " + g1);
-            assertThat(status(app)).isEqualTo(503);
+            assertThat(node.runtime().degradedShards()).containsExactly(JAVA);
+            assertThat(node.runtime().selfHeartbeat()).as("the heartbeat names the shard, not the node")
+                    .satisfies(hb -> {
+                        assertThat(hb.state()).isEqualTo(com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED);
+                        assertThat(hb.degradedShards()).containsExactly(JAVA);
+                        assertThat(hb.shards()).contains(JAVA);
+                    });
+            assertThat(status(app)).as("routable for its other shards").isEqualTo(200);
+            removed.forEach(store::put); // the objects are back (the search below reads uncached blocks)
+            assertThat(warnings(node.engine())).as("degraded until a newer generation is active")
+                    .anySatisfy(w -> assertThat(w)
+                            .startsWith("shard " + JAVA + " is degraded on this reader").contains("generation " + g1));
             assertThat(log.list.stream().filter(e -> e.getLevel() == Level.ERROR)
                     .map(ILoggingEvent::getFormattedMessage).toList())
                     .singleElement().satisfies(m -> assertThat(m).contains("generation " + g1, JAVA,
                             "garbage-collected", "behind retention", "mode full"));
 
-            removed.forEach(store::put); // the writer publishes again: the objects are back
-            addMethodAndReindex("triple");
+            addMethodAndReindex("triple"); // the writer publishes again
             node.runtime().syncNow();
             assertThat(node.runtime().served().get(SHARD).value()).isGreaterThan(g1);
             assertThat(node.runtime().degradation()).isNull();
+            assertThat(node.runtime().degradedShards()).isEmpty();
+            assertThat(node.runtime().selfHeartbeat().state()).isEqualTo(com.pharos.cluster.membership.ReaderHeartbeat.READY);
             assertThat(status(app)).isEqualTo(200);
+            assertThat(warnings(node.engine())).noneMatch(w -> w.contains("degraded"));
         } finally {
             app.stop();
             logger.detachAppender(log);

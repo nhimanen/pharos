@@ -58,12 +58,19 @@ class WebServerHealthTest {
         assertThat(server.health()).containsEntry("readerCache", cache).containsEntry("ready", true);
     }
 
-    /** A ready reader whose served generation lost its objects answers 503 degraded, so routers drain it. */
+    /**
+     * Phase 2 follow-up M3: a ready reader with a degraded shard (its served generation lost objects
+     * on the bucket) stays routable: 200 with {@code "status":"degraded"} and the shards, so routers
+     * keep sending it the queries for its other shards; only warming and draining answer 503.
+     */
     @Test
-    void healthAnswers503DegradedOverHttpWhileAShardIsDegraded() throws Exception {
+    void aDegradedShardKeepsTheNodeAt200AndNamesTheShard() throws Exception {
         WebServer server = new WebServer(null, null, null, null, null);
         java.util.concurrent.atomic.AtomicReference<String> reason = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<java.util.List<String>> shards =
+                new java.util.concurrent.atomic.AtomicReference<>(java.util.List.of());
         server.setDegradation(reason::get);
+        server.setDegradedShards(shards::get);
         java.util.concurrent.atomic.AtomicInteger readinessReads = new java.util.concurrent.atomic.AtomicInteger();
         server.setReadiness(() -> {
             readinessReads.incrementAndGet();
@@ -76,20 +83,24 @@ class WebServerHealthTest {
             var ok = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString());
             assertThat(ok.statusCode()).isEqualTo(200);
+            assertThat(ok.body()).doesNotContain("degradedShards");
             assertThat(readinessReads.get()).as("one readiness read per request").isEqualTo(1);
 
             reason.set("shard java: generation 7 was garbage-collected on the bucket");
+            shards.set(java.util.List.of("java"));
             var degraded = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString());
-            assertThat(degraded.statusCode()).isEqualTo(503);
-            assertThat(degraded.body()).contains("\"status\":\"degraded\"", "\"reason\":\"shard java: generation 7");
-            assertThat(server.healthStatus()).isEqualTo(503);
+            assertThat(degraded.statusCode()).as("routable for its other shards").isEqualTo(200);
+            assertThat(degraded.body()).contains("\"status\":\"degraded\"", "\"degradedShards\":[\"java\"]",
+                    "\"reason\":\"shard java: generation 7");
+            assertThat(server.healthStatus()).isEqualTo(200);
 
             reason.set(null);
+            shards.set(java.util.List.of());
             var again = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString());
             assertThat(again.statusCode()).isEqualTo(200);
-            assertThat(again.body()).contains("\"status\":\"ok\"").doesNotContain("reason");
+            assertThat(again.body()).contains("\"status\":\"ok\"").doesNotContain("reason", "degradedShards");
         } finally {
             app.stop();
         }

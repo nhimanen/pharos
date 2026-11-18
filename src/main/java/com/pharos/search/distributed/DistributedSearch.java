@@ -276,7 +276,7 @@ public final class DistributedSearch implements Closeable {
         public synchronized List<String> warnings() {
             for (ShardState s : shards) {
                 if (!s.local && s.route.candidates().isEmpty() && s.unavailable == null) {
-                    markUnavailable(s, "no live reader serves it");
+                    markUnavailable(s, noReaderReason(s));
                 }
             }
             return List.copyOf(warnings);
@@ -284,6 +284,13 @@ public final class DistributedSearch implements Closeable {
 
         synchronized void warn(String w) {
             if (!warnings.contains(w)) warnings.add(w);
+        }
+
+        /** Why no reader is a candidate for {@code s}: none serves it, or every one is degraded for it. */
+        private static String noReaderReason(ShardState s) {
+            List<String> degraded = s.route.degraded();
+            return degraded.isEmpty() ? "no live reader serves it"
+                    : "every live reader serving it is degraded (" + String.join(", ", degraded) + ")";
         }
 
         private synchronized void markUnavailable(ShardState s, String reason) {
@@ -299,7 +306,7 @@ public final class DistributedSearch implements Closeable {
             for (ShardState s : shards) {
                 if (s.unavailable != null) continue;
                 if (!s.local && s.route.candidates().isEmpty()) {
-                    markUnavailable(s, "no live reader serves it");
+                    markUnavailable(s, noReaderReason(s));
                     continue;
                 }
                 out.add(s);

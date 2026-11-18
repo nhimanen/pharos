@@ -53,6 +53,7 @@ public class WebServer {
     private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
+    private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
     private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
     private volatile com.pharos.cluster.internal.InternalApi internalApi = null;
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
@@ -92,11 +93,20 @@ public class WebServer {
 
     /**
      * Degradation reported by {@code /health}: while it returns a reason (non-null), a ready node
-     * answers HTTP 503 {@code {"status":"degraded","reason":…}}, so routers drain it (a lazy reader
-     * whose served generation was garbage-collected on the bucket).
+     * answers HTTP 200 {@code {"status":"degraded","reason":…}} (a lazy reader whose served generation
+     * was garbage-collected on the bucket); see {@link #setDegradedShards}.
      */
     public void setDegradation(java.util.function.Supplier<String> reason) {
         this.degradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /**
+     * The shards this reader can't serve fully, reported by {@code /health} as {@code degradedShards}
+     * with status {@code degraded} and HTTP 200: the node stays routable for its other shards (the
+     * coordinators' routers skip it for these shards only, from its heartbeat).
+     */
+    public void setDegradedShards(java.util.function.Supplier<java.util.List<String>> shards) {
+        this.degradedShards = java.util.Objects.requireNonNull(shards, "shards");
     }
 
     /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
@@ -119,7 +129,7 @@ public class WebServer {
         this.liveReaders = java.util.Objects.requireNonNull(s, "s");
     }
 
-    /** {@code {readers:[{node, advertiseUrl, shards, draining, ageSeconds}]}}. */
+    /** {@code {readers:[{node, advertiseUrl, shards, draining, state, degradedShards, ageSeconds}]}}. */
     Map<String, Object> readersPayload() {
         java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
         for (var l : liveReaders.get()) {
@@ -129,6 +139,8 @@ public class WebServer {
             r.put("advertiseUrl", h.advertiseUrl());
             r.put("shards", h.shards());
             r.put("draining", h.draining());
+            r.put("state", h.state());
+            r.put("degradedShards", h.degradedShards());
             r.put("ageSeconds", l.ageSeconds());
             rows.add(r);
         }
@@ -139,21 +151,30 @@ public class WebServer {
     record HealthAnswer(int status, Map<String, Object> body) {}
 
     /**
-     * {@code /health}: 200 {@code ok} when ready; 503 {@code warming} while a reader's first sync or
-     * model load runs, and 503 {@code degraded} (with a {@code reason}) while a ready reader can't
-     * serve a shard. The 503 keeps load balancers and the router from sending traffic. A client that
-     * only wants liveness treats any answer as "running". Readiness and degradation are read once.
+     * {@code /health}, one code path for every state:
+     * <ul>
+     *   <li>503 {@code warming} while a reader's first sync or model load runs;</li>
+     *   <li>200 {@code degraded} (with {@code degradedShards} and a {@code reason}) while a ready reader
+     *       can't fully serve some shards: it stays routable for the others, and routers skip it for
+     *       those shards only;</li>
+     *   <li>200 {@code ok} otherwise.</li>
+     * </ul>
+     * The 503 keeps load balancers and the router from sending traffic. A client that only wants
+     * liveness treats any answer as "running". Every signal is read once.
      */
     HealthAnswer healthAnswer() {
         boolean ready = readiness.getAsBoolean();
-        String degraded = ready ? degradation.get() : null;
+        String reason = ready ? degradation.get() : null;
+        java.util.List<String> shards = ready ? degradedShards.get() : java.util.List.of();
+        boolean degraded = reason != null || (shards != null && !shards.isEmpty());
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("status", !ready ? "warming" : degraded != null ? "degraded" : "ok");
+        out.put("status", !ready ? "warming" : degraded ? "degraded" : "ok");
         out.put("ready", ready);
-        if (degraded != null) out.put("reason", degraded);
+        if (shards != null && !shards.isEmpty()) out.put("degradedShards", shards);
+        if (reason != null) out.put("reason", reason);
         Map<String, Object> cache = readerCacheStats.get();
         if (cache != null) out.put("readerCache", cache);
-        return new HealthAnswer(ready && degraded == null ? 200 : 503, out);
+        return new HealthAnswer(ready ? 200 : 503, out);
     }
 
     /** The {@code /health} payload; see {@link #healthAnswer}. */

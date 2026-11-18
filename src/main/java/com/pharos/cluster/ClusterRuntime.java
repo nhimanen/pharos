@@ -195,6 +195,20 @@ public final class ClusterRuntime implements Closeable {
         return lazy == null ? null : lazy.degradation();
     }
 
+    /**
+     * The shards this reader can't serve fully (sorted; empty when none): a lazy reader's shards
+     * whose active generation was garbage-collected on the bucket. Reported per shard by
+     * {@code /health} and the heartbeat, so routers keep sending the node its other shards.
+     */
+    public List<String> degradedShards() {
+        return lazy == null ? List.of() : lazy.degradedShards();
+    }
+
+    /** Why {@code shard} is degraded on this reader, or null when it is not. */
+    public String degradation(String shard) {
+        return lazy == null ? null : lazy.degradation(shard);
+    }
+
     /** The generation number of the shard's active generation dir; empty when none is active. */
     private java.util.OptionalLong activeGeneration(String shard) {
         if (!(backend.localCache() instanceof ReaderLocalCache cache)) return java.util.OptionalLong.empty();
@@ -226,7 +240,7 @@ public final class ClusterRuntime implements Closeable {
         if (r != null) r.drain();
     }
 
-    private com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {
+    com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {
         ClusterConfig c = config.getCluster();
         // The shards actually held, so routing never guesses what "all" means; a pinned reader
         // advertises only what it holds of its pin.
@@ -238,8 +252,12 @@ public final class ClusterRuntime implements Closeable {
         List<String> pin = c.getReader().getShards();
         if (!pin.isEmpty()) names.retainAll(pin);
         List<String> shards = new ArrayList<>(names);
+        List<String> degraded = degradedShards();
+        String state = !ready() ? com.pharos.cluster.membership.ReaderHeartbeat.WARMING
+                : degraded.isEmpty() ? com.pharos.cluster.membership.ReaderHeartbeat.READY
+                : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
-                false, readerCacheStats(), load.inFlight(), load.qps(), 0L);
+                false, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded);
     }
 
     // Holding the monitor of this.
@@ -298,6 +316,7 @@ public final class ClusterRuntime implements Closeable {
         }
         if (previous != null) previous.close();
         engine.setDistributed(ds);
+        engine.setLocalDegradation(this::degradation);
         return new com.pharos.cluster.internal.InternalApi(c.getToken()).service(service);
     }
 

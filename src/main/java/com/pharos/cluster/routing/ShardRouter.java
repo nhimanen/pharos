@@ -21,12 +21,24 @@ import java.util.function.ToIntFunction;
 /**
  * Picks, per shard, the live readers that may serve it. A reader's heartbeat lists the shards it
  * actually holds (never "all"), so a shard is routable exactly to readers naming it. Draining and
- * suspect readers are skipped; the rest are ordered by least {@code inFlight}, rotating among ties.
+ * suspect readers are skipped, and a reader is skipped for the shards its heartbeat lists as
+ * degraded (only those); the rest are ordered by least {@code inFlight}, rotating among ties.
  */
 public final class ShardRouter {
 
-    /** {@code candidates} is empty when no live reader serves {@code shard}. */
-    public record Route(ShardId shard, List<ReaderHeartbeat> candidates) {}
+    /**
+     * {@code candidates} is empty when no live reader serves {@code shard}; {@code degraded} names the
+     * live readers left out because the shard is degraded on them.
+     */
+    public record Route(ShardId shard, List<ReaderHeartbeat> candidates, List<String> degraded) {
+        public Route {
+            degraded = degraded == null ? List.of() : List.copyOf(degraded);
+        }
+
+        public Route(ShardId shard, List<ReaderHeartbeat> candidates) {
+            this(shard, candidates, List.of());
+        }
+    }
 
     private final Supplier<List<ReaderHeartbeat>> live;
     private final ShardCatalog catalog;
@@ -79,7 +91,8 @@ public final class ShardRouter {
         List<Route> routes = new ArrayList<>(names.size());
         for (String n : names) {
             ShardId shard = new ShardId(n);
-            routes.add(new Route(shard, candidates(shard, readers)));
+            List<String> degraded = new ArrayList<>();
+            routes.add(new Route(shard, candidates(shard, readers, degraded), degraded));
         }
         return routes;
     }
@@ -89,11 +102,16 @@ public final class ShardRouter {
         return local.test(shard);
     }
 
-    private List<ReaderHeartbeat> candidates(ShardId shard, List<ReaderHeartbeat> readers) {
+    /** @param degraded receives the readers left out because {@code shard} is degraded on them */
+    private List<ReaderHeartbeat> candidates(ShardId shard, List<ReaderHeartbeat> readers, List<String> degraded) {
         List<ReaderHeartbeat> eligible = new ArrayList<>();
         for (ReaderHeartbeat r : readers) {
             if (!r.draining() && r.shards() != null && r.shards().contains(shard.value())
                     && !health.isSuspect(r.node())) {
+                if (r.degradedShards().contains(shard.value())) { // only for this shard: the rest stays routable
+                    degraded.add(r.node());
+                    continue;
+                }
                 eligible.add(r);
             }
         }

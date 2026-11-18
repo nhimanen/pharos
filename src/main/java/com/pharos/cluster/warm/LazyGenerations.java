@@ -215,6 +215,25 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return String.join("; ", reasons);
     }
 
+    /** The shards whose active generation lost objects on the bucket ({@link #degradation}), sorted. */
+    public List<String> degradedShards() {
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        for (Map.Entry<String, Long> e : goneGenerations.entrySet()) {
+            java.util.OptionalLong active = activeGeneration.apply(e.getKey());
+            if (active.isPresent() && active.getAsLong() == e.getValue()) out.add(e.getKey());
+        }
+        return List.copyOf(out);
+    }
+
+    /** Why {@code shard} is degraded on this reader, or null when it is not. */
+    public String degradation(String shard) {
+        Long gone = goneGenerations.get(shard);
+        if (gone == null) return null;
+        java.util.OptionalLong active = activeGeneration.apply(shard);
+        if (active.isEmpty() || active.getAsLong() != gone) return null;
+        return "generation " + gone + " was garbage-collected on the bucket; this reader is behind retention";
+    }
+
     /** A lazy generation exists when its manifest names a commit whose {@code segments_N} is on disk. */
     @Override
     public boolean indexExists(Path luceneDir) throws IOException {

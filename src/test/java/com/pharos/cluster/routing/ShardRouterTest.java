@@ -138,4 +138,65 @@ class ShardRouterTest {
             assertThat(r.route(List.of("b")).get(0).candidates()).hasSize(12);
         }
     }
+
+    private static ReaderHeartbeat degraded(String node, List<String> degradedShards, String... shards) {
+        return new ReaderHeartbeat(node, "http://" + node, List.of(shards), false, Map.of(), 0, 0, 0L,
+                ReaderHeartbeat.DEGRADED, degradedShards);
+    }
+
+    /**
+     * Phase 2 follow-up M3: one degraded shard on every reader (a rolling upgrade whose GC took the
+     * generation they serve) leaves every node routable for its other shards; only the degraded
+     * shard loses them as candidates, and its route names why.
+     */
+    @Test
+    void aDegradedShardExcludesReadersForThatShardOnly() {
+        live = List.of(degraded("r1", List.of("a"), "a", "b"), degraded("r2", List.of("a"), "a", "b"),
+                hb("r3", false, 0, "b"));
+        List<ShardRouter.Route> routes = router().route(List.of());
+        assertThat(routes.get(0).shard().value()).isEqualTo("a");
+        assertThat(routes.get(0).candidates()).as("every reader of a is degraded for it").isEmpty();
+        assertThat(routes.get(0).degraded()).containsExactly("r1", "r2");
+        assertThat(nodes(routes.get(1))).as("still routable for b").containsExactlyInAnyOrder("r1", "r2", "r3");
+        assertThat(routes.get(1).degraded()).isEmpty();
+
+        live = List.of(degraded("r1", List.of("a"), "a", "b"), hb("r2", false, 0, "a", "b"));
+        assertThat(nodes(router().route(List.of("a")).get(0))).as("a healthy replica takes it").containsExactly("r2");
+    }
+
+    /** A heartbeat written by an older reader (no state, no degradedShards) still parses and routes. */
+    @Test
+    void anOlderHeartbeatWithoutStateParses() throws Exception {
+        String json = "{\"node\":\"old\",\"advertiseUrl\":\"http://old\",\"shards\":[\"a\"],\"draining\":false,"
+                + "\"inFlight\":0,\"qps\":0.0,\"startedAt\":1}";
+        ReaderHeartbeat hb = new com.fasterxml.jackson.databind.ObjectMapper().readValue(json, ReaderHeartbeat.class);
+        assertThat(hb.state()).isEqualTo(ReaderHeartbeat.READY);
+        assertThat(hb.degradedShards()).isEmpty();
+        live = List.of(hb);
+        assertThat(nodes(router().route(List.of("a")).get(0))).containsExactly("old");
+        ReaderHeartbeat draining = new ReaderHeartbeat("d", "http://d", List.of("a"), true, null, 0, 0, 0L);
+        assertThat(draining.state()).isEqualTo(ReaderHeartbeat.DRAINING);
+    }
+
+    /** Queries for a shard every reader is degraded for name it, and why, instead of dropping it silently. */
+    @Test
+    void aShardDegradedEverywhereIsNamedInTheQueryWarnings() {
+        live = List.of(degraded("r1", List.of("b"), "a", "b"), degraded("r2", List.of("b"), "a", "b"));
+        ShardRouter remoteOnly = new ShardRouter(() -> live, catalog, health, s -> false);
+        com.pharos.search.distributed.DistributedSearch ds = new com.pharos.search.distributed.DistributedSearch(
+                remoteOnly, new com.pharos.cluster.internal.ShardClient(health, "t", java.time.Duration.ofMillis(100),
+                java.time.Duration.ofMillis(100)), null, null, null, java.time.Duration.ofSeconds(5), () -> -1L);
+        try {
+            try (var q = ds.open(List.of("b"))) {
+                assertThat(q.warnings()).containsExactly(
+                        "shard b unavailable: every live reader serving it is degraded (r1, r2); results exclude it");
+            }
+            try (var q = ds.open(List.of("a"))) {
+                assertThat(q.fansOut()).isTrue();
+                assertThat(q.warnings()).isEmpty();
+            }
+        } finally {
+            ds.close();
+        }
+    }
 }
