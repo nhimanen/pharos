@@ -3,7 +3,6 @@ package com.pharos.cluster.objectstore;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Clock;
@@ -67,7 +66,7 @@ public class InMemoryObjectStore implements ObjectStore {
             if (key.contains(s)) throw new IOException("injected download failure for key: " + key);
         }
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         Path abs = target.toAbsolutePath();
         Files.createDirectories(abs.getParent());
         Path tmp = Files.createTempFile(abs.getParent(), abs.getFileName().toString(), ".part");
@@ -83,7 +82,7 @@ public class InMemoryObjectStore implements ObjectStore {
     public void downloadRange(String key, long offset, long length, Path target) throws IOException {
         long end = ObjectStore.checkRange(offset, length);
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         if (end > e.data().length) {
             throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
         }
@@ -109,7 +108,7 @@ public class InMemoryObjectStore implements ObjectStore {
     public java.io.InputStream openRange(String key, long offset, long length) throws IOException {
         long end = ObjectStore.checkRange(offset, length);
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         if (end > e.data().length) {
             throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
         }

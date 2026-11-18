@@ -641,10 +641,14 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             return lease;
         }
 
-        /** True when {@code e} (or a cause) says the object is not in the store. */
+        /**
+         * True when {@code e} (or a cause) says the object is not in the store: only the store's own
+         * {@link com.pharos.cluster.objectstore.ObjectMissingException}, never a local
+         * {@code NoSuchFileException} (a cache file gone from disk is no garbage-collected generation).
+         */
         static boolean objectMissing(Throwable e) {
             for (Throwable t = e; t != null; t = t.getCause()) {
-                if (t instanceof java.nio.file.NoSuchFileException) return true;
+                if (t instanceof com.pharos.cluster.objectstore.ObjectMissingException) return true;
                 if (t.getCause() == t) break;
             }
             return false;

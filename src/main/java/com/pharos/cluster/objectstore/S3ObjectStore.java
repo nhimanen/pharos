@@ -27,7 +27,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -457,8 +456,8 @@ public class S3ObjectStore implements ObjectStore {
         return PutObjectRequest.builder().bucket(bucket).key(key);
     }
 
-    private static NoSuchFileException missing(String key) {
-        return new NoSuchFileException(key, null, "object not found: " + key);
+    private static ObjectMissingException missing(String key) {
+        return new ObjectMissingException(key);
     }
 
     /**
