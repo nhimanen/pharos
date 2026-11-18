@@ -233,7 +233,7 @@ t_release_with_upgrade_indexes_installs_then_upgrades() {
 # reader_config HOME -> config.json for a reader node (role reader on an object store)
 reader_config() {
   mkdir -p "$1/.pharos"
-  printf '%s\n' '{"cluster": {"role": "reader", "backend": "object-store", "objectStore": {"bucket": "b", "endpoint": "http://127.0.0.1:1", "region": "us-east-1"}}}' \
+  printf '%s\n' '{"cluster": {"role": "reader", "advertiseUrl": "http://127.0.0.1:7171", "token": "t", "backend": "object-store", "objectStore": {"bucket": "b", "endpoint": "http://127.0.0.1:1", "region": "us-east-1"}}}' \
     > "$1/.pharos/config.json"
 }
 
