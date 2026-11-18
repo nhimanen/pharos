@@ -221,6 +221,58 @@ public final class ClusterRuntime implements Closeable {
         return java.util.OptionalLong.of(Long.parseLong(dirName.substring("gen-".length())));
     }
 
+    /** The requests a drain waits for (the web server's in-flight count); none until set. */
+    private volatile java.util.function.IntSupplier inFlight = () -> 0;
+    private volatile boolean draining;
+
+    /** Where a drain reads the requests still being served (the web server's {@code inFlightRequests}). */
+    public void setInFlight(java.util.function.IntSupplier inFlight) {
+        this.inFlight = Objects.requireNonNull(inFlight, "inFlight");
+    }
+
+    /** True once {@link #drain} or {@link #drainAndClose} ran: {@code /health} answers 503 draining. */
+    public boolean draining() {
+        return draining;
+    }
+
+    /**
+     * Shutdown of a serving reader (the JVM shutdown hook): announces {@code draining} at once (its
+     * heartbeat, so coordinators stop routing shard calls to it, and {@code /health} 503, so the
+     * router and load balancers stop sending queries), waits up to {@code cluster.drainSeconds} for
+     * the in-flight requests to reach 0, then {@link #close}s. Any other node, or one not serving,
+     * closes at once. Idempotent.
+     */
+    public void drainAndClose() {
+        boolean serve;
+        synchronized (this) {
+            serve = isReader() && serving && !closed;
+        }
+        if (serve) {
+            drain();
+            long max = config.getCluster().getDrainSeconds();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(max);
+            int busy = inFlight.getAsInt();
+            if (busy > 0) {
+                log.info("Draining: waiting up to {} s for {} in-flight request(s)", max, busy);
+            }
+            while ((busy = inFlight.getAsInt()) > 0 && System.nanoTime() < deadline) {
+                try {
+                    Thread.sleep(25);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (busy > 0) {
+                log.warn("Draining: stopping after {} s with {} request(s) still in flight (cluster.drainSeconds)",
+                        max, busy);
+            } else {
+                log.info("Drained: no request in flight; stopping");
+            }
+        }
+        close();
+    }
+
     /** Where the heartbeat takes {@code inFlight}/{@code qps} from (the web server's counter). */
     public void setLoad(com.pharos.cluster.membership.LoadCounter load) {
         this.load = Objects.requireNonNull(load, "load");
@@ -233,8 +285,12 @@ public final class ClusterRuntime implements Closeable {
         return r == null ? List.of() : r.liveWithAge();
     }
 
-    /** Marks this reader draining in the bucket (readers with a registry only). */
+    /**
+     * Marks this reader draining: {@code /health} answers 503 {@code draining} from now on, and the
+     * heartbeat (readers with a registry) is rewritten with {@code draining} at once.
+     */
     public void drain() {
+        draining = true;
         com.pharos.cluster.membership.ReaderRegistry r;
         synchronized (this) { r = readerRegistry; }
         if (r != null) r.drain();
@@ -253,11 +309,12 @@ public final class ClusterRuntime implements Closeable {
         if (!pin.isEmpty()) names.retainAll(pin);
         List<String> shards = new ArrayList<>(names);
         List<String> degraded = degradedShards();
-        String state = !ready() ? com.pharos.cluster.membership.ReaderHeartbeat.WARMING
+        String state = draining ? com.pharos.cluster.membership.ReaderHeartbeat.DRAINING
+                : !ready() ? com.pharos.cluster.membership.ReaderHeartbeat.WARMING
                 : degraded.isEmpty() ? com.pharos.cluster.membership.ReaderHeartbeat.READY
                 : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
-                false, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded);
+                draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded);
     }
 
     // Holding the monitor of this.

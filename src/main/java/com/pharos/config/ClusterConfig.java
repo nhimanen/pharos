@@ -51,6 +51,15 @@ public class ClusterConfig {
     private int queryTimeoutMillis = 0;
     /** How old the last good read of the shard catalog may get before unscoped routing is refused. */
     private int maxCatalogAgeSeconds = 600;
+    /**
+     * Readers: on shutdown (SIGTERM), how long the node keeps running while draining: it announces
+     * {@code draining} (heartbeat and {@code /health} 503) at once and stops when its in-flight
+     * requests reach 0, or after this many seconds. 0 stops at once (still announcing first).
+     */
+    private int drainSeconds = DEFAULT_DRAIN_SECONDS;
+
+    public static final int DEFAULT_DRAIN_SECONDS = 20;
+    static final int MAX_DRAIN_SECONDS = 3600;
 
     public static final int DEFAULT_QUERY_TIMEOUT_MILLIS = 20_000;
     /** A pinned local reader is retired this long after a swap: a query must finish well before. */
@@ -124,6 +133,10 @@ public class ClusterConfig {
             throw new IllegalStateException("cluster.queryTimeoutMillis (effective " + effectiveQueryTimeoutMillis()
                     + " ms, from cluster.fanoutTimeoutMillis when unset) must stay below " + RETIRE_DELAY_MILLIS
                     + " ms, how long a swapped-out index reader stays open");
+        }
+        if (drainSeconds < 0 || drainSeconds > MAX_DRAIN_SECONDS) {
+            throw new IllegalStateException("cluster.drainSeconds must be between 0 and " + MAX_DRAIN_SECONDS
+                    + ", got " + drainSeconds);
         }
         if (maxCatalogAgeSeconds <= 0) {
             throw new IllegalStateException("cluster.maxCatalogAgeSeconds must be positive, got " + maxCatalogAgeSeconds);
@@ -208,6 +221,8 @@ public class ClusterConfig {
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
+    public int getDrainSeconds() { return drainSeconds; }
+    public void setDrainSeconds(int v) { this.drainSeconds = v; }
     public String getAdvertiseUrl() { return advertiseUrl; }
     public void setAdvertiseUrl(String v) { this.advertiseUrl = v; }
     /** Serialised for config persistence ({@code IndexConfig.save}); every output surface redacts it. */

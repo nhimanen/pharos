@@ -58,10 +58,12 @@ public class WebCommand implements Callable<Integer> {
             if (searchEngine != null) searchEngine.warmUpInBackground();
             if (clusterRuntime != null) {
                 clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
+                clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for
                 clusterRuntime.beginServing(searchEngine != null
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
                         : java.util.concurrent.CompletableFuture.completedFuture(null)); // no wait
                 webServer.setReadiness(clusterRuntime::ready);
+                webServer.setDraining(clusterRuntime::draining);
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
                 webServer.setDegradation(clusterRuntime::degradation);
                 webServer.setDegradedShards(clusterRuntime::degradedShards);

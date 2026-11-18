@@ -190,4 +190,28 @@ class ReaderRegistryTest {
         String json = new String(store.get("pharos/catalog/readers/a.json").orElseThrow().data());
         assertThat(json).contains("\"startedAt\"").doesNotContain("ageSeconds");
     }
+
+    /**
+     * Task 6: {@code pharos router} only reads the bucket. An observer lists the live readers by the
+     * bucket's clock (the newest heartbeat is "now") and never writes or deletes an object.
+     */
+    @Test
+    void anObserverListsLiveReadersWithoutWriting() throws Exception {
+        ReaderRegistry a = registry("a", List.of("p1"));
+        a.tick();
+        bucketClock.advance(40); // a stops beating: 40 s behind the newest heartbeat, past the 30 s TTL
+        ReaderRegistry b = registry("b", List.of("p2"));
+        b.tick();
+        ReaderRegistry router = ReaderRegistry.observer(store, layout, cfg("router", List.of()));
+        router.tick();
+        assertThat(router.live()).extracting(ReaderHeartbeat::node).containsExactly("b");
+        router.drain();
+        router.close();
+        assertThat(store.list("pharos/catalog/readers/")).extracting(com.pharos.cluster.objectstore.ObjectInfo::key)
+                .containsExactlyInAnyOrder("pharos/catalog/readers/a.json", "pharos/catalog/readers/b.json");
+        assertThat(store.get("pharos/catalog/readers/b.json").orElseThrow().data())
+                .as("never rewritten").isEqualTo(mem.get("pharos/catalog/readers/b.json").orElseThrow().data());
+        b.close();
+        a.close();
+    }
 }

@@ -32,9 +32,18 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `privateCacheMaxBytes` (0 = derived). Size the cache dir with the README's disk formula.
 - `/health` on a reader: HTTP 503 `{"status":"warming"}` until its first sync and its search
   models are ready (model warm-up runs in parallel with the first sync; a model that fails or
-  hangs for 5 minutes does not hold readiness), and HTTP 503 `{"status":"degraded","reason":…}`
-  while a served lazy generation has lost objects on the bucket (it lags beyond retention); 200
-  otherwise. Searches answered while warming carry a notice in `X-Pharos-Warnings`.
+  hangs for 5 minutes does not hold readiness), HTTP 503 `{"status":"draining"}` while it shuts
+  down, and HTTP 200 `{"status":"degraded","degradedShards":[…],"reason":…}` while a served lazy
+  generation has lost objects on the bucket (it lags beyond retention): the node stays routable for
+  its other shards. 200 `ok` otherwise. Searches answered while warming carry a notice in
+  `X-Pharos-Warnings`.
+- Reader heartbeats carry `state` (`warming|ready|degraded|draining`) and `degradedShards`;
+  coordinators skip a reader only for its degraded shards.
+- Draining: on SIGTERM a serving reader announces `draining` (heartbeat and `/health` 503), finishes
+  its in-flight requests and stops after at most `cluster.drainSeconds` (default 20).
+- `pharos router --port <p>` (`./pharos router`): a stateless router over the healthy readers
+  (`/health` polled every 2 s, round-robin, one retry of idempotent requests on another reader,
+  `/internal/*` never forwarded). Needs the object-store config and `cluster.token`, no index.
 - `readerCache` (`mode, cacheMaxBytes, bytesOnDisk, hits, misses, hitRate, bytesFetched,
   evictions, leasesOpen, shared, source`) in `index-status --json` and `/health` on readers, and a
   `reader cache: …` line in `index-status`.
@@ -64,6 +73,9 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   unified retrieval.
 
 ### Changed
+- The S3 client waits up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a
+  response (ranged block reads keep their `readTimeoutSeconds` bounds), so whole-object downloads
+  and uploads on a slow bucket are not cut short.
 - Config validation: `cluster.retireGraceSeconds` must be at least `2 x cluster.pollIntervalSeconds`
   and at least `cluster.fanoutTimeoutMillis` (in seconds); a reader config that violated either now
   fails at startup with a message naming both fields (see UPGRADING.md).

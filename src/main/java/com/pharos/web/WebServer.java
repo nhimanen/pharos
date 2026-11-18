@@ -54,6 +54,9 @@ public class WebServer {
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
     private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
+    private volatile java.util.function.BooleanSupplier draining = () -> false;
+    /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
+    private final int[] active = new int[1];
     private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
     private volatile com.pharos.cluster.internal.InternalApi internalApi = null;
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
@@ -109,6 +112,45 @@ public class WebServer {
         this.degradedShards = java.util.Objects.requireNonNull(shards, "shards");
     }
 
+    /**
+     * Draining reported by {@code /health}: while it returns true the node answers HTTP 503
+     * {@code {"status":"draining"}} (whatever else holds), so the router and load balancers stop
+     * sending it requests; requests already running, and any still arriving, are served.
+     */
+    public void setDraining(java.util.function.BooleanSupplier draining) {
+        this.draining = java.util.Objects.requireNonNull(draining, "draining");
+    }
+
+    /** Requests being served now ({@code /api/*}, {@code /internal/*}, {@code /cluster/*}); what a drain waits for. */
+    public int inFlightRequests() {
+        synchronized (active) {
+            return active[0];
+        }
+    }
+
+    /** Waits up to {@code max} for {@link #inFlightRequests} to reach 0; true when it did. */
+    public boolean awaitIdle(java.time.Duration max) {
+        long deadline = System.nanoTime() + max.toNanos();
+        synchronized (active) {
+            while (active[0] > 0) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) return false;
+                try {
+                    java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(active, left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    /** Paths whose requests count as in-flight work for a drain (not {@code /health} or static files). */
+    private static boolean drainCounted(String path) {
+        return path.startsWith("/api/") || path.startsWith("/internal/") || path.startsWith("/cluster/");
+    }
+
     /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
     public com.pharos.cluster.membership.LoadCounter load() { return load; }
 
@@ -153,6 +195,7 @@ public class WebServer {
     /**
      * {@code /health}, one code path for every state:
      * <ul>
+     *   <li>503 {@code draining} once a reader is shutting down (it finishes its in-flight requests);</li>
      *   <li>503 {@code warming} while a reader's first sync or model load runs;</li>
      *   <li>200 {@code degraded} (with {@code degradedShards} and a {@code reason}) while a ready reader
      *       can't fully serve some shards: it stays routable for the others, and routers skip it for
@@ -163,7 +206,14 @@ public class WebServer {
      * liveness treats any answer as "running". Every signal is read once.
      */
     HealthAnswer healthAnswer() {
+        boolean drain = draining.getAsBoolean();
         boolean ready = readiness.getAsBoolean();
+        if (drain) { // wins over every other state: the node is going away
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "draining");
+            out.put("ready", ready);
+            return new HealthAnswer(503, out);
+        }
         String reason = ready ? degradation.get() : null;
         java.util.List<String> shards = ready ? degradedShards.get() : java.util.List.of();
         boolean degraded = reason != null || (shards != null && !shards.isEmpty());
@@ -206,12 +256,20 @@ public class WebServer {
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
+            // Global on a reader: Javalin has one request-size cap, so every route (not only /internal/*)
+            // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
             if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
         UsageLogger usage = new UsageLogger(pharosDir);
         app.before(ctx -> {
+            if (drainCounted(ctx.path())) {
+                ctx.attribute("drain.counted", Boolean.TRUE);
+                synchronized (active) {
+                    active[0]++;
+                }
+            }
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
                 ctx.attribute("load.counted", Boolean.TRUE);
@@ -219,6 +277,13 @@ public class WebServer {
             }
         });
         app.after(ctx -> {
+            if (ctx.attribute("drain.counted") != null) {
+                ctx.attribute("drain.counted", null);
+                synchronized (active) {
+                    active[0]--;
+                    active.notifyAll();
+                }
+            }
             if (ctx.attribute("load.counted") != null) {
                 ctx.attribute("load.counted", null);
                 load.end();

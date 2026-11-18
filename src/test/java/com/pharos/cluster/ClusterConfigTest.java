@@ -322,4 +322,12 @@ class ClusterConfigTest {
                 .hasMessageContaining("cluster.maxCatalogAgeSeconds");
         assertThat(parse("{\"cluster\":{\"queryTimeoutMillis\":5000}}").effectiveQueryTimeoutMillis()).isEqualTo(5000);
     }
+
+    @Test
+    void drainSecondsDefaultsAndBounds() throws Exception {
+        assertThat(parse("{}").getDrainSeconds()).isEqualTo(20);
+        assertThat(parse("{\"cluster\":{\"drainSeconds\":0}}").getDrainSeconds()).isZero();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":-1}}")).hasMessageContaining("cluster.drainSeconds");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":3601}}")).hasMessageContaining("cluster.drainSeconds");
+    }
 }

@@ -63,8 +63,18 @@ public final class ReaderRegistry implements Closeable {
         this.store = Objects.requireNonNull(store, "store");
         this.layout = Objects.requireNonNull(layout, "layout");
         this.cfg = Objects.requireNonNull(cfg, "cfg");
-        this.self = Objects.requireNonNull(self, "self");
-        this.key = layout.readerKey(cfg.effectiveNodeId());
+        this.self = self; // null: an observer
+        this.key = self == null ? null : layout.readerKey(cfg.effectiveNodeId());
+    }
+
+    /**
+     * A read-only registry ({@code pharos router}): it lists the live readers every
+     * {@code heartbeatSeconds} and never writes, drains or deletes an object. With no heartbeat of
+     * its own, the bucket's "now" is the newest heartbeat's LastModified: when every reader stopped
+     * beating, all still look live to it; the router's own {@code /health} polls catch those.
+     */
+    public static ReaderRegistry observer(ObjectStore store, ObjectStoreLayout layout, ClusterConfig cfg) {
+        return new ReaderRegistry(store, layout, cfg, null);
     }
 
     /** Beats now and then every {@code heartbeatSeconds}, all on a daemon thread (never blocks the caller). */
@@ -93,7 +103,7 @@ public final class ReaderRegistry implements Closeable {
     /** Marks this reader draining and publishes that at once. */
     public void drain() {
         synchronized (mu) {
-            if (closed) return;
+            if (closed || self == null) return;
             draining = true;
             write();
             refresh();
@@ -112,7 +122,7 @@ public final class ReaderRegistry implements Closeable {
 
     // Holding mu.
     private void write() {
-        if (closed) return;
+        if (closed || self == null) return;
         try {
             ReaderHeartbeat hb = self.get();
             store.put(key, MAPPER.writeValueAsBytes(hb.with(draining || hb.draining(), startedAt)));
@@ -135,15 +145,21 @@ public final class ReaderRegistry implements Closeable {
     // and only when our latest write succeeded: otherwise we cannot tell "peers are dead" from
     // "the bucket is unreachable", so the previous list stays.
     void refresh() {
-        if (!lastWriteOk) {
+        if (self != null && !lastWriteOk) {
             warnStale("our own heartbeat write failed");
             return;
         }
         try {
             List<ObjectInfo> infos = store.list(layout.readersPrefix()).stream()
                     .filter(i -> i.key().endsWith(".json") && i.lastModified() != null).toList();
-            Instant now = infos.stream().filter(i -> i.key().equals(key)).map(ObjectInfo::lastModified)
-                    .findFirst().orElse(null);
+            Instant now = self == null
+                    ? infos.stream().map(ObjectInfo::lastModified).max(Comparator.naturalOrder()).orElse(null)
+                    : infos.stream().filter(i -> i.key().equals(key)).map(ObjectInfo::lastModified)
+                            .findFirst().orElse(null);
+            if (now == null && self == null) {
+                live = List.of(); // no reader announces itself
+                return;
+            }
             if (now == null) {
                 warnStale("our own heartbeat is missing from the listing");
                 return;
@@ -192,6 +208,10 @@ public final class ReaderRegistry implements Closeable {
             }
         }
         synchronized (mu) {
+            if (self == null) { // an observer owns no object
+                live = List.of();
+                return;
+            }
             try {
                 store.delete(key);
             } catch (IOException | RuntimeException e) {
