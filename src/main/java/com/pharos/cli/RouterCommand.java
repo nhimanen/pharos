@@ -134,6 +134,9 @@ public class RouterCommand implements Callable<Integer> {
         /** Node → base URL of the readers whose last {@code /health} poll answered 200. */
         private final Map<String, String> healthy = new ConcurrentHashMap<>();
         private final AtomicLong turn = new AtomicLong();
+        /** A reader's answer larger than this is not forwarded (502). */
+        static final long MAX_RESPONSE_BYTES = 64L << 20;
+        private volatile long maxResponseBytes = MAX_RESPONSE_BYTES;
         private ScheduledExecutorService poller;
         private Javalin app;
 
@@ -166,6 +169,11 @@ public class RouterCommand implements Callable<Integer> {
                 return t;
             });
             poller.scheduleWithFixedDelay(this::pollNow, 0, pollEvery.toMillis(), TimeUnit.MILLISECONDS);
+        }
+
+        /** Test seam: the largest response body forwarded (default {@link #MAX_RESPONSE_BYTES}). */
+        void setMaxResponseBytes(long max) {
+            this.maxResponseBytes = max;
         }
 
         public synchronized int port() {
@@ -273,6 +281,11 @@ public class RouterCommand implements Callable<Integer> {
                 try {
                     answer = forward(ctx, target.getValue(), rawPath, query, method, body);
                     failure = null;
+                    if (answer == null) { // over the cap: the reader answered; not retried
+                        ctx.status(502).json(Map.of("error", "the reader's answer exceeds " + maxResponseBytes
+                                + " bytes; not forwarded"));
+                        return;
+                    }
                     if (answer.statusCode() < 500) break;
                     log.debug("Router: {} {} on reader {} answered {}", method, rawPath, target.getKey(),
                             answer.statusCode());
@@ -287,6 +300,9 @@ public class RouterCommand implements Callable<Integer> {
                     failure = e;
                     if (!(e.getCause() instanceof ConnectException)) break; // sent: it may have run; not resent
                     healthy.remove(target.getKey(), target.getValue());
+                } catch (IllegalArgumentException e) { // the request's URI is not one the HTTP client accepts
+                    ctx.status(400).json(Map.of("error", "malformed request URI: " + e.getMessage()));
+                    return;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     ctx.status(503).json(Map.of("error", "interrupted"));
@@ -299,11 +315,25 @@ public class RouterCommand implements Callable<Integer> {
                 return;
             }
             ctx.status(answer.statusCode());
+            Set<String> named = connectionNamed(answer.headers().allValues("connection"));
             answer.headers().map().forEach((name, values) -> {
-                if (DROP_RESPONSE.contains(name.toLowerCase(Locale.ROOT))) return;
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (DROP_RESPONSE.contains(lower) || named.contains(lower)) return;
                 for (String v : values) ctx.res().addHeader(name, v);
             });
             ctx.result(answer.body());
+        }
+
+        /** The header names a {@code Connection} header lists (hop-by-hop: never forwarded), lower case. */
+        private static Set<String> connectionNamed(List<String> values) {
+            Set<String> out = new java.util.HashSet<>();
+            for (String v : values) {
+                for (String token : v.split(",")) {
+                    String t = token.trim().toLowerCase(Locale.ROOT);
+                    if (!t.isEmpty()) out.add(t);
+                }
+            }
+            return out;
         }
 
         private HttpResponse<byte[]> forward(Context ctx, String base, String rawPath, String query, String method,
@@ -312,8 +342,15 @@ public class RouterCommand implements Callable<Integer> {
                     .timeout(requestTimeout)
                     .method(method, body.length == 0 ? HttpRequest.BodyPublishers.noBody()
                             : HttpRequest.BodyPublishers.ofByteArray(body));
+            Set<String> named = connectionNamed(Collections.list(ctx.req().getHeaders("Connection")));
+            String forwardedFor = null;
             for (String name : Collections.list(ctx.req().getHeaderNames())) {
-                if (DROP_REQUEST.contains(name.toLowerCase(Locale.ROOT))) continue;
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (DROP_REQUEST.contains(lower) || named.contains(lower)) continue;
+                if (lower.equals("x-forwarded-for")) {
+                    forwardedFor = String.join(", ", Collections.list(ctx.req().getHeaders(name)));
+                    continue;
+                }
                 for (String v : Collections.list(ctx.req().getHeaders(name))) {
                     try {
                         b.header(name, v);
@@ -322,7 +359,30 @@ public class RouterCommand implements Callable<Integer> {
                     }
                 }
             }
-            return http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
+            String client = ctx.req().getRemoteAddr();
+            b.header("X-Forwarded-For", forwardedFor == null || forwardedFor.isBlank() ? client
+                    : forwardedFor + ", " + client);
+            HttpResponse<java.io.InputStream> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofInputStream());
+            long cap = maxResponseBytes;
+            try (java.io.InputStream in = resp.body()) {
+                long declared = resp.headers().firstValueAsLong("content-length").orElse(-1);
+                if (declared > cap) return null;
+                byte[] data = in.readNBytes((int) Math.min(Integer.MAX_VALUE - 8, cap + 1));
+                if (data.length > cap) return null;
+                return new BodyResponse(resp, data);
+            }
+        }
+
+        /** A response whose body was read (and bounded) here. */
+        private record BodyResponse(HttpResponse<java.io.InputStream> head, byte[] body)
+                implements HttpResponse<byte[]> {
+            @Override public int statusCode() { return head.statusCode(); }
+            @Override public HttpRequest request() { return head.request(); }
+            @Override public java.util.Optional<HttpResponse<byte[]>> previousResponse() { return java.util.Optional.empty(); }
+            @Override public java.net.http.HttpHeaders headers() { return head.headers(); }
+            @Override public java.util.Optional<javax.net.ssl.SSLSession> sslSession() { return head.sslSession(); }
+            @Override public URI uri() { return head.uri(); }
+            @Override public HttpClient.Version version() { return head.version(); }
         }
 
         @Override

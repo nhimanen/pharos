@@ -454,6 +454,33 @@ class DistributedSearchTest {
         }
     }
 
+    /**
+     * Phase 2 follow-up M3, end to end: the shard is degraded on every reader serving it (a rolling
+     * upgrade whose GC took their generation). Those readers stay live for the rest; the query
+     * answers from the other shards and names the degraded one.
+     */
+    @Test
+    void shardDegradedOnEveryReaderGivesTheOtherShardsAndAWarning() throws Exception {
+        try (Small s = small(2, null)) {
+            for (TestReaderNode r : s.replicas()) {
+                com.pharos.cluster.ClusterTestAccess.markServedGenerationMissing(r.parts.runtime(), JAVA);
+                assertThat(r.parts.runtime().degradedShards()).containsExactly(JAVA);
+            }
+            long deadline = System.nanoTime() + 20_000_000_000L;
+            while (s.coordinator().parts.runtime().liveReaders().stream()
+                    .filter(l -> l.heartbeat().degradedShards().contains(JAVA)).count() < 2) {
+                if (System.nanoTime() > deadline) throw new AssertionError("degraded heartbeats not seen");
+                Thread.sleep(100);
+            }
+            SearchResponse r = search(s.coordinator(), "multiply", SearchType.HYBRID, null, 10);
+            assertThat(r.results()).as("the other shards answer").isNotEmpty()
+                    .allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
+            assertThat(r.warnings()).containsExactly("shard " + JAVA
+                    + " unavailable: every live reader serving it is degraded (r1, r2); results exclude it");
+            assertThat(s.coordinator().parts.runtime().liveReaders()).as("the readers stay live").hasSize(3);
+        }
+    }
+
     /** Review Focus 1: with no replica left, the other shards still answer and the lost one is named. */
     @Test
     void noReplicaGivesPartialWithWarning() throws Exception {

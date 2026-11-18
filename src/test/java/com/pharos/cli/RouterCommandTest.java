@@ -293,4 +293,58 @@ class RouterCommandTest {
             release.countDown();
         }
     }
+
+    /** Sends one raw HTTP/1.1 request (headers the JDK client refuses to send); returns the status line and headers. */
+    private static String raw(RouterCommand.Router router, String requestLineAndHeaders) throws Exception {
+        try (java.net.Socket sock = new java.net.Socket("127.0.0.1", router.port())) {
+            sock.setSoTimeout(10_000);
+            sock.getOutputStream().write((requestLineAndHeaders + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+            sock.getOutputStream().flush();
+            return new String(sock.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+        }
+    }
+
+    /** Fix round 1 minors: bad query → 400; oversized answer → 502; X-Forwarded-For; Connection-named headers dropped. */
+    @Test
+    void routerHardening() throws Exception {
+        FakeReader a = reader("a");
+        RouterCommand.Router router = router(a);
+
+        String bad = raw(router, "GET /api/search?q=a|b{c} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+        assertThat(bad).as(bad).startsWith("HTTP/1.1 400");
+        assertThat(a.requests).isEmpty();
+
+        String hop = raw(router, "GET /api/projects HTTP/1.1\r\nHost: x\r\nConnection: close, X-Hop-Secret\r\n"
+                + "X-Hop-Secret: s3cret\r\nX-Keep: kept\r\n");
+        assertThat(hop).startsWith("HTTP/1.1 200");
+        Map<String, List<String>> seen = a.headers.getLast();
+        assertThat(seen.keySet()).noneMatch(h -> h.equalsIgnoreCase("X-Hop-Secret"));
+        assertThat(seen.entrySet()).anySatisfy(e -> {
+            assertThat(e.getKey()).isEqualToIgnoringCase("X-Keep");
+            assertThat(e.getValue()).containsExactly("kept");
+        });
+        assertThat(seen.entrySet()).anySatisfy(e -> {
+            assertThat(e.getKey()).isEqualToIgnoringCase("X-Forwarded-For");
+            assertThat(e.getValue()).containsExactly("127.0.0.1");
+        });
+
+        HttpRequest chained = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + router.port() + "/api/projects"))
+                .header("X-Forwarded-For", "10.0.0.7").build();
+        assertThat(http.send(chained, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(200);
+        assertThat(a.headers.getLast().entrySet()).anySatisfy(e -> {
+            assertThat(e.getKey()).isEqualToIgnoringCase("X-Forwarded-For");
+            assertThat(e.getValue()).containsExactly("10.0.0.7, 127.0.0.1");
+        });
+
+        router.setMaxResponseBytes(4);
+        HttpResponse<String> big = get(router, "/api/projects"); // "a" fits
+        assertThat(big.statusCode()).isEqualTo(200);
+        a.statusFor.clear();
+        FakeReader longName = reader("a-reader-with-a-long-name");
+        RouterCommand.Router capped = router(longName);
+        capped.setMaxResponseBytes(4);
+        HttpResponse<String> over = get(capped, "/api/projects");
+        assertThat(over.statusCode()).as("an answer over the cap").isEqualTo(502);
+        assertThat(over.body()).contains("exceeds");
+    }
 }
