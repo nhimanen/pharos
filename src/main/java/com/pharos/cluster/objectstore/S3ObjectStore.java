@@ -37,8 +37,9 @@ import java.util.Optional;
 /**
  * {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given.
  *
- * <p>Timeouts: the HTTP client connects and waits for each read of a response within
- * {@code cluster.objectStore.readTimeoutSeconds}; a ranged read ({@link #openRange}, which a reader's
+ * <p>Timeouts: the HTTP client connects within {@code cluster.objectStore.readTimeoutSeconds} and
+ * waits for each read of a response up to that or 30 s, whichever is longer (a whole-object download
+ * or an upload on a slow bucket is not cut short); a ranged read ({@link #openRange}, which a reader's
  * block fetches use) also bounds each attempt by that and the whole call, retries included, by
  * {@link ClusterConfig.ObjectStoreConfig#readTotalTimeout}. An unreachable bucket then fails a query's
  * miss in seconds instead of stalling it for the SDK's minutes of socket timeouts and retries.
@@ -77,11 +78,25 @@ public class S3ObjectStore implements ObjectStore {
                 : "endpoint '" + cfg.getEndpoint() + "'";
     }
 
+    /** The client-wide floor of {@link #clientSocketTimeout}. */
+    static final java.time.Duration MIN_CLIENT_SOCKET_TIMEOUT = java.time.Duration.ofSeconds(30);
+
+    /**
+     * The HTTP client's socket timeout (the idle time between two reads of any call): at least
+     * 30 s ({@link #MIN_CLIENT_SOCKET_TIMEOUT}), so a whole-object download or a writer's upload
+     * waiting on a slow bucket is not cut by the tight {@code readTimeoutSeconds}; ranged reads keep
+     * that bound through their per-request timeouts ({@link #readTimeouts}).
+     */
+    static java.time.Duration clientSocketTimeout(ClusterConfig.ObjectStoreConfig cfg) {
+        java.time.Duration read = cfg.readAttemptTimeout();
+        return read.compareTo(MIN_CLIENT_SOCKET_TIMEOUT) > 0 ? read : MIN_CLIENT_SOCKET_TIMEOUT;
+    }
+
     private static S3Client buildClient(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         var builder = S3Client.builder()
                 .httpClient(UrlConnectionHttpClient.builder()
                         .connectionTimeout(cfg.readAttemptTimeout())
-                        .socketTimeout(cfg.readAttemptTimeout()) // idle time between reads, not a whole body
+                        .socketTimeout(clientSocketTimeout(cfg)) // idle time between reads, not a whole body
                         .build())
                 .region(Region.of(cfg.getRegion()))
                 .credentialsProvider(credentials)

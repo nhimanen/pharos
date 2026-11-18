@@ -837,6 +837,56 @@ class LazyReaderTest {
     }
 
     /**
+     * Phase 2 follow-up M4: a background materialisation that failed (here: the bucket refused a
+     * download) is forgotten, so the next refused poll starts it again instead of treating the
+     * generation dir as already handled.
+     */
+    @Test
+    void failedMaterialisationIsRetriedOnTheNextRefusedPoll() throws Exception {
+        long g1 = publishWithoutCompoundFiles();
+        Node node = reader("retry-materialise", r -> {
+            small(r);
+            r.setEagerMaxBytes(0);
+            r.setPrefetchExtensions(List.of());
+            r.setCacheMaxBytes(4 * 64 * KIB);
+        });
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(LazyGenerations.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        try {
+            node.runtime().startServing();
+            Path lucene = node.genDir(g1).resolve("lucene");
+            List<ManifestFile> remote = remoteFiles(g1, 1);
+            assertThat(remote).isNotEmpty();
+            String gen1Prefix = remote.get(0).key().substring(0, remote.get(0).key().lastIndexOf('/') + 1);
+            store.failOn(gen1Prefix); // every whole-file download of generation g1 fails
+
+            addMethodAndReindex("triple");
+            restampManifest(g1 + 1, new com.pharos.indexer.IndexFormat.Stamp(
+                    com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1, "9.9.9", java.time.Instant.now()));
+            node.runtime().syncNow();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (log.list.stream().noneMatch(e -> e.getLevel() == Level.WARN
+                    && e.getFormattedMessage().contains("materialising generation dir")) && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertThat(log.list).anySatisfy(e -> assertThat(e.getFormattedMessage()).contains("failed"));
+
+            store.clearFailures();
+            node.runtime().syncNow(); // refused again: the failed materialisation starts over
+            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (!remote.stream().allMatch(f -> Files.isRegularFile(lucene.resolve(f.name())))
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            for (ManifestFile f : remote) assertThat(lucene.resolve(f.name())).as(f.name()).hasSize(f.length());
+        } finally {
+            logger.detachAppender(log);
+        }
+    }
+
+    /**
      * Final review I1(c): the format gate refuses a newer generation (a rolling N-1 upgrade), so the
      * reader keeps serving an older lazy one that the bucket's GC will delete. The syncer then
      * materialises that generation's remote files in the background; once they are local, reads
