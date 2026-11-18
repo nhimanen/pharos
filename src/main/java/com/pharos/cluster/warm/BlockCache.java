@@ -36,12 +36,17 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -146,7 +151,7 @@ public final class BlockCache implements Closeable {
      */
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>(64, 0.75f, true);
     /** The same entries for lock-free hit lookups; changed only under the lock, with {@link #entries}. */
-    private final java.util.concurrent.ConcurrentHashMap<String, Entry> index = new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Entry> index = new ConcurrentHashMap<>();
     private final Map<String, Flight> inflight = new HashMap<>();
     /** Ids whose evicted file is being deleted outside the lock; a fetch of the id waits before its move. */
     private final Set<String> deleting = new HashSet<>();
@@ -154,11 +159,11 @@ public final class BlockCache implements Closeable {
     private volatile long bytesOnDisk;
     private long hits;
     /** Hits on the lock-free path. */
-    private final java.util.concurrent.atomic.LongAdder fastHits = new java.util.concurrent.atomic.LongAdder();
+    private final LongAdder fastHits = new LongAdder();
     private long misses;
     private long bytesFetched;
     private long evictions;
-    private final java.util.concurrent.atomic.AtomicLong leasesOpen = new java.util.concurrent.atomic.AtomicLong();
+    private final AtomicLong leasesOpen = new AtomicLong();
     private long writeFailures;
     private long thrashWarnings;
     private boolean warnedThrash;
@@ -238,6 +243,12 @@ public final class BlockCache implements Closeable {
      * {@link #acquire} with the block's {@link #blockId} computed by the caller once. A block that is
      * cached and mapped is leased without the cache lock: a CAS on its lease count, which fails once
      * eviction has retired the block (then the locked path below runs).
+     *
+     * <p>The lock-free path does not check {@code closed}. That is safe: {@link #close} clears the
+     * lookup index and marks every entry removed under the lock, so a racing acquire either finds
+     * nothing, or leases an entry it then sees as removed and gives back before taking the locked
+     * path (which throws). A lease taken just before close stays valid until it is closed, as for any
+     * lease open at close. Lock-free hits don't reorder the LRU list: see {@link #evictOverCap}.
      */
     Lease acquire(BlockKey key, String hash, String id, long blockLength, BlockFetcher fetcher) throws IOException {
         Objects.requireNonNull(key, "key");
@@ -340,7 +351,7 @@ public final class BlockCache implements Closeable {
             throw new IllegalArgumentException("block length " + blockLength + " of block " + key.index() + " of '"
                     + key.objectKey() + "' is outside (0, " + blockSize + "]");
         }
-        String id = hash + "/" + key.index();
+        String id = blockId(hash, key.index());
         synchronized (lock) {
             if (closed) {
                 return CompletableFuture.failedFuture(new IllegalStateException("block cache " + dir + " is closed"));
@@ -364,19 +375,19 @@ public final class BlockCache implements Closeable {
 
     /**
      * Cancels the prefetch of block {@code key} when it is still queued and no acquire waits for it:
-     * it will never fetch, and its future fails with a {@link java.util.concurrent.CancellationException}.
+     * it will never fetch, and its future fails with a {@link CancellationException}.
      *
      * @return true when it was cancelled; false when it is running, awaited, done or unknown
      */
     boolean cancelQueued(BlockKey key, String hash) {
         Flight f;
         synchronized (lock) {
-            f = inflight.get(hash + "/" + key.index());
+            f = inflight.get(blockId(hash, key.index()));
             if (f == null || f.submitted || f.waiters > 0 || !f.started.compareAndSet(false, true)) return false;
             inflight.remove(f.id);
             f.settled = true;
         }
-        f.done.completeExceptionally(new java.util.concurrent.CancellationException(
+        f.done.completeExceptionally(new CancellationException(
                 "prefetch of block " + key.index() + " of '" + key.objectKey() + "' cancelled"));
         return true;
     }
@@ -402,7 +413,7 @@ public final class BlockCache implements Closeable {
                     f.completeExceptionally(t);
                 }
             });
-        } catch (java.util.concurrent.RejectedExecutionException e) {
+        } catch (RejectedExecutionException e) {
             f.completeExceptionally(new IllegalStateException("block cache " + dir + " is closed", e));
         }
         return f;
@@ -721,7 +732,7 @@ public final class BlockCache implements Closeable {
     /** Removes an invalid entry from the cache (not an eviction). Under lock. */
     private void drop(Entry e, Cleanup cleanup) {
         entries.remove(e.id);
-        index.remove(e.id);
+        index.remove(e.id, e);
         e.removed = true;
         bytesOnDisk -= e.length;
         deleteLater(e, cleanup);
@@ -731,7 +742,8 @@ public final class BlockCache implements Closeable {
     /**
      * Evicts unleased blocks, least recently used first, until at or under the cap. A block hit on the
      * lock-free path since the last pass ({@link Entry#referenced}) gets a second chance: it is moved
-     * to the young end instead, and evicted only by a second pass if nothing else is left. A block is
+     * to the young end instead, and evicted only by a second pass if nothing else is left. A leased
+     * block a pass skips loses its mark (an accepted approximation: its next hits re-mark it). A block is
      * evicted by retiring it (CAS of its lease count from 0), so a concurrent lock-free acquire either
      * leased it first (it stays) or fails and takes the locked path. Under lock.
      */
@@ -760,7 +772,7 @@ public final class BlockCache implements Closeable {
             }
             if (!e.leases.compareAndSet(0, RETIRED)) continue; // leased on the lock-free path meanwhile
             it.remove();
-            index.remove(e.id);
+            index.remove(e.id, e);
             e.removed = true;
             bytesOnDisk -= e.length;
             evictions++;
@@ -943,7 +955,7 @@ public final class BlockCache implements Closeable {
         if (size <= 0 || size > blockSize) return null;
         String name = file.getFileName().toString();
         long index = Long.parseLong(name.substring(0, name.length() - ".blk".length()));
-        Entry e = new Entry(file.getParent().getFileName() + "/" + index, file, size, true);
+        Entry e = new Entry(blockId(file.getParent().getFileName().toString(), index), file, size, true);
         e.lastTouch = attrs.lastModifiedTime().toMillis();
         return e;
     }
@@ -964,7 +976,7 @@ public final class BlockCache implements Closeable {
     void invalidate(BlockKey key, String hash) {
         Cleanup cleanup = new Cleanup();
         synchronized (lock) {
-            Entry e = entries.get(hash + "/" + key.index());
+            Entry e = entries.get(blockId(hash, key.index()));
             if (e != null) drop(e, cleanup);
         }
         cleanup.run();
@@ -972,7 +984,7 @@ public final class BlockCache implements Closeable {
 
     /** True when block {@code key} is in the cache now (on disk); in-flight fetches don't count. */
     public boolean isCached(BlockKey key) {
-        String id = objectHash(key.objectKey()) + "/" + key.index();
+        String id = blockId(objectHash(key.objectKey()), key.index());
         synchronized (lock) {
             return entries.containsKey(id);
         }

@@ -72,6 +72,11 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
     private byte[] buf;
     private long bufStart = -1;
     private int bufLen;
+    /**
+     * How many bytes the next refill copies: {@link #MIN_BUFFER}, doubled per sequential refill up
+     * to {@link #MAX_BUFFER}, back to {@link #MIN_BUFFER} on a random one. The array only grows.
+     */
+    private int window;
 
     CachingRemoteIndexInput(String resourceDescription, RemoteFile file) {
         this(resourceDescription, file, 0, file.length);
@@ -194,6 +199,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         c.buf = null; // the clone fills its own buffer: two inputs never write into one array
         c.bufStart = -1;
         c.bufLen = 0;
+        c.window = 0;
         return c;
     }
 
@@ -248,8 +254,10 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
                 abs += n;
                 off += n;
                 len -= n;
-            } else if (len >= BUFFER_SIZE) {
-                file.copy(abs, b, off, len); // long read: straight from the blocks, no double copy
+            } else if (len >= Math.min(BUFFER_SIZE, Math.max(window, MIN_BUFFER))) {
+                // at least what a refill would copy: straight from the blocks (one lease per block
+                // touched), not refill after refill through the buffer
+                file.copy(abs, b, off, len);
                 return;
             } else {
                 fill(abs);
@@ -307,18 +315,23 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
     }
 
     /**
-     * Copies up to the buffer's size of bytes at {@code abs}, never past the end of abs's block. The
-     * buffer starts at {@link #MIN_BUFFER} and doubles (to {@link #MAX_BUFFER}) on sequential refills.
+     * Copies up to {@link #window} bytes at {@code abs}, never past the end of abs's block. The window
+     * starts at {@link #MIN_BUFFER}, doubles (to {@link #MAX_BUFFER}) while refills are sequential (each
+     * continues where the last one ended) and drops back to {@link #MIN_BUFFER} on a random refill, so
+     * a seek after a long scan copies a small window, not 64 KiB.
      */
     private void fill(long abs) throws IOException {
-        if (buf == null) {
-            buf = new byte[MIN_BUFFER];
-        } else if (buf.length < MAX_BUFFER && bufStart >= 0 && abs == bufStart + bufLen) {
-            buf = new byte[Math.min(MAX_BUFFER, buf.length * 2)];
-        }
+        boolean sequential = bufStart >= 0 && abs == bufStart + bufLen;
+        window = window == 0 || !sequential ? MIN_BUFFER : Math.min(MAX_BUFFER, window * 2);
+        if (buf == null || buf.length < window) buf = new byte[window];
         bufStart = -1; // stays invalid if the copy fails
-        bufLen = file.copyWithinBlock(abs, buf);
+        bufLen = file.copyWithinBlock(abs, buf, window);
         bufStart = abs;
+    }
+
+    /** Bytes the last buffer refill copied (tests). */
+    int lastFillLength() {
+        return bufLen;
     }
 
     /** The {@code n} bytes at {@code abs}, which straddle a block boundary. */
@@ -478,14 +491,14 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             }
         }
 
-        /** Copies from {@code abs} up to the end of its block or of {@code dst}; returns the count. */
-        int copyWithinBlock(long abs, byte[] dst) throws IOException {
-            int edge = copyEdge(abs, dst, 0, dst.length);
+        /** Copies from {@code abs} up to the end of its block or {@code max} bytes; returns the count. */
+        int copyWithinBlock(long abs, byte[] dst, int max) throws IOException {
+            int edge = copyEdge(abs, dst, 0, max);
             if (edge > 0) return edge;
             long index = abs / blockSize;
             long inBlock = abs - index * blockSize;
             try (BlockCache.Lease lease = acquire(index)) {
-                int n = (int) Math.min(dst.length, lease.length() - inBlock);
+                int n = (int) Math.min(max, lease.length() - inBlock);
                 MemorySegment.copy(lease.segment(), ValueLayout.JAVA_BYTE, inBlock, dst, 0, n);
                 return n;
             }

@@ -275,4 +275,92 @@ class BlockCacheStressTest {
         assertThat(st.bytesOnDisk()).isLessThanOrEqualTo(8L * BS).isEqualTo(blockBytesOnDisk(dir.resolve("i")));
         cache.close();
     }
+
+    /**
+     * Large blocks (128 KiB) and long sequential runs, so the refill window grows to its maximum and
+     * shrinks again on seeks, while other threads keep evicting: readByte and readBytes stay byte-exact.
+     */
+    @RepeatedTest(3)
+    void longSequentialRunsWithSeeksAreExactWithLargeBlocks() throws Exception {
+        int bs = 128 * 1024;
+        int files = 4;
+        int fileLength = 5 * bs + 777;
+        java.util.Map<String, byte[]> objects = new java.util.HashMap<>();
+        List<ManifestFile> mfs = new ArrayList<>();
+        for (int f = 0; f < files; f++) {
+            String k = key(200 + f);
+            byte[] d = new byte[fileLength];
+            for (int i = 0; i < d.length; i++) d[i] = expected(k, i);
+            objects.put(k, d);
+            mfs.add(new ManifestFile(ManifestFile.LUCENE, "_" + f + ".big", k, fileLength, "0"));
+        }
+        BlockCache cache = new BlockCache(dir.resolve("big"), 6L * bs, bs, 4); // 6 of 24 blocks fit
+        ReplicaSource src = source(objects);
+        List<CachingRemoteIndexInput> inputs = new ArrayList<>();
+        for (ManifestFile mf : mfs) {
+            inputs.add(new CachingRemoteIndexInput("big " + mf.name(),
+                    new CachingRemoteIndexInput.RemoteFile(new ShardId("s"), 1, mf, cache, src)));
+        }
+        ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(THREADS);
+        try {
+            List<Future<?>> fs = new ArrayList<>();
+            for (int t = 0; t < THREADS; t++) {
+                fs.add(pool.submit(() -> {
+                    ThreadLocalRandom r = ThreadLocalRandom.current();
+                    try {
+                        start.await();
+                        for (int i = 0; i < 60; i++) {
+                            int f = r.nextInt(files);
+                            byte[] want = objects.get(mfs.get(f).key());
+                            try (IndexInput in = inputs.get(f).clone()) {
+                                for (int seek = 0; seek < 6; seek++) {
+                                    long p = r.nextLong(fileLength - 1);
+                                    in.seek(p);
+                                    int run = (int) Math.min(fileLength - p, r.nextInt(300_000));
+                                    int done = 0;
+                                    while (done < run) {
+                                        if (r.nextInt(4) == 0) {
+                                            int n = Math.min(run - done, 1 + r.nextInt(20_000));
+                                            byte[] b = new byte[n];
+                                            in.readBytes(b, 0, n);
+                                            for (int j = 0; j < n; j++) {
+                                                if (b[j] != want[(int) p + done + j]) {
+                                                    throw new AssertionError("readBytes at " + (p + done + j));
+                                                }
+                                            }
+                                            done += n;
+                                        } else {
+                                            int n = Math.min(run - done, 1 + r.nextInt(5_000));
+                                            for (int j = 0; j < n; j++) {
+                                                if (in.readByte() != want[(int) p + done + j]) {
+                                                    throw new AssertionError("readByte at " + (p + done + j));
+                                                }
+                                            }
+                                            done += n;
+                                        }
+                                    }
+                                    if (in.getFilePointer() != p + run) throw new AssertionError("position");
+                                }
+                            }
+                        }
+                    } catch (Throwable e) {
+                        failures.add(e);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> f : fs) f.get(300, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThat(failures).as("first failure: %s", failures.peek()).isEmpty();
+        WarmStats st = cache.stats();
+        assertThat(st.leasesOpen()).isZero();
+        assertThat(st.evictions()).isPositive();
+        assertThat(st.bytesOnDisk()).isLessThanOrEqualTo(6L * bs).isEqualTo(blockBytesOnDisk(dir.resolve("big")));
+        cache.close();
+    }
 }
