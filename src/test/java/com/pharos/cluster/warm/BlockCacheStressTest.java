@@ -131,15 +131,17 @@ class BlockCacheStressTest {
         assertThat(st.hits() + st.misses()).isEqualTo(acquires.get());
         assertThat(st.evictions()).as("the cap forced evictions").isPositive();
         assertThat(st.bytesOnDisk()).isLessThanOrEqualTo(6L * BS);
-        // A fetch thread deletes the files its fetch evicted after completing the flight (outside the
-        // lock), so the last deletes may still be running when every acquire has returned.
+        // Fire-and-forget prefetches may still land, and a fetch thread deletes the files its fetch
+        // evicted after completing the flight (outside the lock): wait for the cache to settle.
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        long accounted = cache.stats().bytesOnDisk();
         long onDisk = blockBytesOnDisk(dir.resolve("c"));
-        while (onDisk != st.bytesOnDisk() && System.nanoTime() < deadline) {
+        while (onDisk != accounted && System.nanoTime() < deadline) {
             Thread.sleep(20);
+            accounted = cache.stats().bytesOnDisk();
             onDisk = blockBytesOnDisk(dir.resolve("c"));
         }
-        assertThat(st.bytesOnDisk()).isEqualTo(onDisk);
+        assertThat(accounted).isLessThanOrEqualTo(6L * BS).isEqualTo(onDisk);
         cache.close();
     }
 
