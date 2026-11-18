@@ -686,6 +686,75 @@ class LazyReaderTest {
         assertThat(ids(full.engine(), "Calculator")).isEqualTo(want).isNotEmpty();
     }
 
+    /** The remote (block-read) Lucene files of a generation with at least {@code min} bytes. */
+    private List<ManifestFile> remoteFiles(long gen, long min) throws IOException {
+        return manifest(gen).files().stream()
+                .filter(f -> ManifestFile.LUCENE.equals(f.role()) && !alwaysEager(f.name()) && f.length() >= min)
+                .toList();
+    }
+
+    private static int status(io.javalin.Javalin app) throws Exception {
+        return java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://127.0.0.1:" + app.port() + "/health")).build(),
+                java.net.http.HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
+    /**
+     * Final review I1(b): GC removed objects of the generation a lagging lazy reader still serves.
+     * The miss logs one ERROR per generation and /health answers 503 degraded (routers drain the
+     * node) until a newer generation is activated.
+     */
+    @Test
+    void missingObjectOfTheServedGenerationDegradesHealthUntilANewerOneActivates() throws Exception {
+        long g1 = publishWithoutCompoundFiles();
+        Node node = reader("gone", r -> { small(r); r.setEagerMaxBytes(0); r.setPrefetchExtensions(List.of()); });
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(LazyGenerations.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        com.pharos.web.WebServer web = new com.pharos.web.WebServer(null, null, null, null, null);
+        web.setDegradation(node.runtime()::degradation);
+        io.javalin.Javalin app = web.start(0);
+        try {
+            node.runtime().startServing();
+            assertThat(node.runtime().degradation()).isNull();
+            assertThat(status(app)).isEqualTo(200);
+
+            // The bucket's GC deletes generation g1's objects while this reader still serves it.
+            Map<String, byte[]> removed = new java.util.HashMap<>();
+            for (ManifestFile f : remoteFiles(g1, 1)) {
+                removed.put(f.key(), store.get(f.key()).orElseThrow().data());
+                store.delete(f.key());
+            }
+            ManifestFile big = remoteFiles(g1, 0).stream().max(Comparator.comparingLong(ManifestFile::length))
+                    .orElseThrow();
+            for (int i = 0; i < 2; i++) {
+                try (Directory d = node.runtime().lazyGenerations().open(node.genDir(g1).resolve("lucene"));
+                     IndexInput in = d.openInput(big.name(), IOContext.DEFAULT)) {
+                    byte[] all = new byte[(int) big.length()];
+                    org.assertj.core.api.Assertions.assertThatThrownBy(() -> in.readBytes(all, 0, all.length))
+                            .isInstanceOf(IOException.class).hasMessageContaining(big.key());
+                }
+            }
+            assertThat(node.runtime().degradation()).contains(JAVA, "generation " + g1);
+            assertThat(status(app)).isEqualTo(503);
+            assertThat(log.list.stream().filter(e -> e.getLevel() == Level.ERROR)
+                    .map(ILoggingEvent::getFormattedMessage).toList())
+                    .singleElement().satisfies(m -> assertThat(m).contains("generation " + g1, JAVA,
+                            "garbage-collected", "behind retention", "mode full"));
+
+            removed.forEach(store::put); // the writer publishes again: the objects are back
+            addMethodAndReindex("triple");
+            node.runtime().syncNow();
+            assertThat(node.runtime().served().get(SHARD).value()).isGreaterThan(g1);
+            assertThat(node.runtime().degradation()).isNull();
+            assertThat(status(app)).isEqualTo(200);
+        } finally {
+            app.stop();
+            logger.detachAppender(log);
+        }
+    }
+
     /** Ranged reads (prefetch and block fetches) wait for {@code release}; whole-file downloads do not. */
     private static final class SlowRanges implements ReplicaSource {
         private final ReplicaSource d;

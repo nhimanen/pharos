@@ -363,9 +363,16 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         final long footerStart;
         /** {@link BlockCache#blockId} per block, built on first use: no string building per read. */
         private final String[] blockIds;
+        /** Told when a block's object is missing from the bucket; null for nobody. */
+        private final RemoteDirectory.MissingObjectListener missing;
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source) {
             this(shard, generation, file, cache, source, null, false);
+        }
+
+        RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source,
+                   byte[] head, boolean synthFooter) {
+            this(shard, generation, file, cache, source, head, synthFooter, null);
         }
 
         /**
@@ -374,7 +381,8 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
          *                    checksum is its footer checksum)
          */
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source,
-                   byte[] head, boolean synthFooter) {
+                   byte[] head, boolean synthFooter, RemoteDirectory.MissingObjectListener missing) {
+            this.missing = missing;
             this.shard = Objects.requireNonNull(shard, "shard");
             this.generation = generation;
             this.file = Objects.requireNonNull(file, "file");
@@ -570,10 +578,26 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
                 x.initCause(e);
                 throw x;
             } catch (IOException | RuntimeException e) {
+                if (missing != null && objectMissing(e)) {
+                    try {
+                        missing.objectMissing(shard, generation, file.key());
+                    } catch (RuntimeException ignored) {
+                        // a listener must not hide the read's own failure
+                    }
+                }
                 throw new IOException("cannot read block " + index + " of " + where() + ": " + e.getMessage(), e);
             }
             if (footer != null) checkFooter(key, index, lease);
             return lease;
+        }
+
+        /** True when {@code e} (or a cause) says the object is not in the store. */
+        static boolean objectMissing(Throwable e) {
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t instanceof java.nio.file.NoSuchFileException) return true;
+                if (t.getCause() == t) break;
+            }
+            return false;
         }
 
         /** A block holding the whole footer must end with the synthesised one. */

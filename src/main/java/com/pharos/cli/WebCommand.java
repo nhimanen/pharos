@@ -62,6 +62,7 @@ public class WebCommand implements Callable<Integer> {
                         : java.util.concurrent.CompletableFuture.completedFuture(null)); // no wait
                 webServer.setReadiness(clusterRuntime::ready);
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
+                webServer.setDegradation(clusterRuntime::degradation);
             }
             webServer.start(port);
             if (!noOpen) {

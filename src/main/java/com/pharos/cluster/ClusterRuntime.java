@@ -91,6 +91,7 @@ public final class ClusterRuntime implements Closeable {
         this.luceneIndexer = Objects.requireNonNull(luceneIndexer, "luceneIndexer");
         if (isReader() && config.getCluster().getReader().isLazy()) {
             lazy = new LazyGenerations(cacheDir(), config.getCluster().getReader(), backend.source());
+            lazy.setActiveGenerations(this::activeGeneration);
             luceneIndexer.setDirectoryFactory(lazy);
         } else {
             lazy = null;
@@ -175,6 +176,26 @@ public final class ClusterRuntime implements Closeable {
         int i = 0;
         while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
         return i == 0 ? bytes + " B" : String.format(java.util.Locale.ROOT, "%.1f %s", v, units[i]);
+    }
+
+    /**
+     * Why this reader can't answer every query (served by {@code /health} as 503 {@code degraded}),
+     * or null when it can: a lazy reader whose active generation was garbage-collected on the bucket.
+     */
+    public String degradation() {
+        return lazy == null ? null : lazy.degradation();
+    }
+
+    /** The generation number of the shard's active generation dir; empty when none is active. */
+    private java.util.OptionalLong activeGeneration(String shard) {
+        if (!(backend.localCache() instanceof ReaderLocalCache cache)) return java.util.OptionalLong.empty();
+        return cache.active(shard).map(p -> generationOf(p.getFileName().toString()))
+                .orElse(java.util.OptionalLong.empty());
+    }
+
+    private static java.util.OptionalLong generationOf(String dirName) {
+        if (!GEN_DIR.matcher(dirName).matches()) return java.util.OptionalLong.empty();
+        return java.util.OptionalLong.of(Long.parseLong(dirName.substring("gen-".length())));
     }
 
     public IndexPublisher publisher() {

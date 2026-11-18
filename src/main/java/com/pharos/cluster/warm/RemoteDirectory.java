@@ -50,6 +50,8 @@ public final class RemoteDirectory extends BaseDirectory {
     private final ReplicaSource source;
     /** Serve heads from sidecars and footers from the manifest (lazy generations). */
     private final boolean edges;
+    /** Told when a block read finds the object gone from the bucket; null: nobody listens. */
+    private final MissingObjectListener missing;
     private FSDirectory eager; // guarded by this; opened on first use
 
     /**
@@ -69,8 +71,25 @@ public final class RemoteDirectory extends BaseDirectory {
      */
     public RemoteDirectory(ShardId shard, ShardManifest manifest, Path eagerDir, BlockCache cache,
                            ReplicaSource source, boolean edges) {
+        this(shard, manifest, eagerDir, cache, source, edges, null);
+    }
+
+    /**
+     * Called when a block read of a remote file fails because its object is missing from the bucket
+     * (the store answered {@link NoSuchFileException}): typically the generation was garbage-collected.
+     * It runs on the reading thread, before the read's {@link IOException} is thrown, and must not throw.
+     */
+    @FunctionalInterface
+    public interface MissingObjectListener {
+        void objectMissing(ShardId shard, long generation, String objectKey);
+    }
+
+    /** @param missing told about every block read that finds its object gone; null for none */
+    public RemoteDirectory(ShardId shard, ShardManifest manifest, Path eagerDir, BlockCache cache,
+                           ReplicaSource source, boolean edges, MissingObjectListener missing) {
         super(NoLockFactory.INSTANCE);
         this.edges = edges;
+        this.missing = missing;
         this.shard = Objects.requireNonNull(shard, "shard");
         this.generation = manifest.generation();
         this.eagerDir = eagerDir;
@@ -107,7 +126,7 @@ public final class RemoteDirectory extends BaseDirectory {
             return eager().openInput(name, context);
         }
         CachingRemoteIndexInput.RemoteFile remote = new CachingRemoteIndexInput.RemoteFile(shard, generation, f,
-                cache, source, edges ? head(f) : null, edges);
+                cache, source, edges ? head(f) : null, edges, missing);
         return new CachingRemoteIndexInput("CachingRemoteIndexInput(" + remote.where() + ")", remote);
     }
 

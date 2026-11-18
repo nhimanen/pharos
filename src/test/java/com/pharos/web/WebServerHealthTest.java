@@ -57,4 +57,41 @@ class WebServerHealthTest {
         server.setReaderCacheStats(() -> cache);
         assertThat(server.health()).containsEntry("readerCache", cache).containsEntry("ready", true);
     }
+
+    /** A ready reader whose served generation lost its objects answers 503 degraded, so routers drain it. */
+    @Test
+    void healthAnswers503DegradedOverHttpWhileAShardIsDegraded() throws Exception {
+        WebServer server = new WebServer(null, null, null, null, null);
+        java.util.concurrent.atomic.AtomicReference<String> reason = new java.util.concurrent.atomic.AtomicReference<>();
+        server.setDegradation(reason::get);
+        java.util.concurrent.atomic.AtomicInteger readinessReads = new java.util.concurrent.atomic.AtomicInteger();
+        server.setReadiness(() -> {
+            readinessReads.incrementAndGet();
+            return true;
+        });
+        io.javalin.Javalin app = server.start(0);
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            java.net.URI uri = java.net.URI.create("http://127.0.0.1:" + app.port() + "/health");
+            var ok = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertThat(ok.statusCode()).isEqualTo(200);
+            assertThat(readinessReads.get()).as("one readiness read per request").isEqualTo(1);
+
+            reason.set("shard java: generation 7 was garbage-collected on the bucket");
+            var degraded = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertThat(degraded.statusCode()).isEqualTo(503);
+            assertThat(degraded.body()).contains("\"status\":\"degraded\"", "\"reason\":\"shard java: generation 7");
+            assertThat(server.healthStatus()).isEqualTo(503);
+
+            reason.set(null);
+            var again = http.send(java.net.http.HttpRequest.newBuilder(uri).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertThat(again.statusCode()).isEqualTo(200);
+            assertThat(again.body()).contains("\"status\":\"ok\"").doesNotContain("reason");
+        } finally {
+            app.stop();
+        }
+    }
 }

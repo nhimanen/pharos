@@ -99,7 +99,7 @@ def _jvm_flags() -> list:
 # ── Daemon management ─────────────────────────────────────────────────────────
 
 def _health_status():
-    """HTTP status of the daemon's /health (200 ready, 503 warming), or None when nothing answers."""
+    """HTTP status of the daemon's /health (200 ready, 503 warming or degraded), or None when nothing answers."""
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
             return resp.status

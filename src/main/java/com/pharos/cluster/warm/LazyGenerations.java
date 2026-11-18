@@ -86,6 +86,16 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
 
     private record CachedManifest(Object fileKey, long modified, long size, ShardManifest manifest) {}
 
+    /** The generation each shard serves now (empty when none); set by the reader runtime. */
+    private volatile java.util.function.Function<String, java.util.OptionalLong> activeGeneration =
+            shard -> java.util.OptionalLong.empty();
+    /**
+     * Per shard, the active generation a block read found an object of missing on the bucket (it was
+     * garbage-collected while this reader served it). Reported by {@link #degradation} while that
+     * generation is still the active one.
+     */
+    private final Map<String, Long> goneGenerations = new java.util.concurrent.ConcurrentHashMap<>();
+
     // Guarded by this.
     private BlockCache blockCache;
     private SyncLock blocksLock;
@@ -131,7 +141,56 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         Path genDir = luceneDir.toAbsolutePath().getParent();
         if (!isLazy(genDir)) return FSDirectory.open(luceneDir);
         ShardManifest manifest = manifest(genDir);
-        return new RemoteDirectory(new ShardId(manifest.shard()), manifest, luceneDir, blockCache(), source, true);
+        return new RemoteDirectory(new ShardId(manifest.shard()), manifest, luceneDir, blockCache(), source, true,
+                this::objectMissing);
+    }
+
+    // ---------------------------------------------------------------- retention
+
+    /**
+     * Tells this reader which generation each shard serves now (the reader runtime's active
+     * generation dirs), so a missing object can be told apart from one of a retired generation.
+     */
+    public void setActiveGenerations(java.util.function.Function<String, java.util.OptionalLong> active) {
+        this.activeGeneration = Objects.requireNonNull(active, "active");
+    }
+
+    /**
+     * A block read of {@code shard}'s generation {@code gen} found object {@code key} missing on the
+     * bucket. When {@code gen} is the shard's active generation, the generation was garbage-collected
+     * under this reader (it lags more than the writer's retention): one ERROR per generation, and the
+     * shard counts as degraded ({@link #degradation}) until a newer generation is activated.
+     */
+    void objectMissing(ShardId shard, long gen, String key) {
+        java.util.OptionalLong active = activeGeneration.apply(shard.value());
+        if (active.isEmpty() || active.getAsLong() != gen) return; // a retired generation: GC may take it
+        Long before = goneGenerations.put(shard.value(), gen);
+        if (before == null || before != gen) {
+            log.error("generation {} of shard {} was garbage-collected on the bucket (object {} is gone); this reader"
+                    + " is behind retention — sync a newer generation or switch to mode full"
+                    + " (cluster.reader.mode \"full\"). Queries that need uncached blocks of it fail until then.",
+                    gen, shard, key);
+        }
+    }
+
+    /**
+     * Why this reader can't serve every query, or null: the shards whose active generation lost
+     * objects on the bucket. A shard drops out as soon as a newer generation is active.
+     */
+    public String degradation() {
+        List<String> reasons = new ArrayList<>();
+        for (Map.Entry<String, Long> e : goneGenerations.entrySet()) {
+            java.util.OptionalLong active = activeGeneration.apply(e.getKey());
+            if (active.isPresent() && active.getAsLong() == e.getValue()) {
+                reasons.add("shard " + e.getKey() + ": generation " + e.getValue() + " was garbage-collected on the"
+                        + " bucket; this reader is behind retention");
+            } else {
+                goneGenerations.remove(e.getKey(), e.getValue()); // a newer generation is active
+            }
+        }
+        if (reasons.isEmpty()) return null;
+        java.util.Collections.sort(reasons);
+        return String.join("; ", reasons);
     }
 
     /** A lazy generation exists when its manifest names a commit whose {@code segments_N} is on disk. */
