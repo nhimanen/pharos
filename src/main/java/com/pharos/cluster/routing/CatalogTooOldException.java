@@ -11,11 +11,16 @@ import java.util.List;
  */
 public class CatalogTooOldException extends CatalogUnavailableException {
     private final List<ShardId> lastKnown;
+    private final long ageSeconds;
 
-    public CatalogTooOldException(String message, Throwable cause, List<ShardId> lastKnown) {
+    public CatalogTooOldException(String message, Throwable cause, List<ShardId> lastKnown, long ageSeconds) {
         super(message, cause);
         this.lastKnown = List.copyOf(lastKnown);
+        this.ageSeconds = ageSeconds;
     }
 
     public List<ShardId> lastKnown() { return lastKnown; }
+
+    /** Seconds since the last good read of the catalog. */
+    public long ageSeconds() { return ageSeconds; }
 }

@@ -705,8 +705,7 @@ class DistributedSearchTest {
             SearchResponse onFull = search(full, q, SearchType.KEYWORD, null, 10);
             assertThat(ids(onFull.results())).as("holds every shard: complete").isEqualTo(fullBefore);
             assertThat(onFull.warnings()).singleElement().asString()
-                    .startsWith("searching only this reader's shards: the shard catalog was last read")
-                    .doesNotContain("not searched");
+                    .matches("catalog is \\d+ s old; serving this reader's shards \\(complete\\)");
             assertThat(full.engine.findCallers("com.example.model.User#getName()", null, new ArrayList<>()))
                     .as("graph ops too").isNotEmpty();
 

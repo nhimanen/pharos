@@ -286,7 +286,10 @@ public class SearchEngine {
             Set<String> held = new java.util.HashSet<>();
             for (ProjectMeta m : registry.listAll()) if (m.getName() != null) held.add(m.getName());
             List<String> missing = old.lastKnown().stream().map(ShardId::value).filter(n -> !held.contains(n)).toList();
-            if (!missing.isEmpty()) w += "; not searched: " + String.join(", ", missing);
+            if (missing.isEmpty()) { // this reader holds every shard of the last good catalog: nothing is lost
+                return "catalog is " + old.ageSeconds() + " s old; serving this reader's shards (complete)";
+            }
+            w += "; not searched: " + String.join(", ", missing);
         }
         return w;
     }

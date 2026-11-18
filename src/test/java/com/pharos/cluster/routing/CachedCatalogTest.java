@@ -122,4 +122,53 @@ class CachedCatalogTest {
         refreshes.remove(0).run();
         assertThat(c.ageSeconds()).isZero();
     }
+
+    // ---------------------------------------------------------------- Task 5 carried minors
+
+    /** An abandoned (hung) read is capped at one: while it still runs, the watchdog abandons no other. */
+    @Test
+    void atMostOneAbandonedReadIsInFlight() throws Exception {
+        CachedCatalog c = new CachedCatalog(store, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                refreshes::add, Duration.ofSeconds(10));
+        c.shards();
+        now.addAndGet(6 * S);
+        c.shards();
+        assertThat(refreshes).hasSize(1);
+        now.addAndGet(11 * S);
+        c.shards();
+        assertThat(refreshes).as("the first hung read is abandoned, a second starts").hasSize(2);
+        now.addAndGet(11 * S);
+        c.shards();
+        assertThat(refreshes).as("the second hangs too, but one abandoned read still runs: no third")
+                .hasSize(2);
+        refreshes.remove(0).run(); // the abandoned read finally returns
+        now.addAndGet(1 * S);
+        c.shards();
+        assertThat(refreshes).as("no abandoned read in flight any more: the hung second is given up")
+                .hasSize(2);
+    }
+
+    /** A late finish of an abandoned read never overwrites what its replacement stored. */
+    @Test
+    void anAbandonedReadsLateResultIsDiscarded() throws Exception {
+        List<List<ShardId>> answers = new ArrayList<>(List.of(
+                List.of(new ShardId("a")),          // the first, blocking read
+                List.of(new ShardId("fresh")),      // the replacement, which finishes first
+                List.of(new ShardId("stale"))));    // the abandoned read, which finishes last
+        ShardCatalog scripted = () -> answers.remove(0);
+        CachedCatalog c = new CachedCatalog(scripted, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                refreshes::add, Duration.ofSeconds(10));
+        c.shards();
+        now.addAndGet(6 * S);
+        c.shards();
+        Runnable hung = refreshes.remove(0);
+        now.addAndGet(11 * S);
+        c.shards(); // the hung read is abandoned; its replacement starts
+        refreshes.remove(0).run();
+        assertThat(c.shards()).containsExactly(new ShardId("fresh"));
+        now.addAndGet(1 * S);
+        hung.run();
+        assertThat(c.shards()).as("the abandoned read's result is not stored").containsExactly(new ShardId("fresh"));
+        assertThat(c.ageSeconds()).as("nor its read time").isEqualTo(1);
+    }
 }

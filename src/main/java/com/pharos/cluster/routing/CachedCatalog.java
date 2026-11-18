@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
@@ -31,11 +31,21 @@ public final class CachedCatalog implements ShardCatalog {
     private final LongSupplier clock;
     private final Executor refresher;
     private final ReentrantLock firstRead = new ReentrantLock();
-    private final AtomicBoolean refreshing = new AtomicBoolean();
-    /** Bumped per refresh; a refresh only clears {@link #refreshing} while it is still the current one. */
-    private final java.util.concurrent.atomic.AtomicLong refreshToken = new java.util.concurrent.atomic.AtomicLong();
+    private static final long IDLE = Long.MIN_VALUE;
+    /**
+     * When the running background read started, or {@link #IDLE}. One atomic value is both the
+     * "running" flag and its start time, so a concurrent query never sees a read running with the
+     * start time of an earlier one (and takes it for hung).
+     */
+    private final AtomicLong runningSince = new AtomicLong(IDLE);
+    /**
+     * Bumped per refresh. Only the current refresh may store its result or clear
+     * {@link #runningSince}: a late finish of an abandoned one changes nothing.
+     */
+    private final AtomicLong refreshToken = new AtomicLong();
+    /** The token of the abandoned read still running, or 0: at most one is ever abandoned at a time. */
+    private final AtomicLong abandoned = new AtomicLong();
     private final long hungNanos;
-    private volatile long refreshStartedAt;
 
     private volatile List<ShardId> cached;
     private volatile long readAt;          // last good read
@@ -67,27 +77,23 @@ public final class CachedCatalog implements ShardCatalog {
         long now = clock.getAsLong();
         List<ShardId> current = cached;
         if (current == null) return firstShards(now);
-        if (refreshing.get() && now - refreshStartedAt > hungNanos) { // watchdog: a read that hangs
-            log.warn("The background read of the shard catalog has run {} s; starting another",
-                    (now - refreshStartedAt) / 1_000_000_000L);
-            refreshToken.incrementAndGet();
-            refreshing.set(false);
-        }
-        if (now - attemptAt >= refreshNanos && refreshing.compareAndSet(false, true)) {
+        long since = runningSince.get();
+        if (since != IDLE && now - since > hungNanos) giveUp(since, now); // watchdog: a read that hangs
+        if (now - attemptAt >= refreshNanos && runningSince.compareAndSet(IDLE, now)) {
             attemptAt = now;
-            refreshStartedAt = now;
             long token = refreshToken.incrementAndGet();
             try {
                 refresher.execute(() -> refresh(token));
             } catch (RuntimeException e) {
-                refreshing.set(false);
+                runningSince.compareAndSet(now, IDLE);
             }
         }
         long age = now - readAt;
         if (age > maxAgeNanos) {
             throw new CatalogTooOldException("the shard catalog was last read " + age / 1_000_000_000L
                     + " s ago, over cluster.maxCatalogAgeSeconds (" + maxAgeNanos / 1_000_000_000L + " s)"
-                    + (lastFailure == null ? "" : ": " + lastFailure.getMessage()), lastFailure, current);
+                    + (lastFailure == null ? "" : ": " + lastFailure.getMessage()), lastFailure, current,
+                    age / 1_000_000_000L);
         }
         return current;
     }
@@ -123,18 +129,51 @@ public final class CachedCatalog implements ShardCatalog {
                 + (f == null ? "" : ": " + f.getMessage()), f);
     }
 
+    /**
+     * Abandons the read running since {@code since} so the next query starts another, unless an
+     * abandoned read is still running: then this one is waited for too (no pile-up of hung reads).
+     */
+    private void giveUp(long since, long now) {
+        long token = refreshToken.get();
+        if (!abandoned.compareAndSet(0, token)) return; // one abandoned read still runs
+        synchronized (this) {
+            if (refreshToken.get() != token || runningSince.get() != since) { // finished or replaced meanwhile
+                abandoned.compareAndSet(token, 0);
+                return;
+            }
+            refreshToken.incrementAndGet(); // its late result is discarded
+            runningSince.set(IDLE);
+        }
+        log.warn("The background read of the shard catalog has run {} s; starting another",
+                (now - since) / 1_000_000_000L);
+    }
+
     private void refresh(long token) {
+        List<ShardId> read = null;
+        Exception failure = null;
         try {
-            List<ShardId> read = List.copyOf(base.shards());
-            readAt = clock.getAsLong();
-            lastFailure = null;
-            cached = read;
+            read = List.copyOf(base.shards());
         } catch (IOException | RuntimeException e) {
-            lastFailure = e instanceof IOException io ? io : new IOException(e.toString(), e);
+            failure = e;
+        }
+        boolean current;
+        synchronized (this) { // stores only while still the current refresh
+            current = refreshToken.get() == token;
+            if (current) {
+                if (read != null) {
+                    readAt = clock.getAsLong();
+                    lastFailure = null;
+                    cached = read;
+                } else {
+                    lastFailure = failure instanceof IOException io ? io : new IOException(failure.toString(), failure);
+                }
+                runningSince.set(IDLE);
+            }
+        }
+        abandoned.compareAndSet(token, 0); // an abandoned read has finished
+        if (current && failure != null) {
             log.warn("Reading the shard catalog failed; routing with the one read {} s ago (retrying in {} s): {}",
-                    ageSeconds(), refreshNanos / 1_000_000_000L, e.toString());
-        } finally {
-            if (refreshToken.get() == token) refreshing.set(false);
+                    ageSeconds(), refreshNanos / 1_000_000_000L, failure.toString());
         }
     }
 
