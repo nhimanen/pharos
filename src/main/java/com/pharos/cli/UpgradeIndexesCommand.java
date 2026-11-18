@@ -101,6 +101,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             RoleGuard.requireUpgrades(config);
         } catch (IllegalStateException e) {

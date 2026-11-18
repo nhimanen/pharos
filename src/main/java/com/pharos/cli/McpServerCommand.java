@@ -40,6 +40,7 @@ public class McpServerCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             clusterRuntime.startServing(); // readers: wait for the first sync pass (failures are logged and retried)
         } catch (Exception e) {

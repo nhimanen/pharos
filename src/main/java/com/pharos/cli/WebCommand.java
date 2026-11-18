@@ -52,6 +52,7 @@ public class WebCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             // The model warm-up starts first and runs in parallel with a reader's first sync;
             // readiness waits for both (a hanging load is bounded by MODEL_WARMUP_TIMEOUT).

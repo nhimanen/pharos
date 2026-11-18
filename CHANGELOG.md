@@ -39,8 +39,10 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `X-Pharos-Warnings`.
 - Reader heartbeats carry `state` (`warming|ready|degraded|draining`) and `degradedShards`;
   coordinators skip a reader only for its degraded shards.
-- Draining: on SIGTERM a serving reader announces `draining` (heartbeat and `/health` 503), finishes
-  its in-flight requests and stops after at most `cluster.drainSeconds` (default 20).
+- Draining: on SIGTERM a serving reader announces `draining` (heartbeat and `/health` 503), keeps
+  serving for a quiet period (at least 4 s and one heartbeat, and until nothing has been in flight
+  for 1 s) and stops after at most `cluster.drainSeconds` (default 20).
+
 - `pharos router --port <p>` (`./pharos router`): a stateless router over the healthy readers
   (`/health` polled every 2 s, round-robin, one retry of idempotent requests on another reader,
   `/internal/*` never forwarded). Needs the object-store config and `cluster.token`, no index.
@@ -71,6 +73,12 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   queries answer from the reader's own shards with a warning naming the shards not searched). A
   shard without vectors of the coordinator's model is named in a warning and left out of vector and
   unified retrieval.
+
+### Fixed
+- Shutdown order on SIGTERM/SIGINT/SIGHUP: the reader drain, then the running model calls, then
+  exit; JVM shutdown hooks (ONNX Runtime's environment closer among them) start only after that, so
+  a signal no longer frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies
+  to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
 
 ### Changed
 - The S3 client waits up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a

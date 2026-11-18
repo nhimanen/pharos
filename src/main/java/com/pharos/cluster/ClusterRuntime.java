@@ -224,6 +224,8 @@ public final class ClusterRuntime implements Closeable {
     /** The requests a drain waits for (the web server's in-flight count); none until set. */
     private volatile java.util.function.IntSupplier inFlight = () -> 0;
     private volatile boolean draining;
+    /** Removes this runtime's signal-time drain step; set while serving. Guarded by this. */
+    private AutoCloseable drainStep;
 
     /** Where a drain reads the requests still being served (the web server's {@code inFlightRequests}). */
     public void setInFlight(java.util.function.IntSupplier inFlight) {
@@ -236,11 +238,22 @@ public final class ClusterRuntime implements Closeable {
     }
 
     /**
-     * Shutdown of a serving reader (the JVM shutdown hook): announces {@code draining} at once (its
+     * How long a router needs to notice a draining reader: one {@code /health} poll interval plus
+     * the probe's timeout ({@code pharos router}: 2 s + 2 s).
+     */
+    public static final Duration ROUTER_NOTICE = Duration.ofSeconds(4);
+    /** In-flight requests must stay at 0 this long before a drain closes. */
+    static final Duration FINAL_QUIET = Duration.ofSeconds(1);
+
+    /**
+     * Shutdown of a serving reader (run first on a signal by {@link com.pharos.ShutdownSequence},
+     * and by the JVM shutdown hook as the fallback): announces {@code draining} at once (its
      * heartbeat, so coordinators stop routing shard calls to it, and {@code /health} 503, so the
-     * router and load balancers stop sending queries), waits up to {@code cluster.drainSeconds} for
-     * the in-flight requests to reach 0, then {@link #close}s. Any other node, or one not serving,
-     * closes at once. Idempotent.
+     * router and load balancers stop sending queries), then keeps serving: it stays up at least
+     * {@code max(}{@link #ROUTER_NOTICE}{@code , heartbeatSeconds)} so others can see the draining
+     * state, and until no request has been in flight for {@link #FINAL_QUIET}; everything is capped
+     * by {@code cluster.drainSeconds}. Requests arriving meanwhile are served. Then it
+     * {@link #close}s. Any other node, or one not serving, closes at once. Idempotent.
      */
     public void drainAndClose() {
         boolean serve;
@@ -249,13 +262,27 @@ public final class ClusterRuntime implements Closeable {
         }
         if (serve) {
             drain();
-            long max = config.getCluster().getDrainSeconds();
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(max);
-            int busy = inFlight.getAsInt();
-            if (busy > 0) {
-                log.info("Draining: waiting up to {} s for {} in-flight request(s)", max, busy);
-            }
-            while ((busy = inFlight.getAsInt()) > 0 && System.nanoTime() < deadline) {
+            ClusterConfig c = config.getCluster();
+            long start = System.nanoTime();
+            long max = TimeUnit.SECONDS.toNanos(c.getDrainSeconds());
+            long notice = Math.min(max, Math.max(ROUTER_NOTICE.toNanos(),
+                    TimeUnit.SECONDS.toNanos(c.getHeartbeatSeconds())));
+            long quiet = FINAL_QUIET.toNanos();
+            log.info("Draining: announced; stopping when no request has been in flight for {} ms, after at least"
+                    + " {} ms, at most {} s (cluster.drainSeconds)", FINAL_QUIET.toMillis(),
+                    TimeUnit.NANOSECONDS.toMillis(notice), c.getDrainSeconds());
+            long idleSince = -1;
+            int busy = 0;
+            while (true) {
+                long now = System.nanoTime();
+                busy = inFlight.getAsInt();
+                if (busy > 0) {
+                    idleSince = -1;
+                } else if (idleSince < 0) {
+                    idleSince = now;
+                }
+                if (now - start >= max) break;
+                if (now - start >= notice && idleSince >= 0 && now - idleSince >= quiet) break;
                 try {
                     Thread.sleep(25);
                 } catch (InterruptedException e) {
@@ -265,7 +292,7 @@ public final class ClusterRuntime implements Closeable {
             }
             if (busy > 0) {
                 log.warn("Draining: stopping after {} s with {} request(s) still in flight (cluster.drainSeconds)",
-                        max, busy);
+                        c.getDrainSeconds(), busy);
             } else {
                 log.info("Drained: no request in flight; stopping");
             }
@@ -463,6 +490,12 @@ public final class ClusterRuntime implements Closeable {
                 becomeFollower();
             }
             startMembership();
+        }
+        // On a signal the drain runs before any shutdown hook (ONNX Runtime's environment closer
+        // among them), while queries that call the models are still served.
+        AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("reader drain", this::drainAndClose);
+        synchronized (this) {
+            drainStep = step;
         }
         modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
     }
@@ -742,6 +775,7 @@ public final class ClusterRuntime implements Closeable {
         SyncLock lock;
         ScheduledExecutorService f;
         Thread first;
+        AutoCloseable step;
         com.pharos.cluster.membership.ReaderRegistry members;
         synchronized (this) {
             if (closed) return;
@@ -755,6 +789,15 @@ public final class ClusterRuntime implements Closeable {
             f = follower;
             follower = null;
             first = firstSyncThread;
+            step = drainStep;
+            drainStep = null;
+        }
+        if (step != null) {
+            try {
+                step.close();
+            } catch (Exception e) {
+                // removing from a list: cannot fail
+            }
         }
         if (members != null) members.close();
         com.pharos.search.distributed.DistributedSearch ds;
