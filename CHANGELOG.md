@@ -5,6 +5,43 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 ## [Unreleased]
 
+**Index format:** 1 (unchanged)
+
+### Added
+- Multi-node (experimental, README "Multi-node"): a `cluster` section in `config.json` with
+  `role` (`all` — the single-node default —, `writer`, `reader`) and `backend` (`local`,
+  `object-store`). Without it pharos behaves exactly as before.
+- Object-store backend for any S3-compatible store (`cluster.objectStore`: endpoint, region,
+  bucket, prefix, pathStyle, credentials from the variables named by `accessKeyEnv`/`secretKeyEnv`
+  or the AWS default chain, `readTimeoutSeconds`). A writer publishes each index run as an
+  immutable generation (content-named objects plus a manifest carrying the index format stamp)
+  and garbage-collects generations beyond `retentionGenerations` and older than `retentionMinutes`.
+  `pharos publish <project>` retries a failed upload; `index` exits 3 when publishing failed, and
+  `publish` exits 4 on an index it would not serve.
+- Readers poll the store (`pollIntervalSeconds`), sync into `cacheDir` and serve search and
+  call-graph queries; they refuse write commands (`index`, `link`, `embed`, `mine`,
+  `remove-index`, `backfill-embedding-cache`, `upgrade-indexes`) and never read source files. A
+  reader only swaps in generations whose index format it serves (N or N-1) and keeps serving its
+  current one otherwise. One process per `cacheDir` syncs; others follow it and take over.
+- Reader modes (`cluster.reader.mode`): `lazy` (default) downloads only the manifest, the graph
+  and the small Lucene files, and reads the rest in blocks through a size-capped local block cache
+  (`<cacheDir>/.blocks`) with prefetch of term dictionaries and vector graphs before a new
+  generation is swapped in; `full` copies every file. Keys under `cluster.reader`: `mode`,
+  `cacheMaxBytes` (8 GiB), `blockSizeBytes` (8 MiB, power of two 64 KiB–64 MiB), `eagerMaxBytes`
+  (1 MiB), `prefetchExtensions`, `prefetchTimeoutSeconds` (30), `maxConcurrentFetches` (16),
+  `privateCacheMaxBytes` (0 = derived). Size the cache dir with the README's disk formula.
+- `/health` on a reader: HTTP 503 `{"status":"warming"}` until its first sync and its search
+  models are ready (model warm-up runs in parallel with the first sync; a model that fails or
+  hangs for 5 minutes does not hold readiness), and HTTP 503 `{"status":"degraded","reason":…}`
+  while a served lazy generation has lost objects on the bucket (it lags beyond retention); 200
+  otherwise. Searches answered while warming carry a notice in `X-Pharos-Warnings`.
+- `readerCache` (`mode, cacheMaxBytes, bytesOnDisk, hits, misses, hitRate, bytesFetched,
+  evictions, leasesOpen, shared, source`) in `index-status --json` and `/health` on readers, and a
+  `reader cache: …` line in `index-status`.
+- A lazy reader held on an older generation by a refused newer one downloads the rest of it in
+  the background, so the bucket's GC can't strand it; switching a reader from lazy to full deletes
+  the unused block cache.
+
 ## [1.4.1] - 2026-11-16
 
 **Index format:** 1 (unchanged)
