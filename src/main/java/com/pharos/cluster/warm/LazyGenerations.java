@@ -668,6 +668,10 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      * volume) and after PID reuse. A staging dir ({@code .new}) is left alone for its first minute.
      */
     private void deleteStalePrivateDirs() {
+        deleteStalePrivateDirs(cacheDir);
+    }
+
+    private static void deleteStalePrivateDirs(Path cacheDir) {
         Path parent = cacheDir.resolve(PRIVATE_BLOCKS_DIR);
         if (!Files.isDirectory(parent)) return;
         try (Stream<Path> s = Files.list(parent)) {
@@ -691,6 +695,42 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             }
         } catch (IOException | RuntimeException e) {
             log.warn("Cleaning up private block caches in {} failed: {}", parent, e.toString());
+        }
+    }
+
+    /**
+     * For a full-mode reader: deletes what lazy mode left in {@code cacheDir} — the shared block cache
+     * {@value #BLOCKS_DIR} and the private ones nobody owns — when no process holds the block cache's
+     * lock (a lazy process on the same cache dir keeps it). A full-mode reader never reads them.
+     *
+     * @return true when the shared block cache was deleted
+     */
+    public static boolean deleteUnusedBlockCaches(Path cacheDir) {
+        Path dir = cacheDir.toAbsolutePath();
+        Path blocks = dir.resolve(BLOCKS_DIR);
+        if (!Files.exists(blocks) && !Files.exists(dir.resolve(PRIVATE_BLOCKS_DIR))) return false;
+        Optional<SyncLock> lock;
+        try {
+            lock = SyncLock.tryAcquire(dir, BLOCKS_LOCK);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Cannot check whether the block cache {} is in use; leaving it: {}", blocks, e.toString());
+            return false;
+        }
+        if (lock.isEmpty()) {
+            log.info("Full mode: the lazy-mode block cache {} is still used by another process; leaving it", blocks);
+            return false;
+        }
+        try {
+            deleteStalePrivateDirs(dir);
+            if (!Files.exists(blocks)) return false;
+            log.info("Full mode: deleting the lazy-mode block cache {} (no process uses it)", blocks);
+            deleteRecursively(blocks);
+            return true;
+        } catch (IOException | RuntimeException e) {
+            log.warn("Deleting the lazy-mode block cache {} failed: {}", blocks, e.toString());
+            return false;
+        } finally {
+            releaseQuietly(lock.get());
         }
     }
 

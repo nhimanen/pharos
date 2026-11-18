@@ -47,7 +47,8 @@ import java.util.regex.Pattern;
  * activated: lazy generation dirs open as remote directories over the block cache, every other dir
  * as before. A full-mode reader, and every other role, keeps the default factory and never builds a
  * Phase 2 class. A full-mode reader does not activate lazy generation dirs found on disk (the syncer
- * materialises them again).
+ * materialises them again), and its syncing process deletes the block cache lazy mode left in the
+ * cache dir when no process holds that cache's lock.
  *
  * <p>{@link #close} stops the syncer, releases the lock, closes the block cache and the backend
  * (object-store clients); it is idempotent. Shutdown order: close it only once nothing searches
@@ -313,7 +314,9 @@ public final class ClusterRuntime implements Closeable {
     // Holding the monitor of this.
     private void becomeOwner(SyncLock lock, ReaderLocalCache cache) {
         syncLock = lock;
-        if (lazy != null) {
+        if (lazy == null) {
+            LazyGenerations.deleteUnusedBlockCaches(cacheDir()); // left by lazy mode; full mode never reads it
+        } else {
             try {
                 lazy.blockCache(); // the prefetching process takes the shared block cache, not a private one
                 lazy.adoptSharedCache(); // a follower taking over starts on a private one

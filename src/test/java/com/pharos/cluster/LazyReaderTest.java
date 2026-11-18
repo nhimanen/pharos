@@ -795,6 +795,36 @@ class LazyReaderTest {
         }
     }
 
+    /**
+     * Final review M9: switching a reader from lazy to full leaves {@code <cacheDir>/.blocks}; the
+     * full-mode syncer deletes it on start, unless a process still holds the block cache's lock.
+     */
+    @Test
+    void fullModeSyncerDeletesTheUnusedLazyBlockCache() throws Exception {
+        publishWithoutCompoundFiles();
+        Node lazy = reader("to-full", r -> { small(r); r.setEagerMaxBytes(0); });
+        lazy.runtime().startServing();
+        assertThat(ids(lazy.engine(), "Calculator")).isNotEmpty();
+        Path cacheDir = lazy.config().getCluster().getCacheDir().toAbsolutePath();
+        Path blocks = cacheDir.resolve(LazyGenerations.BLOCKS_DIR);
+        assertThat(blocks).isDirectory();
+        lazy.close();
+
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        try (LazyGenerations holder = new LazyGenerations(cacheDir, rc, new ObjectStoreReplicaSource(store, layout))) {
+            holder.blockCache(); // another process still serves lazily from the shared block cache
+            Node busy = reader("to-full", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
+            busy.runtime().startServing();
+            assertThat(blocks).as("still locked by another process").isDirectory();
+            busy.close();
+        }
+        Node full = reader("to-full", r -> r.setMode(ClusterConfig.ReaderConfig.FULL));
+        full.runtime().startServing();
+        assertThat(blocks).as("nobody holds its lock: deleted").doesNotExist();
+        assertThat(ids(full.engine(), "Calculator")).isNotEmpty();
+    }
+
     /** Ranged reads (prefetch and block fetches) wait for {@code release}; whole-file downloads do not. */
     private static final class SlowRanges implements ReplicaSource {
         private final ReplicaSource d;
