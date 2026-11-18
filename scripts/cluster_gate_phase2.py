@@ -11,8 +11,10 @@ This script starts the reader JVMs itself, one configuration at a time, and stop
         trial's own, from 20 distinct lucene queries of eval/benchmark.py), then one vector query on
         pharos. Pass: lucene first-query p95 < 3 s (vector reported only). Start->ready is reported.
   warm  A lazy reader (warm cache) and a full-mode reader (MMap, production) run side by side; the
-        99 pharos+lucene benchmark queries (keyword) run 3 times per side, interleaved query by query. Pass: lazy
-        p95 <= 1.10 x full p95. Then top-10 checks, keyword on all 99 plus vector and hybrid on the
+        99 pharos+lucene benchmark queries (keyword) run GATE_WARM_RUNS times per side (default 3),
+        interleaved query by query. With 5 or more runs (decision of 2026-11-18) the check is on the
+        median of the per-run p95 ratios lazy/full: median <= 1.10 and the upper end of its bootstrap
+        95% CI <= 1.15; with fewer, on the pooled p95 ratio (<= 1.10). Then top-10 checks, keyword on all 99 plus vector and hybrid on the
         pharos queries: against the production full copy (default MMapDirectory) every result (ids,
         order, score bits, stored fields) is identical; against the same copy re-opened with
         NIOFSDirectory (-Dpharos.lucene.directory=niofs), non-vector results are identical and
@@ -50,6 +52,7 @@ import cluster_gate  # noqa: E402  (Phase 1 helpers: load_queries)
 
 COLD_P95_LIMIT_S = 3.0
 WARM_RATIO_LIMIT = 1.10
+WARM_CI_UPPER_LIMIT = 1.15
 ULP_TOL = 4
 REL_TOL = 1e-6
 DEFAULT_BLOCK = 8 << 20
@@ -91,6 +94,21 @@ def near(a, b):
     if a == b:
         return True
     return ulps(a, b) <= ULP_TOL or abs(a - b) <= REL_TOL * max(abs(a), abs(b))
+
+
+def median(values):
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def median_ci(values, resamples=10000, seed=12345):
+    """(median, low, high): the median and its percentile-bootstrap 95% CI (fixed seed: reproducible)."""
+    import random
+    rnd = random.Random(seed)
+    n = len(values)
+    meds = sorted(median([values[rnd.randrange(n)] for _ in range(n)]) for _ in range(resamples))
+    return median(values), meds[int(0.025 * resamples)], meds[int(0.975 * resamples) - 1]
 
 
 def cache_cap(lucene_bytes, block=DEFAULT_BLOCK, min_block=64 << 10):
@@ -242,6 +260,7 @@ class Reader:
                "-Duser.home=" + str(self.home), "-Dpharos.home=" + str(self.ph)]
         if self.niofs:
             cmd.append("-Dpharos.lucene.directory=niofs")
+        cmd += os.environ.get("GATE_READER_JVM_OPTS", "").split()
         return cmd + ["-jar", os.environ["GATE_JAR"], "web", "--port", str(self.port), "--no-open"]
 
     def start(self, tag=""):
@@ -457,31 +476,58 @@ def phase_warm():
         run_all(lazy, qs)  # warm the block cache (and both JVMs)
         run_all(full, qs)
         out["lazy_after_warmup"] = health(lazy.base).get("readerCache")
-        # 3 runs per side, interleaved query by query (the side that goes first alternates), so
-        # load from other processes on a shared host lands on both sides alike.
+        # WARM_RUNS runs per side, interleaved query by query (the side that goes first alternates),
+        # so load from other processes on a shared host lands on both sides alike.
+        runs = int(os.environ.get("GATE_WARM_RUNS", "3"))
         timed = {"lazy": {}, "full": {}}
+        per_run = []
         sides = {"lazy": lazy, "full": full}
-        for run in range(3):
+        for run in range(runs):
             res = {"lazy": {}, "full": {}}
+            kw = {"lazy": [], "full": []}
             for i, (q, p, pl) in enumerate(qs):
                 order = ("lazy", "full") if (run + i) % 2 == 0 else ("full", "lazy")
                 for side in order:
                     dt, r = search(sides[side].base, q, p, pl)
                     timed[side].setdefault(pl, []).append(dt)
+                    if pl == "keyword":
+                        kw[side].append(dt)
                     res[side][f"{pl}|{p}|{q}"] = r
-            if run == 2:
+            ls, fs_ = summary(kw["lazy"]), summary(kw["full"])
+            per_run.append({"run": run + 1, "lazy_p50": ls["p50"], "lazy_p95": ls["p95"], "full_p50": fs_["p50"],
+                            "full_p95": fs_["p95"], "ratio_p50": ls["p50"] / fs_["p50"],
+                            "ratio_p95": ls["p95"] / fs_["p95"]})
+            pr = per_run[-1]
+            print(f"   run {run + 1}: keyword p50 {pr['lazy_p50'] * 1000:.1f}/{pr['full_p50'] * 1000:.1f} ms"
+                  f" (ratio {pr['ratio_p50']:.3f}), p95 {pr['lazy_p95'] * 1000:.1f}/{pr['full_p95'] * 1000:.1f} ms"
+                  f" (ratio {pr['ratio_p95']:.3f})")
+            if run == runs - 1:
                 lazy_res, full_res = res["lazy"], res["full"]
                 (gate / "ref-full-mmap.json").write_text(json.dumps(full_res))
                 (gate / "ref-lazy.json").write_text(json.dumps(lazy_res))
+        out["per_run"] = per_run
         out["lazy_cache"] = health(lazy.base).get("readerCache")
         out["timings"] = {s: {pl: summary(v) for pl, v in d.items()} for s, d in timed.items()}
         lk, fk = out["timings"]["lazy"]["keyword"], out["timings"]["full"]["keyword"]
         ratio = lk["p95"] / fk["p95"]
         out["ratio_keyword_p95"] = ratio
-        warm_ok = ratio <= WARM_RATIO_LIMIT
-        print(f"WARM keyword p95 lazy {lk['p95'] * 1000:.1f} ms vs full {fk['p95'] * 1000:.1f} ms"
-              f" (n={lk['n']} each; p50 {lk['p50'] * 1000:.1f} vs {fk['p50'] * 1000:.1f}) ratio {ratio:.3f}"
-              f" limit <= {WARM_RATIO_LIMIT} -> {'PASS' if warm_ok else 'FAIL'}")
+        print(f"WARM pooled keyword p95 lazy {lk['p95'] * 1000:.1f} ms vs full {fk['p95'] * 1000:.1f} ms"
+              f" (n={lk['n']} each; p50 {lk['p50'] * 1000:.1f} vs {fk['p50'] * 1000:.1f}) ratio {ratio:.3f}")
+        if runs >= 5:
+            # Decision of 2026-11-18: judge on the median per-run p95 ratio and its bootstrap CI.
+            r95 = [r["ratio_p95"] for r in per_run]
+            r50 = [r["ratio_p50"] for r in per_run]
+            med95, lo95, hi95 = median_ci(r95)
+            med50, lo50, hi50 = median_ci(r50)
+            out["median_ratio_p95"], out["ci95_ratio_p95"] = med95, [lo95, hi95]
+            out["median_ratio_p50"], out["ci95_ratio_p50"] = med50, [lo50, hi50]
+            warm_ok = med95 <= WARM_RATIO_LIMIT and hi95 <= WARM_CI_UPPER_LIMIT
+            print(f"WARM median per-run p95 ratio {med95:.3f} (bootstrap 95% CI {lo95:.3f}-{hi95:.3f}, {runs} runs)"
+                  f" limit median <= {WARM_RATIO_LIMIT} and CI upper <= {WARM_CI_UPPER_LIMIT}"
+                  f" -> {'PASS' if warm_ok else 'FAIL'}; median p50 ratio {med50:.3f} (CI {lo50:.3f}-{hi50:.3f})")
+        else:
+            warm_ok = ratio <= WARM_RATIO_LIMIT
+            print(f"WARM keyword p95 ratio {ratio:.3f} limit <= {WARM_RATIO_LIMIT} -> {'PASS' if warm_ok else 'FAIL'}")
         for pl in ("vector", "hybrid"):
             lv, fv = out["timings"]["lazy"][pl], out["timings"]["full"][pl]
             print(f"   {pl} p95 lazy {lv['p95'] * 1000:.1f} ms vs full {fv['p95'] * 1000:.1f} ms (not gated)")
@@ -601,6 +647,11 @@ def self_test():
     assert near(1000.0, 1000.0005) and not near(1000.0, 1000.01)
     assert cache_cap(55_601_636) == (24 << 20, 4 << 20), cache_cap(55_601_636)
     assert cache_cap(200 << 20) == (96 << 20, 8 << 20)
+    assert median([3, 1, 2]) == 2 and median([4, 1, 3, 2]) == 2.5
+    m, lo, hi = median_ci([1.0] * 10)
+    assert (m, lo, hi) == (1.0, 1.0, 1.0)
+    m, lo, hi = median_ci([0.9, 1.0, 1.0, 1.05, 1.1, 0.95, 1.02, 0.98, 1.2, 1.01])
+    assert abs(m - 1.005) < 1e-12 and lo <= m <= hi and 0.9 <= lo and hi <= 1.2, (m, lo, hi)
     assert cache_cap(2 * (32 << 20)) == (32 << 20, 8 << 20)
 
     def r(i, s, **kw):

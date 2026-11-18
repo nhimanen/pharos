@@ -25,10 +25,13 @@
 #   GATE_REUSE_INDEX=1 skip indexing when $GATE already holds a published bucket (re-runs)
 #   GATE_PHASES        python driver phases (default "cold,warm,cap"; diagnostics: cold-models, cold-full)
 #   GATE_TRIALS        cold trials (default 20)
+#   GATE_JAR           pharos jar to run (default target/pharos-*.jar; a copy lets you rebuild meanwhile)
+#   GATE_WARM_RUNS     timed warm runs per side (default 3)
+#   GATE_READER_JVM_OPTS  extra JVM options for the reader JVMs (e.g. JFR flags)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
@@ -50,7 +53,7 @@ MODEL_DIR_NAME="$(echo "${MODEL_URL#hf://}" | tr '/' '-')"
 MODEL_ID="${GATE_MODEL_ID:-jina-code-v2}"
 PHASES="${GATE_PHASES:-cold,warm,cap}"
 TRIALS="${GATE_TRIALS:-20}"
-JAR="$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)"
+JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
 
 if (( DRY )); then
   cat <<PLAN
