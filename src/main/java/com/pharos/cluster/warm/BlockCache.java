@@ -102,6 +102,11 @@ public final class BlockCache implements Closeable {
     /** A hit rewrites the block's mtime (the LRU order seen by the next start) at most this often. */
     private static final long TOUCH_GRANULARITY_MILLIS = 1_000;
     static final String BLOCK_SIZE_MARKER = "block-size";
+    /**
+     * The owner's liveness lock a cache dir may hold (a reader's private cache): the startup scan
+     * counts a dir whose only entry it is as empty, and never touches it.
+     */
+    public static final String OWNER_LOCK = "owner.lock";
     private static final Pattern PREFIX = Pattern.compile("[0-9a-f]{2}");
     private static final Pattern HASH = Pattern.compile("[0-9a-f]{64}");
     private static final Pattern BLOCK_NAME = Pattern.compile("(0|[1-9][0-9]{0,17})\\.blk");
@@ -887,7 +892,7 @@ public final class BlockCache implements Closeable {
         String want = Integer.toString(blockSize);
         if (!Files.exists(marker)) {
             try (Stream<Path> s = Files.list(dir)) {
-                if (s.findAny().isPresent()) {
+                if (s.anyMatch(p -> !p.getFileName().toString().equals(OWNER_LOCK))) {
                     throw new IOException("block cache dir " + dir + " is not empty but has no " + BLOCK_SIZE_MARKER
                             + " marker; refusing to use it (point the cache at an empty or dedicated dir)");
                 }

@@ -28,7 +28,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -48,8 +47,9 @@ import java.util.stream.Stream;
  * process holding the {@value #BLOCKS_LOCK} lock on the cache dir. Another process on the same cache
  * dir (a follower, a one-shot command) gets a private cache at
  * {@code <cacheDir>/}{@value #PRIVATE_BLOCKS_DIR}{@code /<pid>-<random>}, capped at
- * {@code effectivePrivateCacheMaxBytes} and deleted when it closes; the lock holder deletes private
- * dirs of processes that are gone at startup and on every {@link #sweep}. The syncing reader takes
+ * {@code effectivePrivateCacheMaxBytes} and deleted when it closes. Its owner holds the file lock
+ * {@value #PRIVATE_OWNER_LOCK} inside it for its lifetime; the shared cache's holder deletes, at
+ * startup and on every {@link #sweep}, the private dirs whose lock it can take (their owner is gone). The syncing reader takes
  * the shared cache as soon as it starts syncing ({@code ClusterRuntime}), so the process that
  * prefetches always fills the shared cache, and a process that began on a private cache moves to the
  * shared one ({@link #adoptSharedCache}) once its lock is free (the private one stays open until close).
@@ -65,8 +65,14 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     public static final String BLOCKS_DIR = ".blocks";
     public static final String PRIVATE_BLOCKS_DIR = ".blocks-private";
     static final String BLOCKS_LOCK = ".blocks.lock";
+    /** Held by the process that owns a private block cache, inside its dir, for the cache's lifetime. */
+    public static final String PRIVATE_OWNER_LOCK = BlockCache.OWNER_LOCK;
     private static final String MANIFEST_FILE = "manifest.json";
-    private static final Pattern PRIVATE_NAME = Pattern.compile("(\\d{1,19})-[0-9a-f]{8}");
+    private static final Pattern PRIVATE_NAME = Pattern.compile("\\d{1,19}-[0-9a-f]{8}");
+    /** A private cache dir being created; its lock is taken before it gets its final name. */
+    private static final String STAGING_SUFFIX = ".new";
+    /** A staging dir older than this whose lock is free was left by a crash. */
+    private static final long STAGING_GRACE_MILLIS = 60_000;
     private static final int MANIFEST_CACHE_SIZE = 64;
 
     private final Path cacheDir;
@@ -102,9 +108,12 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     private BlockCache blockCache;
     private SyncLock blocksLock;
     private Path privateDir;
+    /** The lock this process holds inside {@link #privateDir}: the dir's proof of life. */
+    private SyncLock privateOwner;
     /** Private caches this process left for the shared one: retired readers may still use them. */
     private final List<BlockCache> retiredCaches = new ArrayList<>();
     private final List<Path> retiredDirs = new ArrayList<>();
+    private final List<SyncLock> retiredOwners = new ArrayList<>();
     private boolean closed;
 
     public LazyGenerations(Path cacheDir, ClusterConfig.ReaderConfig config, ReplicaSource source) {
@@ -493,12 +502,15 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         if (blockCache != null) return blockCache;
         Optional<SyncLock> lock = SyncLock.tryAcquire(cacheDir, BLOCKS_LOCK);
         Path dir;
+        SyncLock owner = null;
         if (lock.isPresent()) {
             dir = cacheDir.resolve(BLOCKS_DIR);
             deleteStalePrivateDirs();
         } else {
             Path parent = Files.createDirectories(cacheDir.resolve(PRIVATE_BLOCKS_DIR));
-            dir = parent.resolve(ProcessHandle.current().pid() + "-" + UUID.randomUUID().toString().substring(0, 8));
+            String name = ProcessHandle.current().pid() + "-" + UUID.randomUUID().toString().substring(0, 8);
+            dir = parent.resolve(name);
+            owner = lockedPrivateDir(parent, name);
             log.info("Another process uses the block cache {}; using the private block cache {} until this one exits",
                     cacheDir.resolve(BLOCKS_DIR), dir);
         }
@@ -508,11 +520,35 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
                     config.getMaxConcurrentFetches(), fetchTimeout);
         } catch (IOException | RuntimeException e) {
             if (lock.isPresent()) lock.get().close();
+            if (owner != null) {
+                deleteRecursively(dir);
+                owner.close();
+            }
             throw e;
         }
         blocksLock = lock.orElse(null);
         privateDir = lock.isPresent() ? null : dir;
+        privateOwner = owner;
         return blockCache;
+    }
+
+    /**
+     * Creates the private cache dir {@code <parent>/<name>} holding its {@link #PRIVATE_OWNER_LOCK}:
+     * the dir is made and locked under a staging name ({@code <name>.new}) and then renamed, so a
+     * sweeper never sees the final name without a held lock (an OS file lock follows the file).
+     */
+    private static SyncLock lockedPrivateDir(Path parent, String name) throws IOException {
+        Path staging = parent.resolve(name + STAGING_SUFFIX);
+        SyncLock owner = SyncLock.tryAcquire(staging, PRIVATE_OWNER_LOCK)
+                .orElseThrow(() -> new IOException("cannot lock the new private block cache " + staging));
+        try {
+            Files.move(staging, parent.resolve(name), java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException e) {
+            owner.close();
+            deleteRecursively(staging);
+            throw e;
+        }
+        return owner;
     }
 
     /** The block cache's dir; null before its first use. */
@@ -576,9 +612,11 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             retiring = blockCache;
             retiredCaches.add(retiring);
             retiredDirs.add(privateDir);
+            if (privateOwner != null) retiredOwners.add(privateOwner);
             blockCache = shared;
             blocksLock = lock;
             privateDir = null;
+            privateOwner = null;
         }
         // Prefetches still queued on the private cache would only fill a cache no new open reads.
         List<BlockKey> queued = new ArrayList<>();
@@ -623,19 +661,33 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return blockCache == null ? config.getCacheMaxBytes() : blockCache.maxBytes();
     }
 
-    /** Private block caches of processes that no longer run. */
+    /**
+     * Deletes the private block caches nobody owns: a dir under {@value #PRIVATE_BLOCKS_DIR} whose
+     * {@link #PRIVATE_OWNER_LOCK} this process can take (its owner is gone: the OS released the lock),
+     * or that has none. PIDs are not consulted: they lie across PID namespaces (sidecars sharing a
+     * volume) and after PID reuse. A staging dir ({@code .new}) is left alone for its first minute.
+     */
     private void deleteStalePrivateDirs() {
         Path parent = cacheDir.resolve(PRIVATE_BLOCKS_DIR);
         if (!Files.isDirectory(parent)) return;
-        long self = ProcessHandle.current().pid();
         try (Stream<Path> s = Files.list(parent)) {
             for (Path p : s.toList()) {
-                Matcher m = PRIVATE_NAME.matcher(p.getFileName().toString());
-                if (!m.matches()) continue;
-                long pid = Long.parseLong(m.group(1));
-                if (pid == self || ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)) continue;
-                log.info("Deleting the private block cache {} of a process that is gone", p);
-                deleteRecursively(p);
+                String name = p.getFileName().toString();
+                boolean staging = name.endsWith(STAGING_SUFFIX);
+                String base = staging ? name.substring(0, name.length() - STAGING_SUFFIX.length()) : name;
+                if (!PRIVATE_NAME.matcher(base).matches() || !Files.isDirectory(p)) continue;
+                if (staging && System.currentTimeMillis() - Files.getLastModifiedTime(p).toMillis()
+                        < STAGING_GRACE_MILLIS) {
+                    continue;
+                }
+                Optional<SyncLock> owner = SyncLock.tryAcquire(p, PRIVATE_OWNER_LOCK);
+                if (owner.isEmpty()) continue; // held: its owner runs (in whatever PID namespace)
+                try {
+                    log.info("Deleting the private block cache {}: no process holds its lock", p);
+                    deleteRecursively(p);
+                } finally {
+                    releaseQuietly(owner.get());
+                }
             }
         } catch (IOException | RuntimeException e) {
             log.warn("Cleaning up private block caches in {} failed: {}", parent, e.toString());
@@ -658,6 +710,9 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
                 log.warn("Deleting the private block cache {} failed: {}", d, e.toString());
             }
         }
+        List<SyncLock> owners = new ArrayList<>(retiredOwners);
+        if (privateOwner != null) owners.add(privateOwner);
+        owners.forEach(LazyGenerations::releaseQuietly); // after the delete: a sweeper never races it
         if (blocksLock != null) {
             try {
                 blocksLock.close();

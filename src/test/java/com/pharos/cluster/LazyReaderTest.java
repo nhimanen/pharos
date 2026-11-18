@@ -657,10 +657,50 @@ class LazyReaderTest {
         Path alive = cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR)
                 .resolve(ProcessHandle.current().pid() + "-4567cdef");
         Files.createDirectories(stale.resolve("ab"));
-        Files.createDirectories(alive);
-        node.runtime().syncNow();
-        assertThat(stale).doesNotExist();
-        assertThat(alive).isDirectory();
+        try (SyncLock owner = SyncLock.tryAcquire(alive, LazyGenerations.PRIVATE_OWNER_LOCK).orElseThrow()) {
+            node.runtime().syncNow();
+            assertThat(stale).doesNotExist();
+            assertThat(alive).isDirectory();
+        }
+    }
+
+    /**
+     * Final review M3: a private cache is stale when nobody holds the lock inside it, whatever its
+     * PID says (PIDs of another PID namespace look dead here; a reused PID looks alive).
+     */
+    @Test
+    void stalePrivateCachesAreFoundByTheirLockNotTheirPid() throws Exception {
+        ClusterConfig.ReaderConfig rc = new ClusterConfig.ReaderConfig();
+        small(rc);
+        Path cacheDir = tmp.resolve("locks-cache").toAbsolutePath();
+        Path privates = cacheDir.resolve(LazyGenerations.PRIVATE_BLOCKS_DIR);
+        ReplicaSource source = new ObjectStoreReplicaSource(store, layout);
+        Process gone = new ProcessBuilder("true").start();
+        gone.waitFor();
+        try (LazyGenerations owner = new LazyGenerations(cacheDir, rc, source);
+             LazyGenerations second = new LazyGenerations(cacheDir, rc, source)) {
+            owner.blockCache();
+            second.blockCache(); // a real private cache of a live holder
+            Path secondDir = second.blockCacheDir();
+            assertThat(secondDir.resolve(LazyGenerations.PRIVATE_OWNER_LOCK)).isRegularFile();
+            // a holder in another PID namespace: its PID is dead here, but it holds its lock
+            Path otherNamespace = privates.resolve(gone.pid() + "-11111111");
+            // a crashed holder whose PID was reused by a live process: nobody holds its lock
+            Path reusedPid = privates.resolve(ProcessHandle.current().pid() + "-22222222");
+            SyncLock released = SyncLock.tryAcquire(reusedPid, LazyGenerations.PRIVATE_OWNER_LOCK).orElseThrow();
+            released.close();
+            Files.createDirectories(reusedPid.resolve("ab"));
+            try (SyncLock held = SyncLock.tryAcquire(otherNamespace, LazyGenerations.PRIVATE_OWNER_LOCK)
+                    .orElseThrow()) {
+                owner.sweep();
+                assertThat(reusedPid).as("released lock: stale").doesNotExist();
+                assertThat(otherNamespace).as("held lock: alive").isDirectory();
+                assertThat(secondDir).as("held by a live LazyGenerations").isDirectory();
+            }
+            owner.sweep();
+            assertThat(otherNamespace).as("released now").doesNotExist();
+            assertThat(secondDir).isDirectory();
+        }
     }
 
     /** Switching a reader from lazy to full re-materialises the generation instead of serving a stub. */
