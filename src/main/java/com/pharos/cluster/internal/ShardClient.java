@@ -292,45 +292,6 @@ public final class ShardClient {
         }
     }
 
-    /**
-     * Collects a response body up to {@code cap} bytes and then stops reading (the caller rejects
-     * a body that reached the cap), so a runaway reader cannot fill the heap.
-     */
-    private static final class CappedBody implements HttpResponse.BodySubscriber<byte[]> {
-        private final int cap;
-        private final java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        private final java.util.concurrent.CompletableFuture<byte[]> result = new java.util.concurrent.CompletableFuture<>();
-        private java.util.concurrent.Flow.Subscription subscription;
-
-        CappedBody(int cap) { this.cap = cap; }
-
-        @Override public java.util.concurrent.CompletionStage<byte[]> getBody() { return result; }
-
-        @Override public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
-            subscription = s;
-            s.request(Long.MAX_VALUE);
-        }
-
-        @Override public void onNext(List<java.nio.ByteBuffer> items) {
-            if (result.isDone()) return;
-            for (java.nio.ByteBuffer b : items) {
-                int n = Math.min(b.remaining(), cap - out.size());
-                byte[] chunk = new byte[n];
-                b.get(chunk);
-                out.write(chunk, 0, n);
-                if (out.size() >= cap) {
-                    subscription.cancel();
-                    result.complete(out.toByteArray());
-                    return;
-                }
-            }
-        }
-
-        @Override public void onError(Throwable t) { result.completeExceptionally(t); }
-
-        @Override public void onComplete() { result.complete(out.toByteArray()); }
-    }
-
     private long servedGeneration(byte[] body) {
         try {
             JsonNode n = mapper.readTree(body);

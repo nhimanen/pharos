@@ -66,7 +66,7 @@ public class RouterCommand implements Callable<Integer> {
 
     /** How often each live reader's {@code /health} is polled. */
     static final Duration POLL_EVERY = Duration.ofSeconds(2);
-    /** The longest a forwarded request waits for its response headers. */
+    /** The longest a forwarded exchange takes, response headers and (capped) body read together; past it: 504. */
     static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(120);
 
     private final IndexConfig config;
@@ -295,6 +295,10 @@ public class RouterCommand implements Callable<Integer> {
                     healthy.remove(target.getKey(), target.getValue()); // until a poll finds it healthy again
                     log.info("Router: reader {} is unreachable ({}); skipping it until it answers /health",
                             target.getKey(), e.toString());
+                } catch (ExchangeTimeout | java.net.http.HttpTimeoutException e) { // sent, maybe running: not resent
+                    log.info("Router: {} {} on reader {}: {}", method, rawPath, target.getKey(), e.getMessage());
+                    ctx.status(504).json(Map.of("error", "the reader did not answer in time: " + e.getMessage()));
+                    return;
                 } catch (IOException e) {
                     answer = null;
                     failure = e;
@@ -362,27 +366,33 @@ public class RouterCommand implements Callable<Integer> {
             String client = ctx.req().getRemoteAddr();
             b.header("X-Forwarded-For", forwardedFor == null || forwardedFor.isBlank() ? client
                     : forwardedFor + ", " + client);
-            HttpResponse<java.io.InputStream> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofInputStream());
             long cap = maxResponseBytes;
-            try (java.io.InputStream in = resp.body()) {
-                long declared = resp.headers().firstValueAsLong("content-length").orElse(-1);
-                if (declared > cap) return null;
-                byte[] data = in.readNBytes((int) Math.min(Integer.MAX_VALUE - 8, cap + 1));
-                if (data.length > cap) return null;
-                return new BodyResponse(resp, data);
+            int wanted = (int) Math.min(Integer.MAX_VALUE - 8, cap + 1);
+            // The JDK's request timeout ends once the headers arrive: the whole exchange, the capped
+            // body read included, is bounded here by requestTimeout (as in ShardClient).
+            java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> pending = http.sendAsync(b.build(),
+                    info -> new com.pharos.cluster.internal.CappedBody(
+                            info.headers().firstValueAsLong("content-length").orElse(-1) > cap ? 0 : wanted));
+            HttpResponse<byte[]> resp;
+            try {
+                resp = pending.get(requestTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                pending.cancel(true);
+                throw new ExchangeTimeout("no complete answer within " + requestTimeout.toMillis() + " ms");
+            } catch (java.util.concurrent.ExecutionException e) {
+                Throwable c = e.getCause();
+                if (c instanceof IOException io) throw io;
+                if (c instanceof IllegalArgumentException iae) throw iae;
+                throw new IOException(String.valueOf(c), c);
             }
+            long declared = resp.headers().firstValueAsLong("content-length").orElse(-1);
+            if (declared > cap || resp.body().length > cap) return null;
+            return resp;
         }
 
-        /** A response whose body was read (and bounded) here. */
-        private record BodyResponse(HttpResponse<java.io.InputStream> head, byte[] body)
-                implements HttpResponse<byte[]> {
-            @Override public int statusCode() { return head.statusCode(); }
-            @Override public HttpRequest request() { return head.request(); }
-            @Override public java.util.Optional<HttpResponse<byte[]>> previousResponse() { return java.util.Optional.empty(); }
-            @Override public java.net.http.HttpHeaders headers() { return head.headers(); }
-            @Override public java.util.Optional<javax.net.ssl.SSLSession> sslSession() { return head.sslSession(); }
-            @Override public URI uri() { return head.uri(); }
-            @Override public HttpClient.Version version() { return head.version(); }
+        /** The forwarded exchange (headers and body) did not complete within the request timeout. */
+        static final class ExchangeTimeout extends IOException {
+            ExchangeTimeout(String message) { super(message); }
         }
 
         @Override

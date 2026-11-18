@@ -36,11 +36,18 @@ class RouterCommandTest {
         final List<String> bodies = new CopyOnWriteArrayList<>();
         final List<Map<String, List<String>>> headers = new CopyOnWriteArrayList<>();
         final AtomicInteger healthCalls = new AtomicInteger();
+        /** Paths whose answer sends its headers and one body byte, then stalls this long before finishing. */
+        final Map<String, Integer> stallBodyMillis = new ConcurrentHashMap<>();
 
         FakeReader(String name) throws IOException {
+            this(name, null);
+        }
+
+        FakeReader(String name, java.util.concurrent.Executor executor) throws IOException {
             this.name = name;
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
             server.createContext("/", this::handle);
+            if (executor != null) server.setExecutor(executor);
             server.start();
         }
 
@@ -62,6 +69,24 @@ class RouterCommandTest {
                 out = name;
             }
             byte[] bytes = out.getBytes(StandardCharsets.UTF_8);
+            Integer stall = stallBodyMillis.get(path);
+            if (stall != null) { // chunked: headers now, the rest of the body much later
+                ex.sendResponseHeaders(status, 0);
+                ex.getResponseBody().write('x');
+                ex.getResponseBody().flush();
+                try {
+                    Thread.sleep(stall);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                try {
+                    ex.getResponseBody().write(bytes);
+                } catch (IOException gone) {
+                    // the router gave up on the exchange
+                }
+                ex.close();
+                return;
+            }
             ex.getResponseHeaders().add("Content-Type", "text/plain");
             ex.getResponseHeaders().add("X-Pharos-Warnings", "[\"from " + name + "\"]");
             ex.sendResponseHeaders(status, bytes.length);
@@ -346,5 +371,31 @@ class RouterCommandTest {
         HttpResponse<String> over = get(capped, "/api/projects");
         assertThat(over.statusCode()).as("an answer over the cap").isEqualTo(502);
         assertThat(over.body()).contains("exceeds");
+    }
+
+    /** Carried minor: the forwarded exchange has one total deadline, the body read included (as ShardClient). */
+    @Test
+    void routerBoundsTheWholeExchangeIncludingABodyThatStalls() throws Exception {
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newCachedThreadPool();
+        open.add(pool::shutdownNow);
+        FakeReader a = new FakeReader("a", pool);
+        open.add(a);
+        a.stallBodyMillis.put("/api/slow", 5_000);
+        RouterCommand.Router router = new RouterCommand.Router(() -> List.of(a.heartbeat()), Duration.ofHours(1),
+                Duration.ofMillis(500), Duration.ofMillis(800));
+        open.add(router);
+        router.start(0);
+        router.pollNow();
+
+        long t0 = System.nanoTime();
+        HttpResponse<String> slow = get(router, "/api/slow");
+        long tookMs = (System.nanoTime() - t0) / 1_000_000;
+        assertThat(slow.statusCode()).as(slow.body()).isEqualTo(504);
+        assertThat(tookMs).as("headers arrived at once; the stalled body is cut at the deadline").isLessThan(3_000);
+        assertThat(a.count("GET /api/slow")).as("a request that may have run is not resent").isEqualTo(1);
+
+        HttpResponse<String> fast = get(router, "/api/projects");
+        assertThat(fast.statusCode()).isEqualTo(200);
+        assertThat(fast.body()).isEqualTo("a");
     }
 }

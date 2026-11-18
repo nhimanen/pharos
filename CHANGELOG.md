@@ -41,11 +41,13 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   coordinators skip a reader only for its degraded shards.
 - Draining: on SIGTERM a serving reader announces `draining` (heartbeat and `/health` 503), keeps
   serving for a quiet period (at least 4 s and one heartbeat, and until nothing has been in flight
-  for 1 s) and stops after at most `cluster.drainSeconds` (default 20).
+  for 1 s) and stops after at most `cluster.drainSeconds` (default 20). Give the process manager
+  a stop timeout above `drainSeconds` + 15 s (Kubernetes `terminationGracePeriodSeconds`, e.g. 45).
 
 - `pharos router --port <p>` (`./pharos router`): a stateless router over the healthy readers
   (`/health` polled every 2 s, round-robin, one retry of idempotent requests on another reader,
-  `/internal/*` never forwarded). Needs the object-store config and `cluster.token`, no index.
+  `/internal/*` never forwarded; 504 when a forwarded exchange, body included, exceeds 120 s).
+  Needs the object-store config and `cluster.token`, no index.
 - `readerCache` (`mode, cacheMaxBytes, bytesOnDisk, hits, misses, hitRate, bytesFetched,
   evictions, leasesOpen, shared, source`) in `index-status --json` and `/health` on readers, and a
   `reader cache: …` line in `index-status`.
