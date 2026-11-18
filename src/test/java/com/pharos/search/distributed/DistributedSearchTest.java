@@ -71,12 +71,16 @@ class DistributedSearchTest {
         ParityCorpus.unzip(ParityCorpus.PHAROS_CORPUS, pharosRoot);
         cluster.indexSource(pharosRoot, PHAROS);
         cluster.index(JAVA, false);
-        a = new TestReaderNode(shared.resolve("a"), store, BUCKET, "a", List.of(PHAROS), EMBEDDER, null);
-        b = new TestReaderNode(shared.resolve("b"), store, BUCKET, "b", List.of(JAVA), EMBEDDER, null);
+        cluster.indexSource(skewSource(shared.resolve("skew-a"), 100, 5, 1), SKEW_A);
+        cluster.indexSource(skewSource(shared.resolve("skew-b"), 1, 5, 4), SKEW_B);
+        a = new TestReaderNode(shared.resolve("a"), store, BUCKET, "a", List.of(PHAROS, SKEW_A), EMBEDDER, null);
+        b = new TestReaderNode(shared.resolve("b"), store, BUCKET, "b", List.of(JAVA, SKEW_B), EMBEDDER, null);
         all = new TestReaderNode(shared.resolve("all"), store, BUCKET, "all", List.of(), EMBEDDER, null);
         for (TestReaderNode n : List.of(a, b, all)) {
             n.awaitShard(PHAROS, 2);
             n.awaitShard(JAVA, 2);
+            n.awaitShard(SKEW_A, 2);
+            n.awaitShard(SKEW_B, 2);
         }
         assertThat(a.parts.runtime().servesShard(PHAROS)).isTrue();
         assertThat(a.parts.runtime().servesShard(JAVA)).isFalse();
@@ -92,6 +96,32 @@ class DistributedSearchTest {
                 s.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
             }
         }
+    }
+
+    static final String SKEW_A = "skew-a";
+    static final String SKEW_B = "skew-b";
+    static final String RARE = "zebrafinch";
+
+    /**
+     * A project of {@code classes} × {@code methods} methods (plus class documents); {@code withRare}
+     * of the methods mention {@value #RARE}, every one mentions {@code quokka}. skew-a: ~500 documents,
+     * the rare term in one; skew-b: 5 methods, the rare term in 4 — shard-local statistics then rank
+     * the two shards' rare-term hits very differently from a single node.
+     */
+    static Path skewSource(Path root, int classes, int methods, int withRare) throws Exception {
+        Path pkg = Files.createDirectories(root.resolve("src/main/java/skew"));
+        int rare = 0;
+        String prefix = root.getFileName().toString().replace("-", "");
+        for (int c = 0; c < classes; c++) {
+            StringBuilder sb = new StringBuilder("package skew;\n\npublic class " + prefix + "C" + c + " {\n");
+            for (int m = 0; m < methods; m++) {
+                String word = rare++ < withRare ? RARE + " quokka" : "quokka plain";
+                sb.append("    public String m").append(m).append("() { return \"").append(word)
+                        .append(" value ").append(c).append(' ').append(m).append("\"; }\n");
+            }
+            Files.writeString(pkg.resolve(prefix + "C" + c + ".java"), sb.append("}\n").toString());
+        }
+        return root;
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -180,12 +210,25 @@ class DistributedSearchTest {
 
     // ── tests ────────────────────────────────────────────────────────────────
 
+    static SearchResponse search(TestReaderNode node, String q, SearchType type, String project, int limit,
+                                 boolean expand) throws Exception {
+        return node.engine.searchWithTrace(new SearchRequest(q, type, project, null, limit, "text", null, null, 0),
+                expand);
+    }
+
+    static double jaccard(List<String> x, List<String> y) {
+        Set<String> u = new LinkedHashSet<>(x);
+        u.addAll(y);
+        if (u.isEmpty()) return 1.0;
+        return (double) x.stream().filter(y::contains).distinct().count() / u.size();
+    }
+
     @Test
     void crossProjectFanOutMatchesSingleNode() throws Exception {
         internalCalls(a, b, all);
-        double tauSum = 0, tauMin = 1;
-        int tauN = 0;
         List<String> vectorDiffs = new ArrayList<>();
+        Map<SearchType, double[]> tau = new java.util.EnumMap<>(SearchType.class); // sum, min, n
+        List<String> idSetDiffs = new ArrayList<>();
         for (String q : queries()) {
             SearchResponse fan = search(a, q, SearchType.KEYWORD, null, 10);
             SearchResponse one = search(all, q, SearchType.KEYWORD, null, 10);
@@ -196,23 +239,72 @@ class DistributedSearchTest {
                     search(all, q, SearchType.VECTOR, null, 10).results(), 10);
             if (v != null) vectorDiffs.add(q + ": " + v);
 
-            List<String> hf = ids(search(a, q, SearchType.HYBRID, null, 10).results());
-            List<String> h1 = ids(search(all, q, SearchType.HYBRID, null, 10).results());
-            assertThat(hf).as("hybrid " + q).isNotEmpty();
-            double tau = kendallTau(hf, h1);
-            tauSum += tau;
-            tauMin = Math.min(tauMin, tau);
-            tauN++;
+            for (SearchType type : List.of(SearchType.HYBRID, SearchType.UNIFIED, SearchType.AUTO)) {
+                SearchResponse f = search(a, q, type, null, 10, true);
+                List<String> hf = ids(f.results());
+                List<String> h1 = ids(search(all, q, type, null, 10, true).results());
+                assertThat(hf).as(type + " " + q).isNotEmpty();
+                assertThat(f.warnings()).as(type + " " + q).isEmpty();
+                if (jaccard(hf, h1) < 1.0) idSetDiffs.add(type + " " + q + ": " + hf + " vs " + h1);
+                double t = kendallTau(hf, h1);
+                double[] acc = tau.computeIfAbsent(type, k -> new double[]{0, 1, 0});
+                acc[0] += t;
+                acc[1] = Math.min(acc[1], t);
+                acc[2]++;
+            }
         }
-        System.out.printf("crossProjectFanOut: %d queries, hybrid mean Kendall tau %.4f (min %.4f), vector diffs %d%n",
-                tauN, tauSum / tauN, tauMin, vectorDiffs.size());
+        tau.forEach((type, acc) -> System.out.printf("crossProjectFanOut: %s (expand) over %d queries: mean Kendall tau %.4f, min %.4f%n",
+                type, (int) acc[2], acc[0] / acc[2], acc[1]));
+        System.out.printf("crossProjectFanOut: vector diffs %d, id-set diffs %d%n", vectorDiffs.size(), idSetDiffs.size());
+        vectorDiffs.forEach(d -> System.out.println("  vector diff: " + d));
+        idSetDiffs.forEach(d -> System.out.println("  id-set diff: " + d));
         assertThat(vectorDiffs).as("vector top-10 within the ulp tolerance").isEmpty();
-        assertThat(tauSum / tauN).as("hybrid mean Kendall tau").isGreaterThanOrEqualTo(0.95);
+        assertThat(idSetDiffs).as("same ids (Jaccard 1.0) for hybrid, unified, auto with expansion").isEmpty();
+        tau.forEach((type, acc) -> assertThat(acc[0] / acc[2]).as(type + " mean Kendall tau").isGreaterThanOrEqualTo(0.95));
         List<TestReaderNode.Call> served = new ArrayList<>(b.drainCalls());
         served.addAll(all.drainCalls());
-        assertThat(served).as("a fanned out to the readers of sample-app").isNotEmpty()
-                .allSatisfy(c -> assertThat(c.shard()).isEqualTo(JAVA));
+        assertThat(served).as("a fanned out to the readers of the shards it lacks").isNotEmpty()
+                .allSatisfy(c -> assertThat(c.shard()).isIn(JAVA, SKEW_B));
         assertThat(a.drainCalls()).as("nobody asked a: b and all hold what they search").isEmpty();
+    }
+
+    /**
+     * The control: the same keyword comparison with shard-local statistics must differ from the
+     * single node on many queries, or the parity test above could not tell global statistics apart.
+     */
+    @Test
+    void shardLocalStatisticsWouldDiffer() throws Exception {
+        DistributedSearch ds = a.ds();
+        int differ = 0;
+        ds.globalStatistics = false;
+        try {
+            for (String q : queries()) {
+                if (!bits(search(a, q, SearchType.KEYWORD, null, 10).results())
+                        .equals(bits(search(all, q, SearchType.KEYWORD, null, 10).results()))) differ++;
+            }
+        } finally {
+            ds.globalStatistics = true;
+        }
+        System.out.printf("shardLocalStatisticsWouldDiffer: %d of %d keyword top-10s differ%n", differ, queries().size());
+        assertThat(differ).as("queries whose top-10 changes without global statistics").isGreaterThanOrEqualTo(20);
+    }
+
+    /** A rare term in a big shard, common in a small one: only global statistics rank it as a single node. */
+    @Test
+    void skewedTermNeedsGlobalStatistics() throws Exception {
+        String q = RARE + " quokka";
+        List<String> single = bits(search(all, q, SearchType.KEYWORD, null, 10).results());
+        List<String> fan = bits(search(a, q, SearchType.KEYWORD, null, 10).results());
+        assertThat(fan).anyMatch(r -> r.startsWith(SKEW_A + ":")).anyMatch(r -> r.startsWith(SKEW_B + ":"));
+        assertThat(fan).as("global statistics: as a single node").isEqualTo(single);
+        DistributedSearch ds = a.ds();
+        ds.globalStatistics = false;
+        try {
+            assertThat(bits(search(a, q, SearchType.KEYWORD, null, 10).results()))
+                    .as("shard-local statistics").isNotEqualTo(single);
+        } finally {
+            ds.globalStatistics = true;
+        }
     }
 
     /** Review Focus 5: one shard through fan-out is bitwise that shard's own local search. */
@@ -275,12 +367,14 @@ class DistributedSearchTest {
         assertThat(w).isEmpty();
         List<TestReaderNode.Call> graphCalls = new ArrayList<>(b.drainCalls());
         graphCalls.addAll(all.drainCalls());
-        assertThat(graphCalls).as("a asked the readers of sample-app").isNotEmpty()
-                .allSatisfy(c -> assertThat(c.shard()).as(c.path()).isEqualTo(JAVA));
+        assertThat(graphCalls).as("a asked the readers of the shards it lacks").isNotEmpty()
+                .allSatisfy(c -> assertThat(c.shard()).as(c.path()).isIn(JAVA, SKEW_B))
+                .anySatisfy(c -> assertThat(c.shard()).isEqualTo(JAVA));
 
-        // ...exactly as b, which holds sample-app, answers them locally
-        assertThat(bits(callers)).isEqualTo(bits(b.engine.findCallers(getName, null, new ArrayList<>())));
-        assertThat(fromA).isEqualTo(graphAnswers(b, getName, greet, new ArrayList<>()));
+        // ...exactly as a single node (all holds every shard) answers them locally; callers are
+        // scored with the summed statistics of their one term, so bitwise
+        assertThat(bits(callers)).isEqualTo(bits(all.engine.findCallers(getName, null, new ArrayList<>())));
+        assertThat(fromA).isEqualTo(graphAnswers(all, getName, greet, new ArrayList<>()));
     }
 
     private static List<Object> graphAnswers(TestReaderNode n, String getName, String greet, List<String> w)
@@ -318,15 +412,23 @@ class DistributedSearchTest {
         }
     }
 
+    private int smallClusters;
+
     private Small small(int replicas, String coordinatorSynonyms) throws Exception {
+        return small(replicas, coordinatorSynonyms, EMBEDDER, cfg -> { });
+    }
+
+    private Small small(int replicas, String coordinatorSynonyms, com.pharos.embedding.EmbeddingProvider coordinatorEmbedder,
+                        java.util.function.Consumer<com.pharos.config.ClusterConfig> coordinatorConfig) throws Exception {
+        Path home = tmp.resolve("small-" + smallClusters++);
         InMemoryObjectStore store = new InMemoryObjectStore();
-        ClusterFixture f = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, EMBEDDER);
+        ClusterFixture f = new ClusterFixture(home.resolve("fixture"), store, store, BUCKET, EMBEDDER);
         f.indexBoth();
-        TestReaderNode c = new TestReaderNode(tmp.resolve("c"), store, BUCKET, "c", List.of(PY), EMBEDDER,
-                coordinatorSynonyms);
+        TestReaderNode c = new TestReaderNode(home.resolve("c"), store, BUCKET, "c", List.of(PY), coordinatorEmbedder,
+                coordinatorSynonyms, coordinatorConfig);
         List<TestReaderNode> rs = new ArrayList<>();
         for (int i = 1; i <= replicas; i++) {
-            rs.add(new TestReaderNode(tmp.resolve("r" + i), store, BUCKET, "r" + i, List.of(JAVA), EMBEDDER, null));
+            rs.add(new TestReaderNode(home.resolve("r" + i), store, BUCKET, "r" + i, List.of(JAVA), EMBEDDER, null));
         }
         c.awaitShard(JAVA, replicas);
         return new Small(f, store, c, rs);
@@ -344,6 +446,8 @@ class DistributedSearchTest {
                 assertThat(r.warnings()).as("query " + i).isEmpty();
                 assertThat(bits(r.results())).as("query " + i).isEqualTo(before);
             }
+            assertThat(s.coordinator().ds().suspect("r1")).as("r1 was attempted (and failed)").isTrue();
+            assertThat(s.coordinator().ds().suspect("r2")).isFalse();
         }
     }
 
@@ -417,6 +521,164 @@ class DistributedSearchTest {
             assertThat(r.warnings()).singleElement().asString()
                     .startsWith("shard " + JAVA + " unavailable: ").contains("synonyms");
             assertThat(s.replicas().get(0).drainCalls()).extracting(TestReaderNode.Call::status).contains(409);
+        }
+    }
+
+    // ── fix round 1: load, deadlines, pinned readers, mid-query death, models ───
+
+    /**
+     * I1: many concurrent queries while the replicas are slow (they answer, under the call timeout, so
+     * nobody is marked suspect and the router cannot steer around them) never lose a shard, the
+     * coordinator's own included: remote calls wait for a per-reader permit within the query budget,
+     * local shards are searched on the query's thread, and no queue wait eats a round's deadline.
+     */
+    @Test
+    void concurrentQueriesWithAStalledReplicaKeepHealthyShards() throws Exception {
+        try (Small s = small(2, null, EMBEDDER, cfg -> {
+            cfg.setFanoutTimeoutMillis(1500);
+            cfg.setQueryTimeoutMillis(15000);
+        })) {
+            String q = "GreetingService farewell";
+            List<String> expected = ids(search(s.coordinator(), q, SearchType.KEYWORD, null, 10).results());
+            assertThat(expected).anyMatch(id -> id.startsWith(JAVA + ":")).anyMatch(id -> id.startsWith(PY + ":"));
+            for (TestReaderNode r : s.replicas()) {
+                r.stallPath = "/internal/";
+                r.stallMillis = 1200; // answers, under the 1500 ms call timeout
+            }
+            int n = 160;
+            java.util.concurrent.ExecutorService clients = java.util.concurrent.Executors.newFixedThreadPool(n);
+            try {
+                List<java.util.concurrent.Future<SearchResponse>> fs = new ArrayList<>();
+                java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+                for (int i = 0; i < n; i++) {
+                    fs.add(clients.submit(() -> {
+                        go.await();
+                        return search(s.coordinator(), q, SearchType.KEYWORD, null, 10);
+                    }));
+                }
+                go.countDown();
+                for (var f : fs) {
+                    SearchResponse r = f.get(60, java.util.concurrent.TimeUnit.SECONDS);
+                    assertThat(r.warnings()).as("no shard lost under load").isEmpty();
+                    assertThat(ids(r.results())).isEqualTo(expected);
+                }
+            } finally {
+                clients.shutdownNow();
+                s.replicas().forEach(r -> r.stallPath = null);
+            }
+        }
+    }
+
+    /** I2: one deadline per query covers every round; a stalled search round cannot stretch it. */
+    @Test
+    void queryDeadlineCoversEveryRound() throws Exception {
+        try (Small s = small(2, null, EMBEDDER, cfg -> {
+            cfg.setFanoutTimeoutMillis(1400); // two attempts of 1400 ms each: the query budget must cut them
+            cfg.setQueryTimeoutMillis(1500);
+        })) {
+            for (TestReaderNode r : s.replicas()) { // term stats answer at once, the search round stalls
+                r.stallPath = "/internal/shard-search";
+                r.stallMillis = 10_000;
+            }
+            long t0 = System.nanoTime();
+            SearchResponse r = search(s.coordinator(), "GreetingService multiply", SearchType.HYBRID, null, 10);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            s.replicas().forEach(x -> x.stallPath = null);
+            assertThat(ms).as("query time with a 1500 ms query timeout").isLessThan(2_200);
+            assertThat(r.results()).isNotEmpty().allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
+            assertThat(r.warnings()).singleElement().asString().startsWith("shard " + JAVA + " unavailable: ");
+        }
+    }
+
+    /** I2: a query holds a reference on its local readers: a swap closing the reader meanwhile cannot break it. */
+    @Test
+    void pinnedLocalReaderSurvivesItsRetirementUntilTheQueryCloses() throws Exception {
+        try (Small s = small(1, null)) {
+            DistributedSearch ds = s.coordinator().ds();
+            String fqn;
+            org.apache.lucene.index.IndexReader pinned;
+            try (DistributedSearch.Query q = ds.open(List.of())) {
+                assertThat(q.fansOut()).isTrue();
+                SearchResult any = search(s.coordinator(), "multiply", SearchType.KEYWORD, PY, 1).results().get(0);
+                fqn = any.id().substring(PY.length() + 1);
+                assertThat(q.docs(List.of(fqn))).containsKey(fqn); // pins the local python shard
+                pinned = s.coordinator().parts.lucene().openReader(PY);
+                int refs = pinned.getRefCount();
+                pinned.close(); // what LuceneIndexer's retirement does after a swap
+                assertThat(q.docs(List.of(fqn))).as("still readable while pinned").containsKey(fqn);
+                q.vectorResolver(List.of(any), "multiply").resolve(any); // reads the pinned reader: no AlreadyClosed
+                assertThat(pinned.getRefCount()).isEqualTo(refs - 1);
+            }
+            assertThat(pinned.getRefCount()).as("released when the query closed").isZero();
+        }
+    }
+
+    /** I4d: the pinned reader dies after the statistics round; the shard is retried on its replica (same generation). */
+    @Test
+    void readerDyingAfterTermStatsIsRetriedOnItsReplica() throws Exception {
+        try (Small s = small(2, null)) {
+            String q = "GreetingService farewell";
+            List<String> expected = bits(search(s.coordinator(), q, SearchType.KEYWORD, null, 10).results());
+            s.replicas().forEach(r -> { r.drainCalls(); r.dieAfterStats = true; });
+            SearchResponse r = search(s.coordinator(), q, SearchType.KEYWORD, null, 10);
+            assertThat(r.warnings()).isEmpty();
+            assertThat(bits(r.results())).isEqualTo(expected);
+            List<TestReaderNode.Call> calls = new ArrayList<>(s.replicas().get(0).drainCalls());
+            calls.addAll(s.replicas().get(1).drainCalls());
+            TestReaderNode.Call stats = calls.stream().filter(c -> c.path().endsWith("/term-stats")).findFirst().orElseThrow();
+            assertThat(s.coordinator().ds().suspect(stats.node())).as("the stats reader died (503) and was marked").isTrue();
+            assertThat(calls).as("its replica answered the search, on the pinned generation")
+                    .anySatisfy(c -> {
+                        assertThat(c.node()).isNotEqualTo(stats.node());
+                        assertThat(c.path()).endsWith("/shard-search");
+                        assertThat(c.status()).isEqualTo(200);
+                        assertThat(c.requestJson().path("generation").asLong())
+                                .isEqualTo(stats.responseJson().path("generation").asLong());
+                    })
+                    .noneSatisfy(c -> {
+                        assertThat(c.node()).isEqualTo(stats.node());
+                        assertThat(c.path()).endsWith("/shard-search");
+                        assertThat(c.status()).isEqualTo(200);
+                    });
+        }
+        try (Small s = small(1, null)) { // no replica to take over: the shard is named
+            s.replicas().get(0).dieAfterStats = true;
+            SearchResponse r = search(s.coordinator(), "GreetingService multiply", SearchType.KEYWORD, null, 10);
+            assertThat(r.results()).isNotEmpty().allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
+            assertThat(r.warnings()).singleElement().asString().startsWith("shard " + JAVA + " unavailable: ");
+        }
+    }
+
+    /** I3: shards without vectors of the coordinator's model refuse; each is named, keyword results stay. */
+    @Test
+    void shardsWithoutVectorsOfTheModelAreNamed() throws Exception {
+        com.pharos.embedding.EmbeddingProvider other = new HashEmbeddings() {
+            @Override public String modelId() { return "other-model"; }
+        };
+        try (Small s = small(1, null, other, cfg -> { })) {
+            SearchResponse v = search(s.coordinator(), "multiply", SearchType.VECTOR, null, 10);
+            assertThat(v.results()).isEmpty();
+            assertThat(v.warnings()).containsExactlyInAnyOrder(
+                    "shard " + PY + " has no vectors for model other-model",
+                    "shard " + JAVA + " has no vectors for model other-model");
+            SearchResponse h = search(s.coordinator(), "GreetingService multiply", SearchType.HYBRID, null, 10);
+            assertThat(h.results()).anyMatch(x -> x.project().equals(JAVA)).anyMatch(x -> x.project().equals(PY));
+            assertThat(h.warnings()).contains("shard " + JAVA + " has no vectors for model other-model");
+            assertThat(s.replicas().get(0).drainCalls()).extracting(TestReaderNode.Call::status).contains(409);
+        }
+    }
+
+    /** Minor: a reader that never read the catalog (bucket down since it started) still answers from its shards. */
+    @Test
+    void neverReadCatalogSearchesTheShardsHeldHere() throws Exception {
+        try (Small s = small(1, null)) {
+            s.store().failGetOn("catalog/shards.json");
+            SearchResponse r = search(s.coordinator(), "multiply", SearchType.KEYWORD, null, 10);
+            assertThat(r.results()).isNotEmpty().allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
+            assertThat(r.warnings()).singleElement().asString().startsWith("searching only this reader's shards: ");
+            SearchResponse scoped = search(s.coordinator(), "Calculator", SearchType.KEYWORD, JAVA, 10);
+            assertThat(scoped.results()).as("a scoped query needs no catalog").isNotEmpty()
+                    .allSatisfy(x -> assertThat(x.project()).isEqualTo(JAVA));
         }
     }
 }

@@ -228,7 +228,7 @@ final class ParityCorpus {
     }
 
     /** Deterministic fake embeddings: a unit vector seeded by the text. */
-    static final class HashEmbeddings implements EmbeddingProvider {
+    static class HashEmbeddings implements EmbeddingProvider {
         static final int DIMS = 16;
         static final String MODEL = "test-hash";
 

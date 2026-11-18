@@ -125,4 +125,17 @@ class ShardRouterTest {
         ShardRouter r = new ShardRouter(() -> live, catalog, health, s -> true, node -> node.equals("r1") ? 3 : 0);
         for (int i = 0; i < 6; i++) assertThat(nodes(r.route(List.of("a")).get(0))).containsExactly("r2", "r1");
     }
+
+    /** The coordinator's in-flight counts change while a route is computed: one snapshot per route, never a broken grouping. */
+    @Test
+    void changingInFlightCountsDuringRoutingNeverBreakIt() {
+        live = new ArrayList<>();
+        for (int i = 0; i < 12; i++) live.add(hb("r" + i, false, 0, "b"));
+        java.util.concurrent.atomic.AtomicInteger ticks = new java.util.concurrent.atomic.AtomicInteger();
+        ShardRouter r = new ShardRouter(() -> live, catalog, health, s -> false,
+                node -> (ticks.incrementAndGet() * 7 + node.hashCode()) % 3); // a different answer on every call
+        for (int i = 0; i < 2_000; i++) {
+            assertThat(r.route(List.of("b")).get(0).candidates()).hasSize(12);
+        }
+    }
 }

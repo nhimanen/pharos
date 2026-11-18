@@ -60,6 +60,12 @@ public final class ShardClient {
     private final ObjectMapper mapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private final Map<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
+    /** Calls one coordinator may have open to one reader at a time; the rest wait (within their deadline). */
+    private final int perNodeConcurrency;
+    private final Map<String, java.util.concurrent.Semaphore> permits = new ConcurrentHashMap<>();
+
+    /** Default {@link #perNodeConcurrency}: open calls from one coordinator to one reader. */
+    public static final int DEFAULT_PER_NODE_CONCURRENCY = 64;
 
     public ShardClient(ReaderHealth health, String token, Duration connectTimeout, Duration requestTimeout) {
         this(health, token, connectTimeout, requestTimeout, DEFAULT_MAX_RESPONSE_BYTES);
@@ -67,6 +73,12 @@ public final class ShardClient {
 
     public ShardClient(ReaderHealth health, String token, Duration connectTimeout, Duration requestTimeout,
                        int maxResponseBytes) {
+        this(health, token, connectTimeout, requestTimeout, maxResponseBytes, DEFAULT_PER_NODE_CONCURRENCY);
+    }
+
+    public ShardClient(ReaderHealth health, String token, Duration connectTimeout, Duration requestTimeout,
+                       int maxResponseBytes, int perNodeConcurrency) {
+        this.perNodeConcurrency = perNodeConcurrency;
         this.maxResponseBytes = maxResponseBytes;
         this.health = health;
         this.token = token;
@@ -87,9 +99,25 @@ public final class ShardClient {
             new Endpoint<>("/internal/graph", GraphResponse.class, GraphRequest::generation,
                     GraphResponse::generation);
 
+    /** The suspect marks this client keeps (shared with the router). */
+    public ReaderHealth health() {
+        return health;
+    }
+
     /** Calls the route's candidates in order, at most two attempts. */
     public <Q, R> R call(Route route, Endpoint<Q, R> endpoint, Function<ReaderHeartbeat, Q> request) {
         return callPreferring(route, null, endpoint, request).response();
+    }
+
+    /** The deadline of a call made without one: each of two attempts gets twice the request timeout. */
+    private long defaultDeadline() {
+        return System.nanoTime() + requestTimeout.toNanos() * 4;
+    }
+
+    /** {@link #callPreferring(Route, ReaderHeartbeat, Endpoint, Function, long)} without a query deadline. */
+    public <Q, R> Answer<R> callPreferring(Route route, ReaderHeartbeat preferred, Endpoint<Q, R> endpoint,
+                                           Function<ReaderHeartbeat, Q> request) {
+        return callPreferring(route, preferred, endpoint, request, defaultDeadline());
     }
 
     /**
@@ -102,7 +130,7 @@ public final class ShardClient {
      * @throws ShardUnavailableException when no attempt answered
      */
     public <Q, R> Answer<R> callPreferring(Route route, ReaderHeartbeat preferred, Endpoint<Q, R> endpoint,
-                                           Function<ReaderHeartbeat, Q> request) {
+                                           Function<ReaderHeartbeat, Q> request, long deadlineNanos) {
         List<ReaderHeartbeat> candidates = new java.util.ArrayList<>(route.candidates().size() + 1);
         if (preferred != null) candidates.add(preferred);
         for (ReaderHeartbeat r : route.candidates()) {
@@ -112,15 +140,23 @@ public final class ShardClient {
             throw new ShardUnavailableException(route.shard(), "no live reader serves it", null);
         }
         Exception last = null;
-        for (int i = 0; i < Math.min(2, candidates.size()); i++) {
+        int attempts = Math.min(2, candidates.size());
+        for (int i = 0; i < attempts; i++) {
             ReaderHeartbeat reader = candidates.get(i);
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                last = new ShardCallException("the query deadline passed");
+                break;
+            }
+            // Leave the later attempts their share, so a retry after a stalled reader still runs.
+            long bound = Math.min(requestTimeout.toNanos() * 2, remaining / (attempts - i));
             try {
-                return new Answer<>(reader, callOn(reader, endpoint, request.apply(reader)));
+                return new Answer<>(reader, callOn(reader, endpoint, request.apply(reader), bound));
             } catch (RetryableFailure f) {
                 health.markSuspect(reader.node());
                 last = f;
-            } catch (NotServedException | SynonymsMismatchException n) { // not a sick reader
-                last = n;
+            } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException n) {
+                last = n; // not a sick reader
             }
         }
         throw new ShardUnavailableException(route.shard(), last == null ? null : last.getMessage(), last);
@@ -128,6 +164,35 @@ public final class ShardClient {
 
     /** One call to one reader, no retry: how a query keeps its later calls on the reader it pinned. */
     public <Q, R> R callOn(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request) {
+        return callOn(reader, endpoint, request, requestTimeout.toNanos() * 2);
+    }
+
+    /**
+     * One call to one reader, the whole exchange (permit wait, connect, headers, body) bounded by
+     * {@code boundNanos}. At most {@code perNodeConcurrency} calls run to one reader at a time.
+     */
+    public <Q, R> R callOn(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request, long boundNanos) {
+        long start = System.nanoTime();
+        java.util.concurrent.Semaphore permit = permits.computeIfAbsent(reader.node(),
+                n -> new java.util.concurrent.Semaphore(perNodeConcurrency));
+        try {
+            if (!permit.tryAcquire(boundNanos, java.util.concurrent.TimeUnit.NANOSECONDS)) {
+                throw new BusyException(perNodeConcurrency + " calls to " + reader.node() + " already open");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ShardCallException("interrupted waiting to call " + reader.node());
+        }
+        try {
+            return exchange(reader, endpoint, request, Math.max(1_000_000L, boundNanos - (System.nanoTime() - start)));
+        } finally {
+            permit.release();
+        }
+    }
+
+    private <Q, R> R exchange(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request, long boundNanos) {
+        long boundMillis = Math.max(1, boundNanos / 1_000_000L);
+        Duration headerTimeout = Duration.ofMillis(Math.min(requestTimeout.toMillis(), boundMillis));
         byte[] payload;
         try {
             payload = mapper.writeValueAsBytes(request);
@@ -141,21 +206,21 @@ public final class ShardClient {
             byte[] body;
             try {
                 HttpRequest req = HttpRequest.newBuilder(URI.create(reader.advertiseUrl() + endpoint.path()))
-                        .timeout(requestTimeout)
+                        .timeout(headerTimeout)
                         .header("Content-Type", "application/json")
                         .header(InternalApi.TOKEN_HEADER, token)
                         .POST(HttpRequest.BodyPublishers.ofByteArray(payload))
                         .build();
                 // The JDK's request timeout ends once the headers arrive: the whole exchange, body
-                // included, is bounded here by the same duration (twice it, so a slow connect still fits).
+                // included, is bounded here (twice the request timeout, or less within a query deadline).
                 java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> pending =
                         http.sendAsync(req, info -> new CappedBody(maxResponseBytes + 1));
                 HttpResponse<byte[]> resp;
                 try {
-                    resp = pending.get(requestTimeout.toMillis() * 2, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    resp = pending.get(boundMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
                     pending.cancel(true);
-                    throw new IOException("no complete response within " + requestTimeout.toMillis() * 2 + " ms");
+                    throw new IOException("no complete response within " + boundMillis + " ms");
                 } catch (java.util.concurrent.ExecutionException e) {
                     Throwable c = e.getCause();
                     if (c instanceof IOException io) throw io;
@@ -176,7 +241,11 @@ public final class ShardClient {
             if (status >= 500) throw new RetryableFailure(reader.node() + " answered " + status);
             if (status == 409) {
                 health.markHealthy(reader.node());
-                if (InternalApi.SYNONYMS_MISMATCH.equals(errorOf(body))) {
+                String error = errorOf(body);
+                if (InternalApi.MODEL_MISMATCH.equals(error)) {
+                    throw new ModelMismatchException(detailOf(body));
+                }
+                if (InternalApi.SYNONYMS_MISMATCH.equals(error)) {
                     throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
                             + " (synonyms.txt differs from this coordinator's)");
                 }
@@ -200,6 +269,19 @@ public final class ShardClient {
         } finally {
             counter.decrementAndGet();
         }
+    }
+
+    private String detailOf(byte[] body) {
+        try {
+            return mapper.readTree(body).path("detail").asText("model mismatch");
+        } catch (IOException e) {
+            return "model mismatch";
+        }
+    }
+
+    /** This coordinator already has {@code perNodeConcurrency} calls open to the reader: try another. */
+    private static final class BusyException extends ShardCallException {
+        BusyException(String message) { super(message); }
     }
 
     private String errorOf(byte[] body) {

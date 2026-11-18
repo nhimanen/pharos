@@ -97,7 +97,13 @@ public final class ShardRouter {
                 eligible.add(r);
             }
         }
-        ToIntFunction<ReaderHeartbeat> load = r -> r.inFlight() + coordinatorInFlight.applyAsInt(r.node());
+        // One snapshot of each reader's load: the coordinator's in-flight counts move while this runs,
+        // and a load read twice could break the sort's contract or leave an empty tie group.
+        Map<String, Integer> loads = new java.util.HashMap<>();
+        for (ReaderHeartbeat r : eligible) {
+            loads.put(r.node(), r.inFlight() + coordinatorInFlight.applyAsInt(r.node()));
+        }
+        ToIntFunction<ReaderHeartbeat> load = r -> loads.get(r.node());
         eligible.sort(Comparator.comparingInt(load).thenComparing(ReaderHeartbeat::node));
         long turn = rotation.computeIfAbsent(shard, s -> new AtomicLong()).getAndIncrement();
         List<ReaderHeartbeat> out = new ArrayList<>(eligible.size());

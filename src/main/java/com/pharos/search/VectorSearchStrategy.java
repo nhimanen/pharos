@@ -88,18 +88,36 @@ public class VectorSearchStrategy {
     public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] queryVector)
             throws IOException {
         IndexReader reader = searcher.getIndexReader();
+        TopDocs firstPass = firstPass(searcher, req, queryVector);
+        return finish(searcher, firstPass, queryVector, req.limit(), hasChunkVectors(reader));
+    }
+
+    /** First-pass candidates per query for a result limit (the HNSW pass fetches this many). */
+    public static int firstPassK(int limit) {
+        return limit * RESCORE_FACTOR;
+    }
+
+    /** The HNSW first pass: the top {@link #firstPassK} documents by document-vector similarity. */
+    public TopDocs firstPass(IndexSearcher searcher, SearchRequest req, float[] queryVector) throws IOException {
         Query filter      = buildFilter(req);
-        int   limit       = req.limit();
-        int   firstPassK  = limit * RESCORE_FACTOR;
+        int   firstPassK  = firstPassK(req.limit());
 
         Query vectorQuery = filter != null
                 ? new KnnFloatVectorQuery(vectorField, queryVector, firstPassK, filter)
                 : new KnnFloatVectorQuery(vectorField, queryVector, firstPassK);
 
-        TopDocs firstPass = searcher.search(vectorQuery, firstPassK);
+        return searcher.search(vectorQuery, firstPassK);
+    }
 
+    /**
+     * The second pass over first-pass candidates: late-interaction rescoring when the index (all of
+     * it, for a coordinator: any shard) has chunk vectors, else the first pass truncated; the top
+     * {@code limit} with unboosted scores.
+     */
+    public List<RawCandidate> finish(IndexSearcher searcher, TopDocs firstPass, float[] queryVector, int limit,
+                                     boolean chunkVectors) throws IOException {
         // Late-interaction rescoring when chunkVectors field is present
-        if (hasChunkVectors(reader) && firstPass.totalHits.value() > 0) {
+        if (chunkVectors && firstPass.totalHits.value() > 0) {
             // Wrap single query vector as float[][] — the rescorer treats it as a 1-element
             // multi-vector, so SUM_MAX_SIM becomes MAX(cosine(queryVec, chunkVec_i)).
             float[][] queryMultiVec = new float[][] { queryVector };
@@ -176,7 +194,7 @@ public class VectorSearchStrategy {
     }
 
     /** Returns true when the index contains the per-model chunk-vectors late-interaction field. */
-    private boolean hasChunkVectors(IndexReader reader) {
+    public boolean hasChunkVectors(IndexReader reader) {
         return reader.leaves().stream().anyMatch(
                 ctx -> ctx.reader().getFieldInfos().fieldInfo(chunkVectorField) != null);
     }

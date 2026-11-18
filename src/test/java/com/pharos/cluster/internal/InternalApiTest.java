@@ -442,4 +442,27 @@ class InternalApiTest {
         assertThatThrownBy(() -> client(health).call(new Route(new ShardId("java"), List.of(reader("syn", mismatched.port()))),
                 ShardClient.TERM_STATS, STATS)).isInstanceOf(ShardUnavailableException.class).hasMessageContaining("synonyms");
     }
+
+    /** I3: a shard without vectors of the coordinator's model answers 409 "model mismatch"; the client tries the next replica. */
+    @Test
+    void modelMismatchIsRefusedAndRetriedElsewhereWithoutSuspect() throws Exception {
+        FakeShardSearchService noVectors = new FakeShardSearchService() {
+            @Override public ShardSearchResponse searchRaw(ShardSearchRequest r) {
+                throw new ModelMismatchException("no vectors for model m");
+            }
+        }.serving("java", 5);
+        Javalin refusing = serve(noVectors);
+        Javalin good = serve(new FakeShardSearchService().serving("java", 5));
+        ReaderHealth health = new ReaderHealth(30);
+        SearchRequest req = new SearchRequest("q", SearchRequest.SearchType.VECTOR, null, null, 10, "json", null, null, 0);
+        var request = (java.util.function.Function<ReaderHeartbeat, ShardSearchRequest>)
+                hb -> new ShardSearchRequest("java", 5L, "vector-knn", req, new float[]{1f}, null, null, "m", 1, null);
+        assertThatThrownBy(() -> client(health).call(new Route(new ShardId("java"), List.of(reader("nv", refusing.port()))),
+                ShardClient.SHARD_SEARCH, request)).isInstanceOf(ShardUnavailableException.class)
+                .hasCauseInstanceOf(ModelMismatchException.class).hasMessageContaining("no vectors for model m");
+        ShardClient.Answer<ShardSearchResponse> a = client(health).callPreferring(new Route(new ShardId("java"),
+                List.of(reader("nv", refusing.port()), reader("ok", good.port()))), null, ShardClient.SHARD_SEARCH, request);
+        assertThat(a.reader().node()).isEqualTo("ok");
+        assertThat(health.isSuspect("nv")).isFalse();
+    }
 }

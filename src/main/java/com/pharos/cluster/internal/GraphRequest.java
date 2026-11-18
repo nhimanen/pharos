@@ -15,10 +15,17 @@ import java.util.List;
  *   <li>{@code called}: the stored called methods of each of {@code fqns} found on the shard, in
  *       {@code lists} (as {@code /internal/callees}, but without a pinned generation: a graph call's
  *       first contact)</li>
- *   <li>{@code callers}: raw candidates of the methods calling {@code fqns[0]} (top {@code limit})</li>
+ *   <li>{@code callers}: raw candidates of the methods calling {@code fqns[0]} (top {@code limit}),
+ *       scored with {@code globalStats} when given</li>
  *   <li>{@code path}: the shortest call path {@code fqns[0]} → {@code to}, as {@code lists["path"]}</li>
  * </ul>
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record GraphRequest(String shard, Long generation, String op, List<String> fqns, String direction,
-                           String kind, String to, int limit) {}
+                           String kind, String to, int limit, com.pharos.search.distributed.GlobalStats globalStats) {
+
+    public GraphRequest(String shard, Long generation, String op, List<String> fqns, String direction,
+                        String kind, String to, int limit) {
+        this(shard, generation, op, fqns, direction, kind, to, limit, null);
+    }
+}

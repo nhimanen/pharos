@@ -11,12 +11,16 @@ import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.cluster.routing.CatalogNeverReadException;
+import com.pharos.search.distributed.DistributedSearch;
+import com.pharos.search.distributed.LocalShardService;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import com.pharos.search.pipeline.PipelineConfig;
 import com.pharos.search.pipeline.PipelineDescriptor;
 import com.pharos.search.pipeline.PipelineFactory;
 import com.pharos.search.pipeline.SearchPipeline;
+import com.pharos.search.pipeline.UnifiedRetrievalStage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import org.apache.lucene.document.Document;
@@ -46,7 +50,10 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -150,7 +157,7 @@ public class SearchEngine {
      * The fan-out coordinator of a reader node (Phase 3); null on every other node, which always
      * searches locally. Even when set, a query whose shards are all held here runs the local path.
      */
-    private volatile com.pharos.search.distributed.DistributedSearch distributed;
+    private volatile DistributedSearch distributed;
 
     /** True when an embedding model is configured (a bare no-op provider means none is). */
     private final boolean modelConfigured;
@@ -202,7 +209,7 @@ public class SearchEngine {
     }
 
     /** Makes this engine a coordinator for shards it does not hold (reader nodes only). */
-    public void setDistributed(com.pharos.search.distributed.DistributedSearch distributed) {
+    public void setDistributed(DistributedSearch distributed) {
         this.distributed = distributed;
     }
 
@@ -210,11 +217,13 @@ public class SearchEngine {
      * The shard side of fan-out over this engine's index, analysers and embedder: what a reader's
      * {@code /internal/*} endpoints and a coordinator's own shards run.
      *
-     * @param serves whether this node holds a shard
+     * @param serves           whether this node holds a shard
+     * @param modelFingerprint the fingerprint of this node's search model's configuration, or null
      */
-    public com.pharos.search.distributed.LocalShardService shardService(java.util.function.Predicate<String> serves) {
-        return new com.pharos.search.distributed.LocalShardService(luceneIndexer, serves, keywordStrategy,
-                vectorStrategy, new com.pharos.search.pipeline.UnifiedRetrievalStage(keywordStrategy, embedder));
+    public LocalShardService shardService(Predicate<String> serves, String modelFingerprint) {
+        return new LocalShardService(luceneIndexer, serves, keywordStrategy, vectorStrategy,
+                new UnifiedRetrievalStage(keywordStrategy, embedder), registry,
+                new LocalShardService.Model(embedder.modelId(), embedder.dimensions(), modelFingerprint));
     }
 
     /** The query embedder (the coordinator embeds each query once and sends the vector). */
@@ -238,12 +247,32 @@ public class SearchEngine {
      * The fan-out of a graph or lookup call over {@code project} (null: every shard), or null when
      * this node holds every shard involved (then the local code runs, unchanged).
      */
-    private com.pharos.search.distributed.DistributedSearch.Query graphFanOut(String project) {
-        com.pharos.search.distributed.DistributedSearch ds = distributed;
+    private record FanOut<T>(T value) {}
+
+    /**
+     * Runs {@code op} over the fan-out of a graph or lookup call over {@code project} (null: every
+     * shard), adding its warnings; null when this node holds every shard involved (the local code
+     * then runs, unchanged), or when the shard catalog was never read (local, with a warning).
+     */
+    private <T> FanOut<T> fannedOut(String project, List<String> warnings, Function<DistributedSearch.Query, T> op) {
+        DistributedSearch ds = distributed;
         if (ds == null) return null;
-        var q = ds.open(project == null || project.isEmpty() ? List.of() : List.of(project));
-        return q.fansOut() ? q : null;
+        DistributedSearch.Query q;
+        try {
+            q = ds.open(project == null || project.isEmpty() ? List.of() : List.of(project));
+        } catch (CatalogNeverReadException e) {
+            warnings.add(CATALOG_UNREAD_WARNING + e.getMessage());
+            return null;
+        }
+        try (q) {
+            if (!q.fansOut()) return null;
+            T value = op.apply(q);
+            warnings.addAll(q.warnings());
+            return new FanOut<>(value);
+        }
     }
+
+    static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
 
     /** Returns the ordered list of available pipelines for UI display. */
     public List<PipelineDescriptor> listPipelines() {
@@ -308,14 +337,23 @@ public class SearchEngine {
             warnings.add("vector search unavailable: " + modelFailure + "; vector results are missing");
         }
         List<String> projects;
-        com.pharos.search.distributed.DistributedSearch ds = distributed;
-        com.pharos.search.distributed.DistributedSearch.Query fanout = ds == null ? null : ds.open(requestedProjects(req));
+        DistributedSearch ds = distributed;
+        DistributedSearch.Query fanout = null;
+        if (ds != null) {
+            try {
+                fanout = ds.open(requestedProjects(req));
+            } catch (CatalogNeverReadException e) { // as before fan-out: this reader's shards
+                warnings.add(CATALOG_UNREAD_WARNING + e.getMessage());
+            }
+        }
         if (fanout != null && fanout.fansOut()) {
-            return searchFannedOut(req, hints, expand, trace, warnings, fanout);
+            try (DistributedSearch.Query q = fanout) {
+                return searchFannedOut(req, hints, expand, trace, warnings, q);
+            }
         } else if (fanout != null && !fanout.unservedShards().isEmpty()) {
             // Shards nobody serves are named, never silently dropped; the held ones search locally.
             warnings.addAll(fanout.warnings());
-            java.util.Set<String> held = java.util.Set.copyOf(fanout.localShards());
+            Set<String> held = Set.copyOf(fanout.localShards());
             boolean explicit = !requestedProjects(req).isEmpty();
             List<String> heldProjects = resolveProjects(req).stream().filter(held::contains).toList();
             projects = usable(heldProjects, explicit && heldProjects.size() == 1, warnings);
@@ -419,13 +457,13 @@ public class SearchEngine {
 
     /**
      * The coordinator path of {@link #searchWithTrace}: the same pipeline, with every retrieval stage
-     * fanned out over the query's shards ({@link com.pharos.search.distributed.DistributedSearch}),
+     * fanned out over the query's shards ({@link DistributedSearch}),
      * then the same boosts, snippets and expansion as the local path. Shards left out are named in
      * the warnings.
      */
     private SearchResponse searchFannedOut(SearchRequest req, QueryHints hints, boolean expand, SearchTrace trace,
                                            List<String> warnings,
-                                           com.pharos.search.distributed.DistributedSearch.Query fanout)
+                                           DistributedSearch.Query fanout)
             throws IOException {
         SearchRequest.SearchType resolvedType = req.type();
         final String resolvedTypeName = resolvedType.name().toLowerCase();
@@ -446,7 +484,10 @@ public class SearchEngine {
 
         if (primary.isEmpty()) {
             warnings.addAll(fanout.warnings());
-            return new SearchResponse(List.of(), trace, resolvedTypeName, null, null, null, List.copyOf(warnings));
+            // Suggestions from the shards held here (cheap: local terms only); none when it holds none.
+            List<String> held = fanout.localShards();
+            ZeroResultAdvisor.Suggestions suggestions = held.isEmpty() ? null : zeroResultAdvisor.advise(req, held);
+            return new SearchResponse(List.of(), trace, resolvedTypeName, suggestions, null, null, List.copyOf(warnings));
         }
         SnippetResolver kwResolver = keywordStrategy.buildKeywordResolver(
                 keywordStrategy.buildQuery(new SearchRequest(
@@ -725,12 +766,8 @@ public class SearchEngine {
     }
 
     private SearchResult getByFqn(String fqn, List<String> warnings) throws IOException {
-        var fanout = graphFanOut(null);
-        if (fanout != null) {
-            SearchResult r = fanout.docs(List.of(fqn)).get(fqn);
-            warnings.addAll(fanout.warnings());
-            return r;
-        }
+        FanOut<SearchResult> fanned = fannedOut(null, warnings, q -> q.docs(List.of(fqn)).get(fqn));
+        if (fanned != null) return fanned.value();
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return null;
 
@@ -764,12 +801,8 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public Map<String, SearchResult> getByFqns(List<String> fqns, List<String> warnings) throws IOException {
         if (fqns.isEmpty()) return Map.of();
-        var fanout = graphFanOut(null);
-        if (fanout != null) {
-            Map<String, SearchResult> r = fanout.docs(fqns);
-            warnings.addAll(fanout.warnings());
-            return r;
-        }
+        FanOut<Map<String, SearchResult>> fanned = fannedOut(null, warnings, q -> q.docs(fqns));
+        if (fanned != null) return fanned.value();
 
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return Map.of();
@@ -815,13 +848,11 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
                                           int maxBodyChars, List<String> warnings) throws IOException {
-        var fanout = graphFanOut(null);
-        List<GraphView> graphs = fanout != null ? List.of() : openAllGraphs(null, warnings);
+        FanOut<BfsResult> fanned = fannedOut(null, warnings,
+                q -> bfsLevels(level -> q.neighbors(level, direction), rootFqn, depth, 50));
+        List<GraphView> graphs = fanned != null ? List.of() : openAllGraphs(null, warnings);
         try {
-            BfsResult bfs = fanout != null
-                    ? bfsLevels(level -> fanout.neighbors(level, direction), rootFqn, depth, 50)
-                    : bfsCallGraph(graphs, rootFqn, depth, direction, 50);
-            if (fanout != null) warnings.addAll(fanout.warnings());
+            BfsResult bfs = fanned != null ? fanned.value() : bfsCallGraph(graphs, rootFqn, depth, direction, 50);
 
             // Bulk-fetch bodies — one Lucene query for all visited FQNs.
             Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()), warnings);
@@ -931,7 +962,7 @@ public class SearchEngine {
      * {@link #bfsCallGraph} for a fan-out: the same traversal (FIFO order is level order), with the
      * neighbours of a whole level fetched in one call per shard.
      */
-    private static BfsResult bfsLevels(java.util.function.Function<List<String>, Map<String, Set<String>>> neighbors,
+    private static BfsResult bfsLevels(Function<List<String>, Map<String, Set<String>>> neighbors,
                                        String rootFqn, int depth, int maxNodes) {
         Map<String, Integer>      fqnDepth    = new LinkedHashMap<>();
         Map<String, List<String>> fqnChildren = new LinkedHashMap<>();
@@ -963,21 +994,16 @@ public class SearchEngine {
      * Callers (or callees) of {@code fqn} over a fan-out's call graphs; empty when this node holds
      * every shard (the caller then reads its local graphs as before).
      */
-    public java.util.Optional<Set<String>> fannedOutNeighbors(String fqn, boolean callers, List<String> warnings) {
-        var fanout = graphFanOut(null);
-        if (fanout == null) return java.util.Optional.empty();
-        Set<String> r = fanout.neighbors(List.of(fqn), callers ? "callers" : "callees").getOrDefault(fqn, Set.of());
-        warnings.addAll(fanout.warnings());
-        return java.util.Optional.of(r);
+    public Optional<Set<String>> fannedOutNeighbors(String fqn, boolean callers, List<String> warnings) {
+        FanOut<Set<String>> fanned = fannedOut(null, warnings,
+                q -> q.neighbors(List.of(fqn), callers ? "callers" : "callees").getOrDefault(fqn, Set.of()));
+        return fanned == null ? Optional.empty() : Optional.of(fanned.value());
     }
 
     /** The shortest call path over a fan-out's shards (first found in shard order); empty when all are held here. */
-    public java.util.Optional<List<String>> fannedOutCallPath(String from, String to, List<String> warnings) {
-        var fanout = graphFanOut(null);
-        if (fanout == null) return java.util.Optional.empty();
-        List<String> p = fanout.callPath(from, to);
-        warnings.addAll(fanout.warnings());
-        return java.util.Optional.of(p);
+    public Optional<List<String>> fannedOutCallPath(String from, String to, List<String> warnings) {
+        FanOut<List<String>> fanned = fannedOut(null, warnings, q -> q.callPath(from, to));
+        return fanned == null ? Optional.empty() : Optional.of(fanned.value());
     }
 
     // -------------------------------------------------------------------------
@@ -1008,15 +1034,13 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
                                                           int maxCallers, List<String> warnings) throws IOException {
-        var fanout = graphFanOut(null);
-        List<GraphView> graphs = fanout != null ? List.of() : openAllGraphs(null, warnings);
+        FanOut<BfsResult> fanned = fannedOut(null, warnings,
+                q -> bfsLevels(level -> q.neighbors(level, "callers"), rootFqn, depth, Math.max(1, maxCallers + 1)));
+        List<GraphView> graphs = fanned != null ? List.of() : openAllGraphs(null, warnings);
         try {
             // +1 to include root in the cap budget, then exclude it from results
-            BfsResult bfs = fanout != null
-                    ? bfsLevels(level -> fanout.neighbors(level, "callers"), rootFqn, depth, Math.max(1, maxCallers + 1))
-                    : bfsCallGraph(graphs, rootFqn, depth, "callers",
+            BfsResult bfs = fanned != null ? fanned.value() : bfsCallGraph(graphs, rootFqn, depth, "callers",
                     Math.max(1, maxCallers + 1));
-            if (fanout != null) warnings.addAll(fanout.warnings());
 
             List<Map.Entry<String, Integer>> callers = bfs.fqnDepth().entrySet().stream()
                     .filter(e -> !e.getKey().equals(rootFqn))   // exclude root itself
@@ -1205,12 +1229,8 @@ public class SearchEngine {
 
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public List<SearchResult> findCallers(String calleeFqn, String project, List<String> warnings) throws IOException {
-        var fanout = graphFanOut(project);
-        if (fanout != null) {
-            List<SearchResult> r = fanout.callers(calleeFqn, 100);
-            warnings.addAll(fanout.warnings());
-            return r;
-        }
+        FanOut<List<SearchResult>> fanned = fannedOut(project, warnings, q -> q.callers(calleeFqn, 100));
+        if (fanned != null) return fanned.value();
         SearchRequest req = SearchRequest.keyword("", project, 100);
         List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) return List.of();
@@ -1232,10 +1252,10 @@ public class SearchEngine {
     public List<SearchResult> findCallees(String callerFqn, String project, List<String> warnings) throws IOException {
         SearchResult caller = getMethodByFqn(callerFqn, warnings);
         if (caller == null) return List.of();
-        var fanout = graphFanOut(project);
-        if (fanout != null) { // callee fqns from the shard holding the caller, their documents from any shard
-            List<String> called = fanout.calleeFqns(callerFqn);
-            warnings.addAll(fanout.warnings());
+        // callee fqns from the shard holding the caller, their documents from any shard
+        FanOut<List<String>> fanned = fannedOut(project, warnings, q -> q.calleeFqns(callerFqn));
+        if (fanned != null) {
+            List<String> called = fanned.value();
             Map<String, SearchResult> docs = getByFqns(called, warnings);
             return called.stream().map(docs::get).filter(r -> r != null).collect(Collectors.toList());
         }
@@ -1411,10 +1431,9 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
-        var fanout = graphFanOut(project);
-        if (fanout != null) {
-            Map<String, List<String>> u = fanout.usages(fqn, kind);
-            warnings.addAll(fanout.warnings());
+        FanOut<Map<String, List<String>>> fanned = fannedOut(project, warnings, q -> q.usages(fqn, kind));
+        if (fanned != null) {
+            Map<String, List<String>> u = fanned.value();
             return new UsageResult(fqn, u.getOrDefault("callers", List.of()),
                     u.getOrDefault("subclasses", List.of()), u.getOrDefault("superTypes", List.of()),
                     u.getOrDefault("fieldReaders", List.of()), u.getOrDefault("fieldWriters", List.of()),

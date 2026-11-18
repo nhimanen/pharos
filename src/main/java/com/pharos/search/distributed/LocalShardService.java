@@ -5,6 +5,10 @@ import com.pharos.cluster.internal.CalleesRequest;
 import com.pharos.cluster.internal.CalleesResponse;
 import com.pharos.cluster.internal.GraphRequest;
 import com.pharos.cluster.internal.GraphResponse;
+import com.pharos.cluster.internal.ModelMismatchException;
+import com.pharos.config.IndexConfig;
+import com.pharos.config.ProjectMeta;
+import com.pharos.config.ProjectRegistry;
 import com.pharos.cluster.internal.ShardSearchRequest;
 import com.pharos.cluster.internal.ShardSearchResponse;
 import com.pharos.cluster.internal.ShardSearchService;
@@ -68,25 +72,48 @@ public final class LocalShardService implements ShardSearchService {
 
     private static final Pattern GEN_DIR = Pattern.compile("gen-(\\d{1,18})");
 
-    /** One shard pinned for one operation: the generation and the reader of that generation. */
-    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) {}
+    /**
+     * One shard pinned: the generation and the reader of that generation, holding a reference on the
+     * reader until {@link #close} (a swap retires the reader; it is closed only once released).
+     */
+    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) implements AutoCloseable {
+        @Override
+        public void close() throws IOException {
+            reader.decRef();
+        }
+    }
+
+    /** What a node knows of the search embedding model it serves vectors for. */
+    public record Model(String modelId, int dims, String fingerprint) {}
 
     private final LuceneIndexer lucene;
     private final Predicate<String> serves;
     private final KeywordSearchStrategy keyword;
     private final VectorSearchStrategy vector;
     private final UnifiedRetrievalStage unified;
+    private final ProjectRegistry registry;
+    private final Model model;
 
     /**
-     * @param serves whether this node holds a shard (on readers: an active generation)
+     * @param serves   whether this node holds a shard (on readers: an active generation)
+     * @param registry the node's project registry: which embedding models each shard has vectors for
+     * @param model    this node's search model ({@code fingerprint} may be null: not compared)
      */
     public LocalShardService(LuceneIndexer lucene, Predicate<String> serves, KeywordSearchStrategy keyword,
-                             VectorSearchStrategy vector, UnifiedRetrievalStage unified) {
+                             VectorSearchStrategy vector, UnifiedRetrievalStage unified, ProjectRegistry registry,
+                             Model model) {
         this.lucene = lucene;
         this.serves = serves;
         this.keyword = keyword;
         this.vector = vector;
         this.unified = unified;
+        this.registry = registry;
+        this.model = model;
+    }
+
+    /** This node's search model. */
+    public Model model() {
+        return model;
     }
 
     public KeywordSearchStrategy keyword() {
@@ -104,11 +131,45 @@ public final class LocalShardService implements ShardSearchService {
         return OptionalLong.of(generationOf(lucene.getProjectIndexDir(shard.value())));
     }
 
-    /** Pins the shard's current reader and its generation. */
+    /** Pins the shard's current reader and its generation, holding a reference: close the pin. */
     public Pin pin(ShardId shard) throws IOException {
-        LuceneIndexer.PinnedReader p = lucene.openPinnedReader(shard.value());
-        Path shardDir = p.luceneDir().getParent();
-        return new Pin(shard, generationOf(shardDir), p.reader(), shardDir);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            LuceneIndexer.PinnedReader p = lucene.openPinnedReader(shard.value());
+            if (!p.reader().tryIncRef()) continue; // closed between the open and here: take the new one
+            Path shardDir = p.luceneDir().getParent();
+            return new Pin(shard, generationOf(shardDir), p.reader(), shardDir);
+        }
+        throw new IOException("the reader of shard " + shard + " kept closing while being pinned");
+    }
+
+    /**
+     * Refuses a vector request this shard cannot answer with the coordinator's model, as a single
+     * node refuses a vector search on a project without vectors of its model.
+     */
+    void checkModel(ShardId shard, String modelId, int dims, String fingerprint) {
+        if (modelId == null) return;
+        ProjectMeta meta = registry == null ? null : registry.find(shard.value()).orElse(null);
+        if (meta != null) {
+            List<String> embedded = meta.getEmbeddedModels();
+            boolean has = embedded.contains(modelId)
+                    || (embedded.isEmpty() && IndexConfig.LEGACY_MODEL_ID.equals(modelId));
+            if (!has) {
+                throw new ModelMismatchException("no vectors for model " + modelId + " (has: "
+                        + (embedded.isEmpty() ? "<legacy / none recorded>" : String.join(", ", embedded)) + ")");
+            }
+        }
+        if (model == null) return;
+        if (!modelId.equals(model.modelId())) {
+            throw new ModelMismatchException("this reader searches with model " + model.modelId() + ", not " + modelId);
+        }
+        if (dims > 0 && model.dims() > 0 && dims != model.dims()) {
+            throw new ModelMismatchException("model " + modelId + " has " + model.dims() + " dimensions here, "
+                    + dims + " at the coordinator");
+        }
+        if (fingerprint != null && model.fingerprint() != null && !fingerprint.equals(model.fingerprint())) {
+            throw new ModelMismatchException("model " + modelId + " is configured differently here (fingerprint "
+                    + model.fingerprint() + " vs " + fingerprint + ")");
+        }
     }
 
     /** {@code gen-N} → N; 0 for a shard dir that is not a generation dir (a single node's project dir). */
@@ -134,13 +195,14 @@ public final class LocalShardService implements ShardSearchService {
     @Override
     public TermStatsResponse termStats(TermStatsRequest request) throws IOException {
         checkSynonyms(request.synonymsHash());
-        Pin pin = pin(new ShardId(request.shard()));
         List<Term> terms = new ArrayList<>();
         if (request.terms() != null) {
             for (TermStatsRequest.Term t : request.terms()) terms.add(new Term(t.field(), t.text()));
         }
         List<String> fields = request.fields() == null ? List.of() : request.fields();
-        return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms));
+        try (Pin pin = pin(new ShardId(request.shard()))) {
+            return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms));
+        }
     }
 
     /** The pinned shard's statistics of {@code fields} and {@code terms}. */
@@ -153,9 +215,14 @@ public final class LocalShardService implements ShardSearchService {
     @Override
     public ShardSearchResponse searchRaw(ShardSearchRequest request) throws IOException {
         checkSynonyms(request.synonymsHash());
-        Pin pin = pin(new ShardId(request.shard()));
-        if (other(request.generation(), pin)) return new ShardSearchResponse(pin.generation(), 1, List.of());
-        return search(pin, request.retriever(), request.request(), request.queryVector(), request.globalStats());
+        if (request.queryVector() != null && !"keyword".equals(request.retriever())) {
+            checkModel(new ShardId(request.shard()), request.modelId(), request.dims(), request.modelFingerprint());
+        }
+        try (Pin pin = pin(new ShardId(request.shard()))) {
+            if (other(request.generation(), pin)) return new ShardSearchResponse(pin.generation(), 1, List.of());
+            return search(pin, request.retriever(), request.request(), request.queryVector(), request.globalStats(),
+                    request.selected(), request.selectedKnn(), request.chunkVectors());
+        }
     }
 
     /**
@@ -164,11 +231,43 @@ public final class LocalShardService implements ShardSearchService {
      */
     public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
                                       GlobalStats stats) throws IOException {
+        return search(pin, retriever, req, queryVector, stats, null, null, false);
+    }
+
+    /** As above, with the two-round retrievers' selections (see {@code ShardSearchRequest}). */
+    public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
+                                      GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
+                                      boolean chunkVectors) throws IOException {
         IndexSearcher searcher = stats == null ? new IndexSearcher(pin.reader())
                 : new GlobalStatsSearcher(pin.reader(), stats);
         List<RawCandidate> raw;
         String intent = null;
         switch (retriever == null ? "" : retriever) {
+            case "vector-knn" -> {
+                if (queryVector == null) return ShardSearchResponse.recall(pin.generation(), List.of(), List.of(), false);
+                return ShardSearchResponse.recall(pin.generation(),
+                        scoredIds(searcher, vector.firstPass(searcher, req, queryVector)), List.of(),
+                        vector.hasChunkVectors(pin.reader()));
+            }
+            case "unified-recall" -> {
+                List<ScoredId> bm25 = scoredIds(searcher, unified.bm25Recall(searcher, req));
+                List<ScoredId> knn = queryVector == null ? List.of()
+                        : scoredIds(searcher, unified.knnRecall(searcher, req, queryVector));
+                return ShardSearchResponse.recall(pin.generation(), bm25, knn, false);
+            }
+            case "vector-rescore" -> {
+                ScoreDoc[] sel = select(searcher, selected);
+                raw = vector.finish(searcher, new TopDocs(new org.apache.lucene.search.TotalHits(sel.length,
+                        org.apache.lucene.search.TotalHits.Relation.EQUAL_TO), sel), queryVector, req.limit(), chunkVectors);
+            }
+            case "unified-rescore" -> {
+                searcher.setSimilarity(new org.apache.lucene.search.similarities.BM25Similarity());
+                UnifiedRetrievalStage.RawRetrieval r = queryVector == null
+                        ? unified.bm25Only(searcher, req, select(searcher, selected))
+                        : unified.rescore(searcher, req, queryVector, select(searcher, selected), select(searcher, selectedKnn));
+                raw = r.candidates();
+                intent = r.shapingIntent();
+            }
             case "keyword" -> raw = keyword.retrieveRaw(searcher, req);
             case "vector" -> raw = queryVector == null ? List.of() : vector.retrieveRaw(searcher, req, queryVector);
             case "unified" -> {
@@ -183,14 +282,46 @@ public final class LocalShardService implements ShardSearchService {
         return new ShardSearchResponse(pin.generation(), maxInDegree, raw, intent);
     }
 
+    /** The stable ids and scores of {@code hits}, in order. */
+    private static List<ScoredId> scoredIds(IndexSearcher searcher, TopDocs hits) throws IOException {
+        StoredFields stored = searcher.storedFields();
+        List<ScoredId> out = new ArrayList<>(hits.scoreDocs.length);
+        for (ScoreDoc sd : hits.scoreDocs) {
+            out.add(new ScoredId(stored.document(sd.doc, Set.of(DocumentMapper.F_ID)).get(DocumentMapper.F_ID),
+                    sd.doc, sd.score));
+        }
+        return out;
+    }
+
+    /**
+     * The selected documents of this shard as score docs, in the given order with the given scores:
+     * by doc id (stable within the pinned generation), each checked against its stored id.
+     */
+    private static ScoreDoc[] select(IndexSearcher searcher, List<ScoredId> ids) throws IOException {
+        if (ids == null || ids.isEmpty()) return new ScoreDoc[0];
+        StoredFields stored = searcher.storedFields();
+        int maxDoc = searcher.getIndexReader().maxDoc();
+        List<ScoreDoc> out = new ArrayList<>(ids.size());
+        for (ScoredId i : ids) {
+            if (i.doc() < 0 || i.doc() >= maxDoc
+                    || !i.id().equals(stored.document(i.doc(), Set.of(DocumentMapper.F_ID)).get(DocumentMapper.F_ID))) {
+                throw new IllegalStateException("selected document " + i.doc() + " is not '" + i.id()
+                        + "' in this generation");
+            }
+            out.add(new ScoreDoc(i.doc(), i.score()));
+        }
+        return out.toArray(new ScoreDoc[0]);
+    }
+
     // ── snippets ──────────────────────────────────────────────────────────────
 
     @Override
     public SnippetsResponse snippets(SnippetsRequest request) throws IOException {
-        Pin pin = pin(new ShardId(request.shard()));
-        if (other(request.generation(), pin)) return new SnippetsResponse(pin.generation(), Map.of());
-        return new SnippetsResponse(pin.generation(),
-                snippets(pin, request.ids(), request.query(), request.queryVector()));
+        try (Pin pin = pin(new ShardId(request.shard()))) {
+            if (other(request.generation(), pin)) return new SnippetsResponse(pin.generation(), Map.of());
+            return new SnippetsResponse(pin.generation(),
+                    snippets(pin, request.ids(), request.query(), request.queryVector()));
+        }
     }
 
     /**
@@ -219,9 +350,10 @@ public final class LocalShardService implements ShardSearchService {
 
     @Override
     public CalleesResponse callees(CalleesRequest request) throws IOException {
-        Pin pin = pin(new ShardId(request.shard()));
-        if (other(request.generation(), pin)) return new CalleesResponse(pin.generation(), Map.of());
-        return new CalleesResponse(pin.generation(), callees(pin, request.fqns()));
+        try (Pin pin = pin(new ShardId(request.shard()))) {
+            if (other(request.generation(), pin)) return new CalleesResponse(pin.generation(), Map.of());
+            return new CalleesResponse(pin.generation(), callees(pin, request.fqns()));
+        }
     }
 
     /** The called methods (stored {@code calledMethods}) of each {@code fqn} found on the pinned shard. */
@@ -243,9 +375,10 @@ public final class LocalShardService implements ShardSearchService {
 
     @Override
     public GraphResponse graph(GraphRequest request) throws IOException {
-        Pin pin = pin(new ShardId(request.shard()));
-        if (other(request.generation(), pin)) return new GraphResponse(pin.generation(), null, null, null);
-        return graph(pin, request);
+        try (Pin pin = pin(new ShardId(request.shard()))) {
+            if (other(request.generation(), pin)) return new GraphResponse(pin.generation(), null, null, null);
+            return graph(pin, request);
+        }
     }
 
     /** One {@link GraphRequest} operation over the pinned shard (its call graph is the pinned generation's). */
@@ -257,7 +390,8 @@ public final class LocalShardService implements ShardSearchService {
             case "called" -> new GraphResponse(pin.generation(), callees(pin, fqns), null, null);
             case "callers" -> {
                 if (fqns.isEmpty()) yield new GraphResponse(pin.generation(), null, null, null);
-                IndexSearcher searcher = new IndexSearcher(pin.reader());
+                IndexSearcher searcher = request.globalStats() == null ? new IndexSearcher(pin.reader())
+                        : new GlobalStatsSearcher(pin.reader(), request.globalStats());
                 TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_CALLED_METHODS, fqns.get(0))),
                         Math.max(1, request.limit()));
                 yield new GraphResponse(pin.generation(), null, null,

@@ -52,18 +52,41 @@ final class TestReaderNode implements AutoCloseable {
     private final Javalin app;
     private boolean killed;
 
+    /** Every {@code /internal} call whose path contains this stalls {@link #stallMillis} first. */
+    volatile String stallPath;
+    volatile long stallMillis;
+    /** Armed: once this node has answered a term-stats call, every later call gets 503 (it "died"). */
+    volatile boolean dieAfterStats;
+    private volatile boolean died;
+
     TestReaderNode(Path home, ObjectStore store, String bucket, String id, List<String> pin,
                    EmbeddingProvider embedder, String synonyms) throws Exception {
+        this(home, store, bucket, id, pin, embedder, synonyms, c -> { });
+    }
+
+    TestReaderNode(Path home, ObjectStore store, String bucket, String id, List<String> pin,
+                   EmbeddingProvider embedder, String synonyms,
+                   java.util.function.Consumer<com.pharos.config.ClusterConfig> tune) throws Exception {
         this.id = id;
-        this.parts = ClusterFixture.reader(home, store, bucket, id, pin);
+        this.parts = ClusterFixture.reader(home, store, bucket, id, pin, tune);
         this.configBase = Files.createDirectories(home.resolve("config"));
         if (synonyms != null) Files.writeString(configBase.resolve("synonyms.txt"), synonyms);
         this.engine = new SearchEngine(parts.lucene(), embedder, parts.registry(), new NoOpCrossEncoder(),
                 new FstQueryClassifier(), configBase);
         InternalApi api = parts.runtime().internalApi(engine);
         app = Javalin.create(c -> c.http.maxRequestSize = InternalApi.MAX_BODY_BYTES);
-        app.after("/internal/*", ctx -> calls.add(new Call(id, ctx.path(), ctx.body(), ctx.statusCode(),
-                ctx.result())));
+        app.before("/internal/*", ctx -> {
+            String sp = stallPath;
+            if (sp != null && ctx.path().contains(sp)) Thread.sleep(stallMillis);
+            if (died) {
+                ctx.status(503).result("{\"error\":\"dead\"}");
+                ctx.skipRemainingHandlers();
+            }
+        });
+        app.after("/internal/*", ctx -> {
+            calls.add(new Call(id, ctx.path(), ctx.body(), ctx.statusCode(), ctx.result()));
+            if (dieAfterStats && ctx.path().endsWith("/term-stats") && ctx.statusCode() == 200) died = true;
+        });
         api.mount(app);
         app.start(0);
         parts.config().getCluster().setAdvertiseUrl("http://localhost:" + app.port());
@@ -95,6 +118,10 @@ final class TestReaderNode implements AutoCloseable {
             if (System.nanoTime() > deadline) throw new AssertionError(id + " sees fewer than " + readers + " readers of " + shard);
             Thread.sleep(100);
         }
+    }
+
+    DistributedSearch ds() {
+        return parts.runtime().distributedSearch();
     }
 
     McpToolRegistry mcp() {

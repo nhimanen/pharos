@@ -39,14 +39,24 @@ public class InMemoryObjectStore implements ObjectStore {
     public void failMidBodyOn(String keySubstring) { midBodyFailSubstrings.add(keySubstring); }
 
     /** Removes all failure hooks. */
-    public void clearFailures() { failSubstrings.clear(); midBodyFailSubstrings.clear(); }
+    public void clearFailures() { failGetSubstrings.clear(); failSubstrings.clear(); midBodyFailSubstrings.clear(); }
 
     private Entry newEntry(byte[] data) {
         return new Entry(data.clone(), "\"" + UUID.randomUUID() + "\"", clock.instant());
     }
 
+    private final Set<String> failGetSubstrings = ConcurrentHashMap.newKeySet();
+
+    /** Makes any later {@code get} whose key contains {@code keySubstring} fail (until cleared). */
+    public void failGetOn(String keySubstring) { failGetSubstrings.add(keySubstring); }
+
     @Override
     public Optional<StoredObject> get(String key) {
+        for (String s : failGetSubstrings) { // unchecked: subclasses override get without a throws clause
+            if (key.contains(s)) {
+                throw new java.io.UncheckedIOException(new IOException("injected get failure for key: " + key));
+            }
+        }
         Entry e = map.get(key);
         return e == null ? Optional.empty() : Optional.of(new StoredObject(e.data().clone(), e.etag()));
     }

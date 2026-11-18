@@ -306,4 +306,20 @@ class ClusterConfigTest {
         }
         assertThatCode(() -> parse(reader.formatted("https://r.example:7171"))).doesNotThrowAnyException();
     }
+
+    @Test
+    void queryTimeoutDefaultsAndBounds() throws Exception {
+        ClusterConfig c = parse("{}");
+        assertThat(c.effectiveQueryTimeoutMillis()).isEqualTo(20_000);
+        assertThat(c.getMaxCatalogAgeSeconds()).isEqualTo(600);
+        assertThat(parse("{\"cluster\":{\"retireGraceSeconds\":25,\"fanoutTimeoutMillis\":25000}}")
+                .effectiveQueryTimeoutMillis()).as("unset: raised to the fan-out timeout").isEqualTo(25_000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"queryTimeoutMillis\":4000}}"))
+                .hasMessageContaining("cluster.queryTimeoutMillis").hasMessageContaining("cluster.fanoutTimeoutMillis");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"queryTimeoutMillis\":60000}}"))
+                .hasMessageContaining("cluster.queryTimeoutMillis").hasMessageContaining("60000 ms");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"maxCatalogAgeSeconds\":0}}"))
+                .hasMessageContaining("cluster.maxCatalogAgeSeconds");
+        assertThat(parse("{\"cluster\":{\"queryTimeoutMillis\":5000}}").effectiveQueryTimeoutMillis()).isEqualTo(5000);
+    }
 }

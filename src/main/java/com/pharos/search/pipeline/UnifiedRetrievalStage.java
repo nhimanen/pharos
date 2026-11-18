@@ -150,20 +150,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
     private RawRetrieval retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] givenVec,
                             boolean embedHere, SearchTrace trace) throws IOException {
         long t0 = System.currentTimeMillis();
-        int  candidateSize = req.limit() * OVERSAMPLE;
-        // The BM25 recall pass scores with plain BM25 (an IndexSearcher's default), whatever the
-        // searcher was set to before.
-        searcher.setSimilarity(new BM25Similarity());
-
-        // ── BM25 recall pass ──────────────────────────────────────────────────
-        Query bm25Query = keywordStrategy.buildQuery(new SearchRequest(
-                req.query(), SearchRequest.SearchType.KEYWORD, req.project(),
-                req.projects(), candidateSize, req.outputFormat(),
-                req.docType(), req.scope(), req.oversampleFactor()));
-
-        TopDocs bm25Docs = (bm25Query != null)
-                ? searcher.search(bm25Query, candidateSize)
-                : new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
+        TopDocs bm25Docs = bm25Recall(searcher, req);
 
         if (embedHere && !embedder.isAvailable()) {
             traceStep(trace, "unified retrieval (bm25 only — no embedder)", t0);
@@ -177,20 +164,59 @@ public class UnifiedRetrievalStage implements RetrievalStage {
             return bm25Only(searcher, req, bm25Docs);
         }
 
-        // ── KNN recall pass ───────────────────────────────────────────────────
+        TopDocs knnDocs = knnRecall(searcher, req, queryVec);
+        RawRetrieval out = rescore(searcher, req, queryVec, bm25Docs.scoreDocs, knnDocs.scoreDocs);
+        traceStep(trace, "unified retrieval (bm25∪knn → vector rerank, intent=" + out.shapingIntent() + ")", t0);
+        return out;
+    }
+
+    /** Candidates each recall pass fetches for a result limit. */
+    public static int candidateSize(int limit) {
+        return limit * OVERSAMPLE;
+    }
+
+    /**
+     * The BM25 recall pass: the top {@link #candidateSize} by plain BM25 (an IndexSearcher's
+     * default), whatever the searcher was set to before. Sets the similarity on {@code searcher}.
+     */
+    public TopDocs bm25Recall(IndexSearcher searcher, SearchRequest req) throws IOException {
+        int  candidateSize = candidateSize(req.limit());
+        searcher.setSimilarity(new BM25Similarity());
+
+        Query bm25Query = keywordStrategy.buildQuery(new SearchRequest(
+                req.query(), SearchRequest.SearchType.KEYWORD, req.project(),
+                req.projects(), candidateSize, req.outputFormat(),
+                req.docType(), req.scope(), req.oversampleFactor()));
+
+        return (bm25Query != null)
+                ? searcher.search(bm25Query, candidateSize)
+                : new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
+    }
+
+    /** The KNN recall pass: the top {@link #candidateSize} by document-vector similarity. */
+    public TopDocs knnRecall(IndexSearcher searcher, SearchRequest req, float[] queryVec) throws IOException {
+        int candidateSize = candidateSize(req.limit());
         Query filter = buildFilter(req);
         Query knnQuery = filter != null
                 ? new KnnFloatVectorQuery(vectorField, queryVec, candidateSize, filter)
                 : new KnnFloatVectorQuery(vectorField, queryVec, candidateSize);
-        TopDocs knnDocs = searcher.search(knnQuery, candidateSize);
+        return searcher.search(knnQuery, candidateSize);
+    }
 
+    /**
+     * The union of the two recall passes' candidates (BM25 order first, then KNN-only ones), rescored
+     * by late interaction with the intent's BM25 bonus; the top {@code req.limit()} with the intent to
+     * shape them with. A coordinator passes the globally selected candidates of one shard.
+     */
+    public RawRetrieval rescore(IndexSearcher searcher, SearchRequest req, float[] queryVec, ScoreDoc[] bm25,
+                                ScoreDoc[] knn) throws IOException {
         // ── Union (BM25 ∪ KNN) ────────────────────────────────────────────────
         // Key: Lucene internal doc ID.  Value: BM25 score (0 for KNN-only hits).
         // LinkedHashMap preserves BM25 insertion order (higher BM25 scores first)
         // so that for ties in vector score the BM25 ordering is a stable tiebreaker.
         Map<Integer, Float> unionMap = new LinkedHashMap<>();
-        for (ScoreDoc sd : bm25Docs.scoreDocs) unionMap.put(sd.doc, sd.score);
-        for (ScoreDoc sd : knnDocs.scoreDocs)  unionMap.putIfAbsent(sd.doc, 0f);
+        for (ScoreDoc sd : bm25) unionMap.put(sd.doc, sd.score);
+        for (ScoreDoc sd : knn)  unionMap.putIfAbsent(sd.doc, 0f);
 
         ScoreDoc[] unionArray = new ScoreDoc[unionMap.size()];
         int idx = 0;
@@ -211,9 +237,12 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
         TopDocs reranked = new UnifiedRescorer(chunkVectorField, queryMultiVec, bm25Bonus)
                 .rescore(searcher, unionDocs, req.limit());
-
-        traceStep(trace, "unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
         return new RawRetrieval(KeywordSearchStrategy.rawCandidates(searcher, reranked, TYPE), intentLabel);
+    }
+
+    /** The BM25-only result (no query vector): the BM25 recall candidates trimmed to the limit. */
+    public RawRetrieval bm25Only(IndexSearcher searcher, SearchRequest req, ScoreDoc[] bm25) throws IOException {
+        return bm25Only(searcher, req, new TopDocs(new TotalHits(bm25.length, TotalHits.Relation.EQUAL_TO), bm25));
     }
 
     /** The BM25 recall pass trimmed to the limit, shaped without an intent. */

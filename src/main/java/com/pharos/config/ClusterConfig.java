@@ -44,6 +44,17 @@ public class ClusterConfig {
     private int fanoutTimeoutMillis = 5000;
     /** Connect timeout of an internal shard call; a dead reader fails this fast. */
     private int connectTimeoutMillis = 1000;
+    /**
+     * Budget of one fanned-out query, every shard round included; 0 means the default
+     * ({@link #DEFAULT_QUERY_TIMEOUT_MILLIS}, or {@code fanoutTimeoutMillis} when that is larger).
+     */
+    private int queryTimeoutMillis = 0;
+    /** How old the last good read of the shard catalog may get before unscoped routing is refused. */
+    private int maxCatalogAgeSeconds = 600;
+
+    public static final int DEFAULT_QUERY_TIMEOUT_MILLIS = 20_000;
+    /** A pinned local reader is retired this long after a swap: a query must finish well before. */
+    static final long RETIRE_DELAY_MILLIS = com.pharos.indexer.LuceneIndexer.RETIRE_DELAY.toMillis();
 
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
@@ -100,6 +111,22 @@ public class ClusterConfig {
         }
         if (connectTimeoutMillis <= 0) {
             throw new IllegalStateException("cluster.connectTimeoutMillis must be positive, got " + connectTimeoutMillis);
+        }
+        if (queryTimeoutMillis < 0) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis must not be negative (0 = default), got "
+                    + queryTimeoutMillis);
+        }
+        if (queryTimeoutMillis > 0 && queryTimeoutMillis < fanoutTimeoutMillis) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis (" + queryTimeoutMillis
+                    + ") must be at least cluster.fanoutTimeoutMillis (" + fanoutTimeoutMillis + ")");
+        }
+        if (effectiveQueryTimeoutMillis() >= RETIRE_DELAY_MILLIS) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis (effective " + effectiveQueryTimeoutMillis()
+                    + " ms, from cluster.fanoutTimeoutMillis when unset) must stay below " + RETIRE_DELAY_MILLIS
+                    + " ms, how long a swapped-out index reader stays open");
+        }
+        if (maxCatalogAgeSeconds <= 0) {
+            throw new IllegalStateException("cluster.maxCatalogAgeSeconds must be positive, got " + maxCatalogAgeSeconds);
         }
         if (retireGraceSeconds * 1000L < fanoutTimeoutMillis) {
             throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
@@ -191,6 +218,14 @@ public class ClusterConfig {
     public int getFanoutTimeoutMillis() { return fanoutTimeoutMillis; }
     public void setFanoutTimeoutMillis(int v) { this.fanoutTimeoutMillis = v; }
     public int getConnectTimeoutMillis() { return connectTimeoutMillis; }
+    public int getQueryTimeoutMillis() { return queryTimeoutMillis; }
+    public void setQueryTimeoutMillis(int v) { this.queryTimeoutMillis = v; }
+    /** {@code queryTimeoutMillis}, or its default when unset (0): 20000, or {@code fanoutTimeoutMillis} if larger. */
+    public int effectiveQueryTimeoutMillis() {
+        return queryTimeoutMillis > 0 ? queryTimeoutMillis : Math.max(DEFAULT_QUERY_TIMEOUT_MILLIS, fanoutTimeoutMillis);
+    }
+    public int getMaxCatalogAgeSeconds() { return maxCatalogAgeSeconds; }
+    public void setMaxCatalogAgeSeconds(int v) { this.maxCatalogAgeSeconds = v; }
     public void setConnectTimeoutMillis(int v) { this.connectTimeoutMillis = v; }
     public int getReaderTtlSeconds() { return readerTtlSeconds; }
     public void setReaderTtlSeconds(int v) { this.readerTtlSeconds = v; }

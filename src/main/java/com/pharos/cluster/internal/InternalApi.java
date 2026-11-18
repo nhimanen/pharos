@@ -31,6 +31,8 @@ public final class InternalApi {
     public static final int MAX_VECTOR_LENGTH = 4096;
     /** The {@code error} of a 409 refusing a request analysed with other synonyms. */
     public static final String SYNONYMS_MISMATCH = "synonyms mismatch";
+    /** The {@code error} of a 409 refusing a vector request the shard has no vectors for. */
+    public static final String MODEL_MISMATCH = "model mismatch";
 
     /** Null until the shard search is wired: authenticated calls then get 503 and fail over. */
     private volatile ShardSearchService service;
@@ -147,6 +149,9 @@ public final class InternalApi {
                 return;
             }
             ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
+        } catch (ModelMismatchException e) {
+            ctx.status(409).contentType("application/json")
+                    .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage())));
         } catch (SynonymsMismatchException e) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));

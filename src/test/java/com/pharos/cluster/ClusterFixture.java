@@ -130,6 +130,12 @@ public final class ClusterFixture implements AutoCloseable {
      * reader: its backend over {@code store}, registry, indexer and runtime. Not started.
      */
     public static ReaderParts reader(Path home, ObjectStore store, String bucket, String nodeId, List<String> pin) {
+        return reader(home, store, bucket, nodeId, pin, c -> { });
+    }
+
+    /** As above, {@code tune} adjusting the cluster config (timeouts) before it is validated. */
+    public static ReaderParts reader(Path home, ObjectStore store, String bucket, String nodeId, List<String> pin,
+                                     java.util.function.Consumer<com.pharos.config.ClusterConfig> tune) {
         IndexConfig config = config(home, NodeRole.READER, bucket);
         config.getCluster().setNodeId(nodeId);
         config.getCluster().getReader().setShards(pin);
@@ -137,6 +143,7 @@ public final class ClusterFixture implements AutoCloseable {
         config.getCluster().setReaderTtlSeconds(30);
         config.getCluster().setFanoutTimeoutMillis(3000);
         config.getCluster().setConnectTimeoutMillis(500);
+        tune.accept(config.getCluster());
         config.getCluster().validate();
         ReplicationBackend backend = TestBackends.objectStore(config, store);
         ProjectRegistry registry = ClusterRuntime.registryFor(config);
