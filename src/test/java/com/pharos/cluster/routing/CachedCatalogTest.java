@@ -99,4 +99,27 @@ class CachedCatalogTest {
             ds.close();
         }
     }
+
+    /** Fix round 2: a background read that hangs is given up after hungAfter; a late finish of it cannot clear the new one. */
+    @Test
+    void hungRefreshIsGivenUpAndALateFinishDoesNotClearTheNewOne() throws Exception {
+        CachedCatalog c = new CachedCatalog(store, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                refreshes::add, Duration.ofSeconds(10));
+        c.shards();
+        now.addAndGet(6 * S);
+        c.shards();
+        assertThat(refreshes).hasSize(1); // started, never finishes
+        now.addAndGet(5 * S);
+        c.shards();
+        assertThat(refreshes).as("still within hungAfter: no second read").hasSize(1);
+        now.addAndGet(6 * S);
+        c.shards();
+        assertThat(refreshes).as("hung for 11 s: given up, a new read started").hasSize(2);
+        refreshes.remove(0).run(); // the hung one finally returns
+        now.addAndGet(5 * S);
+        c.shards();
+        assertThat(refreshes).as("the new read still counts as running").hasSize(1);
+        refreshes.remove(0).run();
+        assertThat(c.ageSeconds()).isZero();
+    }
 }

@@ -284,7 +284,9 @@ public final class ClusterRuntime implements Closeable {
                 Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));
         var catalog = new com.pharos.cluster.routing.CachedCatalog(backend.catalog(), CATALOG_CACHE,
                 Duration.ofSeconds(c.getMaxCatalogAgeSeconds()), System::nanoTime,
-                r -> Thread.ofVirtual().name("pharos-catalog-refresh").start(r));
+                r -> Thread.ofVirtual().name("pharos-catalog-refresh").start(r),
+                c.getObjectStore() == null ? Duration.ofSeconds(60)
+                        : c.getObjectStore().readTotalTimeout().multipliedBy(2)); // the store's own bound, with slack
         var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, catalog, health,
                 id -> servesShard(id.value()), client::inFlight);
         var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),

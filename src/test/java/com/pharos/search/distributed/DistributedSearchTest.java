@@ -326,6 +326,9 @@ class DistributedSearchTest {
         calls.addAll(all.drainCalls());
         assertThat(calls).as("a searched sample-app remotely").isNotEmpty()
                 .allSatisfy(c -> assertThat(c.shard()).isEqualTo(JAVA));
+        assertThat(calls).as("one shard: single-round retrieval, no second round trip")
+                .noneSatisfy(c -> assertThat(c.requestJson().path("retriever").asText())
+                        .matches(".*-(knn|recall|rescore)"));
         assertThat(a.drainCalls()).as("b never asked: it holds the shard").isEmpty();
     }
 
@@ -679,6 +682,38 @@ class DistributedSearchTest {
             SearchResponse scoped = search(s.coordinator(), "Calculator", SearchType.KEYWORD, JAVA, 10);
             assertThat(scoped.results()).as("a scoped query needs no catalog").isNotEmpty()
                     .allSatisfy(x -> assertThat(x.project()).isEqualTo(JAVA));
+        }
+    }
+
+    /**
+     * Fix round 2: past cluster.maxCatalogAgeSeconds a reader answers from the shards it holds (all of
+     * them: complete results) with a warning naming the catalog's age and the shards not searched.
+     */
+    @Test
+    void tooOldCatalogAnswersFromTheShardsHeldHere() throws Exception {
+        try (Small s = small(1, null, EMBEDDER, cfg -> cfg.setMaxCatalogAgeSeconds(1));
+             TestReaderNode full = new TestReaderNode(tmp.resolve("full"), s.store(), BUCKET, "full", List.of(),
+                     EMBEDDER, null, cfg -> cfg.setMaxCatalogAgeSeconds(1))) {
+            full.awaitShard(JAVA, 2);
+            full.awaitShard(PY, 2);
+            String q = "GreetingService multiply";
+            List<String> fullBefore = ids(search(full, q, SearchType.KEYWORD, null, 10).results());
+            assertThat(search(s.coordinator(), q, SearchType.KEYWORD, null, 10).warnings()).isEmpty(); // catalog read
+            s.store().failGetOn("catalog/shards.json");
+            Thread.sleep(2_200);
+
+            SearchResponse onFull = search(full, q, SearchType.KEYWORD, null, 10);
+            assertThat(ids(onFull.results())).as("holds every shard: complete").isEqualTo(fullBefore);
+            assertThat(onFull.warnings()).singleElement().asString()
+                    .startsWith("searching only this reader's shards: the shard catalog was last read")
+                    .doesNotContain("not searched");
+            assertThat(full.engine.findCallers("com.example.model.User#getName()", null, new ArrayList<>()))
+                    .as("graph ops too").isNotEmpty();
+
+            SearchResponse onPinned = search(s.coordinator(), q, SearchType.KEYWORD, null, 10);
+            assertThat(onPinned.results()).isNotEmpty().allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
+            assertThat(onPinned.warnings()).singleElement().asString()
+                    .contains("over cluster.maxCatalogAgeSeconds").endsWith("; not searched: " + JAVA);
         }
     }
 }

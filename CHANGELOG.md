@@ -54,12 +54,14 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   reach shards held elsewhere through `/internal/graph`. A shard no reader can answer for is named
   in the response warnings (`shard <name> unavailable: <reason>; results exclude it`); the other
   shards still answer. Coordinator and shard must use the same `synonyms.txt` (a shard refuses
-  otherwise, 409). An invalid project name answers 400 and an unreadable shard catalog 503.
+  otherwise, 409). An invalid project name answers 400 (an unusable shard catalog maps to 503 where no answer from local shards is possible).
   Vector first passes and unified recall pools are merged in two rounds (global top candidates,
   then rescored on their shards), so fan-out rankings equal a single node's. New config:
   `cluster.queryTimeoutMillis` (default 20000: one budget for all rounds of a query) and
-  `cluster.maxCatalogAgeSeconds` (600). A shard without vectors of the coordinator's model is named
-  in a warning and left out of vector retrieval.
+  `cluster.maxCatalogAgeSeconds` (600: past it, or before the catalog was first read, unscoped
+  queries answer from the reader's own shards with a warning naming the shards not searched). A
+  shard without vectors of the coordinator's model is named in a warning and left out of vector and
+  unified retrieval.
 
 ### Changed
 - Config validation: `cluster.retireGraceSeconds` must be at least `2 x cluster.pollIntervalSeconds`

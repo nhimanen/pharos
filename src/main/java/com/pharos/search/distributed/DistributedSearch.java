@@ -95,8 +95,9 @@ import java.util.function.LongSupplier;
  *
  * <p><b>Failures.</b> A shard whose readers all fail is left out of the rest of the query and named in
  * a warning: {@code shard <name> unavailable: <reason>; results exclude it}. A shard without vectors
- * of the coordinator's model is left out of the vector retrieval only: {@code shard <name> has no
- * vectors for model <id>}. The other shards still answer.
+ * of the coordinator's model is left out of the retrievals that use the query vector: vector, and
+ * unified as a whole (its BM25 recall pass included), with {@code shard <name> has no vectors for
+ * model <id>}; its keyword retrieval still runs. The other shards still answer.
  *
  * <p><b>Exactness.</b> BM25 (keyword, and unified's recall pass) scores with corpus-wide statistics,
  * so keyword results equal a single node's over the same shards. Known gaps: SynonymQuery/
@@ -406,6 +407,9 @@ public final class DistributedSearch implements Closeable {
         private <T> Map<ShardState, T> fanOut(List<ShardState> targets, ShardWork<T> work,
                                               java.util.function.BiPredicate<ShardState, Throwable> onError) {
             Map<ShardState, Future<T>> futures = new LinkedHashMap<>();
+            // Only remote calls run on the futures cancel(true) may interrupt: they do HTTP only. Local
+            // shards (file-backed Lucene and graph reads, where an interrupt would close a shared
+            // FileChannel of an NIOFS or lazy remote directory) run on this thread, which nothing interrupts.
             for (ShardState s : targets) {
                 if (s.local) continue;
                 Future<T> f = remote.submit(() -> work.run(s));
@@ -544,13 +548,24 @@ public final class DistributedSearch implements Closeable {
             List<List<RawCandidate>> lists = new ArrayList<>();
             String intent = null;
             int answered;
-            switch (retriever) {
+            String mode = "keyword".equals(retriever) || targets.size() == 1 ? retriever : retriever + "-2";
+            switch (mode) {
                 case "keyword" -> {
                     Map<ShardState, ShardSearchResponse> r = round(targets, "keyword", req, null, stats, s -> null, s -> null, false);
                     r.values().forEach(x -> lists.add(candidates(x)));
                     answered = r.size();
                 }
-                case "vector" -> {
+                case "vector", "unified" -> {
+                    // One shard: its own single-round retrieval is the exact answer; no second round trip.
+                    Map<ShardState, ShardSearchResponse> r = round(targets, retriever, req, vec, stats,
+                            s -> null, s -> null, false);
+                    for (ShardSearchResponse x : r.values()) {
+                        lists.add(candidates(x));
+                        intent = x.shapingIntent();
+                    }
+                    answered = r.size();
+                }
+                case "vector-2" -> {
                     // Round 1: each shard's HNSW first pass; the global top firstPassK of them...
                     Map<ShardState, ShardSearchResponse> first = round(targets, "vector-knn", req, vec, null,
                             s -> null, s -> null, false);
@@ -563,7 +578,7 @@ public final class DistributedSearch implements Closeable {
                     second.values().forEach(x -> lists.add(candidates(x)));
                     answered = first.size();
                 }
-                default -> { // unified
+                default -> { // unified-2
                     Map<ShardState, ShardSearchResponse> first = round(targets, "unified-recall", req, vec, stats,
                             s -> null, s -> null, false);
                     int cs = UnifiedRetrievalStage.candidateSize(req.limit());
@@ -588,7 +603,7 @@ public final class DistributedSearch implements Closeable {
             String shapeIntent = switch (retriever) {
                 case "keyword" -> KeywordSearchStrategy.shapingIntent(req);
                 case "vector" -> null;
-                default -> intent;
+                default -> answered == 0 ? (vec == null ? null : vectorPassIntent(req)) : intent;
             };
             if (trace != null) trace.record(retriever + " fan-out (" + answered + " shards)", t0);
             return CandidateShaper.shape(merged, type, shapeIntent);

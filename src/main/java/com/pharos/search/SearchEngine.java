@@ -11,7 +11,9 @@ import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
-import com.pharos.cluster.routing.CatalogNeverReadException;
+import com.pharos.cluster.ShardId;
+import com.pharos.cluster.routing.CatalogTooOldException;
+import com.pharos.cluster.routing.CatalogUnavailableException;
 import com.pharos.search.distributed.DistributedSearch;
 import com.pharos.search.distributed.LocalShardService;
 import com.pharos.search.pipeline.CrossEncoder;
@@ -260,8 +262,8 @@ public class SearchEngine {
         DistributedSearch.Query q;
         try {
             q = ds.open(project == null || project.isEmpty() ? List.of() : List.of(project));
-        } catch (CatalogNeverReadException e) {
-            warnings.add(CATALOG_UNREAD_WARNING + e.getMessage());
+        } catch (CatalogUnavailableException e) { // never read, or too old: this reader's shards
+            warnings.add(catalogFallbackWarning(e));
             return null;
         }
         try (q) {
@@ -273,6 +275,21 @@ public class SearchEngine {
     }
 
     static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
+
+    /**
+     * The warning of an answer from this reader's shards alone because the catalog cannot route: why,
+     * and, for a catalog too old, the shards of its last good read this reader does not hold.
+     */
+    private String catalogFallbackWarning(CatalogUnavailableException e) {
+        String w = CATALOG_UNREAD_WARNING + e.getMessage();
+        if (e instanceof CatalogTooOldException old) {
+            Set<String> held = new java.util.HashSet<>();
+            for (ProjectMeta m : registry.listAll()) if (m.getName() != null) held.add(m.getName());
+            List<String> missing = old.lastKnown().stream().map(ShardId::value).filter(n -> !held.contains(n)).toList();
+            if (!missing.isEmpty()) w += "; not searched: " + String.join(", ", missing);
+        }
+        return w;
+    }
 
     /** Returns the ordered list of available pipelines for UI display. */
     public List<PipelineDescriptor> listPipelines() {
@@ -342,15 +359,17 @@ public class SearchEngine {
         if (ds != null) {
             try {
                 fanout = ds.open(requestedProjects(req));
-            } catch (CatalogNeverReadException e) { // as before fan-out: this reader's shards
-                warnings.add(CATALOG_UNREAD_WARNING + e.getMessage());
+            } catch (CatalogUnavailableException e) { // never read, or too old: as before fan-out, this reader's shards
+                warnings.add(catalogFallbackWarning(e));
             }
         }
         if (fanout != null && fanout.fansOut()) {
             try (DistributedSearch.Query q = fanout) {
                 return searchFannedOut(req, hints, expand, trace, warnings, q);
             }
-        } else if (fanout != null && !fanout.unservedShards().isEmpty()) {
+        }
+        if (fanout != null) fanout.close(); // routed, nothing pinned: released all the same
+        if (fanout != null && !fanout.unservedShards().isEmpty()) {
             // Shards nobody serves are named, never silently dropped; the held ones search locally.
             warnings.addAll(fanout.warnings());
             Set<String> held = Set.copyOf(fanout.localShards());

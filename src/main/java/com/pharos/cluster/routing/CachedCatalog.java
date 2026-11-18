@@ -32,6 +32,10 @@ public final class CachedCatalog implements ShardCatalog {
     private final Executor refresher;
     private final ReentrantLock firstRead = new ReentrantLock();
     private final AtomicBoolean refreshing = new AtomicBoolean();
+    /** Bumped per refresh; a refresh only clears {@link #refreshing} while it is still the current one. */
+    private final java.util.concurrent.atomic.AtomicLong refreshToken = new java.util.concurrent.atomic.AtomicLong();
+    private final long hungNanos;
+    private volatile long refreshStartedAt;
 
     private volatile List<ShardId> cached;
     private volatile long readAt;          // last good read
@@ -41,6 +45,16 @@ public final class CachedCatalog implements ShardCatalog {
 
     public CachedCatalog(ShardCatalog base, Duration refreshEvery, Duration maxAge, LongSupplier nanoClock,
                          Executor refresher) {
+        this(base, refreshEvery, maxAge, nanoClock, refresher, Duration.ofSeconds(60));
+    }
+
+    /**
+     * @param hungAfter a background read still running after this (the object store's own timeouts
+     *                  should have ended it) is given up: the next query starts a new one
+     */
+    public CachedCatalog(ShardCatalog base, Duration refreshEvery, Duration maxAge, LongSupplier nanoClock,
+                         Executor refresher, Duration hungAfter) {
+        this.hungNanos = hungAfter.toNanos();
         this.base = base;
         this.refreshNanos = refreshEvery.toNanos();
         this.maxAgeNanos = maxAge.toNanos();
@@ -53,19 +67,27 @@ public final class CachedCatalog implements ShardCatalog {
         long now = clock.getAsLong();
         List<ShardId> current = cached;
         if (current == null) return firstShards(now);
+        if (refreshing.get() && now - refreshStartedAt > hungNanos) { // watchdog: a read that hangs
+            log.warn("The background read of the shard catalog has run {} s; starting another",
+                    (now - refreshStartedAt) / 1_000_000_000L);
+            refreshToken.incrementAndGet();
+            refreshing.set(false);
+        }
         if (now - attemptAt >= refreshNanos && refreshing.compareAndSet(false, true)) {
             attemptAt = now;
+            refreshStartedAt = now;
+            long token = refreshToken.incrementAndGet();
             try {
-                refresher.execute(this::refresh);
+                refresher.execute(() -> refresh(token));
             } catch (RuntimeException e) {
                 refreshing.set(false);
             }
         }
         long age = now - readAt;
         if (age > maxAgeNanos) {
-            throw new CatalogUnavailableException("the shard catalog was last read " + age / 1_000_000_000L
+            throw new CatalogTooOldException("the shard catalog was last read " + age / 1_000_000_000L
                     + " s ago, over cluster.maxCatalogAgeSeconds (" + maxAgeNanos / 1_000_000_000L + " s)"
-                    + (lastFailure == null ? "" : ": " + lastFailure.getMessage()), lastFailure);
+                    + (lastFailure == null ? "" : ": " + lastFailure.getMessage()), lastFailure, current);
         }
         return current;
     }
@@ -101,7 +123,7 @@ public final class CachedCatalog implements ShardCatalog {
                 + (f == null ? "" : ": " + f.getMessage()), f);
     }
 
-    private void refresh() {
+    private void refresh(long token) {
         try {
             List<ShardId> read = List.copyOf(base.shards());
             readAt = clock.getAsLong();
@@ -112,7 +134,7 @@ public final class CachedCatalog implements ShardCatalog {
             log.warn("Reading the shard catalog failed; routing with the one read {} s ago (retrying in {} s): {}",
                     ageSeconds(), refreshNanos / 1_000_000_000L, e.toString());
         } finally {
-            refreshing.set(false);
+            if (refreshToken.get() == token) refreshing.set(false);
         }
     }
 
