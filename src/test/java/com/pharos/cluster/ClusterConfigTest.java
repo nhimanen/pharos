@@ -204,18 +204,18 @@ class ClusterConfigTest {
 
     @Test
     void objectStoreReadTimeoutDefaultsAndIsValidated() throws Exception {
-        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                 + "\"objectStore\":{\"bucket\":\"b\"}}}");
         assertThat(c.getObjectStore().getReadTimeoutSeconds()).isEqualTo(10);
         assertThat(c.getObjectStore().readAttemptTimeout()).isEqualTo(java.time.Duration.ofSeconds(10));
         assertThat(c.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
         for (int bad : new int[]{0, -1, 3601}) {
-            assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                     + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":" + bad + "}}}"))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("cluster.objectStore.readTimeoutSeconds");
         }
-        ClusterConfig five = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+        ClusterConfig five = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                 + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":5}}}");
         assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
     }
