@@ -73,7 +73,7 @@ class ReadPathInventoryTest {
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
         assertThat(files("DirectoryReader.open(")).containsExactly("indexer/LuceneIndexer.java");
         // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
-        // or NIOFSDirectory under the -Dpharos.lucene.directory=niofs diagnostics hook).
+        // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
         assertThat(files("FSDirectory::open")).isEmpty();
         assertThat(files("FSDirectory.open(")).containsExactlyInAnyOrder(
                 "indexer/LuceneDirectoryFactory.java",            // the default factory

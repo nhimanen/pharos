@@ -38,6 +38,11 @@ class LuceneDirectoryTest {
         assertThat(opened).containsExactly(tmp);
     }
 
+    /**
+     * Sets a JVM-global system property for its duration: every directory opened through
+     * {@code DEFAULT} meanwhile is an NIOFSDirectory. Safe only because surefire runs test classes
+     * one after another in one fork (no parallel execution); restored in {@code finally}.
+     */
     @Test
     void niofsPropertySwapsTheDefaultForDiagnostics() throws Exception {
         String before = System.getProperty(LuceneDirectoryFactory.DIRECTORY_PROPERTY);

@@ -17,7 +17,7 @@ This script starts the reader JVMs itself, one configuration at a time, and stop
         95% CI <= 1.15; with fewer, on the pooled p95 ratio (<= 1.10). Then top-10 checks, keyword on all 99 plus vector and hybrid on the
         pharos queries: against the production full copy (default MMapDirectory) every result (ids,
         order, score bits, stored fields) is identical; against the same copy re-opened with
-        NIOFSDirectory (-Dpharos.lucene.directory=niofs), non-vector results are identical and
+        NIOFSDirectory (-Dpharos.diag.luceneDirectory=niofs), non-vector results are identical and
         vector/hybrid scores agree within 4 ulp (float32) or 1e-6 relative, with id swaps only among
         such near-ties (Lucene scores vectors on mmap and heap inputs in different evaluation orders).
   cap   cacheMaxBytes = 50% of the lucene shard's Lucene bytes, rounded down to a block multiple
@@ -259,7 +259,7 @@ class Reader:
                "-Dlogback.configurationFile=" + os.environ["GATE_LOGBACK"],
                "-Duser.home=" + str(self.home), "-Dpharos.home=" + str(self.ph)]
         if self.niofs:
-            cmd.append("-Dpharos.lucene.directory=niofs")
+            cmd.append("-Dpharos.diag.luceneDirectory=niofs")
         cmd += os.environ.get("GATE_READER_JVM_OPTS", "").split()
         return cmd + ["-jar", os.environ["GATE_JAR"], "web", "--port", str(self.port), "--no-open"]
 
