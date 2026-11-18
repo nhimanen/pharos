@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -250,6 +251,158 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             manifests.put(genDir, new CachedManifest(fileKey, modified, attrs.size(), m));
         }
         return m;
+    }
+
+    // ---------------------------------------------------------------- background materialisation
+
+    /** Kept free on the cache dir's disk beyond the block cache's remaining room and the file itself. */
+    static final long MATERIALISE_MARGIN_BYTES = 64L << 20;
+
+    /** Per shard, the generation dir being (or last) materialised in the background. */
+    private final Map<String, Materialisation> materialisations = new java.util.concurrent.ConcurrentHashMap<>();
+    // Guarded by this; created on first use.
+    private java.util.concurrent.ExecutorService materialiser;
+    /** Test seam: usable bytes of the disk holding a dir. */
+    volatile java.util.function.ToLongFunction<Path> usableSpace = LazyGenerations::fileStoreUsableSpace;
+
+    private static long fileStoreUsableSpace(Path dir) {
+        try {
+            return Files.getFileStore(dir).getUsableSpace();
+        } catch (IOException e) {
+            return 0;
+        }
+    }
+
+    private static final class Materialisation {
+        final Path genDir;
+        volatile boolean cancelled;
+
+        Materialisation(Path genDir) {
+            this.genDir = genDir;
+        }
+    }
+
+    /**
+     * Starts downloading, on one background thread, the remote Lucene files of the lazy generation
+     * {@code genDir} that {@code shard} keeps serving because a newer one was refused (format gate):
+     * the bucket's GC will delete its objects after {@code retentionMinutes}, so the reader makes it
+     * self-sufficient first. Each file is downloaded next to the eager ones, checked against the
+     * manifest (length and checksum) and moved into place; from then on new opens read it locally
+     * and misses of inputs already open read their blocks from it. Smallest files first; it stops
+     * (WARN) when the cache dir's disk would keep less than the block cache's remaining room plus a
+     * margin. Idempotent per generation dir: a second call for the same dir does nothing; a call
+     * for another dir of the shard cancels the first.
+     *
+     * @return true when a materialisation was started
+     */
+    public boolean materialiseInBackground(ShardId shard, Path genDir) {
+        if (!isLazy(genDir)) return false;
+        Path dir = genDir.toAbsolutePath().normalize();
+        Materialisation job;
+        synchronized (this) {
+            if (closed) return false;
+            Materialisation running = materialisations.get(shard.value());
+            if (running != null && running.genDir.equals(dir)) return false;
+            if (running != null) running.cancelled = true;
+            job = new Materialisation(dir);
+            materialisations.put(shard.value(), job);
+            if (materialiser == null) {
+                materialiser = Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "pharos-materialise");
+                    t.setDaemon(true);
+                    return t;
+                });
+            }
+            materialiser.execute(() -> materialise(shard, job));
+        }
+        return true;
+    }
+
+    /** Cancels the shard's background materialisation unless it is of {@code keep} (its active dir). */
+    public void stopMaterialising(ShardId shard, Path keep) {
+        Path dir = keep == null ? null : keep.toAbsolutePath().normalize();
+        Materialisation job = materialisations.get(shard.value());
+        if (job != null && !job.genDir.equals(dir)) {
+            job.cancelled = true;
+            materialisations.remove(shard.value(), job);
+        }
+    }
+
+    private void materialise(ShardId shard, Materialisation job) {
+        Path lucene = job.genDir.resolve("lucene");
+        try {
+            ShardManifest m = manifest(job.genDir);
+            List<ManifestFile> todo = new ArrayList<>();
+            for (ManifestFile f : m.files()) {
+                if (!ManifestFile.LUCENE.equals(f.role())) continue;
+                Path local = lucene.resolve(f.name());
+                if (Files.isRegularFile(local) && Files.size(local) == f.length()) continue;
+                todo.add(f);
+            }
+            if (todo.isEmpty()) return;
+            todo.sort(Comparator.comparingLong(ManifestFile::length).thenComparing(ManifestFile::name));
+            long total = todo.stream().mapToLong(ManifestFile::length).sum();
+            log.info("Shard {}: materialising the {} remote files ({} bytes) of generation {} in the background: a newer"
+                    + " generation was refused, and the bucket deletes this one's objects after"
+                    + " cluster.retentionMinutes", shard, todo.size(), total, m.generation());
+            long doneBytes = 0;
+            int doneFiles = 0;
+            for (ManifestFile f : todo) {
+                if (job.cancelled || isClosed()) {
+                    log.info("Shard {}: stopped materialising generation {} ({} of {} files done): a newer generation"
+                            + " is served", shard, m.generation(), doneFiles, todo.size());
+                    return;
+                }
+                long free = usableSpace.applyAsLong(lucene);
+                long reserve = cacheRoom() + MATERIALISE_MARGIN_BYTES;
+                if (free - f.length() < reserve) {
+                    log.warn("Shard {}: stopped materialising generation {} at {} of {} files: {} needs {} bytes and"
+                            + " the disk of {} has {} free, of which {} stay reserved for the block cache; the rest"
+                            + " stays remote (free disk, raise cluster.retentionMinutes, or use mode full)",
+                            shard, m.generation(), doneFiles, todo.size(), f.name(), f.length(), lucene, free, reserve);
+                    return;
+                }
+                download(f, lucene);
+                doneFiles++;
+                doneBytes += f.length();
+                log.info("Shard {}: materialised {} of generation {} ({}/{} files, {}/{} bytes)", shard, f.name(),
+                        m.generation(), doneFiles, todo.size(), doneBytes, total);
+            }
+            log.info("Shard {}: generation {} is now fully local: this reader no longer needs the bucket for it",
+                    shard, m.generation());
+        } catch (IOException | RuntimeException e) {
+            log.warn("Shard {}: materialising generation dir {} in the background failed; it stays partly remote: {}",
+                    shard, job.genDir, e.toString());
+        }
+    }
+
+    /** One remote file into {@code lucene}: a temp file, length and checksum checked, then moved in place. */
+    private void download(ManifestFile f, Path lucene) throws IOException {
+        Path target = lucene.resolve(f.name());
+        Path tmp = lucene.resolve(f.name() + ".materialise.tmp");
+        try {
+            Files.deleteIfExists(tmp);
+            source.download(f, tmp);
+            long got = Files.size(tmp);
+            if (got != f.length()) {
+                throw new IOException(f.key() + ": downloaded " + got + " bytes, the manifest says " + f.length());
+            }
+            RemoteDirectory.verifyChecksum(tmp, f);
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    private synchronized boolean isClosed() {
+        return closed;
+    }
+
+    /** Bytes the block cache may still grow by. */
+    private synchronized long cacheRoom() {
+        long cap = blockCache == null ? config.getCacheMaxBytes() : blockCache.maxBytes();
+        long used = blockCache == null ? 0 : blockCache.stats().bytesOnDisk();
+        return Math.max(0, cap - used);
     }
 
     // ---------------------------------------------------------------- prefetch
@@ -739,6 +892,7 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     public synchronized void close() {
         if (closed) return;
         closed = true;
+        if (materialiser != null) materialiser.shutdownNow();
         if (blockCache != null) blockCache.close();
         retiredCaches.forEach(BlockCache::close);
         List<Path> privateDirs = new ArrayList<>(retiredDirs);

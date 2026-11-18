@@ -126,7 +126,7 @@ public final class RemoteDirectory extends BaseDirectory {
             return eager().openInput(name, context);
         }
         CachingRemoteIndexInput.RemoteFile remote = new CachingRemoteIndexInput.RemoteFile(shard, generation, f,
-                cache, source, edges ? head(f) : null, edges, missing);
+                cache, source, edges ? head(f) : null, edges, missing, local);
         return new CachingRemoteIndexInput("CachingRemoteIndexInput(" + remote.where() + ")", remote);
     }
 
@@ -182,7 +182,7 @@ public final class RemoteDirectory extends BaseDirectory {
     }
 
     /** The whole file is checksummed against its footer, and the footer's checksum must be the manifest's. */
-    private static void verifyChecksum(Path file, ManifestFile f) throws IOException {
+    static void verifyChecksum(Path file, ManifestFile f) throws IOException {
         long actual;
         try (FSDirectory dir = FSDirectory.open(file.getParent());
              IndexInput in = dir.openInput(file.getFileName().toString(), IOContext.READONCE)) {

@@ -828,6 +828,77 @@ class LazyReaderTest {
         assertThat(ids(full.engine(), "Calculator")).isNotEmpty();
     }
 
+    private void restampManifest(long gen, com.pharos.indexer.IndexFormat.Stamp stamp) throws IOException {
+        ShardManifest m = manifest(gen);
+        ShardManifest re = new ShardManifest(m.formatVersion(), m.shard(), m.generation(), m.parentGeneration(),
+                m.createdAt(), m.writerNode(), m.docCount(), m.sizeBytes(), m.modelFingerprint(), m.files(),
+                m.projectMeta(), stamp);
+        store.put(layout.manifestKey(SHARD, new Generation(gen)), re.toJson());
+    }
+
+    /**
+     * Final review I1(c): the format gate refuses a newer generation (a rolling N-1 upgrade), so the
+     * reader keeps serving an older lazy one that the bucket's GC will delete. The syncer then
+     * materialises that generation's remote files in the background; once they are local, reads
+     * (through inputs opened before, too) no longer need the bucket.
+     */
+    @Test
+    void refusedNewerGenerationMakesTheServedLazyGenerationLocal() throws Exception {
+        long g1 = publishWithoutCompoundFiles();
+        Node node = reader("lagging", r -> {
+            small(r);
+            r.setEagerMaxBytes(0);
+            r.setPrefetchExtensions(List.of());
+            r.setCacheMaxBytes(4 * 64 * KIB);
+        });
+        var logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(LazyGenerations.class);
+        ListAppender<ILoggingEvent> log = new ListAppender<>();
+        log.start();
+        logger.addAppender(log);
+        try {
+            node.runtime().startServing();
+            Path lucene = node.genDir(g1).resolve("lucene");
+            List<ManifestFile> remote = remoteFiles(g1, 1);
+            assertThat(remote).isNotEmpty().allSatisfy(f -> assertThat(lucene.resolve(f.name())).doesNotExist());
+            ManifestFile big = remote.stream().max(Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+            byte[] expected = store.get(big.key()).orElseThrow().data();
+            Directory before = node.runtime().lazyGenerations().open(lucene);
+            IndexInput openedBefore = before.openInput(big.name(), IOContext.DEFAULT);
+
+            addMethodAndReindex("triple");
+            long g2 = g1 + 1;
+            restampManifest(g2, new com.pharos.indexer.IndexFormat.Stamp(
+                    com.pharos.indexer.IndexVersions.INDEX_FORMAT + 1, "9.9.9", java.time.Instant.now()));
+            node.runtime().syncNow();
+            assertThat(node.runtime().served()).isEqualTo(Map.of(SHARD, new Generation(g1)));
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (!remote.stream().allMatch(f -> Files.isRegularFile(lucene.resolve(f.name())))
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            for (ManifestFile f : remote) assertThat(lucene.resolve(f.name())).as(f.name()).hasSize(f.length());
+            node.runtime().syncNow(); // refused again: nothing is materialised twice
+
+            // GC deletes generation g1's objects: the reader does not need them any more.
+            for (ManifestFile f : remote) store.delete(f.key());
+            byte[] got = new byte[expected.length];
+            openedBefore.readBytes(got, 0, got.length);
+            assertThat(got).isEqualTo(expected);
+            openedBefore.close();
+            before.close();
+            assertThat(ids(node.engine(), "Calculator")).isNotEmpty();
+            assertThat(node.runtime().degradation()).isNull();
+        } finally {
+            logger.detachAppender(log);
+        }
+        List<String> infos = log.list.stream().filter(e -> e.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage).toList();
+        assertThat(infos).filteredOn(m -> m.contains("materialising")).singleElement()
+                .satisfies(m -> assertThat(m).contains(JAVA, "generation " + g1, "in the background"));
+        assertThat(infos).anySatisfy(m -> assertThat(m).contains("generation " + g1, "fully local"));
+    }
+
     /** Ranged reads (prefetch and block fetches) wait for {@code release}; whole-file downloads do not. */
     private static final class SlowRanges implements ReplicaSource {
         private final ReplicaSource d;

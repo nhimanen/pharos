@@ -15,6 +15,7 @@ import java.io.InterruptedIOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 
@@ -365,6 +366,12 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         private final String[] blockIds;
         /** Told when a block's object is missing from the bucket; null for nobody. */
         private final RemoteDirectory.MissingObjectListener missing;
+        /**
+         * Where a complete local copy of the file may appear (a lagging generation materialised in the
+         * background); once it is there with the manifest's length, misses read it instead of the bucket.
+         */
+        private final Path localCopy;
+        private volatile boolean localReady;
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source) {
             this(shard, generation, file, cache, source, null, false);
@@ -372,7 +379,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source,
                    byte[] head, boolean synthFooter) {
-            this(shard, generation, file, cache, source, head, synthFooter, null);
+            this(shard, generation, file, cache, source, head, synthFooter, null, null);
         }
 
         /**
@@ -381,8 +388,10 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
          *                    checksum is its footer checksum)
          */
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source,
-                   byte[] head, boolean synthFooter, RemoteDirectory.MissingObjectListener missing) {
+                   byte[] head, boolean synthFooter, RemoteDirectory.MissingObjectListener missing,
+                   Path localCopy) {
             this.missing = missing;
+            this.localCopy = localCopy;
             this.shard = Objects.requireNonNull(shard, "shard");
             this.generation = generation;
             this.file = Objects.requireNonNull(file, "file");
@@ -450,14 +459,55 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
                     + file.key() + ")";
         }
 
+        /** True once {@link #localCopy} holds the whole file (it is only ever moved into place complete). */
+        private boolean local() {
+            if (localReady) return true;
+            if (localCopy == null) return false;
+            try {
+                if (Files.isRegularFile(localCopy) && Files.size(localCopy) == length) {
+                    localReady = true;
+                    return true;
+                }
+            } catch (IOException e) {
+                // not there (yet)
+            }
+            return false;
+        }
+
         @Override
         public void fetch(BlockKey key, long offset, long len, Path target) throws IOException {
+            if (local()) {
+                try (java.nio.channels.FileChannel in = java.nio.channels.FileChannel.open(localCopy);
+                     java.nio.channels.FileChannel out = java.nio.channels.FileChannel.open(target,
+                             java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE,
+                             java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+                    long done = 0;
+                    while (done < len) {
+                        long n = in.transferTo(offset + done, len - done, out);
+                        if (n <= 0) throw new EOFException("short local copy " + localCopy + " of " + where());
+                        done += n;
+                    }
+                }
+                return;
+            }
             source.downloadRange(file, offset, len, target);
         }
 
         /** Streams the ranged body straight into the cache's memory: no temp file on a full disk. */
         @Override
         public void fetchToMemory(BlockKey key, long offset, long len, ByteBuffer target) throws IOException {
+            if (local()) {
+                try (java.nio.channels.FileChannel in = java.nio.channels.FileChannel.open(localCopy)) {
+                    long pos = offset;
+                    while (target.position() < len) {
+                        if (in.read(target, pos) < 0) {
+                            throw new EOFException("short local copy " + localCopy + " of " + where());
+                        }
+                        pos = offset + target.position();
+                    }
+                }
+                return;
+            }
             try (InputStream in = source.openRange(file, offset, len)) {
                 byte[] chunk = new byte[(int) Math.min(len, STREAM_CHUNK)];
                 long remaining = len;

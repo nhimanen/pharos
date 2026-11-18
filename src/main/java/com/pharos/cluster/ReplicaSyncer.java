@@ -93,7 +93,9 @@ import java.util.zip.CheckedInputStream;
  * registered and activated. The previous generation serves meanwhile. A lazy dir is adopted on
  * restart like a full one, except by a full-mode syncer, which materialises it again in full.
  * Remote files are not checksummed when the generation is opened; their lengths come from the
- * manifest.
+ * manifest. When the format gate refuses a newer generation, the served lazy generation is
+ * materialised in the background ({@link LazyGenerations#materialiseInBackground}): the bucket's GC
+ * would otherwise delete objects it still reads.
  */
 public class ReplicaSyncer implements Closeable {
 
@@ -256,7 +258,12 @@ public class ReplicaSyncer implements Closeable {
         }
 
         ShardManifest manifest = source.manifest(shard, gen);
-        if (!formatServable(shard, gen, manifest)) return;
+        if (!formatServable(shard, gen, manifest)) {
+            // Stuck on the served generation, whose objects the bucket's GC deletes after its retention:
+            // a lazy one is made local in the background before that.
+            if (lazy != null) cache.active(shard.value()).ifPresent(dir -> lazy.materialiseInBackground(shard, dir));
+            return;
+        }
         checkFiles(manifest);
         byte[] manifestJson = manifest.toJson();
 
@@ -288,6 +295,7 @@ public class ReplicaSyncer implements Closeable {
         register(shard, gen, manifest.projectMeta(), genDir);
         cache.activate(shard.value(), genDir);
         served.put(shard, gen);
+        if (lazy != null) lazy.stopMaterialising(shard, genDir);
         prune(shard, shardRoot, gen);
     }
 
