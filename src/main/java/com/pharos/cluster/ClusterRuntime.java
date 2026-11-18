@@ -90,7 +90,9 @@ public final class ClusterRuntime implements Closeable {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.luceneIndexer = Objects.requireNonNull(luceneIndexer, "luceneIndexer");
         if (isReader() && config.getCluster().getReader().isLazy()) {
-            lazy = new LazyGenerations(cacheDir(), config.getCluster().getReader(), backend.source());
+            ClusterConfig.ObjectStoreConfig store = config.getCluster().getObjectStore();
+            lazy = new LazyGenerations(cacheDir(), config.getCluster().getReader(), backend.source(),
+                    store == null ? null : store.readTotalTimeout());
             lazy.setActiveGenerations(this::activeGeneration);
             luceneIndexer.setDirectoryFactory(lazy);
         } else {

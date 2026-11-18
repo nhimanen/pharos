@@ -35,10 +35,21 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given. */
+/**
+ * {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given.
+ *
+ * <p>Timeouts: the HTTP client connects and waits for each read of a response within
+ * {@code cluster.objectStore.readTimeoutSeconds}; a ranged read ({@link #openRange}, which a reader's
+ * block fetches use) also bounds each attempt by that and the whole call, retries included, by
+ * {@link ClusterConfig.ObjectStoreConfig#readTotalTimeout}. An unreachable bucket then fails a query's
+ * miss in seconds instead of stalling it for the SDK's minutes of socket timeouts and retries.
+ */
 public class S3ObjectStore implements ObjectStore {
 
     private final S3Client s3;
+    /** Per-request bounds of a ranged read: one attempt, and the whole call with retries. */
+    private final java.time.Duration readAttemptTimeout;
+    private final java.time.Duration readTotalTimeout;
     private final String bucket;
     /** For messages: the configured endpoint, or the AWS default. */
     private final String endpoint;
@@ -51,6 +62,8 @@ public class S3ObjectStore implements ObjectStore {
     S3ObjectStore(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         this.bucket = cfg.getBucket();
         this.endpoint = describeEndpoint(cfg);
+        this.readAttemptTimeout = cfg.readAttemptTimeout();
+        this.readTotalTimeout = cfg.readTotalTimeout();
         try {
             this.s3 = buildClient(cfg, credentials);
         } catch (RuntimeException e) {
@@ -67,7 +80,10 @@ public class S3ObjectStore implements ObjectStore {
 
     private static S3Client buildClient(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         var builder = S3Client.builder()
-                .httpClient(UrlConnectionHttpClient.create())
+                .httpClient(UrlConnectionHttpClient.builder()
+                        .connectionTimeout(cfg.readAttemptTimeout())
+                        .socketTimeout(cfg.readAttemptTimeout()) // idle time between reads, not a whole body
+                        .build())
                 .region(Region.of(cfg.getRegion()))
                 .credentialsProvider(credentials)
                 .serviceConfiguration(S3Configuration.builder()
@@ -174,7 +190,8 @@ public class S3ObjectStore implements ObjectStore {
                 // No ranged GET can express zero bytes; a HEAD gives the same missing-key / past-end answers.
                 long size;
                 try {
-                    size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+                    size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key)
+                                    .overrideConfiguration(this::readTimeouts).build())
                             .contentLength();
                 } catch (S3Exception e) {
                     if (isMissingOnHead(e)) throw missing(key);
@@ -186,7 +203,8 @@ public class S3ObjectStore implements ObjectStore {
                 return InputStream.nullInputStream();
             }
             GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
-                    .range("bytes=" + offset + "-" + (end - 1)).build();
+                    .range("bytes=" + offset + "-" + (end - 1))
+                    .overrideConfiguration(this::readTimeouts).build();
             ResponseInputStream<GetObjectResponse> in = s3.getObject(req);
             try {
                 String contentRange = in.response().contentRange();
@@ -212,6 +230,11 @@ public class S3ObjectStore implements ObjectStore {
         } catch (SdkException e) {
             throw wrap("open range", key, e);
         }
+    }
+
+    /** A ranged read's bounds: {@code readTimeoutSeconds} per attempt, three times that per call. */
+    private void readTimeouts(software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration.Builder o) {
+        o.apiCallAttemptTimeout(readAttemptTimeout).apiCallTimeout(readTotalTimeout);
     }
 
     private static void closeQuietly(InputStream in) {

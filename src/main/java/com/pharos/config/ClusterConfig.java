@@ -76,6 +76,7 @@ public class ClusterConfig {
         if (reader == null) reader = new ReaderConfig();
         reader.validate();
         if (backend == BackendKind.OBJECT_STORE) {
+            objectStore.validate();
             String prefix = objectStore.getPrefix();
             if (prefix != null && !prefix.isEmpty()) {
                 if (prefix.startsWith("/")) {
@@ -205,6 +206,35 @@ public class ClusterConfig {
         private boolean pathStyle = true;
         private String accessKeyEnv;
         private String secretKeyEnv;
+        /**
+         * Bound of one attempt of a reader's ranged read (and the HTTP client's connect and idle-read
+         * timeouts); a whole call, retries included, gets {@value #READ_ATTEMPTS} times this.
+         */
+        private int readTimeoutSeconds = 10;
+
+        static final int READ_ATTEMPTS = 3;
+        static final int MAX_READ_TIMEOUT_SECONDS = 3600;
+
+        /** @throws IllegalStateException naming the offending field */
+        void validate() {
+            if (readTimeoutSeconds < 1 || readTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.readTimeoutSeconds must be between 1 and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + readTimeoutSeconds);
+            }
+        }
+
+        public int getReadTimeoutSeconds() { return readTimeoutSeconds; }
+        public void setReadTimeoutSeconds(int v) { this.readTimeoutSeconds = v; }
+
+        /** One attempt of a ranged read: {@code readTimeoutSeconds}. */
+        public java.time.Duration readAttemptTimeout() {
+            return java.time.Duration.ofSeconds(readTimeoutSeconds);
+        }
+
+        /** A whole ranged read, retries included (and a block-cache waiter): 3 × {@code readTimeoutSeconds}. */
+        public java.time.Duration readTotalTimeout() {
+            return java.time.Duration.ofSeconds((long) READ_ATTEMPTS * readTimeoutSeconds);
+        }
 
         public String getEndpoint() { return endpoint; }
         public void setEndpoint(String endpoint) { this.endpoint = endpoint; }

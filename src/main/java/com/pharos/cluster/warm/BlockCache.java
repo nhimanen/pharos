@@ -139,6 +139,8 @@ public final class BlockCache implements Closeable {
     private final ExecutorService fetchers;
     /** Speculative prefetches only; never shared with acquires. */
     private final ExecutorService prefetchers;
+    /** Bound of an acquire's wait for a fetch, in nanos; 0 = unbounded. Set once by the constructor. */
+    private volatile long fetchTimeoutNanos;
     /** Test seam: makes mapping a freshly moved block fail. */
     volatile boolean failMappingForTest;
 
@@ -174,6 +176,17 @@ public final class BlockCache implements Closeable {
 
     public BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches) throws IOException {
         this(dir, maxBytes, blockSize, maxConcurrentFetches, System::currentTimeMillis, null);
+    }
+
+    /**
+     * @param fetchTimeout how long an {@link #acquire} waits for a missing block's fetch (queueing
+     *                     included) before it gives up with an {@link IOException}; the fetch itself
+     *                     goes on for later acquires. Zero or null waits without bound.
+     */
+    public BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches, java.time.Duration fetchTimeout)
+            throws IOException {
+        this(dir, maxBytes, blockSize, maxConcurrentFetches, System::currentTimeMillis, null);
+        this.fetchTimeoutNanos = fetchTimeout == null || fetchTimeout.isNegative() ? 0 : fetchTimeout.toNanos();
     }
 
     /**
@@ -426,26 +439,39 @@ public final class BlockCache implements Closeable {
 
     private Lease await(Flight flight, BlockKey key) throws IOException {
         try {
-            return new Lease(this, flight.done.get());
+            Entry e = fetchTimeoutNanos > 0
+                    ? flight.done.get(fetchTimeoutNanos, java.util.concurrent.TimeUnit.NANOSECONDS)
+                    : flight.done.get();
+            return new Lease(this, e);
         } catch (InterruptedException ie) {
-            Entry reserved = null;
-            synchronized (lock) {
-                if (flight.result != null) {
-                    reserved = flight.result; // a lease was reserved for this thread
-                } else if (!flight.settled) {
-                    flight.waiters--; // the fetch completes without a reservation for this thread
-                }
-            }
-            if (reserved != null) release(reserved); // give back the lease reserved for this thread
+            stopWaiting(flight);
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("interrupted waiting for block " + key.index() + " of '"
                     + key.objectKey() + "'");
+        } catch (java.util.concurrent.TimeoutException te) {
+            stopWaiting(flight);
+            throw new IOException("timed out after " + java.time.Duration.ofNanos(fetchTimeoutNanos).toMillis()
+                    + " ms waiting for block " + key.index() + " of '" + key.objectKey() + "' (the object store did"
+                    + " not answer in time; see cluster.objectStore.readTimeoutSeconds)");
         } catch (ExecutionException ee) {
             Throwable c = ee.getCause();
             if (c instanceof Error err) throw err;
             throw new IOException("fetching block " + key.index() + " of '" + key.objectKey() + "' failed: "
                     + c.getMessage(), c);
         }
+    }
+
+    /** A waiter gives up: it takes no lease, and gives back one already reserved for it. */
+    private void stopWaiting(Flight flight) {
+        Entry reserved = null;
+        synchronized (lock) {
+            if (flight.result != null) {
+                reserved = flight.result; // a lease was reserved for this thread
+            } else if (!flight.settled) {
+                flight.waiters--; // the fetch completes without a reservation for this thread
+            }
+        }
+        if (reserved != null) release(reserved); // give back the lease reserved for this thread
     }
 
     /**

@@ -617,6 +617,65 @@ class RemoteDirectoryTest {
         }
     }
 
+    /**
+     * Final review I2: an object store that never answers. The waiter gives up after the cache's fetch
+     * timeout with an IOException naming the shard and object key, instead of stalling the query.
+     */
+    @Test
+    void unansweredFetchTimesOutNamingShardAndKey() throws Exception {
+        Blob b = blob("_hang.bin", 3 * KIB);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        ReplicaSource hanging = new ReplicaSource() {
+            private void hang() throws IOException {
+                try {
+                    release.await(60, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    throw new java.io.InterruptedIOException();
+                }
+            }
+            @Override public Optional<Generation> latest(ShardId s) { return Optional.empty(); }
+            @Override public ShardManifest manifest(ShardId s, Generation g) { throw new UnsupportedOperationException(); }
+            @Override public void download(ManifestFile f, Path t) throws IOException { hang(); source.download(f, t); }
+            @Override public void downloadRange(ManifestFile f, long o, long l, Path t) throws IOException {
+                hang();
+                source.downloadRange(f, o, l, t);
+            }
+            @Override public InputStream openRange(ManifestFile f, long o, long l) throws IOException {
+                hang();
+                return source.openRange(f, o, l);
+            }
+            @Override public Optional<byte[]> synonyms() { return Optional.empty(); }
+        };
+        BlockCache cache = track(new BlockCache(tmp.resolve("hang"), 1L << 30, KIB, 4, Duration.ofMillis(300)));
+        RemoteDirectory dir = remote(cache, null, hanging, b.manifest());
+        try (IndexInput in = dir.openInput("_hang.bin", IOContext.DEFAULT)) {
+            long start = System.nanoTime();
+            assertThatThrownBy(in::readByte)
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("shard " + PROJECT)
+                    .hasMessageContaining(b.manifest().files().get(0).key())
+                    .hasMessageContaining("timed out");
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)).isBetween(250L, 10_000L);
+            assertThat(cache.stats().leasesOpen()).isZero();
+            release.countDown();
+            // the store answers again: the next read succeeds
+            in.seek(0);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            byte first;
+            while (true) {
+                try {
+                    first = in.readByte();
+                    break;
+                } catch (IOException e) {
+                    if (System.nanoTime() > deadline) throw e;
+                }
+            }
+            assertThat(first).isEqualTo(b.data()[0]);
+        } finally {
+            release.countDown();
+        }
+    }
+
     /** The disk-full branch (fetchToMemory → openRange) reports a missing object like the cached one. */
     @Test
     void missingObjectOnTheUncachedPathFailsWithShardGenKeyInMessage() throws Exception {

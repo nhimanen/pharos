@@ -73,6 +73,8 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     private final ClusterConfig.ReaderConfig config;
     private final ReplicaSource source;
     private final Set<String> prefetchExtensions;
+    /** Bound of a read's wait for a block fetch; null for none. */
+    private final Duration fetchTimeout;
     /** Block keys of each shard's last prefetch, cancelled when the next one starts. */
     private final Map<String, List<BlockKey>> lastPrefetch = new java.util.HashMap<>();
 
@@ -106,6 +108,16 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
     private boolean closed;
 
     public LazyGenerations(Path cacheDir, ClusterConfig.ReaderConfig config, ReplicaSource source) {
+        this(cacheDir, config, source, null);
+    }
+
+    /**
+     * @param fetchTimeout how long a read waits for a block fetch before failing (the object store's
+     *                     {@code readTotalTimeout}); null waits without bound
+     */
+    public LazyGenerations(Path cacheDir, ClusterConfig.ReaderConfig config, ReplicaSource source,
+                           Duration fetchTimeout) {
+        this.fetchTimeout = fetchTimeout;
         this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir").toAbsolutePath();
         this.config = Objects.requireNonNull(config, "config");
         this.source = Objects.requireNonNull(source, "source");
@@ -493,7 +505,7 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         try {
             long cap = lock.isPresent() ? config.getCacheMaxBytes() : config.effectivePrivateCacheMaxBytes();
             blockCache = new BlockCache(dir, cap, Math.toIntExact(config.getBlockSizeBytes()),
-                    config.getMaxConcurrentFetches());
+                    config.getMaxConcurrentFetches(), fetchTimeout);
         } catch (IOException | RuntimeException e) {
             if (lock.isPresent()) lock.get().close();
             throw e;
@@ -545,7 +557,7 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         BlockCache shared;
         try {
             shared = new BlockCache(cacheDir.resolve(BLOCKS_DIR), config.getCacheMaxBytes(), // scans the dir
-                    Math.toIntExact(config.getBlockSizeBytes()), config.getMaxConcurrentFetches());
+                    Math.toIntExact(config.getBlockSizeBytes()), config.getMaxConcurrentFetches(), fetchTimeout);
         } catch (IOException | RuntimeException e) {
             releaseQuietly(lock);
             log.warn("Opening the shared block cache {} failed; staying on the private one: {}",
