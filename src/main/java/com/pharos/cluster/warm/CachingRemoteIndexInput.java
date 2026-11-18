@@ -48,8 +48,19 @@ import java.util.Objects;
  */
 public final class CachingRemoteIndexInput extends IndexInput implements RandomAccessInput {
 
-    /** Bytes copied out of a block per lease; also the threshold above which reads bypass the buffer. */
+    /** Reads of at least this many bytes bypass the buffer and copy straight out of the blocks. */
     static final int BUFFER_SIZE = 8192;
+    /**
+     * A new input's (or clone's) first buffer. Lucene clones inputs for every term and postings
+     * lookup and most clones read a few bytes: allocating a full buffer each time made the lazy
+     * reader allocate ~3x a full copy's bytes per query and run old-generation GCs.
+     */
+    static final int MIN_BUFFER = 1024;
+    /**
+     * The buffer doubles while an input reads sequentially (each refill continues where the last one
+     * ended), up to this size: fewer leases per byte for long scans, never more than a block.
+     */
+    static final int MAX_BUFFER = 64 * 1024;
 
     private final RemoteFile file;
     /** Start of this input within the file. */
@@ -295,9 +306,16 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         return buffered(abs, n);
     }
 
-    /** Copies up to {@link #BUFFER_SIZE} bytes at {@code abs}, never past the end of abs's block. */
+    /**
+     * Copies up to the buffer's size of bytes at {@code abs}, never past the end of abs's block. The
+     * buffer starts at {@link #MIN_BUFFER} and doubles (to {@link #MAX_BUFFER}) on sequential refills.
+     */
     private void fill(long abs) throws IOException {
-        if (buf == null) buf = new byte[BUFFER_SIZE];
+        if (buf == null) {
+            buf = new byte[MIN_BUFFER];
+        } else if (buf.length < MAX_BUFFER && bufStart >= 0 && abs == bufStart + bufLen) {
+            buf = new byte[Math.min(MAX_BUFFER, buf.length * 2)];
+        }
         bufStart = -1; // stays invalid if the copy fails
         bufLen = file.copyWithinBlock(abs, buf);
         bufStart = abs;
@@ -330,6 +348,8 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         /** The file's last 16 bytes, built from the manifest; null without footer synthesis. */
         final byte[] footer;
         final long footerStart;
+        /** {@link BlockCache#blockId} per block, built on first use: no string building per read. */
+        private final String[] blockIds;
 
         RemoteFile(ShardId shard, long generation, ManifestFile file, BlockCache cache, ReplicaSource source) {
             this(shard, generation, file, cache, source, null, false);
@@ -353,6 +373,21 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             this.head = head == null || head.length > length ? new byte[0] : head;
             this.footer = synthFooter ? footerOf(file) : null;
             this.footerStart = length - FOOTER;
+            long blocks = (length + blockSize - 1) / blockSize;
+            this.blockIds = blocks <= MAX_CACHED_IDS ? new String[(int) blocks] : null;
+        }
+
+        /** Files with more blocks than this build their block ids per read instead of caching them. */
+        private static final int MAX_CACHED_IDS = 1 << 16;
+
+        private String blockId(long index) {
+            if (blockIds == null) return BlockCache.blockId(objectHash, index);
+            String id = blockIds[(int) index];
+            if (id == null) {
+                id = BlockCache.blockId(objectHash, index); // racy init is fine: equal strings
+                blockIds[(int) index] = id;
+            }
+            return id;
         }
 
         static final int FOOTER = 16;
@@ -515,7 +550,7 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
             BlockKey key = new BlockKey(file.key(), index);
             BlockCache.Lease lease;
             try {
-                lease = cache.acquire(key, objectHash, blockLength(index), this);
+                lease = cache.acquire(key, objectHash, blockId(index), blockLength(index), this);
             } catch (InterruptedIOException e) {
                 InterruptedIOException x = new InterruptedIOException("interrupted reading block " + index + " of "
                         + where());

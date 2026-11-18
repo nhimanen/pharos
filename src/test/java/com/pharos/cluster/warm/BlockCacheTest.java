@@ -309,6 +309,32 @@ class BlockCacheTest {
         assertThatThrownBy(() -> seg.get(ValueLayout.JAVA_BYTE, 0)).isInstanceOf(IllegalStateException.class);
     }
 
+    /**
+     * Hits on the lock-free path don't reorder the LRU list; they mark the block, and eviction gives a
+     * marked block a second chance (an approximate LRU) instead of evicting it.
+     */
+    @Test
+    void aBlockHitSinceTheLastEvictionGetsASecondChance() throws Exception {
+        BlockCache c = cache(2);
+        FakeFetcher f = new FakeFetcher();
+        BlockKey a = new BlockKey(OBJ, 0);
+        BlockKey b = new BlockKey(OBJ, 1);
+        c.acquire(a, BS, f).close();
+        c.acquire(b, BS, f).close();
+        c.acquire(a, BS, f).close(); // a lock-free hit: a stays the eldest in the list, but is marked
+        assertThat(c.stats().hits()).isEqualTo(1);
+        c.acquire(new BlockKey(OBJ, 2), BS, f).close(); // over the cap: one eviction
+        assertThat(c.isCached(a)).as("hit since the last eviction: spared").isTrue();
+        assertThat(c.isCached(b)).isFalse();
+        // spared = moved to the young end: the next eviction takes block 2, the one after that a
+        c.acquire(new BlockKey(OBJ, 3), BS, f).close();
+        assertThat(c.isCached(new BlockKey(OBJ, 2))).isFalse();
+        assertThat(c.isCached(a)).isTrue();
+        c.acquire(new BlockKey(OBJ, 4), BS, f).close(); // its mark was used up
+        assertThat(c.isCached(a)).isFalse();
+        assertThat(c.stats().leasesOpen()).isZero();
+    }
+
     @Test
     void truncatedBlockOnDiskIsRefetched() throws Exception {
         BlockKey k = new BlockKey(OBJ, 1);

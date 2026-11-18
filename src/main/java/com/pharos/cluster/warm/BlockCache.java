@@ -139,17 +139,26 @@ public final class BlockCache implements Closeable {
 
     private final Object lock = new Object();
     // All fields below are guarded by lock.
-    /** Cached blocks in access order (eldest = least recently used). */
+    /**
+     * Cached blocks in access order (eldest = least recently used). Hits on the lock-free path don't
+     * reorder it; they set {@link Entry#referenced}, and eviction gives such a block a second chance
+     * (moves it to the young end) before it evicts it: an approximate LRU (CLOCK).
+     */
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>(64, 0.75f, true);
+    /** The same entries for lock-free hit lookups; changed only under the lock, with {@link #entries}. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Entry> index = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Flight> inflight = new HashMap<>();
     /** Ids whose evicted file is being deleted outside the lock; a fetch of the id waits before its move. */
     private final Set<String> deleting = new HashSet<>();
-    private long bytesOnDisk;
+    /** Written under the lock; read without it by a releasing reader (is eviction due?). */
+    private volatile long bytesOnDisk;
     private long hits;
+    /** Hits on the lock-free path. */
+    private final java.util.concurrent.atomic.LongAdder fastHits = new java.util.concurrent.atomic.LongAdder();
     private long misses;
     private long bytesFetched;
     private long evictions;
-    private long leasesOpen;
+    private final java.util.concurrent.atomic.AtomicLong leasesOpen = new java.util.concurrent.atomic.AtomicLong();
     private long writeFailures;
     private long thrashWarnings;
     private boolean warnedThrash;
@@ -217,13 +226,40 @@ public final class BlockCache implements Closeable {
 
     /** {@link #acquire} with {@code hash} = {@link #objectHash} of the key's object, computed by the caller once. */
     Lease acquire(BlockKey key, String hash, long blockLength, BlockFetcher fetcher) throws IOException {
+        return acquire(key, hash, blockId(hash, key.index()), blockLength, fetcher);
+    }
+
+    /** The cache's id of block {@code index} of the object whose {@link #objectHash} is {@code hash}. */
+    static String blockId(String hash, long index) {
+        return hash + "/" + index;
+    }
+
+    /**
+     * {@link #acquire} with the block's {@link #blockId} computed by the caller once. A block that is
+     * cached and mapped is leased without the cache lock: a CAS on its lease count, which fails once
+     * eviction has retired the block (then the locked path below runs).
+     */
+    Lease acquire(BlockKey key, String hash, String id, long blockLength, BlockFetcher fetcher) throws IOException {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(fetcher, "fetcher");
         if (blockLength <= 0 || blockLength > blockSize) {
             throw new IllegalArgumentException("block length " + blockLength + " of block " + key.index() + " of '"
                     + key.objectKey() + "' is outside (0, " + blockSize + "]");
         }
-        String id = hash + "/" + key.index();
+        Entry fast = index.get(id);
+        if (fast != null && fast.verified && fast.length == blockLength && fast.segment != null && tryLease(fast)) {
+            if (!fast.removed) {
+                fastHits.increment();
+                if (!fast.referenced) fast.referenced = true;
+                long now = clock.getAsLong();
+                if (now - fast.lastTouch >= TOUCH_GRANULARITY_MILLIS) {
+                    fast.lastTouch = now;
+                    setMtime(fast.file, now);
+                }
+                return new Lease(this, fast);
+            }
+            release(fast); // evicted or dropped meanwhile: take the locked path
+        }
         Entry hit = null;
         boolean touch = false;
         Flight flight = null;
@@ -236,11 +272,9 @@ public final class BlockCache implements Closeable {
                     throw lengthMismatch(key, blockLength, e.length);
                 }
                 if (e != null) {
-                    if (e.length == blockLength && ensureMapped(e)) {
+                    if (e.length == blockLength && ensureMapped(e) && tryLease(e)) {
                         e.verified = true;
                         hits++;
-                        e.leases++;
-                        leasesOpen++;
                         hit = e;
                         long now = clock.getAsLong();
                         if (now - e.lastTouch >= TOUCH_GRANULARITY_MILLIS) {
@@ -403,17 +437,48 @@ public final class BlockCache implements Closeable {
         }
     }
 
-    private void release(Entry e) {
-        Cleanup cleanup = new Cleanup();
-        synchronized (lock) {
-            e.leases--;
-            leasesOpen--;
-            if (e.leases == 0) {
-                if (e.removed) closeArena(e, cleanup);
-                else if (bytesOnDisk > maxBytes) evictOverCap(true, cleanup);
+    /**
+     * Takes one lease on {@code e} unless it was retired (its arena closed or about to be): the lease
+     * count is a CAS'd counter, {@link #RETIRED} once a block may never be leased again.
+     */
+    private boolean tryLease(Entry e) {
+        while (true) {
+            int n = e.leases.get();
+            if (n < 0) return false;
+            if (e.leases.compareAndSet(n, n + 1)) {
+                leasesOpen.incrementAndGet();
+                return true;
             }
         }
+    }
+
+    /**
+     * Gives a lease back. Lock-free unless this was the last lease of a block that left the cache
+     * (its arena closes now) or the cache is over its cap (eviction was waiting for this block).
+     */
+    private void release(Entry e) {
+        leasesOpen.decrementAndGet();
+        if (e.leases.decrementAndGet() != 0) return;
+        if (!e.removed && bytesOnDisk <= maxBytes) return;
+        Cleanup cleanup = new Cleanup();
+        synchronized (lock) {
+            if (e.removed) retireIfUnleased(e, cleanup);
+            else if (bytesOnDisk > maxBytes) evictOverCap(true, cleanup);
+        }
         cleanup.run();
+    }
+
+    /** The lease count of a block that can never be leased again. */
+    private static final int RETIRED = Integer.MIN_VALUE;
+
+    /**
+     * Retires {@code e} when it holds no lease, and detaches its arena for closing; false (nothing done)
+     * while a lease is open: the last release retires it then. Under lock.
+     */
+    private static boolean retireIfUnleased(Entry e, Cleanup cleanup) {
+        if (!e.leases.compareAndSet(0, RETIRED)) return false;
+        closeArena(e, cleanup);
+        return true;
     }
 
     // ---------------------------------------------------------------- fetch
@@ -430,7 +495,7 @@ public final class BlockCache implements Closeable {
         boolean publish = false;
         synchronized (lock) {
             if (closed) { // close() already failed this flight
-                if (entry != null) closeArena(entry, cleanup);
+                if (entry != null) retireIfUnleased(entry, cleanup);
             } else {
                 inflight.remove(id);
                 flight.settled = true;
@@ -439,15 +504,16 @@ public final class BlockCache implements Closeable {
                     bytesFetched += length;
                     // Reserve one lease per waiter before anyone can see the entry: eviction can't take
                     // it and an uncached entry's memory can't be freed before every waiter has read it.
-                    entry.leases = flight.waiters;
-                    leasesOpen += flight.waiters;
+                    entry.leases.set(flight.waiters);
+                    leasesOpen.addAndGet(flight.waiters);
                     if (entry.cached) {
                         entries.put(id, entry);
+                        index.put(id, entry);
                         bytesOnDisk += length;
                         evictOverCap(true, cleanup);
                     } else {
                         entry.removed = true; // never in the cache: free on last release
-                        if (entry.leases == 0) closeArena(entry, cleanup);
+                        retireIfUnleased(entry, cleanup);
                     }
                     flight.result = entry;
                 }
@@ -655,21 +721,46 @@ public final class BlockCache implements Closeable {
     /** Removes an invalid entry from the cache (not an eviction). Under lock. */
     private void drop(Entry e, Cleanup cleanup) {
         entries.remove(e.id);
+        index.remove(e.id);
         e.removed = true;
         bytesOnDisk -= e.length;
         deleteLater(e, cleanup);
-        if (e.leases == 0) closeArena(e, cleanup);
+        retireIfUnleased(e, cleanup);
     }
 
-    /** Evicts unleased blocks, least recently used first, until at or under the cap. Under lock. */
+    /**
+     * Evicts unleased blocks, least recently used first, until at or under the cap. A block hit on the
+     * lock-free path since the last pass ({@link Entry#referenced}) gets a second chance: it is moved
+     * to the young end instead, and evicted only by a second pass if nothing else is left. A block is
+     * evicted by retiring it (CAS of its lease count from 0), so a concurrent lock-free acquire either
+     * leased it first (it stays) or fails and takes the locked path. Under lock.
+     */
     private void evictOverCap(boolean warn, Cleanup cleanup) {
         if (bytesOnDisk <= maxBytes) return;
+        int evicted = evictPass(true, cleanup);
+        if (bytesOnDisk > maxBytes) evicted += evictPass(false, cleanup);
+        if (evicted > 0 && warn) maybeWarnThrash();
+    }
+
+    private int evictPass(boolean secondChance, Cleanup cleanup) {
         int evicted = 0;
+        List<Entry> spared = null;
         Iterator<Entry> it = entries.values().iterator();
         while (bytesOnDisk > maxBytes && it.hasNext()) {
             Entry e = it.next();
-            if (e.leases > 0) continue;
+            if (e.leases.get() != 0) {
+                e.referenced = false; // pinned now; its later hits decide its next chance
+                continue;
+            }
+            if (secondChance && e.referenced) {
+                e.referenced = false;
+                if (spared == null) spared = new ArrayList<>();
+                spared.add(e);
+                continue;
+            }
+            if (!e.leases.compareAndSet(0, RETIRED)) continue; // leased on the lock-free path meanwhile
             it.remove();
+            index.remove(e.id);
             e.removed = true;
             bytesOnDisk -= e.length;
             evictions++;
@@ -677,7 +768,10 @@ public final class BlockCache implements Closeable {
             deleteLater(e, cleanup);
             closeArena(e, cleanup);
         }
-        if (evicted > 0 && warn) maybeWarnThrash();
+        if (spared != null) {
+            for (Entry e : spared) entries.get(e.id); // access order: to the young end
+        }
+        return evicted;
     }
 
     private void deleteLater(Entry e, Cleanup cleanup) {
@@ -700,11 +794,12 @@ public final class BlockCache implements Closeable {
         warnedThrash = true;
         lastThrashWarn = now;
         thrashWarnings++;
-        long total = hits + misses;
-        String rate = total == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f%%", 100.0 * hits / total);
+        long allHits = hits + fastHits.sum();
+        long total = allHits + misses;
+        String rate = total == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f%%", 100.0 * allHits / total);
         log.warn("block cache {} is evicting: the working set exceeds the cap of {} bytes; hit rate {}"
                         + " ({} hits, {} misses, {} evictions so far)",
-                dir, maxBytes, rate, hits, misses, evictions);
+                dir, maxBytes, rate, allHits, misses, evictions);
     }
 
     private void noteWriteFailure(BlockKey key, String reason) {
@@ -772,6 +867,7 @@ public final class BlockCache implements Closeable {
         synchronized (lock) {
             for (Entry e : seeds) {
                 entries.put(e.id, e);
+                index.put(e.id, e);
                 bytesOnDisk += e.length;
             }
             evictOverCap(false, cleanup);
@@ -856,8 +952,8 @@ public final class BlockCache implements Closeable {
 
     public WarmStats stats() {
         synchronized (lock) {
-            return new WarmStats(hits, misses, bytesFetched, evictions, bytesOnDisk, leasesOpen, writeFailures,
-                    thrashWarnings);
+            return new WarmStats(hits + fastHits.sum(), misses, bytesFetched, evictions, bytesOnDisk, leasesOpen.get(),
+                    writeFailures, thrashWarnings);
         }
     }
 
@@ -904,9 +1000,10 @@ public final class BlockCache implements Closeable {
             inflight.clear();
             for (Entry e : entries.values()) {
                 e.removed = true;
-                if (e.leases == 0) closeArena(e, cleanup);
+                retireIfUnleased(e, cleanup);
             }
             entries.clear();
+            index.clear();
             bytesOnDisk = 0;
         }
         cleanup.run();
@@ -953,7 +1050,12 @@ public final class BlockCache implements Closeable {
 
     // ---------------------------------------------------------------- types
 
-    /** One block; fields other than the finals are guarded by the cache lock. */
+    /**
+     * One block. {@code leases} is read and CAS'd without the lock (lock-free hits); {@code segment},
+     * {@code removed}, {@code verified}, {@code referenced} and {@code lastTouch} are volatile for those
+     * reads and written under the cache lock (except the advisory {@code referenced}/{@code lastTouch}).
+     * The arena is closed only after the lease count was CAS'd from 0 to {@link #RETIRED}.
+     */
     private static final class Entry {
         final String id;
         /** The block file; null for an uncached (memory-only) entry. */
@@ -962,13 +1064,16 @@ public final class BlockCache implements Closeable {
         /** False for a block served from memory because it could not be written to the cache dir. */
         final boolean cached;
         Arena arena;
-        MemorySegment segment;
-        int leases;
+        volatile MemorySegment segment;
+        /** Open leases; {@link #RETIRED} once the block can never be leased again (its arena closes). */
+        final AtomicInteger leases = new AtomicInteger();
         /** Out of the cache (evicted, dropped, closed, or never cached): the arena closes at zero leases. */
-        boolean removed;
+        volatile boolean removed;
         /** Its length is known good (fetched, or matched an acquire); a seeded file's is not, yet. */
-        boolean verified;
-        long lastTouch;
+        volatile boolean verified;
+        /** Hit on the lock-free path since eviction last looked at it (second chance). */
+        volatile boolean referenced;
+        volatile long lastTouch;
 
         Entry(String id, Path file, long length, boolean cached) {
             this.id = id;
