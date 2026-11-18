@@ -348,10 +348,13 @@ class LazyReaderTest {
             release.countDown();
             logger.detachAppender(log);
         }
-        assertThat(log.list.stream().filter(e -> e.getLevel() == Level.WARN)
-                .map(ILoggingEvent::getFormattedMessage))
-                .anySatisfy(m -> assertThat(m).contains(JAVA, "generation " + gen, "prefetch", "1 s",
-                        "activating it anyway"));
+        List<String> warns = log.list.stream().filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage).toList();
+        assertThat(warns).anySatisfy(m -> assertThat(m).contains(JAVA, "generation " + gen, "prefetch", "1 s",
+                "warm open", "5 s"));
+        // Final review M4: the warm open is still attempted after a prefetch timeout, with a small budget.
+        assertThat(warns).anySatisfy(m -> assertThat(m).contains("opening generation " + gen,
+                "did not finish", "activating it anyway"));
     }
 
     /**

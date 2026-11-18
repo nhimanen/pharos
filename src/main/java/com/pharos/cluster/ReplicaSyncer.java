@@ -87,8 +87,9 @@ import java.util.zip.CheckedInputStream;
  * the first bytes of every remote file are downloaded as head sidecars, the blocks of the
  * {@code prefetchExtensions} files are prefetched, and a reader is opened and closed on the
  * generation (Lucene's per-file header and footer reads then cost no fetch), all within
- * {@code prefetchTimeoutSeconds} (after which a WARN is logged and the generation is activated
- * anyway, the prefetch going on in the background); only then is the dir moved to {@code gen-N},
+ * {@code prefetchTimeoutSeconds} (after which a WARN is logged, the warm open still gets up to
+ * {@code WARM_OPEN_GRACE} (5 s), and the generation is activated anyway, the prefetch going on in
+ * the background); only then is the dir moved to {@code gen-N},
  * registered and activated. The previous generation serves meanwhile. A lazy dir is adopted on
  * restart like a full one, except by a full-mode syncer, which materialises it again in full.
  * Remote files are not checksummed when the generation is opened; their lengths come from the
@@ -101,6 +102,8 @@ public class ReplicaSyncer implements Closeable {
     static final String MANIFEST_FILE = "manifest.json";
     static final String LUCENE_DIR = "lucene";
     private static final String PARTIAL_SUFFIX = ".partial";
+    /** After a prefetch timeout, the warm open still gets this long before the generation is activated. */
+    static final Duration WARM_OPEN_GRACE = Duration.ofSeconds(5);
     private static final Pattern GEN_DIR = Pattern.compile("gen-(\\d{1,18})");
     /** A plain file name: no separators, no {@code .}/{@code ..}, nothing absolute. */
     private static final Pattern PLAIN_NAME = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,254}");
@@ -408,8 +411,8 @@ public class ReplicaSyncer implements Closeable {
         LazyGenerations.Prefetch p = lazy.prefetch(manifest, lucene, reusable);
         if (p.heads() == 0 && p.blocks() == 0) return;
         if (timeout.isZero()) { // configured not to wait
-            log.info("Shard {}: prefetching {} heads and {} blocks of generation {} in the background", shard,
-                    p.heads(), p.blocks(), gen.value());
+            log.info("Shard {}: prefetching {} heads and {} blocks of generation {} in the background; the warm open"
+                    + " is skipped (prefetchTimeoutSeconds is 0)", shard, p.heads(), p.blocks(), gen.value());
             return;
         }
         try {
@@ -418,8 +421,10 @@ public class ReplicaSyncer implements Closeable {
                     p.heads(), p.blocks(), p.bytes(), gen.value(), (System.nanoTime() - start) / 1_000_000);
         } catch (java.util.concurrent.TimeoutException e) {
             log.warn("Shard {}: the prefetch of generation {} ({} heads, {} blocks, {} bytes) did not finish within"
-                    + " {} s; activating it anyway (the prefetch goes on in the background)", shard, gen.value(),
-                    p.heads(), p.blocks(), p.bytes(), timeout.toSeconds());
+                    + " {} s; trying the warm open with up to {} s more, then activating it anyway (the prefetch"
+                    + " goes on in the background)", shard, gen.value(), p.heads(), p.blocks(), p.bytes(),
+                    timeout.toSeconds(), WARM_OPEN_GRACE.toSeconds());
+            warmOpen(shard, gen, lucene, System.nanoTime() + WARM_OPEN_GRACE.toNanos(), WARM_OPEN_GRACE);
             return;
         } catch (java.util.concurrent.ExecutionException e) {
             log.warn("Shard {}: the prefetch of generation {} failed; activating it anyway (blocks are fetched"
@@ -432,7 +437,10 @@ public class ReplicaSyncer implements Closeable {
         warmOpen(shard, gen, lucene, deadline, timeout);
     }
 
-    /** Opens and closes a reader on the not yet activated generation, waiting until {@code deadline}. */
+    /**
+     * Opens and closes a reader on the not yet activated generation, waiting until {@code deadline};
+     * {@code budget} is only for the log.
+     */
     private void warmOpen(ShardId shard, Generation gen, Path lucene, long deadline, Duration timeout)
             throws IOException {
         long start = System.nanoTime();
@@ -452,8 +460,8 @@ public class ReplicaSyncer implements Closeable {
             log.info("Shard {}: opened generation {} before activating it in {} ms", shard, gen.value(),
                     (System.nanoTime() - start) / 1_000_000);
         } catch (java.util.concurrent.TimeoutException e) {
-            log.warn("Shard {}: opening generation {} did not finish within the prefetch timeout of {} s;"
-                    + " activating it anyway", shard, gen.value(), timeout.toSeconds());
+            log.warn("Shard {}: opening generation {} did not finish within {} s; activating it anyway (the first"
+                    + " query opens it)", shard, gen.value(), timeout.toSeconds());
         } catch (java.util.concurrent.ExecutionException e) {
             log.warn("Shard {}: opening generation {} before activating it failed; activating it anyway: {}",
                     shard, gen.value(), String.valueOf(e.getCause()));
