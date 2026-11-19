@@ -320,6 +320,11 @@ public class WebServer {
             ctx.status(409).json(body);
         });
 
+        // A search scoped to one project without vectors of the search model → 409 (a conflict
+        // between the request and the index, as an incompatible index), never a generic 500
+        app.exception(com.pharos.search.VectorModelUnavailableException.class, (e, ctx) ->
+                ctx.status(409).json(Map.of("error", e.getMessage())));
+
         // Fan-out routing (reader nodes): a project name that is no shard id → 400; the shard
         // catalog unreadable → 503
         app.exception(com.pharos.cluster.routing.InvalidProjectException.class, (e, ctx) ->
@@ -451,7 +456,8 @@ public class WebServer {
                     ctx.json(results);
                 }
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
@@ -534,7 +540,8 @@ public class WebServer {
                     ctx.json(classToMap(r));
                 }
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
@@ -590,7 +597,8 @@ public class WebServer {
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
@@ -609,7 +617,8 @@ public class WebServer {
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
@@ -630,7 +639,8 @@ public class WebServer {
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
@@ -771,7 +781,8 @@ public class WebServer {
                 res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
-                     | com.pharos.cluster.routing.CatalogUnavailableException e) {
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());

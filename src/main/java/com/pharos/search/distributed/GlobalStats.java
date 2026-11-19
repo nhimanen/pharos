@@ -26,7 +26,7 @@ import java.util.TreeSet;
  * shard's, {@link #merge} sums them, {@link GlobalStatsSearcher} scores with them.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-public record GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms) {
+public record GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms, boolean partial) {
 
     /** Collection statistics of one field. */
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -39,6 +39,20 @@ public record GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms) 
     public GlobalStats {
         fields = fields == null ? Map.of() : fields;
         terms = terms == null ? List.of() : terms;
+    }
+
+    /** Statistics covering every term of the query. */
+    public GlobalStats(Map<String, FieldStats> fields, List<TermStat> terms) {
+        this(fields, terms, false);
+    }
+
+    /**
+     * The same statistics marked {@code partial}: the coordinator shipped only some of the query's
+     * terms (it caps them), so a term missing here may still occur in the corpus; a shard then scores
+     * such a term (and a synonym group holding it) with its own statistics.
+     */
+    public GlobalStats asPartial() {
+        return new GlobalStats(fields, terms, true);
     }
 
     /**

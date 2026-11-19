@@ -431,7 +431,8 @@ public class SearchEngine {
         // re-indexing); any other search leaves those projects out of the vector part, with a
         // warning, and still runs the keyword part over them (as a cluster coordinator does).
         if (requiresVectors(req.type()) && embedder.isAvailable()) {
-            boolean explicitSingle = projects.size() == 1 && !requestedProjects(req).isEmpty();
+            // the REQUESTED count, as a coordinator decides: [a, b] with b unusable still only warns for a
+            boolean explicitSingle = requestedProjects(req).size() == 1;
             for (String p : projectsWithoutSearchModel(projects)) {
                 if (explicitSingle) throw new VectorModelUnavailableException(searchModelMissingMessage(p));
                 warnings.add(noVectorsWarning(p, embedder.modelId()));

@@ -151,7 +151,8 @@ public final class InternalApi {
             ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
         } catch (ModelMismatchException e) {
             ctx.status(409).contentType("application/json")
-                    .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage())));
+                    .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage(),
+                            "reason", e.reason().name())));
         } catch (SynonymsMismatchException e) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));

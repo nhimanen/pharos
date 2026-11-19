@@ -66,7 +66,8 @@ public class McpServer {
         log.info("MCP server stopped");
     }
 
-    private String handleMessage(String jsonLine) throws Exception {
+    /** One JSON-RPC message in, its response out (null for a notification). Package-private for tests. */
+    String handleMessage(String jsonLine) throws Exception {
         JsonNode msg = mapper.readTree(jsonLine);
         String method = msg.path("method").asText();
         JsonNode id = msg.get("id");
@@ -143,6 +144,13 @@ public class McpServer {
                     toolName, arguments, ms, e.getMessage());
             ObjectNode result = mapper.createObjectNode();
             result.putArray("content").addObject().put("type", "text").put("text", e.getMessage());
+            result.put("isError", true);
+            return successResponse(id, result);
+        } catch (com.pharos.search.VectorModelUnavailableException e) {
+            // as HTTP 409: the scoped project has no vectors of the search model; a tool error, not a crash
+            log.warn("tool={} args={} status=no-vectors error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text").put("text", "conflict (409): " + e.getMessage());
             result.put("isError", true);
             return successResponse(id, result);
         } catch (com.pharos.cluster.routing.InvalidProjectException e) {

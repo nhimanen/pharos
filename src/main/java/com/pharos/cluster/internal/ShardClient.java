@@ -243,7 +243,7 @@ public final class ShardClient {
                 health.markHealthy(reader.node());
                 String error = errorOf(body);
                 if (InternalApi.MODEL_MISMATCH.equals(error)) {
-                    throw new ModelMismatchException(detailOf(body));
+                    throw new ModelMismatchException(reasonOf(body), detailOf(body));
                 }
                 if (InternalApi.SYNONYMS_MISMATCH.equals(error)) {
                     throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
@@ -268,6 +268,14 @@ public final class ShardClient {
             return response;
         } finally {
             counter.decrementAndGet();
+        }
+    }
+
+    private ModelMismatchException.Reason reasonOf(byte[] body) {
+        try {
+            return ModelMismatchException.Reason.parse(mapper.readTree(body).path("reason").asText(null));
+        } catch (IOException e) {
+            return ModelMismatchException.Reason.OTHER;
         }
     }
 

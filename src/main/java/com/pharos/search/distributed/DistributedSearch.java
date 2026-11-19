@@ -114,6 +114,13 @@ public final class DistributedSearch implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(DistributedSearch.class);
 
+    /**
+     * The most query terms (synonym expansions included) whose statistics a query ships to its shards;
+     * well below the {@code /internal} cap of {@link com.pharos.cluster.internal.InternalApi#MAX_ITEMS}.
+     * Terms beyond it are scored with each shard's own statistics, with a warning.
+     */
+    static final int MAX_SHIPPED_TERMS = 5_000;
+
     /** An unscoped query routed with a catalog older than this carries a warning. */
     static final long CATALOG_AGE_WARNING_SECONDS = 60;
 
@@ -125,6 +132,8 @@ public final class DistributedSearch implements Closeable {
     private final Duration queryTimeout;
     private final LongSupplier catalogAgeSeconds;
     private final ExecutorService remote = Executors.newVirtualThreadPerTaskExecutor();
+    /** The cap on shipped terms ({@link #MAX_SHIPPED_TERMS}); lowered by tests only. */
+    volatile int maxShippedTerms = MAX_SHIPPED_TERMS;
     /** Tests only: false scores each shard with its own statistics (the control of the parity test). */
     volatile boolean globalStatistics = true;
 
@@ -535,7 +544,22 @@ public final class DistributedSearch implements Closeable {
             synchronized (this) {
                 if (globalStats != null && key.equals(statsKey)) return globalStats;
             }
+            int cap = maxShippedTerms;
+            boolean capped = terms.size() > cap;
+            log.debug("Fan-out query ships {} term(s) (synonym expansions included){}", terms.size(),
+                    capped ? "; capped at " + cap : "");
+            if (capped) {
+                Set<Term> shipped = new LinkedHashSet<>();
+                for (Term t : terms) {
+                    if (shipped.size() == cap) break;
+                    shipped.add(t);
+                }
+                warn("query expands to " + terms.size() + " terms; the " + (terms.size() - cap)
+                        + " beyond " + cap + " are scored with each shard's own statistics");
+                terms = shipped;
+            }
             GlobalStats merged = gather(terms, local.synonymsHash());
+            if (capped) merged = merged.asPartial();
             synchronized (this) {
                 globalStats = merged;
                 statsKey = key;
@@ -716,7 +740,8 @@ public final class DistributedSearch implements Closeable {
             }, (s, t) -> {
                 ModelMismatchException m = modelMismatch(t);
                 if (m == null) return false;
-                String detail = m.getMessage() != null && m.getMessage().startsWith("no vectors") ? ""
+                boolean noVectors = m.reason() == ModelMismatchException.Reason.NO_VECTORS;
+                String detail = noVectors ? ""
                         : " (" + m.getMessage() + ")";
                 if (explicitSingle) {
                     throw new com.pharos.search.VectorModelUnavailableException(String.format(
@@ -725,7 +750,7 @@ public final class DistributedSearch implements Closeable {
                 }
                 synchronized (this) {
                     vectorless.add(s.name());
-                    if (detail.isEmpty()) noModelVectors.add(s.name());
+                    if (noVectors) noModelVectors.add(s.name());
                 }
                 warn(com.pharos.search.SearchEngine.noVectorsWarning(s.name(), queryModelId + detail));
                 return true;

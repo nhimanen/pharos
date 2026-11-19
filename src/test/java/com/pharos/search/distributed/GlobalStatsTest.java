@@ -152,6 +152,37 @@ class GlobalStatsTest {
         }
     }
 
+    /**
+     * Partial stats (the coordinator capped the shipped terms): a synonym group with an unshipped term
+     * is not replaced (the unshipped term is NOT taken as absent); Lucene then combines the shipped
+     * terms' global statistics with the unshipped ones' shard-local statistics.
+     */
+    @Test
+    void partialStatsLeaveAnIncompleteSynonymGroupToLocalStatistics() throws Exception {
+        IndexReader a = textShard("beta x", "beta y", "beta z", "beta w", "beta v", "alpha one");
+        IndexReader b = textShard("alpha two", "other three");
+        Query synonyms = new org.apache.lucene.search.SynonymQuery.Builder("body")
+                .addTerm(new Term("body", "alpha")).addTerm(new Term("body", "beta")).build();
+        Term alpha = new Term("body", "alpha"), beta = new Term("body", "beta");
+        GlobalStats shippedAlpha = GlobalStats.merge(List.of(
+                new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(a), Set.of(alpha))),
+                new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(b), Set.of(alpha)))));
+        GlobalStats partial = shippedAlpha.asPartial();
+        // what Lucene computes with alpha global and beta shard-local: the same stats, beta added from a
+        List<GlobalStats.TermStat> withLocalBeta = new ArrayList<>(shippedAlpha.terms());
+        withLocalBeta.addAll(GlobalStats.of(new IndexSearcher(a), Set.of(beta)).terms());
+        GlobalStats expectedStats = new GlobalStats(shippedAlpha.fields(), withLocalBeta);
+
+        float[] scored = topScores(new GlobalStatsSearcher(a, partial), synonyms, 0, a.maxDoc());
+        assertThat(scored).isNotEqualTo(new float[a.maxDoc()]);
+        assertThat(scored).as("alpha global + beta local")
+                .isEqualTo(topScores(new GlobalStatsSearcher(a, expectedStats), synonyms, 0, a.maxDoc()));
+        assertThat(scored).as("control: not partial, beta would count as absent")
+                .isNotEqualTo(topScores(new GlobalStatsSearcher(a, shippedAlpha), synonyms, 0, a.maxDoc()));
+        assertThat(new ObjectMapper().readValue(new ObjectMapper().writeValueAsString(partial), GlobalStats.class))
+                .as("partial travels on the wire").isEqualTo(partial);
+    }
+
     /** Scores of the documents {@code [from, from + n)} (by doc id, shifted to start at 0). */
     private static float[] topScores(IndexSearcher s, Query q, int from, int n) throws IOException {
         float[] out = new float[n];

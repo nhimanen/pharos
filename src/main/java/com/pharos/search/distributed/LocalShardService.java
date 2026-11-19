@@ -154,7 +154,8 @@ public final class LocalShardService implements ShardSearchService {
             boolean has = embedded.contains(modelId)
                     || (embedded.isEmpty() && IndexConfig.LEGACY_MODEL_ID.equals(modelId));
             if (!has) {
-                throw new ModelMismatchException("no vectors for model " + modelId + " (has: "
+                throw new ModelMismatchException(ModelMismatchException.Reason.NO_VECTORS,
+                        "no vectors for model " + modelId + " (has: "
                         + (embedded.isEmpty() ? "<legacy / none recorded>" : String.join(", ", embedded)) + ")");
             }
         }

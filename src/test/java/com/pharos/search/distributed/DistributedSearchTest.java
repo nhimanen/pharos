@@ -420,8 +420,36 @@ class DistributedSearchTest {
                     }
                     assertThat(search(n, q, SearchType.KEYWORD, JAVA, 10).results()).as(n.id + " keyword").isNotEmpty();
                 }
+                assertThat(noVec.drainCalls()).as("k refused the model with a typed reason on the wire")
+                        .anySatisfy(c -> {
+                            assertThat(c.status()).isEqualTo(409);
+                            assertThat(c.responseJson().path("reason").asText()).isEqualTo("NO_VECTORS");
+                        });
             }
         }
+    }
+
+    /** Minor: a query expanding to more terms than the cap ships only the first ones, with a warning. */
+    @Test
+    void shippedTermsAreCappedWithAWarning() throws Exception {
+        DistributedSearch ds = a.ds();
+        String q = "greeting message user display name";
+        List<String> exact = bits(search(a, q, SearchType.KEYWORD, null, 10).results());
+        ds.maxShippedTerms = 3;
+        internalCalls(a, b, all); // drop the uncapped query's calls
+        try {
+            SearchResponse capped = search(a, q, SearchType.KEYWORD, null, 10);
+            assertThat(capped.warnings()).singleElement().asString()
+                    .startsWith("query expands to ").contains(" beyond 3 are scored with each shard's own statistics");
+            assertThat(capped.results()).isNotEmpty();
+            List<TestReaderNode.Call> calls = new ArrayList<>(b.drainCalls());
+            calls.addAll(all.drainCalls());
+            assertThat(calls).filteredOn(c -> c.path().endsWith("/term-stats"))
+                    .isNotEmpty().allSatisfy(c -> assertThat(c.requestJson().path("terms").size()).isEqualTo(3));
+        } finally {
+            ds.maxShippedTerms = DistributedSearch.MAX_SHIPPED_TERMS;
+        }
+        assertThat(bits(search(a, q, SearchType.KEYWORD, null, 10).results())).as("uncapped again").isEqualTo(exact);
     }
 
     /** Review Focus 5: one shard through fan-out is bitwise that shard's own local search. */

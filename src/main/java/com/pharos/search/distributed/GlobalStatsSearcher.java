@@ -59,9 +59,12 @@ public class GlobalStatsSearcher extends IndexSearcher {
     private final Map<String, GlobalStats.FieldStats> fields;
     private final Map<String, Map<String, GlobalStats.TermStat>> terms = new HashMap<>();
     private final AtomicLong localFallbacks = new AtomicLong();
+    /** The coordinator shipped only some of the query's terms (see {@link GlobalStats#asPartial}). */
+    private final boolean partial;
 
     public GlobalStatsSearcher(IndexReader reader, GlobalStats stats) {
         super(reader);
+        this.partial = stats.partial();
         this.fields = Map.copyOf(stats.fields());
         for (GlobalStats.TermStat t : stats.terms()) {
             terms.computeIfAbsent(t.field(), f -> new HashMap<>()).put(t.text(), t);
@@ -162,6 +165,7 @@ public class GlobalStatsSearcher extends IndexSearcher {
             long docFreq = 0, totalTermFreq = 0;
             for (Term t : sq.getTerms()) {
                 GlobalStats.TermStat g = termStat(t);
+                if (g == null && partial) return null; // not shipped: this group keeps the shard's statistics
                 if (g == null || g.docFreq() <= 0) continue;
                 docFreq = Math.max(docFreq, g.docFreq());
                 totalTermFreq += g.totalTermFreq();
@@ -176,6 +180,7 @@ public class GlobalStatsSearcher extends IndexSearcher {
             for (Term[] position : arrays) {
                 for (Term t : position) {
                     GlobalStats.TermStat g = termStat(t);
+                    if (g == null && partial) return null;
                     if (g != null && g.docFreq() > 0) {
                         out.add(new TermStatistics(t.bytes(), g.docFreq(), g.totalTermFreq()));
                     }
