@@ -2,17 +2,18 @@
 # Phase 3 gate: multi-shard fan-out (pinned readers, distributed coordinator, router, draining)
 # against a local MinIO. See docs/superpowers/plans/2026-11-17-multi-node-phase-3.md (Task 7).
 #
-# This script starts MinIO, has a writer index lucene (--no-embed) and pharos (with embeddings)
-# and publish both, builds a single-node reference (role all) from a copy of the writer's local
-# indexes, and hands over to scripts/cluster_gate_phase3.py, which starts and stops the reference,
-# the readers R1 {pharos}, R2 {lucene}, R3 (all), R4 (all) and the router one at a time, by PID.
+# This script starts MinIO, has a writer index lucene (--no-embed), pharos and mypal (both with
+# embeddings, so the multi-shard vector merge is measured; GATE_WITH_MYPAL=0 leaves mypal out) and
+# publish them, builds a single-node reference (role all) from a copy of the writer's local indexes,
+# and hands over to scripts/cluster_gate_phase3.py, which starts and stops the reference, the readers
+# R1 {pharos}, R2 {lucene, mypal}, R3 (all), R4 (all) and the router one at a time, by PID.
 #
 # It NEVER downloads anything and never touches the real ~/.pharos or ~/.djl.ai: every JVM gets an
 # isolated user.home and pharos.home under $GATE; the embedding and cross-encoder models are COPIED
 # from ~/.djl.ai into $GATE/models-home/.djl.ai (each node's .djl.ai is a symlink to that copy). The
-# lucene source path is only READ from ~/.pharos/registry.json. With GATE_SEED_EMBED_CACHE=1 (default)
-# the writer's pharos embedding cache is seeded from a COPY of ~/.pharos/indexes/pharos/embed-cache.*
-# (same model and vectors; saves ~35 min of embedding), which is only read.
+# lucene and mypal source paths are only READ from ~/.pharos/registry.json (the sources are only read).
+# With GATE_SEED_EMBED_CACHE=1 (default) the writer's pharos and mypal embedding caches are seeded from
+# COPIES of ~/.pharos/indexes/<project>/embed-cache.* (same model and vectors), which are only read.
 #
 # Run under a memory cap, e.g.
 #   GATE=/home/me/gate3-scratch/run1 systemd-run --user --scope -q -p MemoryMax=9G \
@@ -29,12 +30,13 @@
 #   GATE_MODEL_ID      its provider modelId (default jina-code-v2; never "legacy", see the Phase 2 gate)
 #   GATE_REUSE_INDEX=1 skip indexing when $GATE already holds a published bucket (re-runs)
 #   GATE_SEED_EMBED_CACHE  1 (default) or 0
+#   GATE_WITH_MYPAL    1 (default): also index and publish mypal (embedded); 0: lucene and pharos only
 #   GATE_PHASES        python driver phases (default "reference,ranking,elasticity")
 #   GATE_LOAD_SECONDS / GATE_QPS / GATE_JOIN_AT / GATE_DRAIN_AT  elasticity timeline (180 / 20 / 60 / 120)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
@@ -55,6 +57,9 @@ CE_DIR_NAME="Xenova-ms-marco-MiniLM-L-6-v2"   # CrossEncoderProvider default (hy
 MODEL_ID="${GATE_MODEL_ID:-jina-code-v2}"
 PHASES="${GATE_PHASES:-reference,ranking,elasticity}"
 SEED="${GATE_SEED_EMBED_CACHE:-1}"
+WITH_MYPAL="${GATE_WITH_MYPAL:-1}"
+PROJECTS="lucene,pharos"; R2_SHARDS="lucene"
+if (( WITH_MYPAL )); then PROJECTS="lucene,pharos,mypal"; R2_SHARDS="lucene, mypal"; fi
 JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
 TOKEN="gate3-cluster-token-0123456789"
 
@@ -67,12 +72,13 @@ cluster-gate-phase3 (dry run): nothing is started.
   gate dir    ${GATE:-<GATE unset>}
   heaps       index $INDEX_HEAP, readers/router $WEB_HEAP, reference $REF_HEAP
   models      $MODEL_URL as '$MODEL_ID' + cross-encoder $CE_DIR_NAME (copied from ~/.djl.ai/pharos)
-  writer      index lucene --no-embed, pharos with embeddings (embed cache seeded: $SEED); publish
+  writer      index lucene --no-embed; pharos$( (( WITH_MYPAL )) && echo " and mypal") with embeddings (embed caches seeded: $SEED); publish
+  projects    $PROJECTS
   reference   copy of the writer's local indexes, role all, :7305
-  readers     R1 {pharos} :7301, R2 {lucene} :7302, R3 all :7303, R4 all :7304 (lazy); router :7080
+  readers     R1 {pharos} :7301, R2 {$R2_SHARDS} :7302, R3 all :7303, R4 all :7304 (lazy); router :7080
   phases      $PHASES
 PLAN
-  python3 -I "$REPO/scripts/cluster_gate_phase3.py" --dry-run --phases "$PHASES"
+  GATE_PROJECTS="$PROJECTS" python3 -I "$REPO/scripts/cluster_gate_phase3.py" --dry-run --phases "$PHASES"
   exit 0
 fi
 
@@ -83,14 +89,21 @@ for d in "$MODEL_DIR_NAME" "$CE_DIR_NAME"; do
   [[ -d "$HOME/.djl.ai/pharos/$d" ]] || { echo "cluster-gate-phase3: model not in ~/.djl.ai/pharos/$d" >&2; exit 2; }
 done
 
-LUCENE_SRC="$(python3 -I - "$HOME/.pharos/registry.json" <<'PY'
+src_of() {  # $1 = project: its rootPath in ~/.pharos/registry.json (only read)
+  python3 -I - "$HOME/.pharos/registry.json" "$1" <<'PY'
 import json, os, sys
 try:
-    print(os.path.normpath(json.load(open(sys.argv[1]))["lucene"]["rootPath"]))
+    print(os.path.normpath(json.load(open(sys.argv[1]))[sys.argv[2]]["rootPath"]))
 except (OSError, ValueError, KeyError, TypeError) as e:
-    sys.exit("cluster-gate-phase3: no usable 'lucene' entry in %s (%r)" % (sys.argv[1], e))
+    sys.exit("cluster-gate-phase3: no usable '%s' entry in %s (%r)" % (sys.argv[2], sys.argv[1], e))
 PY
-)" || exit 2
+}
+LUCENE_SRC="$(src_of lucene)" || exit 2
+MYPAL_SRC=""
+if (( WITH_MYPAL )); then
+  MYPAL_SRC="$(src_of mypal)" || exit 2
+  [[ -d "$MYPAL_SRC" ]] || { echo "cluster-gate-phase3: mypal rootPath not a directory: $MYPAL_SRC" >&2; exit 2; }
+fi
 
 for port in 9000 9001 7080 7301 7302 7303 7304 7305; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
@@ -174,13 +187,18 @@ if [[ "${GATE_REUSE_INDEX:-0}" == 1 && -f "$GATE/writer.done" ]]; then
 else
   rm -rf "$PHAROS_SRC"; mkdir -p "$PHAROS_SRC"
   cp -r "$REPO/src" "$REPO/pom.xml" "$PHAROS_SRC/"
-  if [[ "$SEED" == 1 && -f "$HOME/.pharos/indexes/pharos/embed-cache.bin" ]]; then
-    mkdir -p "$W_PH/indexes/pharos"
-    cp "$HOME/.pharos/indexes/pharos/embed-cache.bin" "$W_PH/indexes/pharos/embed-cache.$MODEL_ID.bin"
-    cp "$HOME/.pharos/indexes/pharos/embed-cache.meta" "$W_PH/indexes/pharos/embed-cache.$MODEL_ID.meta"
-    echo "== seeded the pharos embed cache from a copy ($(cat "$W_PH/indexes/pharos/embed-cache.$MODEL_ID.meta"))"
-  fi
-  for spec in "lucene|$LUCENE_SRC|--no-embed" "pharos|$PHAROS_SRC|"; do
+  for p in pharos mypal; do
+    [[ "$p" == mypal ]] && (( ! WITH_MYPAL )) && continue
+    if [[ "$SEED" == 1 && -f "$HOME/.pharos/indexes/$p/embed-cache.bin" ]]; then
+      mkdir -p "$W_PH/indexes/$p"
+      cp "$HOME/.pharos/indexes/$p/embed-cache.bin" "$W_PH/indexes/$p/embed-cache.$MODEL_ID.bin"
+      cp "$HOME/.pharos/indexes/$p/embed-cache.meta" "$W_PH/indexes/$p/embed-cache.$MODEL_ID.meta"
+      echo "== seeded the $p embed cache from a copy ($(cat "$W_PH/indexes/$p/embed-cache.$MODEL_ID.meta"))"
+    fi
+  done
+  SPECS=("lucene|$LUCENE_SRC|--no-embed" "pharos|$PHAROS_SRC|")
+  (( WITH_MYPAL )) && SPECS+=("mypal|$MYPAL_SRC|")
+  for spec in "${SPECS[@]}"; do
     IFS='|' read -r name src flag <<<"$spec"
     echo "== writer: index $name ${flag:-(with embeddings)}; MemAvailable $(mem)"
     t0=$SECONDS
@@ -212,6 +230,7 @@ fi
 
 export GATE GATE_JAR="$JAR" GATE_LOGBACK="$LOGBACK" GATE_WEB_HEAP="$WEB_HEAP" GATE_REF_HEAP="$REF_HEAP"
 export GATE_MODELS="$MODELS" GATE_MODEL_URL="$MODEL_URL" GATE_MODEL_ID="$MODEL_ID" GATE_TOKEN="$TOKEN"
+export GATE_PROJECTS="$PROJECTS"
 rc=0
 python3 -I -u "$REPO/scripts/cluster_gate_phase3.py" --phases "$PHASES" || rc=$?
 echo "== MinIO bucket: $(du -sh "$MINIO_DATA/pharos-gate" | cut -f1); gate exit $rc (logs in $GATE)"

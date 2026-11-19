@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """Phase 3 gate driver (standard library only). Driven by scripts/cluster-gate-phase3.sh, which has
-already started MinIO on 127.0.0.1:9000, published lucene (--no-embed) and pharos (embedded), and
-built the single-node reference home ($GATE/reference) from a copy of the writer's local indexes.
+already started MinIO on 127.0.0.1:9000, published lucene (--no-embed), pharos and mypal (both
+embedded; GATE_PROJECTS lists them), and built the single-node reference home ($GATE/reference) from
+a copy of the writer's local indexes.
 
 Starts and stops every JVM itself, by PID (Popen), one at a time, checking MemAvailable:
 
   reference   the single-node reference (role all, :7305) answers the gate queries (see specs()):
-              the 99 pharos + lucene benchmark queries, keyword with NO project filter, hybrid,
-              hybrid-reranked and vector scoped to pharos (limit 10). Saved to $GATE/ref-results.json; stopped.
-  ranking     R1 {pharos} :7301, R2 {lucene} :7302, R3 (all) :7303 (lazy readers). The same queries
-              on R1, R2 and R3. Keyword unscoped on R1 (fan-out: lucene is on R2/R3); the vector
-              family on R2 (fan-out: pharos is on R1/R3); everything on R3 (holds all: local path).
+              the 99 pharos + lucene benchmark query texts with NO project filter, pipelines keyword,
+              hybrid, hybrid-reranked and vector (limit 10). Results and per-answer warnings are saved
+              to $GATE/ref-results.json and ref-warnings.json; then it is stopped.
+  ranking     R1 {pharos} :7301, R2 {every other project} :7302, R3 (all) :7303 (lazy readers). The
+              same queries on each. R1 fans out (lucene and mypal are elsewhere); R3 holds all (local).
                 keyword          top-10 identical (ids and order) on >= 98% of queries
                 hybrid, hybrid-reranked   mean Kendall tau >= 0.95 and top-1 identical on >= 95%
-                                 (scoped to pharos and coordinated by R2 {lucene}: the single node
-                                 refuses unscoped vector queries, lucene having no vectors)
                                  (tau over the ids both top-10s share, as DistributedSearchTest)
-                vector           reported under the Phase 2 ulp rule (4 ulp / 1e-6 relative,
-                                 id swaps only within near-ties)
+                vector           Phase 2 ulp rule (4 ulp / 1e-6 relative, id swaps only within
+                                 near-ties); with mypal it merges two embedded shards in two rounds
                 R3 vs reference  identical (bitwise: ids, order, score bits, every field)
-              The readers stay up for the elasticity phase.
+                warnings         every answer's warnings on R1, R2 and R3 equal the reference's
+                                 (lucene: `project lucene has no vectors for model ...; vector results
+                                 exclude it`): the answer does not depend on the reader
+              R2 is compared too (info). The readers stay up for the elasticity phase.
   elasticity  router :7080 in front. ~QPS requests/s for LOAD seconds (open loop, a thread pool),
-              cycling the 99 queries: half unscoped keyword, a quarter keyword scoped to the query's
-              own project, a quarter hybrid scoped to pharos. At JOIN_AT s R4 (all, :7304) starts; at DRAIN_AT s R2 gets
-              SIGTERM (R3 still covers lucene). Pass: 0 failed requests (non-200, error, timeout) and 0
-              responses whose warnings (body or X-Pharos-Warnings) mention "unavailable".
-              Latency p50/p95 before (< JOIN_AT), during (JOIN_AT .. R2 exit), after (R2 exit .. end).
+              cycling the 99 queries: unscoped keyword, keyword scoped to the query's own project,
+              unscoped hybrid, hybrid scoped to pharos. At JOIN_AT s R4 (all, :7304) starts; at
+              DRAIN_AT s R2 gets SIGTERM (R3 still covers its shards). Pass: 0 failed requests
+              (non-200, error, timeout) and 0 responses whose warnings (body or X-Pharos-Warnings)
+              mention "unavailable". Latency p50/p95 before (< JOIN_AT), during (JOIN_AT .. R2 exit),
+              after (R2 exit .. end).
 
 --self-test checks the statistics on canned inputs; --dry-run prints the plan.
 """
@@ -55,7 +58,10 @@ KEYWORD_IDENTICAL_MIN = 0.98
 TAU_MIN = 0.95
 TOP1_MIN = 0.95
 PORTS = {"reference": 7305, "r1": 7301, "r2": 7302, "r3": 7303, "r4": 7304, "router": 7080}
-SHARDS = {"r1": ["pharos"], "r2": ["lucene"], "r3": [], "r4": []}
+# GATE_PROJECTS: the published projects (the shell script's list). With mypal (embedded, decision of
+# 2026-11-19) the vector family merges two embedded shards: R1 {pharos}, R2 {lucene, mypal}, R3 all.
+PROJECTS = os.environ.get("GATE_PROJECTS", "lucene,pharos,mypal").split(",")
+SHARDS = {"r1": ["pharos"], "r2": [p for p in PROJECTS if p != "pharos"], "r3": [], "r4": []}
 
 # --------------------------------------------------------------------------- statistics
 
@@ -284,7 +290,7 @@ class Node(p2.Reader):
         """Seconds from JVM start until ready: /health 200 with ready (reader: 'serving N shard(s)'
         logged with the expected N); the router: it lists `want` healthy readers (checked elsewhere)."""
         end = time.perf_counter() + timeout
-        want = {"r1": 1, "r2": 1}.get(self.name, 2)
+        want = (len(SHARDS.get(self.name, [])) or len(PROJECTS))
         pat = re.compile(r"serving (\d+) shard\(s\)")
         while time.perf_counter() < end:
             if self.proc.poll() is not None:
@@ -357,31 +363,35 @@ def gate_queries():
 
 
 def specs():
-    """(pipeline, scope, query) of the ranking comparison. keyword: all 99 with no project filter.
-    hybrid, hybrid-reranked, vector: all 99 scoped to pharos, because a single node REFUSES an
-    unscoped vector-bearing query when one project (lucene, --no-embed) has no vectors of the search
-    model (HTTP 500 VectorModelUnavailableException, run 1); gated on the 45 pharos-origin queries."""
-    base, qs = gate_queries()
-    out = [("keyword", None, q) for q in qs]
-    out += [(pl, "pharos", q) for pl in ("hybrid", "hybrid-reranked", "vector") for q in qs]
-    return out
+    """(pipeline, scope, query) of the ranking comparison: the 99 query texts with no project filter,
+    in every pipeline (the brief's procedure). Since the decision of 2026-11-19 a single node answers
+    an unscoped vector-bearing query with lucene (--no-embed) left out of the vector part and the
+    warning `project lucene has no vectors for model ...; vector results exclude it` (run 1 got HTTP
+    500 there), so the vector family is comparable; with mypal embedded it merges two shards."""
+    _, qs = gate_queries()
+    return [(pl, None, q) for pl in PIPELINES for q in qs]
 
 
 def key(pl, scope, q):
     return f"{pl}|{scope or '*'}|{q}"
 
 
+LAST_WARNINGS = {}  # base url -> {key: sorted warnings} of its last run_queries
+
+
 def run_queries(base_url, sp):
-    """{key: results}, warnings {text: count}, failures."""
-    res, warns, fails = {}, {}, []
+    """{key: results}, warnings {text: count}, failures. Per-answer warnings: LAST_WARNINGS[base_url]."""
+    res, warns, fails, per = {}, {}, [], {}
     for pl, scope, q in sp:
         _, status, results, w = fetch(base_url, q, pl, scope)
         k = key(pl, scope, q)
         if status != 200:
             fails.append(f"{k}: status {status} {w}")
         res[k] = results
+        per[k] = sorted(w)
         for x in w:
             warns[x[:160]] = warns.get(x[:160], 0) + 1
+    LAST_WARNINGS[base_url] = per
     return res, warns, fails
 
 
@@ -410,6 +420,7 @@ def phase_reference():
     finally:
         ref.stop()
     (Path(os.environ["GATE"]) / "ref-results.json").write_text(json.dumps(res))
+    (Path(os.environ["GATE"]) / "ref-warnings.json").write_text(json.dumps(LAST_WARNINGS[ref.base]))
     print(f"REFERENCE {len(sp)} (pipeline, scope, query) answers; failures {len(fails)}; warnings {warns}")
     for f in fails[:10]:
         print("   " + f)
@@ -445,58 +456,45 @@ def report_cmp(label, ref, res, pl, gated_subset, rule_kind):
 
 
 def phase_ranking():
-    base, qs = gate_queries()
-    pharos_q = {q for q, p in base if p == "pharos"}
+    _, qs = gate_queries()
     sp = specs()
-    ref = json.loads((Path(os.environ["GATE"]) / "ref-results.json").read_text())
+    gate = Path(os.environ["GATE"])
+    ref = json.loads((gate / "ref-results.json").read_text())
+    ref_warn = json.loads((gate / "ref-warnings.json").read_text())
     for name in ("r1", "r2", "r3"):
         NODES[name] = Node(name, shards=SHARDS[name], fresh=True)
         start(NODES[name])
     wait_cluster(NODES["r1"].base, ["r1", "r2", "r3"])
-    out = {"answers": len(sp), "pharos_queries": len(pharos_q), "nodes": {}, "checks": []}
+    out = {"answers": len(sp), "projects": PROJECTS, "shards": SHARDS, "nodes": {}, "checks": []}
     ok = True
     got = {}
     for name in ("r1", "r2", "r3"):
         run_queries(NODES[name].base, sp)  # warm-up pass
         res, warns, fails = run_queries(NODES[name].base, sp)
         got[name] = res
-        (Path(os.environ["GATE"]) / f"{name}-results.json").write_text(json.dumps(res))
-        out["nodes"][name] = {"warnings": warns, "failures": fails}
-        print(f"RANKING {name}: failures {len(fails)}; warnings {warns}")
+        (gate / f"{name}-results.json").write_text(json.dumps(res))
+        per = LAST_WARNINGS[NODES[name].base]
+        same_warn = sum(1 for k in ref_warn if per.get(k) == ref_warn[k])
+        out["nodes"][name] = {"warnings": warns, "failures": fails, "warnings_identical": same_warn}
+        print(f"RANKING {name}: failures {len(fails)}; warnings {warns}; per-answer warnings identical to the"
+              f" reference {same_warn}/{len(ref_warn)}")
         for f in fails[:10]:
             print("   " + f)
-        ok = ok and not fails
+        for k in [k for k in ref_warn if per.get(k) != ref_warn[k]][:5]:
+            print(f"   warnings differ {k!r}: ref {ref_warn[k]} got {per.get(k)}")
+        # Router consistency (decision of 2026-11-19): same answer status and warnings on every reader.
+        ok = ok and not fails and same_warn == len(ref_warn)
     # (label, node, pipeline, subset, rule, gated)
-    checks = [("R1 {pharos} unscoped (fan-out)", "r1", "keyword", None, "brief", True)]
-    for pl in ("hybrid", "hybrid-reranked", "vector"):
-        checks.append(("R2 {lucene} -> pharos (fan-out)", "r2", pl, pharos_q, "brief", True))
-    for pl in ("hybrid", "hybrid-reranked", "vector"):
-        checks.append(("R2 -> pharos, all 99 texts", "r2", pl, None, "brief", False))
-        checks.append(("R1 pharos-scoped (local)", "r1", pl, None, "bitwise", False))
-    checks.append(("R2 {lucene} unscoped keyword (fan-out)", "r2", "keyword", None, "brief", False))
-    for pl in PIPELINES:
-        checks.append(("R3 (all) local", "r3", pl, None, "bitwise", True))
+    checks = [("R1 {pharos} unscoped (fan-out)", "r1", pl, None, "brief", True) for pl in PIPELINES]
+    checks += [("R2 {%s} unscoped (fan-out)" % ", ".join(SHARDS["r2"]), "r2", pl, None, "brief", False)
+               for pl in PIPELINES]
+    checks += [("R3 (all) local", "r3", pl, None, "bitwise", True) for pl in PIPELINES]
     for label, node, pl, subset, rule, gated in checks:
         good, st = report_cmp(label + ("" if gated else " [info]"), ref, got[node], pl, subset, rule)
         st.update({"label": label, "node": node, "gated": gated})
         out["checks"].append(st)
         if gated:
             ok = ok and good
-    # Unscoped vector-bearing queries on R1: the single node refuses them; recorded, not compared.
-    unscoped = {}
-    for pl in ("hybrid", "vector"):
-        n_ok = n_hits = 0
-        warns = {}
-        for q in qs:
-            _, status, results, w = fetch(NODES["r1"].base, q, pl)
-            n_ok += status == 200
-            n_hits += bool(results)
-            for x in w:
-                warns[x[:160]] = warns.get(x[:160], 0) + 1
-        unscoped[pl] = {"ok": n_ok, "non_empty": n_hits, "warnings": warns}
-        print(f"   R1 unscoped {pl} [not comparable: the single node answers 500]: {n_ok}/{len(qs)} answered 200,"
-              f" {n_hits} non-empty; warnings {warns}")
-    out["r1_unscoped_vector_family"] = unscoped
     out["rss_mib"] = {n: NODES[n].rss_mib() for n in NODES}
     print(f"   RSS MiB {out['rss_mib']}; MemAvailable {p2.mem_available_gib():.1f} GiB")
     out["pass"] = ok
@@ -531,13 +529,16 @@ def phase_elasticity(load_s, qps, join_at, drain_at):
     plan = []
     for i in range(n):
         q, proj = base_q[i % len(base_q)]
-        # half unscoped keyword; a quarter keyword scoped to the query's own project; a quarter
-        # hybrid scoped to pharos (unscoped hybrid is refused on a node holding both, as single node)
+        # half unscoped (keyword and hybrid alternately), half scoped to the query's own project
+        # (keyword and hybrid alternately; hybrid scoped to lucene, which has no vectors, would be
+        # refused as on a single node, so scoped hybrid uses pharos)
         kind = i % 4
-        if kind in (0, 2):
+        if kind == 0:
             plan.append((i / qps, q, None, "keyword"))
         elif kind == 1:
             plan.append((i / qps, q, proj, "keyword"))
+        elif kind == 2:
+            plan.append((i / qps, q, None, "hybrid"))
         else:
             plan.append((i / qps, q, "pharos", "hybrid"))
     samples, events = [], {}
