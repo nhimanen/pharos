@@ -73,8 +73,8 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `cluster.queryTimeoutMillis` (default 20000: one budget for all rounds of a query) and
   `cluster.maxCatalogAgeSeconds` (600: past it, or before the catalog was first read, unscoped
   queries answer from the reader's own shards with a warning naming the shards not searched). A
-  shard without vectors of the coordinator's model is named in a warning and left out of vector and
-  unified retrieval.
+  shard without vectors of the coordinator's model is named in a warning and left out of the vector
+  part (see Changed).
 
 ### Fixed
 - Shutdown order on SIGTERM/SIGINT/SIGHUP: the reader drain, then the running model calls, then
@@ -83,6 +83,15 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
 
 ### Changed
+- Multi-node fan-out fixes from the Phase 3 gate: a query naming a project the coordinator does
+  not hold boosts it as a single node does (the project list comes from the shard catalog), and
+  synonym expansions are scored with every expanded term's global statistics, terms absent on a
+  shard included (`SynonymQuery`, `MultiPhraseQuery`), so fan-out keyword results equal a single
+  node's.
+- A vector, hybrid or unified search over several projects no longer fails when one of them has
+  no vectors of the search model: that project is left out of the vector part with the warning
+  `project <name> has no vectors for model <id>; vector results exclude it`, on a single node and
+  on every cluster reader alike. A search scoped to that one project still fails.
 - The S3 client waits up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a
   response (ranged block reads keep their `readTimeoutSeconds` bounds), so whole-object downloads
   and uploads on a slow bucket are not cut short.

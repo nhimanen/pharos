@@ -108,43 +108,56 @@ class GlobalStatsTest {
     }
 
     /**
-     * Known gap (documented in {@link GlobalStatsSearcher}): {@code SynonymQuery} asks the searcher for a
-     * term's statistics only when the term occurs in the shard, so a synonym present only on another
-     * shard drops out of the combined statistics there: its scores differ from a {@code MultiReader}'s.
-     * Plain term queries over the same shards are exact. If Lucene ever asks for every term, this test
-     * fails and the gap can be closed.
+     * Gate Phase 3 decision: a synonym present only on another shard still counts in the combined
+     * statistics. Lucene's SynonymWeight / MultiPhraseQuery ask for a term's statistics only when the
+     * term occurs locally; {@link GlobalStatsSearcher} supplies every term's global statistics, so each
+     * shard scores exactly as a {@code MultiReader} over both, nested in boolean and boost clauses too.
      */
     @Test
-    void synonymTermOnlyOnAnotherShardDivergesFromMultiReader() throws Exception {
-        IndexReader a = textShard("alpha one", "alpha two", "alpha alpha three", "other four");
+    void synonymTermOnlyOnAnotherShardEqualsMultiReader() throws Exception {
+        IndexReader a = textShard("alpha one", "alpha two", "alpha alpha three", "other four", "gamma alpha five");
         IndexReader b = textShard("beta five", "beta beta six", "alpha beta seven", "beta eight", "beta nine",
-                "beta ten", "beta eleven"); // beta: docFreq 6 > alpha 4, so the max the pseudo-term uses differs
+                "beta ten", "beta eleven"); // beta: docFreq 6 > alpha 4 and only on b; gamma only on a
         MultiReader both = new MultiReader(new IndexReader[]{a, b}, false);
         open.add(both::close);
         Query synonyms = new org.apache.lucene.search.SynonymQuery.Builder("body")
                 .addTerm(new Term("body", "alpha")).addTerm(new Term("body", "beta")).build();
+        Query nested = new org.apache.lucene.search.BooleanQuery.Builder()
+                .add(new org.apache.lucene.search.BoostQuery(synonyms, 3f), org.apache.lucene.search.BooleanClause.Occur.SHOULD)
+                .add(new org.apache.lucene.search.TermQuery(new Term("body", "other")),
+                        org.apache.lucene.search.BooleanClause.Occur.SHOULD)
+                .build();
+        Query multiPhrase = new org.apache.lucene.search.MultiPhraseQuery.Builder()
+                .add(new Term[]{new Term("body", "alpha"), new Term("body", "beta")})
+                .add(new Term[]{new Term("body", "five"), new Term("body", "seven"), new Term("body", "two")})
+                .build();
         Query alphaOnly = new org.apache.lucene.search.TermQuery(new Term("body", "alpha"));
 
-        for (Query q : List.of(alphaOnly, synonyms)) {
+        for (Query q : List.of(alphaOnly, synonyms, nested, multiPhrase)) {
             Set<Term> terms = GlobalStats.queryTerms(q);
             GlobalStats stats = GlobalStats.merge(List.of(
                     new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(a), terms)),
                     new TermStatsResponse(1, GlobalStats.of(new IndexSearcher(b), terms))));
-            float[] multi = topScores(new IndexSearcher(both), q, a.maxDoc());
-            float[] global = topScores(new GlobalStatsSearcher(a, stats), q, a.maxDoc());
-            if (q == alphaOnly) {
-                assertThat(global).as("term query: exact").isEqualTo(multi);
-            } else {
-                assertThat(global).as("synonym query: 'beta' exists only on b, so a scores without its stats")
-                        .isNotEqualTo(multi);
+            float[] multiA = topScores(new IndexSearcher(both), q, 0, a.maxDoc());
+            float[] multiB = topScores(new IndexSearcher(both), q, a.maxDoc(), b.maxDoc());
+            float[] globalA = topScores(new GlobalStatsSearcher(a, stats), q, 0, a.maxDoc());
+            float[] globalB = topScores(new GlobalStatsSearcher(b, stats), q, 0, b.maxDoc());
+            assertThat(globalA).as("shard a: " + q).isEqualTo(multiA);
+            assertThat(globalB).as("shard b: " + q).isEqualTo(multiB);
+            assertThat(globalA).as("non-vacuous: shard a matches " + q).isNotEqualTo(new float[a.maxDoc()]);
+            if (q != alphaOnly) {
+                assertThat(topScores(new IndexSearcher(a), q, 0, a.maxDoc()))
+                        .as("control: shard-local statistics differ for " + q).isNotEqualTo(multiA);
             }
         }
     }
 
-    /** Scores of shard-a documents (the first {@code n} doc ids), by doc id. */
-    private static float[] topScores(IndexSearcher s, Query q, int n) throws IOException {
+    /** Scores of the documents {@code [from, from + n)} (by doc id, shifted to start at 0). */
+    private static float[] topScores(IndexSearcher s, Query q, int from, int n) throws IOException {
         float[] out = new float[n];
-        for (var sd : s.search(q, 100).scoreDocs) if (sd.doc < n) out[sd.doc] = sd.score;
+        for (var sd : s.search(q, 100).scoreDocs) {
+            if (sd.doc >= from && sd.doc < from + n) out[sd.doc - from] = sd.score;
+        }
         return out;
     }
 

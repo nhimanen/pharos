@@ -116,7 +116,12 @@ public final class ClusterFixture implements AutoCloseable {
     }
 
     public void index(String project, boolean incremental) throws IOException {
-        writerManager.index(source.resolve(project), project, incremental, false, embed, false,
+        index(project, incremental, embed);
+    }
+
+    /** Indexes a bundled project; {@code withVectors} false indexes it without embeddings ({@code --no-embed}). */
+    public void index(String project, boolean incremental, boolean withVectors) throws IOException {
+        writerManager.index(source.resolve(project), project, incremental, false, withVectors && embed, false,
                 ProgressListener.SILENT);
     }
 

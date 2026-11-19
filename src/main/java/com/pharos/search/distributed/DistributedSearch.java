@@ -95,14 +95,17 @@ import java.util.function.LongSupplier;
  *
  * <p><b>Failures.</b> A shard whose readers all fail is left out of the rest of the query and named in
  * a warning: {@code shard <name> unavailable: <reason>; results exclude it}. A shard without vectors
- * of the coordinator's model is left out of the retrievals that use the query vector: vector, and
- * unified as a whole (its BM25 recall pass included), with {@code shard <name> has no vectors for
- * model <id>}; its keyword retrieval still runs. The other shards still answer.
+ * of the coordinator's model is left out of the vector part of the query, with {@code project <name>
+ * has no vectors for model <id>; vector results exclude it} (the warning a single node gives): its
+ * keyword retrieval still runs, and unified still scores its documents as a single node scores
+ * documents without vectors. A query explicitly scoped to that one project
+ * fails instead ({@link com.pharos.search.VectorModelUnavailableException}), as on a single node. The
+ * other shards still answer.
  *
  * <p><b>Exactness.</b> BM25 (keyword, and unified's recall pass) scores with corpus-wide statistics,
- * so keyword results equal a single node's over the same shards. Known gaps: SynonymQuery/
- * MultiPhraseQuery skip a term's statistics on a shard lacking that term (see
- * {@link GlobalStatsSearcher}); vector and unified across more than one shard are approximate (each
+ * synonym expansions included (every expanded term's global statistics, see
+ * {@link GlobalStatsSearcher}), so keyword results equal a single node's over the same shards.
+ * Known gaps: vector and unified across more than one shard are approximate (each
  * shard's HNSW search and unified pool are its own, not a {@code MultiReader}'s); ties between shards
  * break by shard ordinal (the order of the requested projects, else the catalog's name order).
  * A single shard through fan-out is bitwise its own local search.
@@ -141,6 +144,11 @@ public final class DistributedSearch implements Closeable {
         this.catalogAgeSeconds = catalogAgeSeconds;
     }
 
+    /** The catalog's shard names (see {@link ShardRouter#catalogShardNames}); never throws. */
+    public List<String> catalogShardNames() {
+        return router.catalogShardNames();
+    }
+
     /** True while this coordinator marks {@code node} suspect (it failed a call). */
     public boolean suspect(String node) {
         return client.health().isSuspect(node);
@@ -171,7 +179,7 @@ public final class DistributedSearch implements Closeable {
         for (Route r : routes) {
             shards.add(new ShardState(shards.size(), r, router.servesLocally(r.shard())));
         }
-        Query q = new Query(shards, start + queryTimeout.toNanos());
+        Query q = new Query(shards, start + queryTimeout.toNanos(), !unscoped && shards.size() == 1);
         long age = unscoped ? catalogAgeSeconds.getAsLong() : -1;
         if (age > CATALOG_AGE_WARNING_SECONDS) q.warn("routing with a catalog " + age + " s old");
         return q;
@@ -241,13 +249,22 @@ public final class DistributedSearch implements Closeable {
         private final Map<String, float[]> vectors = new HashMap<>();
         private final Set<Future<?>> outstanding = java.util.concurrent.ConcurrentHashMap.newKeySet();
         private final Set<String> vectorless = new LinkedHashSet<>();
+        /**
+         * Of {@link #vectorless}, the shards whose project has no vectors of the model at all (no such
+         * field): unified still sends them the query vector, unchecked, so their documents score as a
+         * single node scores documents without vectors (the BM25 fallback of its rescorer).
+         */
+        private final Set<String> noModelVectors = new LinkedHashSet<>();
         private GlobalStats globalStats;
         private String statsKey;
         private boolean closed;
+        /** Scoped to exactly one project: a shard without vectors of the model fails the query, as locally. */
+        private final boolean explicitSingle;
 
-        Query(List<ShardState> shards, long deadlineNanos) {
+        Query(List<ShardState> shards, long deadlineNanos, boolean explicitSingle) {
             this.shards = shards;
             this.deadlineNanos = deadlineNanos;
+            this.explicitSingle = explicitSingle;
         }
 
         /** True when some shard is not held here and a live reader serves it: the query fans out. */
@@ -547,9 +564,14 @@ public final class DistributedSearch implements Closeable {
             if ("vector".equals(retriever) && vec == null) return List.of(); // as the local stage: no vectors
             GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             List<ShardState> targets = new ArrayList<>();
+            boolean unified = "unified".equals(retriever);
             for (ShardState s : available()) {
                 synchronized (this) {
-                    if (vec == null || !vectorless.contains(s.name())) targets.add(s);
+                    // unified keeps a shard whose project lacks the model's vectors (its documents score
+                    // by the rescorer's BM25 fallback, as on a single node)
+                    if (vec == null || !vectorless.contains(s.name()) || (unified && noModelVectors.contains(s.name()))) {
+                        targets.add(s);
+                    }
                 }
             }
             List<List<RawCandidate>> lists = new ArrayList<>();
@@ -566,6 +588,7 @@ public final class DistributedSearch implements Closeable {
                     // One shard: its own single-round retrieval is the exact answer; no second round trip.
                     Map<ShardState, ShardSearchResponse> r = round(targets, retriever, req, vec, stats,
                             s -> null, s -> null, false);
+                    if (unified) r = withoutVectorRetry(r, targets, retriever, req, vec, stats);
                     for (ShardSearchResponse x : r.values()) {
                         lists.add(candidates(x));
                         intent = x.shapingIntent();
@@ -588,6 +611,7 @@ public final class DistributedSearch implements Closeable {
                 default -> { // unified-2
                     Map<ShardState, ShardSearchResponse> first = round(targets, "unified-recall", req, vec, stats,
                             s -> null, s -> null, false);
+                    first = withoutVectorRetry(first, targets, "unified-recall", req, vec, stats);
                     int cs = UnifiedRetrievalStage.candidateSize(req.limit());
                     Map<ShardState, List<ScoredId>> bm25 = selectTop(first, ShardSearchResponse::recall, cs);
                     Map<ShardState, List<ScoredId>> knn = vec == null ? Map.of()
@@ -669,27 +693,69 @@ public final class DistributedSearch implements Closeable {
                                                            boolean chunks) {
             String hash = local.synonymsHash();
             LocalShardService.Model model = local.model();
-            String modelId = vec == null || model == null ? null : model.modelId();
-            int dims = vec == null ? 0 : vec.length;
-            String fingerprint = vec == null || model == null ? null : model.fingerprint();
+            String queryModelId = vec == null || model == null ? null : model.modelId();
+            boolean unifiedRound = retriever.startsWith("unified");
             return fanOut(targets, s -> {
+                boolean unchecked; // unified on a shard without the model's vectors: sent unchecked
+                boolean drop;
+                synchronized (this) {
+                    unchecked = vec != null && unifiedRound && noModelVectors.contains(s.name());
+                    drop = vec != null && !unchecked && vectorless.contains(s.name());
+                }
+                float[] v = drop ? null : vec;
+                String modelId = v == null || model == null || unchecked ? null : model.modelId();
+                int dims = v == null ? 0 : v.length;
+                String fingerprint = v == null || model == null ? null : model.fingerprint();
                 if (s.local) {
-                    if (vec != null) local.checkModel(s.route.shard(), modelId, dims, fingerprint);
-                    return local.search(pin(s), retriever, req, vec, stats, selected.apply(s), selectedKnn.apply(s), chunks);
+                    if (modelId != null) local.checkModel(s.route.shard(), modelId, dims, fingerprint);
+                    return local.search(pin(s), retriever, req, v, stats, selected.apply(s), selectedKnn.apply(s), chunks);
                 }
                 return remote(s, ShardClient.SHARD_SEARCH, true, // first-round doc ids bind the generation too
-                        (hb, gen) -> new ShardSearchRequest(s.name(), gen, retriever, req, vec, stats, hash, modelId,
+                        (hb, gen) -> new ShardSearchRequest(s.name(), gen, retriever, req, v, stats, hash, modelId,
                                 dims, fingerprint, selected.apply(s), selectedKnn.apply(s), chunks));
             }, (s, t) -> {
                 ModelMismatchException m = modelMismatch(t);
                 if (m == null) return false;
+                String detail = m.getMessage() != null && m.getMessage().startsWith("no vectors") ? ""
+                        : " (" + m.getMessage() + ")";
+                if (explicitSingle) {
+                    throw new com.pharos.search.VectorModelUnavailableException(String.format(
+                            "Project '%s' has no vectors for search embedding model '%s'%s. Run: pharos embed --model=%s %s",
+                            s.name(), queryModelId, detail, queryModelId, s.name()));
+                }
                 synchronized (this) {
                     vectorless.add(s.name());
+                    if (detail.isEmpty()) noModelVectors.add(s.name());
                 }
-                warn("shard " + s.name() + " has no vectors for model " + modelId
-                        + (m.getMessage() != null && m.getMessage().startsWith("no vectors") ? "" : " (" + m.getMessage() + ")"));
+                warn(com.pharos.search.SearchEngine.noVectorsWarning(s.name(), queryModelId + detail));
                 return true;
             });
+        }
+
+        /**
+         * Unified keeps a shard whose project has no vectors of the model: the shards of {@code targets}
+         * that refused the query vector in {@code answered}'s round for that reason are asked again
+         * with it unchecked (see {@link #noModelVectors}), and the answers are merged in ordinal order.
+         */
+        private Map<ShardState, ShardSearchResponse> withoutVectorRetry(Map<ShardState, ShardSearchResponse> answered,
+                                                                       List<ShardState> targets, String retriever,
+                                                                       SearchRequest req, float[] vec, GlobalStats stats) {
+            if (vec == null) return answered;
+            List<ShardState> again = new ArrayList<>();
+            for (ShardState s : targets) {
+                synchronized (this) {
+                    if (!answered.containsKey(s) && noModelVectors.contains(s.name()) && s.unavailable == null) again.add(s);
+                }
+            }
+            if (again.isEmpty()) return answered;
+            Map<ShardState, ShardSearchResponse> more = round(again, retriever, req, vec, stats,
+                    s -> null, s -> null, false);
+            Map<ShardState, ShardSearchResponse> out = new LinkedHashMap<>();
+            for (ShardState s : targets) {
+                if (answered.containsKey(s)) out.put(s, answered.get(s));
+                else if (more.containsKey(s)) out.put(s, more.get(s));
+            }
+            return out;
         }
 
         // ── snippets and expansion ───────────────────────────────────────────

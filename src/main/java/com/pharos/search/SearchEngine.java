@@ -296,6 +296,19 @@ public class SearchEngine {
         }
     }
 
+    /**
+     * The project names a query may mention ({@code project:query}, or a bare project name): this
+     * node's projects plus, on a reader, every shard of the cluster catalog, so a coordinator boosts a
+     * named project it does not hold exactly as a single node holding it would.
+     */
+    List<String> knownProjects() {
+        Set<String> names = new java.util.LinkedHashSet<>();
+        for (ProjectMeta m : registry.listAll()) if (m.getName() != null) names.add(m.getName());
+        DistributedSearch ds = distributed;
+        if (ds != null) names.addAll(ds.catalogShardNames());
+        return List.copyOf(names);
+    }
+
     static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
 
     /**
@@ -364,9 +377,7 @@ public class SearchEngine {
         trace.start();
 
         // Parse query modifiers (project:query, in:lang) before dispatching
-        List<String> knownProjects = registry.listAll().stream()
-                .map(ProjectMeta::getName).collect(Collectors.toList());
-        QueryHints hints = parseQueryHints(req.query(), knownProjects);
+        QueryHints hints = parseQueryHints(req.query(), knownProjects());
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
                     req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor());
@@ -414,13 +425,17 @@ public class SearchEngine {
                     null, null, null, List.copyOf(warnings));
         }
 
-        // Refuse vector-shaped queries when the configured search model has no
-        // corresponding vectors in one or more of the resolved projects. Throwing
-        // a clear exception beats silently returning empty results, which is the
-        // failure mode an unsuspecting user would otherwise see after swapping
-        // searchEmbeddingModel without re-indexing.
+        // Vector-shaped queries and projects without vectors of the configured search model: an
+        // explicitly requested single project fails loud (silently empty results are the failure
+        // mode an unsuspecting user would otherwise see after swapping searchEmbeddingModel without
+        // re-indexing); any other search leaves those projects out of the vector part, with a
+        // warning, and still runs the keyword part over them (as a cluster coordinator does).
         if (requiresVectors(req.type()) && embedder.isAvailable()) {
-            validateSearchModelAvailable(projects);
+            boolean explicitSingle = projects.size() == 1 && !requestedProjects(req).isEmpty();
+            for (String p : projectsWithoutSearchModel(projects)) {
+                if (explicitSingle) throw new VectorModelUnavailableException(searchModelMissingMessage(p));
+                warnings.add(noVectorsWarning(p, embedder.modelId()));
+            }
         }
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -1349,32 +1364,43 @@ public class SearchEngine {
     }
 
     /**
-     * Checks every resolved project's {@code embeddedModels} carries the model
-     * id the configured search embedder uses. Pre-upgrade indexes have an empty
+     * The resolved projects whose {@code embeddedModels} lack the model id the
+     * configured search embedder uses. Pre-upgrade indexes have an empty
      * {@code embeddedModels} list and are allowed only when the search embedder
      * is the synthesized legacy one — they're served from the legacy
      * {@code vectorEmbedding} field.
      */
-    private void validateSearchModelAvailable(List<String> projects) {
-        String modelId = embedder.modelId();
-        boolean isLegacyModel = com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId);
+    private List<String> projectsWithoutSearchModel(List<String> projects) {
+        List<String> out = new ArrayList<>();
         for (String p : projects) {
             ProjectMeta meta = registry.find(p).orElse(null);
             if (meta == null) continue;  // shouldn't happen; resolveProjects already filtered
-            List<String> embeddedModels = meta.getEmbeddedModels();
-            boolean has = embeddedModels.contains(modelId)
-                    || (embeddedModels.isEmpty() && isLegacyModel);
-            if (!has) {
-                String available = embeddedModels.isEmpty()
-                        ? "<legacy / none recorded>"
-                        : String.join(", ", embeddedModels);
-                throw new VectorModelUnavailableException(String.format(
-                        "Project '%s' has no vectors for search embedding model '%s'. " +
-                        "Available model(s): %s. " +
-                        "Run: pharos embed --model=%s %s",
-                        p, modelId, available, modelId, p));
-            }
+            if (!hasSearchModel(meta)) out.add(p);
         }
+        return out;
+    }
+
+    private boolean hasSearchModel(ProjectMeta meta) {
+        String modelId = embedder.modelId();
+        List<String> embeddedModels = meta.getEmbeddedModels();
+        return embeddedModels.contains(modelId)
+                || (embeddedModels.isEmpty() && com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId));
+    }
+
+    private String searchModelMissingMessage(String project) {
+        String modelId = embedder.modelId();
+        List<String> embeddedModels = registry.find(project).map(ProjectMeta::getEmbeddedModels).orElse(List.of());
+        String available = embeddedModels.isEmpty() ? "<legacy / none recorded>" : String.join(", ", embeddedModels);
+        return String.format("Project '%s' has no vectors for search embedding model '%s'. "
+                + "Available model(s): %s. Run: pharos embed --model=%s %s", project, modelId, available, modelId, project);
+    }
+
+    /**
+     * The warning of a search that leaves {@code project} out of its vector part because it has no
+     * vectors of {@code modelId}: the same text on a single node and on a cluster coordinator.
+     */
+    public static String noVectorsWarning(String project, String modelId) {
+        return "project " + project + " has no vectors for model " + modelId + "; vector results exclude it";
     }
 
     /**

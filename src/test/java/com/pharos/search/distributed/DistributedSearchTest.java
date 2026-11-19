@@ -307,6 +307,123 @@ class DistributedSearchTest {
         }
     }
 
+    /**
+     * Gate Phase 3 decision (bug A): a query naming a project the coordinator does not hold, bare or as
+     * a {@code project:} prefix, boosts that project's results exactly as a single node holding it.
+     */
+    @Test
+    void projectNamedInTheQueryIsBoostedOnACoordinatorWithoutIt() throws Exception {
+        for (String q : List.of(JAVA + " Calculator divide", "greeting message " + JAVA, JAVA + ":Calculator divide")) {
+            List<String> single = bits(search(all, q, SearchType.KEYWORD, null, 10).results());
+            assertThat(single).as(q).anyMatch(r -> r.startsWith(JAVA + ":"));
+            SearchResponse fan = search(a, q, SearchType.KEYWORD, null, 10);
+            assertThat(fan.warnings()).as(q).isEmpty();
+            assertThat(bits(fan.results())).as("a lacks " + JAVA + ": " + q).isEqualTo(single);
+        }
+    }
+
+    /**
+     * Gate Phase 3 decision: a synonym whose expansion exists only on another shard scores with the
+     * global statistics of every expanded term, so fan-out keyword results equal a single node's.
+     */
+    @Test
+    void synonymOnlyOnAnotherShardScoresAsASingleNode() throws Exception {
+        // friendly: one python document pair; int: many java documents. The python shard lacks "int",
+        // so without its global statistics the pseudo-term's docFreq there would be friendly's alone.
+        String synonyms = "friendly, int\n";
+        Path home = tmp.resolve("synonyms");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture f = new ClusterFixture(home.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            f.indexBoth();
+            try (TestReaderNode c = new TestReaderNode(home.resolve("c"), store, BUCKET, "c", List.of(PY), EMBEDDER, synonyms);
+                 TestReaderNode r = new TestReaderNode(home.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER, synonyms);
+                 TestReaderNode one = new TestReaderNode(home.resolve("one"), store, BUCKET, "one", List.of(), EMBEDDER,
+                         synonyms)) {
+                c.awaitShard(JAVA, 2);
+                c.awaitShard(PY, 2);
+                one.awaitShard(JAVA, 2);
+                one.awaitShard(PY, 2);
+                for (String q : List.of("friendly", "int", "friendly greeting", "int division")) {
+                    SearchResponse fan = search(c, q, SearchType.KEYWORD, null, 10);
+                    List<String> single = bits(search(one, q, SearchType.KEYWORD, null, 10).results());
+                    assertThat(fan.warnings()).as(q).isEmpty();
+                    assertThat(bits(fan.results())).as("fan-out vs single node: " + q).isEqualTo(single);
+                    assertThat(single).as("both shards match " + q)
+                            .anyMatch(x -> x.startsWith(JAVA + ":")).anyMatch(x -> x.startsWith(PY + ":"));
+                }
+                assertThat(r.drainCalls()).as("c fanned out to r").isNotEmpty();
+            }
+        }
+    }
+
+    /**
+     * Gate Phase 3 decision: a project without vectors of the search model is left out of the vector
+     * part with the same warning on a single node and on every coordinator (keyword part kept); an
+     * explicitly requested single project without vectors fails on every node alike.
+     */
+    @Test
+    void projectWithoutVectorsIsSkippedWithAWarningEverywhere() throws Exception {
+        Path home = tmp.resolve("no-vectors");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture f = new ClusterFixture(home.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            f.index(PY, false, true);
+            f.index(JAVA, false, false); // --no-embed
+            try (TestReaderNode withVec = new TestReaderNode(home.resolve("v"), store, BUCKET, "v", List.of(PY), EMBEDDER, null);
+                 TestReaderNode noVec = new TestReaderNode(home.resolve("k"), store, BUCKET, "k", List.of(JAVA), EMBEDDER, null);
+                 TestReaderNode one = new TestReaderNode(home.resolve("one"), store, BUCKET, "one", List.of(), EMBEDDER, null)) {
+                for (TestReaderNode n : List.of(withVec, noVec, one)) {
+                    n.awaitShard(PY, 2);
+                    n.awaitShard(JAVA, 2);
+                }
+                String warning = SearchEngine.noVectorsWarning(JAVA, EMBEDDER.modelId());
+                assertThat(warning).isEqualTo("project " + JAVA + " has no vectors for model " + EMBEDDER.modelId()
+                        + "; vector results exclude it");
+                String q = "GreetingService greeting message";
+                for (SearchType type : List.of(SearchType.VECTOR, SearchType.HYBRID, SearchType.UNIFIED)) {
+                    SearchResponse single = search(one, q, type, null, 10);
+                    assertThat(single.warnings()).as("single node " + type).containsExactly(warning);
+                    assertThat(single.results()).as("single node " + type).isNotEmpty();
+                    if (type == SearchType.VECTOR) {
+                        assertThat(single.results()).allSatisfy(r -> assertThat(r.project()).isEqualTo(PY));
+                    } else if (type == SearchType.HYBRID) {
+                        assertThat(single.results()).as("keyword part over both " + type)
+                                .anyMatch(r -> r.project().equals(JAVA)).anyMatch(r -> r.project().equals(PY));
+                    }
+                    for (TestReaderNode coordinator : List.of(withVec, noVec)) {
+                        SearchResponse fan = search(coordinator, q, type, null, 10);
+                        assertThat(fan.warnings()).as(coordinator.id + " " + type).containsExactly(warning);
+                        if (type == SearchType.UNIFIED) { // multi-shard unified is approximate: same ids
+                            assertThat(jaccard(ids(fan.results()), ids(single.results())))
+                                    .as(coordinator.id + " " + type + ": " + ids(fan.results()) + " vs " + ids(single.results()))
+                                    .isEqualTo(1.0);
+                        } else {
+                            assertThat(bits(fan.results())).as(coordinator.id + " " + type).isEqualTo(bits(single.results()));
+                        }
+                    }
+                }
+                // unified scores the vectorless project's BM25 hits (its rescorer's fallback) on every node
+                String javaOnly = "minuend subtrahend";
+                List<String> unifiedSingle = ids(search(one, javaOnly, SearchType.UNIFIED, null, 30).results());
+                assertThat(unifiedSingle).anyMatch(id -> id.startsWith(JAVA + ":"));
+                for (TestReaderNode coordinator : List.of(withVec, noVec)) {
+                    List<String> fan = ids(search(coordinator, javaOnly, SearchType.UNIFIED, null, 30).results());
+                    assertThat(fan.stream().filter(id -> id.startsWith(JAVA + ":")).toList()).as(coordinator.id)
+                            .isEqualTo(unifiedSingle.stream().filter(id -> id.startsWith(JAVA + ":")).toList());
+                }
+                for (TestReaderNode n : List.of(withVec, noVec, one)) {
+                    for (SearchType type : List.of(SearchType.VECTOR, SearchType.HYBRID)) {
+                        org.assertj.core.api.Assertions.assertThatThrownBy(() -> search(n, q, type, JAVA, 10))
+                                .as(n.id + " " + type + " scoped to " + JAVA)
+                                .isInstanceOf(com.pharos.search.VectorModelUnavailableException.class)
+                                .hasMessageContaining("Project '" + JAVA + "' has no vectors for search embedding model '"
+                                        + EMBEDDER.modelId() + "'");
+                    }
+                    assertThat(search(n, q, SearchType.KEYWORD, JAVA, 10).results()).as(n.id + " keyword").isNotEmpty();
+                }
+            }
+        }
+    }
+
     /** Review Focus 5: one shard through fan-out is bitwise that shard's own local search. */
     @Test
     void singleShardThroughFanOutIsBitwiseLocal() throws Exception {
@@ -689,11 +806,10 @@ class DistributedSearchTest {
             SearchResponse v = search(s.coordinator(), "multiply", SearchType.VECTOR, null, 10);
             assertThat(v.results()).isEmpty();
             assertThat(v.warnings()).containsExactlyInAnyOrder(
-                    "shard " + PY + " has no vectors for model other-model",
-                    "shard " + JAVA + " has no vectors for model other-model");
+                    SearchEngine.noVectorsWarning(PY, "other-model"), SearchEngine.noVectorsWarning(JAVA, "other-model"));
             SearchResponse h = search(s.coordinator(), "GreetingService multiply", SearchType.HYBRID, null, 10);
             assertThat(h.results()).anyMatch(x -> x.project().equals(JAVA)).anyMatch(x -> x.project().equals(PY));
-            assertThat(h.warnings()).contains("shard " + JAVA + " has no vectors for model other-model");
+            assertThat(h.warnings()).contains(SearchEngine.noVectorsWarning(JAVA, "other-model"));
             assertThat(s.replicas().get(0).drainCalls()).extracting(TestReaderNode.Call::status).contains(409);
         }
     }

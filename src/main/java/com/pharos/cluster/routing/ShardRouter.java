@@ -97,6 +97,25 @@ public final class ShardRouter {
         return routes;
     }
 
+    /**
+     * The shard names of the catalog for naming purposes (e.g. a query mentioning a project): the
+     * current catalog, the last good read when it is too old to route with, empty before any read.
+     * Never throws and never blocks on a catalog read another query is already making.
+     */
+    public List<String> catalogShardNames() {
+        List<ShardId> shards;
+        try {
+            shards = catalog.shards();
+        } catch (CatalogTooOldException e) {
+            shards = e.lastKnown();
+        } catch (IOException | RuntimeException e) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>(shards.size());
+        for (ShardId s : shards) out.add(s.value());
+        return out;
+    }
+
     /** True when this reader holds the shard. */
     public boolean servesLocally(ShardId shard) {
         return local.test(shard);
