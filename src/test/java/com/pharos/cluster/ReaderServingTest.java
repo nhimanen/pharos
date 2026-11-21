@@ -399,4 +399,12 @@ class ReaderServingTest {
         assertThat(ClusterRuntime.catalogWait(10_000)).isEqualTo(java.time.Duration.ofMillis(500));
         assertThat(ClusterRuntime.catalogWait(2_000)).isEqualTo(java.time.Duration.ofMillis(200));
     }
+
+    /** Final review minor 10: the drain's notice floor covers a coordinator's tick plus its bucket latency. */
+    @Test
+    void drainNoticeHasAMarginOverOneHeartbeat() {
+        assertThat(ClusterRuntime.drainNotice(10)).isEqualTo(java.time.Duration.ofSeconds(12));
+        assertThat(ClusterRuntime.drainNotice(1)).as("the router's notice is the floor").isEqualTo(java.time.Duration.ofSeconds(4));
+        assertThat(ClusterRuntime.drainNotice(3)).isEqualTo(java.time.Duration.ofSeconds(5));
+    }
 }

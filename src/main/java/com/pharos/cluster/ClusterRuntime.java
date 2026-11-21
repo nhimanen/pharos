@@ -249,6 +249,18 @@ public final class ClusterRuntime implements Closeable {
      * the probe's timeout ({@code pharos router}: 2 s + 2 s).
      */
     public static final Duration ROUTER_NOTICE = Duration.ofSeconds(4);
+    /**
+     * Added to one {@code heartbeatSeconds} in the drain's notice floor: a coordinator's reader list
+     * lags our draining write by up to one of its ticks plus its bucket list and get latency.
+     */
+    static final Duration HEARTBEAT_NOTICE_MARGIN = Duration.ofSeconds(2);
+
+    /** The least a drain stays up after announcing: {@code max(ROUTER_NOTICE, heartbeatSeconds + 2 s)}. */
+    static Duration drainNotice(int heartbeatSeconds) {
+        Duration coordinators = Duration.ofSeconds(heartbeatSeconds).plus(HEARTBEAT_NOTICE_MARGIN);
+        return coordinators.compareTo(ROUTER_NOTICE) > 0 ? coordinators : ROUTER_NOTICE;
+    }
+
     /** In-flight requests must stay at 0 this long before a drain closes. */
     static final Duration FINAL_QUIET = Duration.ofSeconds(1);
 
@@ -257,7 +269,7 @@ public final class ClusterRuntime implements Closeable {
      * and by the JVM shutdown hook as the fallback): announces {@code draining} at once (its
      * heartbeat, so coordinators stop routing shard calls to it, and {@code /health} 503, so the
      * router and load balancers stop sending queries), then keeps serving: it stays up at least
-     * {@code max(}{@link #ROUTER_NOTICE}{@code , heartbeatSeconds)} so others can see the draining
+     * {@link #drainNotice} ({@code max(4 s, heartbeatSeconds + 2 s)}) so others can see the draining
      * state, and until no request has been in flight for {@link #FINAL_QUIET}; everything is capped
      * by {@code cluster.drainSeconds}. Requests arriving meanwhile are served. Then it
      * {@link #close}s. Any other node, or one not serving, closes at once. Idempotent.
@@ -272,8 +284,7 @@ public final class ClusterRuntime implements Closeable {
             ClusterConfig c = config.getCluster();
             long start = System.nanoTime();
             long max = TimeUnit.SECONDS.toNanos(c.getDrainSeconds());
-            long notice = Math.min(max, Math.max(ROUTER_NOTICE.toNanos(),
-                    TimeUnit.SECONDS.toNanos(c.getHeartbeatSeconds())));
+            long notice = Math.min(max, drainNotice(c.getHeartbeatSeconds()).toNanos());
             long quiet = FINAL_QUIET.toNanos();
             log.info("Draining: announced; stopping when no request has been in flight for {} ms, after at least"
                     + " {} ms, at most {} s (cluster.drainSeconds)", FINAL_QUIET.toMillis(),
