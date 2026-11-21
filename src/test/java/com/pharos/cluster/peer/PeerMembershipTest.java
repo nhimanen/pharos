@@ -40,6 +40,7 @@ import java.util.function.BooleanSupplier;
 import static com.pharos.cluster.peer.PeerWriterFixture.TOKEN;
 import static com.pharos.cluster.peer.PeerWriterFixture.heartbeat;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Phase 5 Task 2b: reader membership and the status hysteresis state without a bucket. */
 class PeerMembershipTest {
@@ -357,15 +358,20 @@ class PeerMembershipTest {
 
     // ── status (P5-R1, P5-R2) ────────────────────────────────────────────────
 
+    /** Refreshes {@code catalog} until it dropped every writer that stopped answering. */
+    private static void dropMissing(PeerCatalog catalog) {
+        for (int i = 0; i < PeerCatalog.DROP_AFTER; i++) catalog.refresh();
+    }
+
     @Test
     void statusStateMovesToNextWriter() throws Exception {
         PeerWriterFixture a = writer("a", CLOCK_A);
         PeerWriterFixture b = writer("b", CLOCK_B);
         PeerHttp http = http();
         PeerCatalog catalog = PeerWriterFixture.catalog(http, b, a);
-        StatusStateStore store = PeerStatusState.remote(catalog::liveWriters, http);
+        StatusStateStore store = PeerStatusState.remote(() -> PeerStatusState.tracked(catalog), http);
 
-        // compare-and-set on the lowest-id live writer
+        // compare-and-set on the lowest-id writer
         StatusStateStore.Versioned v0 = store.read();
         assertThat(v0.state()).isEqualTo(StatusState.EMPTY);
         assertThat(v0.etag()).isNull();
@@ -382,8 +388,16 @@ class PeerMembershipTest {
         assertThat(store.write(s2, v1.etag())).isFalse(); // a racing node that read v1 too loses
         assertThat(store.read().state().asOf()).isEqualTo(200);
 
-        // a dies: the state starts over on b; a's versions mean nothing there
+        // a misses a refresh: it still holds the state; nobody falls over to b
         a.stop();
+        catalog.refresh();
+        assertThat(catalog.liveWriters()).extracting(PeerCatalog.WriterRef::node).containsExactly("b");
+        assertThatThrownBy(store::read).isInstanceOf(java.io.IOException.class);
+        assertThatThrownBy(() -> store.write(s1, null)).isInstanceOf(java.io.IOException.class);
+        assertThat(b.statusState.get()).isEmpty();
+
+        // a is dropped: the state starts over on b; a's versions mean nothing there
+        catalog.refresh();
         catalog.refresh();
         StatusStateStore.Versioned onB = store.read();
         assertThat(onB.state()).isEqualTo(StatusState.EMPTY);
@@ -391,11 +405,107 @@ class PeerMembershipTest {
         assertThat(store.write(s2, v1.etag())).isFalse();
         assertThat(store.write(s1, null)).isTrue();
         assertThat(b.statusState.get()).isPresent();
+    }
 
-        // a answers again (a partition healed): the lowest id holds the state again, as a had it
+    /** A status service over the peers with an SSE client recording the event types it gets. */
+    private record Watched(StatusService service, List<String> events) {}
+
+    private Watched watchedStatus(PeerCatalog catalog, PeerHttp http) {
+        PeerReplicaSource replicas = new PeerReplicaSource(catalog, http, Duration.ofSeconds(2));
+        open.add(replicas::close);
+        PeerStatusSource source = new PeerStatusSource(catalog, replicas, http, Duration.ofSeconds(2),
+                Duration.ofSeconds(30), System::nanoTime, java.time.Clock.systemUTC());
+        com.pharos.cluster.status.StatusEvents events = new com.pharos.cluster.status.StatusEvents(
+                Duration.ofMinutes(5), null);
+        List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        assertThat(events.tryReserve()).isTrue();
+        events.add(new com.pharos.cluster.status.StatusEvents.Sink() {
+            @Override public void event(String type, String data) { seen.add(type); }
+            @Override public void comment(String text) { }
+            @Override public void onClose(Runnable r) { }
+            @Override public void close() { }
+        });
+        StatusService status = new StatusService(source,
+                PeerStatusState.remote(() -> PeerStatusState.tracked(catalog), http),
+                StatusSettings.of(new ClusterConfig().getStatus()), events, Duration.ofHours(1), Duration.ZERO,
+                System::nanoTime);
+        open.add(status);
+        return new Watched(status, seen);
+    }
+
+    /** A state with one proposal in force since long before {@code asOf}. */
+    private static byte[] activeProposal(long asOfSeconds, long sinceSeconds) throws Exception {
+        String id = com.pharos.cluster.status.Proposals.id("add-readers", "readers");
+        var rule = new StatusState.Rule("add-readers", "readers", sinceSeconds, null, true, "load", "Start 1 reader");
+        return new StatusState(StatusState.VERSION, asOfSeconds, new java.util.TreeMap<>(Map.of(id, rule)), null,
+                new StatusState.Summary(0, 2, 1)).toJson();
+    }
+
+    @Test
+    void holderMissingOneRefreshKeepsTheStatusAndItsEvents() throws Exception {
+        PeerWriterFixture a = writer("a", CLOCK_A);
+        PeerWriterFixture b = writer("b", CLOCK_B);
+        PeerHttp http = http();
+        PeerCatalog catalog = PeerWriterFixture.catalog(http, a, b);
+        member(PeerWriterFixture.catalog(http, a, b), http, heartbeat("r1", List.of("p1"), false, null, null, 0)).tick();
+        long asOf = CLOCK_A / 1000;
+        assertThat(a.statusState.put(activeProposal(asOf - 10, asOf - 1000), null)).isPresent();
+        Watched w = watchedStatus(catalog, http);
+
+        ClusterStatus before = w.service().refresh();
+        assertThat(before.proposals()).extracting(ClusterStatus.Proposal::kind).containsExactly("add-readers");
+
+        // a is slow for one refresh: the refresh fails, the status stays, nothing moves to b
+        a.stop();
+        catalog.refresh();
+        assertThatThrownBy(() -> w.service().refresh()).isInstanceOf(java.io.IOException.class);
+        assertThat(w.service().current().proposals()).extracting(ClusterStatus.Proposal::kind)
+                .containsExactly("add-readers");
+        assertThat(b.statusState.get()).isEmpty();
+
+        // a is back: same holder, same state, no event
         a.start();
         catalog.refresh();
-        assertThat(store.read().etag()).isEqualTo(a.statusState.get().map(PeerStatusState.Held::etag).orElseThrow());
+        ClusterStatus after = w.service().refresh();
+        assertThat(after.proposals()).extracting(ClusterStatus.Proposal::kind).containsExactly("add-readers");
+        assertThat(b.statusState.get()).isEmpty();
+        Thread.sleep(300); // the event sender is asynchronous
+        assertThat(w.events()).doesNotContain(com.pharos.cluster.status.StatusEvent.CLEARED,
+                com.pharos.cluster.status.StatusEvent.APPEARED);
+    }
+
+    @Test
+    void holderReturningAfterTheWindowStartsOver() throws Exception {
+        PeerWriterFixture a = writer("a", CLOCK_A);
+        PeerWriterFixture b = writer("b", CLOCK_B);
+        PeerHttp http = http();
+        PeerCatalog catalog = PeerWriterFixture.catalog(http, a, b);
+        member(PeerWriterFixture.catalog(http, a, b), http, heartbeat("r1", List.of("p1"), false, null, null, 0)).tick();
+        long asOf = CLOCK_A / 1000;
+        String id = com.pharos.cluster.status.Proposals.id("add-readers", "readers");
+        assertThat(a.statusState.put(activeProposal(asOf - 10, asOf - 1000), null)).isPresent();
+
+        // a is cut off for longer than the window: the cluster moves to b, and a's state expires
+        a.stop();
+        dropMissing(catalog);
+        assertThat(PeerStatusState.tracked(catalog)).extracting(PeerCatalog.WriterRef::node).containsExactly("b");
+        a.advance(PeerWriterFixture.STATE_IDLE.toSeconds() + 1);
+        a.start();
+        HttpResponse<String> gone = call("GET", a.url() + "/replication/status-state", TOKEN, null);
+        assertThat(gone.statusCode()).isEqualTo(404);
+
+        // a is the holder again (lowest id), but with its pre-partition proposal forgotten
+        catalog.refresh();
+        ClusterStatus s = watchedStatus(catalog, http).service().refresh();
+        assertThat(s.proposals()).isEmpty();
+        StatusState recorded = StatusState.read(a.statusState.get().orElseThrow().json());
+        assertThat(recorded.rules()).doesNotContainKey(id);
+
+        // within the window a held state survives (reads keep it, writes are not needed)
+        a.advance(PeerWriterFixture.STATE_IDLE.toSeconds() - 1);
+        assertThat(a.statusState.get()).isPresent();
+        a.advance(PeerWriterFixture.STATE_IDLE.toSeconds() - 1);
+        assertThat(a.statusState.get()).isPresent();
     }
 
     @Test
@@ -406,14 +516,7 @@ class PeerMembershipTest {
         PeerCatalog catalog = PeerWriterFixture.catalog(http, a, b);
         member(PeerWriterFixture.catalog(http, a, b), http,
                 heartbeat("r1", List.of("p1"), false, ReaderHeartbeat.WARMING, null, 0)).tick();
-        PeerReplicaSource replicas = new PeerReplicaSource(catalog, http, Duration.ofSeconds(2));
-        open.add(replicas::close);
-        PeerStatusSource source = new PeerStatusSource(catalog, replicas, http, Duration.ofSeconds(2),
-                Duration.ofSeconds(30), System::nanoTime, java.time.Clock.systemUTC());
-        StatusService status = new StatusService(source, PeerStatusState.remote(catalog::liveWriters, http),
-                StatusSettings.of(new ClusterConfig().getStatus()), null, Duration.ofHours(1), Duration.ZERO,
-                System::nanoTime);
-        open.add(status);
+        StatusService status = watchedStatus(catalog, http).service();
 
         ClusterStatus s = status.refresh();
         assertThat(s.mode()).isEqualTo("cluster");
@@ -427,7 +530,7 @@ class PeerMembershipTest {
         assertThat(b.statusState.get()).isEmpty();
 
         a.stop();
-        catalog.refresh();
+        dropMissing(catalog);
         b.advance(1);
         ClusterStatus after = status.refresh();
         assertThat(Instant.parse(after.asOf())).isBetween(Instant.ofEpochMilli(CLOCK_B), Instant.ofEpochMilli(CLOCK_B + 6000));
@@ -437,22 +540,29 @@ class PeerMembershipTest {
     }
 
     @Test
-    void peerWriterStatusComesFromThePeers() throws Exception {
+    void peerWriterWithoutDiscoveryNeverWritesTheState() throws Exception {
         int port;
         try (java.net.ServerSocket sock = new java.net.ServerSocket(0)) {
             port = sock.getLocalPort();
         }
+        java.util.concurrent.atomic.AtomicInteger hooks = new java.util.concurrent.atomic.AtomicInteger();
+        Javalin hook = Javalin.create();
+        hook.post("/hook", ctx -> hooks.incrementAndGet());
+        hook.start(0);
+        open.add(hook::stop);
+
         IndexConfig config = IndexConfig.defaults();
-        Path h = tmp.resolve("writer-1");
+        Path h = tmp.resolve("a-writer");
         config.setIndexDir(h.resolve("indexes"));
         config.setSynonymsFile(h.resolve("synonyms.txt"));
         ClusterConfig c = new ClusterConfig();
         c.setRole(NodeRole.WRITER);
         c.setBackend(BackendKind.PEER_PULL);
-        c.setNodeId("writer-1");
+        c.setNodeId("a-writer"); // the lowest id: the holder of the shared state
         c.setToken(TOKEN);
-        c.setAdvertiseUrl("http://localhost:" + port); // no discovery: it lists itself
+        c.setAdvertiseUrl("http://localhost:" + port); // no discovery: it sees itself only
         c.getPeers().setStoreDir(h.resolve("peer-store"));
+        c.getStatus().setWebhookUrl("http://localhost:" + hook.port() + "/hook");
         c.validate();
         config.setCluster(c);
         PeerBackend backend = new PeerBackend(config);
@@ -464,14 +574,63 @@ class PeerMembershipTest {
             lucene.close();
         });
         Javalin app = Javalin.create();
-        runtime.replicationEndpoint().orElseThrow().mount(app);
+        ReplicationEndpoint endpoint = runtime.replicationEndpoint().orElseThrow();
+        endpoint.mount(app);
         app.start(port);
         open.add(app::stop);
+        PeerWriterFixture b = writer("b-writer", CLOCK_B);
 
-        ClusterStatus s = runtime.statusService().refresh();
-        assertThat(s.mode()).isEqualTo("cluster");
-        assertThat(s.layout().writers()).extracting(ClusterStatus.Writer::node).containsExactly("writer-1");
-        // the state it holds as the only (lowest-id) writer
-        assertThat(runtime.replicationEndpoint().orElseThrow().statusState().get()).isPresent();
+        // its own refreshes: a status of what it sees, never written into the shared state
+        for (int i = 0; i < 3; i++) {
+            ClusterStatus s = runtime.statusService().refresh();
+            assertThat(s.mode()).isEqualTo("cluster");
+            assertThat(s.layout().writers()).extracting(ClusterStatus.Writer::node).containsExactly("a-writer");
+        }
+        assertThat(endpoint.statusState().get()).isEmpty();
+
+        // a node seeing both writers records the state there; the partial writer only reads it
+        PeerHttp http = http();
+        PeerCatalog full = new PeerCatalog(new PeerDiscovery(PeerDiscovery.parse("seeds:http://localhost:" + port
+                + "," + b.url()), "http", PeerDiscovery.SYSTEM_RESOLVER, http), http, Duration.ofSeconds(1),
+                System::nanoTime);
+        full.refresh();
+        watchedStatus(full, http).service().refresh();
+        String etag = endpoint.statusState().get().orElseThrow().etag();
+        for (int i = 0; i < 3; i++) runtime.statusService().refresh();
+        assertThat(endpoint.statusState().get().orElseThrow().etag()).isEqualTo(etag);
+        Thread.sleep(500); // webhook delivery is asynchronous
+        assertThat(hooks.get()).isZero();
+    }
+
+    @Test
+    void routerFollowsGossipWithinAllowHosts() throws Exception {
+        PeerWriterFixture seed = writer("seed", CLOCK_A);
+        PeerWriterFixture gossiped = writer("gossiped", CLOCK_B);
+        String viaIp = gossiped.url().replace("localhost", "127.0.0.1");
+        seed.peers.add(viaIp); // only the seed knows it, under another host name
+        PeerHttp http = http();
+        member(new PeerCatalog(new PeerDiscovery(PeerDiscovery.parse("seeds:" + viaIp), "http",
+                PeerDiscovery.SYSTEM_RESOLVER, http), http, Duration.ofSeconds(1), System::nanoTime), http,
+                heartbeat("r1", List.of("p1"), false, null, null, 0)).tick();
+        assertThat(gossiped.liveNodes()).containsExactly("r1");
+        assertThat(seed.liveNodes()).isEmpty();
+
+        ClusterConfig c = new ClusterConfig();
+        c.setToken(TOKEN);
+        c.setBackend(BackendKind.PEER_PULL);
+        c.setHeartbeatSeconds(1);
+        c.setReaderTtlSeconds(30);
+        c.getPeers().setDiscovery("seeds:" + seed.url());
+        try (var router = RouterCommand.observe(c)) { // allowHosts unset: only the seed's host, localhost
+            router.start();
+            Thread.sleep(1500);
+            assertThat(router.live()).isEmpty();
+        }
+        c.getPeers().setAllowHosts(List.of("localhost", "127.0.0.1"));
+        try (var router = RouterCommand.observe(c)) {
+            router.start();
+            await("the gossiped writer's reader", () -> !router.live().isEmpty());
+            assertThat(nodes(router.live())).containsExactly("r1");
+        }
     }
 }

@@ -676,9 +676,10 @@ public final class ClusterRuntime implements Closeable {
             // lowest-id live writer
             source = new com.pharos.cluster.peer.PeerStatusSource(peerStatus.catalog(), peerStatus.source(),
                     peerStatus.http(), com.pharos.cluster.peer.PeerMembership.callTimeout(c.getHeartbeatSeconds()),
-                    c.getWriter().leaseTtl(), System::nanoTime, java.time.Clock.systemUTC());
-            states = com.pharos.cluster.peer.PeerStatusState.remote(peerStatus.catalog()::liveWriters,
-                    peerStatus.http());
+                    c.getWriter().leaseTtl(), System::nanoTime, java.time.Clock.systemUTC(), peerStatus.partial());
+            var cat = peerStatus.catalog();
+            states = com.pharos.cluster.peer.PeerStatusState.remote(
+                    () -> com.pharos.cluster.peer.PeerStatusState.tracked(cat), peerStatus.http());
         } else {
             source = new com.pharos.cluster.status.LocalStatusSource(c.getNodeId() == null ? "local" : c.getNodeId(),
                     registry, luceneIndexer, () -> load, java.time.Clock.systemUTC());
@@ -699,30 +700,35 @@ public final class ClusterRuntime implements Closeable {
     }
 
     /** What a peer-mode node builds its {@code /cluster/status} from. */
+    /** @param partial the catalog lists this writer alone (no discovery): read the shared state, never write it */
     private record PeerStatusParts(com.pharos.cluster.peer.PeerCatalog catalog, ReplicaSource source,
-                                   com.pharos.cluster.peer.PeerHttp http) {}
+                                   com.pharos.cluster.peer.PeerHttp http, boolean partial) {}
 
     /**
      * A peer-mode node's status inputs; null on other backends. A reader uses its own catalog, source
      * and client. A writer has none, so it builds them over {@code cluster.peers.discovery}, or, without
-     * one, over its own {@code cluster.advertiseUrl} (it lists itself); with neither, null (the local
+     * one, over its own {@code cluster.advertiseUrl} (it lists itself, a partial view: dated by its
+     * node clock, so it reads the shared state but never writes it); with neither, null (the local
      * status, as before). Holding the monitor of this.
      */
     private PeerStatusParts peerStatusParts() {
         if (!(backend instanceof com.pharos.cluster.peer.PeerBackend peer)) return null;
         if (peer.isReader()) {
-            return new PeerStatusParts(peer.peerCatalog().orElseThrow(), peer.source(), peer.peerHttp().orElseThrow());
+            return new PeerStatusParts(peer.peerCatalog().orElseThrow(), peer.source(), peer.peerHttp().orElseThrow(),
+                    false);
         }
         ClusterConfig c = config.getCluster();
         String discovery = c.getPeers().getDiscovery();
+        boolean partial = false;
         if ((discovery == null || discovery.isBlank()) && c.getAdvertiseUrl() != null && !c.getAdvertiseUrl().isBlank()) {
             discovery = "seeds:" + c.getAdvertiseUrl().strip();
+            partial = true; // it sees itself only: its view must never become the shared state
         }
         if (discovery == null || discovery.isBlank()) return null;
         com.pharos.cluster.peer.PeerHttp http = com.pharos.cluster.peer.PeerHttp.of(c);
         try {
-            var d = new com.pharos.cluster.peer.PeerDiscovery(com.pharos.cluster.peer.PeerDiscovery.parse(discovery),
-                    http.tls() ? "https" : "http", com.pharos.cluster.peer.PeerDiscovery.SYSTEM_RESOLVER, http);
+            var d = com.pharos.cluster.peer.PeerDiscovery.of(c, com.pharos.cluster.peer.PeerDiscovery.parse(discovery),
+                    http); // with cluster.peers.allowHosts, as the readers
             var cat = new com.pharos.cluster.peer.PeerCatalog(d, http,
                     Duration.ofSeconds(c.getPeers().getRefreshSeconds()), System::nanoTime);
             var src = new com.pharos.cluster.peer.PeerReplicaSource(cat, http,
@@ -731,7 +737,7 @@ public final class ClusterRuntime implements Closeable {
                 src.close();
                 http.close();
             };
-            return new PeerStatusParts(cat, src, http);
+            return new PeerStatusParts(cat, src, http, partial);
         } catch (RuntimeException e) {
             http.close();
             log.warn("Peer status: cannot use cluster.peers.discovery for /cluster/status ({}); serving the local"

@@ -115,13 +115,12 @@ public class RouterCommand implements Callable<Integer> {
      * bucket's {@code catalog/readers/}, or on {@code peer-pull} every discovered writer's
      * {@code GET /replication/readers}, merged.
      */
-    static MembershipSource observe(ClusterConfig c) throws IOException {
+    public static MembershipSource observe(ClusterConfig c) throws IOException {
         if (c.getBackend() == BackendKind.PEER_PULL) {
             com.pharos.cluster.peer.PeerHttp http = com.pharos.cluster.peer.PeerHttp.of(c);
             try {
-                var discovery = new com.pharos.cluster.peer.PeerDiscovery(
-                        com.pharos.cluster.peer.PeerDiscovery.parse(c.getPeers().getDiscovery()),
-                        http.tls() ? "https" : "http", com.pharos.cluster.peer.PeerDiscovery.SYSTEM_RESOLVER, http);
+                var discovery = com.pharos.cluster.peer.PeerDiscovery.of(c,
+                        com.pharos.cluster.peer.PeerDiscovery.parse(c.getPeers().getDiscovery()), http); // allowHosts too
                 var catalog = new com.pharos.cluster.peer.PeerCatalog(discovery, http,
                         Duration.ofSeconds(c.getPeers().getRefreshSeconds()), System::nanoTime);
                 var members = com.pharos.cluster.peer.PeerMembership.observer(catalog, http, c);

@@ -18,7 +18,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 
@@ -29,11 +28,14 @@ import java.util.function.LongSupplier;
  * merged as {@link PeerMembership#merge} does) and the live writers themselves.
  *
  * <p><b>Clock.</b> The snapshot is dated by the clock of the writer that holds the status state
- * (the lowest node id among the live writers, {@link PeerStatusState#holder}): its {@code now}, plus
- * the time since its answer arrived on this node's monotonic clock. Every node therefore stamps the
- * shared state with the holder's clock, as bucket nodes stamp it with the bucket's. Reader ages are
- * the writers' own. When the holder did not answer, the snapshot falls back to this node's clock
- * ({@link StatusSnapshot#nodeClock}) and never writes the state.
+ * (the lowest node id among the writers the catalog tracks, live or missing but not dropped,
+ * {@link PeerStatusState#holder}): its {@code now}, plus the time since its answer arrived on this
+ * node's monotonic clock. Every node therefore stamps the shared state with the holder's clock, as
+ * bucket nodes stamp it with the bucket's. Reader ages are the writers' own. When the holder did not
+ * answer, {@link #read} throws: the status service keeps its previous status and writes nothing, and
+ * the holder does not change until the catalog drops it. A {@code partial} source (a writer seeing
+ * only itself) dates every snapshot by this node's clock ({@link StatusSnapshot#nodeClock}), so it
+ * never writes the state.
  *
  * <p>Lease fields are null (there are no leases in peer mode), as are {@code publishedAt} (no
  * bucket LastModified) and every writer heartbeat field (peer writers send none: they appear with
@@ -50,11 +52,23 @@ public final class PeerStatusSource implements StatusSource {
     private final Duration leaseTtl;
     private final LongSupplier nanoClock;
     private final Clock fallback;
+    private final boolean partial;
     /** Manifests by shard, for the generation last read (manifests are immutable). */
     private final Map<String, ShardManifest> manifests = new ConcurrentHashMap<>();
 
     public PeerStatusSource(PeerCatalog catalog, ReplicaSource replicas, PeerHttp http, Duration timeout,
                             Duration leaseTtl, LongSupplier nanoClock, Clock fallback) {
+        this(catalog, replicas, http, timeout, leaseTtl, nanoClock, fallback, false);
+    }
+
+    /**
+     * @param partial the catalog sees part of the cluster only (a writer without
+     *                {@code cluster.peers.discovery}): every snapshot is dated by this node's clock, so
+     *                it reads the shared state but never writes it
+     */
+    public PeerStatusSource(PeerCatalog catalog, ReplicaSource replicas, PeerHttp http, Duration timeout,
+                            Duration leaseTtl, LongSupplier nanoClock, Clock fallback, boolean partial) {
+        this.partial = partial;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.replicas = Objects.requireNonNull(replicas, "replicas");
         this.http = Objects.requireNonNull(http, "http");
@@ -73,12 +87,21 @@ public final class PeerStatusSource implements StatusSource {
             throw new IOException("no live writer answered GET /replication/readers");
         }
         long nowNanos = nanoClock.getAsLong();
-        Optional<PeerCatalog.WriterRef> holder = PeerStatusState.holder(live);
-        Optional<PeerMembership.WriterReaders> clock = holder.flatMap(h -> answers.stream()
-                .filter(a -> a.writer().node().equals(h.node())).findFirst());
-        boolean nodeClock = clock.isEmpty();
-        Instant asOf = clock.map(a -> Instant.ofEpochMilli(a.nowMillis())
-                .plusNanos(Math.max(0, nowNanos - a.answeredNanos()))).orElseGet(fallback::instant);
+        Instant asOf;
+        boolean nodeClock = partial;
+        if (partial) {
+            asOf = fallback.instant();
+        } else {
+            // the holder is the lowest id the catalog still tracks (live or missing, not dropped): one
+            // missed refresh must not move the state, so while it is unreachable the status stays as is
+            PeerCatalog.WriterRef holder = PeerStatusState.holder(PeerStatusState.tracked(catalog)).orElseThrow(() ->
+                    new IOException("no writer to hold the cluster status state"));
+            PeerMembership.WriterReaders clock = answers.stream()
+                    .filter(a -> a.writer().node().equals(holder.node())).findFirst().orElseThrow(() ->
+                            new IOException("the status-state holder, writer " + holder + ", did not answer;"
+                                    + " keeping the previous status"));
+            asOf = Instant.ofEpochMilli(clock.nowMillis()).plusNanos(Math.max(0, nowNanos - clock.answeredNanos()));
+        }
 
         List<StatusSnapshot.ReaderObs> readers = new ArrayList<>();
         for (PeerMembership.Merged m : PeerMembership.merge(answers).values()) {

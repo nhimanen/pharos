@@ -26,7 +26,11 @@ public final class PeerWriterFixture implements AutoCloseable {
     public final AtomicLong nanos = new AtomicLong(System.nanoTime());
     public final AtomicLong wallMillis;
     public final PeerReaderRegistry readers;
-    public final PeerStatusState statusState = new PeerStatusState();
+    /** Held state idle for {@link #STATE_IDLE} (by {@link #nanos}) is dropped. */
+    public static final Duration STATE_IDLE = Duration.ofSeconds(60);
+    public final PeerStatusState statusState = new PeerStatusState(STATE_IDLE, nanos::get);
+    /** What {@code /replication/peers} lists (gossip). */
+    public final List<String> peers = new java.util.concurrent.CopyOnWriteArrayList<>();
     public final ReplicationEndpoint endpoint;
     private final PeerStore store;
     private Javalin app;
@@ -37,7 +41,8 @@ public final class PeerWriterFixture implements AutoCloseable {
         this.wallMillis = new AtomicLong(wallMillis);
         this.store = PeerStore.open(dir);
         this.readers = new PeerReaderRegistry(Duration.ofSeconds(readerTtlSeconds), nanos::get);
-        this.endpoint = new ReplicationEndpoint(store, node, InternalApi.tokenMatcher(TOKEN), 8, 16, List::of,
+        this.endpoint = new ReplicationEndpoint(store, node, InternalApi.tokenMatcher(TOKEN), 8, 16,
+                () -> List.copyOf(peers),
                 readers, statusState, this.wallMillis::get);
     }
 

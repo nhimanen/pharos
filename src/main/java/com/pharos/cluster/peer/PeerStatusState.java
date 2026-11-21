@@ -13,6 +13,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -31,6 +32,17 @@ import java.util.function.Supplier;
  * version read from one writer never matches on another or on a restarted one: when the holder dies,
  * the next writer's (empty) state starts over and racing nodes re-read it. Proposals may then reappear
  * after their wait window, once per holder loss (P5-R2's accepted cost).
+ *
+ * <p><b>Holder.</b> The lowest id among the writers the catalog tracks: live, or missing but not yet
+ * dropped ({@link PeerCatalog#DROP_AFTER} missed refreshes). A writer that misses one refresh keeps the
+ * state; nodes that cannot reach it keep their previous status and write nothing (no flip to another
+ * writer's empty state and back).
+ *
+ * <p><b>Idle expiry.</b> A held state that nobody read or wrote for {@link #idleExpiry} is dropped
+ * (the next {@code GET} answers 404, and the state starts over). Every node reads it on every status
+ * refresh, so this only happens to a writer that was cut off from the cluster: when it returns, its
+ * pre-partition state (old {@code since}s) must not fire proposals at once. Reads count, not only
+ * writes: a quiet cluster whose state does not change writes nothing for long stretches.
  */
 public final class PeerStatusState {
 
@@ -39,20 +51,55 @@ public final class PeerStatusState {
     public static final int MAX_BODY_BYTES = 1024 * 1024;
 
     private final String nonce;
+    private final long idleNanos;
+    private final LongSupplier nanoClock;
     // guarded by this
     private byte[] json;
     private long version;
+    private long lastAccess;
 
+    /** With the default idle expiry ({@value #DEFAULT_IDLE_SECONDS} s). */
     public PeerStatusState() {
+        this(Duration.ofSeconds(DEFAULT_IDLE_SECONDS), System::nanoTime);
+    }
+
+    /** The idle expiry of the defaults: {@code clearGraceSeconds} 60 s, above 4 × the 15 s refresh. */
+    static final long DEFAULT_IDLE_SECONDS = 60;
+
+    public PeerStatusState(Duration idleExpiry, LongSupplier nanoClock) {
         byte[] b = new byte[8];
         new SecureRandom().nextBytes(b);
         this.nonce = HexFormat.of().formatHex(b);
+        this.idleNanos = Objects.requireNonNull(idleExpiry, "idleExpiry").toNanos();
+        this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
+        this.lastAccess = nanoClock.getAsLong();
+    }
+
+    /**
+     * How long a held state may go unread and unwritten before it is dropped:
+     * {@code cluster.status.windows.clearGraceSeconds} (the hysteresis's own "condition gone" grace),
+     * and never less than the time the catalog takes to drop a writer
+     * ({@code (DROP_AFTER + 1) × cluster.peers.refreshSeconds}), so a holder that nodes still target
+     * while it is missing keeps its state.
+     */
+    public static Duration idleExpiry(com.pharos.config.ClusterConfig cfg) {
+        long grace = cfg.getStatus().getWindows().getClearGraceSeconds();
+        long drop = (PeerCatalog.DROP_AFTER + 1L) * cfg.getPeers().getRefreshSeconds();
+        return Duration.ofSeconds(Math.max(grace, drop));
+    }
+
+    // Holding this: drops a state idle for the expiry, then records this access.
+    private void access() {
+        long now = nanoClock.getAsLong();
+        if (json != null && now - lastAccess > idleNanos) json = null; // version stays: old ETags never match
+        lastAccess = now;
     }
 
     /** The held state's bytes and ETag; empty when none was written. */
     public record Held(byte[] json, String etag) {}
 
     public synchronized Optional<Held> get() {
+        access();
         return json == null ? Optional.empty() : Optional.of(new Held(json.clone(), etag(version)));
     }
 
@@ -71,6 +118,7 @@ public final class PeerStatusState {
         } catch (IOException | RuntimeException e) {
             throw new IllegalArgumentException("not a status state");
         }
+        access();
         String current = json == null ? null : etag(version);
         if (!Objects.equals(current, ifMatch)) return Optional.empty();
         json = next.clone();
@@ -86,16 +134,23 @@ public final class PeerStatusState {
 
     /**
      * The {@link StatusStateStore} of a peer-mode node: the state on the lowest-id writer among
-     * {@code liveWriters} (those that answered the catalog's last refresh), looked up on every call.
-     * A read or write that fails throws, so that status refresh keeps its previous status.
+     * {@code writers} (pass {@link #tracked}: live or missing, not dropped), looked up on every call.
+     * A read or write that fails (the holder unreachable) throws, so that status refresh keeps its
+     * previous status and writes nothing; it never falls over to another writer.
      */
     public static StatusStateStore remote(Supplier<List<PeerCatalog.WriterRef>> liveWriters, PeerHttp http) {
         return new Remote(liveWriters, http);
     }
 
-    /** The writer holding the state: the lowest node id among {@code live}; empty when there is none. */
-    public static Optional<PeerCatalog.WriterRef> holder(List<PeerCatalog.WriterRef> live) {
-        return live.stream().min(Comparator.comparing(PeerCatalog.WriterRef::node));
+    /** The writer holding the state: the lowest node id among {@code writers}; empty when there is none. */
+    public static Optional<PeerCatalog.WriterRef> holder(List<PeerCatalog.WriterRef> writers) {
+        return writers.stream().min(Comparator.comparing(PeerCatalog.WriterRef::node));
+    }
+
+    /** The writers {@code catalog} tracks: live, or missing but not yet dropped. */
+    public static List<PeerCatalog.WriterRef> tracked(PeerCatalog catalog) {
+        return catalog.writers().stream()
+                .map(w -> new PeerCatalog.WriterRef(w.node(), java.net.URI.create(w.url()))).toList();
     }
 
     static final Duration TIMEOUT = Duration.ofSeconds(5);

@@ -240,6 +240,17 @@ public final class PeerDiscovery {
     /** Hosts already warned about (a refused gossip entry is logged once per host). */
     private final Set<String> refusedHosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /**
+     * The discovery a node builds from its config: {@code spec}, the scheme {@code http} has
+     * ({@code https} with a truststore), the system resolver and {@code cluster.peers.allowHosts}. Every
+     * node that follows gossip must build it this way, so readers, writers and routers trust the same
+     * writers (and so agree on the status-state holder).
+     */
+    public static PeerDiscovery of(com.pharos.config.ClusterConfig c, Spec spec, PeerHttp http) {
+        return new PeerDiscovery(spec, http.tls() ? "https" : "http", SYSTEM_RESOLVER, http,
+                c.getPeers().getAllowHosts());
+    }
+
     /** {@link #PeerDiscovery(Spec, String, Resolver, PeerHttp, java.util.Collection)} allowing the seed hosts. */
     public PeerDiscovery(Spec spec, String scheme, Resolver resolver, PeerHttp http) {
         this(spec, scheme, resolver, http, null);

@@ -157,7 +157,7 @@ public final class PeerBackend implements ReplicationBackend {
                 com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
                 cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg),
                 new PeerReaderRegistry(Duration.ofSeconds(cfg.getReaderTtlSeconds()), System::nanoTime),
-                new PeerStatusState(), System::currentTimeMillis);
+                new PeerStatusState(PeerStatusState.idleExpiry(cfg), System::nanoTime), System::currentTimeMillis);
     }
 
     /**
