@@ -100,6 +100,7 @@ public final class ClusterFixture implements AutoCloseable {
         c.setRetireGraceSeconds(7200);
         c.getObjectStore().setBucket(bucket);
         c.getObjectStore().setPrefix("pharos");
+        c.getWriter().setWorkQueue(false); // fixtures index and publish by hand; work-queue tests opt in
         c.validate();
         config.setCluster(c);
         return config;

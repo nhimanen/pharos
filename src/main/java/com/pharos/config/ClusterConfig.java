@@ -369,8 +369,12 @@ public class ClusterConfig {
         private Path workDir = IndexConfig.DEFAULT_BASE.resolve("work");
         /** How often a writer polls a shard's source (git ls-remote, directory state) for changes. */
         private int pollSeconds = 60;
-        /** Work-queue mode (leases and takeover). Opt-in; nothing reads it before the work-queue task. */
-        private boolean workQueue = false;
+        /**
+         * Work-queue mode (leases, takeover, source polling): the default on {@code role: writer}
+         * since the Phase 4 gate. {@code false} keeps the hand-run writer (index and publish by
+         * hand under an implicit lease). Ignored on every other role.
+         */
+        private boolean workQueue = true;
         /**
          * Lease TTL in work-queue mode. A lease whose last write (by the bucket's LastModified) is
          * older than this may be taken over; the holder renews every TTL/3.

@@ -335,7 +335,8 @@ class ClusterConfigTest {
     void writerSectionDefaultsAndValidation() throws Exception {
         ClusterConfig.WriterConfig w = parse("{}").getWriter();
         assertThat(w.getPollSeconds()).isEqualTo(60);
-        assertThat(w.isWorkQueue()).isFalse();
+        assertThat(w.isWorkQueue()).as("work-queue mode is the writer default").isTrue();
+        assertThat(parse("{\"cluster\":{\"writer\":{\"workQueue\":false}}}").getWriter().isWorkQueue()).isFalse();
         assertThat(w.getWorkDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("work"));
         w = parse("{\"cluster\":{\"writer\":{\"workDir\":\"/w\",\"pollSeconds\":5,\"workQueue\":true}}}").getWriter();
         assertThat(w.getWorkDir()).isEqualTo(Path.of("/w"));

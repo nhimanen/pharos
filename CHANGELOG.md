@@ -83,6 +83,21 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   transient, it heals by itself. A
   shard without vectors of the coordinator's model is named in a warning and left out of the vector
   part (see Changed).
+- Work-queue writers (README "Work-queue writers"): `role: writer` nodes take shards from the
+  catalog under leases (`cluster.writer.leaseTtlSeconds`, 30), detect source changes every
+  `pollSeconds` at a fixed rate, also during runs (`pharos index|publish --source-git <url> --ref
+  <ref>` or `--source-path` record the source; `--no-embed` is recorded as `"embed": false` and
+  work-queue runs of that shard skip embeddings), publish changes, share shards
+  (`minHoldSeconds`, 120) and take over a dead writer's shards with its writer state restored from
+  the bucket. Writer disk guard (`cluster.writer.disk`), `/cluster/status`, `/cluster/events`, a
+  webhook for scaling proposals (`cluster.status`) and the Cluster page. A writer's `pharos web`
+  no longer loads the search models.
+
+### Changed (upgrade note)
+- `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
+  writer config without the key now runs the work queue and refuses hand-run `pharos index` /
+  `pharos publish` (exit 2); add `"writer": {"workQueue": false}` to keep indexing and publishing
+  by hand.
 
 ### Fixed
 - Multi-node: `pharos mcp-server` on a reader no longer joins reader membership. It wrote the
