@@ -41,7 +41,7 @@ import java.util.function.Function;
                 "0:nothing to upgrade, all upgraded, or aborted at the prompt",
                 "1:a project was skipped (unknown, missing index, root gone) or failed",
                 "2:confirmation needed but no terminal; re-run with --yes",
-                "5:refused on this node: a reader (readers receive upgrades by syncing) or a work-queue writer (its work loop upgrades: restart it on the new release)"}
+                "5:refused on a reader node (readers receive upgrades by syncing) or on a work-queue writer (its work loop upgrades: restart it on the new release)"}
 )
 public class UpgradeIndexesCommand implements Callable<Integer> {
 
