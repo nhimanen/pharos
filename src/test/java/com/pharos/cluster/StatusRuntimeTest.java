@@ -41,11 +41,18 @@ class StatusRuntimeTest {
             load.end(42_000_000L);
             assertThat(runtime.selfHeartbeat().warmP95Millis()).isEqualTo(50L);
 
-            // a reader's status comes from the bucket: its own state object lands there
+            // a reader's status comes from the bucket
+            ObjectStoreLayout layout = new ObjectStoreLayout(config.getCluster().getObjectStore().getPrefix());
+            ClusterStatus empty = runtime.statusService().refresh();
+            assertThat(empty.mode()).isEqualTo("cluster");
+            assertThat(store.get(layout.statusStateKey())).as("an empty bucket has no clock: nothing is recorded")
+                    .isEmpty();
+            store.put(layout.readerKey("r9"), new com.fasterxml.jackson.databind.ObjectMapper()
+                    .writeValueAsBytes(before));
             ClusterStatus st = runtime.statusService().refresh();
-            assertThat(st.mode()).isEqualTo("cluster");
-            assertThat(store.get(new ObjectStoreLayout(config.getCluster().getObjectStore().getPrefix())
-                    .statusStateKey())).isPresent();
+            assertThat(st.layout().readers()).extracting(ClusterStatus.Reader::node)
+                    .containsExactly(before.node());
+            assertThat(store.get(layout.statusStateKey())).isPresent();
         }
     }
 

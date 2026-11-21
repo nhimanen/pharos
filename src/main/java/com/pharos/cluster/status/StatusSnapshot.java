@@ -20,11 +20,14 @@ import java.util.Objects;
  * read (heartbeats, leases, {@code LATEST}s), truncated to seconds. Every age in the status is
  * measured against it, never against a node clock.
  *
- * @param mode     {@value #CLUSTER} or {@value #SINGLE_NODE}
- * @param leaseTtl the writer lease TTL ({@code cluster.writer.leaseTtlSeconds}) expiry is judged by
+ * @param mode      {@value #CLUSTER} or {@value #SINGLE_NODE}
+ * @param leaseTtl  the writer lease TTL ({@code cluster.writer.leaseTtlSeconds}) expiry is judged by
+ * @param nodeClock {@code asOf} is this node's clock, not the bucket's (a bucket with no timestamped
+ *                  object at all): such a snapshot never writes the shared state, since a skewed
+ *                  node clock stamped into it would stall every other node's updates
  */
 public record StatusSnapshot(String mode, Instant asOf, List<ShardObs> shards, List<WriterObs> writers,
-                             List<ReaderObs> readers, Duration leaseTtl) {
+                             List<ReaderObs> readers, Duration leaseTtl, boolean nodeClock) {
 
     public static final String CLUSTER = "cluster";
     public static final String SINGLE_NODE = "single-node";
@@ -39,6 +42,12 @@ public record StatusSnapshot(String mode, Instant asOf, List<ShardObs> shards, L
         readers = readers == null ? List.of()
                 : readers.stream().sorted(Comparator.comparing((ReaderObs r) -> r.heartbeat().node())).toList();
         leaseTtl = leaseTtl == null ? Duration.ofSeconds(30) : leaseTtl;
+    }
+
+    /** A snapshot dated by the bucket's clock (single node: by its own, the only clock there is). */
+    public StatusSnapshot(String mode, Instant asOf, List<ShardObs> shards, List<WriterObs> writers,
+                          List<ReaderObs> readers, Duration leaseTtl) {
+        this(mode, asOf, shards, writers, readers, leaseTtl, false);
     }
 
     /**

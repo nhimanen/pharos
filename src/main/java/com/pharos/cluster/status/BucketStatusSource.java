@@ -83,7 +83,8 @@ public final class BucketStatusSource implements StatusSource {
             now = max(now, r.latestAt());
             if (r.lease() != null) now = max(now, r.lease().lastModified());
         }
-        if (now == null) now = fallback.instant();
+        boolean nodeClock = now == null;
+        if (nodeClock) now = fallback.instant();
 
         List<StatusSnapshot.ReaderObs> readers = new ArrayList<>();
         for (BucketClock.Aged a : BucketClock.unexpired(readerInfos, now, readerTtl)) {
@@ -103,7 +104,7 @@ public final class BucketStatusSource implements StatusSource {
                     r.gen() == null ? null : r.gen().value(), m == null ? null : m.docCount(),
                     m == null ? null : m.sizeBytes(), m == null ? null : m.writerNode(), r.latestAt(), rev, r.lease()));
         }
-        return new StatusSnapshot(StatusSnapshot.CLUSTER, now, shards, writers, readers, leaseTtl);
+        return new StatusSnapshot(StatusSnapshot.CLUSTER, now, shards, writers, readers, leaseTtl, nodeClock);
     }
 
     private static Instant max(Instant a, Instant b) {

@@ -236,6 +236,13 @@ class ProposalsTest {
     }
 
     @Test
+    void aSnapshotDatedByANodeClockNeverWrites() {
+        StatusSnapshot s = new StatusSnapshot(StatusSnapshot.CLUSTER, T0.plusSeconds(86_400),
+                List.of(shard("a", true, 10L, null, null)), List.of(), List.of(), Duration.ofSeconds(30), true);
+        assertThat(Proposals.advance(s, null, CFG)).isSameAs(StatusState.EMPTY);
+    }
+
+    @Test
     void backlogAgeIsBucketTimeAndSurvivesATakeover() {
         List<StatusSnapshot.ShardObs> shards = List.of(shard("a", true, 10L, "w1", T0));
         // w1 saw the change 100 s before its heartbeat at T0 (its clock is irrelevant: an age is a duration)

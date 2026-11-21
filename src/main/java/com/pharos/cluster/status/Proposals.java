@@ -278,13 +278,14 @@ public final class Proposals {
 
     /**
      * The next state after observing {@code s}. Returns {@code prev} itself when {@code s} is older
-     * than the state's {@code asOf} (another node already recorded a newer observation) or when
-     * nothing worth a write changed; otherwise a new state stamped with {@code s.asOf()}.
+     * than the state's {@code asOf} (another node already recorded a newer observation), when it is
+     * dated by a node clock ({@link StatusSnapshot#nodeClock}), or when nothing worth a write
+     * changed; otherwise a new state stamped with {@code s.asOf()}.
      */
     public static StatusState advance(StatusSnapshot s, StatusState prev, StatusSettings cfg) {
         StatusState base = prev == null ? StatusState.EMPTY : prev;
         long now = s.asOf().getEpochSecond();
-        if (now < base.asOf()) return base;
+        if (now < base.asOf() || s.nodeClock()) return base;
         Map<String, Candidate> cands = candidates(s, base, cfg);
 
         TreeMap<String, StatusState.Rule> rules = new TreeMap<>();
