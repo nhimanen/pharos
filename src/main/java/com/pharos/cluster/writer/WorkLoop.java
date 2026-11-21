@@ -947,7 +947,11 @@ public final class WorkLoop implements Closeable {
         ProjectMeta meta = ShardManifest.stripRefs(m.projectMeta()); // refs stay in the restored unresolved-refs.json
         String originalRoot = meta.getRootPath();
         meta.setName(shard.value());
-        meta.setRootPath(root.toString());
+        // The restored documents and file state are those of originalRoot: register that root until a
+        // run here commits (the index run registers this writer's root). Registering ours at once let
+        // a full run that died before its commit be followed by an incremental one, which indexed every
+        // file a second time under this writer's paths (Phase 4 gate re-run: lucene gen 12, 2 x docs).
+        meta.setRootPath(originalRoot != null ? originalRoot : root.toString());
         meta.setIndexPath(indexDir.toString());
         projects.register(meta);
         return originalRoot;

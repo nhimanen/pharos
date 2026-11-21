@@ -680,6 +680,53 @@ class WorkLoopTest {
                 .isEqualTo(git(pusher, "rev-parse", "HEAD"));
     }
 
+    /**
+     * Phase 4 gate re-run: a writer restored a shard indexed under another checkout path, and its full
+     * run died before the commit (killed, aborted or failed). The local index still holds the old
+     * owner's documents, so the next run must be full again, never an incremental run that adds the
+     * documents a second time under this writer's paths.
+     */
+    @Test
+    void restoredShardWhoseFullRunDiedRunsFullAgain() throws Exception {
+        Path pusher = tmp.resolve("pusher");
+        Path bare = tmp.resolve("origin.git");
+        Files.createDirectories(bare);
+        git(bare, "init", "--bare", "--initial-branch=main");
+        Files.createDirectories(pusher.resolve("src"));
+        Files.writeString(pusher.resolve("src/Svc.java"),
+                "public class Svc {\n    public int a(int x) { return x; }\n    public int b(int x) { return a(x) + 1; }\n}\n");
+        git(pusher, "init", "--initial-branch=main");
+        git(pusher, "add", ".");
+        git(pusher, "commit", "-m", "one");
+        git(pusher, "push", bare.toString(), "main");
+        ShardId s = new ShardId("gitshard");
+        catalog.register(s, Optional.of(ShardSource.git(bare.toString(), "main")));
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        String aRoot = replicas.manifest(s, Generation.FIRST).projectMeta().getRootPath();
+        int docs = a.docs(s);
+        a.loop.stop(Duration.ofSeconds(5));
+
+        Files.writeString(pusher.resolve("src/Svc.java"),
+                "public class Svc {\n    public int a(int x) { return x; }\n    public int b(int x) { return a(x) + 1; }\n"
+                        + "    public int c(int x) { return b(x) * 3; }\n}\n");
+        git(pusher, "commit", "-am", "two");
+        git(pusher, "push", bare.toString(), "main");
+        Writer b = new Writer("node-b");
+        java.util.concurrent.atomic.AtomicBoolean crash = new java.util.concurrent.atomic.AtomicBoolean(true);
+        b.embedder.onBatch = n -> {
+            if (crash.getAndSet(false)) throw new IllegalStateException("the run dies before its commit");
+        };
+        b.loop.tick();
+        assertThat(latest(s)).as("nothing published by the dead run").contains(Generation.FIRST);
+        rounds(1, 10, b);   // the retry
+        assertThat(latest(s)).contains(new Generation(2));
+        String bRoot = b.registry.find("gitshard").orElseThrow().getRootPath();
+        assertThat(b.docsUnder(s, aRoot)).as("no document left under the old owner's paths").isZero();
+        assertThat(b.docs(s)).as("no document indexed twice").isEqualTo(b.docsUnder(s, bRoot)).isGreaterThan(docs);
+        assertThat(replicas.manifest(s, new Generation(2)).docCount()).isEqualTo(b.docs(s));
+    }
+
     @Test
     void restoreStoreOutageRetriesInsteadOfAFullReembed() throws IOException {
         ShardId s = pathShard("solo");
