@@ -530,4 +530,40 @@ class InternalApiTest {
             }
         }
     }
+
+    /** Minor 3: interrupting a call (query closed, deadline cancel) aborts its HTTP exchange too. */
+    @Test
+    void anInterruptedCallAbortsItsExchange() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            java.util.concurrent.CountDownLatch requested = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch closedByClient = new java.util.concurrent.CountDownLatch(1);
+            Thread t = new Thread(() -> {
+                try (var socket = server.accept()) {
+                    var in = socket.getInputStream();
+                    in.read();
+                    requested.countDown();
+                    while (in.read() >= 0) { } // drain the request; -1 once the client aborts
+                    closedByClient.countDown();
+                } catch (Exception e) {
+                    closedByClient.countDown(); // reset by the client: aborted too
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+            ShardClient c = new ShardClient(new ReaderHealth(30), TOKEN, Duration.ofMillis(500), Duration.ofSeconds(20));
+            ReaderHeartbeat slow = reader("slow", server.getLocalPort());
+            Thread caller = Thread.ofVirtual().start(() -> {
+                try {
+                    c.callOn(slow, ShardClient.TERM_STATS, new TermStatsRequest("java", List.of("body"), List.of()));
+                } catch (RuntimeException expected) {
+                }
+            });
+            assertThat(requested.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            caller.interrupt();
+            caller.join(5_000);
+            assertThat(c.inFlight("slow")).isZero();
+            assertThat(closedByClient.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("the connection is closed, not left running for 40 s").isTrue();
+        }
+    }
 }
