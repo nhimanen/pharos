@@ -349,4 +349,52 @@ class DrainTest {
             reader.lucene().close();
         }
     }
+
+    // ---------------------------------------------------------------- final review I2: rejected /internal/* calls
+
+    private static int post(io.javalin.Javalin app, String path, String token, String body) throws Exception {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + app.port() + path))
+                .POST(HttpRequest.BodyPublishers.ofString(body)).header("Content-Type", "application/json");
+        if (token != null) b.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER, token);
+        return HTTP.send(b.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
+    /**
+     * I2: an {@code /internal/*} call rejected by the API's before-filter (401 without the token, 413
+     * over the size cap, 503 before the shard service is wired) still ends its in-flight count, so a
+     * later shutdown drain is not held for the full {@code drainSeconds}.
+     */
+    @Test
+    void rejectedInternalCallsDoNotLeakTheInFlightCount() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        var reader = ClusterFixture.reader(tmp.resolve("rej"), store, "b", "rej", List.of(), c -> c.setDrainSeconds(30));
+        WebServer server = new WebServer(null, null, null, null, null, com.pharos.cluster.NodeRole.READER);
+        server.setDraining(reader.runtime()::draining);
+        server.setInternalApi(reader.runtime().internalApi()); // no service yet: authenticated calls get 503
+        reader.runtime().setInFlight(server::inFlightRequests);
+        io.javalin.Javalin app = server.start(0);
+        try {
+            for (int i = 0; i < 3; i++) assertThat(post(app, "/internal/term-stats", null, "{}")).isEqualTo(401);
+            assertThat(post(app, "/internal/term-stats", "wrong", "{}")).isEqualTo(401);
+            HttpResponse<String> unauthorized = HTTP.send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + app.port() + "/internal/term-stats"))
+                    .POST(HttpRequest.BodyPublishers.ofString("{}")).build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(unauthorized.body()).as("the body is unchanged").isEqualTo("{\"error\":\"unauthorized\"}");
+            assertThat(unauthorized.headers().firstValue("Content-Type").orElse("")).startsWith("application/json");
+            String big = "{\"shard\":\"java\",\"pad\":\"" + "x".repeat(com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES) + "\"}";
+            assertThat(post(app, "/internal/term-stats", "test-token", big)).isEqualTo(413);
+            assertThat(post(app, "/internal/term-stats", "test-token", "{\"shard\":\"java\"}")).isEqualTo(503);
+            assertThat(server.inFlightRequests()).as("every rejection ended its count").isZero();
+
+            reader.runtime().startServing(true);
+            long start = System.nanoTime();
+            reader.runtime().drainAndClose();
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertThat(millis).as("the quiet period, not drainSeconds (30 s)").isLessThan(12_000L);
+        } finally {
+            app.stop();
+            reader.runtime().close();
+            reader.lucene().close();
+        }
+    }
 }

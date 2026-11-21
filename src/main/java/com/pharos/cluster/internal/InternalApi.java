@@ -69,17 +69,32 @@ public final class InternalApi {
         return MessageDigest.isEqual(tokenDigest, sha256(presented));
     }
 
+    /**
+     * A request the before-filter refuses. Thrown (not {@code skipRemainingHandlers()}, which in
+     * Javalin also drops the queued after-handlers): the web server's after-handlers, which end the
+     * drain's in-flight count, still run.
+     */
+    private static final class Rejected extends RuntimeException {
+        final int status;
+        final String error;
+
+        Rejected(int status, String error) {
+            super(error, null, false, false);
+            this.status = status;
+            this.error = error;
+        }
+    }
+
     public void mount(Javalin app) {
+        app.exception(Rejected.class, (e, ctx) ->
+                ctx.status(e.status).contentType("application/json").result("{\"error\":\"" + e.error + "\"}"));
         app.before("/internal/*", ctx -> {
             if (!authorized(ctx)) {
-                ctx.status(401).contentType("application/json").result("{\"error\":\"unauthorized\"}");
-                ctx.skipRemainingHandlers();
+                throw new Rejected(401, "unauthorized");
             } else if (ctx.contentLength() > MAX_BODY_BYTES) {
-                ctx.status(413).contentType("application/json").result("{\"error\":\"request too large\"}");
-                ctx.skipRemainingHandlers();
+                throw new Rejected(413, "request too large");
             } else if (service == null) {
-                ctx.status(503).contentType("application/json").result("{\"error\":\"shard search not available\"}");
-                ctx.skipRemainingHandlers();
+                throw new Rejected(503, "shard search not available");
             }
         });
         app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard, null,
