@@ -97,7 +97,26 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
   writer config without the key now runs the work queue and refuses hand-run `pharos index` /
   `pharos publish` (exit 2); add `"writer": {"workQueue": false}` to keep indexing and publishing
-  by hand.
+  by hand. On a work-queue writer `remove-index` and `embed` are refused too (exit 2), and
+  `upgrade-indexes` / `./setup.sh --upgrade-indexes` (exit 5): restarting the writer on a new
+  release upgrades it, because its work loop gives a full run (and a re-publish) to every held shard
+  whose local or published index format, chunking version or model is out of date.
+- `cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds` (default 30) on a
+  work-queue writer, validated at startup: a Phase 1–3 writer config with `heartbeatSeconds` of 30
+  or more stops starting after the upgrade until it is lowered.
+- `cluster.writer.disk.minFreePercent` defaults to 0 (was 10): the threshold is `minFreeBytes`
+  (5 GiB), so a writer on a large disk no longer stays "low" and publishes nothing. A low writer
+  logs a WARN once per low episode.
+- Only one process per writer node runs the work loop (`<workDir>/.work-loop.lock`); another daemon
+  with the same config (e.g. one `./pharos` auto-starts) logs a WARN and serves without a loop.
+- Synonyms: a publish replaces only its own shard's section of the cluster's `synonyms.txt`
+  (conditional read-modify-write), so writers holding different shards no longer drop each other's
+  rules, and every reader serves the same file.
+- `git ls-remote` of a work-queue source is killed (with its helper processes) after
+  `cluster.writer.lsRemoteTimeoutSeconds` (default 30); an unreachable remote stalls only its own
+  shard, and its failed polls count toward `maxConsecutiveFailures`.
+- A takeover that restores a generation with an older writer-state backup (the newest one was lost)
+  runs a full index, so documents of files deleted since never stay behind.
 
 ### Fixed
 - Multi-node: `pharos mcp-server` on a reader no longer joins reader membership. It wrote the

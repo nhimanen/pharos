@@ -37,6 +37,28 @@ directory. If you also have a project named `lucene`, the `.` project may have p
 `lucene` index lives one level down, in `indexes/lucene/lucene/`: never touch that folder.
 **Never delete project subdirectories** of the indexes directory.
 
+## Work-queue writers (multi-node)
+
+`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`). On such a
+writer:
+
+- **Upgrading is restarting it on the new release.** Its work loop gives every shard it holds a full
+  run when this release needs one (an older local or published index format, a broken graph pointer,
+  files embedded under another chunking version or model) and re-publishes it, without a source
+  change. `pharos upgrade-indexes` and `./setup.sh --upgrade-indexes` refuse there (exit 5), as do
+  `remove-index` and `embed` (exit 2): they would change the indexes under the running loop. The
+  "Steps" of a format upgrade below apply to single nodes and hand-run writers
+  (`"writer": {"workQueue": false}`).
+- **`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds`** (default 30), checked
+  at startup: a writer config from an earlier phase with `heartbeatSeconds` of 30 or more no longer
+  starts until you lower it (or raise the TTL).
+- **Disk guard default:** `cluster.writer.disk.minFreePercent` defaults to 0, so the threshold is
+  `minFreeBytes` (5 GiB). A percentage made writers on large disks permanently "low" (no lease
+  taken, nothing published); set one explicitly if you want it. A low writer logs a WARN once per
+  low episode.
+- **One work loop per node:** a second pharos daemon with the same config on the writer host (one
+  that `./pharos` starts on demand, say) runs no loop; it logs a WARN and serves everything else.
+
 ## Cluster readers: `retireGraceSeconds` rules
 
 `cluster.retireGraceSeconds` (default 120) must be at least `2 x cluster.pollIntervalSeconds` and at
@@ -74,6 +96,9 @@ are re-indexed.
    ```bash
    ./setup.sh --upgrade-indexes      # or: pharos upgrade-indexes
    ```
+   On a multi-node cluster: readers sync the upgraded generations; a work-queue writer refuses this
+   step and upgrades by itself once restarted on the new release (see "Work-queue writers" above).
+   Run it only on a hand-run writer (`"writer": {"workQueue": false}`).
    You can check progress any time with `pharos index-status`.
 
 ### Time and cost
