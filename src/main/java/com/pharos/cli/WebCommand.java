@@ -67,7 +67,7 @@ public class WebCommand implements Callable<Integer> {
             if (clusterRuntime != null) {
                 clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
                 clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for
-                clusterRuntime.beginServing(searchEngine != null
+                clusterRuntime.beginServing(searchEngine != null && !isWriter() // a writer warms nothing
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
                         : java.util.concurrent.CompletableFuture.completedFuture(null), // no wait
                         true); // serves /internal/*: joins reader membership, drains on shutdown
