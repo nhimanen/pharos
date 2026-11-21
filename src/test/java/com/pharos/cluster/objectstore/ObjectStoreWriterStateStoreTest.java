@@ -324,6 +324,143 @@ class ObjectStoreWriterStateStoreTest {
     }
 
     /**
+     * The restored writer is indistinguishable from the original: the same change (a heavy
+     * knowledge-graph footprint and a deleted file) indexed incrementally on both leaves identical
+     * graphs (every vertex with all properties, every edge of every type) and identical stored
+     * fields on every live Lucene document. Both nodes index the same root path (file state and
+     * {@code filePath} are absolute).
+     */
+    @Test
+    void restoreThenIncrementalIndexMatchesOriginalWriter() throws Exception {
+        Node a = new Node("node-a");
+        a.index(false);
+        Node b = new Node("node-b");
+        assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
+        b.registerRestored(Generation.FIRST);
+        assertThat(graphDump(b.indexDir())).isEqualTo(graphDump(a.indexDir()));
+        assertThat(storedDocs(b.indexDir())).isEqualTo(storedDocs(a.indexDir()));
+
+        Path model = source.resolve("src/main/java/com/example/model");
+        Path user = model.resolve("User.java");
+        String u = Files.readString(user);
+        int end = u.lastIndexOf('}');
+        Files.writeString(user, u.substring(0, end) + """
+
+                    @Audited
+                    private String nickname;
+
+                    @Audited
+                    public String getNickname() {
+                        return nickname;
+                    }
+
+                    public void setNickname(String nickname) {
+                        this.nickname = nickname;
+                    }
+                }
+                """);
+        Files.writeString(model.resolve("Audited.java"), """
+                package com.example.model;
+
+                /** Marks audited members. */
+                public @interface Audited {
+                }
+                """);
+        Files.writeString(model.resolve("Named.java"), """
+                package com.example.model;
+
+                /** Something with a display name. */
+                public interface Named {
+                    String displayName();
+                }
+                """);
+        Files.writeString(model.resolve("Admin.java"), """
+                package com.example.model;
+
+                /** A user with an admin level. */
+                @Audited
+                public class Admin extends User implements Named {
+                    private int level;
+
+                    public Admin(String name, String email) {
+                        super(name, email);
+                    }
+
+                    @Override
+                    public String displayName() {
+                        return getName() + " (" + level + ")";
+                    }
+
+                    public void promote() {
+                        level = level + 1;
+                        setNickname("admin-" + level);
+                    }
+                }
+                """);
+        Files.delete(source.resolve("src/main/java/com/example/service/GreetingService.java"));
+        long t = System.currentTimeMillis() + 5_000;
+        Files.setLastModifiedTime(user, FileTime.fromMillis(t));
+
+        a.index(true);
+        b.index(true);
+
+        List<String> graphA = graphDump(a.indexDir());
+        assertThat(graphA).anyMatch(l -> l.contains("Admin")).anyMatch(l -> l.contains("nickname"))
+                .anyMatch(l -> l.startsWith("E inherits")).anyMatch(l -> l.startsWith("E implements_iface"))
+                .anyMatch(l -> l.startsWith("E writes_field")).anyMatch(l -> l.startsWith("E reads_field"))
+                // field annotations are no graph edges; the annotated getter's is
+                .anyMatch(l -> l.startsWith("E annotated_by") && l.contains("Audited"));
+        // (A deleted file's classes stay in the graph after an incremental run on any writer:
+        // indexIncremental drops their file state before patchGraph reads their class names.
+        // Pre-existing, reported; both writers agree, which is what this test checks.)
+        assertThat(graphDump(b.indexDir())).isEqualTo(graphA);
+        List<String> docsA = storedDocs(a.indexDir());
+        // every stored field of every live doc, graph-derived ones (inDegree, callerContext; callerMethods
+        // is declared but written by no index path) included
+        assertThat(docsA).anyMatch(d -> d.contains("Admin")).noneMatch(d -> d.contains("GreetingService"))
+                .allMatch(d -> d.contains("inDegree="));
+        assertThat(storedDocs(b.indexDir())).isEqualTo(docsA);
+    }
+
+    /** Every vertex (all properties) and every edge record of every type, sorted. */
+    private static List<String> graphDump(Path indexDir) throws IOException {
+        List<String> out = new ArrayList<>();
+        try (CallGraph g = CallGraph.openExisting(CallGraph.writerGraphDir(indexDir))) {
+            g.forEachVertex(v -> out.add("V " + v));
+            for (String type : CallGraph.EDGE_TYPES) {
+                g.forEachEdgeRecord(type, e -> out.add("E " + type + " " + e));
+            }
+        }
+        out.sort(null);
+        return out;
+    }
+
+    /** The stored fields of every live document, one sorted line per document, sorted. */
+    private static List<String> storedDocs(Path indexDir) throws IOException {
+        List<String> out = new ArrayList<>();
+        try (DirectoryReader r = DirectoryReader.open(FSDirectory.open(indexDir.resolve("lucene")))) {
+            for (var leaf : r.leaves()) {
+                var live = leaf.reader().getLiveDocs();
+                var stored = leaf.reader().storedFields();
+                for (int d = 0; d < leaf.reader().maxDoc(); d++) {
+                    if (live != null && !live.get(d)) continue;
+                    List<String> fields = new ArrayList<>();
+                    for (var f : stored.document(d).getFields()) {
+                        Object v = f.stringValue() != null ? f.stringValue()
+                                : f.numericValue() != null ? f.numericValue()
+                                : f.binaryValue() != null ? f.binaryValue().utf8ToString() : null;
+                        fields.add(f.name() + "=" + v);
+                    }
+                    fields.sort(null);
+                    out.add(String.join("|", fields));
+                }
+            }
+        }
+        out.sort(null);
+        return out;
+    }
+
+    /**
      * Ruling R8's takeover (restore, then a FULL index): the restored embedding cache alone makes
      * every unchanged text cost 0 provider calls, even though the full run re-parses everything and
      * rebuilds Lucene and the graph.

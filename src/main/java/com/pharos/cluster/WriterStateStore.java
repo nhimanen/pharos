@@ -41,6 +41,13 @@ public interface WriterStateStore {
      * as a WARN and returns empty with {@code indexDir} untouched: the caller then runs a full
      * index. It never leaves {@code indexDir} half replaced.
      *
+     * <p><b>Precondition:</b> the project must not be open on this node: no cached
+     * {@code LuceneIndexer} reader or writer, no open {@code CallGraph} or cached graph view on
+     * {@code indexDir}, and no index run of it in progress. Restore swaps the whole directory: a
+     * reader opened before keeps serving the replaced (deleted) files, and a writer opened before
+     * would commit into them. The caller (the work loop) enforces this; {@code LuceneIndexer} has no
+     * per-project close to call from here.
+     *
      * @return the generation {@code indexDir} now holds ({@code LATEST}); empty when nothing was
      *         restored
      * @throws IOException when the store cannot be read (a transient failure: retry later rather
