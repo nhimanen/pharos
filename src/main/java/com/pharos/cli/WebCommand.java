@@ -79,6 +79,8 @@ public class WebCommand implements Callable<Integer> {
                     System.out.println("Writer work queue running (cluster.writer.workQueue)");
                     webServer.setWriterDisk(clusterRuntime::writerDisk);
                 }
+                // /cluster/status and /cluster/events on every role (single node: from local state)
+                webServer.setClusterStatus(clusterRuntime.statusService());
             }
             webServer.start(port);
             if (!noOpen) {

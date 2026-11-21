@@ -356,4 +356,37 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"leaseTtlSeconds\":4}}}"))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.leaseTtlSeconds");
     }
+
+    /** Task 5: {@code cluster.status} defaults, shortened windows, and validation. */
+    @Test
+    void statusTargetsWindowsAndWebhook() throws Exception {
+        ClusterConfig d = parse("{}");
+        assertThat(d.getStatus().getTargets().getWarmP95Millis()).isEqualTo(500);
+        assertThat(d.getStatus().getTargets().getQpsPerReader()).isEqualTo(50.0);
+        assertThat(d.getStatus().getTargets().getBacklog()).isEqualTo(600);
+        assertThat(d.getStatus().getWindows().getAddReadersSeconds()).isEqualTo(300);
+        assertThat(d.getStatus().getWindows().getRemoveReadersSeconds()).isEqualTo(1800);
+        assertThat(d.getStatus().getEventsKeepAliveSeconds()).isEqualTo(15);
+        assertThat(d.getStatus().getWebhookUrl()).isNull();
+
+        ClusterConfig c = parse("{\"cluster\":{\"status\":{\"targets\":{\"warmP95Millis\":250,\"qpsPerReader\":5,"
+                + "\"backlog\":30},\"windows\":{\"addReadersSeconds\":20,\"clearGraceSeconds\":0},"
+                + "\"webhookUrl\":\"http://127.0.0.1:9/hook\"}}}");
+        var st = com.pharos.cluster.status.StatusSettings.of(c.getStatus());
+        assertThat(st.warmP95Millis()).isEqualTo(250);
+        assertThat(st.qpsPerReader()).isEqualTo(5.0);
+        assertThat(st.backlogSeconds()).isEqualTo(30);
+        assertThat(st.window(com.pharos.cluster.status.Proposals.ADD_READERS)).isEqualTo(20);
+        assertThat(st.clearGraceSeconds()).isZero();
+
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"targets\":{\"qpsPerReader\":0}}}}"))
+                .hasMessageContaining("cluster.status.targets.qpsPerReader");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"windows\":{\"reshardSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.windows");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"webhookUrl\":\"ftp://x/y?k=secret\"}}}"))
+                .hasMessageContaining("cluster.status.webhookUrl").satisfies(e -> assertThat(e.getMessage())
+                        .doesNotContain("secret"));
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"eventsKeepAliveSeconds\":0}}}"))
+                .hasMessageContaining("eventsKeepAliveSeconds");
+    }
 }

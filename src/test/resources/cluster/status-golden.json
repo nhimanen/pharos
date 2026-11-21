@@ -1,0 +1,232 @@
+{
+  "mode" : "cluster",
+  "asOf" : "2026-11-21T10:06:40Z",
+  "layout" : {
+    "summary" : {
+      "shards" : 3,
+      "writers" : 2,
+      "readers" : 2
+    },
+    "shards" : [ {
+      "shard" : "alpha",
+      "specVersion" : 1,
+      "keys" : {
+        "project" : "alpha"
+      },
+      "docCount" : 48210,
+      "sizeBytes" : 734003200,
+      "generation" : 12,
+      "ageSeconds" : 640,
+      "writer" : "w1",
+      "lease" : {
+        "writer" : "w1",
+        "ageSeconds" : 4,
+        "expired" : false,
+        "released" : false
+      },
+      "readers" : [ "r1", "r2" ],
+      "backlog" : {
+        "sourceRevision" : "9a0b7c3",
+        "publishedRevision" : "4f1c2e9",
+        "pending" : true,
+        "oldestUnpublishedChangeAgeSeconds" : 493
+      },
+      "state" : "lagging"
+    }, {
+      "shard" : "beta",
+      "specVersion" : 1,
+      "keys" : {
+        "project" : "beta"
+      },
+      "docCount" : 9120,
+      "sizeBytes" : 88080384,
+      "generation" : 7,
+      "ageSeconds" : 4000,
+      "writer" : "w3",
+      "lease" : {
+        "writer" : "w3",
+        "ageSeconds" : 340,
+        "expired" : true,
+        "released" : false
+      },
+      "readers" : [ "r1" ],
+      "backlog" : {
+        "sourceRevision" : null,
+        "publishedRevision" : "b77d0a1",
+        "pending" : true,
+        "oldestUnpublishedChangeAgeSeconds" : 420
+      },
+      "state" : "lease-expired"
+    }, {
+      "shard" : "gamma",
+      "specVersion" : 1,
+      "keys" : {
+        "project" : "gamma"
+      },
+      "docCount" : 1204,
+      "sizeBytes" : 6291456,
+      "generation" : 3,
+      "ageSeconds" : 86800,
+      "writer" : "w2",
+      "lease" : {
+        "writer" : "w2",
+        "ageSeconds" : 8,
+        "expired" : false,
+        "released" : false
+      },
+      "readers" : [ "r1", "r2" ],
+      "backlog" : {
+        "sourceRevision" : "/srv/src/gamma@3e9a",
+        "publishedRevision" : "/srv/src/gamma@3e9a",
+        "pending" : false,
+        "oldestUnpublishedChangeAgeSeconds" : null
+      },
+      "state" : "current"
+    } ],
+    "writers" : [ {
+      "node" : "w1",
+      "workQueue" : true,
+      "leases" : [ "alpha" ],
+      "pinned" : [ ],
+      "indexing" : {
+        "shard" : "alpha",
+        "phase" : "embed",
+        "progress" : 0.42,
+        "startedAt" : 1795255200000
+      },
+      "startedAt" : 1795248000000,
+      "stopping" : false,
+      "disk" : {
+        "freeBytes" : 442381631488,
+        "totalBytes" : 1073741824000,
+        "low" : false
+      },
+      "heartbeatAgeSeconds" : 3
+    }, {
+      "node" : "w2",
+      "workQueue" : true,
+      "leases" : [ "gamma" ],
+      "pinned" : [ "gamma" ],
+      "indexing" : null,
+      "startedAt" : 1795252200000,
+      "stopping" : false,
+      "disk" : {
+        "freeBytes" : 3221225472,
+        "totalBytes" : 107374182400,
+        "low" : true
+      },
+      "heartbeatAgeSeconds" : 6
+    } ],
+    "readers" : [ {
+      "node" : "r1",
+      "advertiseUrl" : "http://r1.cluster.local:7171",
+      "shards" : [ "alpha", "beta", "gamma" ],
+      "state" : "ready",
+      "degradedShards" : [ ],
+      "readerCache" : {
+        "bytesFetched" : 805306368,
+        "bytesOnDisk" : 851443712,
+        "cacheMaxBytes" : 1073741824,
+        "evictions" : 41,
+        "hitRate" : 0.9731,
+        "hits" : 97310,
+        "leasesOpen" : 2,
+        "misses" : 2690,
+        "mode" : "lazy",
+        "shared" : true,
+        "source" : "process"
+      },
+      "inFlight" : 3,
+      "qps" : 72.4,
+      "startedAt" : 1795250200000,
+      "warmP95Millis" : 640,
+      "catalogAgeSeconds" : 4,
+      "heartbeatAgeSeconds" : 0
+    }, {
+      "node" : "r2",
+      "advertiseUrl" : "http://r2.cluster.local:7171",
+      "shards" : [ "alpha", "gamma" ],
+      "state" : "degraded",
+      "degradedShards" : [ "gamma" ],
+      "readerCache" : {
+        "bytesFetched" : 805306368,
+        "bytesOnDisk" : 555745280,
+        "cacheMaxBytes" : 1073741824,
+        "evictions" : 41,
+        "hitRate" : 0.8004,
+        "hits" : 40022,
+        "leasesOpen" : 2,
+        "misses" : 9978,
+        "mode" : "lazy",
+        "shared" : true,
+        "source" : "process"
+      },
+      "inFlight" : 1,
+      "qps" : 66.1,
+      "startedAt" : 1795251200000,
+      "warmP95Millis" : null,
+      "catalogAgeSeconds" : null,
+      "heartbeatAgeSeconds" : 2
+    } ]
+  },
+  "backlogSummary" : {
+    "shardsPending" : 2,
+    "oldestPendingAgeSeconds" : 493
+  },
+  "health" : [ {
+    "kind" : "lease-expired",
+    "target" : "beta",
+    "message" : "lease of shard beta held by w3 expired (last renewed 340 s ago)"
+  }, {
+    "kind" : "reader-degraded",
+    "target" : "r2",
+    "message" : "reader r2 can't fully serve shard(s) gamma"
+  }, {
+    "kind" : "shard-unassigned",
+    "target" : "beta",
+    "message" : "shard beta has no live writer holding its lease"
+  }, {
+    "kind" : "writer-low-disk",
+    "target" : "w2",
+    "message" : "writer w2 low on disk"
+  } ],
+  "proposals" : [ {
+    "id" : "2abee09c58319007b402809b5e6bc8227db8fc3e",
+    "kind" : "add-readers",
+    "target" : "readers",
+    "reason" : "QPS per reader and warm p95 above target for 5 min",
+    "metrics" : {
+      "qpsPerReader" : 69.25,
+      "qpsTotal" : 138.5,
+      "readers" : 2,
+      "targetQpsPerReader" : 50.0,
+      "targetWarmP95Millis" : 500,
+      "warmP95Millis" : 640
+    },
+    "action" : "Start 1 reader",
+    "since" : "2026-11-21T10:00:00Z"
+  }, {
+    "id" : "285a2b0ddbe37d749157b2eca82a826950c5248f",
+    "kind" : "reshard",
+    "target" : "alpha",
+    "reason" : "shard above 50% of a reader's cache cap",
+    "metrics" : {
+      "readerCacheMaxBytes" : 1073741824,
+      "shareOfCache" : 0.68,
+      "sizeBytes" : 734003200
+    },
+    "action" : "New shard spec, e.g. [project, hash(path) % 2]",
+    "since" : "2026-11-21T10:00:00Z"
+  }, {
+    "id" : "bef5d6d3813b7eace15feb55c151f2f348201942",
+    "kind" : "writer-disk",
+    "target" : "w2",
+    "reason" : "writer w2 low on disk",
+    "metrics" : {
+      "freeBytes" : 3221225472,
+      "totalBytes" : 107374182400
+    },
+    "action" : "add writer capacity / free disk on w2",
+    "since" : "2026-11-21T10:00:00Z"
+  } ]
+}

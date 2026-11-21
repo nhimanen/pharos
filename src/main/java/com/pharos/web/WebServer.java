@@ -61,6 +61,8 @@ public class WebServer {
     private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
     private volatile com.pharos.cluster.internal.InternalApi internalApi = null;
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
+    /** Source of {@code /cluster/status} and {@code /cluster/events}; without one both answer 404. */
+    private volatile com.pharos.cluster.status.StatusService clusterStatus = null;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -156,9 +158,23 @@ public class WebServer {
         }
     }
 
-    /** Paths whose requests count as in-flight work for a drain (not {@code /health} or static files). */
-    private static boolean drainCounted(String path) {
+    /**
+     * Paths whose requests count as in-flight work for a drain (not {@code /health}, static files or
+     * the long-lived {@code /cluster/events} stream, which a drain would otherwise wait out).
+     */
+    static boolean drainCounted(String path) {
+        if (path.equals(EVENTS_PATH)) return false;
         return path.startsWith("/api/") || path.startsWith("/internal/") || path.startsWith("/cluster/");
+    }
+
+    static final String EVENTS_PATH = "/cluster/events";
+
+    /**
+     * Source of {@code GET /cluster/status} (the status JSON) and {@code GET /cluster/events}
+     * (server-sent events), served on every role without a token: the status carries no secret.
+     */
+    public void setClusterStatus(com.pharos.cluster.status.StatusService status) {
+        this.clusterStatus = java.util.Objects.requireNonNull(status, "status");
     }
 
     /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
@@ -290,6 +306,7 @@ public class WebServer {
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
                 ctx.attribute("load.counted", Boolean.TRUE);
+                ctx.attribute("load.start", System.nanoTime());
                 load.begin();
             }
         });
@@ -303,7 +320,8 @@ public class WebServer {
             }
             if (ctx.attribute("load.counted") != null) {
                 ctx.attribute("load.counted", null);
-                load.end();
+                Long began = ctx.attribute("load.start");
+                load.end(began == null ? -1 : System.nanoTime() - began); // the warm p95 window
             }
             Long start = ctx.attribute("usage.start");
             if (start == null) return;          // not an /api/* call, or before-handler skipped it
@@ -855,6 +873,29 @@ public class WebServer {
             }
             ctx.json(readersPayload());
         });
+
+        // The cluster's layout, health and proposals; the same JSON on every node for the same bucket
+        // state. No token: it carries neither the token nor object-store credentials.
+        app.get("/cluster/status", ctx -> {
+            com.pharos.cluster.status.StatusService st = clusterStatus;
+            if (st == null) {
+                ctx.status(404).json(Map.of("error", "no cluster status on this node"));
+                return;
+            }
+            try {
+                ctx.contentType("application/json").result(st.currentJson());
+            } catch (java.io.IOException e) {
+                ctx.status(503).json(Map.of("error", "cluster status unavailable: " + e.getMessage()));
+            }
+        });
+        // Proposal and layout changes as server-sent events (appeared|changed|cleared|layout); mounted
+        // when a status source is set before start (WebCommand does), else 404
+        com.pharos.cluster.status.StatusService statusAtStart = clusterStatus;
+        if (statusAtStart != null && statusAtStart.events() != null) {
+            app.sse(EVENTS_PATH, client -> statusAtStart.events().add(client));
+        } else {
+            app.get(EVENTS_PATH, ctx -> ctx.status(404).json(Map.of("error", "no cluster events on this node")));
+        }
 
         if (readerNode && internalApi != null) internalApi.mount(app);
 

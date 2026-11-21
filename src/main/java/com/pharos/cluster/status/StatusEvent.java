@@ -36,13 +36,13 @@ public record StatusEvent(String type, ClusterStatus.Proposal proposal, StatusSt
 
     /**
      * The events between two states (layout first, then proposals by id), proposals carrying the
-     * metrics of {@code cands}. Equal states give none.
+     * metrics of {@code cands}. Equal states give none; the first layout ever recorded is no change.
      */
     public static List<StatusEvent> diff(StatusState before, StatusState after, Map<String, Proposals.Candidate> cands) {
         StatusState a = before == null ? StatusState.EMPTY : before;
         StatusState b = after == null ? StatusState.EMPTY : after;
         List<StatusEvent> out = new ArrayList<>();
-        if (b.layout() != null && !Objects.equals(a.layout(), b.layout())) {
+        if (a.layout() != null && b.layout() != null && !Objects.equals(a.layout(), b.layout())) { // not the first record
             out.add(new StatusEvent(LAYOUT, null, b.layout()));
         }
         TreeSet<String> ids = new TreeSet<>(a.rules().keySet());

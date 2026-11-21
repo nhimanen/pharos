@@ -43,7 +43,10 @@ import java.util.function.Supplier;
 /**
  * {@code pharos router}: a stateless HTTP front for the reader tier. It lists the live readers from
  * the bucket ({@code catalog/readers/}, read only), polls each one's {@code /health} every 2 s, and
- * round-robins {@code /api/*} and {@code /health} over the readers whose last poll answered 200. A
+ * round-robins {@code /api/*}, {@code /health} and {@code GET /cluster/status} over the readers whose
+ * last poll answered 200. {@code GET /cluster/events} (server-sent events) is streamed through from
+ * one reader without buffering, exempt from the total deadline and the body cap, and cut only when
+ * the stream is idle for twice the events keep-alive ({@code cluster.status.eventsKeepAliveSeconds}). A
  * draining or warming reader answers 503 and gets no traffic; a reader with a degraded shard answers
  * 200 and keeps it (coordinators route around that shard). An idempotent request (any {@code GET},
  * and {@code POST /api/search}) is retried once on another reader after a connect error or a 5xx.
@@ -88,6 +91,7 @@ public class RouterCommand implements Callable<Integer> {
                      new ObjectStoreLayout(c.getObjectStore().getPrefix()), c);
              Router router = new Router(readers::live, POLL_EVERY, Duration.ofMillis(c.getConnectTimeoutMillis()),
                      REQUEST_TIMEOUT)) {
+            router.setEventsIdleTimeout(Duration.ofSeconds(2L * c.getStatus().getEventsKeepAliveSeconds()));
             readers.start();
             router.start(port);
             System.out.printf("pharos router listening on port %d (readers of bucket '%s')%n", router.port(),
@@ -137,6 +141,9 @@ public class RouterCommand implements Callable<Integer> {
         /** A reader's answer larger than this is not forwarded (502). */
         static final long MAX_RESPONSE_BYTES = 64L << 20;
         private volatile long maxResponseBytes = MAX_RESPONSE_BYTES;
+        /** {@code /cluster/events}: a stream with no byte for this long is cut (2 × the SSE keep-alive). */
+        static final Duration DEFAULT_EVENTS_IDLE_TIMEOUT = Duration.ofSeconds(30);
+        private volatile Duration eventsIdleTimeout = DEFAULT_EVENTS_IDLE_TIMEOUT;
         private ScheduledExecutorService poller;
         private Javalin app;
 
@@ -174,6 +181,11 @@ public class RouterCommand implements Callable<Integer> {
         /** Test seam: the largest response body forwarded (default {@link #MAX_RESPONSE_BYTES}). */
         void setMaxResponseBytes(long max) {
             this.maxResponseBytes = max;
+        }
+
+        /** How long a {@code /cluster/events} stream may go without a byte before it is cut. */
+        public void setEventsIdleTimeout(Duration idle) {
+            this.eventsIdleTimeout = Objects.requireNonNull(idle, "idle");
         }
 
         public synchronized int port() {
@@ -234,7 +246,8 @@ public class RouterCommand implements Callable<Integer> {
 
         /**
          * True when {@code rawPath} (as received, still percent-encoded) is one this router forwards:
-         * {@code /health} or a path under {@code /api/}, with no percent-encoded byte, dot segment,
+         * {@code /health}, {@code /cluster/status}, {@code /cluster/events} or a path under {@code /api/},
+         * with no percent-encoded byte, dot segment,
          * empty segment, path parameter ({@code ;}) or backslash, so a reader cannot resolve it to
          * anything else (never to {@code /internal/*}).
          */
@@ -248,8 +261,13 @@ public class RouterCommand implements Callable<Integer> {
                 if (seg.equals(".") || seg.equals("..")) return false;
             }
             if (rawPath.toLowerCase(Locale.ROOT).startsWith("/internal")) return false;
-            return rawPath.equals("/health") || (rawPath.startsWith("/api/") && rawPath.length() > "/api/".length());
+            return rawPath.equals("/health") || CLUSTER_PATHS.contains(rawPath)
+                    || (rawPath.startsWith("/api/") && rawPath.length() > "/api/".length());
         }
+
+        static final String EVENTS_PATH = "/cluster/events";
+        /** Cluster paths forwarded, for {@code GET} (and {@code HEAD}) only. */
+        static final Set<String> CLUSTER_PATHS = Set.of("/cluster/status", EVENTS_PATH);
 
         /** Any {@code GET} or {@code HEAD}, and {@code POST /api/search}: safe to send twice. */
         static boolean idempotent(String method, String rawPath) {
@@ -263,6 +281,11 @@ public class RouterCommand implements Callable<Integer> {
                 ctx.status(404).json(Map.of("error", "not routed: " + rawPath));
                 return;
             }
+            String method = ctx.method().name();
+            if (CLUSTER_PATHS.contains(rawPath) && !(method.equals("GET") || method.equals("HEAD"))) {
+                ctx.status(405).json(Map.of("error", method + " " + rawPath + " is not routed (GET only)"));
+                return;
+            }
             List<Map.Entry<String, String>> targets = new ArrayList<>(healthy.entrySet());
             if (targets.isEmpty()) {
                 ctx.status(503).json(Map.of("status", "unavailable", "error", "no healthy reader"));
@@ -270,7 +293,10 @@ public class RouterCommand implements Callable<Integer> {
             }
             targets.sort(Map.Entry.comparingByKey());
             int first = (int) Math.floorMod(turn.getAndIncrement(), (long) targets.size());
-            String method = ctx.method().name();
+            if (rawPath.equals(EVENTS_PATH) && method.equals("GET")) {
+                streamEvents(ctx, targets.get(first), ctx.req().getQueryString());
+                return;
+            }
             int attempts = idempotent(method, rawPath) && targets.size() > 1 ? 2 : 1;
             byte[] body = ctx.bodyAsBytes();
             String query = ctx.req().getQueryString();
@@ -388,6 +414,134 @@ public class RouterCommand implements Callable<Integer> {
             long declared = resp.headers().firstValueAsLong("content-length").orElse(-1);
             if (declared > cap || resp.body().length > cap) return null;
             return resp;
+        }
+
+        /**
+         * Streams {@code GET /cluster/events} from {@code target} to the client as the bytes arrive:
+         * no total deadline and no body cap. The upstream's headers must arrive within the idle
+         * timeout; after that the stream is cut only when no byte arrives for the idle timeout (the
+         * reader sends a keep-alive comment every half of it), when the reader ends it, or when the
+         * client goes away. Never retried: a client reconnects (SSE clients do so on their own).
+         */
+        private void streamEvents(Context ctx, Map.Entry<String, String> target, String query) {
+            Duration idle = eventsIdleTimeout;
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(target.getValue() + EVENTS_PATH
+                    + (query == null ? "" : "?" + query))).header("Accept", "text/event-stream").GET();
+            String last = ctx.req().getHeader("Last-Event-ID");
+            if (last != null) b.header("Last-Event-ID", last);
+            EventPump pump = new EventPump();
+            java.util.concurrent.CompletableFuture<HttpResponse<Void>> pending = http.sendAsync(b.build(), info -> pump);
+            HttpResponse<Void> resp;
+            try {
+                resp = pending.get(idle.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                pending.cancel(true);
+                ctx.status(504).json(Map.of("error", "the reader did not start the event stream in time"));
+                return;
+            } catch (java.util.concurrent.ExecutionException e) {
+                Throwable c = e.getCause();
+                if (c instanceof ConnectException || c instanceof HttpConnectTimeoutException
+                        || c != null && c.getCause() instanceof ConnectException) {
+                    healthy.remove(target.getKey(), target.getValue());
+                }
+                ctx.status(502).json(Map.of("error", "no reader answered: " + c));
+                return;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                ctx.status(503).json(Map.of("error", "interrupted"));
+                return;
+            }
+            ctx.status(resp.statusCode());
+            Set<String> named = connectionNamed(resp.headers().allValues("connection"));
+            resp.headers().map().forEach((name, values) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (DROP_RESPONSE.contains(lower) || named.contains(lower)) return;
+                for (String v : values) ctx.res().addHeader(name, v);
+            });
+            ctx.res().setHeader("Cache-Control", "no-cache");
+            ctx.res().setHeader("X-Accel-Buffering", "no");
+            try {
+                java.io.OutputStream out = ctx.res().getOutputStream();
+                out.flush(); // the headers now: the client sees the stream open
+                pump.run(out, idle);
+            } catch (IOException e) {
+                pump.cancel(); // the client went away
+            }
+        }
+
+        /**
+         * The upstream event stream's body: buffers handed over as they arrive, written by the
+         * request thread (so the client's socket is never written from the HTTP client's threads).
+         */
+        static final class EventPump implements java.net.http.HttpResponse.BodySubscriber<Void> {
+            private static final List<java.nio.ByteBuffer> END = List.of();
+            private final java.util.concurrent.LinkedBlockingQueue<List<java.nio.ByteBuffer>> chunks =
+                    new java.util.concurrent.LinkedBlockingQueue<>();
+            private volatile java.util.concurrent.Flow.Subscription sub;
+            private volatile boolean cancelled;
+
+            @Override
+            public java.util.concurrent.CompletionStage<Void> getBody() {
+                return java.util.concurrent.CompletableFuture.completedFuture(null); // the response at headers
+            }
+
+            @Override
+            public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+                sub = s;
+                if (cancelled) s.cancel();
+                else s.request(1);
+            }
+
+            @Override
+            public void onNext(List<java.nio.ByteBuffer> item) {
+                chunks.add(item);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                chunks.add(END);
+            }
+
+            @Override
+            public void onComplete() {
+                chunks.add(END);
+            }
+
+            void cancel() {
+                cancelled = true;
+                java.util.concurrent.Flow.Subscription s = sub;
+                if (s != null) s.cancel();
+            }
+
+            /** Copies chunks to {@code out} until the upstream ends or is idle for {@code idle}. */
+            void run(java.io.OutputStream out, Duration idle) throws IOException {
+                try {
+                    while (true) {
+                        List<java.nio.ByteBuffer> item;
+                        try {
+                            item = chunks.poll(idle.toMillis(), TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        if (item == null) {
+                            log.info("Router: /cluster/events idle for {} ms; closing the stream", idle.toMillis());
+                            return;
+                        }
+                        if (item == END) return;
+                        for (java.nio.ByteBuffer buf : item) {
+                            byte[] bytes = new byte[buf.remaining()];
+                            buf.get(bytes);
+                            out.write(bytes);
+                        }
+                        out.flush();
+                        java.util.concurrent.Flow.Subscription s = sub;
+                        if (s != null) s.request(1);
+                    }
+                } finally {
+                    cancel();
+                }
+            }
         }
 
         /** The forwarded exchange (headers and body) did not complete within the request timeout. */

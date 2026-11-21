@@ -78,6 +78,10 @@ public final class ClusterRuntime implements Closeable {
     private com.pharos.cluster.writer.WorkLoop workLoop;
     /** Removes the writer's signal-time stop step. Guarded by this. */
     private AutoCloseable writerStopStep;
+    /** The coordinator's cached shard catalog (its age goes into the heartbeat); null until built. */
+    private volatile com.pharos.cluster.routing.CachedCatalog coordinatorCatalog;
+    /** {@code /cluster/status} and {@code /cluster/events}; built on first use. Guarded by this. */
+    private com.pharos.cluster.status.StatusService statusService;
     /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
     private com.pharos.search.distributed.DistributedSearch distributed;
     /** How often the coordinator re-reads the shard catalog (in the background) for "every project" queries. */
@@ -365,8 +369,11 @@ public final class ClusterRuntime implements Closeable {
                 : !ready() ? com.pharos.cluster.membership.ReaderHeartbeat.WARMING
                 : degraded.isEmpty() ? com.pharos.cluster.membership.ReaderHeartbeat.READY
                 : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
+        com.pharos.cluster.routing.CachedCatalog cat = coordinatorCatalog;
+        Long catalogAge = cat == null || cat.ageSeconds() < 0 ? null : cat.ageSeconds();
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
-                draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded);
+                draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
+                catalogAge);
     }
 
     // Holding the monitor of this.
@@ -470,6 +477,43 @@ public final class ClusterRuntime implements Closeable {
         if (loop != null) loop.stop(Duration.ofSeconds(config.getCluster().getDrainSeconds()));
     }
 
+    /**
+     * The {@code /cluster/status} service of this node, started on first call: built from the bucket
+     * (catalog, manifests, leases, writer and reader heartbeats, the shared state
+     * {@code catalog/status/state.json}) on an object-store node, from local state on a single node
+     * ({@code role: all}: one node holding every shard, nothing written anywhere). Closed by
+     * {@link #close}.
+     */
+    public synchronized com.pharos.cluster.status.StatusService statusService() {
+        if (closed) throw new IllegalStateException("cluster runtime is closed");
+        if (statusService != null) return statusService;
+        ClusterConfig c = config.getCluster();
+        ClusterConfig.StatusConfig sc = c.getStatus();
+        com.pharos.cluster.status.StatusSource source;
+        com.pharos.cluster.status.StatusStateStore states;
+        if (backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os) {
+            source = new com.pharos.cluster.status.BucketStatusSource(os.store(), os.layout(), os.objectStoreCatalog(),
+                    os.source(), Duration.ofSeconds(c.getReaderTtlSeconds()), c.getWriter().leaseTtl(),
+                    java.time.Clock.systemUTC());
+            states = com.pharos.cluster.status.StatusStateStore.bucket(os.store(), os.layout());
+        } else {
+            source = new com.pharos.cluster.status.LocalStatusSource(c.getNodeId() == null ? "local" : c.getNodeId(),
+                    registry, luceneIndexer, () -> load, java.time.Clock.systemUTC());
+            states = com.pharos.cluster.status.StatusStateStore.memory();
+        }
+        String hook = sc.getWebhookUrl();
+        var events = new com.pharos.cluster.status.StatusEvents(Duration.ofSeconds(sc.getEventsKeepAliveSeconds()),
+                hook == null || hook.isBlank() ? null : new com.pharos.cluster.status.Webhook(hook));
+        statusService = new com.pharos.cluster.status.StatusService(source, states,
+                com.pharos.cluster.status.StatusSettings.of(sc), events, Duration.ofSeconds(c.getHeartbeatSeconds()),
+                STATUS_MAX_AGE, System::nanoTime);
+        statusService.start();
+        return statusService;
+    }
+
+    /** A {@code /cluster/status} request older than this rebuilds the status first. */
+    static final Duration STATUS_MAX_AGE = Duration.ofSeconds(2);
+
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
     public Optional<com.pharos.cluster.objectstore.ObjectStoreCatalog> sourceCatalog() {
         return backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os
@@ -532,6 +576,7 @@ public final class ClusterRuntime implements Closeable {
                 c.getObjectStore() == null ? Duration.ofSeconds(60)
                         : c.getObjectStore().readTotalTimeout().multipliedBy(2), // the store's own bound, with slack
                 catalogWait(c.effectiveQueryTimeoutMillis()));
+        coordinatorCatalog = catalog;
         var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, catalog, health,
                 id -> servesShard(id.value()), client::inFlight);
         var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),
@@ -996,6 +1041,12 @@ public final class ClusterRuntime implements Closeable {
         }
         stopWriting(); // before the backend (the bucket client) closes
         if (members != null) members.close();
+        com.pharos.cluster.status.StatusService status;
+        synchronized (this) {
+            status = statusService;
+            statusService = null;
+        }
+        if (status != null) status.close();
         stopCatalogTimer();
         com.pharos.search.distributed.DistributedSearch ds;
         synchronized (this) {
