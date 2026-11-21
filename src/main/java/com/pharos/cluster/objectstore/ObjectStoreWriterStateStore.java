@@ -174,6 +174,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         Files.createDirectories(root);
         Path staging = root.resolve("." + dir.getFileName() + ".restoring");
         deleteRecursively(staging); // left by a crashed restore
+        deleteRecursively(root.resolve("." + dir.getFileName() + ".replaced")); // ditto, crashed mid-swap
         Files.createDirectories(staging);
         try {
             WriterStateIndex index = readIndex(shard, backup.get());

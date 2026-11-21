@@ -57,6 +57,7 @@ class ReadPathInventoryTest {
     void graphsAreCreatedOnlyByWriterBuildPaths() throws IOException {
         assertThat(files("CallGraph.open(")).containsExactlyInAnyOrder(
                 "graph/CallGraph.java",                 // javadoc example + the factory itself
+                "graph/CompactGraphImport.java",        // writer takeover: a fresh graph from the published one
                 "graph/CrossProjectLinker.java",        // the global cross-project graph
                 "indexer/ProjectIndexManager.java");    // building/patching a project graph
     }
@@ -77,7 +78,7 @@ class ReadPathInventoryTest {
         assertThat(files("FSDirectory::open")).isEmpty();
         assertThat(files("FSDirectory.open(")).containsExactlyInAnyOrder(
                 "indexer/LuceneDirectoryFactory.java",            // the default factory
-                "cluster/ReplicaSyncer.java",                     // reader: verify before serving
+                "cluster/GenerationFiles.java",                   // reader + restoring writer: verify downloads
                 "cluster/objectstore/ObjectStorePublisher.java",  // writer: read the commit to upload
                 "cluster/warm/LazyGenerations.java",              // reader factory: full-copy generations
                 "cluster/warm/RemoteDirectory.java");             // lazy generation: local eager files, checksums

@@ -323,6 +323,32 @@ class ObjectStoreWriterStateStoreTest {
         assertThat(b.docCount()).isEqualTo(a.docCount());
     }
 
+    /**
+     * Ruling R8's takeover (restore, then a FULL index): the restored embedding cache alone makes
+     * every unchanged text cost 0 provider calls, even though the full run re-parses everything and
+     * rebuilds Lucene and the graph.
+     */
+    @Test
+    void restoreThenFullIndexReembedsNothingUnchanged() throws Exception {
+        Node a = new Node("node-a");
+        a.index(false);
+        assertThat(a.embedder.calls.get()).isPositive();
+
+        Node b = new Node("node-b");
+        assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
+        touchAll();
+        b.index(false); // full
+        assertThat(b.embedder.calls.get()).isZero();
+        assertThat(b.docCount()).isEqualTo(a.docCount());
+        assertThat(methodCount(b.indexDir())).isEqualTo(methodCount(a.indexDir()));
+        assertThat(replicas.latest(SHARD)).contains(new Generation(2));
+
+        // a cold node (no restore) pays for every text
+        Node cold = new Node("node-cold", WriterStateStore.NONE, 5);
+        cold.index(false);
+        assertThat(cold.embedder.calls.get()).isEqualTo(a.embedder.calls.get());
+    }
+
     @Test
     void restoreMaterialisesLatestThenOverlaysState() throws Exception {
         Node a = new Node("node-a");
