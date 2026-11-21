@@ -103,7 +103,9 @@ public abstract class ObjectStoreContract {
         assertThat(info.size()).isEqualTo(5);
         assertThat(info.lastModified()).isNotNull();
         ObjectInfo listed = store().list("stat/a").stream().filter(i -> i.key().equals("stat/a")).findFirst().orElseThrow();
-        assertThat(info.lastModified()).isEqualTo(listed.lastModified());
+        // HEAD (stat) reports LastModified to the second on S3/MinIO, a listing often to the millisecond.
+        assertThat(info.lastModified().truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
+                .isEqualTo(listed.lastModified().truncatedTo(java.time.temporal.ChronoUnit.SECONDS));
     }
 
     @Test

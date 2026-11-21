@@ -2,6 +2,7 @@ package com.pharos.cluster.objectstore;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Optional;
@@ -36,12 +37,20 @@ public final class BucketClock {
                 .filter(java.util.Objects::nonNull).findFirst();
     }
 
-    /** Age of a write stamped {@code lastModified} at the bucket's {@code now} (negative when it is newer). */
+    /**
+     * Age of a write stamped {@code lastModified} at the bucket's {@code now} (negative when it is
+     * newer), in whole seconds: both instants are truncated to seconds first, because S3 reports
+     * LastModified to the second on HEAD (an HTTP date) but often to the millisecond in a listing.
+     * Mixing the two would otherwise skew an age by up to a second.
+     */
     public static Duration age(Instant lastModified, Instant now) {
-        return Duration.between(lastModified, now);
+        return Duration.between(lastModified.truncatedTo(ChronoUnit.SECONDS), now.truncatedTo(ChronoUnit.SECONDS));
     }
 
-    /** True when a write stamped {@code lastModified} is older than {@code ttl} at the bucket's {@code now}. */
+    /**
+     * True when a write stamped {@code lastModified} is older than {@code ttl} at the bucket's
+     * {@code now}, by the whole-second {@link #age}.
+     */
     public static boolean expired(Instant lastModified, Instant now, Duration ttl) {
         return age(lastModified, now).compareTo(ttl) > 0;
     }
