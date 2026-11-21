@@ -13,7 +13,38 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-15-multi-node-design.md`, section "Peer-pull backend", and Phase 5 in "Phases and gates". The live doc is rev 61.
 
-**Base:** branch `feat/cluster-phase-5` from the latest merged multi-node phase. Phase 5 depends only on Phases 0–2 (`ReplicaSource`, `LocalCache`, `BlockCache`). It can run before or after Phases 3–4. **Refresh this plan before execution:** check the `ReplicaSource` interface (Phase 2 added `downloadRange` and `openRange`) and how `ClusterRuntime` chooses a backend.
+**Base:** branch `feat/cluster-phase-5` from `feat/cluster-phase-4` after Phase 4's final review. The refresh below assumes Phases 3 and 4 are present.
+
+**Refreshed 2026-11-21** against Phase 3 (788882d) and the refreshed Phase 4 plan (3c84919). The original plan said Phase 5 depends only on Phases 0–2. With Phases 3 and 4 built that no longer holds: they keep membership and status state in the bucket too. Task 2b and the rulings below cover that.
+
+## What exists, and what still needs a bucket (refresh, 2026-11-21)
+
+**Replication: ready as is**
+- `ReplicaSource` already has `latest`, `manifest`, `download`, `downloadRange`, `openRange` and `synonyms()`. `PeerReplicaSource` implements all six.
+- `ObjectStoreReplicaSource` reads `catalog/synonyms.txt` through `synonyms()`, so synonyms need no separate path.
+- `Backends.create` switches on `BackendKind {LOCAL, OBJECT_STORE}`. Add `PEER_PULL("peer-pull")` there, and update the error message.
+- `ReplicaSyncer` runs `syncOnce` on a fixed delay (`pollInterval`). Long-poll mode replaces that loop for peer sources only.
+
+**Still in the bucket, and what replaces it in peer mode:**
+
+| Bucket use today | Who reads it | Replacement in peer mode |
+|---|---|---|
+| `catalog/shards.json` (`ObjectStoreCatalog`, Phase 4 `source` field) | readers (`CachedCatalog`), writers | `PeerCatalog`, merged from every writer's `/replication/catalog` (Task 2) |
+| `catalog/readers/<node>.json` (`ReaderRegistry`, bucket-clock liveness) | coordinators (`ShardRouter`), `pharos router` (`ReaderRegistry.observer`), Phase 4 status | Writers keep a reader registry fed by `POST /replication/readers`, judged by the writer's own clock. Coordinators and the router merge `GET /replication/readers` from every discovered writer (Task 2b) |
+| `catalog/synonyms.txt` | readers via `ReplicaSource.synonyms()` | `GET /replication/synonyms`. When writers disagree, the newest one by content hash and mtime wins, and the conflict is reported like a shard claim conflict (Task 1) |
+| Phase 4 `catalog/writers/`, leases, `writer-state/` | writers, status | Not used: there is no takeover in peer mode (spec). Each writer reports itself in `/replication/catalog`. `WriterStateStore` falls back to local disk |
+| Phase 4 proposal hysteresis object | status on every node | Kept by the live writer with the lowest node id and served at `GET /replication/status-state`. Ruling P5-R2 |
+
+**Process model.** Today a writer can be just `pharos index` runs. In peer mode the writer must also run a long-lived `pharos web` (role `writer`) to serve `/replication/*`. Its local index directory is what it serves.
+
+**Web stack.** The web server is Javalin 6 (Jetty), with no TLS today. TLS goes through Javalin's Jetty server config, adding an `SslContextFactory.Server` connector from `cluster.tls`. Don't add the community SSL plugin. The `ShardClient` and router `HttpClient`s get an `SSLContext` from the same truststore.
+
+**Shutdown.** `ShutdownSequence` gains a writer step: stop accepting `/replication` transfers, let in-flight ranges finish within `drainSeconds`, then exit.
+
+**Rulings (refresh):**
+- **P5-R1.** Phase 4's `/cluster/status` works in peer mode. It is built from `PeerCatalog`, the writers' reader registries and the writers' catalog entries. Fields that only exist with leases (`lease`, takeover) are null. *Cost if wrong:* the Cluster page shows less in peer mode.
+- **P5-R2.** The proposal hysteresis state lives on the lowest-id live writer. If that writer dies, the state restarts on the next one, and proposals may re-appear after their wait window. *Cost if wrong:* a proposal delayed once per writer loss.
+- **P5-R3.** Every new route (`/replication/catalog`, `/replication/readers`, `/replication/peers`, `/replication/synonyms`, `/replication/status-state`) requires `X-Pharos-Cluster-Token`, like the file routes.
 
 ## Global Constraints
 
@@ -62,6 +93,11 @@
 - `GET /replication/<shard>/manifests/gen-N.json`.
 - `GET /replication/<shard>/files/<key>` with `Range`. It answers 206 with `Content-Range`, 410 for a pruned file, and 503 with `Retry-After` above the transfer cap.
 - Every route requires `X-Pharos-Cluster-Token`.
+- **Refresh:**
+  - Also serve `GET /replication/synonyms`. It returns the bytes plus an `ETag` of their SHA-256, and 404 when there are none.
+  - When two writers' synonyms differ, readers take the newest and report `synonyms differ between A and B` in `/health` and status. Test: `synonymsConflictReported`.
+  - Writers in peer mode run `pharos web --role writer` to serve these routes.
+  - TLS goes through the Javalin/Jetty connector, as in the refresh section above.
 
 - [ ] **Tests:**
   - `latestLongPollsUntilPublish`
@@ -95,6 +131,30 @@
 - [ ] Run the focused tests, then `mvn test`.
 - [ ] **Commit** `cluster: peer-pull backend`.
 
+### Task 2b: Membership without a bucket (refresh, 2026-11-21)
+
+**Files:**
+- `cluster/peer/PeerReaderRegistry.java`: the writer side, fed by `POST /replication/readers`.
+- `cluster/membership/MembershipSource.java`: a new interface over "live readers", implemented by the bucket `ReaderRegistry` and by a peer observer that merges `GET /replication/readers` from every discovered writer.
+- `ShardRouter`, `RouterCommand`, `ClusterRuntime`: take a `MembershipSource` instead of a `ReaderRegistry`.
+- `cluster/peer/PeerStatusState.java`: the hysteresis holder from Ruling P5-R2.
+
+**Interfaces:**
+- A reader's heartbeat body is the existing `ReaderHeartbeat` JSON, unchanged. It is POSTed to every discovered writer every `heartbeatSeconds`.
+- A writer drops a reader whose last POST is older than the same liveness window the bucket registry uses, measured by the writer's own clock.
+- The merged view takes a reader's newest heartbeat across writers. A reader seen by any live writer is live.
+
+- [ ] **Tests:**
+  - `peerMembershipMatchesBucketMembership`: the same heartbeats produce the same live set and routing decisions through both sources.
+  - `readerVisibleWhileOneWriterDown`
+  - `routerUsesPeerMembership`
+  - `drainingReaderLeavesPeerMembership`
+  - `statusStateMovesToNextWriter`: Ruling P5-R2.
+  - `objectStoreMembershipUnchanged`
+- [ ] Implement.
+- [ ] Run the focused tests, then `mvn test`.
+- [ ] **Commit** `cluster: membership and status state without a bucket`.
+
 ### Task 3: Fetch from peer readers
 
 **Files:**
@@ -121,6 +181,7 @@
 1. Re-run the Phase 1 gate with no MinIO, using the same pass criteria. Readers find the writer only through `cluster.peers.discovery` (seed URL), never a static map.
    - Add a second writer for a new project mid-run: readers discover it and serve its shard within 2 refreshes, with 0 failed queries.
 2. Re-run the Phase 2 gate the same way.
+   - **Refresh:** also re-run the Phase 3 fan-out checks with no bucket: keyword ≥ 98% identical top-10, and vector and hybrid under the Phase 3 rules. Coordinators and `pharos router` find readers only through peer membership (Task 2b). The pass criteria are unchanged.
 3. **Writer down.** With two readers serving pharos and lucene, `kill -9` the writer.
    - **Pass:** queries keep working for 2 minutes at about 10 QPS, with 0 failures.
    - **Pass:** a reader restarted while the writer is down serves its on-disk generations.
