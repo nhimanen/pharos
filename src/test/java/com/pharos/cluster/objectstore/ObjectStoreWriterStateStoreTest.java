@@ -269,7 +269,7 @@ class ObjectStoreWriterStateStoreTest {
         byte[] other = Files.readAllBytes(a.indexDir().resolve("lucene").resolve(names.get(1)));
         other[other.length - 1] ^= 0x01; // footer checksum differs
         Files.write(staleLucene.resolve(names.get(1)), other);
-        assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
+        assertThat(b.state.restore(SHARD, b.indexDir()).map(WriterStateStore.Restored::generation)).contains(Generation.FIRST);
 
         Map<String, byte[]> want = stateFiles(a.indexDir()), got = stateFiles(b.indexDir());
         assertThat(got.keySet()).isEqualTo(want.keySet()).contains("file-state.json", "embed-cache.test-counting.bin");
@@ -300,7 +300,7 @@ class ObjectStoreWriterStateStoreTest {
         assertThat(a.embedder.calls.get()).isPositive();
 
         Node b = new Node("node-b");
-        Optional<Generation> restored = b.state.restore(SHARD, b.indexDir());
+        Optional<Generation> restored = b.state.restore(SHARD, b.indexDir()).map(WriterStateStore.Restored::generation);
         assertThat(restored).contains(Generation.FIRST);
         b.registerRestored(restored.get());
 
@@ -335,7 +335,7 @@ class ObjectStoreWriterStateStoreTest {
         Node a = new Node("node-a");
         a.index(false);
         Node b = new Node("node-b");
-        assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
+        assertThat(b.state.restore(SHARD, b.indexDir()).map(WriterStateStore.Restored::generation)).contains(Generation.FIRST);
         b.registerRestored(Generation.FIRST);
         assertThat(graphDump(b.indexDir())).isEqualTo(graphDump(a.indexDir()));
         assertThat(storedDocs(b.indexDir())).isEqualTo(storedDocs(a.indexDir()));
@@ -472,7 +472,7 @@ class ObjectStoreWriterStateStoreTest {
         assertThat(a.embedder.calls.get()).isPositive();
 
         Node b = new Node("node-b");
-        assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
+        assertThat(b.state.restore(SHARD, b.indexDir()).map(WriterStateStore.Restored::generation)).contains(Generation.FIRST);
         touchAll();
         b.index(false); // full
         assertThat(b.embedder.calls.get()).isZero();
@@ -498,7 +498,8 @@ class ObjectStoreWriterStateStoreTest {
         assertThat(replicas.latest(SHARD)).contains(new Generation(2));
 
         Node b = new Node("node-b");
-        assertThat(b.state.restore(SHARD, b.indexDir())).contains(new Generation(2));
+        assertThat(b.state.restore(SHARD, b.indexDir()))
+                .contains(new WriterStateStore.Restored(new Generation(2), Generation.FIRST));
         // the index is LATEST (gen 2: it has the new method) ...
         Set<String> gen2Lucene = replicas.manifest(SHARD, new Generation(2)).files().stream()
                 .filter(f -> ManifestFile.LUCENE.equals(f.role())).map(ManifestFile::name)
@@ -632,7 +633,7 @@ class ObjectStoreWriterStateStoreTest {
 
         // the retained backup still restores
         Node b = new Node("node-b");
-        assertThat(b.state.restore(SHARD, b.indexDir())).contains(new Generation(5));
+        assertThat(b.state.restore(SHARD, b.indexDir()).map(WriterStateStore.Restored::generation)).contains(new Generation(5));
     }
 
     @Test
@@ -645,7 +646,7 @@ class ObjectStoreWriterStateStoreTest {
                     throw new IOException("bucket full");
                 }
 
-                @Override public Optional<Generation> restore(ShardId shard, Path indexDir) {
+                @Override public Optional<Restored> restore(ShardId shard, Path indexDir) {
                     return Optional.empty();
                 }
             }, 5);

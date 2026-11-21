@@ -378,7 +378,11 @@ public final class ObjectStorePublisher implements IndexPublisher {
         return new ManifestFile(role, name, key, Files.size(file), crcHex);
     }
 
-    /** Never fails the publish: the generation is committed, a missing backup only costs a takeover a full index. */
+    /**
+     * Never fails the publish: the generation is committed. A missing backup of this generation makes
+     * a takeover restore it with an older backup's writer state, whose file state doesn't describe
+     * these documents: the new owner then runs a full index (embeddings from the older cache).
+     */
     private void backupWriterState(ShardId shard, Generation gen, Path shardDir) {
         try {
             writerState.backup(shard, gen, shardDir);

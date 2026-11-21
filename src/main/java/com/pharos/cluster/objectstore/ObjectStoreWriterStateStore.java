@@ -5,6 +5,7 @@ import com.pharos.cluster.GenerationFiles;
 import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.WriterStateStore;
+import com.pharos.cluster.WriterStateStore.Restored;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphImport;
 import com.pharos.graph.CrossProjectLinker;
@@ -156,7 +157,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
     // ---- restore ----------------------------------------------------------------------------
 
     @Override
-    public Optional<Generation> restore(ShardId shard, Path indexDir) throws IOException {
+    public Optional<Restored> restore(ShardId shard, Path indexDir) throws IOException {
         Optional<Generation> latestOpt = source.latest(shard);
         if (latestOpt.isEmpty()) {
             log.info("Shard {}: nothing published yet, nothing to restore", shard);
@@ -183,14 +184,14 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
             materialise(shard, latest, manifest, dir, staging);
             swap(staging, dir);
             if (backup.get().compareTo(latest) < 0) {
-                log.warn("Shard {}: restored generation {} with the writer state of generation {}: files changed"
-                        + " since are re-indexed (and re-embedded) by the next run", shard, latest.value(),
-                        backup.get().value());
+                log.warn("Shard {}: restored generation {} with the writer state of generation {}: its file state"
+                        + " doesn't describe the restored documents, so the next run is a full index (embeddings"
+                        + " from the restored cache)", shard, latest.value(), backup.get().value());
             } else {
                 log.info("Shard {}: restored generation {} with its writer state ({} files)", shard,
                         latest.value(), state.size());
             }
-            return Optional.of(latest);
+            return Optional.of(new Restored(latest, backup.get()));
         } catch (Unusable e) {
             log.warn("Shard {}: cannot restore from writer-state backup {} on generation {} ({}); falling back to"
                     + " a full index", shard, backup.get().value(), latest.value(), e.getMessage());

@@ -77,8 +77,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * paths. {@code file-state.json} and the Lucene {@code filePath} field hold absolute paths: when the
  * restored (or local) state was built under another root than this writer's checkout, the run is a
  * FULL index (embeddings still come from the restored cache), so no document stays behind under the
- * old paths. A store failure during restore is retried on the next poll (never a full re-embed); a
- * missing or unusable backup makes the run a full index.
+ * old paths. The same holds when the restored writer state is older than {@code LATEST} (its backup
+ * was lost or never uploaded): its file state doesn't describe the restored documents. A store
+ * failure during restore is retried on the next poll (never a full re-embed); a missing or unusable
+ * backup makes the run a full index.
  *
  * <p><b>Same node id after a restart:</b> the old process's leases name this node but their ETags
  * are unknown to the new process, so it waits them out (one TTL) like any other writer's. This is
@@ -107,6 +109,12 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class WorkLoop implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(WorkLoop.class);
+
+    /**
+     * Marker in a shard's index dir: its file state doesn't describe its documents (restored from an
+     * older generation's backup), so its next run is FULL. Removed after a full run publishes.
+     */
+    static final String FULL_RUN_REQUIRED = ".full-run-required";
 
     /** Timing and run options. */
     public record Settings(String node, Duration leaseTtl, Duration heartbeat, Duration poll, Duration minHold,
@@ -643,7 +651,7 @@ public final class WorkLoop implements Closeable {
             // the restore downloads the published generation, then (at worst) a full run follows
             if (!admitted(shard, estimateWithoutLocalIndex(shard, root))) return Outcome.REFUSED;
             requireRestorable(shard);
-            Optional<Generation> restored;
+            Optional<WriterStateStore.Restored> restored;
             try {
                 restored = writerState.restore(shard, indexDir);
             } catch (IOException e) {
@@ -652,16 +660,31 @@ public final class WorkLoop implements Closeable {
                 return Outcome.FAILED;
             }
             if (restored.isPresent()) {
+                Generation gen = restored.get().generation();
                 String originalRoot;
                 try {
-                    originalRoot = registerRestored(shard, restored.get(), root, indexDir);
+                    // before registering: a run that dies before its commit must not be followed by an
+                    // incremental one on the mismatched file state (the marker goes after a publish)
+                    if (!restored.get().stateMatches()) Files.writeString(indexDir.resolve(FULL_RUN_REQUIRED), "");
+                    originalRoot = registerRestored(shard, gen, root, indexDir);
                 } catch (IOException | RuntimeException e) {
                     log.warn("Registering the restored shard {} failed (retrying next poll): {}", shard, e.toString());
                     return Outcome.FAILED;
                 }
-                full = !sameRoot(originalRoot, root);
-                why = full ? "restored generation " + restored.get().value() + " was indexed under " + originalRoot
-                        + ", this writer checks out at " + root : "restored generation " + restored.get().value();
+                if (!restored.get().stateMatches()) {
+                    // the file state is an older generation's: it doesn't describe the restored documents
+                    // (a file added since and deleted again would keep its documents in an incremental run)
+                    full = true;
+                    why = "restored generation " + gen.value() + " with the writer state of generation "
+                            + restored.get().stateGeneration().value();
+                } else if (!sameRoot(originalRoot, root)) {
+                    full = true;
+                    why = "restored generation " + gen.value() + " was indexed under " + originalRoot
+                            + ", this writer checks out at " + root;
+                } else {
+                    full = false;
+                    why = "restored generation " + gen.value();
+                }
             } else {
                 full = true;
                 why = "no usable writer state to resume from";
@@ -671,6 +694,10 @@ public final class WorkLoop implements Closeable {
             if (local.isEmpty()) {
                 full = true;
                 why = "the local index is not registered";
+            } else if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED))) {
+                full = true;
+                why = "the restored writer state was older than the restored generation, and no full run"
+                        + " has published since";
             } else if (!sameRoot(local.get().getRootPath(), root)) {
                 full = true;
                 why = "the local index was built under " + local.get().getRootPath() + ", the checkout is at " + root;
@@ -704,6 +731,7 @@ public final class WorkLoop implements Closeable {
                     st.pendingSince = null;
                 }
             }
+            if (full) Files.deleteIfExists(indexDir.resolve(FULL_RUN_REQUIRED));
             publishes.merge(shard, 1, Integer::sum);
             leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::renew);
             estimateFloor.remove(shard);

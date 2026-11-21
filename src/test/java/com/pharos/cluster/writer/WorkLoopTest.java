@@ -741,6 +741,47 @@ class WorkLoopTest {
         assertThat(replicas.manifest(s, new Generation(2)).docCount()).isEqualTo(b.docs(s));
     }
 
+    /**
+     * Final review C1: the newest backup (gen 1) is older than LATEST (gen 2, whose backup was lost).
+     * A file added in gen 2 and deleted since is not in gen 1's file state, so an incremental run on
+     * the restored index would never delete its documents. Path shards index the same absolute root
+     * on every writer, so without the fix this takeover runs incrementally. Its first (full) run dies
+     * before the commit: the retry must be full too.
+     */
+    @Test
+    void takeoverWithAnOlderBackupThanLatestRunsFull() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        int gen1Docs = a.docs(s);
+        Path extra = sourceDirs.get(s).resolve("src/main/java/com/example/solo/Extra.java");
+        Files.writeString(extra, "package com.example.solo;\n\npublic class Extra {\n"
+                + "    public int gone(int x) { return x - 1; }\n}\n");
+        rounds(1, 10, a);
+        assertThat(latest(s)).contains(new Generation(2));
+        assertThat(a.docsUnder(s, extra.toString())).isPositive();
+        a.loop.stop(Duration.ofSeconds(5));
+        // gen 2's backup never made it (the writer died uploading it, or S3 failed)
+        for (var o : store.list(layout.writerStateGenPrefix(s, new Generation(2)))) store.delete(o.key());
+        Files.delete(extra);
+        change(s, "afterTakeover");
+
+        Writer b = new Writer("node-b");
+        AtomicBoolean crash = new AtomicBoolean(true);
+        b.embedder.onBatch = n -> {
+            if (crash.getAndSet(false)) throw new IllegalStateException("the run dies before its commit");
+        };
+        b.loop.tick();
+        assertThat(latest(s)).as("nothing published by the dead run").contains(new Generation(2));
+        rounds(1, 10, b);
+
+        assertThat(latest(s)).contains(new Generation(3));
+        assertThat(b.docsUnder(s, extra.toString())).as("no document of the deleted file").isZero();
+        assertThat(b.docs(s)).isEqualTo(gen1Docs + 1);
+        assertThat(replicas.manifest(s, new Generation(3)).docCount()).isEqualTo(b.docs(s));
+        assertThat(b.lucene.getProjectIndexDir("solo").resolve(WorkLoop.FULL_RUN_REQUIRED)).doesNotExist();
+    }
+
     @Test
     void restoreStoreOutageRetriesInsteadOfAFullReembed() throws IOException {
         ShardId s = pathShard("solo");
