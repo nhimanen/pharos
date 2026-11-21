@@ -66,7 +66,9 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   Graph and lookup tools (callers, callees, usages, call chains, call paths, method/class lookup)
   reach shards held elsewhere through `/internal/graph`. A shard no reader can answer for is named
   in the response warnings (`shard <name> unavailable: <reason>; results exclude it`); the other
-  shards still answer. Coordinator and shard must use the same `synonyms.txt` (a shard refuses
+  shards still answer; when none answers and the reader holds none of them, the call answers 503
+  (`no shard answered`, with the warnings; MCP: a retryable tool error) rather than an empty result,
+  so `pharos router` retries it on another reader. Coordinator and shard must use the same `synonyms.txt` (a shard refuses
   otherwise, 409). An invalid project name answers 400 (an unusable shard catalog maps to 503 where no answer from local shards is possible).
   Vector first passes and unified recall pools are merged in two rounds (global top candidates,
   then rescored on their shards), so fan-out rankings equal a single node's. New config:

@@ -297,6 +297,7 @@ public class SearchEngine {
                 return null;
             }
             T value = op.apply(q);
+            q.requireAnAnswer(); // nothing answered and nothing is held here: 503, not an empty answer
             warnings.addAll(q.warnings());
             return new FanOut<>(value);
         }
@@ -551,6 +552,7 @@ public class SearchEngine {
         primary = applyQueryHintBoosts(primary, hints);
 
         if (primary.isEmpty()) {
+            fanout.requireAnAnswer(); // every shard failed and none is held here: 503, not "no matches"
             warnings.addAll(fanout.warnings());
             // Suggestions from the shards held here (cheap: local terms only); none when it holds none.
             List<String> held = fanout.localShards();

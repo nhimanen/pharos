@@ -331,6 +331,10 @@ public class WebServer {
                 ctx.status(400).json(Map.of("error", e.getMessage())));
         app.exception(com.pharos.cluster.routing.CatalogUnavailableException.class, (e, ctx) ->
                 ctx.status(503).json(Map.of("error", e.getMessage())));
+        // A fanned-out call none of whose shards answered (none held here) → 503 with the reasons, so
+        // pharos router retries it once on another reader instead of passing on an empty answer
+        app.exception(com.pharos.cluster.routing.NoShardAnsweredException.class, (e, ctx) ->
+                ctx.status(503).json(Map.of("error", e.getMessage(), "warnings", e.warnings())));
 
         // Project without a call graph (never indexed with one, or a failed build) → 404
         app.exception(com.pharos.graph.GraphNotFoundException.class, (e, ctx) ->
@@ -457,6 +461,7 @@ public class WebServer {
                 }
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
@@ -541,6 +546,7 @@ public class WebServer {
                 }
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -598,6 +604,7 @@ public class WebServer {
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -618,6 +625,7 @@ public class WebServer {
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -640,6 +648,7 @@ public class WebServer {
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
@@ -782,6 +791,7 @@ public class WebServer {
                 ctx.json(res);
             } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
                      | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {

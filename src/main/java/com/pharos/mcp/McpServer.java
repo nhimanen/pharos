@@ -157,6 +157,14 @@ public class McpServer {
             // the caller's fault, as HTTP 400: JSON-RPC "invalid params"
             log.warn("tool={} args={} status=invalid-project error={}", toolName, arguments, e.getMessage());
             return errorResponse(id, -32602, "Invalid params: " + e.getMessage());
+        } catch (com.pharos.cluster.routing.NoShardAnsweredException e) {
+            // as HTTP 503: every shard of the call failed; a tool error the client may retry
+            log.warn("tool={} args={} status=no-shard-answered error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text")
+                    .put("text", "unavailable (503): " + e.getMessage() + "; retry shortly");
+            result.put("isError", true);
+            return successResponse(id, result);
         } catch (com.pharos.cluster.routing.CatalogUnavailableException e) {
             // transient, as HTTP 503: a tool error the client may retry
             log.warn("tool={} args={} status=catalog-unavailable error={}", toolName, arguments, e.getMessage());

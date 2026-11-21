@@ -31,6 +31,7 @@ import java.util.stream.Stream;
 import static com.pharos.cluster.ClusterFixture.JAVA;
 import static com.pharos.cluster.ClusterFixture.PY;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The Phase 3 coordinator over real reader nodes in one JVM: each node syncs its pinned shards from
@@ -642,9 +643,38 @@ class DistributedSearchTest {
             assertThat(r.warnings().get(0)).startsWith("shard " + JAVA + " unavailable: ")
                     .endsWith("; results exclude it");
 
-            SearchResponse only = search(s.coordinator(), "Calculator", SearchType.KEYWORD, JAVA, 10);
-            assertThat(only.results()).isEmpty();
-            assertThat(only.warnings()).singleElement().asString().startsWith("shard " + JAVA + " unavailable: ");
+            // Final review minor 9: scoped to the lost shard alone, nothing answered and nothing is held
+            // here: 503 (web) / a retryable tool error (MCP), never an empty "no matches".
+            assertThatThrownBy(() -> search(s.coordinator(), "Calculator", SearchType.KEYWORD, JAVA, 10))
+                    .isInstanceOf(com.pharos.cluster.routing.NoShardAnsweredException.class)
+                    .hasMessageStartingWith("no shard answered (shard " + JAVA + " unavailable: ");
+            assertThatThrownBy(() -> s.coordinator().engine.findCallers("com.example.model.User#getName()", JAVA,
+                    new ArrayList<>())).as("graph tools too")
+                    .isInstanceOf(com.pharos.cluster.routing.NoShardAnsweredException.class);
+
+            com.pharos.mcp.McpServer mcp = new com.pharos.mcp.McpServer(s.coordinator().mcp());
+            String out = com.pharos.mcp.McpTestAccess.handle(mcp, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":"
+                    + "{\"name\":\"search_code\",\"arguments\":{\"query\":\"Calculator\",\"type\":\"keyword\","
+                    + "\"project\":\"" + JAVA + "\"}}}");
+            com.fasterxml.jackson.databind.JsonNode rpc = new com.fasterxml.jackson.databind.ObjectMapper().readTree(out);
+            assertThat(rpc.path("result").path("isError").asBoolean()).as(out).isTrue();
+            assertThat(rpc.path("result").path("content").get(0).path("text").asText())
+                    .startsWith("unavailable (503): no shard answered");
+
+            com.pharos.web.WebServer web = new com.pharos.web.WebServer(s.coordinator().engine,
+                    s.coordinator().parts.registry(), ClusterFixture.noopModules(s.coordinator().parts.registry()),
+                    s.coordinator().parts.lucene(), new com.pharos.graph.ModuleBoundaryAnalyzer(
+                            s.coordinator().parts.registry(), s.coordinator().engine));
+            io.javalin.Javalin app = web.start(0, tmp.resolve("web-home"));
+            try {
+                var resp = java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://127.0.0.1:" + app.port() + "/api/search?q=Calculator&type=keyword&project="
+                                + JAVA)).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                assertThat(resp.statusCode()).as(resp.body()).isEqualTo(503);
+                assertThat(resp.body()).contains("no shard answered").contains("\"warnings\":[\"shard " + JAVA);
+            } finally {
+                app.stop();
+            }
         }
     }
 

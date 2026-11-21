@@ -285,6 +285,20 @@ public final class DistributedSearch implements Closeable {
             return false;
         }
 
+        /**
+         * Throws {@link com.pharos.cluster.routing.NoShardAnsweredException} when the query has shards,
+         * this reader holds none of them, and every one was left out: nothing answered, so an empty
+         * result would be indistinguishable from "no matches".
+         */
+        public void requireAnAnswer() {
+            List<String> w = warnings(); // marks the shards no live reader serves first
+            synchronized (this) {
+                if (shards.isEmpty()) return;
+                for (ShardState s : shards) if (s.local || s.unavailable == null) return;
+            }
+            throw new com.pharos.cluster.routing.NoShardAnsweredException(w);
+        }
+
         /** The shards this reader holds, in query order. */
         public List<String> localShards() {
             List<String> out = new ArrayList<>();
