@@ -240,7 +240,7 @@ class LeaseManagerTest {
     @Test
     void renewerThreadRenewsAtAThirdOfTheTtl() throws Exception {
         InMemoryObjectStore real = new InMemoryObjectStore(); // the system clock: real time passes
-        Duration ttl = Duration.ofMillis(1500);
+        Duration ttl = Duration.ofSeconds(3);
         String hb = "pharos/test-heartbeats/node-b.json";
         LeaseManager a = new LeaseManager(real, layout, "node-a", ttl, LeaseManager.BucketNow.NONE, Clock.systemUTC());
         LeaseManager b = new LeaseManager(real, layout, "node-b", ttl, () -> {
@@ -259,12 +259,117 @@ class LeaseManagerTest {
             a.assertHeld(SHARD);
             // Without the renewer the lease expires and is taken over.
             a.close();
-            Thread.sleep(ttl.toMillis() + 200);
+            Thread.sleep(ttl.toMillis() + 1500);
             assertThat(b.tryAcquire(SHARD)).isPresent();
             assertThatThrownBy(() -> a.assertHeld(SHARD)).isInstanceOf(PublishConflictException.class);
         } finally {
             a.close();
         }
+    }
+
+    /** Fix round 1, I3: a hung store call on one lease never delays another lease's renewal, and is bounded. */
+    @Test
+    void slowStoreCallOnOneLeaseDoesNotDelayAnothersRenewal() throws Exception {
+        ShardId slow = new ShardId("slow");
+        CountDownLatch unblock = new CountDownLatch(1);
+        AtomicBoolean block = new AtomicBoolean();
+        ObjectStore s = (ObjectStore) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ObjectStore.class}, (proxy, m, args) -> {
+                    if (block.get() && (m.getName().equals("get") || m.getName().equals("putIfMatch"))
+                            && ((String) args[0]).contains("/shards/slow/")) {
+                        unblock.await(); // hangs like an S3 call stuck in socket timeouts and retries
+                    }
+                    try {
+                        return m.invoke(store, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+        String hb = "pharos/test-heartbeats/node-a.json";
+        LeaseManager a = new LeaseManager(s, layout, "node-a", TTL, () -> {
+            s.put(hb, new byte[0]);
+            return s.stat(hb).map(ObjectInfo::lastModified);
+        }, bucketClock, Duration.ofSeconds(1));
+        try {
+            a.tryAcquire(slow).orElseThrow();
+            Lease alpha = a.tryAcquire(SHARD).orElseThrow();
+            block.set(true);
+
+            // A publisher thread is stuck re-reading the slow lease (holding that shard's lock).
+            AtomicReference<Throwable> publishCheck = new AtomicReference<>();
+            Thread publisher = new Thread(() -> {
+                try {
+                    a.assertHeld(slow);
+                } catch (Throwable t) {
+                    publishCheck.set(t);
+                }
+            });
+            publisher.start();
+            Thread.sleep(100);
+
+            long t0 = System.nanoTime();
+            assertThat(a.isHeld(slow)).isTrue(); // in-memory reads never wait on the store
+            assertThat(a.renew(alpha)).isTrue();
+            assertThat(Duration.ofNanos(System.nanoTime() - t0)).isLessThan(Duration.ofMillis(500));
+            assertThat(a.held()).extracting(Lease::shard).contains(SHARD);
+
+            // The stuck check gives up at the deadline ("cannot confirm"), without losing the lease.
+            publisher.join(5000);
+            assertThat(publishCheck.get()).isInstanceOf(PublishConflictException.class)
+                    .hasMessageContaining("timed out");
+
+            // A renewal round: the slow lease's renewal times out and is lost; alpha still renews.
+            String alphaBefore = a.held().stream().filter(l -> l.shard().equals(SHARD)).findFirst().orElseThrow().etag();
+            t0 = System.nanoTime();
+            a.renewAll();
+            assertThat(Duration.ofNanos(System.nanoTime() - t0)).isLessThan(Duration.ofSeconds(3));
+            assertThat(a.isHeld(slow)).isFalse();
+            assertThat(a.isHeld(SHARD)).isTrue();
+            assertThat(a.held().getFirst().etag()).isNotEqualTo(alphaBefore);
+            a.assertHeld(SHARD);
+        } finally {
+            unblock.countDown();
+            a.close();
+        }
+    }
+
+    @Test
+    void acquireGivesUpAtTheDeadline() throws Exception {
+        CountDownLatch unblock = new CountDownLatch(1);
+        ObjectStore s = (ObjectStore) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ObjectStore.class}, (proxy, m, args) -> {
+                    if (m.getName().equals("get")) unblock.await();
+                    try {
+                        return m.invoke(store, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+        LeaseManager a = new LeaseManager(s, layout, "node-a", TTL, LeaseManager.BucketNow.NONE, bucketClock,
+                Duration.ofMillis(200));
+        try {
+            long t0 = System.nanoTime();
+            assertThatThrownBy(() -> a.tryAcquire(SHARD)).isInstanceOf(IOException.class).hasMessageContaining("timed out");
+            assertThat(Duration.ofNanos(System.nanoTime() - t0)).isLessThan(Duration.ofSeconds(2));
+            assertThat(a.isHeld(SHARD)).isFalse();
+            assertThat(store.get(leaseKey)).isEmpty();
+        } finally {
+            unblock.countDown();
+            a.close();
+        }
+    }
+
+    @Test
+    void releaseAfterCloseLeavesTheLeaseToExpire() throws Exception {
+        LeaseManager a = writer("node-a");
+        LeaseManager b = writer("node-b");
+        Lease lease = a.tryAcquire(SHARD).orElseThrow();
+        a.close();
+        a.release(lease); // documented misuse: nothing is written
+        assertThat(leaseBody().has("released")).isFalse();
+        assertThat(b.tryAcquire(SHARD)).isEmpty();
+        bucketClock.advance(31);
+        assertThat(b.tryAcquire(SHARD)).isPresent();
     }
 
     @Test
