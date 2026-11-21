@@ -894,7 +894,8 @@ class PeerPullTest {
     // ── peer readers (Task 3) ────────────────────────────────────────────────
 
     /** A reader serving its held generations on its own port (advertised), as {@code pharos web} does. */
-    private record PeerReader(Reader reader, PeerFileSource files, String url, java.util.concurrent.atomic.AtomicInteger requests) {}
+    private record PeerReader(Reader reader, PeerFileSource files, String url, java.util.concurrent.atomic.AtomicInteger requests,
+                              java.util.concurrent.atomic.AtomicInteger rangeRequests) {}
 
     private PeerReader peerReader(String home, String discovery, boolean heartbeat, Consumer<ClusterConfig> tune)
             throws Exception {
@@ -911,12 +912,16 @@ class PeerPullTest {
         PeerFileSource files = r.runtime().peerFileSource().orElseThrow();
         java.util.concurrent.atomic.AtomicInteger requests = new java.util.concurrent.atomic.AtomicInteger();
         Javalin app = Javalin.create();
-        app.before("/replication/*", ctx -> requests.incrementAndGet());
+        java.util.concurrent.atomic.AtomicInteger ranges = new java.util.concurrent.atomic.AtomicInteger();
+        app.before("/replication/*", ctx -> {
+            requests.incrementAndGet();
+            if (ctx.header("Range") != null) ranges.incrementAndGet();
+        });
         files.mount(app);
         app.start(port);
         open.add(app::stop);
         r.runtime().startServing(heartbeat);
-        return new PeerReader(r, files, url, requests);
+        return new PeerReader(r, files, url, requests, ranges);
     }
 
     private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newHttpClient();
@@ -1026,29 +1031,26 @@ class PeerPullTest {
                 w.backend.peerStore().store().pathOf(body.key())));
         assertThat(ids(second.engine(), JAVA, "Calculator")).isNotEmpty();
 
-        // while suspect the peer is not asked at all
+        // ranges never reach a peer (P5-R10), not even once the backoff is over
+        skew.addAndGet(PeerReplicaSource.SUSPECT_FOR.toNanos() + 1);
         int asked = first.requests().get();
-        second.source().openRange(tail, 0, 16).close();
-        assertThat(first.requests().get()).isEqualTo(asked);
-
-        // after the backoff: a range whose tail does not match the manifest footer is rejected too
-        skew.addAndGet(PeerReplicaSource.SUSPECT_FOR.toNanos() + 1);
-        flip(firstLucene.resolve(tail.name()), tail.length() - 1);
         byte[] real = Files.readAllBytes(w.backend.peerStore().store().pathOf(tail.key()));
-        byte[] got;
         try (var in = second.source().openRange(tail, tail.length() - 32, 32)) {
-            got = in.readAllBytes();
+            assertThat(in.readAllBytes()).isEqualTo(java.util.Arrays.copyOfRange(real, real.length - 32, real.length));
         }
-        assertThat(first.requests().get()).as("the peer was asked again").isGreaterThan(asked);
-        assertThat(got).isEqualTo(java.util.Arrays.copyOfRange(real, real.length - 32, real.length));
-        assertThat(stat(second, "rejected")).isEqualTo(2);
-        // a range that does not cover the footer is checked for its exact length only, and served by the peer
-        skew.addAndGet(PeerReplicaSource.SUSPECT_FOR.toNanos() + 1);
-        long ranges = stat(second, "rangesFromPeers");
-        try (var in = second.source().openRange(tail, 0, 64)) {
-            assertThat(in.readAllBytes()).isEqualTo(java.util.Arrays.copyOf(real, 64));
-        }
-        assertThat(stat(second, "rangesFromPeers")).isEqualTo(ranges + 1);
+        Path range = tmp.resolve("range");
+        second.source().downloadRange(tail, 0, 64, range);
+        assertThat(Files.readAllBytes(range)).isEqualTo(java.util.Arrays.copyOf(real, 64));
+        assertThat(first.requests().get()).as("no range request to the peer").isEqualTo(asked);
+        assertThat(first.rangeRequests().get()).isZero();
+
+        // whole files from it are checked again after the backoff: a correct one is taken
+        long fromPeers = stat(second, "filesFromPeers");
+        Path whole = tmp.resolve("whole");
+        second.source().download(tail, whole);
+        assertThat(Files.readAllBytes(whole)).isEqualTo(real);
+        assertThat(stat(second, "filesFromPeers")).isEqualTo(fromPeers + 1);
+        assertThat(first.requests().get()).isEqualTo(asked + 1);
     }
 
     private static void flip(Path file, long at) throws IOException {
@@ -1123,9 +1125,8 @@ class PeerPullTest {
         assertThat(ok.statusCode()).isEqualTo(200);
         assertThat(ok.body()).isEqualTo(real);
         var range = get(url, TOKEN, "bytes=1-10");
-        assertThat(range.statusCode()).isEqualTo(206);
-        assertThat(range.headers().firstValue("Content-Range")).hasValue("bytes 1-10/" + real.length);
-        assertThat(range.body()).isEqualTo(java.util.Arrays.copyOfRange(real, 1, 11));
+        assertThat(range.statusCode()).as("whole files only").isEqualTo(416);
+        assertThat(range.headers().firstValue("Content-Range")).hasValue("bytes */" + real.length);
 
         // keys: data dirs of this shard only, no traversal; files not held are 404
         assertThat(get(first.url() + "/replication/" + JAVA + "/files/shards/" + JAVA + "/lucene/..%2F..%2Fmanifest.json",
@@ -1214,8 +1215,42 @@ class PeerPullTest {
         assertThat(whole.statusCode()).isEqualTo(200);
         assertThat(whole.body()).as("served from the cached blocks").isEqualTo(real);
         var range = get(fileUrl(lazy.url(), f.key()), TOKEN, "bytes=" + (real.length - 20) + "-");
-        assertThat(range.statusCode()).isEqualTo(206);
-        assertThat(range.body()).isEqualTo(java.util.Arrays.copyOfRange(real, real.length - 20, real.length));
+        assertThat(range.statusCode()).as("whole files only").isEqualTo(416);
+    }
+
+    /** P5-R10: a lazy reader's cold block (and its heads) come from the writer even with a live peer holding the file. */
+    @Test
+    void lazyColdBlockReadGoesToTheWriterEvenWithAPeer() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long gen = w.publishWithoutCompoundFiles();
+        PeerReader full = peerReader("full", "seeds:" + w.url(), false, c -> { });
+        assertThat(full.files().generationsHeld()).containsEntry(JAVA, gen);
+        assertThat(heartbeat(w, "full", full.url(), Map.of(JAVA, gen))).isEqualTo(204);
+        assertThat(listedPeers(w)).containsExactly(full.url());
+
+        Reader lazyReader = reader("lazy", "seeds:" + w.url(), PeerPullTest::lazy);
+        lazyReader.runtime().startServing(); // heads and prefetches are ranges: from the writer
+        assertThat(lazyReader.runtime().served()).containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(full.rangeRequests().get()).as("no head or prefetch range asked of the peer").isZero();
+        int asked = full.requests().get();
+        ManifestFile big = luceneFiles(w, gen).stream()
+                .filter(f -> !Files.exists(lazyReader.genDir(gen).resolve("lucene").resolve(f.name())))
+                .max(Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+        byte[] real = Files.readAllBytes(w.backend.peerStore().store().pathOf(big.key()));
+        long writerBefore = w.endpoint.transfersServed();
+        try (var in = lazyReader.source().openRange(big, 0, big.length())) { // what the block cache fetches with
+            assertThat(in.readAllBytes()).isEqualTo(real);
+        }
+        assertThat(w.endpoint.transfersServed()).isEqualTo(writerBefore + 1);
+        assertThat(full.requests().get()).as("the peer is never asked for a range").isEqualTo(asked);
+        assertThat(full.rangeRequests().get()).isZero();
+        assertThat(ids(lazyReader.engine(), JAVA, "Calculator")).isNotEmpty();
+
+        // and with the writer down, a cold range fails clearly: the peer is no fallback for ranges (the spec)
+        w.stop();
+        assertThatThrownBy(() -> lazyReader.source().openRange(big, 0, big.length()))
+                .isInstanceOf(PeerHttp.WriterUnreachableException.class);
+        assertThat(full.requests().get()).isEqualTo(asked);
     }
 
     @Test

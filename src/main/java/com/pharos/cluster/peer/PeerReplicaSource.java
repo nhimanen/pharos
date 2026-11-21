@@ -150,7 +150,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
 
     @Override
     public void download(ManifestFile file, Path target) throws IOException {
-        if (fromPeersToFile(file, -1, -1, target)) return;
+        if (fromPeers(file, target)) return;
         try (InputStream in = open(file, -1, -1)) {
             write(in, target, -1, file.key());
         }
@@ -164,7 +164,8 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             write(InputStream.nullInputStream(), target, 0, file.key());
             return;
         }
-        if (fromPeersToFile(file, offset, length, target)) return;
+        // ranges (lazy blocks and heads) always come from the writer: a peer's range cannot be
+        // checked end to end against the manifest (P5-R10)
         try (InputStream in = open(file, offset, length)) {
             write(in, target, length, file.key());
         }
@@ -175,10 +176,6 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     public InputStream openRange(ManifestFile file, long offset, long length) throws IOException {
         com.pharos.cluster.objectstore.ObjectStore.checkRange(offset, length);
         if (length == 0) return InputStream.nullInputStream();
-        if (length <= MAX_PEER_BUFFER) {
-            Optional<byte[]> fromPeer = fromPeersToMemory(file, offset, length);
-            if (fromPeer.isPresent()) return new java.io.ByteArrayInputStream(fromPeer.get());
-        }
         fromWriter.incrementAndGet();
         return open(file, offset, length);
     }
@@ -191,8 +188,6 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     static final Duration SUSPECT_FOR = Duration.ofMinutes(2);
     /** Headers of a peer's answer must arrive within this; a slow peer must not slow a cold read much. */
     static final Duration PEER_TIMEOUT = Duration.ofSeconds(10);
-    /** {@link #openRange} buffers a peer's range to verify it before handing it out; longer ranges use the writer. */
-    static final long MAX_PEER_BUFFER = 16L << 20;
 
     /** The peer readers the writer's last {@code latest} listed for a shard, holding {@code generation} in full. */
     private record Holders(long generation, List<URI> peers) {}
@@ -201,7 +196,6 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     /** Peer URL → until when (this source's clock) it is skipped. */
     private final Map<URI, Long> suspects = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong filesFromPeers = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong rangesFromPeers = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong fromWriter = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong peerRejects = new java.util.concurrent.atomic.AtomicLong();
     /** This reader's own advertised base URL (never fetched from); null when it advertises none. */
@@ -239,14 +233,13 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     }
 
     /**
-     * Counters of peer fetching for {@code /health}: files and ranges served by peers, transfers that
+     * Counters of peer fetching for {@code /health}: whole files served by peers, transfers that
      * went to the writer, peer transfers rejected (bytes not matching the manifest, or a failure),
      * and the peers currently suspect.
      */
     public Map<String, Object> peerFetchStats() {
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("filesFromPeers", filesFromPeers.get());
-        out.put("rangesFromPeers", rangesFromPeers.get());
         out.put("fromWriter", fromWriter.get());
         out.put("rejected", peerRejects.get());
         long now = clock.getAsLong();
@@ -301,13 +294,9 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     }
 
     /** True when the bytes of {@code f} can be checked against the manifest (else only the writer is used). */
-    private static boolean verifiable(ManifestFile f, boolean ranged) {
-        if (ManifestFile.LUCENE.equals(f.role())) {
-            return com.pharos.cluster.warm.CachingRemoteIndexInput.manifestFooter(f) != null;
-        }
-        if (ranged) return false; // only Lucene files carry a footer a range can be checked against
+    private static boolean verifiable(ManifestFile f) {
         try {
-            GenerationFiles.parseChecksum(f);
+            PeerCheck.of(f);
             return true;
         } catch (IOException e) {
             return false;
@@ -315,11 +304,12 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     }
 
     /**
-     * Tries the listed peers for {@code f} (whole when {@code length} &lt; 0) into {@code target}:
-     * true once one peer's bytes were verified and moved into place.
+     * Tries the listed peers for the whole of {@code f} into {@code target}: true once one peer's bytes
+     * matched the manifest (length and checksum) and were moved into place. Peers serve whole files
+     * only (P5-R10).
      */
-    private boolean fromPeersToFile(ManifestFile f, long offset, long length, Path target) throws IOException {
-        if (!verifiable(f, length >= 0)) return false;
+    private boolean fromPeers(ManifestFile f, Path target) throws IOException {
+        if (!verifiable(f)) return false;
         List<URI> peers = peersFor(shardOf(f.key()));
         if (peers.isEmpty()) return false;
         Path dir = target.toAbsolutePath().getParent();
@@ -329,7 +319,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             try {
                 boolean ok;
                 try (OutputStream out = Files.newOutputStream(tmp)) {
-                    ok = fromPeer(peer, f, offset, length, out);
+                    ok = fromPeer(peer, f, out);
                 }
                 if (ok) {
                     try {
@@ -346,34 +336,19 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
         return false;
     }
 
-    /** {@link #fromPeersToFile} for a range kept in memory ({@link #openRange}). */
-    private Optional<byte[]> fromPeersToMemory(ManifestFile f, long offset, long length) throws IOException {
-        if (!verifiable(f, true)) return Optional.empty();
-        for (URI peer : peersFor(shardOf(f.key()))) {
-            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream((int) length);
-            if (fromPeer(peer, f, offset, length, out)) return Optional.of(out.toByteArray());
-        }
-        return Optional.empty();
-    }
-
     /**
-     * One peer transfer of {@code f} ({@code length} &lt; 0: the whole file) into {@code out}, checked
-     * against the manifest as it streams ({@link PeerCheck}): true when it was. A peer that does not
-     * hold the file (404, 410) or is busy (503) is just passed over; any other failure, and bytes that
-     * do not match, mark it suspect for {@link #SUSPECT_FOR}. Never throws for the peer's sake: the
-     * writer is the fallback.
+     * One peer transfer of the whole of {@code f} into {@code out}, checked against the manifest as it
+     * streams ({@link PeerCheck}): true when it matched. A peer that does not hold the file (404, 410)
+     * or is busy (503) is just passed over; any other failure, and bytes that do not match, mark it
+     * suspect for {@link #SUSPECT_FOR}. Never throws for the peer's sake: the writer is the fallback.
      */
-    private boolean fromPeer(URI peer, ManifestFile f, long offset, long length, OutputStream out)
-            throws IOException {
-        boolean whole = length < 0;
-        long off = whole ? 0 : offset;
-        long len = whole ? f.length() : length;
+    private boolean fromPeer(URI peer, ManifestFile f, OutputStream out) throws IOException {
+        PeerCheck check = PeerCheck.of(f);
         ShardId shard = shardOf(f.key());
-        HttpRequest.Builder req = http.request(peer, filePath(shard, f.key()), PEER_TIMEOUT);
-        if (!whole) req.header("Range", "bytes=" + off + "-" + (off + len - 1));
+        HttpRequest req = http.request(peer, filePath(shard, f.key()), PEER_TIMEOUT).build();
         HttpResponse<InputStream> r;
         try {
-            r = http.sendOnce(req.build(), HttpResponse.BodyHandlers.ofInputStream());
+            r = http.sendOnce(req, HttpResponse.BodyHandlers.ofInputStream());
         } catch (java.io.InterruptedIOException e) {
             throw e;
         } catch (IOException e) {
@@ -386,25 +361,9 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             log.debug("peer {} did not serve {}: {}", peer, f.key(), status);
             return false;
         }
-        if (status != (whole ? 200 : 206)) {
+        if (status != 200) {
             PeerHttp.discard(r);
             suspect(peer, f, "answered " + status);
-            return false;
-        }
-        if (!whole) {
-            String want = "bytes " + off + "-" + (off + len - 1) + "/" + f.length();
-            String cr = r.headers().firstValue("Content-Range").orElse("");
-            if (!cr.equals(want)) {
-                PeerHttp.discard(r);
-                suspect(peer, f, "answered Content-Range '" + cr + "' for '" + want + "'");
-                return false;
-            }
-        }
-        PeerCheck check;
-        try {
-            check = PeerCheck.of(f, off, len, whole);
-        } catch (IOException unverifiable) {
-            PeerHttp.discard(r);
             return false;
         }
         String mismatch;
@@ -412,7 +371,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             byte[] buf = new byte[64 * 1024];
             int n;
             while ((n = in.read(buf)) >= 0) {
-                if (!check.update(buf, 0, n)) break; // more bytes than asked for: stop reading
+                if (!check.update(buf, 0, n)) break; // more bytes than the file has: stop reading
                 out.write(buf, 0, n);
             }
             mismatch = check.finish();
@@ -427,7 +386,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             suspect(peer, f, mismatch);
             return false;
         }
-        (whole ? filesFromPeers : rangesFromPeers).incrementAndGet();
+        filesFromPeers.incrementAndGet();
         return true;
     }
 
@@ -438,17 +397,15 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     }
 
     /**
-     * Checks the bytes of a peer transfer against the manifest as they stream past (Review Focus 2):
-     * the exact length always; a whole file's checksum (Lucene: the CRC32 of everything before the
-     * stored checksum, which is what its footer records, plus the footer itself; graph and refs: the
-     * CRC32 of the file); and any bytes of a Lucene file's last 16 that a range covers against the
-     * footer built from the manifest checksum (the Phase 2 footer check).
+     * Checks a whole file from a peer against the manifest as it streams past (Review Focus 2): the
+     * exact length, and the checksum. Lucene: the CRC32 of everything before the stored checksum (what
+     * its footer records) must be the manifest's, and the last 16 bytes must be the footer built from
+     * it. Graph and refs: the CRC32 of the whole file.
      */
     static final class PeerCheck {
         private final ManifestFile f;
-        private final long offset;
         private final long length;
-        /** CRC over [0, crcEnd) of the file; -1 for a range. */
+        /** CRC over [0, crcEnd) of the file. */
         private final long crcEnd;
         private final long expectedCrc;
         private final byte[] footer;
@@ -457,34 +414,31 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
         private long seen;
         private String mismatch;
 
-        private PeerCheck(ManifestFile f, long offset, long length, long crcEnd, long expectedCrc, byte[] footer) {
+        private PeerCheck(ManifestFile f, long crcEnd, long expectedCrc, byte[] footer) {
             this.f = f;
-            this.offset = offset;
-            this.length = length;
+            this.length = f.length();
             this.crcEnd = crcEnd;
             this.expectedCrc = expectedCrc;
             this.footer = footer;
             this.footerStart = footer == null ? Long.MAX_VALUE : f.length() - footer.length;
         }
 
-        /** @throws IOException when the manifest gives nothing to check these bytes against */
-        static PeerCheck of(ManifestFile f, long offset, long length, boolean whole) throws IOException {
+        /** @throws IOException when the manifest gives nothing to check the file against */
+        static PeerCheck of(ManifestFile f) throws IOException {
             long expected = GenerationFiles.parseChecksum(f);
             boolean lucene = ManifestFile.LUCENE.equals(f.role());
             byte[] footer = lucene ? com.pharos.cluster.warm.CachingRemoteIndexInput.manifestFooter(f) : null;
             if (lucene && footer == null) throw new IOException("no footer for " + f.key());
-            if (!lucene && !whole) throw new IOException("a range of " + f.key() + " cannot be checked");
-            long crcEnd = !whole ? -1 : lucene ? f.length() - Long.BYTES : f.length();
-            return new PeerCheck(f, offset, length, crcEnd, expected, footer);
+            return new PeerCheck(f, lucene ? f.length() - Long.BYTES : f.length(), expected, footer);
         }
 
-        /** Feeds the next bytes; false (and a mismatch) when they run past the expected length. */
+        /** Feeds the next bytes; false (and a mismatch) when they run past the file's length. */
         boolean update(byte[] b, int off, int n) {
             if (seen + n > length) {
-                mismatch = "more than the " + length + " bytes asked for";
+                mismatch = "more than the manifest's " + length + " bytes";
                 return false;
             }
-            long abs = offset + seen;
+            long abs = seen;
             if (crcEnd > abs) crc.update(b, off, (int) Math.min(n, crcEnd - abs));
             if (footer != null && mismatch == null) {
                 long from = Math.max(abs, footerStart);
@@ -505,7 +459,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
         String finish() {
             if (mismatch != null) return mismatch;
             if (seen != length) return seen + " bytes, " + length + " expected";
-            if (crcEnd >= 0 && crc.getValue() != expectedCrc) {
+            if (crc.getValue() != expectedCrc) {
                 return "CRC32 " + Long.toHexString(crc.getValue()) + ", the manifest says " + f.checksum();
             }
             return null;

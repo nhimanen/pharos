@@ -36,8 +36,8 @@ import java.util.regex.Pattern;
 /**
  * A peer-mode reader serving the files of the generations it holds in full to other readers
  * (Phase 5 Task 3), so a cold read need not reach the writer:
- * {@code GET /replication/<shard>/files/<key>} with the writer's semantics (one {@code Range}, 206 and
- * {@code Content-Range}, 416), the same key rules ({@link ReplicationEndpoint#validFileKey}: no
+ * {@code GET /replication/<shard>/files/<key>}, whole files only (P5-R10: a {@code Range} request gets
+ * 416, since a peer's range could not be checked end to end against the manifest), with the same key rules ({@link ReplicationEndpoint#validFileKey}: no
  * traversal, data dirs only) and the cluster token on every request.
  *
  * <p><b>What is served.</b> Only files of the shard's <em>active</em> generation, and only while that
@@ -231,6 +231,10 @@ public final class PeerFileSource {
         Optional<Held> held = dir.flatMap(this::held);
         ManifestFile f = held.filter(Held::full).map(h -> h.files().get(key)).orElse(null);
         if (f == null) throw new Refused(404, "this reader does not hold " + key + " in full");
+        if (ctx.header("Range") != null) { // whole files only (P5-R10): a range could not be verified end to end
+            ctx.header("Content-Range", "bytes */" + f.length());
+            throw new Refused(416, "peer readers serve whole files only; fetch ranges from the writer");
+        }
         Optional<TransferLimiter.Permit> permit = transfers.tryAcquire();
         if (permit.isEmpty()) {
             ctx.header("Retry-After", Integer.toString(ReplicationEndpoint.RETRY_AFTER_SECONDS));
@@ -248,14 +252,14 @@ public final class PeerFileSource {
                 try (ch) {
                     if (ch.size() != f.length()) throw new Refused(404, "this reader does not hold " + key + " in full");
                     served.incrementAndGet();
-                    ReplicationEndpoint.serve(ctx, f.length(), ch::read, ctx.header("Range"), slot);
+                    ReplicationEndpoint.serve(ctx, f.length(), ch::read, null, slot);
                 }
                 return;
             }
             BlockCache bc = held.get().lazy() ? blockCache() : null;
             if (bc == null || !allBlocksCached(f)) throw new Refused(404, "this reader does not hold " + key + " in full");
             served.incrementAndGet();
-            ReplicationEndpoint.serve(ctx, f.length(), new CachedBlocks(bc, f), ctx.header("Range"), slot);
+            ReplicationEndpoint.serve(ctx, f.length(), new CachedBlocks(bc, f), null, slot);
         }
     }
 
