@@ -240,6 +240,9 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
                 for (ShardId shard : want) {
                     Optional<PeerCatalog.WriterRef> w = catalog.owner(shard);
                     Poll p = polls.get(shard);
+                    // a writer whose lineage restarted below what was reported (store wiped): forget it
+                    long listed = catalog.listedLatest(shard).orElse(Long.MAX_VALUE);
+                    if (listed < reported.getOrDefault(shard, 0L)) reported.remove(shard);
                     long after = Math.max(Optional.ofNullable(served.get(shard)).map(Generation::value).orElse(0L),
                             reported.getOrDefault(shard, 0L));
                     if (p != null && (w.isEmpty() || !p.node().equals(w.get().node()) || p.after() != after)) {
