@@ -54,6 +54,8 @@ public class WebServer {
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
     private volatile java.util.function.Supplier<Map<String, Object>> writerDisk = () -> null;
+    /** A peer-pull reader's writers, conflicts and unavailable shards; null result: omitted. */
+    private volatile java.util.function.Supplier<Map<String, Object>> peers = () -> null;
     private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
     private volatile java.util.function.BooleanSupplier draining = () -> false;
     /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
@@ -83,6 +85,15 @@ public class WebServer {
      */
     public void setTls(Tls tls) {
         this.tls = java.util.Objects.requireNonNull(tls, "tls");
+    }
+
+    /**
+     * A peer-pull reader's writer view reported by {@code /health} as {@code peers} (writers,
+     * {@code shard X claimed by A and B} conflicts, unavailable shards). Informational: it changes
+     * neither the status nor readiness.
+     */
+    public void setPeers(java.util.function.Supplier<Map<String, Object>> peers) {
+        this.peers = java.util.Objects.requireNonNull(peers, "peers");
     }
 
     /** Mounts {@code /replication/*} (a peer-mode writer). */
@@ -307,6 +318,8 @@ public class WebServer {
         if (cache != null) out.put("readerCache", cache);
         Map<String, Object> disk = writerDisk.get();
         if (disk != null) out.put("writerDisk", disk);
+        Map<String, Object> peerView = peers.get();
+        if (peerView != null) out.put("peers", peerView);
         return new HealthAnswer(ready ? 200 : 503, out);
     }
 

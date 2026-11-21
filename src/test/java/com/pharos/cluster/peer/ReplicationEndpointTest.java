@@ -650,12 +650,61 @@ class ReplicationEndpointTest {
     }
 
     @Test
-    void peerBackendRefusesReaders() {
+    void peerBackendReaderNeedsDiscovery() {
         IndexConfig c = writerConfig(3, 60);
         c.getCluster().setRole(NodeRole.READER);
         c.getCluster().setAdvertiseUrl("http://reader-1:7171");
+        c.getCluster().setCacheDir(tmp.resolve("reader-cache"));
         assertThatThrownBy(() -> new PeerBackend(c)).isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("peer-pull");
+                .hasMessageContaining("cluster.peers.discovery");
+        c.getCluster().getPeers().setDiscovery("seeds:http://localhost:1");
+        PeerBackend reader = new PeerBackend(c);
+        try {
+            assertThat(reader.isReader()).isTrue();
+            assertThat(reader.catalog()).isInstanceOf(PeerCatalog.class);
+            assertThat(reader.source()).isInstanceOf(PeerReplicaSource.class);
+            assertThat(reader.localCache()).isInstanceOf(com.pharos.cluster.ReaderLocalCache.class);
+            assertThatThrownBy(reader::peerStore).hasMessageContaining("reader");
+        } finally {
+            reader.close();
+        }
+    }
+
+    @Test
+    void peersListsTheAdvertiseUrlAndSeeds() throws Exception {
+        config.getCluster().setAdvertiseUrl("http://writer-a.example:7070/");
+        config.getCluster().getPeers().setDiscovery("seeds:http://writer-b:7070,https://writer-c");
+        open(config);
+        Javalin app = serve();
+        HttpResponse<byte[]> r = get(app, "/peers");
+        assertThat(r.statusCode()).isEqualTo(200);
+        assertThat(json(r).get("writer").asText()).isEqualTo("writer-a");
+        assertThat(json(r).get("peers")).extracting(JsonNode::asText)
+                .containsExactly("http://writer-a.example:7070", "http://writer-b:7070", "https://writer-c");
+        assertThat(send(get(base(app) + "/peers", null)).statusCode()).isEqualTo(401);
+    }
+
+    /** Task 1 carry: the writer's shutdown step lets an in-flight range finish and refuses new ones. */
+    @Test
+    void drainFinishesInFlightTransfersAndRefusesNewOnes() throws Exception {
+        open(config);
+        indexFull();
+        Javalin app = serve();
+        JsonNode file = largestLucene(manifest(app, 1));
+        TransferLimiter.Permit held = endpoint.transfers().tryAcquire().orElseThrow(); // an in-flight transfer
+        CompletableFuture<Integer> drained = CompletableFuture.supplyAsync(() -> endpoint.drain(Duration.ofSeconds(20)));
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!endpoint.draining() && System.nanoTime() < deadline) Thread.sleep(10);
+        HttpResponse<byte[]> refused = get(app, fileUrl(file.get("key").asText()));
+        assertThat(refused.statusCode()).isEqualTo(503);
+        assertThat(refused.headers().firstValue("Retry-After")).contains("2");
+        assertThat(get(app, "/catalog").statusCode()).isEqualTo(503);
+        assertThat(send(get(base(app) + "/catalog", null)).statusCode()).as("the token still comes first").isEqualTo(401);
+        Thread.sleep(300);
+        assertThat(drained).as("waits for the in-flight transfer").isNotDone();
+        held.close();
+        assertThat(drained.get(10, TimeUnit.SECONDS)).isZero();
+        assertThat(endpoint.drain(Duration.ZERO)).as("idempotent").isZero();
     }
 
     @Test

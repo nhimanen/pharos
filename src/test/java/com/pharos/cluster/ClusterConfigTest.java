@@ -467,7 +467,8 @@ class ClusterConfigTest {
                 "\"role\":\"writer\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},",
                 "\"role\":\"reader\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
                         + "\"advertiseUrl\":\"http://r:1\",\"token\":\"t\",",
-                "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\","}) {
+                "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\","
+                        + "\"peers\":{\"discovery\":\"dns:w\"},"}) {
             assertThatThrownBy(() -> parse("{\"cluster\":{" + other + keystore + "}}")).as(other)
                     .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.tls is not supported")
                     .hasMessageContaining("only peer-pull writers");
@@ -475,5 +476,32 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"tls\":{\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
                 .hasMessageContaining("cluster.tls is not supported");
         assertThat(parse("{\"cluster\":{\"tls\":{}}}").tlsServer()).as("an empty section configures nothing").isFalse();
+    }
+
+    /** Phase 5 Task 2: a peer-pull reader needs discovery and may hold a truststore (P5-R7 carry). */
+    @Test
+    void peerReaderNeedsDiscoveryAndMayHoldATruststore() throws Exception {
+        String peerReader = "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\",";
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader.substring(0, peerReader.length() - 1) + "}}"))
+                .hasMessageContaining("cluster.peers.discovery is required");
+        ClusterConfig dns = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:writers.ns.svc:7070\"}}}");
+        assertThat(dns.getPeers().getDiscovery()).isEqualTo("dns:writers.ns.svc:7070");
+        parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"seeds:http://w1:7070,https://w2\"}}}");
+        for (String bad : new String[]{"dns:", "dns:bad_name", "dns:w:0", "dns:w:x", "seeds:", "seeds:ftp://w",
+                "seeds:http://u:p@w", "w1:7070"}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"" + bad + "\"}}}"))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.peers.discovery");
+        }
+        String trust = "\"tls\":{\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}";
+        ClusterConfig reader = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:w\"}," + trust + "}}");
+        assertThat(reader.getTls().getTruststore()).hasToString("/t.p12");
+        assertThat(reader.tlsServer()).as("a reader never listens with TLS").isFalse();
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:w\"},"
+                + "\"tls\":{\"keystore\":\"/k.p12\",\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
+                .hasMessageContaining("cluster.tls is not supported").hasMessageContaining("cluster.tls.keystore");
+        // object-store readers and coordinators are unchanged: no truststore there yet
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:1\",\"token\":\"t\"," + trust + "}}"))
+                .hasMessageContaining("cluster.tls is not supported");
     }
 }

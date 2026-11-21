@@ -124,6 +124,10 @@ public final class ClusterRuntime implements Closeable {
         } else {
             lazy = null;
         }
+        if (isReader() && backend instanceof com.pharos.cluster.peer.PeerBackend peer) {
+            // shards held on disk stay listed until a live writer releases them (a writer down at start)
+            peer.peerCatalog().ifPresent(c -> c.setHeld(this::registeredShards));
+        }
         if (isReader() && backend.localCache() instanceof ReaderLocalCache) {
             try {
                 activateRegistered();
@@ -150,6 +154,74 @@ public final class ClusterRuntime implements Closeable {
      */
     public static void applySourceReadPolicy(IndexConfig config) {
         SourceReader.setEnabled(config.getCluster().getRole() != NodeRole.READER);
+    }
+
+    /** The valid shard ids of the reader registry. */
+    private java.util.Set<ShardId> registeredShards() {
+        java.util.Set<ShardId> out = new java.util.HashSet<>();
+        for (ProjectMeta m : registry.listAll()) {
+            try {
+                if (m.getName() != null) out.add(new ShardId(m.getName()));
+            } catch (IllegalArgumentException notAShard) {
+                // not served by a reader
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A peer-pull reader's view of its writers for {@code /health} ({@code peers}); null on every
+     * other node. Fields: {@code discovery}; {@code writers} ({@code node, url, live, missedRefreshes,
+     * shards}, and {@code error} while missing); {@code conflicts} ({@code shard X claimed by A and B …}
+     * and conflicting synonyms sections); {@code unavailable} ({@code shard, reason}) for listed shards
+     * this reader does not serve; {@code error} when no writer answered the last refresh.
+     */
+    public Map<String, Object> peerStatus() {
+        if (!isReader() || !(backend instanceof com.pharos.cluster.peer.PeerBackend peer)) return null;
+        com.pharos.cluster.peer.PeerCatalog cat = peer.peerCatalog().orElse(null);
+        if (cat == null) return null;
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("discovery", cat.discovery().spec().text());
+        List<Map<String, Object>> writers = new ArrayList<>();
+        for (var w : cat.writers()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("node", w.node());
+            m.put("url", w.url());
+            m.put("live", w.live());
+            m.put("missedRefreshes", w.missedRefreshes());
+            m.put("shards", w.shards());
+            if (w.error() != null) m.put("error", w.error());
+            writers.add(m);
+        }
+        out.put("writers", writers);
+        List<String> conflicts = new ArrayList<>(cat.conflicts());
+        peer.peerSource().ifPresent(src -> conflicts.addAll(src.synonymsConflicts()));
+        out.put("conflicts", conflicts);
+        List<Map<String, Object>> unavailable = new ArrayList<>();
+        List<String> pin = config.getCluster().getReader().getShards();
+        for (ShardId shard : cat.knownShards()) {
+            if (!pin.isEmpty() && !pin.contains(shard.value())) continue;
+            if (servesShard(shard.value())) continue;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("shard", shard.value());
+            m.put("reason", unavailableReason(cat, shard));
+            unavailable.add(m);
+        }
+        out.put("unavailable", unavailable);
+        String error = cat.lastError();
+        if (error != null) out.put("error", "no writer answered the last refresh: " + error);
+        return out;
+    }
+
+    private static String unavailableReason(com.pharos.cluster.peer.PeerCatalog cat, ShardId shard) {
+        var owner = cat.owner(shard);
+        if (owner.isEmpty()) {
+            return "shard " + shard + " is unavailable on this reader: never synced, and no live writer lists it";
+        }
+        String why = cat.ownerLive(shard) ? "not synced yet (or its last sync failed)"
+                : "its writer is unreachable" + cat.writers().stream().filter(w -> w.node().equals(owner.get().node()))
+                        .map(w -> w.error() == null ? "" : ": " + w.error()).findFirst().orElse("");
+        return "shard " + shard + " is unavailable on this reader: never synced from writer " + owner.get() + "; " + why;
     }
 
     /** Lazy mode's directory factory and block cache; null unless this is a reader (a full-mode reader reports mode {@code full} and zeros). */
@@ -632,6 +704,28 @@ public final class ClusterRuntime implements Closeable {
         return Optional.of(replication);
     }
 
+    /** Removes the writer's replication drain step; guarded by this. */
+    private AutoCloseable replicationDrainStep;
+
+    /**
+     * Registers the shutdown step of a peer-mode writer serving {@code /replication/*}: on a signal it
+     * refuses new transfers, wakes the long-polls and lets in-flight ranges finish within
+     * {@code cluster.drainSeconds} ({@link com.pharos.cluster.peer.ReplicationEndpoint#drain}), before
+     * model calls stop. No-op on other nodes; idempotent.
+     */
+    public void registerReplicationDrain() {
+        Optional<com.pharos.cluster.peer.ReplicationEndpoint> e = replicationEndpoint();
+        if (e.isEmpty()) return;
+        synchronized (this) {
+            if (closed || replicationDrainStep != null) return;
+        }
+        Duration max = Duration.ofSeconds(config.getCluster().getDrainSeconds());
+        AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("replication drain", () -> e.get().drain(max));
+        synchronized (this) {
+            replicationDrainStep = step;
+        }
+    }
+
     /** {@code cluster.tls} when it configures a server keystore; empty otherwise. */
     public Optional<ClusterConfig.TlsConfig> serverTls() {
         ClusterConfig c = config.getCluster();
@@ -919,9 +1013,15 @@ public final class ClusterRuntime implements Closeable {
         try {
             s.syncOnce();
         } catch (Exception e) {
-            log.warn("Replica sync from bucket '{}' failed (retrying every {} s): {}",
-                    config.getCluster().getObjectStore().getBucket(),
-                    config.getCluster().getPollIntervalSeconds(), e.toString());
+            ClusterConfig c = config.getCluster();
+            if (c.getBackend() == BackendKind.PEER_PULL) {
+                log.warn("Replica sync from the peer writers ({}) failed (retrying every {} s, long-polling meanwhile);"
+                        + " serving the generations on disk: {}", c.getPeers().getDiscovery(),
+                        c.getPeers().getRefreshSeconds(), e.toString());
+            } else {
+                log.warn("Replica sync from bucket '{}' failed (retrying every {} s): {}",
+                        c.getObjectStore().getBucket(), c.getPollIntervalSeconds(), e.toString());
+            }
         } finally {
             Map<ShardId, Generation> served = s.served();
             warm(served.keySet().stream().map(ShardId::value).toList());
@@ -1147,9 +1247,19 @@ public final class ClusterRuntime implements Closeable {
             }
         }
         AutoCloseable writerStep;
+        AutoCloseable replicationStep;
         synchronized (this) {
             writerStep = writerStopStep;
             writerStopStep = null;
+            replicationStep = replicationDrainStep;
+            replicationDrainStep = null;
+        }
+        if (replicationStep != null) {
+            try {
+                replicationStep.close();
+            } catch (Exception e) {
+                // removing from a list: cannot fail
+            }
         }
         if (writerStep != null) {
             try {

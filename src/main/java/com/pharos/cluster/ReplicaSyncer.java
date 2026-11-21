@@ -128,6 +128,12 @@ public class ReplicaSyncer implements Closeable {
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
     private ScheduledExecutorService scheduler;
+    /** Long-poll mode: the thread waiting on {@link #longPoll} between passes; null otherwise. */
+    private Thread longPollThread;
+    /** The source's long-poll, when it has one (peer-pull): replaces the {@code pollInterval} loop. */
+    private final LongPollingSource longPoll;
+    /** The shards the last pass wanted (catalog, pinned): what the long-poll waits on. */
+    private volatile List<ShardId> wanted = List.of();
     private volatile boolean closed;
 
     /**
@@ -148,6 +154,7 @@ public class ReplicaSyncer implements Closeable {
         this.lazy = lazy;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.source = Objects.requireNonNull(source, "source");
+        this.longPoll = source instanceof LongPollingSource l ? l : null;
         this.cache = Objects.requireNonNull(cache, "cache");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir");
@@ -197,6 +204,7 @@ public class ReplicaSyncer implements Closeable {
             boolean catalogEmpty = shards.isEmpty();
             Set<ShardId> pin = pinned;
             if (!pin.isEmpty()) shards = shards.stream().filter(pin::contains).toList();
+            wanted = List.copyOf(shards);
             if (catalogEmpty && !served.isEmpty()) {
                 // an empty read may be transient (a catalog object being rewritten): drop nothing
                 log.warn("The shard catalog lists no shard; keeping the {} served shard(s)",
@@ -229,11 +237,24 @@ public class ReplicaSyncer implements Closeable {
         start(Duration.ZERO);
     }
 
-    /** Runs {@link #syncOnce} after {@code initialDelay}, then every {@code pollInterval}. */
+    /**
+     * Runs {@link #syncOnce} after {@code initialDelay}, then every {@code pollInterval}. With a
+     * {@link LongPollingSource} (peer-pull) the passes are driven by its long-polls instead: a pass
+     * runs as soon as a wanted shard's writer reports a newer generation, and at least once per the
+     * source's refresh interval; {@code initialDelay} is then replaced by the first wait (a zero
+     * delay runs a pass first).
+     */
     public void start(Duration initialDelay) {
         synchronized (lifecycleLock) {
             if (closed) throw new IllegalStateException("syncer is closed");
-            if (scheduler != null) return;
+            if (scheduler != null || longPollThread != null) return;
+            if (longPoll != null) {
+                boolean passFirst = initialDelay.isZero() || initialDelay.isNegative();
+                longPollThread = new Thread(() -> longPollLoop(passFirst), "pharos-replica-longpoll");
+                longPollThread.setDaemon(true);
+                longPollThread.start();
+                return;
+            }
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "pharos-replica-syncer");
                 t.setDaemon(true);
@@ -308,6 +329,28 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
+    /** Long-poll mode: wait for news (or the refresh interval), then a pass; until closed. */
+    private void longPollLoop(boolean passFirst) {
+        if (passFirst) syncQuietly();
+        while (!closed) {
+            try {
+                longPoll.awaitChange(wanted, served());
+            } catch (InterruptedException e) {
+                break;
+            } catch (RuntimeException e) {
+                log.warn("Waiting for new generations failed: {}", e.toString());
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            }
+            if (closed) break;
+            syncQuietly();
+        }
+        longPoll.cancelPolls();
+    }
+
     private void syncQuietly() {
         try {
             syncOnce();
@@ -319,10 +362,23 @@ public class ReplicaSyncer implements Closeable {
     @Override
     public void close() {
         ScheduledExecutorService s;
+        Thread lp;
         synchronized (lifecycleLock) {
             closed = true;
             s = scheduler;
             scheduler = null;
+            lp = longPollThread;
+            longPollThread = null;
+        }
+        if (lp != null) {
+            lp.interrupt();
+            longPoll.cancelPolls();
+            try {
+                lp.join(10_000);
+                if (lp.isAlive()) log.warn("Replica long-poll did not stop within 10 s");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         if (s == null) return;
         s.shutdownNow();

@@ -179,15 +179,23 @@ public class ClusterConfig {
         }
         if (peers == null) peers = new PeersConfig();
         peers.validate();
+        if (backend == BackendKind.PEER_PULL && role == NodeRole.READER && peers.getDiscovery() == null) {
+            throw new IllegalStateException("cluster.peers.discovery is required on a peer-pull reader"
+                    + " (dns:<name>[:port] or seeds:<url>,<url>)");
+        }
         if (tls != null) {
             tls.validate();
             // Ruling P5-R7: only a peer-pull writer's /replication/* listens with TLS for now; elsewhere the
             // clients (./pharos, coordinators, the router) have no truststore yet and would be locked out.
-            if ((tls.getKeystore() != null || tls.getTruststore() != null)
-                    && !(backend == BackendKind.PEER_PULL && role == NodeRole.WRITER)) {
+            // A peer-pull reader may hold a truststore (no keystore): its writer clients use it.
+            boolean peerWriter = backend == BackendKind.PEER_PULL && role == NodeRole.WRITER;
+            boolean peerReaderTrust = backend == BackendKind.PEER_PULL && role == NodeRole.READER
+                    && tls.getKeystore() == null;
+            if ((tls.getKeystore() != null || tls.getTruststore() != null) && !peerWriter && !peerReaderTrust) {
                 throw new IllegalStateException("cluster.tls is not supported on cluster.role '" + role.json()
-                        + "' with cluster.backend '" + backend.json() + "' yet: only peer-pull writers serve TLS"
-                        + " (remove cluster.tls)");
+                        + "' with cluster.backend '" + backend.json() + "' yet: only peer-pull writers serve TLS,"
+                        + " and peer-pull readers may only set cluster.tls.truststore (remove cluster.tls"
+                        + (backend == BackendKind.PEER_PULL && role == NodeRole.READER ? ".keystore" : "") + ")");
             }
         }
         if (role == NodeRole.WRITER && writer.isWorkQueue() && heartbeatSeconds >= writer.getLeaseTtlSeconds()) {
@@ -599,6 +607,13 @@ public class ClusterConfig {
             }
             if (storeDir == null) {
                 throw new IllegalStateException("cluster.peers.storeDir must not be empty");
+            }
+            if (discovery != null) {
+                try {
+                    com.pharos.cluster.peer.PeerDiscovery.parse(discovery);
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalStateException(e.getMessage());
+                }
             }
         }
 

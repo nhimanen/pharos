@@ -7,6 +7,8 @@ import com.pharos.cluster.LocalCache;
 import com.pharos.cluster.LocalFsCache;
 import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.NodeRole;
+import com.pharos.cluster.NoOpPublisher;
+import com.pharos.cluster.ReaderLocalCache;
 import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ReplicationBackend;
 import com.pharos.cluster.ShardCatalog;
@@ -37,23 +39,51 @@ import java.util.Optional;
  * <p>There is no takeover in peer mode, so no writer state is backed up
  * ({@link WriterStateStore#NONE}) and no lease guards the publish ({@link LeaseGuard#IMPLICIT}).
  *
- * <p>Readers pull from writers (Phase 5 Task 2); until then a reader on this backend is refused.
+ * <p><b>Readers</b> serve generations materialised under {@code cluster.cacheDir}
+ * ({@link ReaderLocalCache}) and never publish. Their catalog is a {@link PeerCatalog} over the
+ * writers {@code cluster.peers.discovery} finds, their source a {@link PeerReplicaSource}, both on
+ * one {@link PeerHttp} client (with {@code cluster.tls.truststore} when set).
  */
 public final class PeerBackend implements ReplicationBackend {
 
     private final IndexConfig config;
+    /** The writer's store; null on a reader. */
     private final PeerStore peer;
     private final LocalCache cache;
     private final IndexPublisher publisher;
+    /** Reader side; null on a writer. */
+    private final PeerHttp http;
+    private final PeerCatalog peerCatalog;
+    private final PeerReplicaSource peerSource;
 
     public PeerBackend(IndexConfig config) {
+        this(config, PeerDiscovery.SYSTEM_RESOLVER);
+    }
+
+    /** Package-private: injects the DNS resolver (tests). */
+    PeerBackend(IndexConfig config, PeerDiscovery.Resolver resolver) {
         this.config = Objects.requireNonNull(config, "config");
         ClusterConfig cfg = config.getCluster();
         cfg.validate();
-        if (cfg.getRole() != NodeRole.WRITER) {
-            throw new IllegalStateException("cluster.backend 'peer-pull' supports cluster.role 'writer' only in"
-                    + " this build: peer-pull readers are not available yet");
+        if (cfg.getRole() == NodeRole.READER) {
+            this.peer = null;
+            this.cache = new ReaderLocalCache(cfg.getCacheDir());
+            this.publisher = NoOpPublisher.INSTANCE;
+            this.http = PeerHttp.of(cfg);
+            PeerDiscovery discovery = new PeerDiscovery(PeerDiscovery.parse(cfg.getPeers().getDiscovery()),
+                    http.tls() ? "https" : "http", resolver, http);
+            this.peerCatalog = new PeerCatalog(discovery, http, Duration.ofSeconds(cfg.getPeers().getRefreshSeconds()),
+                    System::nanoTime);
+            this.peerSource = new PeerReplicaSource(peerCatalog, http,
+                    Duration.ofSeconds(cfg.getPeers().getLongPollSeconds()));
+            return;
         }
+        if (cfg.getRole() != NodeRole.WRITER) {
+            throw new IllegalStateException("cluster.backend 'peer-pull' needs cluster.role 'writer' or 'reader'");
+        }
+        this.http = null;
+        this.peerCatalog = null;
+        this.peerSource = null;
         try {
             this.peer = PeerStore.open(cfg.getPeers().getStoreDir());
         } catch (IOException e) {
@@ -103,14 +133,47 @@ public final class PeerBackend implements ReplicationBackend {
     }
 
     /** The writer's published state, served by the replication endpoint. */
-    public PeerStore peerStore() { return peer; }
+    public PeerStore peerStore() {
+        if (peer == null) throw new IllegalStateException("a peer-pull reader has no peer store");
+        return peer;
+    }
+
+    /** True on a reader (pulls from writers); false on a writer (serves its store). */
+    public boolean isReader() { return peer == null; }
+
+    /** The reader's merged writer catalog; empty on a writer. */
+    public Optional<PeerCatalog> peerCatalog() { return Optional.ofNullable(peerCatalog); }
+
+    /** The reader's source; empty on a writer. */
+    public Optional<PeerReplicaSource> peerSource() { return Optional.ofNullable(peerSource); }
 
     /** The {@code /replication/*} routes of this writer, sized from {@code cluster.peers}. */
     public ReplicationEndpoint endpoint() {
         ClusterConfig cfg = config.getCluster();
-        return new ReplicationEndpoint(peer, cfg.effectiveNodeId(),
+        return new ReplicationEndpoint(peerStore(), cfg.effectiveNodeId(),
                 com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
-                cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls());
+                cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg));
+    }
+
+    /**
+     * What this writer gossips at {@code /replication/peers}: its own {@code cluster.advertiseUrl}
+     * (when set) and its {@code seeds:} (when its discovery is seeds); readers follow the lists
+     * transitively.
+     */
+    static java.util.List<String> knownPeers(ClusterConfig cfg) {
+        java.util.Set<String> out = new java.util.TreeSet<>();
+        if (cfg.getAdvertiseUrl() != null && !cfg.getAdvertiseUrl().isBlank()) {
+            try {
+                out.add(PeerDiscovery.baseUrl(cfg.getAdvertiseUrl().strip()).toString());
+            } catch (IllegalArgumentException e) {
+                log.debug("cluster.advertiseUrl is not a writer URL: {}", e.getMessage());
+            }
+        }
+        if (cfg.getPeers().getDiscovery() != null
+                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof PeerDiscovery.Seeds s) {
+            s.urls().forEach(u -> out.add(u.toString()));
+        }
+        return java.util.List.copyOf(out);
     }
 
     @Override public BackendKind kind() { return BackendKind.PEER_PULL; }
@@ -119,18 +182,23 @@ public final class PeerBackend implements ReplicationBackend {
 
     @Override public LocalCache localCache() { return cache; }
 
-    /** This writer's own shards (those it published). */
-    @Override public ShardCatalog catalog() { return peer.catalog(); }
+    /** A writer: its own shards (those it published). A reader: every discovered writer's, merged. */
+    @Override public ShardCatalog catalog() { return peer != null ? peer.catalog() : peerCatalog; }
 
-    /** This writer's own published generations, read back from its store. */
-    @Override public ReplicaSource source() { return peer.source(); }
+    /** A writer: its own generations, read back from its store. A reader: pulled from the writers. */
+    @Override public ReplicaSource source() { return peer != null ? peer.source() : peerSource; }
 
     @Override public WriterStateStore writerState() { return WriterStateStore.NONE; }
 
     @Override
     public void close() {
-        peer.signal().close();
-        peer.store().close();
+        if (peer != null) {
+            peer.signal().close();
+            peer.store().close();
+        } else {
+            peerSource.close();
+            http.close();
+        }
     }
 
     /** Publishes, then wakes the {@code latest} long-polls of the shard. */

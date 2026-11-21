@@ -60,7 +60,13 @@ import java.util.regex.Pattern;
  *   <li>{@code GET /replication/synonyms}: this writer's synonyms, reduced to the hand-written lines
  *       and the sections of its own shards (P5-R4), with {@code ETag} = their SHA-256 (304 on a
  *       matching {@code If-None-Match}); 404 when there are none.</li>
+ *   <li>{@code GET /replication/peers}: {@code {"writer": node, "peers": [url, …]}}, the writers this one
+ *       knows (its advertise URL and its seeds): seeds-mode readers gossip through it.</li>
  * </ul>
+ *
+ * <p><b>Drain</b> ({@link #drain}, a shutdown step of the writer): every new request is answered 503
+ * with {@code Retry-After}, waiting long-polls are woken, and transfers already streaming finish,
+ * within {@code cluster.drainSeconds}.
  */
 public final class ReplicationEndpoint {
 
@@ -79,6 +85,9 @@ public final class ReplicationEndpoint {
     private final TransferLimiter transfers;
     private final TransferLimiter longPolls;
     private final ObjectMapper mapper = new ObjectMapper();
+    private final java.util.function.Supplier<List<String>> peers;
+    /** Set by {@link #drain}: new requests get 503. */
+    private volatile boolean draining;
     /**
      * Answers woken long-polls: never the publishing thread (which signals) nor the timeout thread,
      * so a slow reader connection cannot hold up a publish.
@@ -89,6 +98,13 @@ public final class ReplicationEndpoint {
 
     public ReplicationEndpoint(PeerStore peer, String writerNode, Predicate<String> token,
                                int maxTransfers, int maxLongPolls) {
+        this(peer, writerNode, token, maxTransfers, maxLongPolls, List::of);
+    }
+
+    /** @param peers the writer URLs {@code /replication/peers} lists */
+    public ReplicationEndpoint(PeerStore peer, String writerNode, Predicate<String> token,
+                               int maxTransfers, int maxLongPolls, java.util.function.Supplier<List<String>> peers) {
+        this.peers = Objects.requireNonNull(peers, "peers");
         this.peer = Objects.requireNonNull(peer, "peer");
         this.writerNode = Objects.requireNonNull(writerNode, "writerNode");
         this.token = Objects.requireNonNull(token, "token");
@@ -119,10 +135,17 @@ public final class ReplicationEndpoint {
             ctx.status(e.status).contentType("application/json");
             ctx.result("{\"error\":\"" + e.error + "\"}");
         });
-        app.before(PREFIX + "/*", this::requireToken);
+        app.before(PREFIX + "/*", ctx -> {
+            requireToken(ctx);
+            if (draining) {
+                ctx.header("Retry-After", Integer.toString(RETRY_AFTER_SECONDS));
+                throw new Rejected(503, "writer is shutting down");
+            }
+        });
         // Each route checks again: no path the router matches can ever reach a handler without the token.
         app.get(PREFIX + "/catalog", ctx -> { requireToken(ctx); catalog(ctx); });
         app.get(PREFIX + "/synonyms", ctx -> { requireToken(ctx); synonyms(ctx); });
+        app.get(PREFIX + "/peers", ctx -> { requireToken(ctx); peers(ctx); });
         app.get(PREFIX + "/{shard}/latest", ctx -> { requireToken(ctx); latest(ctx); });
         app.get(PREFIX + "/{shard}/manifests/{name}", ctx -> { requireToken(ctx); manifest(ctx); });
         app.get(PREFIX + "/{shard}/files/<key>", ctx -> { requireToken(ctx); file(ctx); });
@@ -135,6 +158,45 @@ public final class ReplicationEndpoint {
     /** Wakes every waiting long-poll (each answers with the current generation). */
     public void close() {
         peer.signal().close(); // the answer executor needs no shutdown: virtual threads, none idle
+    }
+
+    static final long LAST_CHUNK_GRACE_MILLIS = 200;
+
+    /** True once {@link #drain} began. */
+    public boolean draining() { return draining; }
+
+    /**
+     * The writer's shutdown step: refuses new {@code /replication} requests (503, {@code Retry-After}),
+     * wakes the long-polls (they answer with the current generation and readers back off), and waits
+     * until no transfer is in flight or {@code max} passed. Idempotent.
+     *
+     * @return the transfers still in flight when it returned (0 when drained)
+     */
+    public int drain(java.time.Duration max) {
+        draining = true;
+        close();
+        long deadline = System.nanoTime() + max.toNanos();
+        int busy;
+        while ((busy = transfers.inFlight()) > 0 && System.nanoTime() - deadline < 0) {
+            try {
+                Thread.sleep(25);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (busy > 0) {
+            log.warn("Replication drain: stopping with {} transfer(s) still in flight (cluster.drainSeconds)", busy);
+        } else {
+            // a transfer frees its slot just before writing its last chunk: let that chunk go out
+            try {
+                Thread.sleep(LAST_CHUNK_GRACE_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("Replication drained: no transfer in flight");
+        }
+        return busy;
     }
 
     // ── routes ────────────────────────────────────────────────────────────────
@@ -178,6 +240,13 @@ public final class ReplicationEndpoint {
             return;
         }
         ctx.status(200).contentType("text/plain; charset=utf-8").result(bytes);
+    }
+
+    private void peers(Context ctx) throws IOException {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("writer", writerNode);
+        out.put("peers", List.copyOf(peers.get()));
+        json(ctx, 200, out);
     }
 
     private void latest(Context ctx) throws IOException {
