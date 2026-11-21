@@ -238,8 +238,9 @@ class Node:
                                  "leaseTtlSeconds": TTL, "minHoldSeconds": MIN_HOLD, "disk": disk}
             cfg["embeddingProviders"] = [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                           "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}]
-            # a writer serves no search: no search model, so the web start does not warm (load) jina
-            cfg["searchEmbeddingModel"] = "writer-serves-no-search"
+            # a normal writer config: the web start of a writer skips the search-model warm-up (the
+            # driver records each writer's RSS before its first embed to show jina is not loaded)
+            cfg["searchEmbeddingModel"] = os.environ["GATE_MODEL_ID"]
         else:
             cluster["role"] = "reader"
             cluster["advertiseUrl"] = self.base
@@ -918,6 +919,10 @@ def phase_failover():
         node(n).start()
     for n in ("w2", "w3"):
         node(n).wait_health()
+    time.sleep(5)
+    # writers skip the search-model warm-up: before any embed their RSS has no jina (~1.1 GB) in it
+    out["writer_rss_mib_before_embedding"] = {n: node(n).rss_mib() for n in ("w2", "w3")}
+    log(f"idle writer RSS {out['writer_rss_mib_before_embedding']} MiB")
     seen = []
 
     def lucene_commit():
@@ -1290,10 +1295,18 @@ def phase_check():
         out["shards"][s] = {"latest": latest, "generations": len(rows), "chain_ok": cv, "chain_problems": problems,
                             "published_once": po, "latest_valid": valid,
                             "rows": [(g, p, w, (r or "")[:10], c) for g, p, w, r, c in rows]}
-        good = cv and not po["duplicates"] and not po["lost"] and not po["unknown_revisions"] and valid[0]
+        # every gate change only adds comments: a generation's document count equals generation 1's
+        # (a run that indexed files a second time doubles it)
+        counts = {g: (manifest(MON.s3, s, g) or {}).get("docCount") for g, *_ in rows}
+        base = counts.get(1)
+        wrong_counts = {g: n for g, n in counts.items() if n != base}
+        out["shards"][s]["doc_counts"] = {"gen1": base, "different": wrong_counts}
+        good = cv and not po["duplicates"] and not po["lost"] and not po["unknown_revisions"] and valid[0] \
+            and not wrong_counts
         ok = ok and good
         log(f"CHECK {s}: LATEST {latest}, {len(rows)} manifests, chain {'ok' if cv else problems},"
-            f" duplicates {po['duplicates']}, lost {po['lost']}, coalesced {len(po['coalesced'])}")
+            f" duplicates {po['duplicates']}, lost {po['lost']}, coalesced {len(po['coalesced'])},"
+            f" docCount {base} (generations with another count: {wrong_counts})")
     with MON.lock:
         samples = list(MON.samples)
     out["queries_total"] = len(samples)
