@@ -54,7 +54,8 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
         this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, null, null);
     }
 
-    ReaderHeartbeat with(boolean draining, long startedAt) {
+    /** This heartbeat as a membership writes it: {@code draining} and the process start set. */
+    public ReaderHeartbeat with(boolean draining, long startedAt) {
         return new ReaderHeartbeat(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt,
                 state, degradedShards, warmP95Millis, catalogAgeSeconds);
     }

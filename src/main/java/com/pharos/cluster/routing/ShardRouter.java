@@ -3,6 +3,7 @@ package com.pharos.cluster.routing;
 import com.pharos.cluster.ShardCatalog;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.membership.ReaderHealth;
+import com.pharos.cluster.membership.MembershipSource;
 import com.pharos.cluster.membership.ReaderHeartbeat;
 
 import java.io.IOException;
@@ -63,8 +64,17 @@ public final class ShardRouter {
      */
     public ShardRouter(Supplier<List<ReaderHeartbeat>> live, ShardCatalog catalog, ReaderHealth health,
                        Predicate<ShardId> local, ToIntFunction<String> coordinatorInFlight) {
+        this(MembershipSource.of(live), catalog, health, local, coordinatorInFlight);
+    }
+
+    /**
+     * Routes over {@code membership}: the bucket's reader registry, or the peer writers' merged
+     * registries (no bucket); both list the same live readers for the same heartbeats.
+     */
+    public ShardRouter(MembershipSource membership, ShardCatalog catalog, ReaderHealth health,
+                       Predicate<ShardId> local, ToIntFunction<String> coordinatorInFlight) {
         this.coordinatorInFlight = coordinatorInFlight;
-        this.live = live;
+        this.live = java.util.Objects.requireNonNull(membership, "membership")::live;
         this.catalog = catalog;
         this.health = health;
         this.local = local;

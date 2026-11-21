@@ -1,6 +1,7 @@
 package com.pharos.cli;
 
 import com.pharos.cluster.BackendKind;
+import com.pharos.cluster.membership.MembershipSource;
 import com.pharos.cluster.membership.ReaderHeartbeat;
 import com.pharos.cluster.membership.ReaderRegistry;
 import com.pharos.cluster.objectstore.ObjectStore;
@@ -42,7 +43,8 @@ import java.util.function.Supplier;
 
 /**
  * {@code pharos router}: a stateless HTTP front for the reader tier. It lists the live readers from
- * the bucket ({@code catalog/readers/}, read only), polls each one's {@code /health} every 2 s, and
+ * the bucket ({@code catalog/readers/}, read only), or with {@code cluster.backend: peer-pull} from
+ * every writer {@code cluster.peers.discovery} finds ({@code GET /replication/readers}, merged), polls each one's {@code /health} every 2 s, and
  * round-robins {@code /api/*}, {@code /health} and {@code GET /cluster/status} over the readers whose
  * last poll answered 200. {@code GET /cluster/events} (server-sent events) is streamed through from
  * one reader without buffering, exempt from the total deadline and the body cap, and cut only when
@@ -52,7 +54,8 @@ import java.util.function.Supplier;
  * and {@code POST /api/search}) is retried once on another reader after a connect error or a 5xx.
  * {@code /internal/*}, and every other path, answers 404 and is never forwarded.
  *
- * <p>It needs the cluster's object-store settings and {@code cluster.token}, and no index. It never
+ * <p>It needs the cluster's object-store settings (or {@code cluster.peers.discovery}) and
+ * {@code cluster.token}, and no index. It never
  * sends the token to a reader: only {@code /internal/*} takes it, and that is never forwarded.
  */
 @Command(
@@ -86,16 +89,16 @@ public class RouterCommand implements Callable<Integer> {
             System.err.println("pharos router: " + problem);
             return 2;
         }
-        try (ObjectStore store = new S3ObjectStore(c.getObjectStore());
-             ReaderRegistry readers = ReaderRegistry.observer(store,
-                     new ObjectStoreLayout(c.getObjectStore().getPrefix()), c);
-             Router router = new Router(readers::live, POLL_EVERY, Duration.ofMillis(c.getConnectTimeoutMillis()),
+        try (MembershipSource readers = observe(c);
+             Router router = new Router(readers, POLL_EVERY, Duration.ofMillis(c.getConnectTimeoutMillis()),
                      REQUEST_TIMEOUT)) {
             router.setEventsIdleTimeout(Duration.ofSeconds(2L * c.getStatus().getEventsKeepAliveSeconds()));
             readers.start();
             router.start(port);
-            System.out.printf("pharos router listening on port %d (readers of bucket '%s')%n", router.port(),
-                    c.getObjectStore().getBucket());
+            System.out.printf("pharos router listening on port %d (readers %s)%n", router.port(),
+                    c.getBackend() == BackendKind.PEER_PULL
+                            ? "of the writers at '" + c.getPeers().getDiscovery() + "'"
+                            : "of bucket '" + c.getObjectStore().getBucket() + "'");
             Thread.currentThread().join(); // until Ctrl+C
             return 0;
         } catch (InterruptedException e) {
@@ -107,12 +110,69 @@ public class RouterCommand implements Callable<Integer> {
         }
     }
 
+    /**
+     * The read-only reader membership a router routes over, owning its clients (closed with it): the
+     * bucket's {@code catalog/readers/}, or on {@code peer-pull} every discovered writer's
+     * {@code GET /replication/readers}, merged.
+     */
+    static MembershipSource observe(ClusterConfig c) throws IOException {
+        if (c.getBackend() == BackendKind.PEER_PULL) {
+            com.pharos.cluster.peer.PeerHttp http = com.pharos.cluster.peer.PeerHttp.of(c);
+            try {
+                var discovery = new com.pharos.cluster.peer.PeerDiscovery(
+                        com.pharos.cluster.peer.PeerDiscovery.parse(c.getPeers().getDiscovery()),
+                        http.tls() ? "https" : "http", com.pharos.cluster.peer.PeerDiscovery.SYSTEM_RESOLVER, http);
+                var catalog = new com.pharos.cluster.peer.PeerCatalog(discovery, http,
+                        Duration.ofSeconds(c.getPeers().getRefreshSeconds()), System::nanoTime);
+                var members = com.pharos.cluster.peer.PeerMembership.observer(catalog, http, c);
+                return closing(members, http);
+            } catch (RuntimeException e) {
+                http.close();
+                throw e;
+            }
+        }
+        ObjectStore store = new S3ObjectStore(c.getObjectStore());
+        return closing(ReaderRegistry.observer(store, new ObjectStoreLayout(c.getObjectStore().getPrefix()), c), store);
+    }
+
+    /** {@code members}, also closing {@code client} when closed. */
+    private static MembershipSource closing(MembershipSource members, AutoCloseable client) {
+        return new MembershipSource() {
+            @Override public List<com.pharos.cluster.membership.ReaderRegistry.LiveReader> liveWithAge() {
+                return members.liveWithAge();
+            }
+
+            @Override public void start() { members.start(); }
+
+            @Override
+            public void close() {
+                members.close();
+                try {
+                    client.close();
+                } catch (Exception e) {
+                    log.debug("Closing the router's membership client failed: {}", e.toString());
+                }
+            }
+        };
+    }
+
     /** Why this config can't run a router, or null. */
     static String configProblem(ClusterConfig c) {
-        if (c.getBackend() != BackendKind.OBJECT_STORE || c.getObjectStore() == null
+        if (c.getBackend() == BackendKind.PEER_PULL) {
+            String d = c.getPeers().getDiscovery();
+            if (d == null || d.isBlank()) {
+                return "needs cluster.peers.discovery on cluster.backend \"peer-pull\" (the readers are listed"
+                        + " from the writers)";
+            }
+            try {
+                com.pharos.cluster.peer.PeerDiscovery.parse(d);
+            } catch (IllegalArgumentException e) {
+                return e.getMessage();
+            }
+        } else if (c.getBackend() != BackendKind.OBJECT_STORE || c.getObjectStore() == null
                 || c.getObjectStore().getBucket() == null || c.getObjectStore().getBucket().isBlank()) {
             return "needs cluster.backend \"object-store\" and cluster.objectStore.bucket (the readers are listed"
-                    + " from the bucket)";
+                    + " from the bucket), or cluster.backend \"peer-pull\" and cluster.peers.discovery";
         }
         if (c.getToken() == null || c.getToken().isBlank()) {
             return "cluster.token is required on a router (shared secret of the cluster)";
@@ -146,6 +206,12 @@ public class RouterCommand implements Callable<Integer> {
         private volatile Duration eventsIdleTimeout = DEFAULT_EVENTS_IDLE_TIMEOUT;
         private ScheduledExecutorService poller;
         private Javalin app;
+
+        /** Routes over {@code membership}: the bucket's reader registry or the peer writers' (no bucket). */
+        public Router(MembershipSource membership, Duration pollEvery, Duration connectTimeout,
+                      Duration requestTimeout) {
+            this(Objects.requireNonNull(membership, "membership")::live, pollEvery, connectTimeout, requestTimeout);
+        }
 
         public Router(Supplier<List<ReaderHeartbeat>> live, Duration pollEvery, Duration connectTimeout,
                       Duration requestTimeout) {

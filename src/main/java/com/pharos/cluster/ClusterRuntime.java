@@ -71,7 +71,10 @@ public final class ClusterRuntime implements Closeable {
     /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    private com.pharos.cluster.membership.ReaderRegistry readerRegistry;
+    /** Reader membership: the bucket registry, or heartbeats to the peer writers. Guarded by this. */
+    private com.pharos.cluster.membership.MembershipSource readerRegistry;
+    /** A peer-mode writer's own catalog client for {@code /cluster/status}; null otherwise. Guarded by this. */
+    private AutoCloseable statusPeers;
     /** The indexer a work-queue writer's loop runs; set by Main. */
     private volatile com.pharos.indexer.ProjectIndexManager indexManager;
     /** The work queue of a writer with {@code cluster.writer.workQueue: true} while it runs. Guarded by this. */
@@ -409,7 +412,7 @@ public final class ClusterRuntime implements Closeable {
 
     /** The live readers of the cluster; empty unless this reader is serving with a registry. */
     public List<com.pharos.cluster.membership.ReaderRegistry.LiveReader> liveReaders() {
-        com.pharos.cluster.membership.ReaderRegistry r;
+        com.pharos.cluster.membership.MembershipSource r;
         synchronized (this) { r = readerRegistry; }
         return r == null ? List.of() : r.liveWithAge();
     }
@@ -421,7 +424,7 @@ public final class ClusterRuntime implements Closeable {
     public void drain() {
         draining = true;
         stopCatalogTimer(); // queries still refresh on demand while the drain runs
-        com.pharos.cluster.membership.ReaderRegistry r;
+        com.pharos.cluster.membership.MembershipSource r;
         synchronized (this) { r = readerRegistry; }
         if (r != null) r.drain();
     }
@@ -452,14 +455,29 @@ public final class ClusterRuntime implements Closeable {
 
     // Holding the monitor of this.
     private void startMembership() {
-        if (!(backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os)) return;
         try {
-            readerRegistry = new com.pharos.cluster.membership.ReaderRegistry(os.store(), os.layout(),
-                    config.getCluster(), this::selfHeartbeat);
+            if (backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os) {
+                readerRegistry = new com.pharos.cluster.membership.ReaderRegistry(os.store(), os.layout(),
+                        config.getCluster(), this::selfHeartbeat);
+            } else if (backend instanceof com.pharos.cluster.peer.PeerBackend peer && peer.isReader()) {
+                // no bucket: heartbeats POSTed to every live writer, their lists merged (Task 2b)
+                readerRegistry = new com.pharos.cluster.peer.PeerMembership(peer.peerCatalog().orElseThrow(),
+                        peer.peerHttp().orElseThrow(), config.getCluster(), this::selfHeartbeat);
+            } else {
+                return;
+            }
             readerRegistry.start();
         } catch (RuntimeException e) {
             log.warn("Starting reader membership failed: {}", e.toString());
         }
+    }
+
+    /**
+     * The live readers this node routes over, as a {@link com.pharos.cluster.membership.MembershipSource}
+     * that follows the current membership (empty until this reader joins it, and after close).
+     */
+    public com.pharos.cluster.membership.MembershipSource membership() {
+        return this::liveReaders;
     }
 
     /** The indexer the work loop of a work-queue writer runs (and publishes through). */
@@ -634,7 +652,9 @@ public final class ClusterRuntime implements Closeable {
     /**
      * The {@code /cluster/status} service of this node, started on first call: built from the bucket
      * (catalog, manifests, leases, writer and reader heartbeats, the shared state
-     * {@code catalog/status/state.json}) on an object-store node, from local state on a single node
+     * {@code catalog/status/state.json}) on an object-store node, from the peer writers' catalogs and
+     * reader registries on a peer-pull node (the state on the lowest-id live writer; P5-R1, P5-R2;
+     * {@link #peerStatusParts}), from local state on a single node
      * ({@code role: all}: one node holding every shard, nothing written anywhere). Closed by
      * {@link #close}.
      */
@@ -645,11 +665,20 @@ public final class ClusterRuntime implements Closeable {
         ClusterConfig.StatusConfig sc = c.getStatus();
         com.pharos.cluster.status.StatusSource source;
         com.pharos.cluster.status.StatusStateStore states;
+        PeerStatusParts peerStatus = null;
         if (backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os) {
             source = new com.pharos.cluster.status.BucketStatusSource(os.store(), os.layout(), os.objectStoreCatalog(),
                     os.source(), Duration.ofSeconds(c.getReaderTtlSeconds()), c.getWriter().leaseTtl(),
                     java.time.Clock.systemUTC());
             states = com.pharos.cluster.status.StatusStateStore.bucket(os.store(), os.layout());
+        } else if ((peerStatus = peerStatusParts()) != null) {
+            // no bucket (P5-R1, P5-R2): the writers' catalogs and reader registries; the state on the
+            // lowest-id live writer
+            source = new com.pharos.cluster.peer.PeerStatusSource(peerStatus.catalog(), peerStatus.source(),
+                    peerStatus.http(), com.pharos.cluster.peer.PeerMembership.callTimeout(c.getHeartbeatSeconds()),
+                    c.getWriter().leaseTtl(), System::nanoTime, java.time.Clock.systemUTC());
+            states = com.pharos.cluster.peer.PeerStatusState.remote(peerStatus.catalog()::liveWriters,
+                    peerStatus.http());
         } else {
             source = new com.pharos.cluster.status.LocalStatusSource(c.getNodeId() == null ? "local" : c.getNodeId(),
                     registry, luceneIndexer, () -> load, java.time.Clock.systemUTC());
@@ -660,13 +689,55 @@ public final class ClusterRuntime implements Closeable {
                 hook == null || hook.isBlank() ? null : new com.pharos.cluster.status.Webhook(hook));
         // A single node runs no thread of its own: on demand, cached for heartbeatSeconds, and the refresh
         // timer only while an SSE client is connected (the global "single node unchanged" constraint).
-        boolean cluster = backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend;
+        boolean cluster = backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend || peerStatus != null;
         Duration every = Duration.ofSeconds(c.getHeartbeatSeconds());
         statusService = new com.pharos.cluster.status.StatusService(source, states,
                 com.pharos.cluster.status.StatusSettings.of(sc), events, every,
                 cluster ? STATUS_MAX_AGE : every, System::nanoTime, cluster);
         statusService.start();
         return statusService;
+    }
+
+    /** What a peer-mode node builds its {@code /cluster/status} from. */
+    private record PeerStatusParts(com.pharos.cluster.peer.PeerCatalog catalog, ReplicaSource source,
+                                   com.pharos.cluster.peer.PeerHttp http) {}
+
+    /**
+     * A peer-mode node's status inputs; null on other backends. A reader uses its own catalog, source
+     * and client. A writer has none, so it builds them over {@code cluster.peers.discovery}, or, without
+     * one, over its own {@code cluster.advertiseUrl} (it lists itself); with neither, null (the local
+     * status, as before). Holding the monitor of this.
+     */
+    private PeerStatusParts peerStatusParts() {
+        if (!(backend instanceof com.pharos.cluster.peer.PeerBackend peer)) return null;
+        if (peer.isReader()) {
+            return new PeerStatusParts(peer.peerCatalog().orElseThrow(), peer.source(), peer.peerHttp().orElseThrow());
+        }
+        ClusterConfig c = config.getCluster();
+        String discovery = c.getPeers().getDiscovery();
+        if ((discovery == null || discovery.isBlank()) && c.getAdvertiseUrl() != null && !c.getAdvertiseUrl().isBlank()) {
+            discovery = "seeds:" + c.getAdvertiseUrl().strip();
+        }
+        if (discovery == null || discovery.isBlank()) return null;
+        com.pharos.cluster.peer.PeerHttp http = com.pharos.cluster.peer.PeerHttp.of(c);
+        try {
+            var d = new com.pharos.cluster.peer.PeerDiscovery(com.pharos.cluster.peer.PeerDiscovery.parse(discovery),
+                    http.tls() ? "https" : "http", com.pharos.cluster.peer.PeerDiscovery.SYSTEM_RESOLVER, http);
+            var cat = new com.pharos.cluster.peer.PeerCatalog(d, http,
+                    Duration.ofSeconds(c.getPeers().getRefreshSeconds()), System::nanoTime);
+            var src = new com.pharos.cluster.peer.PeerReplicaSource(cat, http,
+                    Duration.ofSeconds(c.getPeers().getLongPollSeconds()));
+            statusPeers = () -> {
+                src.close();
+                http.close();
+            };
+            return new PeerStatusParts(cat, src, http);
+        } catch (RuntimeException e) {
+            http.close();
+            log.warn("Peer status: cannot use cluster.peers.discovery for /cluster/status ({}); serving the local"
+                    + " status", e.getMessage());
+            return null;
+        }
     }
 
     /** A {@code /cluster/status} request older than this rebuilds the status first (cluster nodes). */
@@ -785,7 +856,7 @@ public final class ClusterRuntime implements Closeable {
                         : c.getObjectStore().readTotalTimeout().multipliedBy(2), // the store's own bound, with slack
                 catalogWait(c.effectiveQueryTimeoutMillis()));
         coordinatorCatalog = catalog;
-        var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, catalog, health,
+        var router = new com.pharos.cluster.routing.ShardRouter(membership(), catalog, health,
                 id -> servesShard(id.value()), client::inFlight);
         var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),
                 engine.vectorStrategy(), Duration.ofMillis(c.effectiveQueryTimeoutMillis()), catalog::staleSeconds);
@@ -834,12 +905,6 @@ public final class ClusterRuntime implements Closeable {
     /** True when this reader serves {@code shard}: it has an active generation of it. */
     public boolean servesShard(String shard) {
         return backend.localCache() instanceof ReaderLocalCache cache && cache.active(shard).isPresent();
-    }
-
-    private List<com.pharos.cluster.membership.ReaderHeartbeat> liveHeartbeats() {
-        com.pharos.cluster.membership.ReaderRegistry r;
-        synchronized (this) { r = readerRegistry; }
-        return r == null ? List.of() : r.live();
     }
 
     /** {@code role: writer}: the node indexes and publishes, and serves no search of its own. */
@@ -905,7 +970,8 @@ public final class ClusterRuntime implements Closeable {
 
     /**
      * {@link #beginServing(java.util.concurrent.CompletionStage)}; with {@code advertise} the process
-     * also joins reader membership (its heartbeat in {@code catalog/readers/<node>.json}, so
+     * also joins reader membership (its heartbeat in {@code catalog/readers/<node>.json}, or on
+     * {@code peer-pull} POSTed to every live writer, so
      * coordinators and the router send it shard calls and queries) and registers the shutdown drain.
      * Only a process that serves {@code /internal/*} may advertise: {@code pharos web}. A
      * {@code pharos mcp-server} on a reader does not: it has no {@code /internal/*} behind the
@@ -1223,12 +1289,15 @@ public final class ClusterRuntime implements Closeable {
         ScheduledExecutorService f;
         Thread first;
         AutoCloseable step;
-        com.pharos.cluster.membership.ReaderRegistry members;
+        com.pharos.cluster.membership.MembershipSource members;
+        AutoCloseable peersForStatus;
         synchronized (this) {
             if (closed) return;
             closed = true;
             members = readerRegistry;
             readerRegistry = null;
+            peersForStatus = statusPeers;
+            statusPeers = null;
             s = syncer;
             syncer = null;
             lock = syncLock;
@@ -1277,6 +1346,13 @@ public final class ClusterRuntime implements Closeable {
             statusService = null;
         }
         if (status != null) status.close();
+        if (peersForStatus != null) {
+            try {
+                peersForStatus.close();
+            } catch (Exception e) {
+                log.debug("Closing the status catalog client failed: {}", e.toString());
+            }
+        }
         stopCatalogTimer();
         com.pharos.search.distributed.DistributedSearch ds;
         synchronized (this) {

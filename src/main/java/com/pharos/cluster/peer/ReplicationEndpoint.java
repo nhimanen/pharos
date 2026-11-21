@@ -62,6 +62,9 @@ import java.util.regex.Pattern;
  *       matching {@code If-None-Match}); 404 when there are none.</li>
  *   <li>{@code GET /replication/peers}: {@code {"writer": node, "peers": [url, …]}}, the writers this one
  *       knows (its advertise URL and its seeds): seeds-mode readers gossip through it.</li>
+ *   <li>{@code POST}/{@code GET /replication/readers}, {@code DELETE /replication/readers/<node>} and
+ *       {@code GET}/{@code PUT /replication/status-state}: reader membership and the status hysteresis
+ *       state without a bucket ({@link MembershipRoutes}, P5-R5, P5-R2).</li>
  * </ul>
  *
  * <p><b>Drain</b> ({@link #drain}, a shutdown step of the writer): every new request is answered 503
@@ -104,6 +107,26 @@ public final class ReplicationEndpoint {
     /** @param peers the writer URLs {@code /replication/peers} lists */
     public ReplicationEndpoint(PeerStore peer, String writerNode, Predicate<String> token,
                                int maxTransfers, int maxLongPolls, java.util.function.Supplier<List<String>> peers) {
+        this(peer, writerNode, token, maxTransfers, maxLongPolls, peers,
+                new PeerReaderRegistry(java.time.Duration.ofSeconds(DEFAULT_READER_TTL_SECONDS), System::nanoTime),
+                new PeerStatusState(), System::currentTimeMillis);
+    }
+
+    /** The reader TTL of an endpoint built without one ({@code cluster.readerTtlSeconds}' default). */
+    static final int DEFAULT_READER_TTL_SECONDS = 30;
+
+    /**
+     * @param readers     the reader registry {@code /replication/readers} feeds and lists
+     * @param statusState the status hysteresis state this writer holds when it is the lowest-id writer
+     * @param wallMillis  this writer's clock as {@code /replication/readers} reports it ({@code now})
+     */
+    public ReplicationEndpoint(PeerStore peer, String writerNode, Predicate<String> token,
+                               int maxTransfers, int maxLongPolls, java.util.function.Supplier<List<String>> peers,
+                               PeerReaderRegistry readers, PeerStatusState statusState,
+                               java.util.function.LongSupplier wallMillis) {
+        this.membership = new MembershipRoutes(writerNode, readers, statusState, wallMillis);
+        this.readers = readers;
+        this.statusState = statusState;
         this.peers = Objects.requireNonNull(peers, "peers");
         this.peer = Objects.requireNonNull(peer, "peer");
         this.writerNode = Objects.requireNonNull(writerNode, "writerNode");
@@ -111,6 +134,16 @@ public final class ReplicationEndpoint {
         this.transfers = new TransferLimiter(maxTransfers);
         this.longPolls = new TransferLimiter(maxLongPolls);
     }
+
+    private final MembershipRoutes membership;
+    private final PeerReaderRegistry readers;
+    private final PeerStatusState statusState;
+
+    /** The readers that heartbeat to this writer ({@code /replication/readers}). */
+    public PeerReaderRegistry readers() { return readers; }
+
+    /** The status hysteresis state held here ({@code /replication/status-state}). */
+    public PeerStatusState statusState() { return statusState; }
 
     /** The file-transfer cap ({@code cluster.peers.maxTransfersPerWriter}). */
     public TransferLimiter transfers() { return transfers; }
@@ -149,6 +182,7 @@ public final class ReplicationEndpoint {
         app.get(PREFIX + "/{shard}/latest", ctx -> { requireToken(ctx); latest(ctx); });
         app.get(PREFIX + "/{shard}/manifests/{name}", ctx -> { requireToken(ctx); manifest(ctx); });
         app.get(PREFIX + "/{shard}/files/<key>", ctx -> { requireToken(ctx); file(ctx); });
+        membership.mount(app, this::requireToken); // readers and status-state (Task 2b)
     }
 
     private void requireToken(Context ctx) {

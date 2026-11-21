@@ -476,4 +476,24 @@ class RouterCommandTest {
         assertThat(RouterCommand.Router.forwardable("/cluster/events")).isTrue();
         assertThat(RouterCommand.Router.forwardable("/cluster/status/x")).isFalse();
     }
+
+    @Test
+    void routerConfigAcceptsPeerPullWithDiscovery() throws Exception {
+        com.pharos.config.ClusterConfig c = new com.pharos.config.ClusterConfig();
+        c.setToken("t");
+        c.setBackend(com.pharos.cluster.BackendKind.PEER_PULL);
+        assertThat(RouterCommand.configProblem(c)).contains("cluster.peers.discovery");
+        c.getPeers().setDiscovery("bogus:x");
+        assertThat(RouterCommand.configProblem(c)).contains("cluster.peers.discovery must start with");
+        c.getPeers().setDiscovery("seeds:http://localhost:1");
+        assertThat(RouterCommand.configProblem(c)).isNull();
+        try (com.pharos.cluster.membership.MembershipSource m = RouterCommand.observe(c)) {
+            assertThat(m.liveWithAge()).isEmpty(); // nothing listed before it starts; no bucket touched
+        }
+        c.setToken(null);
+        assertThat(RouterCommand.configProblem(c)).contains("cluster.token");
+        c.setToken("t");
+        c.setBackend(com.pharos.cluster.BackendKind.LOCAL);
+        assertThat(RouterCommand.configProblem(c)).contains("object-store").contains("peer-pull");
+    }
 }

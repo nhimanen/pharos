@@ -144,6 +144,9 @@ public final class PeerBackend implements ReplicationBackend {
     /** The reader's merged writer catalog; empty on a writer. */
     public Optional<PeerCatalog> peerCatalog() { return Optional.ofNullable(peerCatalog); }
 
+    /** The reader's HTTP client to the writers; empty on a writer. */
+    public Optional<PeerHttp> peerHttp() { return Optional.ofNullable(http); }
+
     /** The reader's source; empty on a writer. */
     public Optional<PeerReplicaSource> peerSource() { return Optional.ofNullable(peerSource); }
 
@@ -152,7 +155,9 @@ public final class PeerBackend implements ReplicationBackend {
         ClusterConfig cfg = config.getCluster();
         return new ReplicationEndpoint(peerStore(), cfg.effectiveNodeId(),
                 com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
-                cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg));
+                cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg),
+                new PeerReaderRegistry(Duration.ofSeconds(cfg.getReaderTtlSeconds()), System::nanoTime),
+                new PeerStatusState(), System::currentTimeMillis);
     }
 
     /**
