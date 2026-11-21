@@ -623,6 +623,11 @@ class DistributedSearchTest {
             assertThat(r.warnings()).containsExactly("shard " + JAVA
                     + " unavailable: every live reader serving it is degraded (r1, r2); results exclude it");
             assertThat(s.coordinator().parts.runtime().liveReaders()).as("the readers stay live").hasSize(3);
+            // Final review minor 1: graph tools and lookups answered locally name the lost shard too.
+            List<String> graphWarnings = new ArrayList<>();
+            s.coordinator().engine.findCallers("com.example.model.User#getName()", null, graphWarnings);
+            assertThat(graphWarnings).containsExactly("shard " + JAVA
+                    + " unavailable: every live reader serving it is degraded (r1, r2); results exclude it");
         }
     }
 

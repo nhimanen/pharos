@@ -289,7 +289,13 @@ public class SearchEngine {
             return null;
         }
         try (q) {
-            if (!q.fansOut()) return null;
+            if (!q.fansOut()) {
+                // The local code answers; shards no live reader serves are still named, never dropped silently.
+                if (!q.unservedShards().isEmpty()) {
+                    for (String w : q.warnings()) if (!warnings.contains(w)) warnings.add(w);
+                }
+                return null;
+            }
             T value = op.apply(q);
             warnings.addAll(q.warnings());
             return new FanOut<>(value);
