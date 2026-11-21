@@ -52,8 +52,9 @@ import java.util.zip.GZIPOutputStream;
  * content-named keys ({@code graph/gen-N@<crc32>.cgf.gz}, {@code refs/gen-N@<crc32>.json.gz}), so
  * a racing run for the same N cannot overwrite bytes a committed manifest references → ship
  * synonyms → register the shard in the catalog (idempotent; readers skip a listed shard without
- * {@code LATEST}) → {@code putIfAbsent} the manifest gen-N → the {@link LeaseGuard} check (work-queue
- * mode; a lost lease is a {@link PublishConflictException}) → CAS {@code LATEST} from P to N → GC.
+ * {@code LATEST}) → the {@link LeaseGuard} check (work-queue mode; a lost lease is a
+ * {@link PublishConflictException}) → {@code putIfAbsent} the manifest gen-N → the lease check again,
+ * and the manifest must still carry the ETag this run wrote → CAS {@code LATEST} from P to N → GC.
  * Registering before the commit point means a catalog failure can never be reported as a failed
  * publish of a generation that is in fact committed.
  *
@@ -211,13 +212,24 @@ public final class ObjectStorePublisher implements IndexPublisher {
                     ShardManifest.stripRefs(snapshot.meta()), formatStamp(snapshot.shardDir()));
             byte[] manifestJson = manifest.toJson();
             String manifestKey = layout.manifestKey(shard, gen);
-            if (store.putIfAbsent(manifestKey, manifestJson).isEmpty()) {
-                replaceOrphanManifest(shard, gen, manifestKey, manifestJson,
-                        previous.map(Latest::etag).orElse(null));
+            //    A writer that lost its lease must not write (or replace as an "orphan") the
+            //    manifest a new owner is about to commit: check before writing it.
+            leaseGuard.assertHeld(shard);
+            Optional<String> manifestEtag = store.putIfAbsent(manifestKey, manifestJson);
+            if (manifestEtag.isEmpty()) {
+                manifestEtag = Optional.of(replaceOrphanManifest(shard, gen, manifestKey, manifestJson,
+                        previous.map(Latest::etag).orElse(null)));
             }
 
-            // 7. Commit point: CAS LATEST from P to N, only while this writer holds the shard's lease.
+            // 7. Commit point: CAS LATEST from P to N, only while this writer holds the shard's lease,
+            //    and only onto the manifest this run wrote: a racing run that replaced it as an
+            //    "orphan" in the meantime must never be committed under this run's CAS.
             leaseGuard.assertHeld(shard);
+            String ownManifest = manifestEtag.get();
+            if (!store.get(manifestKey).map(StoredObject::etag).filter(ownManifest::equals).isPresent()) {
+                throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
+                        + " was replaced by another writer before the commit of shard " + shard);
+            }
             byte[] latest = ("{\"generation\": " + gen.value() + ", \"manifest\": \""
                     + ObjectStoreLayout.manifestName(gen) + "\"}").getBytes(StandardCharsets.UTF_8);
             Optional<String> committed = previous.isPresent()
@@ -317,21 +329,22 @@ public final class ObjectStorePublisher implements IndexPublisher {
      * error) between writing it and the CAS, and is replaced by ETag-conditional put. Otherwise
      * another writer committed, and this run conflicts.
      */
-    private void replaceOrphanManifest(ShardId shard, Generation gen, String manifestKey, byte[] json,
-                                       String previousLatestEtag) throws IOException {
+    private String replaceOrphanManifest(ShardId shard, Generation gen, String manifestKey, byte[] json,
+                                         String previousLatestEtag) throws IOException {
         Optional<StoredObject> orphan = store.get(manifestKey);
         String currentLatestEtag = store.get(layout.latestKey(shard)).map(StoredObject::etag).orElse(null);
         if (!Objects.equals(currentLatestEtag, previousLatestEtag)) {
             throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
         }
-        boolean replaced = orphan.isPresent()
-                ? store.putIfMatch(manifestKey, json, orphan.get().etag()).isPresent()
-                : store.putIfAbsent(manifestKey, json).isPresent();
-        if (!replaced) {
+        Optional<String> replaced = orphan.isPresent()
+                ? store.putIfMatch(manifestKey, json, orphan.get().etag())
+                : store.putIfAbsent(manifestKey, json);
+        if (replaced.isEmpty()) {
             throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
                     + " changed while replacing an orphan; another writer is publishing shard " + shard);
         }
         log.warn("Replaced orphan manifest {} of shard {} (LATEST never moved to it)", manifestKey, shard);
+        return replaced.get();
     }
 
     /** CRC32 of a whole file as lower-case hex. */

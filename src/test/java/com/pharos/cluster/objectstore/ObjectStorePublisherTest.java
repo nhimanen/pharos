@@ -76,7 +76,10 @@ class ObjectStorePublisherTest {
         Consumer<String> beforePut = k -> {};
         Consumer<String> beforeConditionalPut = k -> {};
 
+        Consumer<String> beforeGet = k -> {};
+
         @Override public Optional<StoredObject> get(String key) {
+            beforeGet.accept(key);
             return hideOnce.remove(key) ? Optional.empty() : delegate.get(key);
         }
         @Override public void download(String key, Path target) throws IOException { delegate.download(key, target); }
@@ -404,6 +407,63 @@ class ObjectStorePublisherTest {
         assertThat(publisherB.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
                 .contains(new Generation(2));
         assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-b");
+    }
+
+    /**
+     * Fix round 1, I1: A (its lease lost, but its first check passed before the takeover) runs into
+     * the manifest B just wrote, sees LATEST unmoved and "replaces the orphan". B must then refuse
+     * to commit: LATEST may never point at a manifest written by A.
+     */
+    @Test
+    void lostWriterReplacingTheNewOwnersManifestNeverGetsCommitted() throws Exception {
+        indexFull(manager(publisher)); // gen 1
+        StoredObject latestBefore = store.get(layout.latestKey(SHARD)).orElseThrow();
+        java.time.Duration ttl = java.time.Duration.ofSeconds(30);
+        LeaseManager b = new LeaseManager(store, layout, "node-b", ttl, heartbeat("node-b"), store.clock);
+        assertThat(b.tryAcquire(SHARD)).isPresent();
+        // A's guard: its early check ran before B's takeover; its later checks see the lease lost.
+        java.util.concurrent.atomic.AtomicInteger aChecks = new java.util.concurrent.atomic.AtomicInteger();
+        com.pharos.cluster.writer.LeaseGuard aGuard = shard -> {
+            if (aChecks.incrementAndGet() > 1) throw new PublishConflictException("node-a lost the lease");
+        };
+        ObjectStorePublisher publisherA = new ObjectStorePublisher(store, layout, catalog, gc(), "node-a",
+                synonyms, aGuard);
+        ObjectStorePublisher publisherB = new ObjectStorePublisher(store, layout, catalog, gc(), "node-b",
+                synonyms, b);
+        touchOneFileAndReindex(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        LocalSnapshot snap = new LocalSnapshot(SHARD.value(), shardDir, meta, "none");
+
+        // Once B's gen-2 manifest exists, B's next lease read (its final check) lets A run first.
+        String manifest2 = layout.manifestKey(SHARD, new Generation(2));
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        List<Throwable> aResult = new ArrayList<>();
+        store.beforeGet = k -> {
+            if (k.equals(layout.leaseKey(SHARD)) && store.delegate.get(manifest2).isPresent()
+                    && fired.compareAndSet(false, true)) {
+                try {
+                    publisherA.publish(snap);
+                } catch (Throwable t) {
+                    aResult.add(t);
+                }
+            }
+        };
+
+        assertThatThrownBy(() -> publisherB.publish(snap)).isInstanceOf(PublishConflictException.class)
+                .hasMessageContaining("replaced by another writer");
+        store.beforeGet = k -> {};
+
+        assertThat(fired).isTrue();
+        assertThat(aResult).singleElement().isInstanceOf(PublishConflictException.class);
+        assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-a"); // A did replace it ...
+        StoredObject latestAfter = store.get(layout.latestKey(SHARD)).orElseThrow();
+        assertThat(latestAfter.etag()).isEqualTo(latestBefore.etag()); // ... but nobody committed it
+
+        // B's retry replaces A's orphan and commits its own manifest.
+        assertThat(publisherB.publish(snap)).contains(new Generation(2));
+        assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-b");
+        assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(2);
     }
 
     /** The bucket's "now" for {@code node}: it writes a heartbeat and reads back its LastModified. */
