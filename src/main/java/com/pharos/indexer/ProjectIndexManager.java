@@ -54,6 +54,21 @@ import java.util.stream.Collectors;
  */
 public class ProjectIndexManager {
 
+    /** Directories the index walk never enters (dot-directories are skipped as well: see {@link #isSkippedDir}). */
+    public static final Set<String> SKIP_DIRS = Set.of(
+                ".git", ".hg", ".svn",
+                "node_modules", ".yarn", "vendor", ".cargo",
+                "target", "build", "dist", "out", ".gradle",
+                "__pycache__", ".tox", ".venv", "venv", ".env",
+                ".idea", ".vscode",
+                "logs", "log", "tmp", "temp", ".cache"
+    );
+
+    /** Whether the index walk skips a directory with this name. */
+    public static boolean isSkippedDir(String name) {
+        return SKIP_DIRS.contains(name) || name.startsWith(".");
+    }
+
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexManager.class);
     /**
      * Fallback batch size when no provider config is present (only the
@@ -527,14 +542,7 @@ public class ProjectIndexManager {
         // Treat a brand-new project (no prior state) as always changed.
         boolean[] anyChanges = { stateTracker.trackedFiles().isEmpty() };
 
-        Set<String> skipDirs = Set.of(
-                ".git", ".hg", ".svn",
-                "node_modules", ".yarn", "vendor", ".cargo",
-                "target", "build", "dist", "out", ".gradle",
-                "__pycache__", ".tox", ".venv", "venv", ".env",
-                ".idea", ".vscode",
-                "logs", "log", "tmp", "temp", ".cache"
-        );
+        Set<String> skipDirs = SKIP_DIRS;
         OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
             @Override
@@ -688,14 +696,7 @@ public class ProjectIndexManager {
         // Collect all supported source files that currently exist under the project root.
         // Skip noise directories that parsers would also skip — avoids counting .git objects,
         // vendored deps, build artifacts, and log/data directories as source files.
-        Set<String> skipDirs = Set.of(
-                ".git", ".hg", ".svn",
-                "node_modules", ".yarn", "vendor", ".cargo",
-                "target", "build", "dist", "out", ".gradle",
-                "__pycache__", ".tox", ".venv", "venv", ".env",
-                ".idea", ".vscode",
-                "logs", "log", "tmp", "temp", ".cache"
-        );
+        Set<String> skipDirs = SKIP_DIRS;
         Set<Path> currentFiles = new java.util.HashSet<>();
         OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {

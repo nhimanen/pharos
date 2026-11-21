@@ -137,4 +137,67 @@ class SourceCheckoutTest {
                 .prepare(new ShardId("proj"), ShardSource.git(bare.toString(), "main")))
                 .isInstanceOf(IOException.class).hasMessageContaining("not a git clone");
     }
+
+    @Test
+    void hungGitTimesOutPromptly() throws Exception {
+        Path fake = tmp.resolve("fake-git");
+        Files.writeString(fake, "#!/bin/sh\nsleep 30\n");
+        assertThat(fake.toFile().setExecutable(true)).isTrue();
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"),
+                java.time.Duration.ofMillis(300), fake.toString());
+        long t0 = System.nanoTime();
+        assertThatThrownBy(() -> checkout.prepare(new ShardId("h"),
+                ShardSource.git("https://example.org/secret-host/r.git", "main")))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("timed out")
+                .hasMessageNotContaining("secret-host");
+        assertThat(java.time.Duration.ofNanos(System.nanoTime() - t0)).isLessThan(java.time.Duration.ofSeconds(10));
+    }
+
+    @Test
+    void pathRevisionIgnoresDirectoriesTheIndexSkips() throws Exception {
+        Path shared = Files.createDirectories(tmp.resolve("shared"));
+        Files.writeString(shared.resolve("A.java"), "class A {}\n");
+        Path nm = Files.createDirectories(shared.resolve("node_modules/dep"));
+        Path hidden = Files.createDirectories(shared.resolve("sub/.git"));
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"));
+        ShardId shard = new ShardId("p");
+        checkout.prepare(shard, ShardSource.path(shared.toString()));
+        String r1 = checkout.changedSince(shard, null).orElseThrow();
+
+        Files.writeString(nm.resolve("x.js"), "1");
+        Files.writeString(hidden.resolve("HEAD"), "ref");
+        Files.writeString(Files.createDirectories(shared.resolve("target")).resolve("o.class"), "x");
+        assertThat(checkout.changedSince(shard, r1)).as("excluded dirs").isEmpty();
+
+        Files.writeString(shared.resolve("B.java"), "class B {}\n");
+        assertThat(checkout.changedSince(shard, r1)).isPresent();
+    }
+
+    @Test
+    void unreadablePathSurfacesAsIOException() throws Exception {
+        Path shared = Files.createDirectories(tmp.resolve("shared"));
+        Path locked = Files.createDirectories(shared.resolve("locked"));
+        Files.writeString(locked.resolve("A.java"), "x");
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"));
+        ShardId shard = new ShardId("p");
+        checkout.prepare(shard, ShardSource.path(shared.toString()));
+        Files.setPosixFilePermissions(locked, java.util.Set.of());
+        try {
+            org.junit.jupiter.api.Assumptions.assumeFalse(Files.isReadable(locked), "running as a user that ignores modes");
+            assertThatThrownBy(() -> checkout.changedSince(shard, null)).isInstanceOf(IOException.class);
+        } finally {
+            Files.setPosixFilePermissions(locked, java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"));
+        }
+        Files.delete(locked.resolve("A.java"));
+        Files.delete(shared.resolve("locked"));
+        Files.delete(shared);
+        checkout.prepare(shard, ShardSource.path(tmp.toString()));
+        // the shared directory vanishing is an IOException too
+        Path gone = tmp.resolve("gone");
+        Files.createDirectory(gone);
+        checkout.prepare(shard, ShardSource.path(gone.toString()));
+        Files.delete(gone);
+        assertThatThrownBy(() -> checkout.changedSince(shard, null)).isInstanceOf(IOException.class);
+    }
 }

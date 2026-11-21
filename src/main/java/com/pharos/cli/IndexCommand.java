@@ -136,6 +136,14 @@ public class IndexCommand implements Callable<Integer> {
                 // to single-project path with the discovered name if no --project was given
                 if (projects.size() == 1 && projectName == null) {
                     projectName = projects.get(0).name();
+                    if (source.isPresent() && !projects.get(0).path().toAbsolutePath().normalize()
+                            .equals(root.toAbsolutePath().normalize())) {
+                        System.err.println("The project '" + projectName + "' was discovered in a subdirectory ("
+                                + projects.get(0).path() + ") of the given path. A source names the repository root, so"
+                                + " sources for subprojects are not supported yet. Index the project directory itself"
+                                + " or use a layout where the source root is the project root.");
+                        return 2;
+                    }
                     root = projects.get(0).path();
                 }
             }

@@ -2,6 +2,7 @@ package com.pharos.cluster.writer;
 
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.ShardSource;
+import com.pharos.indexer.ProjectIndexManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,7 +24,6 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
 
 /**
  * Gives a writer a shard's source tree: the shared directory of a {@code path} source, or a clone
@@ -40,6 +40,7 @@ public final class SourceCheckout {
 
     private final Path workDir;
     private final Duration gitTimeout;
+    private final String gitExecutable;
     private final Map<ShardId, ShardSource> prepared = new ConcurrentHashMap<>();
 
     public SourceCheckout(Path workDir) {
@@ -47,6 +48,12 @@ public final class SourceCheckout {
     }
 
     SourceCheckout(Path workDir, Duration gitTimeout) {
+        this(workDir, gitTimeout, "git");
+    }
+
+    /** Tests only: another git executable (a fake that hangs). */
+    SourceCheckout(Path workDir, Duration gitTimeout, String gitExecutable) {
+        this.gitExecutable = gitExecutable;
         this.workDir = Objects.requireNonNull(workDir, "workDir").toAbsolutePath().normalize();
         this.gitTimeout = gitTimeout;
     }
@@ -160,7 +167,7 @@ public final class SourceCheckout {
 
     private String git(Path dir, String... args) throws IOException {
         List<String> cmd = new ArrayList<>();
-        cmd.add("git");
+        cmd.add(gitExecutable);
         cmd.addAll(List.of(args));
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(dir.toFile());
         Map<String, String> env = pb.environment();
@@ -170,20 +177,24 @@ public final class SourceCheckout {
         Process p = pb.start();
         p.getOutputStream().close();
         ByteArrayOutputStream err = new ByteArrayOutputStream();
+        ByteArrayOutputStream outBuf = new ByteArrayOutputStream();
         Thread errPump = Thread.ofVirtual().start(() -> drain(p.getErrorStream(), err));
-        byte[] out;
+        Thread outPump = Thread.ofVirtual().start(() -> drain(p.getInputStream(), outBuf));
         try {
-            out = p.getInputStream().readAllBytes();
             if (!p.waitFor(gitTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 p.destroyForcibly();
-                throw new IOException("git " + args[0] + " timed out after " + gitTimeout.toSeconds() + " s");
+                p.waitFor(5, TimeUnit.SECONDS);
+                // the operation only: the command line may carry the source's url
+                throw new IOException("git " + args[0] + " timed out after " + gitTimeout.toMillis() + " ms");
             }
             errPump.join(2000);
+            outPump.join(2000);
         } catch (InterruptedException e) {
             p.destroyForcibly();
             Thread.currentThread().interrupt();
             throw new java.io.InterruptedIOException("interrupted while running git " + args[0]);
         }
+        byte[] out = outBuf.toByteArray();
         if (p.exitValue() != 0) {
             String msg = err.toString(StandardCharsets.UTF_8).trim();
             // the command line is left out: it may carry the source's url
@@ -203,14 +214,21 @@ public final class SourceCheckout {
         Path root = Path.of(src.location()).toAbsolutePath().normalize();
         if (!Files.isDirectory(root)) throw new IOException("source path is not a readable directory: " + root);
         List<String> lines = new ArrayList<>();
-        try (Stream<Path> walk = Files.walk(root)) {
-            for (Path f : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
-                Path rel = root.relativize(f);
-                if (rel.startsWith(".git")) continue;
-                var attrs = Files.readAttributes(f, java.nio.file.attribute.BasicFileAttributes.class);
-                lines.add(rel + "\t" + attrs.size() + "\t" + attrs.lastModifiedTime().toMillis());
+        // the index walk's own skip rules, so a change the index would not see is no change
+        Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<>() {
+            @Override
+            public java.nio.file.FileVisitResult preVisitDirectory(Path dir, java.nio.file.attribute.BasicFileAttributes a) {
+                String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                return !dir.equals(root) && ProjectIndexManager.isSkippedDir(name)
+                        ? java.nio.file.FileVisitResult.SKIP_SUBTREE : java.nio.file.FileVisitResult.CONTINUE;
             }
-        }
+
+            @Override
+            public java.nio.file.FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) {
+                lines.add(root.relativize(f) + "\t" + a.size() + "\t" + a.lastModifiedTime().toMillis());
+                return java.nio.file.FileVisitResult.CONTINUE;
+            }
+        });
         java.util.Collections.sort(lines);
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");

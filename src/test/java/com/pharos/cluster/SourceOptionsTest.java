@@ -61,4 +61,31 @@ class SourceOptionsTest {
             });
         }
     }
+
+    @Test
+    void sourceForDiscoveredSubprojectIsRefused() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            Path repo = tmp.resolve("repo");
+            java.nio.file.Files.createDirectories(repo.resolve("service"));
+            java.nio.file.Files.writeString(repo.resolve("service/pom.xml"), "<project/>");
+            IndexCommand cmd = new IndexCommand(c.writerManager,
+                    new com.pharos.graph.CrossProjectLinker(c.writerConfig, c.writerRegistry),
+                    c.writerRegistry, c.writerConfig, c.writerRuntime);
+            PrintStream old = System.err;
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
+            System.setErr(new PrintStream(err));
+            int exit;
+            try {
+                exit = new CommandLine(cmd).execute(repo.toString(), "--no-embed", "--no-synonyms", "--no-progress",
+                        "--source-git", "https://example.org/r.git", "--ref", "main");
+            } finally {
+                System.setErr(old);
+            }
+            assertThat(exit).isEqualTo(2);
+            assertThat(err.toString()).contains("sources for subprojects are not supported yet");
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries()).isEmpty();
+            assertThat(c.writerRegistry.find("service")).isEmpty();
+        }
+    }
 }
