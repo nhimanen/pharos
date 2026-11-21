@@ -75,13 +75,15 @@ class CachedCatalogTest {
         c.shards();
         failing = true;
         now.addAndGet(601 * S);
+        c.shards(); // starts a background read, which fails
+        refreshes.remove(0).run();
         assertThatThrownBy(c::shards).isInstanceOf(CatalogUnavailableException.class)
                 .isNotInstanceOf(CatalogNeverReadException.class)
                 .hasMessageContaining("cluster.maxCatalogAgeSeconds");
     }
 
     @Test
-    void anOldCatalogIsNamedInTheQueryWarnings() {
+    void anOldCatalogIsNamedInTheQueryWarnings() throws Exception {
         CachedCatalog c = catalog();
         ReaderHealth health = new ReaderHealth(30);
         ShardRouter router = new ShardRouter(List::of, c, health, id -> false);
@@ -92,6 +94,8 @@ class CachedCatalogTest {
             assertThat(ds.open(List.of()).warnings()).noneMatch(w -> w.startsWith("routing with a catalog"));
             now.addAndGet(61 * S);
             failing = true;
+            c.shards(); // starts a background read, which fails
+            refreshes.remove(0).run();
             assertThat(ds.open(List.of()).warnings()).contains("routing with a catalog 61 s old");
             assertThat(ds.open(List.of("a")).warnings()).as("a scoped query does not use the catalog")
                     .noneMatch(w -> w.startsWith("routing with a catalog"));
@@ -170,5 +174,109 @@ class CachedCatalogTest {
         hung.run();
         assertThat(c.shards()).as("the abandoned read's result is not stored").containsExactly(new ShardId("fresh"));
         assertThat(c.ageSeconds()).as("nor its read time").isEqualTo(1);
+    }
+
+    // ---------------------------------------------------------------- final review I1
+
+    /** A refresher that runs each read on its own thread, 50 ms later (a real, not instant, store). */
+    private static void later(Runnable r) {
+        Thread.ofVirtual().start(() -> {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                return;
+            }
+            r.run();
+        });
+    }
+
+    /** I1: idle past maxAge with a healthy store, the first query briefly waits for the fresh read. */
+    @Test
+    void idlePastMaxAgeWithAHealthyStoreTheFirstQueryRoutesNormally() throws Exception {
+        CachedCatalog c = new CachedCatalog(store, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                CachedCatalogTest::later, Duration.ofSeconds(60), Duration.ofMillis(2_000));
+        c.shards();
+        now.addAndGet(700 * S);
+        assertThat(c.shards()).as("no CatalogTooOldException: the store is healthy").hasSize(2);
+        assertThat(c.ageSeconds()).as("the query waited for the read it started").isZero();
+        assertThat(reads).hasValue(2);
+    }
+
+    /** I1: the same through the coordinator: no "routing with a catalog N s old" warning, no fallback. */
+    @Test
+    void idlePastMaxAgeWithAHealthyStoreGivesNoWarning() {
+        CachedCatalog c = new CachedCatalog(store, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                CachedCatalogTest::later, Duration.ofSeconds(60), Duration.ofMillis(2_000));
+        ReaderHealth health = new ReaderHealth(30);
+        ShardRouter router = new ShardRouter(List::of, c, health, id -> false);
+        DistributedSearch ds = new DistributedSearch(router,
+                new ShardClient(health, "t", Duration.ofMillis(100), Duration.ofMillis(100)), null, null, null,
+                Duration.ofSeconds(5), c::staleSeconds);
+        try {
+            assertThat(ds.open(List.of()).warnings()).noneMatch(w -> w.startsWith("routing with a catalog"));
+            now.addAndGet(700 * S);
+            assertThat(ds.open(List.of()).warnings()).as("idle is not stale: routed (no CatalogTooOldException),"
+                    + " no age warning").noneMatch(w -> w.contains("catalog"));
+        } finally {
+            ds.close();
+        }
+    }
+
+    /** I1: a healthy read slower than the wait leaves the held catalog in use, without warning or refusal. */
+    @Test
+    void aSlowHealthyReadIsNotTakenForAFailure() throws Exception {
+        CachedCatalog c = new CachedCatalog(store, Duration.ofSeconds(5), Duration.ofSeconds(600), now::get,
+                refreshes::add, Duration.ofSeconds(60), Duration.ofMillis(20));
+        c.shards();
+        now.addAndGet(700 * S);
+        assertThat(c.shards()).as("the read has not finished, but nothing failed").hasSize(2);
+        assertThat(c.staleSeconds()).isZero();
+        refreshes.remove(0).run();
+        assertThat(c.ageSeconds()).isZero();
+    }
+
+    /** I1: the background timer's tick re-reads the catalog with no query asking. */
+    @Test
+    void tickRefreshesWithoutAQuery() throws Exception {
+        CachedCatalog c = catalog();
+        c.shards();
+        now.addAndGet(6 * S);
+        c.tick();
+        assertThat(refreshes).hasSize(1);
+        refreshes.remove(0).run();
+        assertThat(reads).hasValue(2);
+        c.tick();
+        assertThat(refreshes).as("not due again yet").isEmpty();
+        now.addAndGet(700 * S);
+        c.tick();
+        refreshes.remove(0).run();
+        assertThat(c.ageSeconds()).isZero();
+    }
+
+    /** I1: before any read a tick does nothing (the first read stays a query's, with its back-off). */
+    @Test
+    void tickBeforeTheFirstReadDoesNothing() {
+        CachedCatalog c = catalog();
+        c.tick();
+        assertThat(refreshes).isEmpty();
+        assertThat(reads).hasValue(0);
+    }
+
+    /** I1: with reads failing, staleSeconds reports the age (the warning stays). */
+    @Test
+    void staleSecondsReportsTheAgeOnlyWhileReadsFail() throws Exception {
+        CachedCatalog c = catalog();
+        c.shards();
+        now.addAndGet(61 * S);
+        assertThat(c.staleSeconds()).isZero();
+        failing = true;
+        c.tick();
+        refreshes.remove(0).run();
+        assertThat(c.staleSeconds()).isEqualTo(61);
+        failing = false;
+        now.addAndGet(5 * S);
+        c.tick();
+        refreshes.remove(0).run();
+        assertThat(c.staleSeconds()).isZero();
     }
 }

@@ -9,17 +9,25 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
 /**
  * The shard catalog as a coordinator routes with it: re-read at most every {@code refreshEvery}, in
- * the background once a first read succeeded, so no query waits on the object store. A failed read
- * backs off for {@code refreshEvery} and keeps the last good catalog; once that is older than
- * {@code maxAge} ({@code cluster.maxCatalogAgeSeconds}), unscoped routing is refused (503). Before
- * any good read, {@link #shards} throws {@link CatalogNeverReadException} (one blocking attempt per
- * back-off period; concurrent callers do not wait on it).
+ * the background once a first read succeeded, by a timer ({@link #tick}, which the reader runs every
+ * {@code refreshEvery}) and by queries. A failed read backs off for {@code refreshEvery} and keeps the
+ * last good catalog. Before any good read, {@link #shards} throws {@link CatalogNeverReadException}
+ * (one blocking attempt per back-off period; concurrent callers do not wait on it).
+ *
+ * <p><b>Stale versus failing.</b> A catalog that is merely old (the timer was not running, or the
+ * node was idle) is not an error: a query that finds it older than {@code 2 × refreshEvery} while
+ * nothing has failed waits for the read in flight, at most {@code maxWait}, and then routes with
+ * whatever it has, without warning. Only while reads are actually <i>failing</i> (the last one
+ * failed, or one has been running longer than {@code refreshEvery}) does the age count:
+ * {@link #staleSeconds} reports it (the query warning) and, past {@code maxAge}
+ * ({@code cluster.maxCatalogAgeSeconds}), unscoped routing is refused ({@link CatalogTooOldException}).
  */
 public final class CachedCatalog implements ShardCatalog {
 
@@ -46,6 +54,8 @@ public final class CachedCatalog implements ShardCatalog {
     /** The token of the abandoned read still running, or 0: at most one is ever abandoned at a time. */
     private final AtomicLong abandoned = new AtomicLong();
     private final long hungNanos;
+    /** The longest a query waits for the read in flight when the catalog is stale and nothing failed. */
+    private final long maxWaitNanos;
 
     private volatile List<ShardId> cached;
     private volatile long readAt;          // last good read
@@ -64,6 +74,16 @@ public final class CachedCatalog implements ShardCatalog {
      */
     public CachedCatalog(ShardCatalog base, Duration refreshEvery, Duration maxAge, LongSupplier nanoClock,
                          Executor refresher, Duration hungAfter) {
+        this(base, refreshEvery, maxAge, nanoClock, refresher, hungAfter, Duration.ZERO);
+    }
+
+    /**
+     * @param maxWait how long a query waits for the read in flight when the catalog is stale and no
+     *                read failed (bounded by the caller to a small part of the query budget)
+     */
+    public CachedCatalog(ShardCatalog base, Duration refreshEvery, Duration maxAge, LongSupplier nanoClock,
+                         Executor refresher, Duration hungAfter, Duration maxWait) {
+        this.maxWaitNanos = Math.max(0, maxWait.toNanos());
         this.hungNanos = hungAfter.toNanos();
         this.base = base;
         this.refreshNanos = refreshEvery.toNanos();
@@ -77,6 +97,36 @@ public final class CachedCatalog implements ShardCatalog {
         long now = clock.getAsLong();
         List<ShardId> current = cached;
         if (current == null) return firstShards(now);
+        startRefreshIfDue(now);
+        if (now - readAt > 2 * refreshNanos && lastFailure == null) {
+            awaitRefresh(); // stale, not failing: the read just started (or running) is likely quick
+            current = cached;
+            now = clock.getAsLong();
+        }
+        long age = now - readAt;
+        if (age > maxAgeNanos && failing(now)) {
+            IOException f = lastFailure;
+            throw new CatalogTooOldException("the shard catalog was last read " + age / 1_000_000_000L
+                    + " s ago, over cluster.maxCatalogAgeSeconds (" + maxAgeNanos / 1_000_000_000L + " s)"
+                    + (f == null ? "" : ": " + f.getMessage()), f, current, age / 1_000_000_000L);
+        }
+        return current;
+    }
+
+    /**
+     * The background timer's step: starts a re-read when one is due (never before the first good
+     * read, which stays a query's). Never blocks and never throws.
+     */
+    public void tick() {
+        if (cached == null) return;
+        try {
+            startRefreshIfDue(clock.getAsLong());
+        } catch (RuntimeException e) {
+            log.debug("Catalog refresh tick failed: {}", e.toString());
+        }
+    }
+
+    private void startRefreshIfDue(long now) {
         long since = runningSince.get();
         if (since != IDLE && now - since > hungNanos) giveUp(since, now); // watchdog: a read that hangs
         if (now - attemptAt >= refreshNanos && runningSince.compareAndSet(IDLE, now)) {
@@ -88,14 +138,31 @@ public final class CachedCatalog implements ShardCatalog {
                 runningSince.compareAndSet(now, IDLE);
             }
         }
-        long age = now - readAt;
-        if (age > maxAgeNanos) {
-            throw new CatalogTooOldException("the shard catalog was last read " + age / 1_000_000_000L
-                    + " s ago, over cluster.maxCatalogAgeSeconds (" + maxAgeNanos / 1_000_000_000L + " s)"
-                    + (lastFailure == null ? "" : ": " + lastFailure.getMessage()), lastFailure, current,
-                    age / 1_000_000_000L);
+    }
+
+    /** Waits, at most {@code maxWait} of real time, for the background read in flight to finish. */
+    private void awaitRefresh() {
+        if (maxWaitNanos == 0) return;
+        long end = System.nanoTime() + maxWaitNanos;
+        synchronized (this) {
+            while (runningSince.get() != IDLE) {
+                long left = end - System.nanoTime();
+                if (left <= 0) return;
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(this, left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         }
-        return current;
+    }
+
+    /** Reads are failing: the last one failed, or the one in flight has run longer than refreshEvery. */
+    private boolean failing(long now) {
+        if (lastFailure != null) return true;
+        long since = runningSince.get();
+        return since != IDLE && now - since > refreshNanos;
     }
 
     private List<ShardId> firstShards(long now) {
@@ -143,6 +210,7 @@ public final class CachedCatalog implements ShardCatalog {
             }
             refreshToken.incrementAndGet(); // its late result is discarded
             runningSince.set(IDLE);
+            notifyAll(); // queries waiting on it route with what they have
         }
         log.warn("The background read of the shard catalog has run {} s; starting another",
                 (now - since) / 1_000_000_000L);
@@ -168,6 +236,7 @@ public final class CachedCatalog implements ShardCatalog {
                     lastFailure = failure instanceof IOException io ? io : new IOException(failure.toString(), failure);
                 }
                 runningSince.set(IDLE);
+                notifyAll(); // queries waiting in awaitRefresh
             }
         }
         abandoned.compareAndSet(token, 0); // an abandoned read has finished
@@ -180,5 +249,15 @@ public final class CachedCatalog implements ShardCatalog {
     /** Seconds since the last good read; -1 before the first. */
     public long ageSeconds() {
         return cached == null ? -1 : (clock.getAsLong() - readAt) / 1_000_000_000L;
+    }
+
+    /**
+     * {@link #ageSeconds} while reads are failing (what a query warns about); 0 while they are not,
+     * however old the last read (an idle node's catalog is not stale); -1 before the first read.
+     */
+    public long staleSeconds() {
+        if (cached == null) return -1;
+        long now = clock.getAsLong();
+        return failing(now) ? (now - readAt) / 1_000_000_000L : 0;
     }
 }

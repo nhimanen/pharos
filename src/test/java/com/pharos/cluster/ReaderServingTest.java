@@ -363,4 +363,40 @@ class ReaderServingTest {
         assertThat(lastCache.active(JAVA)).isEmpty();
         assertThat(dir).as("deactivating keeps the directory for the retire grace").isDirectory();
     }
+
+    /** Final review I1: a coordinator's catalog is re-read on a timer; draining and close stop it. */
+    @Test
+    void coordinatorRunsACatalogTimerUntilDrainOrClose() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        var parts = ClusterFixture.reader(tmp.resolve("timer"), store, "b", "t1", List.of());
+        extra.add(parts.lucene());
+        extra.add(parts.runtime());
+        SearchEngine engine = new SearchEngine(parts.lucene(), EmbeddingProvider.create(parts.config()), parts.registry());
+        assertThat(parts.runtime().catalogTimer()).as("no coordinator yet").isNull();
+        parts.runtime().internalApi(engine);
+        var first = parts.runtime().catalogTimer();
+        assertThat(first).isNotNull();
+        assertThat(first.isShutdown()).isFalse();
+        parts.runtime().internalApi(engine); // a replaced coordinator replaces its timer
+        assertThat(first.isShutdown()).isTrue();
+        var second = parts.runtime().catalogTimer();
+        assertThat(second).isNotNull().isNotSameAs(first);
+        parts.runtime().drain();
+        assertThat(parts.runtime().catalogTimer()).isNull();
+        assertThat(second.isShutdown()).isTrue();
+
+        var other = ClusterFixture.reader(tmp.resolve("timer2"), store, "b", "t2", List.of());
+        extra.add(other.lucene());
+        other.runtime().internalApi(new SearchEngine(other.lucene(), EmbeddingProvider.create(other.config()),
+                other.registry()));
+        var t = other.runtime().catalogTimer();
+        other.runtime().close();
+        assertThat(t.isShutdown()).as("close stops it").isTrue();
+    }
+
+    @Test
+    void catalogWaitIsBoundedByTheQueryBudget() {
+        assertThat(ClusterRuntime.catalogWait(10_000)).isEqualTo(java.time.Duration.ofMillis(500));
+        assertThat(ClusterRuntime.catalogWait(2_000)).isEqualTo(java.time.Duration.ofMillis(200));
+    }
 }

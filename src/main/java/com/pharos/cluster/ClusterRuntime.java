@@ -82,6 +82,8 @@ public final class ClusterRuntime implements Closeable {
     private ScheduledExecutorService follower;
     private Thread firstSyncThread;
     private boolean serving;
+    /** Re-reads the coordinator's shard catalog every {@link #CATALOG_CACHE}; null until a coordinator exists. */
+    private ScheduledExecutorService catalogTimer;
     private volatile boolean ready;
     private boolean closed;
     /** The search models' warm-up readiness also waits for; settled at once unless given. */
@@ -318,6 +320,7 @@ public final class ClusterRuntime implements Closeable {
      */
     public void drain() {
         draining = true;
+        stopCatalogTimer(); // queries still refresh on demand while the drain runs
         com.pharos.cluster.membership.ReaderRegistry r;
         synchronized (this) { r = readerRegistry; }
         if (r != null) r.drain();
@@ -370,6 +373,28 @@ public final class ClusterRuntime implements Closeable {
     }
 
     /**
+     * How long a query waits for a catalog read in flight when the held catalog is stale but no read
+     * failed: 500 ms, and never more than a tenth of the query budget.
+     */
+    static Duration catalogWait(long queryTimeoutMillis) {
+        return Duration.ofMillis(Math.max(0, Math.min(500, queryTimeoutMillis / 10)));
+    }
+
+    /** The coordinator's catalog timer while it runs; null otherwise (tests). */
+    synchronized ScheduledExecutorService catalogTimer() {
+        return catalogTimer;
+    }
+
+    private void stopCatalogTimer() {
+        ScheduledExecutorService t;
+        synchronized (this) {
+            t = catalogTimer;
+            catalogTimer = null;
+        }
+        if (t != null) t.shutdownNow();
+    }
+
+    /**
      * Readers: the {@code /internal/*} API with {@code engine}'s shard search behind it, and the
      * engine made a coordinator for shards this reader does not hold (Phase 3 fan-out): it routes over
      * the live readers of the bucket, with suspect marking, the cluster token and the configured
@@ -388,16 +413,32 @@ public final class ClusterRuntime implements Closeable {
                 Duration.ofSeconds(c.getMaxCatalogAgeSeconds()), System::nanoTime,
                 r -> Thread.ofVirtual().name("pharos-catalog-refresh").start(r),
                 c.getObjectStore() == null ? Duration.ofSeconds(60)
-                        : c.getObjectStore().readTotalTimeout().multipliedBy(2)); // the store's own bound, with slack
+                        : c.getObjectStore().readTotalTimeout().multipliedBy(2), // the store's own bound, with slack
+                catalogWait(c.effectiveQueryTimeoutMillis()));
         var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, catalog, health,
                 id -> servesShard(id.value()), client::inFlight);
         var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),
-                engine.vectorStrategy(), Duration.ofMillis(c.effectiveQueryTimeoutMillis()), catalog::ageSeconds);
+                engine.vectorStrategy(), Duration.ofMillis(c.effectiveQueryTimeoutMillis()), catalog::staleSeconds);
         com.pharos.search.distributed.DistributedSearch previous;
+        ScheduledExecutorService previousTimer;
+        ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pharos-catalog-timer");
+            t.setDaemon(true);
+            return t;
+        });
         synchronized (this) {
             previous = distributed;
             distributed = ds;
+            previousTimer = catalogTimer;
+            catalogTimer = null;
+            if (!closed && !draining) { // an idle coordinator keeps its catalog fresh (no first-query wait)
+                long every = CATALOG_CACHE.toMillis();
+                timer.scheduleWithFixedDelay(catalog::tick, every, every, TimeUnit.MILLISECONDS);
+                catalogTimer = timer;
+            }
         }
+        if (catalogTimer() != timer) timer.shutdownNow();
+        if (previousTimer != null) previousTimer.shutdownNow();
         if (previous != null) previous.close();
         engine.setDistributed(ds);
         engine.setLocalDegradation(this::degradation);
@@ -800,6 +841,7 @@ public final class ClusterRuntime implements Closeable {
             }
         }
         if (members != null) members.close();
+        stopCatalogTimer();
         com.pharos.search.distributed.DistributedSearch ds;
         synchronized (this) {
             ds = distributed;
