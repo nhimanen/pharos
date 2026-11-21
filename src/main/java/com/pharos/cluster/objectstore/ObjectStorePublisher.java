@@ -121,6 +121,35 @@ public final class ObjectStorePublisher implements IndexPublisher {
         this.synonymsFile = synonymsFile;
     }
 
+    /** Attempts of the synonyms CAS before the publish fails. */
+    static final int SYNONYMS_CAS_ATTEMPTS = 8;
+
+    /**
+     * Merges this writer's synonyms into {@code catalog/synonyms.txt} ({@link SynonymsMerge}): only
+     * {@code shard}'s section is replaced, every other shard's rules stay, and the result is the same
+     * whichever writer publishes it. A conditional put on the ETag read; on a race it re-reads and
+     * merges again. Unchanged bytes are not rewritten. A bucket with the Phase 1–3 single file is
+     * read the same way (it has the same layout).
+     */
+    private void publishSynonyms(ShardId shard) throws IOException {
+        if (synonymsFile == null || !Files.isRegularFile(synonymsFile)) return;
+        String local = new String(Files.readAllBytes(synonymsFile), StandardCharsets.UTF_8);
+        String key = layout.synonymsKey();
+        for (int attempt = 0; attempt < SYNONYMS_CAS_ATTEMPTS; attempt++) {
+            Optional<StoredObject> remote = store.get(key);
+            byte[] merged = SynonymsMerge.merge(
+                    remote.map(r -> new String(r.data(), StandardCharsets.UTF_8)).orElse(null), local, shard.value())
+                    .getBytes(StandardCharsets.UTF_8);
+            if (remote.isPresent() && java.util.Arrays.equals(remote.get().data(), merged)) return;
+            Optional<String> written = remote.isPresent()
+                    ? store.putIfMatch(key, merged, remote.get().etag())
+                    : store.putIfAbsent(key, merged);
+            if (written.isPresent()) return;
+        }
+        throw new IOException("synonyms.txt changed under " + SYNONYMS_CAS_ATTEMPTS
+                + " concurrent publishes in a row; retry the publish");
+    }
+
     /** Object keys embed the shard id, so the project name must be a valid one. */
     @Override
     public void checkPublishable(String project) {
@@ -212,10 +241,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 bytesUploaded += mf.length();
             }
 
-            // 4. Synonyms are cluster-wide; last writer wins.
-            if (synonymsFile != null && Files.isRegularFile(synonymsFile)) {
-                store.put(layout.synonymsKey(), synonymsFile);
-            }
+            // 4. Synonyms are cluster-wide: replace only this shard's section (a CAS read-modify-write).
+            publishSynonyms(shard);
 
             // 5. Catalog before the commit point (idempotent).
             catalog.register(shard);
