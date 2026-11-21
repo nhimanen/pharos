@@ -77,6 +77,9 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   part (see Changed).
 
 ### Fixed
+- Multi-node: `pharos mcp-server` on a reader no longer joins reader membership. It wrote the
+  heartbeat of the `web` daemon's node id (same config), and on exit marked it draining and deleted
+  it; it now serves the reader's own shards only, and exits without a drain wait.
 - Shutdown order on SIGTERM/SIGINT/SIGHUP: the reader drain, then the running model calls, then
   exit; JVM shutdown hooks (ONNX Runtime's environment closer among them) start only after that, so
   a signal no longer frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies

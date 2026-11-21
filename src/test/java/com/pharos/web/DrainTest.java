@@ -143,7 +143,7 @@ class DrainTest {
             }
         }, "trickle");
         try {
-            reader.runtime().startServing();
+            reader.runtime().startServing(true);
             await("first heartbeat", () -> heartbeat(store, "r1").isPresent());
             assertThat(heartbeat(store, "r1").orElseThrow().draining()).isFalse();
             assertThat(reader.runtime().draining()).isFalse();
@@ -187,7 +187,7 @@ class DrainTest {
         AtomicInteger inFlight = new AtomicInteger(1);
         reader.runtime().setInFlight(inFlight::get);
         try {
-            reader.runtime().startServing();
+            reader.runtime().startServing(true);
             CompletableFuture<Void> stop = CompletableFuture.runAsync(reader.runtime()::drainAndClose);
             Thread.sleep(6_000);
             assertThat(stop).as("past the quiet period, still waiting for the request").isNotDone();
@@ -304,12 +304,46 @@ class DrainTest {
         var reader = ClusterFixture.reader(tmp.resolve("r2"), store, "b", "r2", List.of(), c -> c.setDrainSeconds(1));
         reader.runtime().setInFlight(() -> 3);
         try {
-            reader.runtime().startServing();
+            reader.runtime().startServing(true);
             long start = System.nanoTime();
             reader.runtime().drainAndClose();
             long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
             assertThat(millis).isBetween(900L, 5_000L);
             assertThat(heartbeat(store, "r2")).isEmpty();
+        } finally {
+            reader.runtime().close();
+            reader.lucene().close();
+        }
+    }
+
+    // ---------------------------------------------------------------- final review I3: mcp-server on a reader
+
+    /**
+     * I3: {@code pharos mcp-server} on a reader ({@code startServing(false)}, no {@code /internal/*})
+     * writes no heartbeat, and its exit neither marks draining nor deletes the heartbeat the web
+     * reader of the same node id (another process, same config) keeps in the bucket. Nor does it wait
+     * for a drain nobody can observe.
+     */
+    @Test
+    void mcpModeServingWritesNoHeartbeatAndLeavesAnotherProcessesAlone() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        var reader = ClusterFixture.reader(tmp.resolve("mcp"), store, "b", "shared", List.of(), c -> c.setDrainSeconds(20));
+        String key = "pharos/catalog/readers/shared.json";
+        byte[] webReaders = new ObjectMapper().writeValueAsBytes(new ReaderHeartbeat("shared",
+                "http://web-reader:7171", List.of("java"), false, null, 2, 1.0, 0L, ReaderHeartbeat.READY, List.of()));
+        store.put(key, webReaders);
+        try {
+            reader.runtime().startServing(false);
+            Thread.sleep(2_500); // heartbeatSeconds is 1: an advertising process would have written twice
+            assertThat(new String(store.get(key).orElseThrow().data())).as("not overwritten").isEqualTo(new String(webReaders));
+            assertThat(reader.runtime().liveReaders()).as("no membership at all").isEmpty();
+
+            long start = System.nanoTime();
+            reader.runtime().drainAndClose(); // the MCP client closed stdio: Main's fallback hook
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertThat(millis).as("no drain wait in a process nobody routes to").isLessThan(2_000L);
+            assertThat(store.get(key)).as("the web reader's heartbeat is not deleted").isPresent();
+            assertThat(new String(store.get(key).orElseThrow().data())).as("nor marked draining").isEqualTo(new String(webReaders));
         } finally {
             reader.runtime().close();
             reader.lucene().close();

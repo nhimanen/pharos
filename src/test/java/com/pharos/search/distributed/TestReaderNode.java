@@ -90,7 +90,7 @@ final class TestReaderNode implements AutoCloseable {
         api.mount(app);
         app.start(0);
         parts.config().getCluster().setAdvertiseUrl("http://localhost:" + app.port());
-        parts.runtime().startServing();
+        parts.runtime().startServing(true); // as pharos web: advertises
     }
 
     /** The node stops answering (connection refused) while its heartbeat stays live: dead, not drained. */

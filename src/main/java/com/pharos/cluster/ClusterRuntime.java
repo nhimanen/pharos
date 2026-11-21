@@ -82,6 +82,11 @@ public final class ClusterRuntime implements Closeable {
     private ScheduledExecutorService follower;
     private Thread firstSyncThread;
     private boolean serving;
+    /**
+     * True when this process serves {@code /internal/*} (the {@code pharos web} reader): only then does
+     * it join reader membership (heartbeat) and register the shutdown drain. Guarded by this.
+     */
+    private boolean advertised;
     /** Re-reads the coordinator's shard catalog every {@link #CATALOG_CACHE}; null until a coordinator exists. */
     private ScheduledExecutorService catalogTimer;
     private volatile boolean ready;
@@ -260,7 +265,7 @@ public final class ClusterRuntime implements Closeable {
     public void drainAndClose() {
         boolean serve;
         synchronized (this) {
-            serve = isReader() && serving && !closed;
+            serve = isReader() && serving && advertised && !closed;
         }
         if (serve) {
             drain();
@@ -492,7 +497,15 @@ public final class ClusterRuntime implements Closeable {
      * not: failures are logged and retried every poll interval).
      */
     public void startServing() throws IOException {
-        beginServing();
+        startServing(false);
+    }
+
+    /**
+     * {@link #beginServing(java.util.concurrent.CompletionStage, boolean)} with no models to wait for,
+     * then waits for the first sync pass. {@code advertise}: see there.
+     */
+    public void startServing(boolean advertise) throws IOException {
+        beginServing(java.util.concurrent.CompletableFuture.completedFuture(null), advertise);
         awaitFirstSync();
     }
 
@@ -517,11 +530,26 @@ public final class ClusterRuntime implements Closeable {
      * readiness (the caller bounds a hanging load with a timeout).
      */
     public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded) throws IOException {
+        beginServing(modelsLoaded, false);
+    }
+
+    /**
+     * {@link #beginServing(java.util.concurrent.CompletionStage)}; with {@code advertise} the process
+     * also joins reader membership (its heartbeat in {@code catalog/readers/<node>.json}, so
+     * coordinators and the router send it shard calls and queries) and registers the shutdown drain.
+     * Only a process that serves {@code /internal/*} may advertise: {@code pharos web}. A
+     * {@code pharos mcp-server} on a reader does not: it has no {@code /internal/*} behind the
+     * advertise URL, and on a shared config it would overwrite, mark draining and delete the web
+     * reader's heartbeat (same node id). It searches only the shards this reader holds.
+     */
+    public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded, boolean advertise)
+            throws IOException {
         java.util.Objects.requireNonNull(modelsLoaded, "modelsLoaded");
         synchronized (this) {
             if (!isReader() || serving) return;
             if (closed) throw new IllegalStateException("cluster runtime is closed");
             models = modelsLoaded;
+            advertised = advertise;
             ReaderLocalCache cache = readerCache();
             Optional<SyncLock> lock = SyncLock.tryAcquire(cacheDir());
             serving = true;
@@ -530,13 +558,15 @@ public final class ClusterRuntime implements Closeable {
             } else {
                 becomeFollower();
             }
-            startMembership();
+            if (advertise) startMembership();
         }
-        // On a signal the drain runs before any shutdown hook (ONNX Runtime's environment closer
-        // among them), while queries that call the models are still served.
-        AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("reader drain", this::drainAndClose);
-        synchronized (this) {
-            drainStep = step;
+        if (advertise) {
+            // On a signal the drain runs before any shutdown hook (ONNX Runtime's environment closer
+            // among them), while queries that call the models are still served.
+            AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("reader drain", this::drainAndClose);
+            synchronized (this) {
+                drainStep = step;
+            }
         }
         modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
     }

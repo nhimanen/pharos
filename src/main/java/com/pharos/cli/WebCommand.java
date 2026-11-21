@@ -62,7 +62,8 @@ public class WebCommand implements Callable<Integer> {
                 clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for
                 clusterRuntime.beginServing(searchEngine != null
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
-                        : java.util.concurrent.CompletableFuture.completedFuture(null)); // no wait
+                        : java.util.concurrent.CompletableFuture.completedFuture(null), // no wait
+                        true); // serves /internal/*: joins reader membership, drains on shutdown
                 webServer.setReadiness(clusterRuntime::ready);
                 webServer.setDraining(clusterRuntime::draining);
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
