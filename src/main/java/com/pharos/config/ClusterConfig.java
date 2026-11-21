@@ -32,6 +32,7 @@ public class ClusterConfig {
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
     private ReaderConfig reader = new ReaderConfig();
+    private WriterConfig writer = new WriterConfig();
     /** Base URL other nodes reach this reader at; required on readers. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String advertiseUrl;
@@ -177,6 +178,8 @@ public class ClusterConfig {
         }
         if (reader == null) reader = new ReaderConfig();
         reader.validate();
+        if (writer == null) writer = new WriterConfig();
+        writer.validate();
         if (backend == BackendKind.OBJECT_STORE) {
             objectStore.validate();
             String prefix = objectStore.getPrefix();
@@ -220,6 +223,8 @@ public class ClusterConfig {
     public ObjectStoreConfig getObjectStore() { return objectStore; }
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
+    public WriterConfig getWriter() { return writer; }
+    public void setWriter(WriterConfig writer) { this.writer = writer == null ? new WriterConfig() : writer; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
     public int getDrainSeconds() { return drainSeconds; }
     public void setDrainSeconds(int v) { this.drainSeconds = v; }
@@ -341,6 +346,35 @@ public class ClusterConfig {
             return Math.min(cacheMaxBytes, Math.max(4 * blockSizeBytes, cacheMaxBytes / 8));
         }
         public void setMaxConcurrentFetches(int v) { this.maxConcurrentFetches = v; }
+    }
+
+    /**
+     * {@code cluster.writer}: where a writer keeps source checkouts and how it follows sources.
+     * Only writer nodes use it.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class WriterConfig {
+        private Path workDir = IndexConfig.DEFAULT_BASE.resolve("work");
+        /** How often a writer polls a shard's source (git ls-remote, directory state) for changes. */
+        private int pollSeconds = 60;
+        /** Work-queue mode (leases and takeover). Opt-in; nothing reads it before the work-queue task. */
+        private boolean workQueue = false;
+
+        public void validate() {
+            if (workDir == null) {
+                throw new IllegalStateException("cluster.writer.workDir must not be empty");
+            }
+            if (pollSeconds <= 0) {
+                throw new IllegalStateException("cluster.writer.pollSeconds must be positive, got " + pollSeconds);
+            }
+        }
+
+        public Path getWorkDir() { return workDir; }
+        public void setWorkDir(Path workDir) { this.workDir = workDir; }
+        public int getPollSeconds() { return pollSeconds; }
+        public void setPollSeconds(int v) { this.pollSeconds = v; }
+        public boolean isWorkQueue() { return workQueue; }
+        public void setWorkQueue(boolean v) { this.workQueue = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

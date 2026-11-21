@@ -1,7 +1,9 @@
 package com.pharos.cluster.objectstore;
 
 import com.pharos.cluster.PublishConflictException;
+import com.pharos.cluster.ShardEntry;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.ShardSource;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -77,5 +79,62 @@ class ObjectStoreCatalogTest {
         catalog.register(new ShardId("s"));
         assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
         assertThat(sleeps).isEmpty();
+    }
+
+    @Test
+    void registerRecordsAndUpdatesSourceIdempotently() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        ShardSource first = ShardSource.git("https://example.org/r.git", "main");
+        catalog.register(new ShardId("s"), Optional.of(first));
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        catalog.register(new ShardId("s"), Optional.of(first));
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("unchanged: no write").isEqualTo(etag);
+
+        ShardSource moved = ShardSource.path("/shared/s");
+        catalog.register(new ShardId("s"), Optional.of(moved));
+        assertThat(catalog.entries()).containsExactly(new ShardEntry(new ShardId("s"), Optional.of(moved)));
+        assertThat(catalog.shards()).containsExactly(new ShardId("s"));
+    }
+
+    @Test
+    void olderWritersRegisterKeepsExistingSource() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        ShardSource src = ShardSource.git("https://example.org/r.git", "v1");
+        catalog.register(new ShardId("s"), Optional.of(src));
+        catalog.register(new ShardId("s"));                       // a writer that knows no sources
+        catalog.register(new ShardId("s"), Optional.empty());
+        assertThat(catalog.entries().get(0).source()).contains(src);
+    }
+
+    @Test
+    void noSourceShardIsPinnedToItsWriter() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("plain"));
+        catalog.register(new ShardId("shared"), Optional.of(ShardSource.path("/srv/x")));
+        assertThat(catalog.entries()).extracting(ShardEntry::source)
+                .containsExactly(Optional.empty(), Optional.of(ShardSource.path("/srv/x")));
+        assertThat(new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8))
+                .doesNotContain("\"source\":{\"kind\":\"git\"");
+    }
+
+    @Test
+    void credentialsNeverStoredInCatalog() throws Exception {
+        for (String url : new String[] {"https://user:s3cret@example.org/r.git", "https://ghp_token@example.org/r.git"}) {
+            assertThatThrownBy(() -> ShardSource.git(url, "main"))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("credentials")
+                    .hasMessageNotContaining("s3cret").hasMessageNotContaining("ghp_token");
+        }
+        assertThatThrownBy(() -> ShardSource.git("https://bad host:s3cret@x/\\u0000", "main"))
+                .hasMessageNotContaining("s3cret");
+        // ssh user names and scp-style urls carry no secret
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("a"), Optional.of(ShardSource.git("ssh://git@example.org/r.git", "main")));
+        catalog.register(new ShardId("b"), Optional.of(ShardSource.git("git@example.org:r.git", "main")));
+        assertThat(catalog.entries()).hasSize(2);
     }
 }

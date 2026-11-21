@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardCatalog;
+import com.pharos.cluster.ShardEntry;
+import com.pharos.cluster.ShardSource;
 import com.pharos.cluster.ShardId;
 
 import org.slf4j.Logger;
@@ -20,7 +22,7 @@ import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * The cluster's shard list, {@code catalog/shards.json}: {@code {"shards":[{"id":"..."}]}}.
+ * The cluster's shard list, {@code catalog/shards.json}: {@code {"shards":[{"id":"...","source":{...}}]}}, source optional.
  * Updated by compare-and-set; unknown fields are preserved.
  */
 public final class ObjectStoreCatalog implements ShardCatalog {
@@ -68,21 +70,51 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         return List.copyOf(out);
     }
 
+    /** The listed shards with their sources; the same entries, in the same order, as {@link #shards()}. */
+    public List<ShardEntry> entries() throws IOException {
+        Optional<StoredObject> current = store.get(layout.catalogKey());
+        if (current.isEmpty()) return List.of();
+        List<ShardEntry> out = new ArrayList<>();
+        for (JsonNode s : shardsArray(parse(current.get().data()))) {
+            String id = s.path("id").asText();
+            try {
+                out.add(new ShardEntry(new ShardId(id), ShardSource.fromJson(s.get("source"))));
+            } catch (IllegalArgumentException e) {
+                log.warn("Catalog {} lists an invalid shard id '{}'; skipping it", layout.catalogKey(), id);
+            }
+        }
+        return List.copyOf(out);
+    }
+
+    /** Adds {@code shard} if absent, keeping any {@code source} it already has. */
+    public void register(ShardId shard) throws IOException {
+        register(shard, Optional.empty());
+    }
+
     /**
-     * Adds {@code shard} if absent: CAS read-modify-write, up to {@value #MAX_ATTEMPTS} attempts
+     * Adds {@code shard} if absent and, when {@code source} is present, sets or replaces its source;
+     * an empty {@code source} leaves an existing one alone (an older writer that does not know sources
+     * cannot erase it). Nothing is written when nothing changes. CAS read-modify-write, up to {@value #MAX_ATTEMPTS} attempts
      * with jittered exponential back-off between them. Idempotent.
      */
-    public void register(ShardId shard) throws IOException {
+    public void register(ShardId shard, Optional<ShardSource> source) throws IOException {
         String key = layout.catalogKey();
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             if (attempt > 1) backoff(attempt);
             Optional<StoredObject> current = store.get(key);
             ObjectNode root = current.isPresent() ? parse(current.get().data()) : JSON.createObjectNode();
             ArrayNode shards = shardsArray(root);
+            ObjectNode entry = null;
             for (JsonNode s : shards) {
-                if (shard.value().equals(s.path("id").asText())) return;
+                if (shard.value().equals(s.path("id").asText()) && s instanceof ObjectNode o) { entry = o; break; }
             }
-            shards.addObject().put("id", shard.value());
+            if (entry == null) {
+                entry = shards.addObject();
+                entry.put("id", shard.value());
+            } else if (source.isEmpty() || ShardSource.fromJson(entry.get("source")).equals(source)) {
+                return;
+            }
+            if (source.isPresent()) source.get().writeTo(entry.putObject("source"));
             byte[] data = JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(root);
             Optional<String> etag = current.isPresent()
                     ? store.putIfMatch(key, data, current.get().etag())

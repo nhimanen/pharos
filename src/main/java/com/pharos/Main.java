@@ -157,7 +157,7 @@ public class Main {
         @SuppressWarnings("unchecked")
         public <K> K create(Class<K> cls) throws Exception {
             if (cls == IndexCommand.class)
-                return (K) new IndexCommand(indexManager, crossProjectLinker, registry, config);
+                return (K) new IndexCommand(indexManager, crossProjectLinker, registry, config, clusterRuntime);
             if (cls == SearchCommand.class)
                 return (K) new SearchCommand(searchEngine);
             if (cls == GetMethodCommand.class)

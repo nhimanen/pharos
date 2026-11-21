@@ -16,6 +16,7 @@ import picocli.CommandLine.*;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -73,15 +74,29 @@ public class IndexCommand implements Callable<Integer> {
             defaultValue = "1")
     private int projectThreads = 1;
 
+    @Mixin
+    private SourceOptions sourceOptions = new SourceOptions();
+
     private final ProjectIndexManager indexManager;
     private final CrossProjectLinker crossProjectLinker;
     private final ProjectRegistry registry;
     private final IndexConfig config;
+    /** Where shard sources are recorded; null on a node without a cluster backend. */
+    private final com.pharos.cluster.ClusterRuntime runtime;
 
     public IndexCommand(ProjectIndexManager indexManager,
                         CrossProjectLinker crossProjectLinker,
                         ProjectRegistry registry,
                         IndexConfig config) {
+        this(indexManager, crossProjectLinker, registry, config, null);
+    }
+
+    public IndexCommand(ProjectIndexManager indexManager,
+                        CrossProjectLinker crossProjectLinker,
+                        ProjectRegistry registry,
+                        IndexConfig config,
+                        com.pharos.cluster.ClusterRuntime runtime) {
+        this.runtime = runtime;
         this.indexManager = indexManager;
         this.crossProjectLinker = crossProjectLinker;
         this.registry = registry;
@@ -98,11 +113,23 @@ public class IndexCommand implements Callable<Integer> {
             return 2;
         }
         Path root = path.toAbsolutePath();
+        Optional<com.pharos.cluster.ShardSource> source;
+        try {
+            source = sourceOptions.source(runtime);
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
 
         try {
             if (!single) {
                 List<DiscoveredProject> projects = ProjectDiscovery.discover(root, depth);
                 if (projects.size() > 1) {
+                    if (source.isPresent()) {
+                        System.err.println("A source applies to one project; " + projects.size()
+                                + " projects were discovered. Index each with --single --project <name>.");
+                        return 2;
+                    }
                     return indexMultiple(projects);
                 }
                 // Single project discovered (or root itself is the project) — fall through
@@ -117,7 +144,9 @@ public class IndexCommand implements Callable<Integer> {
                 projectName = fn == null ? "" : fn.toString();
             }
             ProjectNames.validate(projectName);
-            return indexSingle(root, projectName);
+            int rc = indexSingle(root, projectName);
+            if (rc == 0 && source.isPresent()) SourceOptions.record(runtime, projectName, source.get());
+            return rc;
 
         } catch (Exception e) {
             System.err.println("\nError indexing project: " + e.getMessage());

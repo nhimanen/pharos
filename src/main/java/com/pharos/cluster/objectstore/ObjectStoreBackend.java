@@ -76,6 +76,9 @@ public final class ObjectStoreBackend implements ReplicationBackend {
 
     @Override public ShardCatalog catalog() { return catalog; }
 
+    /** The catalog with its write side ({@code register}, source entries). */
+    public ObjectStoreCatalog objectStoreCatalog() { return catalog; }
+
     @Override public ReplicaSource source() { return source; }
 
     @Override

@@ -330,4 +330,18 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":-1}}")).hasMessageContaining("cluster.drainSeconds");
         assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":3601}}")).hasMessageContaining("cluster.drainSeconds");
     }
+
+    @Test
+    void writerSectionDefaultsAndValidation() throws Exception {
+        ClusterConfig.WriterConfig w = parse("{}").getWriter();
+        assertThat(w.getPollSeconds()).isEqualTo(60);
+        assertThat(w.isWorkQueue()).isFalse();
+        assertThat(w.getWorkDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("work"));
+        w = parse("{\"cluster\":{\"writer\":{\"workDir\":\"/w\",\"pollSeconds\":5,\"workQueue\":true}}}").getWriter();
+        assertThat(w.getWorkDir()).isEqualTo(Path.of("/w"));
+        assertThat(w.getPollSeconds()).isEqualTo(5);
+        assertThat(w.isWorkQueue()).isTrue();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"pollSeconds\":0}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.pollSeconds");
+    }
 }

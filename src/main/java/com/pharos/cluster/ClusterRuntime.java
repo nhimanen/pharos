@@ -375,6 +375,12 @@ public final class ClusterRuntime implements Closeable {
         }
     }
 
+    /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
+    public Optional<com.pharos.cluster.objectstore.ObjectStoreCatalog> sourceCatalog() {
+        return backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os
+                ? Optional.of(os.objectStoreCatalog()) : Optional.empty();
+    }
+
     public IndexPublisher publisher() {
         return backend.publisher();
     }
