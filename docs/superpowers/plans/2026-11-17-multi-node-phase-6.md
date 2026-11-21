@@ -14,7 +14,48 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-15-multi-node-design.md`, section "Sharding" and Phase 6 in "Phases and gates". The live doc is rev 61.
 
-**Base:** branch `feat/cluster-phase-6` from Phase 4. Phase 6 needs Phase 3's fan-out and distributed statistics, and Phase 4's leases and writer state. **Refresh this plan before execution** against what Phases 3 and 4 built (`ShardRouter`, `DistributedSearch`, `LeaseManager`, `WriterStateStore`, `/cluster/status` reshard proposals).
+**Base:** branch `feat/cluster-phase-6` from Phase 4 after its final review. Phase 6 needs Phase 3's fan-out and distributed statistics, and Phase 4's leases and writer state.
+
+**Refreshed 2026-11-21** against Phase 3 (788882d) and Phase 4 at the gate (feat/cluster-phase-4 ≥ 63d8249). The section below lists what is built and the rulings this phase must honour. **Process (user, 2026-11-21):** only Critical and Important review findings are fixed; Minor findings are skipped.
+
+## What Phases 3–4 built that Phase 6 changes (refresh, 2026-11-21)
+
+**Shard = project is assumed everywhere today.** `ShardId` is `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and appears in about 37 files. The places that equate a shard with a project:
+- `ShardRouter` and `CachedCatalog`, which route by shard id;
+- `InternalApi` and `ShardSearchService`, which resolve a shard id to a registry project;
+- `WorkLoop`, where one shard means one source, one lease, one local index dir and one run;
+- `WriterStateStore`, which is keyed per shard;
+- the status, the proposals and the Cluster page, which have one row per shard.
+
+Task 1 introduces an explicit **project ↔ shards mapping** in the catalog (`projects[{name, spec, shards[]}]`). Every place above reads the mapping. None of them may infer the project from the id string.
+
+**Rulings (refresh):**
+- **P6-R1: the indexing unit is still the project.**
+  - Indexing a project is one parse pass that feeds N shard writers, so the writer running it must own all N shards. The Phase 4 balancer therefore treats a split project as one work unit:
+    - it acquires every shard lease of the project, or none;
+    - it counts the project's work as one unit;
+    - it releases all of them together, at a clean point.
+  - Splitting a project helps readers (cache size and query fan-out), not writers.
+  - *Cost if wrong:* a single huge project can't be indexed in parallel by several writers. That would be a later phase: parse partitioning.
+- **P6-R2: writer state becomes per project.**
+  - The embed cache and `file-state.json` live in the project's writer dir and are backed up once per project, at `projects/<project>/writer-state/`. This is not per shard.
+  - The project-level compact graph (`projects/<project>/graph/gen-N@crc`) is what restore imports into ArcadeDB, which is R8b's path.
+  - With spec `[project]`, the Phase 4 layout (`shards/<project>/writer-state/`) stays readable. A restore checks the old path first, so a cluster upgraded mid-flight still takes over without a full index.
+- **P6-R3: `ShardId` gains `~` and `=`.**
+  - Every place that turns an id into an object key or a file path must use the URL-safe encoding from Task 1. That includes `ObjectStoreLayout`, the local cache dirs, the `ReaderLocalCache` generation dirs and `BlockCache` keys.
+  - Add a test that runs every `ObjectStoreLayout` key builder with an id containing `~` and `=`.
+- **P6-R4: status and proposals.**
+  - `Proposals.java:273` still suggests `[project, hash(path) % N]`. Change it to `[project, ring(path, shards=N)]`, or `shards=N+1` for a project that is already ringed.
+  - The Cluster page groups shards under their project.
+  - A ring change that is in progress shows in the backlog panel as staged shards.
+- **P6-R5: reader placement.**
+  - Phase 3's `reader.shards` accepts the new ids, plus a project wildcard `lucene~*` that means every shard of a project. Without the wildcard, pinning readers to a project breaks the moment that project is split.
+- **P6-R6: global statistics across the shards of one project.**
+  - Phase 3's term-stats round (`GlobalTermsScope`) is already global across shards.
+  - Add a test: a query scoped to one split project gets the same BM25 scores as the unsplit project. This is Task 2's `partitionedIndexUnionEqualsUnpartitioned`, run through `DistributedSearch` rather than only through Lucene.
+- **P6-R7: relative paths.**
+  - The ring hashes `normalizedRelativePath`. The todo "relative paths in indexes" (file-state and `filePath`) is separate and can land before or after.
+  - If it lands first, reuse its normaliser here.
 
 ## Decisions made here (confirm before execution)
 
