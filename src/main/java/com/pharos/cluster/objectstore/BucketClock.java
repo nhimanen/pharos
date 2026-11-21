@@ -3,7 +3,9 @@ package com.pharos.cluster.objectstore;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Comparator;
 import java.util.Optional;
 
@@ -53,5 +55,22 @@ public final class BucketClock {
      */
     public static boolean expired(Instant lastModified, Instant now, Duration ttl) {
         return age(lastModified, now).compareTo(ttl) > 0;
+    }
+
+    /** A listing entry and its age at the bucket's "now". */
+    public record Aged(ObjectInfo info, Duration age) {}
+
+    /**
+     * The entries of a listing that are not {@link #expired} at {@code now}, with their
+     * {@link #age}, in listing order. Entries without a LastModified are skipped. The liveness rule
+     * of every heartbeat registry (readers and writers).
+     */
+    public static List<Aged> unexpired(Collection<ObjectInfo> infos, Instant now, Duration ttl) {
+        List<Aged> out = new ArrayList<>();
+        for (ObjectInfo i : infos) {
+            if (i.lastModified() == null || expired(i.lastModified(), now, ttl)) continue;
+            out.add(new Aged(i, age(i.lastModified(), now)));
+        }
+        return out;
     }
 }

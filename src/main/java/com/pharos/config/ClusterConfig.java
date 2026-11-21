@@ -157,6 +157,12 @@ public class ClusterConfig {
             throw new IllegalStateException("cluster.readerTtlSeconds must exceed cluster.heartbeatSeconds ("
                     + heartbeatSeconds + "), got " + readerTtlSeconds);
         }
+        if (role == NodeRole.WRITER && writer.isWorkQueue() && heartbeatSeconds >= writer.getLeaseTtlSeconds()) {
+            // a writer's heartbeat is its liveness (TTL = the lease TTL) and the bucket's clock for its leases
+            throw new IllegalStateException("cluster.heartbeatSeconds (" + heartbeatSeconds
+                    + ") must be below cluster.writer.leaseTtlSeconds (" + writer.getLeaseTtlSeconds()
+                    + ") in work-queue mode");
+        }
         if (role == NodeRole.READER) {
             if (advertiseUrl == null || advertiseUrl.isBlank()) {
                 throw new IllegalStateException("cluster.advertiseUrl is required on a reader (the base URL other nodes reach it at)");
@@ -364,6 +370,12 @@ public class ClusterConfig {
          * older than this may be taken over; the holder renews every TTL/3.
          */
         private int leaseTtlSeconds = 30;
+        /**
+         * Work-queue mode: a lease this writer acquired is never released for balance within this
+         * many seconds of acquiring it (and only right after a publish of that shard, or when it has
+         * nothing unpublished), so leases don't bounce while writers join and leave.
+         */
+        private int minHoldSeconds = 120;
 
         static final int MIN_LEASE_TTL_SECONDS = 5;
 
@@ -378,6 +390,9 @@ public class ClusterConfig {
             if (pollSeconds <= 0) {
                 throw new IllegalStateException("cluster.writer.pollSeconds must be positive, got " + pollSeconds);
             }
+            if (minHoldSeconds < 0) {
+                throw new IllegalStateException("cluster.writer.minHoldSeconds must not be negative, got " + minHoldSeconds);
+            }
         }
 
         public Path getWorkDir() { return workDir; }
@@ -388,6 +403,8 @@ public class ClusterConfig {
         public void setWorkQueue(boolean v) { this.workQueue = v; }
         public int getLeaseTtlSeconds() { return leaseTtlSeconds; }
         public void setLeaseTtlSeconds(int v) { this.leaseTtlSeconds = v; }
+        public int getMinHoldSeconds() { return minHoldSeconds; }
+        public void setMinHoldSeconds(int v) { this.minHoldSeconds = v; }
 
         /** {@code leaseTtlSeconds}. */
         public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }

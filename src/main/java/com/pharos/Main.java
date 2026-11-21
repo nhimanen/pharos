@@ -81,6 +81,7 @@ public class Main {
         parsers.add(new GenericFileParser(parseThreads, config.maxFileSizeBytes(true))); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
                 config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers, clusterRuntime.publisher());
+        clusterRuntime.setIndexManager(indexManager); // a work-queue writer's loop indexes through it
         CrossEncoder crossEncoder = buildCrossEncoder(config);
         SearchEngine searchEngine = new SearchEngine(luceneIndexer, searchEmbedder, registry, crossEncoder);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);

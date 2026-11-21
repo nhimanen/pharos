@@ -23,6 +23,11 @@ public final class ObjectStoreLayout {
 
     public String readersPrefix() { return root + "catalog/readers/"; }
 
+    /** Heartbeat of writer {@code node} (work-queue mode): {@code catalog/writers/<node>.json}. */
+    public String writerKey(String node) { return writersPrefix() + node + ".json"; }
+
+    public String writersPrefix() { return root + "catalog/writers/"; }
+
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
     public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }

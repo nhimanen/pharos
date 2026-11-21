@@ -58,6 +58,11 @@ public class PublishCommand implements Callable<Integer> {
             System.err.println(e.getMessage());
             return 2;
         }
+        Optional<String> refusal = runtime.manualPublishRefusal(projectName);
+        if (refusal.isPresent()) {
+            System.err.println("Not publishing " + projectName + ": " + refusal.get());
+            return 2;
+        }
         Optional<com.pharos.cluster.ShardSource> source;
         try {
             source = sourceOptions.source(runtime);

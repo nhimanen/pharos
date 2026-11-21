@@ -72,6 +72,12 @@ public final class ClusterRuntime implements Closeable {
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private com.pharos.cluster.membership.ReaderRegistry readerRegistry;
+    /** The indexer a work-queue writer's loop runs; set by Main. */
+    private volatile com.pharos.indexer.ProjectIndexManager indexManager;
+    /** The work queue of a writer with {@code cluster.writer.workQueue: true} while it runs. Guarded by this. */
+    private com.pharos.cluster.writer.WorkLoop workLoop;
+    /** Removes the writer's signal-time stop step. Guarded by this. */
+    private AutoCloseable writerStopStep;
     /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
     private com.pharos.search.distributed.DistributedSearch distributed;
     /** How often the coordinator re-reads the shard catalog (in the background) for "every project" queries. */
@@ -373,6 +379,78 @@ public final class ClusterRuntime implements Closeable {
         } catch (RuntimeException e) {
             log.warn("Starting reader membership failed: {}", e.toString());
         }
+    }
+
+    /** The indexer the work loop of a work-queue writer runs (and publishes through). */
+    public void setIndexManager(com.pharos.indexer.ProjectIndexManager indexManager) {
+        this.indexManager = Objects.requireNonNull(indexManager, "indexManager");
+    }
+
+    /** True on {@code role: writer} with {@code cluster.writer.workQueue: true}. */
+    public boolean isWorkQueueWriter() {
+        ClusterConfig c = config.getCluster();
+        return c.getRole() == NodeRole.WRITER && c.getWriter().isWorkQueue();
+    }
+
+    /**
+     * Why {@code pharos index} / {@code pharos publish} must not publish {@code project} by hand
+     * here: on a work-queue writer only the work loop publishes, under the shard's lease. Empty on
+     * every other node.
+     */
+    public Optional<String> manualPublishRefusal(String project) {
+        return isWorkQueueWriter()
+                ? Optional.of(com.pharos.cluster.writer.WorkQueueLeaseGuard.refusal(project)) : Optional.empty();
+    }
+
+    /**
+     * Starts the work queue of a work-queue writer ({@code pharos web} on {@code role: writer} with
+     * {@code cluster.writer.workQueue: true}): leases, heartbeat {@code catalog/writers/<node>.json}
+     * and the polling loop. Its graceful stop runs on a signal before model calls stop (within
+     * {@code cluster.drainSeconds}) and on {@link #close}. No-op on every other node and when running.
+     *
+     * @return true when the work loop runs
+     */
+    public boolean beginWriting() {
+        if (!isWorkQueueWriter() || !(backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os)) {
+            return false;
+        }
+        com.pharos.indexer.ProjectIndexManager pim = indexManager;
+        if (pim == null) throw new IllegalStateException("no index manager set for the work loop");
+        ClusterConfig c = config.getCluster();
+        com.pharos.cluster.writer.WorkLoop loop;
+        synchronized (this) {
+            if (closed) throw new IllegalStateException("cluster runtime is closed");
+            if (workLoop != null) return true;
+            ClusterConfig.WriterConfig w = c.getWriter();
+            loop = new com.pharos.cluster.writer.WorkLoop(new com.pharos.cluster.writer.WorkLoop.Settings(
+                    c.effectiveNodeId(), w.leaseTtl(), Duration.ofSeconds(c.getHeartbeatSeconds()),
+                    Duration.ofSeconds(w.getPollSeconds()), Duration.ofSeconds(w.getMinHoldSeconds()), true, true),
+                    os.store(), os.layout(), os.objectStoreCatalog(), os.source(), os.writerState(), pim,
+                    luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir()),
+                    java.time.Clock.systemUTC());
+            os.workQueueGuard().ifPresent(g -> g.attach(loop));
+            workLoop = loop;
+        }
+        loop.start();
+        AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("writer stop", this::stopWriting);
+        synchronized (this) {
+            writerStopStep = step;
+        }
+        return true;
+    }
+
+    /** The running work loop; empty unless {@link #beginWriting} started one. */
+    public synchronized Optional<com.pharos.cluster.writer.WorkLoop> workLoop() {
+        return Optional.ofNullable(workLoop);
+    }
+
+    /** Graceful stop of the work loop within {@code cluster.drainSeconds}; idempotent. */
+    private void stopWriting() {
+        com.pharos.cluster.writer.WorkLoop loop;
+        synchronized (this) {
+            loop = workLoop;
+        }
+        if (loop != null) loop.stop(Duration.ofSeconds(config.getCluster().getDrainSeconds()));
     }
 
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
@@ -887,6 +965,19 @@ public final class ClusterRuntime implements Closeable {
                 // removing from a list: cannot fail
             }
         }
+        AutoCloseable writerStep;
+        synchronized (this) {
+            writerStep = writerStopStep;
+            writerStopStep = null;
+        }
+        if (writerStep != null) {
+            try {
+                writerStep.close();
+            } catch (Exception e) {
+                // removing from a list: cannot fail
+            }
+        }
+        stopWriting(); // before the backend (the bucket client) closes
         if (members != null) members.close();
         stopCatalogTimer();
         com.pharos.search.distributed.DistributedSearch ds;

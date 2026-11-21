@@ -113,6 +113,13 @@ public class IndexCommand implements Callable<Integer> {
             return 2;
         }
         Path root = path.toAbsolutePath();
+        if (runtime != null && runtime.isWorkQueueWriter()) {
+            // an index run publishes; on a work-queue writer only the work loop holding the lease does
+            String name = projectName != null ? projectName
+                    : root.normalize().getFileName() == null ? "?" : root.normalize().getFileName().toString();
+            System.err.println("Not indexing: " + runtime.manualPublishRefusal(name).orElseThrow());
+            return 2;
+        }
         Optional<com.pharos.cluster.ShardSource> source;
         try {
             source = sourceOptions.source(runtime);

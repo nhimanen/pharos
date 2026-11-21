@@ -1383,6 +1383,7 @@ public class ProjectIndexManager {
         LongAdder hits   = new LongAdder();
         LongAdder misses = new LongAdder();
         AtomicInteger chunksDone = new AtomicInteger(0);
+        progress.onProgress("Embedding[" + rt.modelId() + "]", 0, totalChunks);
 
         ExecutorService pool = Executors.newFixedThreadPool(threads, r -> {
             Thread t = new Thread(r, "embed-" + rt.modelId());

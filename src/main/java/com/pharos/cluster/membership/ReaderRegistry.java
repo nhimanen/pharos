@@ -164,9 +164,9 @@ public final class ReaderRegistry implements Closeable {
             }
             Duration ttl = Duration.ofSeconds(cfg.getReaderTtlSeconds());
             List<LiveReader> out = new ArrayList<>();
-            for (ObjectInfo info : infos) {
-                if (BucketClock.expired(info.lastModified(), now, ttl)) continue;
-                Duration age = BucketClock.age(info.lastModified(), now);
+            for (BucketClock.Aged aged : BucketClock.unexpired(infos, now, ttl)) {
+                ObjectInfo info = aged.info();
+                Duration age = aged.age();
                 try {
                     store.get(info.key()).ifPresent(o -> {
                         try {

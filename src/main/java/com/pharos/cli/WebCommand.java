@@ -74,6 +74,10 @@ public class WebCommand implements Callable<Integer> {
                 com.pharos.cluster.internal.InternalApi internal = searchEngine != null
                         ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();
                 if (internal != null) webServer.setInternalApi(internal);
+                // a work-queue writer indexes and publishes the shards it holds the lease of
+                if (clusterRuntime.beginWriting()) {
+                    System.out.println("Writer work queue running (cluster.writer.workQueue)");
+                }
             }
             webServer.start(port);
             if (!noOpen) {
