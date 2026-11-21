@@ -259,6 +259,7 @@ public class ProjectRegistry {
         slim.setArtifactId(meta.getArtifactId());
         slim.setMavenVersion(meta.getMavenVersion());
         slim.setUnresolvedRefsHash(meta.getUnresolvedRefsHash());
+        slim.setSourceRevision(meta.getSourceRevision());
         // unresolvedRefs intentionally omitted — persisted in unresolved-refs.json
         return slim;
     }
