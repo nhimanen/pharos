@@ -158,6 +158,10 @@ public final class WorkLoop implements Closeable {
         final long startedAt;
         volatile String phase = WriterHeartbeat.PARSE;
         volatile double progress;
+        /** Free bytes of the index store when the run was admitted; -1 without a guard. */
+        volatile long freeAtStart = -1;
+        /** What the run had consumed when the guard aborted it for low disk; -1 when it didn't. */
+        volatile long consumedAtDiskAbort = -1;
 
         Run(ShardId shard, long startedAt) {
             this.shard = shard;
@@ -208,6 +212,13 @@ public final class WorkLoop implements Closeable {
     private volatile ShardId busy;
     /** Shards this writer released because it could not index them: not re-acquired before the instant. */
     private final Map<ShardId, Instant> avoidUntil = new ConcurrentHashMap<>();
+    /**
+     * Per shard: the space a run consumed before the guard aborted it for low disk. The next
+     * estimate is never below it (in memory, this writer only; cleared by a publish).
+     */
+    private final Map<ShardId, Long> estimateFloor = new ConcurrentHashMap<>();
+    /** The index store's free bytes when {@link #admitted} last admitted a run (loop thread). */
+    private long admittedFree = -1;
     private final Object diskMu = new Object();
     private ScheduledExecutorService diskWatch;
     private volatile boolean stopping;
@@ -600,6 +611,7 @@ public final class WorkLoop implements Closeable {
         else log.info("Shard {}: incremental index from {}", shard, why);
 
         Run run = new Run(shard, clock.millis());
+        run.freeAtStart = disk == null ? -1 : admittedFree;
         current = run;
         try {
             if (stopping) run.abort.request("stopping");
@@ -612,9 +624,16 @@ public final class WorkLoop implements Closeable {
             st.publishedGeneration = null; // re-read on the next poll
             publishes.merge(shard, 1, Integer::sum);
             leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::renew);
+            estimateFloor.remove(shard);
             return Outcome.PUBLISHED;
         } catch (IndexAbortedException e) {
             log.info("Run of shard {} aborted at a safe point; nothing was committed: {}", shard, e.getMessage());
+            long consumed = run.consumedAtDiskAbort;
+            if (consumed >= 0) {
+                long floor = estimateFloor.merge(shard, consumed, Math::max);
+                log.warn("Shard {}: its run had consumed {} when the disk ran low; its next run is estimated at"
+                        + " no less", shard, DiskGuard.bytes(floor));
+            }
             return Outcome.ABORTED;
         } catch (PublishConflictException e) {
             if (!leases.isHeld(shard)) {
@@ -648,10 +667,10 @@ public final class WorkLoop implements Closeable {
     private boolean admitted(ShardId shard, DiskGuard.EstimatedRun run) {
         if (disk == null) return true;
         disk.check();
-        if (disk.admits(run)) return true;
-        if (collectLeftovers() > 0) {
-            disk.check();
-            if (disk.admits(run)) return true;
+        if (!disk.admits(run) && collectLeftovers() > 0) disk.check();
+        if (disk.admits(run)) {
+            admittedFree = disk.indexStoreFreeBytes();
+            return true;
         }
         log.warn("Shard {}: not starting a {} run: it needs about {} and would leave {} free on the index disk"
                         + " (threshold {}){}", shard, run.full() ? "full" : "incremental",
@@ -663,25 +682,52 @@ public final class WorkLoop implements Closeable {
 
     /**
      * The run estimate of a shard with a local index ({@link DiskGuard.EstimatedRun}): sizes from the
-     * index dir, the changed share by walking the checkout against {@code file-state.json}.
+     * index dir; the run is full when the work loop or the indexer itself
+     * ({@link ProjectIndexManager#fullRunReason}: another index format, a broken graph pointer)
+     * makes it full; otherwise the changed share counts what the indexer will re-index, by
+     * the indexer's own tracker ({@link ProjectIndexManager#stateTracker}): content changes
+     * ({@link com.pharos.indexer.FileStateTracker#isDirty}) and, when embedding, files embedded
+     * under another chunking version or model
+     * ({@link com.pharos.indexer.FileStateTracker#isEmbeddingOutdated}). Never below the shard's
+     * floor from an earlier low-disk abort.
      */
-    private DiskGuard.EstimatedRun estimate(ShardId shard, Path indexDir, Path root, boolean full) {
+    DiskGuard.EstimatedRun estimate(ShardId shard, Path indexDir, Path root, boolean full) {
         if (disk == null) return null;
+        if (!full) {
+            String reason = indexer.fullRunReason(shard.value());
+            if (reason != null) {
+                log.info("Shard {}: estimating a full run ({})", shard, reason);
+                full = true;
+            }
+        }
         long luceneBytes = ProjectIndexManager.sizeOf(indexDir.resolve("lucene"));
         long graphBytes = ProjectIndexManager.sizeOf(com.pharos.graph.CallGraph.projectGraphDir(indexDir));
         long cacheBytes = embedCacheBytes(indexDir);
-        long[] src = sourceBytes(root, full ? null : new com.pharos.indexer.FileStateTracker(indexDir));
-        return new DiskGuard.EstimatedRun(shard.value(), full, luceneBytes, graphBytes, cacheBytes, src[0], src[1]);
+        java.util.function.Predicate<Path> changed = null;
+        if (!full) {
+            com.pharos.indexer.FileStateTracker t = indexer.stateTracker(indexDir, settings.embed());
+            boolean embed = settings.embed();
+            changed = f -> t.isDirty(f) || (embed && t.isEmbeddingOutdated(f));
+        }
+        long[] src = sourceBytes(root, changed);
+        return new DiskGuard.EstimatedRun(shard.value(), full, luceneBytes, graphBytes, cacheBytes, src[0], src[1])
+                .withFloor(estimateFloor.getOrDefault(shard, 0L));
     }
 
-    /** No local index: the restore brings the published generation, then a full run is the worst case. */
-    private DiskGuard.EstimatedRun estimateWithoutLocalIndex(ShardId shard, Path root) {
+    /**
+     * No local index. With a published generation the restore brings it, then a full run over its
+     * sizes is the worst case; with none it is a first index
+     * ({@link DiskGuard.EstimatedRun#firstIndex}: a multiple of the source size).
+     */
+    DiskGuard.EstimatedRun estimateWithoutLocalIndex(ShardId shard, Path root) {
         if (disk == null) return null;
         long luceneBytes = 0;
         long graphBytes = 0;
+        boolean published = false;
         try {
             Optional<Generation> latest = replicas.latest(shard);
             if (latest.isPresent()) {
+                published = true;
                 for (com.pharos.cluster.objectstore.ManifestFile f : replicas.manifest(shard, latest.get()).files()) {
                     if (com.pharos.cluster.objectstore.ManifestFile.LUCENE.equals(f.role())) luceneBytes += f.length();
                     else graphBytes += f.length();
@@ -691,9 +737,16 @@ public final class WorkLoop implements Closeable {
             log.debug("Sizing the published generation of {} failed: {}", shard, e.toString());
         }
         long[] src = sourceBytes(root, null);
+        long floor = estimateFloor.getOrDefault(shard, 0L);
+        if (!published) return DiskGuard.EstimatedRun.firstIndex(shard.value(), src[0]).withFloor(floor);
         long cacheBytes = luceneBytes; // the restored embedding cache: about the vectors the Lucene files hold
         return new DiskGuard.EstimatedRun(shard.value(), true, luceneBytes, graphBytes, cacheBytes, src[0], src[0],
-                luceneBytes + graphBytes + cacheBytes);
+                luceneBytes + graphBytes + cacheBytes, floor);
+    }
+
+    /** The shard's estimate floor from a low-disk abort (0 when none). */
+    long estimateFloor(ShardId shard) {
+        return estimateFloor.getOrDefault(shard, 0L);
     }
 
     private static long embedCacheBytes(Path indexDir) {
@@ -713,9 +766,9 @@ public final class WorkLoop implements Closeable {
 
     /**
      * {@code [total, changed]} bytes of the regular files under {@code root} ({@code .git} skipped);
-     * changed = files {@code tracker} sees as dirty (all of them without a tracker).
+     * changed = files {@code changed} accepts (all of them without a predicate).
      */
-    private static long[] sourceBytes(Path root, com.pharos.indexer.FileStateTracker tracker) {
+    private static long[] sourceBytes(Path root, java.util.function.Predicate<Path> changed) {
         long[] out = {0, 0};
         try {
             Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<>() {
@@ -730,7 +783,7 @@ public final class WorkLoop implements Closeable {
                 public java.nio.file.FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) {
                     if (!a.isRegularFile()) return java.nio.file.FileVisitResult.CONTINUE;
                     out[0] += a.size();
-                    if (tracker == null || tracker.isDirty(f)) out[1] += a.size();
+                    if (changed == null || changed.test(f)) out[1] += a.size();
                     return java.nio.file.FileVisitResult.CONTINUE;
                 }
 
@@ -784,7 +837,11 @@ public final class WorkLoop implements Closeable {
             if (s.low()) {
                 Run r = current;
                 if (r != null && !r.abort.requested()) {
+                    long freeNow = disk.indexStoreFreeBytes();
                     if (r.abort.request("writer low on disk")) {
+                        if (r.freeAtStart >= 0 && freeNow >= 0) {
+                            r.consumedAtDiskAbort = Math.max(0, r.freeAtStart - freeNow);
+                        }
                         log.warn("Writer {} is low on disk: aborting the run of shard {} at its next safe point",
                                 settings.node(), r.shard);
                     } else {

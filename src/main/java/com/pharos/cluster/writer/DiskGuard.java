@@ -86,26 +86,54 @@ public final class DiskGuard {
      *       plus the run's temporary vector caches, about the size of the persistent embedding
      *       cache).</li>
      *   <li><b>Incremental run:</b> the changed files' share {@code f = changedBytes / sourceBytes}
-     *       (by size, files the file-state tracker sees as dirty) of each of those terms: new
-     *       segments {@code f × luceneBytes}, the graph patch {@code f × graphBytes}, the spool
-     *       {@code f × (sourceBytes + embedCacheBytes)}.</li>
+     *       (by size) of each of those terms: new segments {@code f × luceneBytes}, the graph patch
+     *       {@code f × graphBytes}, the spool {@code f × (sourceBytes + embedCacheBytes)}. Changed
+     *       means what the indexer will re-index: files whose content changed and files embedded
+     *       under another chunking version or model. A run the indexer itself turns full (another
+     *       index format, a broken graph pointer) is estimated as full.</li>
      *   <li>Plus {@link #OVERHEAD_BYTES} for everything not modelled (segment merges of small
      *       commits, the publish's temp files, the writer-state backup snapshot, logs).</li>
-     *   <li>Plus {@code restoreBytes}: a shard with no local index is first restored from the
-     *       published generation (Lucene files and graph from its manifest, plus an embedding cache
-     *       assumed as large as its Lucene files, which hold the same vectors), and is then estimated
-     *       as a full run over those sizes.</li>
+     *   <li>Plus {@code extraBytes}, data the run writes besides those terms:
+     *     <ul>
+     *       <li>a shard with no local index is first restored from the published generation (its
+     *           Lucene files and graph from the manifest, plus an embedding cache assumed as large
+     *           as its Lucene files, which hold the same vectors) and then estimated as a full run
+     *           over those sizes;</li>
+     *       <li>a first index (nothing published, nothing local) has no sizes to go by:
+     *           {@link #firstIndex} assumes {@value #FIRST_INDEX_LUCENE_FACTOR}× the source for the
+     *           Lucene files (vectors included) and {@value #FIRST_INDEX_CACHE_FACTOR}× for the
+     *           embedding cache.</li>
+     *     </ul></li>
+     *   <li>At least {@code floorBytes}: what this writer last saw a run of the shard consume before
+     *       it was aborted for low disk (the estimate was too small once; it is not trusted below
+     *       that again).</li>
      * </ul>
      */
     public record EstimatedRun(String shard, boolean full, long luceneBytes, long graphBytes, long embedCacheBytes,
-                               long sourceBytes, long changedBytes, long restoreBytes) {
+                               long sourceBytes, long changedBytes, long extraBytes, long floorBytes) {
 
         /** Fixed allowance for what the estimate doesn't model (64 MiB). */
         public static final long OVERHEAD_BYTES = 64L << 20;
+        /** A first index's Lucene files (text, postings, vectors) per byte of source. */
+        public static final int FIRST_INDEX_LUCENE_FACTOR = 3;
+        /** A first index's persistent embedding cache per byte of source. */
+        public static final int FIRST_INDEX_CACHE_FACTOR = 1;
 
         public EstimatedRun(String shard, boolean full, long luceneBytes, long graphBytes, long embedCacheBytes,
                             long sourceBytes, long changedBytes) {
-            this(shard, full, luceneBytes, graphBytes, embedCacheBytes, sourceBytes, changedBytes, 0);
+            this(shard, full, luceneBytes, graphBytes, embedCacheBytes, sourceBytes, changedBytes, 0, 0);
+        }
+
+        /** A first index of {@code sourceBytes} of source: a full run writing everything new. */
+        public static EstimatedRun firstIndex(String shard, long sourceBytes) {
+            return new EstimatedRun(shard, true, 0, 0, 0, sourceBytes, sourceBytes,
+                    (long) (FIRST_INDEX_LUCENE_FACTOR + FIRST_INDEX_CACHE_FACTOR) * sourceBytes, 0);
+        }
+
+        /** This estimate, but never below {@code floor}. */
+        public EstimatedRun withFloor(long floor) {
+            return new EstimatedRun(shard, full, luceneBytes, graphBytes, embedCacheBytes, sourceBytes, changedBytes,
+                    extraBytes, Math.max(floorBytes, floor));
         }
 
         public long peakBytes() {
@@ -116,7 +144,7 @@ public final class DiskGuard {
                 double f = sourceBytes <= 0 ? 1.0 : Math.min(1.0, Math.max(0.0, (double) changedBytes / sourceBytes));
                 run = (long) Math.ceil(f * (luceneBytes + graphBytes + sourceBytes + embedCacheBytes));
             }
-            return run + restoreBytes + OVERHEAD_BYTES;
+            return Math.max(floorBytes, run + extraBytes + OVERHEAD_BYTES);
         }
     }
 

@@ -406,6 +406,43 @@ public class ProjectIndexManager {
         registry.unregister(projectName);
     }
 
+    /**
+     * Why an incremental run of {@code projectName} would be turned into a full one by this
+     * indexer, or null when it can run incrementally (also null with no index dir yet: that is a
+     * normal first full index). {@link #index} applies exactly this check; the writer disk guard's
+     * run estimate uses it too.
+     * <ul>
+     *   <li>An index written by another format can't be updated in place: rebuild it fully.</li>
+     *   <li>A broken graph pointer (malformed, or naming a generation that is gone, e.g. left behind
+     *       by an older pharos) can't be patched: patching would need a fresh, empty graph. A full
+     *       run rebuilds the graph and replaces the pointer.</li>
+     * </ul>
+     */
+    public String fullRunReason(String projectName) {
+        Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
+        if (!Files.isDirectory(existingDir)) return null;
+        if (IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
+            return "index format changed (" + IndexFormat.read(existingDir).format()
+                    + " → " + IndexVersions.INDEX_FORMAT + ")";
+        }
+        return CallGraph.pointerProblem(existingDir);
+    }
+
+    /**
+     * The file-state tracker a run of the project in {@code projectIndexDir} uses: stamped with
+     * {@link IndexVersions#CHUNKING_VERSION} and the current models' fingerprint, so
+     * {@link FileStateTracker#isEmbeddingOutdated} sees files embedded under another chunking or
+     * model. Without embeddings no model is involved: it stamps "none" rather than the configured
+     * models' fingerprint (stamping it claimed the files were embedded, so a later normal index
+     * never embedded unchanged files, and computing it loaded the models for {@code --no-embed}).
+     * The legacy aliases are model fingerprints too, skipped likewise.
+     */
+    public FileStateTracker stateTracker(Path projectIndexDir, boolean generateEmbeddings) {
+        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
+        List<String> legacyFps = generateEmbeddings ? legacyCompositeModelFingerprints() : List.of();
+        return new FileStateTracker(projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyFps);
+    }
+
     /** The full run's embedding-text spool in the project index dir. */
     static final String FULL_SPOOL = "embed.spool";
     /** The incremental run's embedding-text spool in the project index dir. */
@@ -565,23 +602,9 @@ public class ProjectIndexManager {
                               boolean buildSynonyms, ProgressListener progress,
                               IndexAbort abort) throws IOException {
         if (incremental) {
-            // An index written by another format can't be updated in place: rebuild it fully.
-            // A project with no index dir yet is just a normal first full index.
-            Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
-            if (Files.isDirectory(existingDir) && IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
-                String msg = "index format changed (" + IndexFormat.read(existingDir).format()
-                        + " → " + IndexVersions.INDEX_FORMAT + "): running a full re-index";
-                log.warn(msg);
-                progress.onProgress(msg, 0, 0);
-                incremental = false;
-            }
-            // A broken graph pointer (malformed, or naming a generation that is gone — e.g. left
-            // behind by an older pharos) can't be patched: patching would need a fresh, empty
-            // graph. A full run rebuilds the graph and replaces the pointer.
-            String pointerProblem = incremental && Files.isDirectory(existingDir)
-                    ? CallGraph.pointerProblem(existingDir) : null;
-            if (pointerProblem != null) {
-                String msg = pointerProblem + ": running a full re-index";
+            String reason = fullRunReason(projectName);
+            if (reason != null) {
+                String msg = reason + ": running a full re-index";
                 log.warn(msg);
                 progress.onProgress(msg, 0, 0);
                 incremental = false;
@@ -598,16 +621,8 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        // Without embeddings no model is involved: stamp "none" rather than the configured
-        // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
-        // were embedded, so a later normal `index` never embedded unchanged files — and
-        // computing it forced the models to load for `index --no-embed`.
-        // The legacy aliases are model fingerprints too: resolving them checks provider
-        // availability, which loads the model, so skip them as well when not embedding.
-        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
-        List<String> legacyFps = generateEmbeddings ? legacyCompositeModelFingerprints() : List.of();
-        FileStateTracker stateTracker = new FileStateTracker(
-                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyFps);
+        // "none" as the model fingerprint without embeddings (see stateTracker)
+        FileStateTracker stateTracker = stateTracker(projectIndexDir, generateEmbeddings);
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per
         // available provider. Full and incremental paths use slightly different
         // cache-file prefixes so a parallel re-index can't clobber an in-progress

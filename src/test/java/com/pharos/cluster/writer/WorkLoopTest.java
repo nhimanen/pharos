@@ -941,6 +941,102 @@ class WorkLoopTest {
         assertThat(heartbeatOf("node-b").orElseThrow().has("disk")).isFalse();
     }
 
+    // ------------------------------------------------- run estimates (fix round 1, I1)
+
+    private Path root(ShardId s) {
+        return sourceDirs.get(s).toAbsolutePath().normalize();
+    }
+
+    @Test
+    void estimateIsFullWhenTheIndexFormatDiffers() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a", new FakeDisk());
+        a.loop.tick();
+        Path dir = a.lucene.getProjectIndexDir(s.value());
+        DiskGuard.EstimatedRun before = a.loop.estimate(s, dir, root(s), false);
+        assertThat(before.full()).isFalse();
+        assertThat(before.changedBytes()).as("nothing changed").isZero();
+
+        // what a release bumping INDEX_FORMAT leaves: the indexer runs this one full
+        com.pharos.indexer.IndexFormat.write(dir, new com.pharos.indexer.IndexFormat.Stamp(
+                com.pharos.indexer.IndexVersions.INDEX_FORMAT - 1, "older", Instant.now()));
+        Path stamp = dir.resolve(com.pharos.indexer.IndexFormat.FILE_NAME);
+        Files.setLastModifiedTime(stamp, FileTime.fromMillis(Files.getLastModifiedTime(stamp).toMillis() + 5_000));
+        assertThat(a.manager.fullRunReason(s.value())).isNotNull();
+        DiskGuard.EstimatedRun after = a.loop.estimate(s, dir, root(s), false);
+        assertThat(after.full()).isTrue();
+        assertThat(after.peakBytes()).isGreaterThan(2 * after.luceneBytes());
+    }
+
+    @Test
+    void estimateCountsFilesEmbeddedUnderAnotherChunkingVersionAsChanged() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a", new FakeDisk());
+        a.loop.tick();
+        Path dir = a.lucene.getProjectIndexDir(s.value());
+        assertThat(a.loop.estimate(s, dir, root(s), false).changedBytes()).isZero();
+
+        // what a release bumping CHUNKING_VERSION leaves: every tracked file is re-embedded
+        Path state = dir.resolve("file-state.json");
+        JsonNode tree = JSON.readTree(state.toFile());
+        tree.fields().forEachRemaining(e -> ((com.fasterxml.jackson.databind.node.ObjectNode) e.getValue())
+                .put("chunkingVersion", com.pharos.indexer.IndexVersions.CHUNKING_VERSION - 1));
+        JSON.writeValue(state.toFile(), tree);
+
+        DiskGuard.EstimatedRun e = a.loop.estimate(s, dir, root(s), false);
+        assertThat(e.full()).isFalse();
+        assertThat(e.changedBytes()).as("the tracked source counts as changed").isPositive()
+                .isEqualTo(e.sourceBytes());
+    }
+
+    @Test
+    void firstIndexEstimateUsesTheSourceMultiplier() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a", new FakeDisk());
+        DiskGuard.EstimatedRun e = a.loop.estimateWithoutLocalIndex(s, root(s));
+        long source = e.sourceBytes();
+        assertThat(source).isPositive();
+        assertThat(e.full()).isTrue();
+        int lucene = DiskGuard.EstimatedRun.FIRST_INDEX_LUCENE_FACTOR, cache = DiskGuard.EstimatedRun.FIRST_INDEX_CACHE_FACTOR;
+        assertThat(e.peakBytes()).as("spool + %dx Lucene + %dx cache + overhead", lucene, cache)
+                .isEqualTo((1 + lucene + cache) * source + DiskGuard.EstimatedRun.OVERHEAD_BYTES);
+    }
+
+    @Test
+    void abortedRunRaisesTheNextEstimate() throws IOException {
+        ShardId s = pathShard("solo");
+        FakeDisk fake = new FakeDisk(); // 50 GiB free
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        Path dir = a.lucene.getProjectIndexDir(s.value());
+        change(s, "huge");
+        DiskGuard.EstimatedRun small = a.loop.estimate(s, dir, root(s), false);
+        assertThat(small.peakBytes()).isLessThan(GIB);
+
+        // the run eats 41 GiB before the guard aborts it
+        AtomicBoolean fired = new AtomicBoolean();
+        a.embedder.onBatch = n -> {
+            if (fired.compareAndSet(false, true)) {
+                fake.set(THRESHOLD - GIB);
+                a.loop.checkDisk();
+            }
+        };
+        rounds(1, 10, a);
+        assertThat(fired).isTrue();
+        assertThat(latest(s)).contains(Generation.FIRST);
+        assertThat(a.loop.estimateFloor(s)).isEqualTo(41 * GIB);
+
+        // space is back (40 GiB above the threshold), but the run is known to need more: not admitted
+        a.embedder.onBatch = n -> {};
+        fake.set(50 * GIB);
+        a.disk.check();
+        DiskGuard.EstimatedRun next = a.loop.estimate(s, dir, root(s), false);
+        assertThat(next.peakBytes()).isEqualTo(41 * GIB);
+        assertThat(a.disk.admits(next)).isFalse();
+        assertThat(a.disk.admits(small)).as("the old estimate would have been admitted again").isTrue();
+        assertThat(a.loop.estimateWithoutLocalIndex(s, root(s)).peakBytes()).isGreaterThanOrEqualTo(41 * GIB);
+    }
+
     // ----------------------------------------------------------- release rules (M4, M5)
 
     @Test

@@ -84,8 +84,16 @@ class DiskGuardTest {
         assertThat(unknown.peakBytes()).isEqualTo(lucene + graph + cache + DiskGuard.EstimatedRun.OVERHEAD_BYTES);
         // a restore comes on top
         DiskGuard.EstimatedRun restore = new DiskGuard.EstimatedRun("s", true, lucene, graph, cache, source, source,
-                lucene + graph + cache);
+                lucene + graph + cache, 0);
         assertThat(restore.peakBytes()).isEqualTo(full.peakBytes() + lucene + graph + cache);
+        // a first index: a multiple of the source
+        assertThat(DiskGuard.EstimatedRun.firstIndex("s", source).peakBytes()).isEqualTo(
+                (1 + DiskGuard.EstimatedRun.FIRST_INDEX_LUCENE_FACTOR + DiskGuard.EstimatedRun.FIRST_INDEX_CACHE_FACTOR)
+                        * source + DiskGuard.EstimatedRun.OVERHEAD_BYTES);
+        // a floor wins over a smaller estimate, never over a larger one
+        assertThat(incr.withFloor(5 * GIB).peakBytes()).isEqualTo(5 * GIB);
+        assertThat(full.withFloor(MIB).peakBytes()).isEqualTo(full.peakBytes());
+        assertThat(incr.withFloor(5 * GIB).withFloor(GIB).floorBytes()).as("a floor only grows").isEqualTo(5 * GIB);
     }
 
     @Test
