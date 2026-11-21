@@ -89,6 +89,42 @@ class RoleGuardTest {
         }
     }
 
+    /**
+     * Final review I2: on a work-queue writer the work loop owns the local indexes; upgrade-indexes,
+     * remove-index and embed are refused like index and publish, and touch nothing.
+     */
+    @Test
+    void workQueueWriterRefusesUpgradeRemoveAndEmbed() throws Exception {
+        IndexConfig config = ClusterFixture.config(tmp.resolve("w"), NodeRole.WRITER, "b");
+        config.getCluster().getWriter().setWorkQueue(true);
+        ProjectRegistry registry = ProjectRegistry.at(tmp.resolve("registry.json"));
+        ProjectIndexManager manager = new ProjectIndexManager(config, new LuceneIndexer(config), registry,
+                List.of(EmbeddingProvider.create(config)), ClusterFixture.noopModules(registry),
+                List.of(new JavaCodeParser()));
+        String[] err = new String[1];
+
+        int upgrade = captureErr(err, () -> new CommandLine(
+                new com.pharos.cli.UpgradeIndexesCommand(manager, registry, config)).execute("--yes"));
+        assertThat(upgrade).isEqualTo(5);
+        assertThat(err[0]).contains("Not running 'pharos upgrade-indexes'", "work-queue mode",
+                "restart the writers on the new release");
+
+        int remove = captureErr(err, () -> new CommandLine(
+                new com.pharos.cli.RemoveIndexCommand(registry, manager, config)).execute("--all"));
+        assertThat(remove).isEqualTo(2);
+        assertThat(err[0]).contains("Not running 'pharos remove-index'", "work-queue mode");
+
+        int embed = captureErr(err, () -> new CommandLine(
+                new com.pharos.cli.EmbedCommand(null, registry, config)).execute("--all", "--model", "m"));
+        assertThat(embed).isEqualTo(2);
+        assertThat(err[0]).contains("Not running 'pharos embed'", "work-queue mode");
+
+        // a writer that indexes by hand still may
+        config.getCluster().getWriter().setWorkQueue(false);
+        assertThatCode(() -> RoleGuard.requireNoWorkQueue(config, "x")).doesNotThrowAnyException();
+        assertThatCode(() -> RoleGuard.requireNoWorkQueue(IndexConfig.defaults(), "x")).doesNotThrowAnyException();
+    }
+
     @Test
     void readerAnswersModuleToolsNotAvailable() throws Exception {
         IndexConfig config = ClusterFixture.config(tmp.resolve("reader"), NodeRole.READER, "b");

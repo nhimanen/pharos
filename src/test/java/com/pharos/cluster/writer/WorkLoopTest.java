@@ -782,6 +782,70 @@ class WorkLoopTest {
         assertThat(b.lucene.getProjectIndexDir("solo").resolve(WorkLoop.FULL_RUN_REQUIRED)).doesNotExist();
     }
 
+    /** The WARN and INFO lines {@code logger} writes while {@code body} runs. */
+    private static List<String> logsOf(Class<?> logger, IoRunnable body) throws IOException {
+        var log = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(logger);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        log.addAppender(appender);
+        try {
+            body.run();
+        } finally {
+            log.detachAppender(appender);
+        }
+        return appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    /**
+     * Final review I2: a cluster upgrades by restarting its writers on the new release. A held shard
+     * whose source is unchanged is still pending, and gets a FULL run, when its local index needs one
+     * (another index format), its files were embedded under another chunking version, or its LATEST
+     * generation has an older index format. Once rebuilt it is idle again.
+     */
+    @Test
+    void idleShardIsRebuiltWhenThisReleaseNeedsAFullRun() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        assertThat(latest(s)).contains(Generation.FIRST);
+        rounds(1, 10, a);
+        assertThat(latest(s)).as("idle").contains(Generation.FIRST);
+        Path dir = a.lucene.getProjectIndexDir(s.value());
+
+        // 1. the local index has an older format
+        com.pharos.indexer.IndexFormat.write(dir, new com.pharos.indexer.IndexFormat.Stamp(
+                com.pharos.indexer.IndexVersions.INDEX_FORMAT - 1, "older", Instant.now()));
+        List<String> logs = logsOf(WorkLoop.class, () -> rounds(1, 10, a));
+        assertThat(latest(s)).contains(new Generation(2));
+        assertThat(logs).anyMatch(l -> l.contains("running a FULL index") && l.contains("index format"));
+
+        // 2. every file was embedded under another chunking version
+        Path state = dir.resolve("file-state.json");
+        JsonNode tree = JSON.readTree(state.toFile());
+        tree.fields().forEachRemaining(e -> ((com.fasterxml.jackson.databind.node.ObjectNode) e.getValue())
+                .put("chunkingVersion", com.pharos.indexer.IndexVersions.CHUNKING_VERSION - 1));
+        JSON.writeValue(state.toFile(), tree);
+        logs = logsOf(WorkLoop.class, () -> rounds(1, 10, a));
+        assertThat(latest(s)).contains(new Generation(3));
+        assertThat(logs).anyMatch(l -> l.contains("running a FULL index") && l.contains("chunking version"));
+
+        // 3. LATEST has an older index format (published by the previous release)
+        String key = layout.manifestKey(s, new Generation(3));
+        var manifest = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(store.get(key).orElseThrow().data());
+        ((com.fasterxml.jackson.databind.node.ObjectNode) manifest.get("indexFormat"))
+                .put("format", com.pharos.indexer.IndexVersions.INDEX_FORMAT - 1);
+        store.put(key, JSON.writeValueAsBytes(manifest));
+        logs = logsOf(WorkLoop.class, () -> rounds(1, 10, a));
+        assertThat(latest(s)).contains(new Generation(4));
+        assertThat(logs).anyMatch(l -> l.contains("running a FULL index") && l.contains("published generation 3"));
+        assertThat(replicas.manifest(s, new Generation(4)).indexFormatVersion())
+                .isEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
+
+        // rebuilt: idle again
+        rounds(3, 10, a);
+        assertThat(latest(s)).contains(new Generation(4));
+    }
+
     @Test
     void restoreStoreOutageRetriesInsteadOfAFullReembed() throws IOException {
         ShardId s = pathShard("solo");

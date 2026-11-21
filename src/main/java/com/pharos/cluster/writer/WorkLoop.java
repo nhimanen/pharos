@@ -156,6 +156,16 @@ public final class WorkLoop implements Closeable {
         volatile boolean lastPollOk;
         /** Failed runs in a row (reset by a publish); M4 releases a surplus shard at the limit. */
         volatile int consecutiveFailures;
+        /** The index format of the {@code LATEST} manifest ({@link #publishedGeneration}); -1 when unknown. */
+        volatile int publishedFormat = -1;
+        /** Why the local index needs a full run (loop thread, between runs); null when it doesn't. */
+        volatile String localUpgrade;
+        /** Why this shard needs a full run though its source is unchanged; null when it doesn't. */
+        volatile String upgrade;
+        /** {@code file-state.json} size and mtime when {@link #embeddingsOutdated} was computed. */
+        long stateStamp = Long.MIN_VALUE;
+        boolean stateEmbed;
+        boolean embeddingsOutdated;
     }
 
     /** The run in progress. */
@@ -514,6 +524,7 @@ public final class WorkLoop implements Closeable {
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
                 continue;
             }
+            st.localUpgrade = localUpgradeReason(shard, st);
             announce |= pollShard(shard, st);
         }
         // a change this poll found first (before the detector) is announced now, not after the runs
@@ -539,8 +550,13 @@ public final class WorkLoop implements Closeable {
             try {
                 refreshPublished(shard, st);
                 Optional<String> changed = checkout.changedSince(shard, st.publishedRevision);
+                st.upgrade = upgradeReason(st);
                 if (changed.isPresent()) {
                     st.sourceRevision = changed.get();
+                    if (st.pendingSince == null) st.pendingSince = clock.instant();
+                } else if (st.upgrade != null) {
+                    // the source is published, but the index must be rebuilt by this release
+                    st.sourceRevision = st.publishedRevision;
                     if (st.pendingSince == null) st.pendingSince = clock.instant();
                 } else {
                     st.sourceRevision = st.publishedRevision;
@@ -591,9 +607,55 @@ public final class WorkLoop implements Closeable {
             return;
         }
         if (latest.get().equals(st.publishedGeneration)) return;
-        ProjectMeta meta = replicas.manifest(shard, latest.get()).projectMeta();
+        ShardManifest manifest = replicas.manifest(shard, latest.get());
+        ProjectMeta meta = manifest.projectMeta();
         st.publishedRevision = meta == null ? null : meta.getSourceRevision();
+        st.publishedFormat = manifest.indexFormatVersion();
         st.publishedGeneration = latest.get();
+    }
+
+    /**
+     * Why a shard whose source is published still needs a FULL run with this release: its
+     * {@code LATEST} generation has an older index format, or its local index needs a full run
+     * ({@link #localUpgradeReason}). Null when it doesn't. This is how a cluster upgrades: restart
+     * the writers on the new release and every shard they hold is re-indexed and re-published.
+     */
+    private static String upgradeReason(ShardState st) {
+        if (st.publishedGeneration != null && st.publishedFormat >= 0
+                && st.publishedFormat < com.pharos.indexer.IndexVersions.INDEX_FORMAT) {
+            return "the published generation " + st.publishedGeneration.value() + " has index format "
+                    + st.publishedFormat + ", this writer indexes format " + com.pharos.indexer.IndexVersions.INDEX_FORMAT;
+        }
+        return st.localUpgrade;
+    }
+
+    /**
+     * Why this writer's local index of {@code shard} needs a full run: the indexer's own reasons
+     * ({@link ProjectIndexManager#fullRunReason}: another index format, a broken graph pointer), or
+     * files embedded under another chunking version or model. Null when it doesn't, or when there is
+     * no local index (the restore decides then). Loop thread only, between runs; the file state is
+     * re-read only when it changed.
+     */
+    String localUpgradeReason(ShardId shard, ShardState st) {
+        if (!lucene.indexExists(shard.value())) return null;
+        String reason = indexer.fullRunReason(shard.value());
+        if (reason != null) return reason;
+        Path dir = lucene.getProjectIndexDir(shard.value());
+        Path state = dir.resolve("file-state.json");
+        boolean embed = embeds(shard);
+        long stamp;
+        try {
+            stamp = Files.getLastModifiedTime(state).toMillis() * 31 + Files.size(state);
+        } catch (IOException e) {
+            return null; // no file state: nothing recorded to be outdated
+        }
+        if (stamp != st.stateStamp || embed != st.stateEmbed) {
+            st.embeddingsOutdated = indexer.stateTracker(dir, embed).hasOutdatedEmbeddings();
+            st.stateStamp = stamp;
+            st.stateEmbed = embed;
+        }
+        return st.embeddingsOutdated
+                ? "files were embedded under another chunking version or model than this release's" : null;
     }
 
     /**
@@ -694,6 +756,9 @@ public final class WorkLoop implements Closeable {
             if (local.isEmpty()) {
                 full = true;
                 why = "the local index is not registered";
+            } else if (st.upgrade != null) {
+                full = true;
+                why = st.upgrade;
             } else if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED))) {
                 full = true;
                 why = "the restored writer state was older than the restored generation, and no full run"
@@ -720,6 +785,10 @@ public final class WorkLoop implements Closeable {
             indexer.index(root, shard.value(), !full, false, embeds(shard), settings.buildSynonyms(),
                     run.listener(), run.abort, revision);
             synchronized (pollMu) {
+                if (full) { // rebuilt by this release: nothing left to upgrade
+                    st.localUpgrade = null;
+                    st.upgrade = null;
+                }
                 st.publishedRevision = revision;
                 st.publishedGeneration = null; // re-read on the next poll
                 String head = st.sourceRevision;

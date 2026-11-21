@@ -46,6 +46,7 @@ public class RemoveIndexCommand implements Callable<Integer> {
     public Integer call() throws Exception {
         try {
             RoleGuard.requireIndexing(config);
+            RoleGuard.requireNoWorkQueue(config, "pharos remove-index");
         } catch (IllegalStateException e) {
             System.err.println(e.getMessage());
             return 2;

@@ -253,6 +253,23 @@ t_upgrade_indexes_refused_on_reader() {
   check upgrade_indexes_refused_on_reader $? "rc=$(rc "$h"); $(tail -6 "$h/out.txt")"
 }
 
+# A work-queue writer (role writer, workQueue unset: the default) refuses --upgrade-indexes too (exit 5):
+# its work loop upgrades every shard once restarted on the new release. No upgrade JVM starts.
+t_upgrade_indexes_refused_on_work_queue_writer() {
+  local h; h="$(new_home)"
+  run_setup "$h" --release "$TAG"
+  register_project "$h" oldish none
+  printf '%s\n' '{"cluster": {"role": "writer", "backend": "object-store", "objectStore": {"bucket": "b", "endpoint": "http://127.0.0.1:1", "region": "us-east-1"}}}' \
+    > "$h/.pharos/config.json"
+  JAVA_LOG="$h/java.log" PATH="$STUB_PATH" run_setup "$h" --upgrade-indexes --yes
+  [ "$(rc "$h")" = 5 ] \
+    && grep -q 'work-queue mode' "$h/out.txt" \
+    && grep -q "restart 'pharos web' on the new release" "$h/out.txt" \
+    && ! grep -q 'upgrade-indexes' "$h/java.log" 2>/dev/null \
+    && [ ! -f "$h/.pharos/indexes/oldish/index-format.json" ]
+  check upgrade_indexes_refused_on_work_queue_writer $? "rc=$(rc "$h"); $(tail -6 "$h/out.txt")"
+}
+
 # --release on a reader: the index-status warning points at the writer, not at --upgrade-indexes.
 t_release_on_reader_points_upgrades_at_the_writer() {
   local h; h="$(new_home)"; preinstall "$h"
@@ -339,6 +356,7 @@ t_upgrade_indexes_without_yes_does_not_crash_on_empty_array
 t_upgrade_indexes_delegates_to_cli
 t_release_with_upgrade_indexes_installs_then_upgrades
 t_upgrade_indexes_refused_on_reader
+t_upgrade_indexes_refused_on_work_queue_writer
 t_release_on_reader_points_upgrades_at_the_writer
 t_bad_release_tag_rejected
 t_checksum_naming_other_file_fails

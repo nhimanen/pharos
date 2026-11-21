@@ -61,6 +61,7 @@ public class EmbedCommand implements Callable<Integer> {
         com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             RoleGuard.requireIndexing(config);
+            RoleGuard.requireNoWorkQueue(config, "pharos embed");
         } catch (IllegalStateException e) {
             System.err.println(e.getMessage());
             return 2;

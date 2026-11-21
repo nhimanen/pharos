@@ -28,6 +28,28 @@ public final class RoleGuard {
         }
     }
 
+    /**
+     * Commands that change a project's local index outside an index run ({@code upgrade-indexes},
+     * {@code remove-index}, {@code embed}) are refused on a work-queue writer
+     * ({@code cluster.writer.workQueue: true}), as {@code index} and {@code publish} are: the work
+     * loop of {@code pharos web} owns those indexes, and it upgrades them itself (an outdated index
+     * format, chunking version or model makes its shard's next run a full one).
+     */
+    public static void requireNoWorkQueue(IndexConfig config, String command) {
+        com.pharos.config.ClusterConfig c = config.getCluster();
+        if (c.getRole() == NodeRole.WRITER && c.getWriter().isWorkQueue()) {
+            throw new IllegalStateException(workQueueRefusal(command));
+        }
+    }
+
+    /** Why {@code command} is refused on a work-queue writer. */
+    public static String workQueueRefusal(String command) {
+        return "Not running '" + command + "': this writer runs in work-queue mode (cluster.writer.workQueue: true):"
+                + " shards are indexed, upgraded and published by the work loop of 'pharos web' on the writer holding"
+                + " the lease; to upgrade, restart the writers on the new release. Set cluster.writer.workQueue to"
+                + " false to index and publish by hand.";
+    }
+
     /** Publishing to the object store happens on writers only. */
     public static void requireWriter(IndexConfig config, String command) {
         NodeRole role = config.getCluster().getRole();

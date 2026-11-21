@@ -181,6 +181,19 @@ except Exception:
 PY
 }
 
+# True on a work-queue writer: role writer without "writer": {"workQueue": false} (the default since
+# Phase 4). Its work loop upgrades every shard itself; 'pharos upgrade-indexes' refuses there (exit 5).
+_work_queue_writer() {
+  python3 - "$HOME/.pharos/config.json" 2>/dev/null <<'PY'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1])).get("cluster") or {}
+except Exception:
+    sys.exit(1)
+sys.exit(0 if c.get("role") == "writer" and (c.get("writer") or {}).get("workQueue", True) is not False else 1)
+PY
+}
+
 _run_upgrade_indexes() { # -> exit status of upgrade-indexes
   if [ ! -f "$PHAROS_BIN/pharos.jar" ] || [ ! -f "$PHAROS_BIN/pharos-cli.py" ]; then
     echo "Error: pharos is not installed in $PHAROS_BIN; run setup first." >&2
@@ -189,8 +202,18 @@ _run_upgrade_indexes() { # -> exit status of upgrade-indexes
   # Same refusal as 'pharos upgrade-indexes' on a reader (exit 5), without starting a JVM.
   if [ "$(_cluster_role)" = reader ]; then
     echo "Error: this node has role reader; readers receive upgrades by syncing; upgrade the writer." >&2
-    echo "  (cluster.role in $HOME/.pharos/config.json; on the writer: ./setup.sh --upgrade-indexes," >&2
-    echo "   which re-indexes and re-publishes; this reader picks the new generations up on its next sync)" >&2
+    echo "  (cluster.role in $HOME/.pharos/config.json. Work-queue writers, the default, upgrade by themselves:" >&2
+    echo "   restart them on the new release and their work loops re-index and re-publish every shard. A writer" >&2
+    echo "   with \"workQueue\": false: ./setup.sh --upgrade-indexes there. This reader picks the new generations" >&2
+    echo "   up on its next sync)" >&2
+    return 5
+  fi
+  # Same refusal as 'pharos upgrade-indexes' on a work-queue writer (exit 5).
+  if _work_queue_writer; then
+    echo "Error: this writer runs in work-queue mode (cluster.writer.workQueue: true): its work loop re-indexes" >&2
+    echo "  and re-publishes every shard whose index format, chunking version or model is out of date. To upgrade," >&2
+    echo "  restart 'pharos web' on the new release; nothing to run by hand. (Set cluster.writer.workQueue to false" >&2
+    echo "  in $HOME/.pharos/config.json to index and upgrade by hand.)" >&2
     return 5
   fi
   local args=()
@@ -204,8 +227,8 @@ if [ "$UPGRADE_INDEXES" = true ] && [ -z "$RELEASE" ]; then
   _daemon_running && WAS_RUNNING=true
   UP_RC=0
   _run_upgrade_indexes || UP_RC=$?
-  # A reader's refusal changed nothing: leave its daemon alone.
-  if [ "$WAS_RUNNING" = true ] && [ "$(_cluster_role)" != reader ]; then
+  # A reader's or work-queue writer's refusal changed nothing: leave its daemon alone.
+  if [ "$WAS_RUNNING" = true ] && [ "$UP_RC" != 5 ]; then
     _restart_daemon
   fi
   exit "$UP_RC"
@@ -341,12 +364,16 @@ if [ "$RESTART_ONLY" = false ] && { [ -f "$HOME/.pharos/registry.json" ] || [ -f
   if [ "$STATUS_RC" -ne 0 ]; then
     CAUSE="the new jar's 'index-status --json' exited with status $STATUS_RC"
   else
-    WARN_TEXT="$(printf '%s' "$STATUS_JSON" | python3 -c '
-import json, sys
+    WQ=0
+    _work_queue_writer && WQ=1
+    WARN_TEXT="$(printf '%s' "$STATUS_JSON" | PHAROS_WQ="$WQ" python3 -c '
+import json, os, sys
 d = json.load(sys.stdin)
 rows = d.get("projects", [])
 # Readers do not re-index: the writer upgrades and re-publishes, readers sync.
 reader = d.get("role") == "reader"
+# A work-queue writer re-indexes them itself once it runs the new release.
+wq = os.environ.get("PHAROS_WQ") == "1"
 
 def human(b):
     v = float(b)
@@ -358,7 +385,7 @@ def human(b):
 def line(r, with_cmd):
     last = (r.get("lastIndexed") or "never")[:10]
     s = "  %-12s (%s, last indexed %s)" % (r["name"], human(r.get("indexBytes", 0)), last)
-    if with_cmd and not reader:
+    if with_cmd and not reader and not wq:
         if r.get("rootExists"):
             s += "   pharos index --full " + r["name"]
         else:
@@ -386,7 +413,9 @@ if invalid:
     out.append("Remove each from ~/.pharos/registry.json by hand, then re-index with: pharos index --project <name> <path>")
     out += ["  '" + r["name"] + "'" + ("  (root: " + r["rootPath"] + ")" if r.get("rootPath") else "") for r in invalid]
 if reader:
-    out.append("(this is a reader node: upgrade and re-publish these projects on the writer; this reader picks the new generations up by syncing)")
+    out.append("(this is a reader node: upgrade and re-publish these projects on the writer (a work-queue writer does it by itself once restarted on the new release); this reader picks the new generations up by syncing)")
+elif wq:
+    out.append("(this is a work-queue writer: after the install, restart pharos web; its work loop re-indexes and re-publishes these projects by itself)")
 else:
     out.append("(re-index afterwards with: ./setup.sh --upgrade-indexes)")
 print("\n".join(out))
