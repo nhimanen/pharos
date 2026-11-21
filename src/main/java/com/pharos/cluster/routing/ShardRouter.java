@@ -20,9 +20,10 @@ import java.util.function.ToIntFunction;
 
 /**
  * Picks, per shard, the live readers that may serve it. A reader's heartbeat lists the shards it
- * actually holds (never "all"), so a shard is routable exactly to readers naming it. Draining and
- * suspect readers are skipped, and a reader is skipped for the shards its heartbeat lists as
- * degraded (only those); the rest are ordered by least {@code inFlight}, rotating among ties.
+ * actually holds (never "all"), so a shard is routable exactly to readers naming it. Draining
+ * readers are skipped, and a reader is skipped for the shards its heartbeat lists as degraded (only
+ * those); warming readers are a last resort and suspect ones are tried only when nothing else is
+ * left (see {@link #candidates}); within a tier, by least {@code inFlight}, rotating among ties.
  */
 public final class ShardRouter {
 
@@ -121,19 +122,44 @@ public final class ShardRouter {
         return local.test(shard);
     }
 
-    /** @param degraded receives the readers left out because {@code shard} is degraded on them */
+    /**
+     * The readers to try for {@code shard}, in order. Draining readers, and readers listing the
+     * shard as degraded, never get it. Ready (or otherwise degraded) readers come first; a reader
+     * still {@code warming} only when no such reader is left; and when every remaining reader is
+     * suspect, those are tried anyway, least recently marked first (fail open: one call can clear a
+     * mark, so a shard whose readers all failed once is not lost for a whole TTL).
+     *
+     * @param degraded receives the readers left out because {@code shard} is degraded on them
+     */
     private List<ReaderHeartbeat> candidates(ShardId shard, List<ReaderHeartbeat> readers, List<String> degraded) {
         List<ReaderHeartbeat> eligible = new ArrayList<>();
+        List<ReaderHeartbeat> warming = new ArrayList<>();
+        List<ReaderHeartbeat> suspect = new ArrayList<>();
         for (ReaderHeartbeat r : readers) {
-            if (!r.draining() && r.shards() != null && r.shards().contains(shard.value())
-                    && !health.isSuspect(r.node())) {
-                if (r.degradedShards().contains(shard.value())) { // only for this shard: the rest stays routable
-                    degraded.add(r.node());
-                    continue;
-                }
-                eligible.add(r);
+            if (r.draining() || r.shards() == null || !r.shards().contains(shard.value())) continue;
+            if (r.degradedShards().contains(shard.value())) { // only for this shard: the rest stays routable
+                degraded.add(r.node());
+                continue;
             }
+            if (health.isSuspect(r.node())) suspect.add(r);
+            else if (ReaderHeartbeat.WARMING.equals(r.state())) warming.add(r);
+            else eligible.add(r);
         }
+        List<ReaderHeartbeat> out = ordered(shard, eligible);
+        out.addAll(ordered(shard, warming));
+        if (out.isEmpty() && !suspect.isEmpty()) {
+            Map<String, Long> until = new java.util.HashMap<>();
+            for (ReaderHeartbeat r : suspect) until.put(r.node(), health.suspectUntil(r.node()));
+            suspect.sort(Comparator.comparingLong((ReaderHeartbeat r) -> until.get(r.node()))
+                    .thenComparing(ReaderHeartbeat::node));
+            out.addAll(suspect);
+        }
+        return out;
+    }
+
+    /** {@code eligible} by least load, rotating among ties. */
+    private List<ReaderHeartbeat> ordered(ShardId shard, List<ReaderHeartbeat> eligible) {
+        if (eligible.isEmpty()) return new ArrayList<>();
         // One snapshot of each reader's load: the coordinator's in-flight counts move while this runs,
         // and a load read twice could break the sort's contract or leave an empty tie group.
         Map<String, Integer> loads = new java.util.HashMap<>();

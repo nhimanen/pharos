@@ -153,7 +153,7 @@ public final class ShardClient {
             try {
                 return new Answer<>(reader, callOn(reader, endpoint, request.apply(reader), bound));
             } catch (RetryableFailure f) {
-                health.markSuspect(reader.node());
+                if (f.suspect) health.markSuspect(reader.node()); // not for a timeout the query budget cut short
                 last = f;
             } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException n) {
                 last = n; // not a sick reader
@@ -184,13 +184,18 @@ public final class ShardClient {
             throw new ShardCallException("interrupted waiting to call " + reader.node());
         }
         try {
-            return exchange(reader, endpoint, request, Math.max(1_000_000L, boundNanos - (System.nanoTime() - start)));
+            // Full: this attempt had the whole per-exchange allowance; a stall over it marks the reader
+            // suspect (a permit wait within it does not shorten it for that purpose).
+            boolean full = boundNanos >= requestTimeout.toNanos() * 2;
+            return exchange(reader, endpoint, request, Math.max(1_000_000L, boundNanos - (System.nanoTime() - start)),
+                    full);
         } finally {
             permit.release();
         }
     }
 
-    private <Q, R> R exchange(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request, long boundNanos) {
+    private <Q, R> R exchange(ReaderHeartbeat reader, Endpoint<Q, R> endpoint, Q request, long boundNanos,
+                              boolean fullBound) {
         long boundMillis = Math.max(1, boundNanos / 1_000_000L);
         Duration headerTimeout = Duration.ofMillis(Math.min(requestTimeout.toMillis(), boundMillis));
         byte[] payload;
@@ -220,12 +225,25 @@ public final class ShardClient {
                     resp = pending.get(boundMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
                     pending.cancel(true);
-                    throw new IOException("no complete response within " + boundMillis + " ms");
+                    // Only a stall over the full per-exchange allowance (twice the request timeout)
+                    // says the reader is sick; a shorter bound was the query's leftover budget.
+                    throw new RetryableFailure(reader.node() + ": no complete response within " + boundMillis + " ms",
+                            fullBound);
                 } catch (java.util.concurrent.ExecutionException e) {
                     Throwable c = e.getCause();
+                    if (c instanceof java.net.http.HttpTimeoutException t
+                            && !(c instanceof java.net.http.HttpConnectTimeoutException)) {
+                        // The headers did not come within headerTimeout: the reader's fault only when
+                        // that was the full request timeout, not a share of the query's budget.
+                        throw new RetryableFailure(reader.node() + ": " + t,
+                                headerTimeout.compareTo(requestTimeout) >= 0);
+                    }
                     if (c instanceof IOException io) throw io;
                     if (c instanceof IllegalArgumentException iae) throw iae;
                     throw new IOException(String.valueOf(c), c);
+                } catch (InterruptedException e) {
+                    pending.cancel(true); // the exchange must not outlive the cancelled query
+                    throw e;
                 }
                 status = resp.statusCode();
                 body = resp.body();
@@ -314,8 +332,19 @@ public final class ShardClient {
         NotServedException(String message) { super(message); }
     }
 
-    /** Internal: a failure another replica may not share. {@link #callOn} callers see {@link ShardCallException} instead. */
+    /**
+     * Internal: a failure another replica may not share. {@code suspect}: it says the reader is sick
+     * (connect error, reset, 5xx, or a timeout of the full per-call allowance), so it is marked
+     * suspect. {@link #callOn} callers see {@link ShardCallException} instead.
+     */
     private static final class RetryableFailure extends ShardCallException {
-        RetryableFailure(String message) { super(message); }
+        final boolean suspect;
+
+        RetryableFailure(String message) { this(message, true); }
+
+        RetryableFailure(String message, boolean suspect) {
+            super(message);
+            this.suspect = suspect;
+        }
     }
 }

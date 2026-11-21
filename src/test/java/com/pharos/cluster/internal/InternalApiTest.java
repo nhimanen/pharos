@@ -465,4 +465,69 @@ class InternalApiTest {
         assertThat(a.reader().node()).isEqualTo("ok");
         assertThat(health.isSuspect("nv")).isFalse();
     }
+
+    // ---------------------------------------------------------------- final review I4: suspect only on the reader's own timeout
+
+    /** A server that reads the request, then sends headers (or not) and stalls; closed with the socket. */
+    private static ServerSocket stalling(boolean sendHeaders) throws Exception {
+        ServerSocket server = new ServerSocket(0);
+        Thread t = new Thread(() -> {
+            while (!server.isClosed()) {
+                try (var socket = server.accept()) {
+                    var in = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream()));
+                    String line;
+                    int contentLength = 0;
+                    while ((line = in.readLine()) != null && !line.isEmpty()) {
+                        if (line.toLowerCase().startsWith("content-length:")) contentLength = Integer.parseInt(line.substring(15).trim());
+                    }
+                    for (int i = 0; i < contentLength; i++) in.read();
+                    if (sendHeaders) {
+                        socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                + "Content-Length: 1000\r\n\r\n{\"gen").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                        socket.getOutputStream().flush();
+                    }
+                    Thread.sleep(10_000);
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+        return server;
+    }
+
+    /**
+     * I4: a timeout whose bound was the query's leftover budget (shorter than the per-call timeout)
+     * says nothing about the reader: it is not marked suspect. Headers or body, either way.
+     */
+    @Test
+    void aTimeoutFromTheShortenedQueryBudgetDoesNotMarkSuspect() throws Exception {
+        for (boolean headers : new boolean[] {false, true}) {
+            try (ServerSocket server = stalling(headers)) {
+                ReaderHealth health = new ReaderHealth(30);
+                ShardClient c = new ShardClient(health, TOKEN, Duration.ofMillis(500), Duration.ofSeconds(3));
+                Route route = new Route(new ShardId("java"), List.of(reader("slow", server.getLocalPort())));
+                long t0 = System.nanoTime();
+                assertThatThrownBy(() -> c.callPreferring(route, null, ShardClient.TERM_STATS, STATS,
+                        System.nanoTime() + 300_000_000L)).isInstanceOf(ShardUnavailableException.class);
+                assertThat((System.nanoTime() - t0) / 1_000_000).as("bounded by the budget").isLessThan(2_000);
+                assertThat(health.isSuspect("slow")).as("headers sent: " + headers).isFalse();
+            }
+        }
+    }
+
+    /** I4 control: the same stall with the full per-call timeout marks the reader suspect. */
+    @Test
+    void aTimeoutWithTheFullPerCallTimeoutMarksSuspect() throws Exception {
+        for (boolean headers : new boolean[] {false, true}) {
+            try (ServerSocket server = stalling(headers)) {
+                ReaderHealth health = new ReaderHealth(30);
+                ShardClient c = new ShardClient(health, TOKEN, Duration.ofMillis(500), Duration.ofMillis(300));
+                Route route = new Route(new ShardId("java"), List.of(reader("slow", server.getLocalPort())));
+                assertThatThrownBy(() -> c.callPreferring(route, null, ShardClient.TERM_STATS, STATS,
+                        System.nanoTime() + 10_000_000_000L)).isInstanceOf(ShardUnavailableException.class);
+                assertThat(health.isSuspect("slow")).as("headers sent: " + headers).isTrue();
+            }
+        }
+    }
 }

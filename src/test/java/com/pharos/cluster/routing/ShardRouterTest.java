@@ -53,11 +53,46 @@ class ShardRouterTest {
 
     @Test
     void successClearsSuspect() {
-        live = List.of(hb("r1", false, 0, "a"));
+        live = List.of(hb("r1", false, 0, "a"), hb("r2", false, 0, "a"));
         health.markSuspect("r1");
-        assertThat(router().route(List.of("a")).get(0).candidates()).isEmpty();
+        assertThat(nodes(router().route(List.of("a")).get(0))).containsExactly("r2");
         health.markHealthy("r1");
-        assertThat(router().route(List.of("a")).get(0).candidates()).hasSize(1);
+        assertThat(router().route(List.of("a")).get(0).candidates()).hasSize(2);
+    }
+
+    /**
+     * Final review I4: when every reader of a shard is suspect, the router fails open: it still tries
+     * them (least recently marked first), so one call can clear the mark instead of the shard being
+     * lost for a whole TTL.
+     */
+    @Test
+    void everyReaderSuspectFailsOpenLeastRecentlySuspectFirst() {
+        live = List.of(hb("r1", false, 0, "b"), hb("r2", false, 0, "b"), hb("r3", true, 0, "b"));
+        health.markSuspect("r2");
+        nanos.addAndGet(1_000_000_000L);
+        health.markSuspect("r1");
+        assertThat(nodes(router().route(List.of("b")).get(0))).as("r2 was marked first; draining r3 stays out")
+                .containsExactly("r2", "r1");
+        health.markHealthy("r1");
+        assertThat(nodes(router().route(List.of("b")).get(0))).as("a healthy reader: suspects are skipped again")
+                .containsExactly("r1");
+    }
+
+    /** Final review minor 2: a warming reader gets no shard calls while a ready one serves the shard; last resort otherwise. */
+    @Test
+    void warmingReadersAreALastResort() {
+        ReaderHeartbeat warming = new ReaderHeartbeat("w", "http://w", List.of("b"), false, Map.of(), 0, 0, 0L,
+                ReaderHeartbeat.WARMING, List.of());
+        ReaderHeartbeat ready = new ReaderHeartbeat("r", "http://r", List.of("b"), false, Map.of(), 5, 0, 0L,
+                ReaderHeartbeat.READY, List.of());
+        live = List.of(warming, ready);
+        assertThat(nodes(router().route(List.of("b")).get(0))).containsExactly("r", "w");
+        live = List.of(warming);
+        assertThat(nodes(router().route(List.of("b")).get(0))).as("the only reader of the shard").containsExactly("w");
+        health.markSuspect("r");
+        live = List.of(warming, ready);
+        assertThat(nodes(router().route(List.of("b")).get(0))).as("a warming reader is left: no fail-open to the suspect")
+                .containsExactly("w");
     }
 
     @Test
@@ -83,12 +118,12 @@ class ShardRouterTest {
 
     @Test
     void suspectClearsAfterTtl() {
-        live = List.of(hb("r1", false, 0, "a"));
+        live = List.of(hb("r1", false, 0, "a"), hb("r2", false, 0, "a"));
         health.markSuspect("r1");
         nanos.addAndGet(29_000_000_000L);
-        assertThat(router().route(List.of("a")).get(0).candidates()).isEmpty();
+        assertThat(nodes(router().route(List.of("a")).get(0))).containsExactly("r2");
         nanos.addAndGet(2_000_000_000L);
-        assertThat(router().route(List.of("a")).get(0).candidates()).hasSize(1);
+        assertThat(router().route(List.of("a")).get(0).candidates()).hasSize(2);
     }
 
     @Test

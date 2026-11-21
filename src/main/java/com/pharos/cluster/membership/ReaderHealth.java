@@ -34,6 +34,15 @@ public final class ReaderHealth {
         suspectUntil.remove(node);
     }
 
+    /**
+     * When {@code node}'s suspect mark expires ({@link Long#MAX_VALUE} when it is not suspect): the
+     * earlier, the longer ago it was marked.
+     */
+    public long suspectUntil(String node) {
+        Long until = suspectUntil.get(node);
+        return until == null || !isSuspect(node) ? Long.MAX_VALUE : until;
+    }
+
     public boolean isSuspect(String node) {
         Long until = suspectUntil.get(node);
         if (until == null) return false;
