@@ -280,6 +280,28 @@ class WorkLoopTest {
     }
 
     @Test
+    void shardRecordedWithoutEmbeddingsIsIndexedWithoutThem() throws IOException {
+        ShardId plain = pathShard("plain");
+        ShardId bare = pathShard("bare");
+        catalog.register(bare, Optional.of(ShardSource.path(sourceDirs.get(bare).toString()).withEmbed(false)));
+        Writer a = new Writer("node-a");
+
+        a.loop.tick();
+        assertThat(latest(plain)).contains(Generation.FIRST);
+        assertThat(latest(bare)).contains(Generation.FIRST);
+        int afterFirst = a.embedder.calls.get();
+        assertThat(afterFirst).as("the embedded shard was embedded").isPositive();
+
+        change(bare, "three");
+        rounds(1, 10, a);
+        assertThat(latest(bare)).contains(new Generation(2));
+        assertThat(a.embedder.calls.get()).as("a change of the no-embed shard embeds nothing").isEqualTo(afterFirst);
+        change(plain, "three");
+        rounds(1, 10, a);
+        assertThat(a.embedder.calls.get()).as("the embedded shard still embeds").isGreaterThan(afterFirst);
+    }
+
+    @Test
     void heartbeatReportsPendingBacklogAndIndexingPhase() throws IOException {
         ShardId s = pathShard("solo");
         Writer a = new Writer("node-a");

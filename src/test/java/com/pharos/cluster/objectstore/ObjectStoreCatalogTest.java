@@ -98,6 +98,24 @@ class ObjectStoreCatalogTest {
     }
 
     @Test
+    void noEmbedSourceIsRecordedAndReadBack() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        ShardSource plain = ShardSource.git("https://example.org/r.git", "main");
+        catalog.register(new ShardId("s"), Optional.of(plain));
+        assertThat(new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8))
+                .as("embed defaults to true and is not written").doesNotContain("embed");
+        ShardSource noEmbed = plain.withEmbed(false);
+        catalog.register(new ShardId("s"), Optional.of(noEmbed));
+        assertThat(new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8))
+                .contains("\"embed\" : false");
+        assertThat(catalog.entries().get(0).source()).contains(noEmbed);
+        assertThat(catalog.entries().get(0).source().orElseThrow().embed()).isFalse();
+        catalog.register(new ShardId("s"), Optional.of(plain));
+        assertThat(catalog.entries().get(0).source().orElseThrow().embed()).isTrue();
+    }
+
+    @Test
     void olderWritersRegisterKeepsExistingSource() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
         ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);

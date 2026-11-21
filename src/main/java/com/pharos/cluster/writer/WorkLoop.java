@@ -178,6 +178,12 @@ public final class WorkLoop implements Closeable {
         }
     }
 
+    /** Whether runs of {@code shard} embed: the writer's setting, unless the shard's source says no. */
+    private boolean embeds(ShardId shard) {
+        ShardState st = shards.get(shard);
+        return settings.embed() && (st == null || st.source == null || st.source.embed());
+    }
+
     /** Maps a {@link ProjectIndexManager} progress stage to a heartbeat phase. */
     static String phaseOf(String stage) {
         if (stage == null) return WriterHeartbeat.PARSE;
@@ -616,7 +622,7 @@ public final class WorkLoop implements Closeable {
         try {
             if (stopping) run.abort.request("stopping");
             if (diskLow()) run.abort.request("writer low on disk");
-            indexer.index(root, shard.value(), !full, false, settings.embed(), settings.buildSynonyms(),
+            indexer.index(root, shard.value(), !full, false, embeds(shard), settings.buildSynonyms(),
                     run.listener(), run.abort, revision);
             st.publishedRevision = revision;
             st.sourceRevision = revision;
@@ -705,8 +711,8 @@ public final class WorkLoop implements Closeable {
         long cacheBytes = embedCacheBytes(indexDir);
         java.util.function.Predicate<Path> changed = null;
         if (!full) {
-            com.pharos.indexer.FileStateTracker t = indexer.stateTracker(indexDir, settings.embed());
-            boolean embed = settings.embed();
+            boolean embed = embeds(shard);
+            com.pharos.indexer.FileStateTracker t = indexer.stateTracker(indexDir, embed);
             changed = f -> t.isDirty(f) || (embed && t.isEmbeddingOutdated(f));
         }
         long[] src = sourceBytes(root, changed);

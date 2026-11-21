@@ -57,7 +57,9 @@ class SourceOptionsTest {
             assertThat(exit).isZero();
             assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries()).singleElement().satisfies(e -> {
                 assertThat(e.id()).isEqualTo(new ShardId(ClusterFixture.JAVA));
-                assertThat(e.source()).isEqualTo(Optional.of(ShardSource.git("https://example.org/r.git", "main")));
+                // --no-embed is recorded with the source: work-queue writers index the shard without embeddings too
+                assertThat(e.source()).isEqualTo(Optional.of(ShardSource.git("https://example.org/r.git", "main")
+                        .withEmbed(false)));
             });
         }
     }

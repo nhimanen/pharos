@@ -160,7 +160,7 @@ public class IndexCommand implements Callable<Integer> {
             }
             ProjectNames.validate(projectName);
             int rc = indexSingle(root, projectName);
-            if (rc == 0 && source.isPresent()) SourceOptions.record(runtime, projectName, source.get());
+            if (rc == 0 && source.isPresent()) SourceOptions.record(runtime, projectName, source.get().withEmbed(!noEmbed));
             return rc;
 
         } catch (Exception e) {
