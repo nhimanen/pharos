@@ -359,8 +359,19 @@ public class ClusterConfig {
         private int pollSeconds = 60;
         /** Work-queue mode (leases and takeover). Opt-in; nothing reads it before the work-queue task. */
         private boolean workQueue = false;
+        /**
+         * Lease TTL in work-queue mode. A lease whose last write (by the bucket's LastModified) is
+         * older than this may be taken over; the holder renews every TTL/3.
+         */
+        private int leaseTtlSeconds = 30;
+
+        static final int MIN_LEASE_TTL_SECONDS = 5;
 
         public void validate() {
+            if (leaseTtlSeconds < MIN_LEASE_TTL_SECONDS) {
+                throw new IllegalStateException("cluster.writer.leaseTtlSeconds must be at least "
+                        + MIN_LEASE_TTL_SECONDS + ", got " + leaseTtlSeconds);
+            }
             if (workDir == null) {
                 throw new IllegalStateException("cluster.writer.workDir must not be empty");
             }
@@ -375,6 +386,14 @@ public class ClusterConfig {
         public void setPollSeconds(int v) { this.pollSeconds = v; }
         public boolean isWorkQueue() { return workQueue; }
         public void setWorkQueue(boolean v) { this.workQueue = v; }
+        public int getLeaseTtlSeconds() { return leaseTtlSeconds; }
+        public void setLeaseTtlSeconds(int v) { this.leaseTtlSeconds = v; }
+
+        /** {@code leaseTtlSeconds}. */
+        public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }
+
+        /** How often a held lease is renewed: TTL/3. */
+        public java.time.Duration leaseRenewInterval() { return leaseTtl().dividedBy(3); }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

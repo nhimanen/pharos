@@ -344,4 +344,16 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"pollSeconds\":0}}}"))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.pollSeconds");
     }
+
+    @Test
+    void writerLeaseTtlDefaultsAndValidation() throws Exception {
+        ClusterConfig.WriterConfig w = parse("{}").getWriter();
+        assertThat(w.getLeaseTtlSeconds()).isEqualTo(30);
+        assertThat(w.leaseRenewInterval()).isEqualTo(java.time.Duration.ofSeconds(10));
+        w = parse("{\"cluster\":{\"writer\":{\"leaseTtlSeconds\":5}}}").getWriter();
+        assertThat(w.leaseTtl()).isEqualTo(java.time.Duration.ofSeconds(5));
+        assertThat(w.leaseRenewInterval()).isEqualTo(java.time.Duration.ofNanos(1_666_666_666));
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"leaseTtlSeconds\":4}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.leaseTtlSeconds");
+    }
 }

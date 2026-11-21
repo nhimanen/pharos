@@ -8,6 +8,7 @@ import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.writer.LeaseGuard;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphWriter;
 import com.pharos.graph.GraphViews;
@@ -51,7 +52,8 @@ import java.util.zip.GZIPOutputStream;
  * content-named keys ({@code graph/gen-N@<crc32>.cgf.gz}, {@code refs/gen-N@<crc32>.json.gz}), so
  * a racing run for the same N cannot overwrite bytes a committed manifest references → ship
  * synonyms → register the shard in the catalog (idempotent; readers skip a listed shard without
- * {@code LATEST}) → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N → GC.
+ * {@code LATEST}) → {@code putIfAbsent} the manifest gen-N → the {@link LeaseGuard} check (work-queue
+ * mode; a lost lease is a {@link PublishConflictException}) → CAS {@code LATEST} from P to N → GC.
  * Registering before the commit point means a catalog failure can never be reported as a failed
  * publish of a generation that is in fact committed.
  *
@@ -75,6 +77,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private final GenerationGc gc;
     private final String nodeId;
     private final Path synonymsFile;
+    private final LeaseGuard leaseGuard;
 
     /**
      * @param gc           generation GC, run with the shard and the {@code LATEST} last-modified
@@ -83,6 +86,16 @@ public final class ObjectStorePublisher implements IndexPublisher {
      */
     public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
                                 GenerationGc gc, String nodeId, Path synonymsFile) {
+        this(store, layout, catalog, gc, nodeId, synonymsFile, LeaseGuard.IMPLICIT);
+    }
+
+    /**
+     * @param leaseGuard checked right before the {@code LATEST} CAS; {@link LeaseGuard#IMPLICIT}
+     *                   (the default) always passes
+     */
+    public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
+                                GenerationGc gc, String nodeId, Path synonymsFile, LeaseGuard leaseGuard) {
+        this.leaseGuard = Objects.requireNonNull(leaseGuard, "leaseGuard");
         this.store = store;
         this.layout = layout;
         this.catalog = catalog;
@@ -203,7 +216,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                         previous.map(Latest::etag).orElse(null));
             }
 
-            // 7. Commit point: CAS LATEST from P to N.
+            // 7. Commit point: CAS LATEST from P to N, only while this writer holds the shard's lease.
+            leaseGuard.assertHeld(shard);
             byte[] latest = ("{\"generation\": " + gen.value() + ", \"manifest\": \""
                     + ObjectStoreLayout.manifestName(gen) + "\"}").getBytes(StandardCharsets.UTF_8);
             Optional<String> committed = previous.isPresent()

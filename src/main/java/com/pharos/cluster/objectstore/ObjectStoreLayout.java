@@ -29,6 +29,9 @@ public final class ObjectStoreLayout {
 
     public String latestKey(ShardId shard) { return shardPrefix(shard) + "LATEST"; }
 
+    /** Writer lease of a shard (work-queue mode): {@code shards/<shard>/lease}. */
+    public String leaseKey(ShardId shard) { return shardPrefix(shard) + "lease"; }
+
     public String manifestKey(ShardId shard, Generation gen) {
         return shardPrefix(shard) + "manifests/" + manifestName(gen);
     }
