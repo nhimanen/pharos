@@ -1,6 +1,7 @@
 package com.pharos.cluster.writer;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 
 import java.util.List;
@@ -22,15 +23,19 @@ import java.util.TreeMap;
  *   <li>{@code indexing}: the run in progress ({@code phase} parse|embed|commit|publish,
  *       {@code progress} 0..1 within the phase, {@code startedAt} epoch millis), or null;</li>
  *   <li>{@code startedAt}: the process start (epoch millis, informational: a node clock);</li>
- *   <li>{@code stopping}: a graceful stop is under way; the balancer no longer counts this writer.</li>
+ *   <li>{@code stopping}: a graceful stop is under way; the balancer no longer counts this writer;</li>
+ *   <li>{@code disk}: the disk guard's view ({@link DiskGuard}): free and total bytes of the most
+ *       constrained watched file store, and whether this writer is low on disk. A low writer
+ *       acquires nothing and the balancer no longer counts it. Absent when no guard runs (a heartbeat
+ *       written before Task 4b reads as "not low").</li>
  * </ul>
- * Unknown fields are ignored on read, so later fields (the disk guard's {@code disk}) need no
- * version bump.
+ * Unknown fields are ignored on read, so later fields need no version bump.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-@JsonPropertyOrder({"node", "workQueue", "leases", "pinned", "backlog", "indexing", "startedAt", "stopping"})
+@JsonPropertyOrder({"node", "workQueue", "leases", "pinned", "backlog", "indexing", "startedAt", "stopping", "disk"})
 public record WriterHeartbeat(String node, boolean workQueue, List<String> leases, List<String> pinned,
-                              Map<String, Backlog> backlog, Indexing indexing, long startedAt, boolean stopping) {
+                              Map<String, Backlog> backlog, Indexing indexing, long startedAt, boolean stopping,
+                              @JsonInclude(JsonInclude.Include.NON_NULL) Disk disk) {
 
     public static final String PARSE = "parse";
     public static final String EMBED = "embed";
@@ -43,9 +48,20 @@ public record WriterHeartbeat(String node, boolean workQueue, List<String> lease
         backlog = backlog == null ? Map.of() : java.util.Collections.unmodifiableMap(new TreeMap<>(backlog));
     }
 
-    /** True when this writer counts towards the fair share. Task 4b adds {@code && !disk.low}. */
+    /** Without the disk guard's field (no guard, or a heartbeat from before it). */
+    public WriterHeartbeat(String node, boolean workQueue, List<String> leases, List<String> pinned,
+                           Map<String, Backlog> backlog, Indexing indexing, long startedAt, boolean stopping) {
+        this(node, workQueue, leases, pinned, backlog, indexing, startedAt, stopping, null);
+    }
+
+    /** True when this writer counts towards the fair share: work queue, not stopping, not low on disk. */
     public boolean takesShare() {
-        return workQueue && !stopping;
+        return workQueue && !stopping && !lowOnDisk();
+    }
+
+    /** True when the heartbeat says this writer is low on disk. */
+    public boolean lowOnDisk() {
+        return disk != null && disk.low();
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -56,4 +72,9 @@ public record WriterHeartbeat(String node, boolean workQueue, List<String> lease
     @JsonIgnoreProperties(ignoreUnknown = true)
     @JsonPropertyOrder({"shard", "phase", "progress", "startedAt"})
     public record Indexing(String shard, String phase, double progress, long startedAt) {}
+
+    /** {@code disk}: free and total bytes of the most constrained watched file store; {@code low}. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    @JsonPropertyOrder({"freeBytes", "totalBytes", "low"})
+    public record Disk(long freeBytes, long totalBytes, boolean low) {}
 }

@@ -376,6 +376,13 @@ public class ClusterConfig {
          * nothing unpublished), so leases don't bounce while writers join and leave.
          */
         private int minHoldSeconds = 120;
+        /**
+         * Work-queue mode: after this many consecutive failed runs of a surplus shard (not pinned,
+         * held at least {@code minHoldSeconds}) the writer releases it so another writer can try.
+         */
+        private int maxConsecutiveFailures = 3;
+        /** Work-queue mode: the disk guard ({@code cluster.writer.disk}). */
+        private DiskConfig disk = new DiskConfig();
 
         static final int MIN_LEASE_TTL_SECONDS = 5;
 
@@ -393,6 +400,12 @@ public class ClusterConfig {
             if (minHoldSeconds < 0) {
                 throw new IllegalStateException("cluster.writer.minHoldSeconds must not be negative, got " + minHoldSeconds);
             }
+            if (maxConsecutiveFailures < 1) {
+                throw new IllegalStateException("cluster.writer.maxConsecutiveFailures must be at least 1, got "
+                        + maxConsecutiveFailures);
+            }
+            if (disk == null) disk = new DiskConfig();
+            disk.validate();
         }
 
         public Path getWorkDir() { return workDir; }
@@ -405,12 +418,56 @@ public class ClusterConfig {
         public void setLeaseTtlSeconds(int v) { this.leaseTtlSeconds = v; }
         public int getMinHoldSeconds() { return minHoldSeconds; }
         public void setMinHoldSeconds(int v) { this.minHoldSeconds = v; }
+        public int getMaxConsecutiveFailures() { return maxConsecutiveFailures; }
+        public void setMaxConsecutiveFailures(int v) { this.maxConsecutiveFailures = v; }
+        public DiskConfig getDisk() { return disk; }
+        public void setDisk(DiskConfig disk) { this.disk = disk == null ? new DiskConfig() : disk; }
 
         /** {@code leaseTtlSeconds}. */
         public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }
 
         /** How often a held lease is renewed: TTL/3. */
         public java.time.Duration leaseRenewInterval() { return leaseTtl().dividedBy(3); }
+    }
+
+    /**
+     * {@code cluster.writer.disk}: the writer disk guard. A watched file store is <i>low</i> when its
+     * free space is below {@code minFreeBytes} or below {@code minFreePercent} of its size; it is
+     * no longer low once free space is back above that threshold plus {@code hysteresisBytes}.
+     * The guard probes every {@code checkSeconds}.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DiskConfig {
+        private long minFreeBytes = 5L << 30;
+        private int minFreePercent = 10;
+        private int checkSeconds = 15;
+        private long hysteresisBytes = 1L << 30;
+
+        public void validate() {
+            if (minFreeBytes < 0) {
+                throw new IllegalStateException("cluster.writer.disk.minFreeBytes must not be negative, got " + minFreeBytes);
+            }
+            if (minFreePercent < 0 || minFreePercent > 100) {
+                throw new IllegalStateException("cluster.writer.disk.minFreePercent must be between 0 and 100, got "
+                        + minFreePercent);
+            }
+            if (checkSeconds <= 0) {
+                throw new IllegalStateException("cluster.writer.disk.checkSeconds must be positive, got " + checkSeconds);
+            }
+            if (hysteresisBytes < 0) {
+                throw new IllegalStateException("cluster.writer.disk.hysteresisBytes must not be negative, got "
+                        + hysteresisBytes);
+            }
+        }
+
+        public long getMinFreeBytes() { return minFreeBytes; }
+        public void setMinFreeBytes(long v) { this.minFreeBytes = v; }
+        public int getMinFreePercent() { return minFreePercent; }
+        public void setMinFreePercent(int v) { this.minFreePercent = v; }
+        public int getCheckSeconds() { return checkSeconds; }
+        public void setCheckSeconds(int v) { this.checkSeconds = v; }
+        public long getHysteresisBytes() { return hysteresisBytes; }
+        public void setHysteresisBytes(long v) { this.hysteresisBytes = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

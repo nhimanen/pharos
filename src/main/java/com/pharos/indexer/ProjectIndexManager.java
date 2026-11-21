@@ -406,6 +406,82 @@ public class ProjectIndexManager {
         registry.unregister(projectName);
     }
 
+    /** The full run's embedding-text spool in the project index dir. */
+    static final String FULL_SPOOL = "embed.spool";
+    /** The incremental run's embedding-text spool in the project index dir. */
+    static final String INCREMENTAL_SPOOL = "embed-incr.spool";
+
+    /**
+     * True for a run's temporary files in the project index dir: the spools and the per-run vector
+     * caches ({@code embed.<model>.cache}, {@code embed-incr.<model>.cache}). The persistent
+     * embedding cache ({@code embed-cache.<model>.bin|meta}) is not one of them.
+     */
+    static boolean isRunTempFile(String name) {
+        if (name.equals(FULL_SPOOL) || name.equals(INCREMENTAL_SPOOL)) return true;
+        return (name.startsWith("embed.") || name.startsWith("embed-incr.")) && name.endsWith(".cache");
+    }
+
+    /**
+     * Garbage-collects what an interrupted run (a crash, a kill) left in the project's index dir,
+     * under the same retention rule the index runs apply themselves: every graph generation except
+     * the live one ({@link CallGraph#removeUnusedGraphs}, which a full run also calls before and after
+     * its build) and the run's temporary spool and vector-cache files (a run deletes them in its
+     * {@code finally}). The live Lucene commit, the live graph, {@code file-state.json}, the
+     * persistent embedding cache and the registry are never touched.
+     *
+     * <p>Takes the project's Lucene write lock first, so it never races a run of the project (in
+     * this JVM or another): when a run holds it, nothing is deleted.
+     *
+     * @return bytes freed; 0 when nothing was left over, -1 when a run holds the write lock
+     */
+    public long removeRunLeftovers(String projectName) {
+        Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
+        if (!Files.isDirectory(projectIndexDir)) return 0;
+        Path luceneDir = projectIndexDir.resolve("lucene");
+        long before = sizeOf(projectIndexDir);
+        try (org.apache.lucene.store.Directory dir = Files.isDirectory(luceneDir)
+                ? org.apache.lucene.store.FSDirectory.open(luceneDir) : null;
+             org.apache.lucene.store.Lock lock = dir == null ? null : dir.obtainLock(IndexWriter.WRITE_LOCK_NAME)) {
+            CallGraph.removeUnusedGraphs(projectIndexDir);
+            try (var files = Files.list(projectIndexDir)) {
+                for (Path f : files.toList()) {
+                    if (Files.isRegularFile(f) && isRunTempFile(f.getFileName().toString())) Files.deleteIfExists(f);
+                }
+            }
+        } catch (org.apache.lucene.store.LockObtainFailedException e) {
+            log.debug("Not collecting leftovers of '{}': a run holds its write lock", projectName);
+            return -1;
+        } catch (IOException e) {
+            log.warn("Collecting the leftovers of '{}' failed: {}", projectName, e.toString());
+        }
+        long freed = Math.max(0, before - sizeOf(projectIndexDir));
+        if (freed > 0) log.info("Removed {} bytes of run leftovers of '{}'", freed, projectName);
+        return freed;
+    }
+
+    /** Total size of the regular files under {@code dir} (0 when absent; best effort). */
+    public static long sizeOf(Path dir) {
+        if (!Files.exists(dir)) return 0;
+        long[] total = {0};
+        try {
+            Files.walkFileTree(dir, new java.nio.file.SimpleFileVisitor<>() {
+                @Override
+                public java.nio.file.FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) {
+                    if (a.isRegularFile()) total[0] += a.size();
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFileFailed(Path f, IOException e) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            log.debug("Sizing {} failed: {}", dir, e.toString());
+        }
+        return total[0];
+    }
+
     /**
      * Index a project.
      *
@@ -835,7 +911,7 @@ public class ProjectIndexManager {
             List<Integer> fileSlotStarts = new ArrayList<>();  // slot offset per parsed file
             List<List<String>> parsedSynthBodies = new ArrayList<>();
 
-            Path spoolPath = projectIndexDir.resolve("embed-incr.spool");
+            Path spoolPath = projectIndexDir.resolve(INCREMENTAL_SPOOL);
             try {
                 int totalSlots = 0;
                 try (DataOutputStream spool = doEmbed
@@ -1041,7 +1117,7 @@ public class ProjectIndexManager {
         List<List<List<Chunk>>> fileMethodChunks = new ArrayList<>(totalFiles);
         List<List<List<Chunk>>> fileClassChunks  = new ArrayList<>(totalFiles);
 
-        Path spoolPath = projectIndexDir.resolve("embed.spool");
+        Path spoolPath = projectIndexDir.resolve(FULL_SPOOL);
         try {
             // Phase 1: build chunk lists and spool all embedding texts to disk.
             // Methods always contribute 1 slot; classes contribute N slots (one per chunk).

@@ -81,6 +81,7 @@ class ReadPathInventoryTest {
                 "cluster/GenerationFiles.java",                   // reader + restoring writer: verify downloads
                 "cluster/objectstore/ObjectStorePublisher.java",  // writer: read the commit to upload
                 "cluster/warm/LazyGenerations.java",              // reader factory: full-copy generations
-                "cluster/warm/RemoteDirectory.java");             // lazy generation: local eager files, checksums
+                "cluster/warm/RemoteDirectory.java",              // lazy generation: local eager files, checksums
+                "indexer/ProjectIndexManager.java");              // writer disk GC: takes write.lock only, no reader
     }
 }
