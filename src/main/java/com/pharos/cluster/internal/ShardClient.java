@@ -28,7 +28,7 @@ import java.util.function.ToLongFunction;
  * {@link GenerationMismatchException} and other 4xx as {@link ShardCallException}: another replica
  * would not change those, and neither marks the reader suspect.
  */
-public final class ShardClient {
+public final class ShardClient implements AutoCloseable {
 
     /**
      * One internal endpoint: its response type, the generation a request pins (null: none) and the
@@ -84,6 +84,17 @@ public final class ShardClient {
         this.token = token;
         this.requestTimeout = requestTimeout;
         this.http = HttpClient.newBuilder().connectTimeout(connectTimeout).build();
+    }
+
+    /** Aborts the calls still open and stops the HTTP client's threads. Idempotent. */
+    @Override
+    public void close() {
+        http.shutdownNow();
+    }
+
+    /** True once {@link #close} ran and the HTTP client's threads have stopped. */
+    public boolean closed() {
+        return http.isTerminated();
     }
 
     /** Calls this client has open to {@code node}: the router's {@code coordinatorInFlight} input. */

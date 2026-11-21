@@ -197,6 +197,7 @@ public final class DistributedSearch implements Closeable {
     @Override
     public void close() {
         remote.shutdownNow();
+        client.close(); // its HttpClient's selector thread would outlive a replaced coordinator
     }
 
     /** One shard of one query: where it is searched and the generation pinned for it. */

@@ -566,4 +566,18 @@ class InternalApiTest {
                     .as("the connection is closed, not left running for 40 s").isTrue();
         }
     }
+
+    /** Minor 4: closing a coordinator closes its shard client's HttpClient. */
+    @Test
+    void closingTheCoordinatorClosesItsShardClient() throws Exception {
+        ReaderHealth health = new ReaderHealth(30);
+        ShardClient c = new ShardClient(health, TOKEN, Duration.ofMillis(500), Duration.ofSeconds(1));
+        var router = new com.pharos.cluster.routing.ShardRouter(List::of, List::of, health, id -> false);
+        var ds = new com.pharos.search.distributed.DistributedSearch(router, c, null, null, null,
+                Duration.ofSeconds(5), () -> 0);
+        ds.close();
+        long until = System.nanoTime() + 5_000_000_000L;
+        while (!c.closed() && System.nanoTime() < until) Thread.sleep(20);
+        assertThat(c.closed()).isTrue();
+    }
 }
