@@ -712,13 +712,14 @@ def insert_method_comment(path, n):
 
 
 FILLER = None
+BALLAST = None
 
 
 def remove_filler():
-    global FILLER
-    if FILLER is not None and FILLER.exists():
-        FILLER.unlink()
-        log(f"removed filler {FILLER}")
+    for f in (FILLER, BALLAST):
+        if f is not None and f.exists():
+            f.unlink()
+            log(f"removed {f}")
 
 
 # --------------------------------------------------------------------------- bucket checks
@@ -1042,8 +1043,8 @@ def phase_scale():
     while len(live) > 1:  # one writer to start from
         live[-1].stop()
         live = writers_alive()
-    if not live:
-        node("w1").start().wait_health()
+    if not live:  # a driver re-run: w2 stopped gracefully last (w1 was killed in K1)
+        node("w2").start().wait_health()
         live = writers_alive()
     base = live[0]
     wait_until(lambda: len((hb_of(base.node_id) or {}).get("leases") or []) == 4, 300, f"{base.name} holding 4")
@@ -1187,9 +1188,18 @@ def phase_disk():
     while len(live) > 1:
         live[-1].stop()
         live = writers_alive()
-    other = live[0] if live else node("w1").start()
+    other = live[0] if live else node("w2").start()  # w2 stopped gracefully last; w1 was killed
     other.wait_health()
     wait_until(all_published, 900, "all shards current before the disk step", step=2)
+    # A ballast file freed together with the filler: other processes keep writing to this shared disk
+    # (run 4 lost ~0.4 GB to them during the step), and "space is freed" must free more than that drift.
+    global BALLAST
+    BALLAST = gate_dir() / "ballast.bin"
+    if free_bytes() - GIB < MIN_FREE_FLOOR + 2 * GIB:
+        raise RuntimeError("not enough disk for the ballast")
+    with open(BALLAST, "wb") as f:
+        os.posix_fallocate(f.fileno(), 0, GIB)
+    out["ballast_bytes"] = GIB
     est = lucene_estimate()
     # headroom: the checkouts it makes (about the lucene source) fit, the lucene run does not
     margin = est["source"] + est["peak"] // 2 + 64 * MIB
@@ -1262,8 +1272,9 @@ def phase_disk():
                    step=1)
         out["low_handover"] = {"shard": target, "published_by": manifest(MON.s3, target, MON.latest[target]).get(
             "writerNode"), "after_s": round(now() - c2["t"], 1)}
-    remove_filler()
+    remove_filler()  # the filler and the ballast
     t_free = now()
+    out["free_after_freeing"] = free_bytes()
     r = MON.wait_status(lambda r: ("writer-low-disk", wlow.node_id) not in [tuple(h) for h in r["health"]]
                         and ((r["writers"].get(wlow.node_id) or {}).get("disk") or {}).get("low") is False, 120,
                         "wlow recovered")

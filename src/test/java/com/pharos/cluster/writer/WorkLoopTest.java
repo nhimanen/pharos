@@ -378,6 +378,20 @@ class WorkLoopTest {
     }
 
     @Test
+    void changeFoundByTheLoopsOwnPollIsAnnouncedBeforeItsRun() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        AtomicReference<JsonNode> seen = new AtomicReference<>();
+        a.embedder.onBatch = duringRunOf(a, s, () -> seen.set(heartbeatOf("node-a").orElseThrow()));
+        change(s, "pushed");
+        rounds(1, 10, a);   // the tick's poll finds the change, then runs it at once
+        assertThat(seen.get()).isNotNull();
+        assertThat(seen.get().path("backlog").path("solo").path("pending").asBoolean())
+                .as("the heartbeat written before the run shows the change").isTrue();
+    }
+
+    @Test
     void changeDuringItsOwnRunStaysPendingAfterThePublish() throws IOException {
         ShardId s = pathShard("solo");
         Writer a = new Writer("node-a");

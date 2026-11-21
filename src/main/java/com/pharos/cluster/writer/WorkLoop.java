@@ -487,6 +487,7 @@ public final class WorkLoop implements Closeable {
 
     /** Polls every held shard's source; returns the pending ones, oldest unpublished change first. */
     private List<ShardId> poll() {
+        boolean announce = false;
         for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
             if (stopping) break;
             ShardId shard = e.getKey();
@@ -505,8 +506,10 @@ public final class WorkLoop implements Closeable {
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
                 continue;
             }
-            pollShard(shard, st);
+            announce |= pollShard(shard, st);
         }
+        // a change this poll found first (before the detector) is announced now, not after the runs
+        if (announce && !stopping) members.beat();
         return shards.entrySet().stream().filter(e -> e.getValue().pendingSince != null)
                 .sorted(Comparator.comparing((Map.Entry<ShardId, ShardState> e) -> e.getValue().pendingSince)
                         .thenComparing(e -> e.getKey().value()))
