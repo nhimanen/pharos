@@ -41,6 +41,7 @@ class FsObjectStoreTest {
         assertThat(second).isPresent().isNotEqualTo(first);
         assertThat(new String(store.get("shards/a/LATEST").orElseThrow().data(), StandardCharsets.UTF_8)).isEqualTo("two");
         assertThat(store.putIfMatch("shards/a/missing", b("x"), second.get())).isEmpty();
+        assertThat(store.durableMoves.get()).as("each committed write was forced to disk").isEqualTo(2);
     }
 
     @Test

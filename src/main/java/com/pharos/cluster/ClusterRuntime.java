@@ -452,8 +452,7 @@ public final class ClusterRuntime implements Closeable {
             }
             workLoopLock = lock.get();
             com.pharos.cluster.writer.DiskGuard disk = new com.pharos.cluster.writer.DiskGuard(config.getIndexDir(),
-                    java.util.List.of(w.getWorkDir(), com.pharos.embedding.DjlEmbeddingProvider.modelCacheDir()),
-                    com.pharos.cluster.writer.DiskGuard.Settings.of(w.getDisk()),
+                    writerDiskDirs(config), com.pharos.cluster.writer.DiskGuard.Settings.of(w.getDisk()),
                     com.pharos.cluster.writer.DiskGuard.Probe.FILE_STORES);
             loop = new com.pharos.cluster.writer.WorkLoop(new com.pharos.cluster.writer.WorkLoop.Settings(
                     c.effectiveNodeId(), w.leaseTtl(), Duration.ofSeconds(c.getHeartbeatSeconds()),
@@ -475,15 +474,57 @@ public final class ClusterRuntime implements Closeable {
     }
 
     /**
+     * What the writer disk guard watches besides the index directory: the source checkouts, the
+     * model cache and, on {@code cluster.backend: peer-pull}, {@code cluster.peers.storeDir}, which
+     * holds every retained generation (each counted once per file store).
+     */
+    public static java.util.List<Path> writerDiskDirs(IndexConfig config) {
+        ClusterConfig c = config.getCluster();
+        java.util.List<Path> dirs = new java.util.ArrayList<>(java.util.List.of(c.getWriter().getWorkDir(),
+                com.pharos.embedding.DjlEmbeddingProvider.modelCacheDir()));
+        if (c.getBackend() == BackendKind.PEER_PULL) dirs.add(c.getPeers().getStoreDir());
+        return java.util.List.copyOf(dirs);
+    }
+
+    /** A peer-mode writer's disk guard (no work loop runs there); built on first use, guarded by this. */
+    private com.pharos.cluster.writer.DiskGuard peerDisk;
+    private long peerDiskCheckedNanos;
+
+    /**
      * The writer disk guard's view for {@code /health} ({@code freeBytes}, {@code totalBytes},
-     * {@code low}); null unless a work loop runs.
+     * {@code low}): the work loop's guard, or on a peer-mode writer a guard of its own (re-probed at
+     * most every {@code cluster.writer.disk.checkSeconds}); null elsewhere.
      */
     public Map<String, Object> writerDisk() {
         com.pharos.cluster.writer.WorkLoop loop;
         synchronized (this) {
             loop = workLoop;
         }
-        return loop == null ? null : loop.diskStatus().map(com.pharos.cluster.writer.DiskGuard.Status::toMap).orElse(null);
+        if (loop != null) {
+            return loop.diskStatus().map(com.pharos.cluster.writer.DiskGuard.Status::toMap).orElse(null);
+        }
+        return peerDiskGuard().map(g -> {
+            synchronized (this) {
+                long now = System.nanoTime();
+                if (now - peerDiskCheckedNanos >= g.settings().check().toNanos()) {
+                    peerDiskCheckedNanos = now;
+                    return g.check().toMap();
+                }
+            }
+            return g.status().toMap();
+        }).orElse(null);
+    }
+
+    /** The disk guard of a peer-mode writer, watching {@link #writerDiskDirs}; empty on other nodes. */
+    public synchronized Optional<com.pharos.cluster.writer.DiskGuard> peerDiskGuard() {
+        if (!isWriter() || config.getCluster().getBackend() != BackendKind.PEER_PULL) return Optional.empty();
+        if (peerDisk == null) {
+            peerDisk = new com.pharos.cluster.writer.DiskGuard(config.getIndexDir(), writerDiskDirs(config),
+                    com.pharos.cluster.writer.DiskGuard.Settings.of(config.getCluster().getWriter().getDisk()),
+                    com.pharos.cluster.writer.DiskGuard.Probe.FILE_STORES);
+            peerDiskCheckedNanos = System.nanoTime();
+        }
+        return Optional.of(peerDisk);
     }
 
     /** The running work loop; empty unless {@link #beginWriting} started one. */

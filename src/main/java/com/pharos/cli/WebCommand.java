@@ -92,6 +92,7 @@ public class WebCommand implements Callable<Integer> {
                 // a peer-mode writer serves its published generations to readers (token-guarded)
                 clusterRuntime.replicationEndpoint().ifPresent(e -> {
                     webServer.setReplicationEndpoint(e);
+                    webServer.setWriterDisk(clusterRuntime::writerDisk); // index dir, store dir, checkouts
                     System.out.println("Serving /replication/* (cluster.backend: peer-pull)");
                 });
                 clusterRuntime.serverTls().ifPresent(t -> webServer.setTls(

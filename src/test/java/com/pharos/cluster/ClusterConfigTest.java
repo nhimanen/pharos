@@ -449,15 +449,31 @@ class ClusterConfigTest {
                 .hasMessageContaining("cluster.peers.longPollSeconds");
         assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxLongPolls\":0}}}"))
                 .hasMessageContaining("cluster.peers.maxLongPolls");
-        assertThatThrownBy(() -> parse("{\"cluster\":{\"tls\":{\"keystore\":\"/k.p12\"}}}"))
+        String peerWriter = "\"role\":\"writer\",\"backend\":\"peer-pull\",\"token\":\"t\",";
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\"}}}"))
                 .hasMessageContaining("cluster.tls.passwordEnv");
-        ClusterConfig tls = parse("{\"cluster\":{\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\"}}}");
+        ClusterConfig tls = parse("{\"cluster\":{" + peerWriter
+                + "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\"}}}");
         assertThat(tls.tlsServer()).isTrue();
         assertThat(tls.getTls().getKeystoreType()).isEqualTo("PKCS12");
         assertThat(new String(tls.getTls().password())).isEqualTo(System.getenv("PATH"));
-        ClusterConfig unset = parse("{\"cluster\":{\"tls\":{\"truststore\":\"/t.p12\","
+        ClusterConfig unset = parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"truststore\":\"/t.p12\","
                 + "\"passwordEnv\":\"PHAROS_TEST_SURELY_UNSET_VAR\"}}}");
         assertThat(unset.tlsServer()).as("a truststore alone is client-side only").isFalse();
         assertThatThrownBy(() -> unset.getTls().password()).hasMessageContaining("PHAROS_TEST_SURELY_UNSET_VAR");
+        // P5-R7: TLS only on peer-pull writers for now
+        String keystore = "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\"}";
+        for (String other : new String[]{"",
+                "\"role\":\"writer\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},",
+                "\"role\":\"reader\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                        + "\"advertiseUrl\":\"http://r:1\",\"token\":\"t\",",
+                "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\","}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{" + other + keystore + "}}")).as(other)
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.tls is not supported")
+                    .hasMessageContaining("only peer-pull writers");
+        }
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tls\":{\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
+                .hasMessageContaining("cluster.tls is not supported");
+        assertThat(parse("{\"cluster\":{\"tls\":{}}}").tlsServer()).as("an empty section configures nothing").isFalse();
     }
 }

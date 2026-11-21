@@ -179,7 +179,17 @@ public class ClusterConfig {
         }
         if (peers == null) peers = new PeersConfig();
         peers.validate();
-        if (tls != null) tls.validate();
+        if (tls != null) {
+            tls.validate();
+            // Ruling P5-R7: only a peer-pull writer's /replication/* listens with TLS for now; elsewhere the
+            // clients (./pharos, coordinators, the router) have no truststore yet and would be locked out.
+            if ((tls.getKeystore() != null || tls.getTruststore() != null)
+                    && !(backend == BackendKind.PEER_PULL && role == NodeRole.WRITER)) {
+                throw new IllegalStateException("cluster.tls is not supported on cluster.role '" + role.json()
+                        + "' with cluster.backend '" + backend.json() + "' yet: only peer-pull writers serve TLS"
+                        + " (remove cluster.tls)");
+            }
+        }
         if (role == NodeRole.WRITER && writer.isWorkQueue() && heartbeatSeconds >= writer.getLeaseTtlSeconds()) {
             // a writer's heartbeat is its liveness (TTL = the lease TTL) and the bucket's clock for its leases
             throw new IllegalStateException("cluster.heartbeatSeconds (" + heartbeatSeconds
@@ -266,8 +276,13 @@ public class ClusterConfig {
     public void setPeers(PeersConfig p) { this.peers = p == null ? new PeersConfig() : p; }
     public TlsConfig getTls() { return tls; }
     public void setTls(TlsConfig t) { this.tls = t; }
-    /** True when {@code cluster.tls.keystore} is set: the web server listens with TLS only. */
-    public boolean tlsServer() { return tls != null && tls.getKeystore() != null; }
+    /**
+     * True when {@code cluster.tls.keystore} is set on a peer-pull writer (the only place it is
+     * accepted, P5-R7): its web server listens with TLS only.
+     */
+    public boolean tlsServer() {
+        return tls != null && tls.getKeystore() != null && backend == BackendKind.PEER_PULL && role == NodeRole.WRITER;
+    }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
     public StatusConfig getStatus() { return status; }
     public void setStatus(StatusConfig status) { this.status = status == null ? new StatusConfig() : status; }

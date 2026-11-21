@@ -182,6 +182,7 @@ public final class FsObjectStore implements ObjectStore {
                 Files.copy(source, staged);
             }
             Files.setLastModifiedTime(staged, FileTime.from(Instant.now()));
+            fsync(staged); // a link shares the source's inode: forcing it makes unsynced temp sources durable too
             withLock(() -> {
                 moveIntoPlace(staged, target);
                 return null;
@@ -301,20 +302,49 @@ public final class FsObjectStore implements ObjectStore {
     @Override
     public void close() {}
 
+    /** Writes {@code data} to a new file in {@code .tmp/} and forces it to disk. */
     private Path stage(byte[] data) throws IOException {
         Path staged = tmp.resolve("put-" + java.util.UUID.randomUUID());
-        Files.write(staged, data, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        try (FileChannel ch = FileChannel.open(staged, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data);
+            while (buf.hasRemaining()) ch.write(buf);
+            ch.force(true);
+        }
         return staged;
     }
 
-    private static void moveIntoPlace(Path staged, Path target) throws IOException {
-        Files.createDirectories(target.getParent());
+    /**
+     * Moves a staged (already forced) file over {@code target} atomically, then forces the
+     * directories whose entries changed: the target's parent and, when this move created
+     * directories, each new one's parent up to the first that existed. Only then is the object
+     * durable: after a power loss {@code LATEST} can never name a manifest that is not on disk.
+     */
+    private void moveIntoPlace(Path staged, Path target) throws IOException {
+        Path parent = target.getParent();
+        Path firstExisting = parent;
+        while (firstExisting != null && !Files.isDirectory(firstExisting)) firstExisting = firstExisting.getParent();
+        Files.createDirectories(parent);
         try {
             Files.move(staged, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException e) { // root and .tmp are one directory tree: not expected
             Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING);
         } catch (FileAlreadyExistsException e) {
             Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+        for (Path d = parent; d != null; d = d.getParent()) {
+            fsync(d);
+            if (d.equals(firstExisting) || d.equals(root)) break;
+        }
+        durableMoves.incrementAndGet();
+    }
+
+    /** Durable moves done (tests). */
+    final java.util.concurrent.atomic.AtomicLong durableMoves = new java.util.concurrent.atomic.AtomicLong();
+
+    /** {@code fsync} of a file or a directory (a directory is opened for reading). */
+    static void fsync(Path p) throws IOException {
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            ch.force(true);
         }
     }
 

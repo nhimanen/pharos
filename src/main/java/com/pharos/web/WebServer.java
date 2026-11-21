@@ -90,12 +90,16 @@ public class WebServer {
         this.replication = java.util.Objects.requireNonNull(endpoint, "endpoint");
     }
 
+    /** The connector's idle timeout when set; null keeps Jetty's default (30 s). */
+    private volatile java.time.Duration idleTimeout = null;
+
     /**
-     * Idle timeout of a connection when the server holds long-polls: above the longest
-     * {@code latest} wait, so Jetty never cuts a waiting request.
+     * Overrides the idle timeout of every connection (Jetty's default is 30 s). A {@code latest}
+     * long-poll raises it for its own connection only, for as long as it waits.
      */
-    static final long LONG_POLL_IDLE_TIMEOUT_MILLIS =
-            (com.pharos.config.ClusterConfig.PeersConfig.MAX_LONG_POLL_SECONDS + 30) * 1000L;
+    public void setIdleTimeout(java.time.Duration timeout) {
+        this.idleTimeout = java.util.Objects.requireNonNull(timeout, "timeout");
+    }
 
     /** Checks a presented cluster token (constant time); without one, no request gets the token view. */
     private volatile java.util.function.Predicate<String> clusterToken = t -> false;
@@ -339,10 +343,10 @@ public class WebServer {
             // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
             if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
             Tls t = tls;
-            boolean longPolls = replication != null;
-            if (t != null || longPolls) {
+            java.time.Duration idle = idleTimeout;
+            if (t != null || idle != null) {
                 // Our own connector replaces Javalin's default one (which it adds only when none is set).
-                config.jetty.addConnector((server, http) -> connector(server, http, port, t, longPolls));
+                config.jetty.addConnector((server, http) -> connector(server, http, port, t, idle));
             }
         });
 
@@ -979,13 +983,10 @@ public class WebServer {
         return app;
     }
 
-    /**
-     * The listening connector: TLS (from {@link Tls}) or plain HTTP, with an idle timeout above the
-     * longest long-poll when {@code longPolls}.
-     */
+    /** The listening connector: TLS (from {@link Tls}) or plain HTTP; {@code idle} null keeps the default. */
     static org.eclipse.jetty.server.ServerConnector connector(org.eclipse.jetty.server.Server server,
                                                               org.eclipse.jetty.server.HttpConfiguration http,
-                                                              int port, Tls tls, boolean longPolls) {
+                                                              int port, Tls tls, java.time.Duration idle) {
         org.eclipse.jetty.server.ServerConnector c;
         if (tls != null) {
             if (!java.nio.file.Files.isRegularFile(tls.keystore())) {
@@ -1007,7 +1008,7 @@ public class WebServer {
             c = new org.eclipse.jetty.server.ServerConnector(server, new org.eclipse.jetty.server.HttpConnectionFactory(http));
         }
         c.setPort(port);
-        if (longPolls) c.setIdleTimeout(Math.max(c.getIdleTimeout(), LONG_POLL_IDLE_TIMEOUT_MILLIS));
+        if (idle != null) c.setIdleTimeout(idle.toMillis());
         return c;
     }
 

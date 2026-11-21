@@ -20,6 +20,7 @@ import com.pharos.config.IndexConfig;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
@@ -58,12 +59,47 @@ public final class PeerBackend implements ReplicationBackend {
         } catch (IOException e) {
             throw new UncheckedIOException("cannot open cluster.peers.storeDir " + cfg.getPeers().getStoreDir(), e);
         }
+        storeMismatch(cfg.getPeers().getStoreDir(), config.getIndexDir(), FILE_STORE).ifPresent(log::warn);
         this.cache = new LocalFsCache(config);
         GenerationGc gc = new GenerationGc(peer.store(), peer.layout(), cfg.getRetentionGenerations(),
                 Duration.ofMinutes(cfg.getRetentionMinutes()));
         this.publisher = new SignallingPublisher(new ObjectStorePublisher(peer.store(), peer.layout(),
                 peer.catalog(), gc, cfg.effectiveNodeId(), config.getSynonymsFile(), LeaseGuard.IMPLICIT,
                 WriterStateStore.NONE), peer.signal());
+    }
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(PeerBackend.class);
+
+    /** The file store of a path (the nearest existing ancestor); tests inject a fake. */
+    @FunctionalInterface
+    interface StoreOf {
+        Object of(Path p) throws IOException;
+    }
+
+    static final StoreOf FILE_STORE = p -> {
+        Path q = p.toAbsolutePath();
+        while (q != null && !java.nio.file.Files.exists(q)) q = q.getParent();
+        return java.nio.file.Files.getFileStore(q == null ? p.toAbsolutePath().getRoot() : q);
+    };
+
+    /**
+     * The WARN for a store directory on another file store than the index directory: hard links
+     * cannot cross file systems, so every published Lucene file is copied and disk use doubles.
+     * Empty when they share one, or when either store cannot be told (nothing to go by).
+     */
+    static Optional<String> storeMismatch(Path storeDir, Path indexDir, StoreOf storeOf) {
+        Object store;
+        Object index;
+        try {
+            store = storeOf.of(storeDir);
+            index = storeOf.of(indexDir);
+        } catch (IOException | RuntimeException e) {
+            return Optional.empty();
+        }
+        if (Objects.equals(store, index)) return Optional.empty();
+        return Optional.of("cluster.peers.storeDir " + storeDir + " (file store " + store + ") is not on the file store"
+                + " of the index directory " + indexDir + " (" + index + "): published Lucene files will be copied"
+                + " instead of hard-linked, which doubles their disk use; put both on one file system");
     }
 
     /** The writer's published state, served by the replication endpoint. */

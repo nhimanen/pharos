@@ -142,7 +142,13 @@ public final class ReplicationEndpoint {
     private void catalog(Context ctx) throws IOException {
         List<Map<String, Object>> shards = new ArrayList<>();
         for (ShardId s : peer.catalog().shards()) {
-            OptionalLong latest = currentGeneration(s);
+            OptionalLong latest;
+            try {
+                latest = currentGeneration(s);
+            } catch (IOException e) { // one unreadable LATEST must not hide the writer's other shards
+                log.warn("catalog: skipping shard {}: {}", s, e.getMessage());
+                continue;
+            }
             if (latest.isEmpty()) continue; // registered, never committed: readers skip it
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("shard", s.value());
@@ -208,7 +214,10 @@ public final class ReplicationEndpoint {
             throw e;
         }
         CompletableFuture<Void> waiting = signalled.completeOnTimeout(null, wait, TimeUnit.SECONDS);
+        // Only this (authenticated) request's connection may stay silent for the wait; restored before answering.
+        IdleTimeout idle = IdleTimeout.extend(ctx, TimeUnit.SECONDS.toMillis(wait) + IDLE_MARGIN_MILLIS);
         ctx.future(() -> waiting.handleAsync((v, e) -> {
+            idle.restore();
             try {
                 answerLatest(ctx, shard, currentGeneration(shard));
             } catch (IOException | RuntimeException ex) {
@@ -219,6 +228,30 @@ public final class ReplicationEndpoint {
             }
             return null;
         }, answers));
+    }
+
+    /** Idle allowance on top of a long-poll's wait. */
+    static final long IDLE_MARGIN_MILLIS = 15_000;
+
+    /**
+     * The idle timeout of one request's connection (Jetty's end point), raised for a long-poll and
+     * put back afterwards so a kept-alive connection gets the connector's default again. A no-op
+     * outside Jetty.
+     */
+    private record IdleTimeout(org.eclipse.jetty.io.EndPoint endPoint, long previous) {
+        static IdleTimeout extend(Context ctx, long millis) {
+            org.eclipse.jetty.server.Request base = org.eclipse.jetty.server.Request.getBaseRequest(ctx.req());
+            org.eclipse.jetty.io.EndPoint ep = base == null || base.getHttpChannel() == null
+                    ? null : base.getHttpChannel().getEndPoint();
+            if (ep == null) return new IdleTimeout(null, 0);
+            long previous = ep.getIdleTimeout();
+            if (previous > 0 && previous < millis) ep.setIdleTimeout(millis); // 0 = no timeout: keep it
+            return new IdleTimeout(ep, previous);
+        }
+
+        void restore() {
+            if (endPoint != null) endPoint.setIdleTimeout(previous);
+        }
     }
 
     private void manifest(Context ctx) throws IOException {

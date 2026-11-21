@@ -541,6 +541,115 @@ class ReplicationEndpointTest {
     }
 
     @Test
+    void catalogSkipsAShardWithAnUnreadableLatest() throws Exception {
+        open(config);
+        indexFull();
+        PeerStore peer = backend.peerStore();
+        peer.catalog().register(new com.pharos.cluster.ShardId("empty-latest"));
+        peer.catalog().register(new com.pharos.cluster.ShardId("garbage-latest"));
+        peer.store().put("shards/empty-latest/LATEST", new byte[0]);
+        peer.store().put("shards/garbage-latest/LATEST", "{not json".getBytes(StandardCharsets.UTF_8));
+        Javalin app = serve();
+        HttpResponse<byte[]> r = get(app, "/catalog");
+        assertThat(r.statusCode()).isEqualTo(200);
+        JsonNode shards = json(r).get("shards");
+        assertThat(shards).hasSize(1);
+        assertThat(shards.get(0).get("shard").asText()).isEqualTo(PROJECT);
+    }
+
+    @Test
+    void longPollRaisesTheIdleTimeoutOfItsOwnConnectionOnly() throws Exception {
+        open(config);
+        indexFull();
+        WebServer web = new WebServer(null, null, null, null, null, NodeRole.WRITER);
+        web.setReplicationEndpoint(backend.endpoint());
+        web.setIdleTimeout(Duration.ofSeconds(1));
+        Javalin app = web.start(0, tmp.resolve("home"));
+        apps.add(app);
+
+        // An ordinary connection that sends nothing is cut at the (shortened) default.
+        try (java.net.Socket idle = new java.net.Socket("localhost", app.port())) {
+            idle.setSoTimeout(15_000);
+            long t0 = System.nanoTime();
+            assertThat(idle.getInputStream().read()).isEqualTo(-1);
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0)).isLessThan(8_000);
+        }
+
+        // A long-poll waits past it, then its kept-alive connection gets the default back.
+        try (java.net.Socket s = new java.net.Socket("localhost", app.port())) {
+            s.setSoTimeout(20_000);
+            s.getOutputStream().write(("GET " + ReplicationEndpoint.PREFIX + "/" + PROJECT + "/latest?wait=3&after=1 HTTP/1.1\r\n"
+                    + "Host: localhost\r\n" + InternalApi.TOKEN_HEADER + ": " + TOKEN + "\r\n\r\n")
+                    .getBytes(StandardCharsets.US_ASCII));
+            s.getOutputStream().flush();
+            long t0 = System.nanoTime();
+            String response = readResponse(s.getInputStream());
+            long waited = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+            assertThat(response).startsWith("HTTP/1.1 200").contains("\"generation\":1");
+            assertThat(waited).as("answered at the wait's end, not cut at the 1 s idle timeout").isGreaterThanOrEqualTo(2_800);
+            long t1 = System.nanoTime();
+            assertThat(s.getInputStream().read()).isEqualTo(-1);
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1))
+                    .as("idle timeout restored after the long-poll").isLessThan(8_000);
+        }
+    }
+
+    /** Reads one HTTP/1.1 response with a Content-Length body. */
+    private static String readResponse(InputStream in) throws IOException {
+        StringBuilder head = new StringBuilder();
+        while (!head.toString().endsWith("\r\n\r\n")) {
+            int c = in.read();
+            if (c < 0) throw new java.io.EOFException("connection closed after: " + head);
+            head.append((char) c);
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)content-length: *(\\d+)").matcher(head);
+        assertThat(m.find()).as(head.toString()).isTrue();
+        byte[] body = in.readNBytes(Integer.parseInt(m.group(1)));
+        return head + new String(body, StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void storeDirOnAnotherFileStoreIsWarned() throws Exception {
+        Path store = tmp.resolve("store");
+        Path index = tmp.resolve("indexes");
+        assertThat(PeerBackend.storeMismatch(store, index, p -> "same")).isEmpty();
+        assertThat(PeerBackend.storeMismatch(store, index, p -> p.equals(store) ? "fs-a" : "fs-b")).hasValueSatisfying(w ->
+                assertThat(w).contains(store.toString(), "fs-a", index.toString(), "fs-b", "copied", "doubles"));
+        assertThat(PeerBackend.storeMismatch(store, index, p -> { throw new IOException("no"); })).isEmpty();
+        assertThat(PeerBackend.storeMismatch(store, index, PeerBackend.FILE_STORE)).as("one temp file system").isEmpty();
+    }
+
+    @Test
+    void writerDiskGuardWatchesTheStoreDir() throws Exception {
+        Path storeDir = config.getCluster().getPeers().getStoreDir();
+        assertThat(com.pharos.cluster.ClusterRuntime.writerDiskDirs(config)).contains(storeDir);
+        IndexConfig objectStore = IndexConfig.defaults();
+        assertThat(com.pharos.cluster.ClusterRuntime.writerDiskDirs(objectStore)).doesNotContain(objectStore.getCluster()
+                .getPeers().getStoreDir());
+
+        // The store dir on its own (nearly full) file store makes the writer low.
+        com.pharos.cluster.writer.DiskGuard.Probe probe = new com.pharos.cluster.writer.DiskGuard.Probe() {
+            @Override public Object storeOf(Path p) { return p.startsWith(storeDir) ? "store-fs" : "index-fs"; }
+            @Override public com.pharos.cluster.writer.DiskGuard.Space space(Path p) {
+                return p.startsWith(storeDir) ? new com.pharos.cluster.writer.DiskGuard.Space(1L << 20, 100L << 30)
+                        : new com.pharos.cluster.writer.DiskGuard.Space(90L << 30, 100L << 30);
+            }
+        };
+        com.pharos.cluster.writer.DiskGuard guard = new com.pharos.cluster.writer.DiskGuard(config.getIndexDir(),
+                com.pharos.cluster.ClusterRuntime.writerDiskDirs(config),
+                com.pharos.cluster.writer.DiskGuard.Settings.of(config.getCluster().getWriter().getDisk()), probe);
+        assertThat(guard.low()).isTrue();
+
+        // A peer-mode writer runtime reports its disk (with the store dir) on /health.
+        open(config);
+        try (com.pharos.cluster.ClusterRuntime rt = new com.pharos.cluster.ClusterRuntime(config, backend,
+                ProjectRegistry.at(tmp.resolve("registry.json")), new LuceneIndexer(config))) {
+            assertThat(rt.peerDiskGuard()).isPresent();
+            assertThat(rt.writerDisk()).containsKeys("freeBytes", "totalBytes", "low");
+        }
+    }
+
+    @Test
     void peerBackendRefusesReaders() {
         IndexConfig c = writerConfig(3, 60);
         c.getCluster().setRole(NodeRole.READER);
