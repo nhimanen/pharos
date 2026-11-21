@@ -63,6 +63,8 @@ public class WebServer {
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     /** Source of {@code /cluster/status} and {@code /cluster/events}; without one both answer 404. */
     private volatile com.pharos.cluster.status.StatusService clusterStatus = null;
+    /** Checks a presented cluster token (constant time); without one, no request gets the token view. */
+    private volatile java.util.function.Predicate<String> clusterToken = t -> false;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -171,10 +173,20 @@ public class WebServer {
 
     /**
      * Source of {@code GET /cluster/status} (the status JSON) and {@code GET /cluster/events}
-     * (server-sent events), served on every role without a token: the status carries no secret.
+     * (server-sent events), served on every role. Without the cluster token the status is the public
+     * view (no reader {@code advertiseUrl}); see {@link #setClusterToken}.
      */
     public void setClusterStatus(com.pharos.cluster.status.StatusService status) {
         this.clusterStatus = java.util.Objects.requireNonNull(status, "status");
+    }
+
+    /**
+     * How {@code /cluster/status} checks {@code X-Pharos-Cluster-Token} for the token view (with the
+     * readers' {@code advertiseUrl}): a constant-time matcher, see
+     * {@link com.pharos.cluster.internal.InternalApi#tokenMatcher}.
+     */
+    public void setClusterToken(java.util.function.Predicate<String> matcher) {
+        this.clusterToken = java.util.Objects.requireNonNull(matcher, "matcher");
     }
 
     /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
@@ -882,20 +894,40 @@ public class WebServer {
                 ctx.status(404).json(Map.of("error", "no cluster status on this node"));
                 return;
             }
+            boolean member = clusterToken.test(ctx.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER));
             try {
-                ctx.contentType("application/json").result(st.currentJson());
+                ctx.contentType("application/json").result(st.currentJson(member));
             } catch (java.io.IOException e) {
                 ctx.status(503).json(Map.of("error", "cluster status unavailable: " + e.getMessage()));
             }
         });
-        // Proposal and layout changes as server-sent events (appeared|changed|cleared|layout); mounted
-        // when a status source is set before start (WebCommand does), else 404
-        com.pharos.cluster.status.StatusService statusAtStart = clusterStatus;
-        if (statusAtStart != null && statusAtStart.events() != null) {
-            app.sse(EVENTS_PATH, client -> statusAtStart.events().add(client));
-        } else {
-            app.get(EVENTS_PATH, ctx -> ctx.status(404).json(Map.of("error", "no cluster events on this node")));
-        }
+        // Proposal and layout changes as server-sent events (appeared|changed|cleared|layout). Events
+        // carry no addresses, so token and public clients get the same stream. At most
+        // StatusEvents.MAX_CLIENTS streams per node (503 above).
+        app.get(EVENTS_PATH, ctx -> {
+            com.pharos.cluster.status.StatusService st = clusterStatus;
+            com.pharos.cluster.status.StatusEvents ev = st == null ? null : st.events();
+            if (ev == null) {
+                ctx.status(404).json(Map.of("error", "no cluster events on this node"));
+                return;
+            }
+            if (!"text/event-stream".equals(ctx.header("Accept"))) { // the SSE handler's own condition
+                ctx.status(406).json(Map.of("error", "send Accept: text/event-stream"));
+                return;
+            }
+            if (!ev.tryReserve()) {
+                ctx.status(503).json(Map.of("error", "too many /cluster/events streams on this node (max "
+                        + com.pharos.cluster.status.StatusEvents.MAX_CLIENTS + ")"));
+                return;
+            }
+            try {
+                new io.javalin.http.sse.SseHandler(client -> ev.add(com.pharos.cluster.status.StatusEvents.of(client)))
+                        .handle(ctx);
+            } catch (Exception e) {
+                ev.release();
+                throw e;
+            }
+        });
 
         if (readerNode && internalApi != null) internalApi.mount(app);
 

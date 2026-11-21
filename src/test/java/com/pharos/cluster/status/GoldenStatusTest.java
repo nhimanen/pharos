@@ -24,7 +24,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class GoldenStatusTest {
 
+    /** The public view (no token): what the Cluster page gets. */
     static final Path GOLDEN = Path.of("src/test/resources/cluster/status-golden.json");
+    /** The token view: the same, plus every reader's {@code advertiseUrl}. */
+    static final Path GOLDEN_TOKEN = Path.of("src/test/resources/cluster/status-golden-token.json");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final long GIB = 1L << 30;
 
@@ -96,13 +99,20 @@ class GoldenStatusTest {
     @Test
     void goldenStatusFixtureMatches() throws Exception {
         ClusterStatus st = golden();
-        JsonNode actual = JSON.readTree(st.toJson());
+        JsonNode token = JSON.readTree(st.toJson());
+        JsonNode pub = JSON.readTree(st.withoutAddresses().toJson());
         if (Boolean.getBoolean("pharos.regenerateStatusGolden")) {
             Files.createDirectories(GOLDEN.getParent());
-            Files.writeString(GOLDEN, JSON.writerWithDefaultPrettyPrinter().writeValueAsString(actual) + "\n");
+            Files.writeString(GOLDEN, JSON.writerWithDefaultPrettyPrinter().writeValueAsString(pub) + "\n");
+            Files.writeString(GOLDEN_TOKEN, JSON.writerWithDefaultPrettyPrinter().writeValueAsString(token) + "\n");
         }
-        assertThat(actual).as("regenerate with -Dpharos.regenerateStatusGolden=true after a deliberate change")
+        assertThat(pub).as("regenerate with -Dpharos.regenerateStatusGolden=true after a deliberate change")
                 .isEqualTo(JSON.readTree(Files.readString(GOLDEN)));
+        assertThat(token).isEqualTo(JSON.readTree(Files.readString(GOLDEN_TOKEN)));
+        assertThat(Files.readString(GOLDEN)).as("the public view has no addresses").doesNotContain("advertiseUrl")
+                .doesNotContain("cluster.local");
+        assertThat(token.path("layout").path("readers").get(0).path("advertiseUrl").asText())
+                .isEqualTo("http://r1.cluster.local:7171");
 
         // what the fixture is for: every section populated
         assertThat(st.proposals()).extracting(ClusterStatus.Proposal::kind).containsExactly(

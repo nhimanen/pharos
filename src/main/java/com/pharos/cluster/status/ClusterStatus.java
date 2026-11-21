@@ -1,5 +1,6 @@
 package com.pharos.cluster.status;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -35,6 +36,18 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
 
     public byte[] toJson() throws IOException {
         return MAPPER.writeValueAsBytes(this);
+    }
+
+    /**
+     * The public view (served without the cluster token): every reader's {@code advertiseUrl} left
+     * out, since the internal topology is for cluster members only (as on {@code /cluster/readers}).
+     */
+    public ClusterStatus withoutAddresses() {
+        List<Reader> rs = layout.readers().stream().map(r -> new Reader(r.node(), null, r.shards(), r.state(),
+                r.degradedShards(), r.readerCache(), r.inFlight(), r.qps(), r.startedAt(), r.warmP95Millis(),
+                r.catalogAgeSeconds(), r.heartbeatAgeSeconds())).toList();
+        return new ClusterStatus(mode, asOf, new Layout(layout.summary(), layout.shards(), layout.writers(), rs),
+                backlogSummary, health, proposals);
     }
 
     /** @param summary the scale: shard, live writer and live reader counts */
@@ -74,10 +87,14 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
                          WriterHeartbeat.Indexing indexing, long startedAt, boolean stopping,
                          WriterHeartbeat.Disk disk, long heartbeatAgeSeconds) {}
 
-    /** The reader heartbeat's fields by their names, plus its age. */
+    /**
+     * The reader heartbeat's fields by their names, plus its age. {@code advertiseUrl} is present only
+     * in the token view ({@link #withoutAddresses}).
+     */
     @JsonPropertyOrder({"node", "advertiseUrl", "shards", "state", "degradedShards", "readerCache", "inFlight",
             "qps", "startedAt", "warmP95Millis", "catalogAgeSeconds", "heartbeatAgeSeconds"})
-    public record Reader(String node, String advertiseUrl, List<String> shards, String state,
+    public record Reader(String node, @JsonInclude(JsonInclude.Include.NON_NULL) String advertiseUrl,
+                         List<String> shards, String state,
                          List<String> degradedShards, Map<String, Object> readerCache, int inFlight, double qps,
                          long startedAt, Long warmP95Millis, Long catalogAgeSeconds, long heartbeatAgeSeconds) {}
 

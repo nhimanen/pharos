@@ -22,6 +22,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -228,5 +229,120 @@ class StatusEventsTest {
         assertThat(service.current().layout().readers()).hasSize(1);
         ReaderHeartbeat h = snap.get().readers().get(0).heartbeat();
         assertThat(h.node()).isEqualTo("r1");
+    }
+
+    /** A sink whose writes block until released: a client that never reads. */
+    static final class StuckSink implements StatusEvents.Sink {
+        final CountDownLatch released = new CountDownLatch(1);
+        final AtomicInteger writes = new AtomicInteger();
+        final AtomicInteger closes = new AtomicInteger();
+
+        private void block() {
+            writes.incrementAndGet();
+            try {
+                released.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted");
+            }
+        }
+
+        @Override public void event(String type, String data) { block(); }
+
+        @Override public void comment(String text) { block(); }
+
+        @Override public void onClose(Runnable r) { }
+
+        @Override public void close() { closes.incrementAndGet(); released.countDown(); }
+    }
+
+    /** A sink that records what it gets. */
+    static final class ListSink implements StatusEvents.Sink {
+        final List<String> got = new CopyOnWriteArrayList<>();
+        final AtomicInteger closes = new AtomicInteger();
+
+        @Override public void event(String type, String data) { got.add(type); }
+
+        @Override public void comment(String text) { }
+
+        @Override public void onClose(Runnable r) { }
+
+        @Override public void close() { closes.incrementAndGet(); }
+    }
+
+    @Test
+    void slowClientIsDroppedAndNeverStallsStatus(@TempDir Path tmp) throws Exception {
+        ClusterConfig.StatusConfig sc = new ClusterConfig.StatusConfig();
+        sc.getWindows().setAddReadersSeconds(0);
+        sc.getWindows().setClearGraceSeconds(0);
+        AtomicReference<StatusSnapshot> snap = new AtomicReference<>(readers(T0, 10));
+        StatusEvents events = new StatusEvents(Duration.ofHours(1), null);
+        StatusService service = new StatusService(snap::get, StatusStateStore.memory(), StatusSettings.of(sc), events,
+                Duration.ofHours(1), Duration.ZERO, System::nanoTime);
+        open.add(service);
+        service.refresh();
+        StuckSink stuck = new StuckSink();
+        ListSink healthy = new ListSink();
+        assertThat(events.tryReserve()).isTrue();
+        events.add(stuck);
+        assertThat(events.tryReserve()).isTrue();
+        events.add(healthy);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (stuck.writes.get() == 0 && System.nanoTime() < deadline) Thread.sleep(5);
+        assertThat(stuck.writes.get()).as("the stuck client's sender is blocked in its first write").isEqualTo(1);
+
+        WebServer web = new WebServer(null, null, null, null, null);
+        web.setClusterStatus(service);
+        io.javalin.Javalin app = web.start(0, tmp);
+        open.add(app::stop);
+        HttpClient http = HttpClient.newHttpClient();
+        long t0 = System.nanoTime();
+        for (int i = 1; i <= 60; i++) { // appears and clears every refresh: 60 events
+            snap.set(readers(T0.plusSeconds(i), i % 2 == 1 ? 90 : 1));
+            service.refresh();
+            if (i % 10 == 0) {
+                HttpResponse<String> st = http.send(HttpRequest.newBuilder(
+                        URI.create("http://127.0.0.1:" + app.port() + "/cluster/status")).build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(st.statusCode()).isEqualTo(200);
+            }
+        }
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0)).as("refreshes and GETs stay prompt")
+                .isLessThan(5_000);
+        assertThat(stuck.closes.get()).as("its queue overflowed: dropped and closed").isEqualTo(1);
+        assertThat(events.clientCount()).isEqualTo(1);
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (healthy.got.size() < 60 && System.nanoTime() < deadline) Thread.sleep(5);
+        assertThat(healthy.got).as("the reading client got every event").hasSize(60);
+        assertThat(events.tryReserve()).as("the dropped client's slot is free again").isTrue();
+        events.release();
+    }
+
+    @Test
+    void eventStreamsAreCappedPerNode(@TempDir Path tmp) throws Exception {
+        StatusEvents events = new StatusEvents(Duration.ofHours(1), null);
+        StatusService service = new StatusService(() -> readers(T0, 1), StatusStateStore.memory(),
+                StatusSettings.defaults(), events, Duration.ofHours(1), Duration.ZERO, System::nanoTime);
+        open.add(service);
+        WebServer web = new WebServer(null, null, null, null, null);
+        web.setClusterStatus(service);
+        io.javalin.Javalin app = web.start(0, tmp);
+        open.add(app::stop);
+        for (int i = 0; i < StatusEvents.MAX_CLIENTS; i++) assertThat(events.tryReserve()).isTrue();
+        assertThat(events.tryReserve()).isFalse();
+        HttpClient http = HttpClient.newHttpClient();
+        URI uri = URI.create("http://127.0.0.1:" + app.port() + "/cluster/events");
+        HttpResponse<String> full = http.send(HttpRequest.newBuilder(uri).header("Accept", "text/event-stream")
+                .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(full.statusCode()).isEqualTo(503);
+        assertThat(full.body()).contains("max 64");
+        HttpResponse<String> noAccept = http.send(HttpRequest.newBuilder(uri).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(noAccept.statusCode()).isEqualTo(406);
+        events.release();
+        HttpResponse<java.io.InputStream> ok = http.send(HttpRequest.newBuilder(uri)
+                .header("Accept", "text/event-stream").build(), HttpResponse.BodyHandlers.ofInputStream());
+        assertThat(ok.statusCode()).isEqualTo(200);
+        ok.body().close();
     }
 }

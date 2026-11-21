@@ -119,7 +119,6 @@
     } ],
     "readers" : [ {
       "node" : "r1",
-      "advertiseUrl" : "http://r1.cluster.local:7171",
       "shards" : [ "alpha", "beta", "gamma" ],
       "state" : "ready",
       "degradedShards" : [ ],
@@ -144,7 +143,6 @@
       "heartbeatAgeSeconds" : 0
     }, {
       "node" : "r2",
-      "advertiseUrl" : "http://r2.cluster.local:7171",
       "shards" : [ "alpha", "gamma" ],
       "state" : "degraded",
       "degradedShards" : [ "gamma" ],

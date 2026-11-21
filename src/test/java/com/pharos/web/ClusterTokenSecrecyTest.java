@@ -103,6 +103,40 @@ class ClusterTokenSecrecyTest {
              var runtime = new com.pharos.cluster.ClusterRuntime(cfg, backend, registry, lucene)) {
             String json = new String(runtime.statusService().currentJson(), java.nio.charset.StandardCharsets.UTF_8);
             assertThat(json).contains("\"r1\"").contains("\"w1\"");
+            assertThat(json).as("the public view has no reader address").doesNotContain("advertiseUrl")
+                    .doesNotContain(c.getAdvertiseUrl());
+
+            // over HTTP: the address only with the right token (R12)
+            WebServer server = new WebServer(null, null, null, null, null);
+            server.setClusterStatus(runtime.statusService());
+            server.setClusterToken(runtime.clusterTokenMatcher());
+            io.javalin.Javalin app = server.start(0, tmp.resolve("web"));
+            try {
+                java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+                java.net.URI uri = java.net.URI.create("http://127.0.0.1:" + app.port() + "/cluster/status");
+                java.util.function.Function<String, String> get = tok -> {
+                    var b = java.net.http.HttpRequest.newBuilder(uri);
+                    if (tok != null) b.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER, tok);
+                    try {
+                        var r = http.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                        assertThat(r.statusCode()).isEqualTo(200);
+                        return r.body();
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                };
+                assertThat(get.apply(null)).as("no token").doesNotContain("advertiseUrl");
+                assertThat(get.apply("wrong-token")).as("a wrong token").doesNotContain("advertiseUrl");
+                assertThat(get.apply(SECRET.substring(0, SECRET.length() - 1))).as("a prefix of the token")
+                        .doesNotContain("advertiseUrl");
+                String member = get.apply(SECRET);
+                assertThat(member).as("the cluster token").contains("\"advertiseUrl\":\"" + c.getAdvertiseUrl() + "\"");
+                for (String body : List.of(get.apply(null), member)) {
+                    assertThat(body).doesNotContain(SECRET).doesNotContain("hook-secret-value");
+                }
+            } finally {
+                app.stop();
+            }
             for (String secret : List.of(SECRET, "hook-secret-value", "PHAROS_TEST_ACCESS_KEY_ENV",
                     "PHAROS_TEST_SECRET_KEY_ENV", "minio.internal")) {
                 assertThat(json).as(secret).doesNotContain(secret);

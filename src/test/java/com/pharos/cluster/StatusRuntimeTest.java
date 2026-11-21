@@ -64,7 +64,30 @@ class StatusRuntimeTest {
         try (ReplicationBackend backend = Backends.create(config);
              LuceneIndexer lucene = new LuceneIndexer(config, backend.localCache());
              ClusterRuntime runtime = new ClusterRuntime(config, backend, registry, lucene)) {
-            ClusterStatus st = runtime.statusService().refresh();
+            var service = runtime.statusService();
+            assertThat(service.timerRunning()).as("a single node starts no status timer of its own").isFalse();
+            assertThat(service.events().keepAliveRunning()).as("nor a keep-alive timer").isFalse();
+            assertThat(new String(service.currentJson(), java.nio.charset.StandardCharsets.UTF_8))
+                    .contains("\"single-node\"");
+            assertThat(service.events().keepAliveRunning()).isFalse();
+            assertThat(service.timerRunning()).isFalse();
+
+            // an SSE client starts the refresh and keep-alive timers; they stop when it leaves
+            java.util.concurrent.atomic.AtomicReference<Runnable> onClose = new java.util.concurrent.atomic.AtomicReference<>();
+            assertThat(service.events().tryReserve()).isTrue();
+            service.events().add(new com.pharos.cluster.status.StatusEvents.Sink() {
+                @Override public void event(String type, String data) { }
+                @Override public void comment(String text) { }
+                @Override public void onClose(Runnable r) { onClose.set(r); }
+                @Override public void close() { }
+            });
+            assertThat(service.timerRunning()).isTrue();
+            assertThat(service.events().keepAliveRunning()).isTrue();
+            onClose.get().run(); // the client disconnects
+            assertThat(service.timerRunning()).isFalse();
+            assertThat(service.events().keepAliveRunning()).isFalse();
+
+            ClusterStatus st = service.refresh();
             assertThat(st.mode()).isEqualTo("single-node");
             assertThat(st.layout().writers()).hasSize(1);
             assertThat(st.layout().readers()).hasSize(1);

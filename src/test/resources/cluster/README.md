@@ -1,8 +1,14 @@
-# `status-golden.json`
+# `status-golden.json` and `status-golden-token.json`
 
-A `GET /cluster/status` answer for a three-shard cluster, written by `GoldenStatusTest`
-(regenerate with `mvn test -Dtest=GoldenStatusTest -Dpharos.regenerateStatusGolden=true`).
-The Cluster page (Task 6) reads its fields from this fixture. Every list is sorted and map keys
+Two `GET /cluster/status` answers for the same three-shard cluster, both written by `GoldenStatusTest`:
+
+- `status-golden.json` is the **public view**, served without the cluster token. It is the one the
+  Cluster page uses, and it has no `advertiseUrl` fields.
+- `status-golden-token.json` is the **token view**, served to a request that carries a valid
+  `X-Pharos-Cluster-Token`. It is identical except that each reader also has its `advertiseUrl`.
+
+Regenerate both with `mvn test -Dtest=GoldenStatusTest -Dpharos.regenerateStatusGolden=true`.
+The Cluster page (Task 6) reads its fields from the public fixture. Every list is sorted and map keys
 are in order. Ages are whole seconds of bucket time, measured to `asOf`.
 
 - `mode`: `cluster`, or `single-node` on `role: all` (one node, both writer and reader, holding every shard).
@@ -24,7 +30,7 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
   disk {freeBytes, totalBytes, low} | null`, plus `heartbeatAgeSeconds`.
 - `layout.readers[]`: the reader heartbeat fields `node, advertiseUrl, shards, state,
   degradedShards, readerCache {…}, inFlight, qps, startedAt, warmP95Millis, catalogAgeSeconds`
-  (the last two may be null), plus `heartbeatAgeSeconds`.
+  (the last two may be null), plus `heartbeatAgeSeconds`. `advertiseUrl` is in the token view only.
 - `backlogSummary`: `{shardsPending, oldestPendingAgeSeconds}`.
 - `health[]`: `{kind, target, message}`. The kinds are `lease-expired`, `no-readers`,
   `reader-degraded`, `reader-draining`, `reader-warming`, `shard-lagging`, `shard-unassigned`,
@@ -34,3 +40,5 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
   `writer-disk`.
 
 `/cluster/events` sends `{type: appeared|changed|cleared, proposal}` and `{type: layout, summary}`.
+Events carry no addresses, with or without the token. The stream needs `Accept: text/event-stream`
+(which `EventSource` sends), and a node allows at most 64 streams; above that it answers 503.

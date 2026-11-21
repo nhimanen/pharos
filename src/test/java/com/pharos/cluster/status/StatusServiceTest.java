@@ -105,6 +105,10 @@ class StatusServiceTest {
         clock.advance(Duration.ofSeconds(4));
         byte[] fromB = b.currentJson();
         assertThat(new String(fromB, StandardCharsets.UTF_8)).isEqualTo(new String(fromA, StandardCharsets.UTF_8));
+        // like with like: the token views are identical too, and only they carry addresses
+        assertThat(b.currentJson(true)).isEqualTo(a.currentJson(true));
+        assertThat(new String(fromA, StandardCharsets.UTF_8)).doesNotContain("advertiseUrl");
+        assertThat(new String(a.currentJson(true), StandardCharsets.UTF_8)).contains("\"advertiseUrl\":\"http://r1:7171\"");
 
         ClusterStatus st = a.current();
         assertThat(st.mode()).isEqualTo("cluster");
@@ -140,7 +144,7 @@ class StatusServiceTest {
         assertThat(store.get(layout.statusStateKey())).isPresent();
         // refreshes with nothing new rewrite nothing and keep the bytes
         String etag = store.get(layout.statusStateKey()).orElseThrow().etag();
-        assertThat(a.refresh().toJson()).isEqualTo(fromA);
+        assertThat(a.refresh().withoutAddresses().toJson()).isEqualTo(fromA);
         assertThat(store.get(layout.statusStateKey()).orElseThrow().etag()).isEqualTo(etag);
     }
 
@@ -172,7 +176,7 @@ class StatusServiceTest {
             for (Thread t : ts) t.join();
         }
         byte[] first = nodes.get(0).refresh().toJson();
-        for (StatusService n : nodes) assertThat(n.refresh().toJson()).isEqualTo(first);
+        for (StatusService n : nodes) assertThat(n.refresh().toJson()).isEqualTo(first); // token views, like with like
         ClusterStatus st = nodes.get(0).current();
         assertThat(st.proposals()).extracting(ClusterStatus.Proposal::kind).contains(Proposals.ADD_READERS);
         ClusterStatus.Proposal p = st.proposals().stream().filter(x -> x.kind().equals(Proposals.ADD_READERS))

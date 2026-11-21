@@ -504,15 +504,27 @@ public final class ClusterRuntime implements Closeable {
         String hook = sc.getWebhookUrl();
         var events = new com.pharos.cluster.status.StatusEvents(Duration.ofSeconds(sc.getEventsKeepAliveSeconds()),
                 hook == null || hook.isBlank() ? null : new com.pharos.cluster.status.Webhook(hook));
+        // A single node runs no thread of its own: on demand, cached for heartbeatSeconds, and the refresh
+        // timer only while an SSE client is connected (the global "single node unchanged" constraint).
+        boolean cluster = backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend;
+        Duration every = Duration.ofSeconds(c.getHeartbeatSeconds());
         statusService = new com.pharos.cluster.status.StatusService(source, states,
-                com.pharos.cluster.status.StatusSettings.of(sc), events, Duration.ofSeconds(c.getHeartbeatSeconds()),
-                STATUS_MAX_AGE, System::nanoTime);
+                com.pharos.cluster.status.StatusSettings.of(sc), events, every,
+                cluster ? STATUS_MAX_AGE : every, System::nanoTime, cluster);
         statusService.start();
         return statusService;
     }
 
-    /** A {@code /cluster/status} request older than this rebuilds the status first. */
+    /** A {@code /cluster/status} request older than this rebuilds the status first (cluster nodes). */
     static final Duration STATUS_MAX_AGE = Duration.ofSeconds(2);
+
+    /**
+     * A constant-time check of a presented {@code X-Pharos-Cluster-Token} against {@code cluster.token}
+     * (never matches without one); the token itself does not leave the config.
+     */
+    public java.util.function.Predicate<String> clusterTokenMatcher() {
+        return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken());
+    }
 
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
     public Optional<com.pharos.cluster.objectstore.ObjectStoreCatalog> sourceCatalog() {

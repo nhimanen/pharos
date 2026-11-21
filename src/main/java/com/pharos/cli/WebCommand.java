@@ -81,6 +81,7 @@ public class WebCommand implements Callable<Integer> {
                 }
                 // /cluster/status and /cluster/events on every role (single node: from local state)
                 webServer.setClusterStatus(clusterRuntime.statusService());
+                webServer.setClusterToken(clusterRuntime.clusterTokenMatcher()); // token view: reader addresses
             }
             webServer.start(port);
             if (!noOpen) {
