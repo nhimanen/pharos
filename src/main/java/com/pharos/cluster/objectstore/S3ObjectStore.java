@@ -15,6 +15,7 @@ import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -444,6 +445,21 @@ public class S3ObjectStore implements ObjectStore {
             throw wrap("list", prefix, e);
         }
         return out;
+    }
+
+    /** HeadObject; a 404 (no body, so no NoSuchKey code) is an absent object. */
+    @Override
+    public Optional<ObjectInfo> stat(String key) throws IOException {
+        try {
+            HeadObjectResponse head = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+            return Optional.of(new ObjectInfo(key, head.contentLength() == null ? 0 : head.contentLength(),
+                    head.lastModified()));
+        } catch (S3Exception e) {
+            if (isMissingOnHead(e)) return Optional.empty();
+            throw wrap("stat", key, e);
+        } catch (SdkException e) {
+            throw wrap("stat", key, e);
+        }
     }
 
     @Override

@@ -74,6 +74,15 @@ public interface ObjectStore extends Closeable {
     /** Lists all objects whose key starts with {@code prefix}. */
     List<ObjectInfo> list(String prefix) throws IOException;
 
+    /**
+     * The listing entry of exactly {@code key} (size and the bucket's LastModified), or empty when it
+     * does not exist. The default lists {@code key} as a prefix and keeps the exact match;
+     * implementations override it with a single-object lookup (S3 HeadObject).
+     */
+    default Optional<ObjectInfo> stat(String key) throws IOException {
+        return list(key).stream().filter(i -> i.key().equals(key)).findFirst();
+    }
+
     /** Deletes an object; an absent key is not an error. */
     void delete(String key) throws IOException;
 }

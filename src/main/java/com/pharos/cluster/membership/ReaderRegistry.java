@@ -1,6 +1,7 @@
 package com.pharos.cluster.membership;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pharos.cluster.objectstore.BucketClock;
 import com.pharos.cluster.objectstore.ObjectInfo;
 import com.pharos.cluster.objectstore.ObjectStore;
 import com.pharos.cluster.objectstore.ObjectStoreLayout;
@@ -152,10 +153,7 @@ public final class ReaderRegistry implements Closeable {
         try {
             List<ObjectInfo> infos = store.list(layout.readersPrefix()).stream()
                     .filter(i -> i.key().endsWith(".json") && i.lastModified() != null).toList();
-            Instant now = self == null
-                    ? infos.stream().map(ObjectInfo::lastModified).max(Comparator.naturalOrder()).orElse(null)
-                    : infos.stream().filter(i -> i.key().equals(key)).map(ObjectInfo::lastModified)
-                            .findFirst().orElse(null);
+            Instant now = BucketClock.nowFrom(infos, self == null ? null : key).orElse(null);
             if (now == null && self == null) {
                 live = List.of(); // no reader announces itself
                 return;
@@ -167,8 +165,8 @@ public final class ReaderRegistry implements Closeable {
             Duration ttl = Duration.ofSeconds(cfg.getReaderTtlSeconds());
             List<LiveReader> out = new ArrayList<>();
             for (ObjectInfo info : infos) {
-                Duration age = Duration.between(info.lastModified(), now);
-                if (age.compareTo(ttl) > 0) continue;
+                if (BucketClock.expired(info.lastModified(), now, ttl)) continue;
+                Duration age = BucketClock.age(info.lastModified(), now);
                 try {
                     store.get(info.key()).ifPresent(o -> {
                         try {
