@@ -361,6 +361,23 @@ class WorkLoopTest {
     }
 
     @Test
+    void newerChangeOfAPendingShardWrittenImmediately() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        change(s, "first");
+        clock.advance(10);
+        a.loop.detectChanges();
+        String first = heartbeatOf("node-a").orElseThrow().path("backlog").path("solo").path("sourceRevision").asText();
+        change(s, "second");    // still unpublished: the shard was already pending
+        clock.advance(10);
+        a.loop.detectChanges();
+        JsonNode b = heartbeatOf("node-a").orElseThrow().path("backlog").path("solo");
+        assertThat(b.path("pending").asBoolean()).isTrue();
+        assertThat(b.path("sourceRevision").asText()).as("the newer change is announced at once").isNotEqualTo(first);
+    }
+
+    @Test
     void changeDuringItsOwnRunStaysPendingAfterThePublish() throws IOException {
         ShardId s = pathShard("solo");
         Writer a = new Writer("node-a");

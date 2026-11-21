@@ -518,11 +518,13 @@ public final class WorkLoop implements Closeable {
      * digest of a path source; never a fetch into the checkout a run may be indexing) against the
      * revision {@code LATEST} holds. Safe on the loop thread and on the change detector.
      *
-     * @return true when the shard turned pending with this check
+     * @return true when this check found a new unpublished source revision: the shard turned pending,
+     *     or a pending shard's source moved on again
      */
     private boolean pollShard(ShardId shard, ShardState st) {
         synchronized (pollMu) {
             boolean wasPending = st.pendingSince != null;
+            String before = st.sourceRevision;
             try {
                 refreshPublished(shard, st);
                 Optional<String> changed = checkout.changedSince(shard, st.publishedRevision);
@@ -539,14 +541,15 @@ public final class WorkLoop implements Closeable {
                 st.lastPollOk = false;
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
             }
-            return !wasPending && st.pendingSince != null;
+            return st.pendingSince != null && (!wasPending || !java.util.Objects.equals(before, st.sourceRevision));
         }
     }
 
     /**
      * The change detector: every {@code pollSeconds} at a fixed rate, on its own thread, a read-only
      * check of every prepared held shard, also while the loop thread runs another shard (or this
-     * one). A shard that turns pending is announced at once by a heartbeat, so the backlog shows it
+     * one). A shard that turns pending, or whose pending source moves on, is announced at once by a
+     * heartbeat, so the backlog shows the change
      * within one poll. Run order, leases and releases stay with the loop thread.
      */
     void detectChanges() {
