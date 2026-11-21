@@ -78,6 +78,8 @@ public final class ClusterRuntime implements Closeable {
     private com.pharos.cluster.writer.WorkLoop workLoop;
     /** Removes the writer's signal-time stop step. Guarded by this. */
     private AutoCloseable writerStopStep;
+    /** {@code <workDir>/.work-loop.lock} while this process runs the work loop. */
+    private SyncLock workLoopLock;
     /** The coordinator's cached shard catalog (its age goes into the heartbeat); null until built. */
     private volatile com.pharos.cluster.routing.CachedCatalog coordinatorCatalog;
     /** {@code /cluster/status} and {@code /cluster/events}; built on first use. Guarded by this. */
@@ -415,7 +417,13 @@ public final class ClusterRuntime implements Closeable {
      * and the polling loop. Its graceful stop runs on a signal before model calls stop (within
      * {@code cluster.drainSeconds}) and on {@link #close}. No-op on every other node and when running.
      *
-     * @return true when the work loop runs
+     * <p>One process per node runs the loop: it holds {@code <workDir>/.work-loop.lock}
+     * ({@link #WORK_LOOP_LOCK}, an OS file lock, freed when the process dies). A second process with
+     * the same config (the daemon {@code ./pharos} starts on demand next to a systemd writer) would
+     * otherwise share the node id, index dir and clones, and run git checkouts under the other's
+     * parse. It logs a WARN instead, starts no loop and serves everything else.
+     *
+     * @return true when the work loop runs (in this process)
      */
     public boolean beginWriting() {
         if (!isWorkQueueWriter() || !(backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os)) {
@@ -429,6 +437,20 @@ public final class ClusterRuntime implements Closeable {
             if (closed) throw new IllegalStateException("cluster runtime is closed");
             if (workLoop != null) return true;
             ClusterConfig.WriterConfig w = c.getWriter();
+            Optional<SyncLock> lock;
+            try {
+                lock = SyncLock.tryAcquire(w.getWorkDir(), WORK_LOOP_LOCK);
+            } catch (java.io.IOException e) {
+                log.warn("Not running the writer work queue: cannot open {}: {}", w.getWorkDir().resolve(WORK_LOOP_LOCK),
+                        e.toString());
+                return false;
+            }
+            if (lock.isEmpty()) {
+                log.warn("Not running the writer work queue: another process is the writer for node {} (it holds {});"
+                        + " this process serves everything else", c.effectiveNodeId(), w.getWorkDir().resolve(WORK_LOOP_LOCK));
+                return false;
+            }
+            workLoopLock = lock.get();
             com.pharos.cluster.writer.DiskGuard disk = new com.pharos.cluster.writer.DiskGuard(config.getIndexDir(),
                     java.util.List.of(w.getWorkDir(), com.pharos.embedding.DjlEmbeddingProvider.modelCacheDir()),
                     com.pharos.cluster.writer.DiskGuard.Settings.of(w.getDisk()),
@@ -468,6 +490,9 @@ public final class ClusterRuntime implements Closeable {
         return Optional.ofNullable(workLoop);
     }
 
+    /** The work-loop lock's file name in {@code cluster.writer.workDir}. */
+    public static final String WORK_LOOP_LOCK = ".work-loop.lock";
+
     /** Graceful stop of the work loop within {@code cluster.drainSeconds}; idempotent. */
     private void stopWriting() {
         com.pharos.cluster.writer.WorkLoop loop;
@@ -475,6 +500,21 @@ public final class ClusterRuntime implements Closeable {
             loop = workLoop;
         }
         if (loop != null) loop.stop(Duration.ofSeconds(config.getCluster().getDrainSeconds()));
+    }
+
+    /** Frees the work-loop lock once the loop has stopped (on {@link #close}). */
+    private void releaseWorkLoopLock() {
+        SyncLock lock;
+        synchronized (this) {
+            lock = workLoopLock;
+            workLoopLock = null;
+        }
+        if (lock == null) return;
+        try {
+            lock.close();
+        } catch (java.io.IOException e) {
+            log.debug("Releasing the work-loop lock failed: {}", e.toString());
+        }
     }
 
     /**
@@ -1057,6 +1097,7 @@ public final class ClusterRuntime implements Closeable {
             }
         }
         stopWriting(); // before the backend (the bucket client) closes
+        releaseWorkLoopLock();
         if (members != null) members.close();
         com.pharos.cluster.status.StatusService status;
         synchronized (this) {

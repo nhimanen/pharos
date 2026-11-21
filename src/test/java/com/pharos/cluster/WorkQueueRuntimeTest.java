@@ -79,6 +79,51 @@ class WorkQueueRuntimeTest {
         assertThat(store.get(new ObjectStoreLayout("pharos").writerKey("writer-1"))).isEmpty();
     }
 
+    /**
+     * Final review I3: a second process with the same writer config (the daemon ./pharos starts on
+     * demand next to a systemd writer) must not run a second work loop on the same node id, index
+     * dir and clones. It warns and serves without one; the loop's lock is free once the first stops.
+     */
+    @Test
+    void secondProcessOnTheSameNodeRunsNoWorkLoop() throws Exception {
+        IndexConfig config = ClusterFixture.config(tmp.resolve("w"), NodeRole.WRITER, "b");
+        config.getCluster().getWriter().setWorkQueue(true);
+        config.getCluster().getWriter().setWorkDir(tmp.resolve("work"));
+        config.getCluster().getWriter().setPollSeconds(3600);
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        var log = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        log.addAppender(appender);
+        Node first = node(config, store);
+        Node second = node(config, store);
+        Node third = null;
+        try {
+            assertThat(first.runtime().beginWriting()).isTrue();
+            assertThat(tmp.resolve("work").resolve(ClusterRuntime.WORK_LOOP_LOCK)).isRegularFile();
+
+            assertThat(second.runtime().beginWriting()).as("the node already has a writer").isFalse();
+            assertThat(second.runtime().workLoop()).isEmpty();
+            assertThat(appender.list).anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
+                    && e.getFormattedMessage().contains("another process is the writer for node writer-1"));
+            // it still serves: status works, and it stays a work-queue writer (hand runs refused)
+            assertThat(second.runtime().statusService()).isNotNull();
+            assertThat(second.runtime().manualPublishRefusal("svc")).isPresent();
+
+            first.runtime().close();
+            third = node(config, store);
+            assertThat(third.runtime().beginWriting()).as("the lock is free once the first stopped").isTrue();
+        } finally {
+            log.detachAppender(appender);
+            first.runtime().close();
+            second.runtime().close();
+            if (third != null) third.runtime().close();
+            first.lucene().close();
+            second.lucene().close();
+            if (third != null) third.lucene().close();
+        }
+    }
+
     @Test
     void writerWithoutWorkQueueKeepsTheImplicitLease() throws Exception {
         IndexConfig config = ClusterFixture.config(tmp.resolve("w"), NodeRole.WRITER, "b");
