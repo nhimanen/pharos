@@ -577,6 +577,26 @@ public final class ClusterRuntime implements Closeable {
         return backend.publisher();
     }
 
+    /** Built on first use; guarded by this. */
+    private com.pharos.cluster.peer.ReplicationEndpoint replication;
+
+    /**
+     * The {@code /replication/*} routes of a peer-mode writer ({@code cluster.backend: peer-pull},
+     * {@code role: writer}), serving its local store; empty on every other node. Its long-polls are
+     * woken when the backend closes.
+     */
+    public synchronized Optional<com.pharos.cluster.peer.ReplicationEndpoint> replicationEndpoint() {
+        if (!isWriter() || !(backend instanceof com.pharos.cluster.peer.PeerBackend peer)) return Optional.empty();
+        if (replication == null) replication = peer.endpoint();
+        return Optional.of(replication);
+    }
+
+    /** {@code cluster.tls} when it configures a server keystore; empty otherwise. */
+    public Optional<ClusterConfig.TlsConfig> serverTls() {
+        ClusterConfig c = config.getCluster();
+        return c.tlsServer() ? Optional.of(c.getTls()) : Optional.empty();
+    }
+
     /**
      * The {@code /internal/*} API of this reader, token-guarded; null on other roles. Its shard
      * search service is set once the raw retrieval exists ({@code InternalApi#service}); until then

@@ -89,6 +89,13 @@ public class WebCommand implements Callable<Integer> {
                 // /cluster/status and /cluster/events on every role (single node: from local state)
                 webServer.setClusterStatus(clusterRuntime.statusService());
                 webServer.setClusterToken(clusterRuntime.clusterTokenMatcher()); // token view: reader addresses
+                // a peer-mode writer serves its published generations to readers (token-guarded)
+                clusterRuntime.replicationEndpoint().ifPresent(e -> {
+                    webServer.setReplicationEndpoint(e);
+                    System.out.println("Serving /replication/* (cluster.backend: peer-pull)");
+                });
+                clusterRuntime.serverTls().ifPresent(t -> webServer.setTls(
+                        new WebServer.Tls(t.getKeystore(), t.getKeystoreType(), t.password())));
             }
             webServer.start(port);
             if (!noOpen) {

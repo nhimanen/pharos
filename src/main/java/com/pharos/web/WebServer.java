@@ -63,6 +63,40 @@ public class WebServer {
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     /** Source of {@code /cluster/status} and {@code /cluster/events}; without one both answer 404. */
     private volatile com.pharos.cluster.status.StatusService clusterStatus = null;
+    /** {@code /replication/*} on a peer-mode writer; null elsewhere (the routes stay absent). */
+    private volatile com.pharos.cluster.peer.ReplicationEndpoint replication = null;
+    /** {@code cluster.tls}: when set, the server listens with TLS only. */
+    private volatile Tls tls = null;
+
+    /** The keystore the TLS connector serves from. */
+    public record Tls(Path keystore, String type, char[] password) {
+        public Tls {
+            java.util.Objects.requireNonNull(keystore, "keystore");
+            type = type == null || type.isBlank() ? "PKCS12" : type;
+            java.util.Objects.requireNonNull(password, "password");
+        }
+    }
+
+    /**
+     * Listen with TLS only (a Jetty SSL connector on the port; plain HTTP connections are refused at
+     * the handshake). Without it the server speaks plain HTTP.
+     */
+    public void setTls(Tls tls) {
+        this.tls = java.util.Objects.requireNonNull(tls, "tls");
+    }
+
+    /** Mounts {@code /replication/*} (a peer-mode writer). */
+    public void setReplicationEndpoint(com.pharos.cluster.peer.ReplicationEndpoint endpoint) {
+        this.replication = java.util.Objects.requireNonNull(endpoint, "endpoint");
+    }
+
+    /**
+     * Idle timeout of a connection when the server holds long-polls: above the longest
+     * {@code latest} wait, so Jetty never cuts a waiting request.
+     */
+    static final long LONG_POLL_IDLE_TIMEOUT_MILLIS =
+            (com.pharos.config.ClusterConfig.PeersConfig.MAX_LONG_POLL_SECONDS + 30) * 1000L;
+
     /** Checks a presented cluster token (constant time); without one, no request gets the token view. */
     private volatile java.util.function.Predicate<String> clusterToken = t -> false;
 
@@ -304,6 +338,12 @@ public class WebServer {
             // Global on a reader: Javalin has one request-size cap, so every route (not only /internal/*)
             // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
             if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
+            Tls t = tls;
+            boolean longPolls = replication != null;
+            if (t != null || longPolls) {
+                // Our own connector replaces Javalin's default one (which it adds only when none is set).
+                config.jetty.addConnector((server, http) -> connector(server, http, port, t, longPolls));
+            }
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
@@ -930,11 +970,45 @@ public class WebServer {
         });
 
         if (readerNode && internalApi != null) internalApi.mount(app);
+        com.pharos.cluster.peer.ReplicationEndpoint repl = replication;
+        if (repl != null) repl.mount(app);
 
         app.start(port);
-        System.out.printf("Web UI available at http://localhost:%d%n", port);
+        System.out.printf("Web UI available at %s://localhost:%d%n", tls != null ? "https" : "http", port);
         log.info("Web server started on port {}", port);
         return app;
+    }
+
+    /**
+     * The listening connector: TLS (from {@link Tls}) or plain HTTP, with an idle timeout above the
+     * longest long-poll when {@code longPolls}.
+     */
+    static org.eclipse.jetty.server.ServerConnector connector(org.eclipse.jetty.server.Server server,
+                                                              org.eclipse.jetty.server.HttpConfiguration http,
+                                                              int port, Tls tls, boolean longPolls) {
+        org.eclipse.jetty.server.ServerConnector c;
+        if (tls != null) {
+            if (!java.nio.file.Files.isRegularFile(tls.keystore())) {
+                throw new IllegalStateException("cluster.tls.keystore " + tls.keystore() + " does not exist");
+            }
+            org.eclipse.jetty.util.ssl.SslContextFactory.Server ssl = new org.eclipse.jetty.util.ssl.SslContextFactory.Server();
+            ssl.setKeyStorePath(tls.keystore().toAbsolutePath().toString());
+            ssl.setKeyStoreType(tls.type());
+            ssl.setKeyStorePassword(new String(tls.password()));
+            org.eclipse.jetty.server.HttpConfiguration https = new org.eclipse.jetty.server.HttpConfiguration(http);
+            org.eclipse.jetty.server.SecureRequestCustomizer secure = new org.eclipse.jetty.server.SecureRequestCustomizer();
+            // Clients verify the host name against the certificate; the server does not police SNI.
+            secure.setSniHostCheck(false);
+            https.addCustomizer(secure);
+            c = new org.eclipse.jetty.server.ServerConnector(server,
+                    new org.eclipse.jetty.server.SslConnectionFactory(ssl, org.eclipse.jetty.http.HttpVersion.HTTP_1_1.asString()),
+                    new org.eclipse.jetty.server.HttpConnectionFactory(https));
+        } else {
+            c = new org.eclipse.jetty.server.ServerConnector(server, new org.eclipse.jetty.server.HttpConnectionFactory(http));
+        }
+        c.setPort(port);
+        if (longPolls) c.setIdleTimeout(Math.max(c.getIdleTimeout(), LONG_POLL_IDLE_TIMEOUT_MILLIS));
+        return c;
     }
 
     private static final com.fasterxml.jackson.databind.ObjectWriter ASCII_JSON = new ObjectMapper()

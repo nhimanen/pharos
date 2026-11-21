@@ -69,6 +69,14 @@ public final class PeerBackend implements ReplicationBackend {
     /** The writer's published state, served by the replication endpoint. */
     public PeerStore peerStore() { return peer; }
 
+    /** The {@code /replication/*} routes of this writer, sized from {@code cluster.peers}. */
+    public ReplicationEndpoint endpoint() {
+        ClusterConfig cfg = config.getCluster();
+        return new ReplicationEndpoint(peer, cfg.effectiveNodeId(),
+                com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
+                cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls());
+    }
+
     @Override public BackendKind kind() { return BackendKind.PEER_PULL; }
 
     @Override public IndexPublisher publisher() { return publisher; }

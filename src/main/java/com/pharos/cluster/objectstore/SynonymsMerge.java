@@ -61,6 +61,26 @@ public final class SynonymsMerge {
     }
 
     /**
+     * The file reduced to its hand-written lines and the sections of {@code projects}, in the same
+     * canonical layout as {@link #merge}: what a peer-mode writer serves for the shards it owns
+     * (ruling P5-R4), so every reader can merge the writers' files with {@link #merge}'s rules.
+     *
+     * @param text     a synonyms file; null is treated as empty
+     * @param projects the projects whose sections are kept
+     */
+    public static String retain(String text, java.util.Collection<String> projects) {
+        Parsed parsed = parse(text);
+        StringBuilder out = new StringBuilder();
+        for (String line : new LinkedHashSet<>(parsed.hand())) out.append(line).append('\n');
+        for (Map.Entry<String, Set<String>> e : parsed.sections().entrySet()) {
+            if (!projects.contains(e.getKey())) continue;
+            if (!out.isEmpty()) out.append('\n');
+            for (String line : e.getValue()) out.append(line).append('\n');
+        }
+        return out.toString();
+    }
+
+    /**
      * @param published the cluster's current file; null when the bucket has none
      * @param local     the publishing writer's file
      * @param project   the project being published
