@@ -871,16 +871,27 @@ class DistributedSearchTest {
             List<String> fullBefore = ids(search(full, q, SearchType.KEYWORD, null, 10).results());
             assertThat(search(s.coordinator(), q, SearchType.KEYWORD, null, 10).warnings()).isEmpty(); // catalog read
             s.store().failGetOn("catalog/shards.json");
-            Thread.sleep(2_200);
-
+            // Until a background read (timer tick, every 5 s) has failed: only then does the age count
+            // (final review I1: an old catalog alone, with nothing failing, is not too old).
+            long until = System.nanoTime() + 20_000_000_000L;
             SearchResponse onFull = search(full, q, SearchType.KEYWORD, null, 10);
+            while (onFull.warnings().isEmpty() && System.nanoTime() < until) {
+                Thread.sleep(200);
+                onFull = search(full, q, SearchType.KEYWORD, null, 10);
+            }
+
             assertThat(ids(onFull.results())).as("holds every shard: complete").isEqualTo(fullBefore);
             assertThat(onFull.warnings()).singleElement().asString()
                     .matches("catalog is \\d+ s old; serving this reader's shards \\(complete\\)");
             assertThat(full.engine.findCallers("com.example.model.User#getName()", null, new ArrayList<>()))
                     .as("graph ops too").isNotEmpty();
 
+            until = System.nanoTime() + 20_000_000_000L;
             SearchResponse onPinned = search(s.coordinator(), q, SearchType.KEYWORD, null, 10);
+            while (onPinned.warnings().isEmpty() && System.nanoTime() < until) {
+                Thread.sleep(200);
+                onPinned = search(s.coordinator(), q, SearchType.KEYWORD, null, 10);
+            }
             assertThat(onPinned.results()).isNotEmpty().allSatisfy(x -> assertThat(x.project()).isEqualTo(PY));
             assertThat(onPinned.warnings()).singleElement().asString()
                     .contains("over cluster.maxCatalogAgeSeconds").endsWith("; not searched: " + JAVA);
