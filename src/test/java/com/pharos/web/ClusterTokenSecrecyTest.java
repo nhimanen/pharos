@@ -36,12 +36,13 @@ class ClusterTokenSecrecyTest {
     }
 
     @Test
-    void saveThenLoadKeepsToken() throws Exception {
+    void saveThenLoadKeepsToken(@TempDir Path tmp) throws Exception {
         IndexConfig cfg = IndexConfig.defaults();
         cfg.setCluster(readerCfg());
-        cfg.save(); // surefire points pharos.home at target/test-pharos-home
+        Path file = tmp.resolve("config.json"); // never the shared test home: later tests load it
+        cfg.save(file);
         IndexConfig back = new ObjectMapper().findAndRegisterModules()
-                .readValue(IndexConfig.DEFAULT_BASE.resolve("config.json").toFile(), IndexConfig.class);
+                .readValue(file.toFile(), IndexConfig.class);
         assertThat(back.getCluster().getToken()).isEqualTo(SECRET);
     }
 
