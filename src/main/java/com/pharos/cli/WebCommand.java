@@ -77,6 +77,7 @@ public class WebCommand implements Callable<Integer> {
                 // a work-queue writer indexes and publishes the shards it holds the lease of
                 if (clusterRuntime.beginWriting()) {
                     System.out.println("Writer work queue running (cluster.writer.workQueue)");
+                    webServer.setWriterDisk(clusterRuntime::writerDisk);
                 }
             }
             webServer.start(port);

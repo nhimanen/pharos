@@ -53,6 +53,7 @@ public class WebServer {
     private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
+    private volatile java.util.function.Supplier<Map<String, Object>> writerDisk = () -> null;
     private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
     private volatile java.util.function.BooleanSupplier draining = () -> false;
     /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
@@ -90,6 +91,15 @@ public class WebServer {
     }
 
     /** Reader cache stats reported by {@code /health} as {@code readerCache}; null result: omitted. */
+    /**
+     * A work-queue writer's disk guard ({@code freeBytes}, {@code totalBytes}, {@code low}), reported
+     * by {@code /health} as {@code writerDisk}. Informational: low disk never fails readiness and
+     * doesn't change {@code status} (the writer keeps serving its last publishes).
+     */
+    public void setWriterDisk(java.util.function.Supplier<Map<String, Object>> disk) {
+        this.writerDisk = java.util.Objects.requireNonNull(disk, "disk");
+    }
+
     public void setReaderCacheStats(java.util.function.Supplier<Map<String, Object>> stats) {
         this.readerCacheStats = java.util.Objects.requireNonNull(stats, "stats");
     }
@@ -205,6 +215,8 @@ public class WebServer {
      *       those shards only;</li>
      *   <li>200 {@code ok} otherwise.</li>
      * </ul>
+     * On a work-queue writer the body also has {@code writerDisk: {freeBytes, totalBytes, low}}
+     * (additive and informational: low disk changes neither the status nor readiness).
      * The 503 keeps load balancers and the router from sending traffic. A client that only wants
      * liveness treats any answer as "running". Every signal is read once.
      */
@@ -227,6 +239,8 @@ public class WebServer {
         if (reason != null) out.put("reason", reason);
         Map<String, Object> cache = readerCacheStats.get();
         if (cache != null) out.put("readerCache", cache);
+        Map<String, Object> disk = writerDisk.get();
+        if (disk != null) out.put("writerDisk", disk);
         return new HealthAnswer(ready ? 200 : 503, out);
     }
 

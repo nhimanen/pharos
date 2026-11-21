@@ -63,7 +63,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
 
     static final String FILE_STATE = "file-state.json";
     /** The per-model embedding caches and their meta files; temp files ({@code .tmp}) never match. */
-    static final Pattern EMBED_CACHE = Pattern.compile("embed-cache(\\.[A-Za-z0-9._-]+)?\\.(bin|meta)");
+    public static final Pattern EMBED_CACHE = Pattern.compile("embed-cache(\\.[A-Za-z0-9._-]+)?\\.(bin|meta)");
     private static final Pattern INDEX_KEY = Pattern.compile("gen-(\\d{1,18})/index\\.json");
     private static final Pattern SHA256 = Pattern.compile("[0-9a-f]{64}");
     private static final String GRAPH_TMP = ".restore-graph.cgf.gz";

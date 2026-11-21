@@ -48,6 +48,20 @@ class WebServerHealthTest {
     }
 
     @Test
+    void healthCarriesTheWriterDiskWithoutFailingReadiness() {
+        WebServer server = new WebServer(null, null, null, null, null);
+        assertThat(server.health()).doesNotContainKey("writerDisk");
+        Map<String, Object> low = new java.util.LinkedHashMap<>();
+        low.put("freeBytes", 1L << 30);
+        low.put("totalBytes", 100L << 30);
+        low.put("low", true);
+        server.setWriterDisk(() -> low);
+        assertThat(server.health()).containsEntry("writerDisk", low).containsEntry("status", "ok")
+                .containsEntry("ready", true);
+        assertThat(server.healthStatus()).as("low disk is informational, not a readiness failure").isEqualTo(200);
+    }
+
+    @Test
     void healthCarriesReaderCacheOnlyWhenThereIsOne() {
         WebServer server = new WebServer(null, null, null, null, null);
         assertThat(server.health()).doesNotContainKey("readerCache");

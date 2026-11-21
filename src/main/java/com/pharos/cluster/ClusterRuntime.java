@@ -422,12 +422,17 @@ public final class ClusterRuntime implements Closeable {
             if (closed) throw new IllegalStateException("cluster runtime is closed");
             if (workLoop != null) return true;
             ClusterConfig.WriterConfig w = c.getWriter();
+            com.pharos.cluster.writer.DiskGuard disk = new com.pharos.cluster.writer.DiskGuard(config.getIndexDir(),
+                    java.util.List.of(w.getWorkDir(), com.pharos.embedding.DjlEmbeddingProvider.modelCacheDir()),
+                    com.pharos.cluster.writer.DiskGuard.Settings.of(w.getDisk()),
+                    com.pharos.cluster.writer.DiskGuard.Probe.FILE_STORES);
             loop = new com.pharos.cluster.writer.WorkLoop(new com.pharos.cluster.writer.WorkLoop.Settings(
                     c.effectiveNodeId(), w.leaseTtl(), Duration.ofSeconds(c.getHeartbeatSeconds()),
-                    Duration.ofSeconds(w.getPollSeconds()), Duration.ofSeconds(w.getMinHoldSeconds()), true, true),
+                    Duration.ofSeconds(w.getPollSeconds()), Duration.ofSeconds(w.getMinHoldSeconds()), true, true,
+                    w.getMaxConsecutiveFailures()),
                     os.store(), os.layout(), os.objectStoreCatalog(), os.source(), os.writerState(), pim,
                     luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir()),
-                    java.time.Clock.systemUTC());
+                    java.time.Clock.systemUTC(), disk);
             os.workQueueGuard().ifPresent(g -> g.attach(loop));
             workLoop = loop;
         }
@@ -437,6 +442,18 @@ public final class ClusterRuntime implements Closeable {
             writerStopStep = step;
         }
         return true;
+    }
+
+    /**
+     * The writer disk guard's view for {@code /health} ({@code freeBytes}, {@code totalBytes},
+     * {@code low}); null unless a work loop runs.
+     */
+    public Map<String, Object> writerDisk() {
+        com.pharos.cluster.writer.WorkLoop loop;
+        synchronized (this) {
+            loop = workLoop;
+        }
+        return loop == null ? null : loop.diskStatus().map(com.pharos.cluster.writer.DiskGuard.Status::toMap).orElse(null);
     }
 
     /** The running work loop; empty unless {@link #beginWriting} started one. */

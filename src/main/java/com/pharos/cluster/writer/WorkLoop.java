@@ -84,6 +84,21 @@ import java.util.concurrent.locks.ReentrantLock;
  * are unknown to the new process, so it waits them out (one TTL) like any other writer's. This is
  * deliberate: the old process may still be alive (a stuck JVM) and publishing.
  *
+ * <p><b>Disk guard</b> ({@link DiskGuard}, optional): probed at every tick and every
+ * {@code cluster.writer.disk.checkSeconds} on its own thread. When the disk is low, local leftovers
+ * are garbage-collected first ({@link #collectLeftovers}); if it stays low the writer acquires no
+ * lease, starts no run, aborts the run in progress at its next safe point (the {@link IndexAbort}
+ * of a graceful stop: never a half commit), releases the leases of the shards it cannot index (not
+ * pinned ones, never mid-run) and keeps renewing the shards whose last publish is still served. Its
+ * heartbeat says {@code disk.low}, so the balancer of every writer stops counting it. Before each
+ * run the guard also checks the run's estimated peak ({@link DiskGuard#admits}); a run that would
+ * cross the threshold is refused and its shard released like a low writer's. A released shard is
+ * not re-acquired by this writer for {@code max(minHold, poll)}.
+ *
+ * <p><b>Failing shards</b>: a surplus shard (not pinned, past {@code minHold}) whose runs failed
+ * {@code cluster.writer.maxConsecutiveFailures} times in a row is released so another writer can
+ * try it. A surplus shard is released when idle only after a poll that succeeded.
+ *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
  * its commit finishes, publish included); then every lease is released (before the lease manager is
@@ -95,15 +110,29 @@ public final class WorkLoop implements Closeable {
 
     /** Timing and run options. */
     public record Settings(String node, Duration leaseTtl, Duration heartbeat, Duration poll, Duration minHold,
-                           boolean embed, boolean buildSynonyms) {
+                           boolean embed, boolean buildSynonyms, int maxConsecutiveFailures) {
+        /** {@code cluster.writer.maxConsecutiveFailures} default. */
+        public static final int DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
+
         public Settings {
             Objects.requireNonNull(node, "node");
             Objects.requireNonNull(leaseTtl, "leaseTtl");
             Objects.requireNonNull(heartbeat, "heartbeat");
             Objects.requireNonNull(poll, "poll");
             Objects.requireNonNull(minHold, "minHold");
+            if (maxConsecutiveFailures < 1) {
+                throw new IllegalArgumentException("maxConsecutiveFailures must be at least 1: " + maxConsecutiveFailures);
+            }
+        }
+
+        public Settings(String node, Duration leaseTtl, Duration heartbeat, Duration poll, Duration minHold,
+                        boolean embed, boolean buildSynonyms) {
+            this(node, leaseTtl, heartbeat, poll, minHold, embed, buildSynonyms, DEFAULT_MAX_CONSECUTIVE_FAILURES);
         }
     }
+
+    /** What one attempt to run a shard came to. */
+    enum Outcome { PUBLISHED, FAILED, ABORTED, CONFLICT, REFUSED }
 
     /** What the loop knows about one held shard. Written by the loop thread, read by the heartbeat. */
     private static final class ShardState {
@@ -115,6 +144,10 @@ public final class WorkLoop implements Closeable {
         volatile Generation publishedGeneration;
         volatile Instant pendingSince;
         volatile Instant acquiredAt;
+        /** The last poll of this shard succeeded: its {@code pendingSince} is current (M5). */
+        volatile boolean lastPollOk;
+        /** Failed runs in a row (reset by a publish); M4 releases a surplus shard at the limit. */
+        volatile int consecutiveFailures;
     }
 
     /** The run in progress. */
@@ -164,12 +197,19 @@ public final class WorkLoop implements Closeable {
     private final Balancer balancer;
     private final WriterRegistry members;
     private final LeaseManager leases;
+    private final DiskGuard disk;            // null: no disk guard
     private final long startedAt;
 
     private final Map<ShardId, ShardState> shards = new ConcurrentHashMap<>();
     private final Map<ShardId, Integer> publishes = new ConcurrentHashMap<>();
     private volatile Set<ShardId> pinnedMine = Set.of();
     private volatile Run current;
+    /** The shard runShard is working on (restore included); the disk GC leaves its dir alone. */
+    private volatile ShardId busy;
+    /** Shards this writer released because it could not index them: not re-acquired before the instant. */
+    private final Map<ShardId, Instant> avoidUntil = new ConcurrentHashMap<>();
+    private final Object diskMu = new Object();
+    private ScheduledExecutorService diskWatch;
     private volatile boolean stopping;
     private final ReentrantLock tickLock = new ReentrantLock();
     private final Object stopMu = new Object();
@@ -183,6 +223,15 @@ public final class WorkLoop implements Closeable {
     public WorkLoop(Settings settings, ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
                     ReplicaSource replicas, WriterStateStore writerState, ProjectIndexManager indexer,
                     LuceneIndexer lucene, ProjectRegistry projects, SourceCheckout checkout, Clock clock) {
+        this(settings, store, layout, catalog, replicas, writerState, indexer, lucene, projects, checkout, clock, null);
+    }
+
+    /** @param disk the writer disk guard; null runs without one (no {@code disk} in the heartbeat) */
+    public WorkLoop(Settings settings, ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
+                    ReplicaSource replicas, WriterStateStore writerState, ProjectIndexManager indexer,
+                    LuceneIndexer lucene, ProjectRegistry projects, SourceCheckout checkout, Clock clock,
+                    DiskGuard disk) {
+        this.disk = disk;
         this.settings = Objects.requireNonNull(settings, "settings");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.replicas = Objects.requireNonNull(replicas, "replicas");
@@ -213,6 +262,16 @@ public final class WorkLoop implements Closeable {
             });
             scheduler.scheduleWithFixedDelay(this::tickQuietly, 0, Math.max(1, settings.poll().toMillis()),
                     TimeUnit.MILLISECONDS);
+            if (disk != null) {
+                // its own thread: the loop thread is busy for the whole run the guard may have to abort
+                diskWatch = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "pharos-writer-disk-guard");
+                    t.setDaemon(true);
+                    return t;
+                });
+                long every = Math.max(1, disk.settings().check().toMillis());
+                diskWatch.scheduleWithFixedDelay(this::checkDiskQuietly, every, every, TimeUnit.MILLISECONDS);
+            }
         }
         log.info("Writer {} runs the work queue (lease TTL {} s, poll every {} s, min hold {} s)", settings.node(),
                 settings.leaseTtl().toSeconds(), settings.poll().toSeconds(), settings.minHold().toSeconds());
@@ -233,6 +292,7 @@ public final class WorkLoop implements Closeable {
         tickLock.lock();
         try {
             if (stopping) return;
+            checkDisk(); // before the beat: it announces the disk state peers balance by
             members.beat();
             if (!members.lastWriteOk()) return; // can't tell "peers are gone" from "the bucket is unreachable"
             leases.renewAll();
@@ -245,19 +305,39 @@ public final class WorkLoop implements Closeable {
                 return;
             }
             Map<ShardId, ShardSource> sources = resolveSources(entries);
-            int share = acquire(sources);
+            if (diskLow()) {
+                log.debug("Writer {} is low on disk: acquiring no lease", settings.node());
+            } else {
+                acquire(sources);
+            }
             members.beat(); // announce the leases now, before a long run
             List<ShardId> pending = poll();
             for (ShardId shard : pending) {
                 if (stopping) return;
                 if (!leases.isHeld(shard)) continue;
-                if (runShard(shard)) {
-                    share = currentShare(sources);
-                    maybeRelease(shard, share);
+                if (diskLow()) {
+                    log.info("Shard {}: not indexing, writer {} is low on disk", shard, settings.node());
+                    continue;
+                }
+                Outcome o = runShard(shard);
+                if (o == Outcome.PUBLISHED) {
+                    maybeRelease(shard, currentShare(sources));
+                } else if (o == Outcome.FAILED) {
+                    maybeReleaseFailing(shard, currentShare(sources));
+                } else if (o == Outcome.REFUSED) {
+                    releaseUnindexable(shard, "its run would not fit on this writer's disk");
                 }
                 members.beat();
             }
             releaseIdleSurplus(currentShare(sources));
+            if (diskLow()) {
+                for (ShardId shard : shards.keySet().stream().sorted(Comparator.comparing(ShardId::value)).toList()) {
+                    ShardState st = shards.get(shard);
+                    // an idle shard whose last publish is still served stays (its lease keeps being renewed)
+                    if (st == null || (st.lastPollOk && st.pendingSince == null)) continue;
+                    releaseUnindexable(shard, "writer " + settings.node() + " is low on disk");
+                }
+            }
             members.beat();
         } finally {
             tickLock.unlock();
@@ -333,8 +413,11 @@ public final class WorkLoop implements Closeable {
                 w.heartbeat().pinned().forEach(s -> pinnedByOthers.add(new ShardId(s)));
             }
         }
+        Instant now = clock.instant();
+        avoidUntil.values().removeIf(until -> !now.isBefore(until));
         List<ShardId> candidates = Balancer.acquireOrder(settings.node(),
-                sources.keySet().stream().filter(s -> !pinnedMine.contains(s) && !pinnedByOthers.contains(s)).toList(),
+                sources.keySet().stream().filter(s -> !pinnedMine.contains(s) && !pinnedByOthers.contains(s)
+                        && !avoidUntil.containsKey(s)).toList(),
                 held);
         for (ShardId s : candidates) {
             if (want == 0 || stopping) break;
@@ -378,6 +461,10 @@ public final class WorkLoop implements Closeable {
             ShardState st = e.getValue();
             try {
                 if (!st.prepared) {
+                    if (diskLow()) { // a first checkout (a clone) needs space this writer doesn't have
+                        st.lastPollOk = false;
+                        continue;
+                    }
                     checkout.prepare(shard, st.source);
                     st.prepared = true;
                 }
@@ -390,7 +477,10 @@ public final class WorkLoop implements Closeable {
                     st.sourceRevision = st.publishedRevision;
                     st.pendingSince = null;
                 }
+                st.lastPollOk = true;
             } catch (IOException | RuntimeException ex) {
+                // pendingSince is now unknown: no idle release until a poll succeeds again (M5)
+                st.lastPollOk = false;
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
             }
         }
@@ -432,13 +522,24 @@ public final class WorkLoop implements Closeable {
     }
 
     /**
-     * One run of {@code shard}: restore if needed, check out, index, publish (in the index run), renew.
-     *
-     * @return true when a generation was published
+     * One run of {@code shard}: check out, ask the disk guard, restore if needed, index, publish (in
+     * the index run), renew.
      */
-    private boolean runShard(ShardId shard) {
+    private Outcome runShard(ShardId shard) {
         ShardState st = shards.get(shard);
-        if (st == null) return false;
+        if (st == null) return Outcome.FAILED;
+        busy = shard;
+        try {
+            Outcome o = attempt(shard, st);
+            if (o == Outcome.PUBLISHED) st.consecutiveFailures = 0;
+            else if (o == Outcome.FAILED) st.consecutiveFailures++;
+            return o;
+        } finally {
+            busy = null;
+        }
+    }
+
+    private Outcome attempt(ShardId shard, ShardState st) {
         Path indexDir = lucene.getProjectIndexDir(shard.value());
         Path root;
         String revision;
@@ -450,11 +551,13 @@ public final class WorkLoop implements Closeable {
                     : checkout.changedSince(shard, null).orElse(null);
         } catch (IOException | RuntimeException e) {
             log.warn("Checking out shard {} failed (retrying next poll): {}", shard, e.toString());
-            return false;
+            return Outcome.FAILED;
         }
         boolean full;
         String why;
         if (!lucene.indexExists(shard.value())) {
+            // the restore downloads the published generation, then (at worst) a full run follows
+            if (!admitted(shard, estimateWithoutLocalIndex(shard, root))) return Outcome.REFUSED;
             requireRestorable(shard);
             Optional<Generation> restored;
             try {
@@ -462,7 +565,7 @@ public final class WorkLoop implements Closeable {
             } catch (IOException e) {
                 // a store outage: retry later rather than paying for a full re-embed now
                 log.warn("Restoring the writer state of shard {} failed (retrying next poll): {}", shard, e.toString());
-                return false;
+                return Outcome.FAILED;
             }
             if (restored.isPresent()) {
                 String originalRoot;
@@ -470,7 +573,7 @@ public final class WorkLoop implements Closeable {
                     originalRoot = registerRestored(shard, restored.get(), root, indexDir);
                 } catch (IOException | RuntimeException e) {
                     log.warn("Registering the restored shard {} failed (retrying next poll): {}", shard, e.toString());
-                    return false;
+                    return Outcome.FAILED;
                 }
                 full = !sameRoot(originalRoot, root);
                 why = full ? "restored generation " + restored.get().value() + " was indexed under " + originalRoot
@@ -491,6 +594,7 @@ public final class WorkLoop implements Closeable {
                 full = false;
                 why = "local index";
             }
+            if (!admitted(shard, estimate(shard, indexDir, root, full))) return Outcome.REFUSED;
         }
         if (full) log.warn("Shard {}: running a FULL index ({})", shard, why);
         else log.info("Shard {}: incremental index from {}", shard, why);
@@ -499,6 +603,7 @@ public final class WorkLoop implements Closeable {
         current = run;
         try {
             if (stopping) run.abort.request("stopping");
+            if (diskLow()) run.abort.request("writer low on disk");
             indexer.index(root, shard.value(), !full, false, settings.embed(), settings.buildSynonyms(),
                     run.listener(), run.abort, revision);
             st.publishedRevision = revision;
@@ -507,10 +612,10 @@ public final class WorkLoop implements Closeable {
             st.publishedGeneration = null; // re-read on the next poll
             publishes.merge(shard, 1, Integer::sum);
             leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::renew);
-            return true;
+            return Outcome.PUBLISHED;
         } catch (IndexAbortedException e) {
             log.info("Run of shard {} aborted at a safe point; nothing was committed: {}", shard, e.getMessage());
-            return false;
+            return Outcome.ABORTED;
         } catch (PublishConflictException e) {
             if (!leases.isHeld(shard)) {
                 shards.remove(shard);
@@ -520,12 +625,183 @@ public final class WorkLoop implements Closeable {
                 st.publishedGeneration = null;
                 log.warn("Shard {} not published ({}); retrying next poll from the new LATEST", shard, e.getMessage());
             }
-            return false;
+            return Outcome.CONFLICT;
         } catch (IOException | RuntimeException e) {
             log.warn("Run of shard {} failed (retrying next poll): {}", shard, e.toString());
-            return false;
+            return Outcome.FAILED;
         } finally {
             current = null;
+        }
+    }
+
+    // --------------------------------------------------------------------------- disk guard
+
+    /** True when the disk guard last saw this writer low on disk. */
+    private boolean diskLow() {
+        return disk != null && disk.low();
+    }
+
+    /**
+     * Asks the disk guard whether {@code run} fits; when it doesn't, garbage-collects local leftovers
+     * first and asks again with fresh numbers.
+     */
+    private boolean admitted(ShardId shard, DiskGuard.EstimatedRun run) {
+        if (disk == null) return true;
+        disk.check();
+        if (disk.admits(run)) return true;
+        if (collectLeftovers() > 0) {
+            disk.check();
+            if (disk.admits(run)) return true;
+        }
+        log.warn("Shard {}: not starting a {} run: it needs about {} and would leave {} free on the index disk"
+                        + " (threshold {}){}", shard, run.full() ? "full" : "incremental",
+                DiskGuard.bytes(run.peakBytes()),
+                DiskGuard.bytes(Math.max(0, disk.indexStoreFreeBytes() - run.peakBytes())),
+                DiskGuard.bytes(disk.indexStoreThreshold()), disk.low() ? "; the writer is low on disk" : "");
+        return false;
+    }
+
+    /**
+     * The run estimate of a shard with a local index ({@link DiskGuard.EstimatedRun}): sizes from the
+     * index dir, the changed share by walking the checkout against {@code file-state.json}.
+     */
+    private DiskGuard.EstimatedRun estimate(ShardId shard, Path indexDir, Path root, boolean full) {
+        if (disk == null) return null;
+        long luceneBytes = ProjectIndexManager.sizeOf(indexDir.resolve("lucene"));
+        long graphBytes = ProjectIndexManager.sizeOf(com.pharos.graph.CallGraph.projectGraphDir(indexDir));
+        long cacheBytes = embedCacheBytes(indexDir);
+        long[] src = sourceBytes(root, full ? null : new com.pharos.indexer.FileStateTracker(indexDir));
+        return new DiskGuard.EstimatedRun(shard.value(), full, luceneBytes, graphBytes, cacheBytes, src[0], src[1]);
+    }
+
+    /** No local index: the restore brings the published generation, then a full run is the worst case. */
+    private DiskGuard.EstimatedRun estimateWithoutLocalIndex(ShardId shard, Path root) {
+        if (disk == null) return null;
+        long luceneBytes = 0;
+        long graphBytes = 0;
+        try {
+            Optional<Generation> latest = replicas.latest(shard);
+            if (latest.isPresent()) {
+                for (com.pharos.cluster.objectstore.ManifestFile f : replicas.manifest(shard, latest.get()).files()) {
+                    if (com.pharos.cluster.objectstore.ManifestFile.LUCENE.equals(f.role())) luceneBytes += f.length();
+                    else graphBytes += f.length();
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            log.debug("Sizing the published generation of {} failed: {}", shard, e.toString());
+        }
+        long[] src = sourceBytes(root, null);
+        long cacheBytes = luceneBytes; // the restored embedding cache: about the vectors the Lucene files hold
+        return new DiskGuard.EstimatedRun(shard.value(), true, luceneBytes, graphBytes, cacheBytes, src[0], src[0],
+                luceneBytes + graphBytes + cacheBytes);
+    }
+
+    private static long embedCacheBytes(Path indexDir) {
+        long total = 0;
+        try (var files = Files.list(indexDir)) {
+            for (Path f : files.toList()) {
+                if (com.pharos.cluster.objectstore.ObjectStoreWriterStateStore.EMBED_CACHE
+                        .matcher(f.getFileName().toString()).matches()) {
+                    total += Files.size(f);
+                }
+            }
+        } catch (IOException e) {
+            log.debug("Sizing the embedding caches in {} failed: {}", indexDir, e.toString());
+        }
+        return total;
+    }
+
+    /**
+     * {@code [total, changed]} bytes of the regular files under {@code root} ({@code .git} skipped);
+     * changed = files {@code tracker} sees as dirty (all of them without a tracker).
+     */
+    private static long[] sourceBytes(Path root, com.pharos.indexer.FileStateTracker tracker) {
+        long[] out = {0, 0};
+        try {
+            Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<>() {
+                @Override
+                public java.nio.file.FileVisitResult preVisitDirectory(Path d,
+                        java.nio.file.attribute.BasicFileAttributes a) {
+                    return d.getFileName() != null && d.getFileName().toString().equals(".git") && !d.equals(root)
+                            ? java.nio.file.FileVisitResult.SKIP_SUBTREE : java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) {
+                    if (!a.isRegularFile()) return java.nio.file.FileVisitResult.CONTINUE;
+                    out[0] += a.size();
+                    if (tracker == null || tracker.isDirty(f)) out[1] += a.size();
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFileFailed(Path f, IOException e) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            log.debug("Sizing the checkout {} failed: {}", root, e.toString());
+        }
+        return out;
+    }
+
+    /**
+     * Garbage-collects run leftovers of every locally registered shard except the one being worked
+     * on ({@link ProjectIndexManager#removeRunLeftovers}: retired graph generations and stale spools,
+     * under the Lucene write lock; the retention rule the index runs apply). The live commit, the
+     * live graph and the persistent embedding caches stay.
+     *
+     * @return bytes freed
+     */
+    long collectLeftovers() {
+        long freed = 0;
+        for (ProjectMeta m : projects.listAll()) {
+            String name = m.getName();
+            ShardId skip = busy; // re-read per shard: the loop thread may have started on one meanwhile
+            if (name == null || (skip != null && skip.value().equals(name))) continue;
+            try {
+                freed += Math.max(0, indexer.removeRunLeftovers(name));
+            } catch (RuntimeException e) {
+                log.debug("Collecting the leftovers of {} failed: {}", name, e.toString());
+            }
+        }
+        if (freed > 0) log.info("Disk guard: garbage collection freed {}", DiskGuard.bytes(freed));
+        return freed;
+    }
+
+    /**
+     * Probes the disk now. When low, garbage-collects leftovers first and probes again; when still
+     * low, aborts the run in progress at its next safe point (a run already past its commit finishes,
+     * publish included). Runs on the disk-guard thread every {@code checkSeconds} and at each tick.
+     *
+     * @return true when the writer is low on disk
+     */
+    boolean checkDisk() {
+        if (disk == null) return false;
+        synchronized (diskMu) {
+            DiskGuard.Status s = disk.check();
+            if (s.low() && collectLeftovers() > 0) s = disk.check();
+            if (s.low()) {
+                Run r = current;
+                if (r != null && !r.abort.requested()) {
+                    if (r.abort.request("writer low on disk")) {
+                        log.warn("Writer {} is low on disk: aborting the run of shard {} at its next safe point",
+                                settings.node(), r.shard);
+                    } else {
+                        log.info("Writer {} is low on disk; the run of shard {} is past its commit, letting it"
+                                + " publish", settings.node(), r.shard);
+                    }
+                }
+            }
+            return s.low();
+        }
+    }
+
+    private void checkDiskQuietly() {
+        try {
+            checkDisk();
+        } catch (RuntimeException | Error e) {
+            log.warn("Writer disk check failed: {}", e.toString());
         }
     }
 
@@ -562,13 +838,49 @@ public final class WorkLoop implements Closeable {
         List<ShardId> held = shards.keySet().stream().sorted(Comparator.comparing(ShardId::value)).toList();
         for (ShardId shard : held) {
             ShardState st = shards.get(shard);
-            if (st == null || st.pendingSince != null || !st.prepared) continue;
+            // only when the last poll confirmed LATEST covers the source (M5)
+            if (st == null || st.pendingSince != null || !st.prepared || !st.lastPollOk) continue;
             if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
                 log.info("Releasing idle shard {}: writer {} holds {} lease(s), its share is {}", shard,
                         settings.node(), heldSet().size(), share);
                 release(shard);
             }
         }
+    }
+
+    /**
+     * M4: a surplus shard whose runs failed {@code maxConsecutiveFailures} times in a row is released
+     * (never a pinned one, never within {@code minHold}), so another writer can try it.
+     */
+    private void maybeReleaseFailing(ShardId shard, int share) {
+        ShardState st = shards.get(shard);
+        if (st == null || st.consecutiveFailures < settings.maxConsecutiveFailures()) return;
+        if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
+            log.warn("Releasing shard {} after {} failed runs in a row so another writer can try it: writer {} holds"
+                            + " {} lease(s), its share is {}", shard, st.consecutiveFailures, settings.node(),
+                    heldSet().size(), share);
+            avoid(shard);
+            release(shard);
+        }
+    }
+
+    /**
+     * Releases a shard this writer cannot index (low on disk, or its run would not fit), so a writer
+     * with space can take it. Between runs only (the loop thread); never a pinned one: only this
+     * writer has its files, so it stays held and its runs are refused until there is space.
+     */
+    private void releaseUnindexable(ShardId shard, String why) {
+        ShardState st = shards.get(shard);
+        if (st == null || st.pinned) return;
+        log.warn("Releasing shard {} so a writer with space can index it: {}", shard, why);
+        avoid(shard);
+        release(shard);
+    }
+
+    /** Not re-acquired by this writer for {@code max(minHold, poll)}: someone else gets the chance. */
+    private void avoid(ShardId shard) {
+        Duration d = settings.minHold().compareTo(settings.poll()) > 0 ? settings.minHold() : settings.poll();
+        avoidUntil.put(shard, clock.instant().plus(d));
     }
 
     private void release(ShardId shard) {
@@ -617,7 +929,14 @@ public final class WorkLoop implements Closeable {
         Run r = current;
         WriterHeartbeat.Indexing indexing = r == null ? null
                 : new WriterHeartbeat.Indexing(r.shard.value(), r.phase, r.progress, r.startedAt);
-        return new WriterHeartbeat(settings.node(), true, held, pinned, backlog, indexing, startedAt, stopping);
+        DiskGuard.Status d = disk == null ? null : disk.status();
+        return new WriterHeartbeat(settings.node(), true, held, pinned, backlog, indexing, startedAt, stopping,
+                d == null ? null : d.toHeartbeat());
+    }
+
+    /** The disk guard's last view; empty without a guard. */
+    public Optional<DiskGuard.Status> diskStatus() {
+        return disk == null ? Optional.empty() : Optional.ofNullable(disk.status());
     }
 
     /** The shards this writer holds the lease of, sorted. */
@@ -660,6 +979,8 @@ public final class WorkLoop implements Closeable {
             stopped = true;
             s = scheduler;
             scheduler = null;
+            if (diskWatch != null) diskWatch.shutdownNow(); // a probe only: nothing to drain
+            diskWatch = null;
         }
         stopping = true;
         long start = System.nanoTime();

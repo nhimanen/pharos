@@ -68,6 +68,23 @@ class WorkLoopTest {
     private static final Duration HEARTBEAT = Duration.ofSeconds(10);
     private static final Duration MIN_HOLD = Duration.ofSeconds(120);
 
+    static final long GIB = 1L << 30;
+    /** 100 GiB disks: threshold max(5 GiB, 10 %) = 10 GiB, back from low above 11 GiB. */
+    static final DiskGuard.Settings DISK = new DiskGuard.Settings(5 * GIB, 10, GIB, Duration.ofSeconds(15));
+    static final long THRESHOLD = 10 * GIB;
+
+    /** A disk whose free space the test sets; every path is on it. */
+    static final class FakeDisk implements DiskGuard.Probe {
+        final java.util.concurrent.atomic.AtomicLong free = new java.util.concurrent.atomic.AtomicLong(50 * GIB);
+        volatile java.util.function.LongSupplier dynamic;
+        @Override public Object storeOf(Path path) { return "disk"; }
+        @Override public DiskGuard.Space space(Path path) {
+            java.util.function.LongSupplier d = dynamic;
+            return new DiskGuard.Space(d != null ? d.getAsLong() : free.get(), 100 * GIB);
+        }
+        void set(long bytes) { free.set(bytes); }
+    }
+
     /** One clock for the bucket and every writer; only the test moves it. */
     static final class TestClock extends Clock {
         final AtomicReference<Instant> now = new AtomicReference<>(Instant.parse("2026-11-21T10:00:00Z"));
@@ -98,8 +115,14 @@ class WorkLoopTest {
         /** The same node's index without a publisher: what a Phase 1-3 hand run left behind. */
         final ProjectIndexManager localOnly;
         final WorkLoop loop;
+        final DiskGuard disk;
 
         Writer(String node) {
+            this(node, null);
+        }
+
+        /** @param probe the disk guard's probe; null runs without a guard */
+        Writer(String node, DiskGuard.Probe probe) {
             this.node = node;
             Path home = tmp.resolve("w" + (++writerSeq) + "-" + node);
             IndexConfig config = IndexConfig.defaults();
@@ -119,9 +142,11 @@ class WorkLoopTest {
                     List.of(new JavaCodeParser()), publisher);
             localOnly = new ProjectIndexManager(config, lucene, registry, List.of(embedder), noopModules,
                     List.of(new JavaCodeParser()));
+            disk = probe == null ? null : new DiskGuard(home.resolve("indexes"), List.of(home.resolve("work")),
+                    DISK, probe);
             loop = new WorkLoop(new WorkLoop.Settings(node, TTL, HEARTBEAT, Duration.ofSeconds(60), MIN_HOLD, true, false),
                     store, layout, catalog, replicas, state, manager, lucene, registry,
-                    new SourceCheckout(home.resolve("work")), clock);
+                    new SourceCheckout(home.resolve("work")), clock, disk);
             guard.attach(loop);
             writers.add(this);
         }
@@ -681,6 +706,286 @@ class WorkLoopTest {
         Writer b = new Writer("node-b");
         b.loop.tick();
         assertThat(latest(s)).contains(new Generation(2));
+    }
+
+    // --------------------------------------------------------------------------- disk guard
+
+    private Set<String> luceneFiles(Writer w, ShardId s) throws IOException {
+        try (var f = Files.list(w.lucene.getProjectIndexDir(s.value()).resolve("lucene"))) {
+            return f.map(p -> p.getFileName().toString()).filter(n -> !n.equals("write.lock"))
+                    .collect(java.util.stream.Collectors.toSet());
+        }
+    }
+
+    private long graphGenerations(Writer w, ShardId s) throws IOException {
+        try (var f = Files.list(w.lucene.getProjectIndexDir(s.value()))) {
+            return f.filter(p -> p.getFileName().toString().matches("callgraph-\\d+\\.arcadedb")).count();
+        }
+    }
+
+    @Test
+    void refusesRunThatWouldCrossThreshold() throws IOException {
+        ShardId s = pathShard("solo");
+        FakeDisk fake = new FakeDisk();
+        fake.set(THRESHOLD + (16L << 20)); // not low, but a run's estimate (>= 64 MiB) would cross it
+        Writer a = new Writer("node-a", fake);
+
+        a.loop.tick();
+
+        assertThat(latest(s)).as("refused before anything was written").isEmpty();
+        assertThat(a.lucene.indexExists(s.value())).isFalse();
+        assertThat(a.held()).as("released so a writer with space can take it").isEmpty();
+        assertThat(heartbeatOf("node-a").orElseThrow().path("disk").path("low").asBoolean()).isFalse();
+
+        // with space, another writer takes it at once and publishes it
+        Writer b = new Writer("node-b", new FakeDisk());
+        b.loop.tick();
+        assertThat(b.held()).containsExactly(s);
+        assertThat(latest(s)).contains(Generation.FIRST);
+        // A, which refused it, doesn't race B for it
+        rounds(1, 10, a);
+        assertThat(a.held()).isEmpty();
+    }
+
+    @Test
+    void lowDiskAbortsAtSafePointWithoutHalfCommit() throws IOException {
+        ShardId s = pathShard("solo");
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        assertThat(latest(s)).contains(Generation.FIRST);
+        int docs = a.docs(s);
+        Set<String> commit = luceneFiles(a, s);
+        Path indexDir = a.lucene.getProjectIndexDir(s.value());
+        byte[] fileState = Files.readAllBytes(indexDir.resolve("file-state.json"));
+        String pointer = Files.readString(indexDir.resolve("callgraph.current"));
+
+        change(s, "big");
+        AtomicBoolean fired = new AtomicBoolean();
+        a.embedder.onBatch = n -> {
+            if (fired.compareAndSet(false, true)) {
+                fake.set(THRESHOLD - GIB); // the disk fills up mid-run
+                assertThat(a.loop.checkDisk()).isTrue(); // what the disk-guard thread does every checkSeconds
+            }
+        };
+        rounds(1, 10, a);
+
+        assertThat(fired).isTrue();
+        assertThat(latest(s)).as("aborted before its commit: nothing published").contains(Generation.FIRST);
+        assertThat(a.docs(s)).isEqualTo(docs);
+        assertThat(luceneFiles(a, s)).as("the previous commit, exactly").isEqualTo(commit);
+        assertThat(Files.readAllBytes(indexDir.resolve("file-state.json"))).isEqualTo(fileState);
+        assertThat(Files.readString(indexDir.resolve("callgraph.current"))).isEqualTo(pointer);
+        assertThat(graphGenerations(a, s)).isEqualTo(1);
+        assertThat(heartbeatOf("node-a").orElseThrow().path("disk").path("low").asBoolean()).isTrue();
+
+        // the previous generation stays publishable: once there is space, the change is published from it
+        a.embedder.onBatch = n -> {};
+        fake.set(50 * GIB);
+        Writer b = new Writer("node-b");
+        rounds(1, 10, a, b);
+        assertThat(latest(s)).contains(new Generation(2));
+    }
+
+    @Test
+    void lowWriterReleasesLeasesAndAnotherTakesThem() throws IOException {
+        List<ShardId> shards = pathShards(3);
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        assertThat(a.held()).hasSize(3);
+        ShardId idle = shards.get(0);
+        change(shards.get(1), "x");
+        change(shards.get(2), "y");
+        fake.set(THRESHOLD - GIB);
+
+        rounds(1, 10, a);
+        assertThat(a.held()).as("the idle shard's last publish is still served: kept").containsExactly(idle);
+        assertThat(latest(shards.get(1))).contains(Generation.FIRST);
+        JsonNode hb = heartbeatOf("node-a").orElseThrow();
+        assertThat(hb.path("disk").path("low").asBoolean()).isTrue();
+
+        // B doesn't count the low writer: share = 3, it takes both released shards and publishes them
+        Writer b = new Writer("node-b");
+        rounds(1, 10, a, b);
+        assertThat(b.held()).containsExactlyInAnyOrder(shards.get(1), shards.get(2));
+        assertThat(latest(shards.get(1))).contains(new Generation(2));
+        assertThat(latest(shards.get(2))).contains(new Generation(2));
+        // A keeps renewing the idle one and acquires nothing while low
+        rounds(10, 10, a, b);
+        assertThat(a.held()).containsExactly(idle);
+        assertThat(lease(idle).path("writer").asText()).isEqualTo("node-a");
+        assertThat(latest(idle)).contains(Generation.FIRST);
+    }
+
+    @Test
+    void lowWriterKeepsItsPinnedShardAndRefusesItsRuns() throws IOException {
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        Path dir = tmp.resolve("sources").resolve("handmade");
+        Files.createDirectories(dir.resolve("src"));
+        Files.writeString(dir.resolve("src/Hand.java"), "public class Hand {\n    public int h(int x) { return x; }\n}\n");
+        a.localOnly.index(dir, "handmade", false, false, true, false, ProgressListener.SILENT);
+        ShardId hand = new ShardId("handmade");
+        catalog.register(hand);
+        a.loop.tick();
+        Generation g = latest(hand).orElseThrow();
+        Files.writeString(dir.resolve("src/Hand.java"), "public class Hand {\n    public int h(int x) { return x; }\n"
+                + "    public int k(int x) { return h(x); }\n}\n");
+        Files.setLastModifiedTime(dir.resolve("src/Hand.java"), FileTime.fromMillis(System.currentTimeMillis() + 9_000));
+        fake.set(THRESHOLD - GIB);
+        rounds(3, 10, a);
+        assertThat(a.held()).containsExactly(hand);
+        assertThat(latest(hand)).contains(g);
+        fake.set(50 * GIB);
+        rounds(1, 10, a);
+        assertThat(latest(hand).orElseThrow().value()).isEqualTo(g.value() + 1);
+    }
+
+    @Test
+    void recoversWithHysteresis() throws IOException {
+        ShardId s = pathShard("solo");
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        change(s, "later");
+        fake.set(THRESHOLD - 1);
+        rounds(1, 10, a);
+        assertThat(a.disk.low()).isTrue();
+        // back above the threshold, but within the 1 GiB margin: still low, nothing runs or is acquired
+        fake.set(THRESHOLD + GIB / 2);
+        rounds(1, 10, a);
+        assertThat(a.disk.low()).isTrue();
+        assertThat(heartbeatOf("node-a").orElseThrow().path("disk").path("low").asBoolean()).isTrue();
+        assertThat(latest(s)).contains(Generation.FIRST);
+        // above threshold + margin: recovered; after its avoid period A takes the shard back and publishes
+        fake.set(THRESHOLD + GIB + 1);
+        rounds(1, 10, a);
+        assertThat(a.disk.low()).isFalse();
+        assertThat(heartbeatOf("node-a").orElseThrow().path("disk").path("low").asBoolean()).isFalse();
+        fake.set(50 * GIB);
+        rounds(13, 10, a);
+        assertThat(a.held()).containsExactly(s);
+        assertThat(latest(s)).contains(new Generation(2));
+    }
+
+    @Test
+    void gcRunsBeforeRefusing() throws IOException {
+        ShardId s = pathShard("solo");
+        ShardId other = pathShard("other");
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        Path dir = a.lucene.getProjectIndexDir(other.value());
+        // what a crashed run of "other" left: a retired graph generation and its spools
+        Path retired = Files.createDirectories(dir.resolve("callgraph-1.arcadedb"));
+        Files.write(retired.resolve("data"), new byte[4096]);
+        Files.write(dir.resolve("embed.spool"), new byte[1024]);
+        Files.write(dir.resolve("embed-incr.test-counting.cache"), new byte[1024]);
+        Set<String> live = luceneFiles(a, other);
+        String pointer = Files.readString(dir.resolve("callgraph.current"));
+        List<String> caches;
+        try (var f = Files.list(dir)) {
+            caches = f.map(p -> p.getFileName().toString()).filter(n -> n.startsWith("embed-cache")).sorted().toList();
+        }
+        assertThat(caches).isNotEmpty();
+        // low while the leftovers are there; enough room once they are gone
+        fake.dynamic = () -> Files.exists(retired) ? THRESHOLD - GIB : 50 * GIB;
+        change(s, "afterGc");
+
+        rounds(1, 10, a);
+
+        assertThat(retired).doesNotExist();
+        assertThat(dir.resolve("embed.spool")).doesNotExist();
+        assertThat(dir.resolve("embed-incr.test-counting.cache")).doesNotExist();
+        assertThat(luceneFiles(a, other)).isEqualTo(live);
+        assertThat(Files.readString(dir.resolve("callgraph.current"))).isEqualTo(pointer);
+        assertThat(dir.resolve(pointer.trim())).isDirectory();
+        try (var f = Files.list(dir)) {
+            assertThat(f.map(p -> p.getFileName().toString()).filter(n -> n.startsWith("embed-cache")).sorted()
+                    .toList()).as("the persistent embedding cache is kept").isEqualTo(caches);
+        }
+        assertThat(a.disk.low()).isFalse();
+        assertThat(a.held()).containsExactlyInAnyOrder(s, other);
+        assertThat(latest(s)).as("not refused: the GC made room").contains(new Generation(2));
+    }
+
+    @Test
+    void heartbeatReportsDisk() throws IOException {
+        pathShard("solo");
+        FakeDisk fake = new FakeDisk();
+        fake.set(40 * GIB);
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        JsonNode disk = heartbeatOf("node-a").orElseThrow().path("disk");
+        assertThat(disk.path("freeBytes").asLong()).isEqualTo(40 * GIB);
+        assertThat(disk.path("totalBytes").asLong()).isEqualTo(100 * GIB);
+        assertThat(disk.path("low").asBoolean()).isFalse();
+        WriterHeartbeat parsed = JSON.readValue(store.get(layout.writerKey("node-a")).orElseThrow().data(),
+                WriterHeartbeat.class);
+        assertThat(parsed.takesShare()).isTrue();
+
+        fake.set(GIB);
+        rounds(1, 10, a);
+        disk = heartbeatOf("node-a").orElseThrow().path("disk");
+        assertThat(disk.path("freeBytes").asLong()).isEqualTo(GIB);
+        assertThat(disk.path("low").asBoolean()).isTrue();
+        parsed = JSON.readValue(store.get(layout.writerKey("node-a")).orElseThrow().data(), WriterHeartbeat.class);
+        assertThat(parsed.takesShare()).as("the balancer skips a low writer").isFalse();
+        assertThat(a.loop.diskStatus().orElseThrow().toMap()).containsEntry("low", true)
+                .containsEntry("freeBytes", GIB);
+
+        // a writer without a guard writes no disk field
+        Writer b = new Writer("node-b");
+        b.loop.tick();
+        assertThat(heartbeatOf("node-b").orElseThrow().has("disk")).isFalse();
+    }
+
+    // ----------------------------------------------------------- release rules (M4, M5)
+
+    @Test
+    void failingPollNeverLeadsToAnIdleRelease() throws IOException {
+        List<ShardId> shards = pathShards(2);
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        Writer b = new Writer("node-b");
+        // both of A's polls fail from now on: it can't confirm LATEST covers either source
+        for (ShardId s : shards) store.failGetOn(layout.latestKey(s));
+        rounds(20, 10, a, b); // 200 s: far past minHold, A is over its share (2 > 1)
+        assertThat(a.held()).as("no idle release without a successful poll").hasSize(2);
+        assertThat(b.held()).isEmpty();
+        // polls succeed again: the surplus is released at an idle clean point
+        store.clearFailures();
+        rounds(2, 10, a, b);
+        assertThat(a.held()).hasSize(1);
+        assertThat(b.held()).hasSize(1);
+    }
+
+    @Test
+    void failingSurplusShardIsReleasedAfterMaxConsecutiveFailures() throws IOException {
+        List<ShardId> shards = pathShards(2);
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        rounds(13, 10, a); // past minHold
+        for (ShardId s : shards) change(s, "broken");
+        a.embedder.onBatch = n -> { throw new IllegalStateException("injected embed failure"); };
+        Writer b = new Writer("node-b");
+        b.loop.tick();
+
+        rounds(2, 10, a, b);
+        assertThat(a.held()).as("two failures in a row: retried, kept").hasSize(2);
+        assertThat(b.held()).isEmpty();
+        for (ShardId s : shards) assertThat(latest(s)).contains(Generation.FIRST);
+
+        rounds(1, 10, a, b); // third failure: one surplus shard released (the other is A's share); B takes it
+        assertThat(a.held()).hasSize(1);
+        assertThat(b.held()).hasSize(1).doesNotContainAnyElementsOf(a.held());
+        ShardId moved = b.held().iterator().next();
+        assertThat(latest(moved)).as("another writer could index it").contains(new Generation(2));
+        assertThat(replicas.manifest(moved, new Generation(2)).writerNode()).isEqualTo("node-b");
+        // the one A keeps is not released for failing: it is its share
+        rounds(5, 10, a, b);
+        assertThat(a.held()).hasSize(1).doesNotContain(moved);
     }
 
     private static String git(Path dir, String... args) throws Exception {
