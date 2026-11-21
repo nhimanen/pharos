@@ -40,6 +40,11 @@ public class PublishCommand implements Callable<Integer> {
     @Mixin
     private SourceOptions sourceOptions = new SourceOptions();
 
+    @picocli.CommandLine.Option(names = "--no-embed",
+            description = "With --source-git or --source-path: record that work-queue writers index this project"
+                    + " without embeddings (\"embed\": false), as 'pharos index --no-embed' records it")
+    private boolean noEmbed;
+
     private final IndexConfig config;
     private final ProjectRegistry registry;
     private final ClusterRuntime runtime;
@@ -65,9 +70,13 @@ public class PublishCommand implements Callable<Integer> {
         }
         Optional<com.pharos.cluster.ShardSource> source;
         try {
-            source = sourceOptions.source(runtime);
+            source = sourceOptions.source(runtime).map(src -> src.withEmbed(!noEmbed));
         } catch (IllegalArgumentException e) {
             System.err.println(e.getMessage());
+            return 2;
+        }
+        if (noEmbed && source.isEmpty()) {
+            System.err.println("--no-embed records how writers index the source: it needs --source-git or --source-path");
             return 2;
         }
         Optional<ProjectMeta> meta = registry.find(projectName);

@@ -44,6 +44,11 @@ public class WebCommand implements Callable<Integer> {
         this(webServer, searchEngine, null);
     }
 
+    /** Whether the search-model warm-up is skipped: on {@code role: writer}. */
+    boolean isWriter() {
+        return clusterRuntime != null && clusterRuntime.isWriter();
+    }
+
     public WebCommand(WebServer webServer, SearchEngine searchEngine, ClusterRuntime clusterRuntime) {
         this.webServer = webServer;
         this.searchEngine = searchEngine;
@@ -56,7 +61,9 @@ public class WebCommand implements Callable<Integer> {
         try {
             // The model warm-up starts first and runs in parallel with a reader's first sync;
             // readiness waits for both (a hanging load is bounded by MODEL_WARMUP_TIMEOUT).
-            if (searchEngine != null) searchEngine.warmUpInBackground();
+            // A writer serves no search: it never warms (loads) the search models, which on a local
+            // ONNX model is ~1.1 GB per process. Its index runs load the embedding models they use.
+            if (searchEngine != null && !isWriter()) searchEngine.warmUpInBackground();
             if (clusterRuntime != null) {
                 clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
                 clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for

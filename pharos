@@ -962,6 +962,8 @@ def cmd_publish(args):
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
     cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "publish", args.project] + _source_flags(args)
+    if args.no_embed:
+        cmd.append("--no-embed")
     sys.exit(subprocess.run(cmd).returncode)
 
 
@@ -1772,11 +1774,14 @@ EXIT CODES
 
 EXAMPLES
   pharos publish myproject
+  pharos publish lucene --source-git https://example.org/lucene.git --ref main --no-embed
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_publish.add_argument("project", help="Project name (as shown in 'pharos projects')")
     _add_source_args(p_publish)
+    p_publish.add_argument("--no-embed", dest="no_embed", action="store_true",
+                           help="With --source-git/--source-path: work-queue writers index it without embeddings")
     p_publish.set_defaults(func=cmd_publish)
 
     # embed

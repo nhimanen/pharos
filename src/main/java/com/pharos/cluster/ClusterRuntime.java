@@ -646,6 +646,11 @@ public final class ClusterRuntime implements Closeable {
         return r == null ? List.of() : r.live();
     }
 
+    /** {@code role: writer}: the node indexes and publishes, and serves no search of its own. */
+    public boolean isWriter() {
+        return config.getCluster().getRole() == NodeRole.WRITER;
+    }
+
     private boolean isReader() {
         return config.getCluster().getRole() == NodeRole.READER;
     }

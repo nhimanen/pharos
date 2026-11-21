@@ -65,6 +65,33 @@ class SourceOptionsTest {
     }
 
     @Test
+    void publishRecordsANoEmbedSource() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            Path project = c.source.resolve(ClusterFixture.JAVA);
+            IndexCommand index = new IndexCommand(c.writerManager,
+                    new com.pharos.graph.CrossProjectLinker(c.writerConfig, c.writerRegistry),
+                    c.writerRegistry, c.writerConfig, c.writerRuntime);
+            assertThat(new CommandLine(index).execute(project.toString(), "--project", ClusterFixture.JAVA,
+                    "--single", "--no-embed", "--no-synonyms", "--no-progress")).isZero();
+            com.pharos.cli.PublishCommand publish = new com.pharos.cli.PublishCommand(c.writerConfig,
+                    c.writerRegistry, c.writerRuntime);
+            assertThat(new CommandLine(publish).execute(ClusterFixture.JAVA, "--no-embed")).as("no source").isEqualTo(2);
+            publish = new com.pharos.cli.PublishCommand(c.writerConfig, c.writerRegistry, c.writerRuntime);
+            assertThat(new CommandLine(publish).execute(ClusterFixture.JAVA, "--no-embed",
+                    "--source-git", "https://example.org/r.git", "--ref", "main")).isZero();
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries()).singleElement().satisfies(e ->
+                    assertThat(e.source()).isEqualTo(Optional.of(ShardSource.git("https://example.org/r.git", "main")
+                            .withEmbed(false))));
+            publish = new com.pharos.cli.PublishCommand(c.writerConfig, c.writerRegistry, c.writerRuntime);
+            assertThat(new CommandLine(publish).execute(ClusterFixture.JAVA,
+                    "--source-git", "https://example.org/r.git", "--ref", "main")).isZero();
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries().get(0).source().orElseThrow().embed())
+                    .as("without the flag the source embeds").isTrue();
+        }
+    }
+
+    @Test
     void sourceForDiscoveredSubprojectIsRefused() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
         try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
