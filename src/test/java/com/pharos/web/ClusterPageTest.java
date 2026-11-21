@@ -139,7 +139,8 @@ class ClusterPageTest {
         assertThat(page).contains("class=\"cl-progress-fill\" style=\"width:42%\"");
 
         // diagram: owners from the lease, the dead lease holder drawn dashed, pending marked on chips
-        assertThat(boxes(view, "writers")).containsExactly("w1:alpha", "w2:gamma", "w3:beta");
+        assertThat(boxes(view, "writers")).as("a ghost writer sorts in by node id")
+                .containsExactly("w1:alpha", "w2:gamma", "w3:beta");
         assertThat(view.path("diagram").path("writers").get(2).path("live").asBoolean()).isFalse();
         assertThat(boxes(view, "readers")).containsExactly("r1:alpha,beta,gamma", "r2:alpha,gamma");
         Element svg = (Element) doc.getElementsByTagName("svg").item(0);
@@ -189,7 +190,12 @@ class ClusterPageTest {
     void aLargeClusterKeepsALegibleDiagram(@TempDir Path tmp) throws Exception {
         JsonNode out = render(tmp, ClusterPageFixtures.json(ClusterPageFixtures.large()));
         JsonNode view = out.path("view");
-        assertThat(view.path("diagram").path("writers")).as("10 live writers, none merged").hasSize(10);
+        assertThat(view.path("diagram").path("writers")).as("9 live writers and w06 without a heartbeat").hasSize(10);
+        List<String> writerIds = new ArrayList<>();
+        view.path("diagram").path("writers").forEach(w -> writerIds.add(w.path("names").get(0).asText()));
+        assertThat(writerIds).as("the ghost writer sorts in by node id")
+                .containsExactly("w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10");
+        assertThat(view.path("diagram").path("writers").get(5).path("live").asBoolean()).isFalse();
         assertThat(view.path("diagram").path("readers")).hasSize(10);
         assertLegible(out.path("layoutWide"), 1280);
         assertLegible(out.path("layoutNarrow"), 420);
@@ -199,6 +205,82 @@ class ClusterPageTest {
         JsonNode grouped = out.path("grouped");
         assertThat(grouped.size()).isLessThan(14);
         assertThat(names(grouped.get(0).path("names"), null)).hasSizeGreaterThan(1);
+    }
+
+    /**
+     * Status strings are data: a hostile heartbeat (any string as node id, state, shard, phase…)
+     * must not break out of an attribute or inject markup. Classes come only from allow-lists.
+     */
+    @Test
+    void hostileStatusStringsRenderAsText(@TempDir Path tmp) throws Exception {
+        String a = "\"><img src=x onerror=alert(1)>";
+        String b = "x\" onmouseover=\"y";
+        var st = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(GOLDEN.toFile());
+        var layout = (com.fasterxml.jackson.databind.node.ObjectNode) st.get("layout");
+        int i = 0;
+        for (JsonNode n : layout.get("shards")) {
+            var o = (com.fasterxml.jackson.databind.node.ObjectNode) n;
+            String evil = (i++ % 2 == 0 ? a : b) + i;
+            o.put("shard", evil);
+            o.put("state", i % 2 == 0 ? a : b);
+            o.put("writer", b);
+            ((com.fasterxml.jackson.databind.node.ObjectNode) o.get("keys")).put(a, b);
+            ((com.fasterxml.jackson.databind.node.ObjectNode) o.get("lease")).put("writer", a + i);
+            ((com.fasterxml.jackson.databind.node.ObjectNode) o.get("backlog")).put("sourceRevision", a)
+                    .put("publishedRevision", b);
+            o.putArray("readers").add(a).add(b);
+        }
+        i = 0;
+        for (JsonNode n : layout.get("writers")) {
+            var o = (com.fasterxml.jackson.databind.node.ObjectNode) n;
+            o.put("node", (i++ % 2 == 0 ? a : b) + "w" + i);
+            o.putArray("leases").add(a);
+            if (o.get("indexing").isObject()) {
+                ((com.fasterxml.jackson.databind.node.ObjectNode) o.get("indexing")).put("phase", a).put("shard", b)
+                        .put("progress", b);
+            }
+        }
+        i = 0;
+        for (JsonNode n : layout.get("readers")) {
+            var o = (com.fasterxml.jackson.databind.node.ObjectNode) n;
+            o.put("node", (i++ % 2 == 0 ? a : b) + "r" + i);
+            o.put("state", i % 2 == 0 ? a : b);
+            o.putArray("shards").add(a + "1").add(b + "2").add(a);
+            o.putArray("degradedShards").add(a + "1").add(b);
+        }
+        for (JsonNode n : st.get("health")) {
+            ((com.fasterxml.jackson.databind.node.ObjectNode) n).put("kind", a).put("target", b).put("message", a + b);
+        }
+        for (JsonNode n : st.get("proposals")) {
+            var o = (com.fasterxml.jackson.databind.node.ObjectNode) n;
+            o.put("kind", b).put("target", a).put("reason", a).put("action", b).put("since", a).put("id", b);
+            ((com.fasterxml.jackson.databind.node.ObjectNode) o.get("metrics")).put(a, b).put(b, 1.5);
+        }
+        st.put("asOf", a);
+        st.put("mode", b);
+
+        JsonNode out = render(tmp, JSON.writeValueAsString(st));
+        for (String key : List.of("html", "htmlNarrow")) {
+            String page = out.path(key).asText();
+            assertThat(page).as(key).doesNotContain("<img", "onerror=\"", "onmouseover=\"", "x\" ");
+            Document doc = xml(page);
+            NodeList all = doc.getElementsByTagName("*");
+            for (int k = 0; k < all.getLength(); k++) {
+                Element e = (Element) all.item(k);
+                assertThat(e.getTagName()).isNotEqualToIgnoringCase("img");
+                var attrs = e.getAttributes();
+                for (int j = 0; j < attrs.getLength(); j++) {
+                    String name = attrs.item(j).getNodeName();
+                    assertThat(name).as("event handler attribute on <%s>", e.getTagName()).doesNotStartWith("on");
+                    if (name.equals("class")) {
+                        assertThat(attrs.item(j).getNodeValue()).as("class tokens come from allow-lists")
+                                .matches("[a-z0-9 -]*");
+                    }
+                }
+            }
+            // the strings are still shown, as text
+            assertThat(doc.getDocumentElement().getTextContent()).contains("<img src=x onerror=alert(1)>");
+        }
     }
 
     // ── helpers ──────────────────────────────────────────────

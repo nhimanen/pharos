@@ -80,6 +80,20 @@ const STATUS_FIELDS = [
 
 /** Shard chip states, in the order the legend shows them. */
 const STATES = ['current', 'lagging', 'lease-expired', 'unpublished'];
+/** Reader heartbeat states; anything else (an older or newer node, a hostile heartbeat) is 'unknown'. */
+const READER_STATES = ['warming', 'ready', 'degraded', 'draining'];
+
+/**
+ * The only way a status string becomes a CSS class or other attribute token: a value from
+ * {@code allowed}, else {@code fallback}. Every other status string is text, and goes through esc().
+ */
+function token(v, allowed, fallback) {
+  return allowed.includes(v) ? v : fallback;
+}
+
+function readerState(v) {
+  return v == null ? 'ready' : token(v, READER_STATES, 'unknown');
+}
 /** Above this many boxes in a diagram column, boxes with the same shards and state are merged. */
 const MAX_BOXES = 12;
 /** Below this width the diagram stacks writers, bucket and readers in one column. */
@@ -176,8 +190,8 @@ function toView(st) {
     return w ? w.node : null;
   };
   const chip = (s, degraded) => ({
-    shard: s.shard,
-    state: STATES.includes(s.state) ? s.state : 'unpublished',
+    shard: String(s.shard),
+    state: token(s.state, STATES, 'unpublished'),
     pending: !!(s.backlog && s.backlog.pending),
     degraded: !!degraded,
     generation: s.generation == null ? null : s.generation,
@@ -229,13 +243,18 @@ function toView(st) {
     const o = ownerOf(s);
     if (o != null && liveWriters.has(o)) continue;
     const key = o == null ? '' : o;
-    if (!ghosts.has(key)) ghosts.set(key, { names: [o == null ? 'no writer' : o], kind: 'writer', live: false,
+    if (!ghosts.has(key)) ghosts.set(key, { names: [o == null ? 'no writer' : String(o)], kind: 'writer', live: false,
+      unassigned: o == null,
       stopping: false, disk: null, job: null, pinned: [], chips: [] });
     ghosts.get(key).chips.push(chip(s));
   }
-  writerBoxes = writerBoxes.concat([...ghosts.values()]);
+  // Ghost writers (a lease holder without a heartbeat) sort in among the live ones by node id;
+  // the 'no writer' box (shards without a lease holder) comes last.
+  const nodeKey = b => b.unassigned ? '\uffff' : String(b.names[0]);
+  writerBoxes = writerBoxes.concat([...ghosts.values()])
+    .sort((a, b) => nodeKey(a) < nodeKey(b) ? -1 : nodeKey(a) > nodeKey(b) ? 1 : 0);
   let readerBoxes = readers.map(r => ({
-    names: [r.node], kind: 'reader', state: r.state || 'ready',
+    names: [r.node], kind: 'reader', state: readerState(r.state),
     chips: (r.shards || []).map(n => chip(byName.get(n) || { shard: n, state: 'unpublished' },
       (r.degradedShards || []).includes(n))),
   }));
@@ -243,7 +262,7 @@ function toView(st) {
   let nodeBox = null;
   if (single) {
     const n = (writers[0] && writers[0].node) || (readers[0] && readers[0].node) || 'this node';
-    nodeBox = { names: [n], kind: 'all', live: true, state: (readers[0] && readers[0].state) || 'ready',
+    nodeBox = { names: [n], kind: 'all', live: true, state: readerState(readers[0] && readers[0].state),
       job: writers[0] ? job(writers[0]) : null, disk: writers[0] ? diskOf(writers[0]) : null,
       chips: shards.map(s => chip(s)) };
     writerBoxes = []; readerBoxes = [];
@@ -261,7 +280,7 @@ function toView(st) {
   const readerRow = r => {
     const served = (r.shards || []).map(n => byName.get(n)).filter(Boolean);
     const rc = r.readerCache || null;
-    return { node: r.node, role: 'reader', state: r.state || null, shards: r.shards || [],
+    return { node: r.node, role: 'reader', state: readerState(r.state), shards: r.shards || [],
       degraded: r.degradedShards || [],
       docs: sum(served.map(s => s.docCount)), size: sum(served.map(s => s.sizeBytes)), disk: null,
       cacheBytes: rc ? rc.bytesOnDisk : null, cacheMax: rc ? rc.cacheMaxBytes : null,
@@ -477,7 +496,7 @@ function chipTitle(c) {
 
 function svgChip(p, ox, oy) {
   const c = p.chip, x = ox + p.x, y = oy + p.y;
-  let s = `<g class="cl-chip cl-st-${esc(c.state)}${c.degraded ? ' cl-degraded' : ''}"><title>${esc(chipTitle(c))}</title>` +
+  let s = `<g class="cl-chip cl-st-${token(c.state, STATES, 'unpublished')}${c.degraded ? ' cl-degraded' : ''}"><title>${esc(chipTitle(c))}</title>` +
     `<rect x="${x}" y="${y}" width="${p.w}" height="${CHIP_H}" rx="4"/>` +
     `<text x="${x + p.w / 2}" y="${y + 12.5}" text-anchor="middle">${esc(c.shard)}</text>`;
   if (c.pending) s += `<circle class="cl-pending" cx="${x + p.w - 1}" cy="${y + 1}" r="3.5"/>`;
@@ -490,7 +509,7 @@ function svgBox(p) {
   if (b.live === false) cls.push('cl-dead');
   if (b.disk && b.disk.low) cls.push('cl-low');
   if (b.stopping) cls.push('cl-stopping');
-  if (b.kind === 'reader' && b.state && b.state !== 'ready') cls.push('cl-rs-' + b.state);
+  if (b.kind === 'reader' && b.state !== 'ready') cls.push('cl-rs-' + token(b.state, READER_STATES, 'unknown'));
   const label = b.kind === 'bucket' ? 'object store' : boxLabel(b);
   let s = `<g class="${cls.join(' ')}"><title>${esc(b.names.join(', '))}</title>` +
     `<rect class="cl-box-bg" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="6"/>` +
@@ -530,7 +549,7 @@ function legend() {
 }
 
 function chipHtml(state, text) {
-  return `<span class="cl-chip-h cl-st-${esc(state)}">${esc(text)}</span>`;
+  return `<span class="cl-chip-h cl-st-${token(state, STATES, 'unpublished')}">${esc(text)}</span>`;
 }
 
 function badge(text, cls) {
