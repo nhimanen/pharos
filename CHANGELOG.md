@@ -95,7 +95,8 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   no vectors of the search model: that project is left out of the vector part with the warning
   `project <name> has no vectors for model <id>; vector results exclude it`, on a single node and
   on every cluster reader alike. A search scoped to that one project still fails, now with HTTP
-  409 on the web API (was 500) and a tool error on MCP.
+  409 on the web API (was 500) and a tool error on MCP; `./pharos search` exits 6 for it (exit 4
+  stays "index format incompatible").
 - The S3 client waits up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a
   response (ranged block reads keep their `readTimeoutSeconds` bounds), so whole-object downloads
   and uploads on a slow bucket are not cut short.
