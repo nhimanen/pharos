@@ -10,6 +10,8 @@ import com.pharos.cluster.ReaderLocalCache;
 import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ReplicationBackend;
 import com.pharos.cluster.ShardCatalog;
+import com.pharos.cluster.WriterStateStore;
+import com.pharos.cluster.writer.LeaseGuard;
 import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 
@@ -31,6 +33,7 @@ public final class ObjectStoreBackend implements ReplicationBackend {
     private final ObjectStoreReplicaSource source;
     private final LocalCache cache;
     private final IndexPublisher publisher;
+    private final WriterStateStore writerState;
 
     public ObjectStoreBackend(IndexConfig config) {
         // validated before the S3 client is built (arguments evaluate left to right)
@@ -54,12 +57,14 @@ public final class ObjectStoreBackend implements ReplicationBackend {
         if (cfg.getRole() == NodeRole.READER) {
             this.cache = new ReaderLocalCache(cfg.getCacheDir());
             this.publisher = NoOpPublisher.INSTANCE;
+            this.writerState = WriterStateStore.NONE;
         } else {
             this.cache = new LocalFsCache(config);
             GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
                     Duration.ofMinutes(cfg.getRetentionMinutes()));
+            this.writerState = new ObjectStoreWriterStateStore(store, layout, source, cfg.effectiveNodeId());
             this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
-                    config.getSynonymsFile());
+                    config.getSynonymsFile(), LeaseGuard.IMPLICIT, writerState);
         }
     }
 
@@ -80,6 +85,8 @@ public final class ObjectStoreBackend implements ReplicationBackend {
     public ObjectStoreCatalog objectStoreCatalog() { return catalog; }
 
     @Override public ReplicaSource source() { return source; }
+
+    @Override public WriterStateStore writerState() { return writerState; }
 
     @Override
     public void close() throws IOException {

@@ -47,6 +47,9 @@ import java.util.regex.Pattern;
  * ({@code list(exactKey)}) immediately before its delete, and the delete is skipped if the object
  * is gone or now younger than {@code minAge}. A window between that re-read and the delete
  * remains; it is closed only by the Phase 4 writer lease.
+ *
+ * <p>Writer state ({@code writer-state/}) is kept for the kept generations only; see
+ * {@link #collectWriterState}.
  */
 public final class GenerationGc {
 
@@ -54,6 +57,8 @@ public final class GenerationGc {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern MANIFEST_NAME = Pattern.compile("gen-(\\d+)\\.json");
     private static final List<String> DATA_DIRS = List.of("lucene/", "graph/", "refs/");
+    /** A file of a per-generation writer-state backup, relative to {@code writer-state/}. */
+    private static final Pattern WRITER_STATE_GEN = Pattern.compile("gen-(\\d{1,18})/.+");
 
     private final ObjectStore store;
     private final ObjectStoreLayout layout;
@@ -190,9 +195,81 @@ public final class GenerationGc {
             }
             deleted[0] += delete(shard, o.key(), protectedKeys);
         }
+        Set<Long> keptGens = new HashSet<>();
+        for (Manifest m : kept) keptGens.add(m.generation());
+        keptGens.add(latestGen);
+        collectWriterState(shard, objects, keptGens, cutoff, protectedKeys, deleted);
         if (deleted[0] > 0) {
             log.info("GC of shard {}: deleted {} objects ({} manifests), LATEST generation {}",
                     shard, deleted[0], doomed.size(), latestGen);
+        }
+    }
+
+    /**
+     * Writer state follows the generations: {@code writer-state/gen-N/} survives only while manifest
+     * N does (its {@code index.json} is deleted first), and a {@code writer-state/blobs/} object only
+     * while a surviving backup index references it or it is younger than {@code minAge} (each
+     * re-checked just before its delete, like data files). When a surviving index cannot be read or
+     * parsed, no blob is deleted.
+     */
+    private void collectWriterState(ShardId shard, List<ObjectInfo> objects, Set<Long> keptGens, Instant cutoff,
+                                    Set<String> protectedKeys, int[] deleted) throws Abort {
+        String prefix = layout.writerStatePrefix(shard);
+        String blobPrefix = prefix + "blobs/";
+        Map<Long, List<ObjectInfo>> byGen = new TreeMap<>();
+        List<ObjectInfo> blobs = new ArrayList<>();
+        for (ObjectInfo o : objects) {
+            if (!o.key().startsWith(prefix)) continue;
+            if (o.key().startsWith(blobPrefix)) {
+                blobs.add(o);
+                continue;
+            }
+            Matcher m = WRITER_STATE_GEN.matcher(o.key().substring(prefix.length()));
+            if (m.matches()) byGen.computeIfAbsent(Long.parseLong(m.group(1)), g -> new ArrayList<>()).add(o);
+        }
+
+        // Blobs referenced by the backups that stay, read before anything is deleted.
+        Set<String> referenced = new HashSet<>();
+        boolean referencesKnown = true;
+        for (long gen : byGen.keySet()) {
+            if (!keptGens.contains(gen)) continue;
+            String indexKey = layout.writerStateIndexKey(shard, new Generation(gen));
+            if (byGen.get(gen).stream().noneMatch(o -> o.key().equals(indexKey))) continue; // backup never completed
+            Optional<StoredObject> obj;
+            try {
+                obj = store.get(indexKey);
+            } catch (IOException e) {
+                throw new Abort("cannot read " + indexKey + ": " + e);
+            }
+            if (obj.isEmpty()) {
+                referencesKnown = false;
+                continue;
+            }
+            try {
+                for (WriterStateIndex.Entry e : WriterStateIndex.read(obj.get().data()).files()) {
+                    if (e != null && e.key() != null) referenced.add(e.key());
+                }
+            } catch (IOException | RuntimeException e) {
+                log.warn("GC of shard {}: unreadable writer-state index {}, keeping every blob: {}",
+                        shard, indexKey, e.toString());
+                referencesKnown = false;
+            }
+        }
+
+        for (Map.Entry<Long, List<ObjectInfo>> e : byGen.entrySet()) {
+            if (keptGens.contains(e.getKey())) continue;
+            String indexKey = layout.writerStateIndexKey(shard, new Generation(e.getKey()));
+            List<ObjectInfo> files = new ArrayList<>(e.getValue());
+            files.sort(Comparator.comparing((ObjectInfo o) -> !o.key().equals(indexKey))); // index first
+            for (ObjectInfo o : files) deleted[0] += delete(shard, o.key(), protectedKeys);
+        }
+
+        if (!referencesKnown) return;
+        for (ObjectInfo o : blobs) {
+            if (referenced.contains(o.key())) continue;
+            if (!o.lastModified().isBefore(cutoff)) continue;
+            if (!stillOld(o.key(), cutoff)) continue;
+            deleted[0] += delete(shard, o.key(), protectedKeys);
         }
     }
 

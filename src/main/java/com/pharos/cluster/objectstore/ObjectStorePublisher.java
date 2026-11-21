@@ -8,6 +8,7 @@ import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.WriterStateStore;
 import com.pharos.cluster.writer.LeaseGuard;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphWriter;
@@ -64,6 +65,9 @@ import java.util.zip.GZIPOutputStream;
  * that race, or {@code LATEST} having moved, is a {@link PublishConflictException}). Nothing
  * becomes visible to readers until the {@code LATEST} CAS succeeds; every failure before it
  * leaves {@code LATEST} untouched.
+ *
+ * <p>After the commit point the shard's writer state is backed up ({@link WriterStateStore#backup}),
+ * then GC runs. Both are best-effort: a failure is a WARN, and the publish still succeeds.
  */
 public final class ObjectStorePublisher implements IndexPublisher {
 
@@ -79,6 +83,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private final String nodeId;
     private final Path synonymsFile;
     private final LeaseGuard leaseGuard;
+    private final WriterStateStore writerState;
 
     /**
      * @param gc           generation GC, run with the shard and the {@code LATEST} last-modified
@@ -96,6 +101,17 @@ public final class ObjectStorePublisher implements IndexPublisher {
      */
     public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
                                 GenerationGc gc, String nodeId, Path synonymsFile, LeaseGuard leaseGuard) {
+        this(store, layout, catalog, gc, nodeId, synonymsFile, leaseGuard, WriterStateStore.NONE);
+    }
+
+    /**
+     * @param writerState backs up the writer state of each generation right after its commit, before
+     *                    GC; {@link WriterStateStore#NONE} keeps none
+     */
+    public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
+                                GenerationGc gc, String nodeId, Path synonymsFile, LeaseGuard leaseGuard,
+                                WriterStateStore writerState) {
+        this.writerState = Objects.requireNonNull(writerState, "writerState");
         this.leaseGuard = Objects.requireNonNull(leaseGuard, "leaseGuard");
         this.store = store;
         this.layout = layout;
@@ -239,7 +255,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
             }
 
-            // 8. Best-effort GC.
+            // 8. Best-effort writer-state backup (before GC, so GC sees this generation's state), then GC.
+            backupWriterState(shard, gen, snapshot.shardDir());
             runGc(shard);
 
             log.info("Published shard {} generation {}: {} files uploaded, {} reused, {} bytes uploaded",
@@ -359,6 +376,16 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private ManifestFile upload(String role, String name, String key, Path file, String crcHex) throws IOException {
         store.put(key, file);
         return new ManifestFile(role, name, key, Files.size(file), crcHex);
+    }
+
+    /** Never fails the publish: the generation is committed, a missing backup only costs a takeover a full index. */
+    private void backupWriterState(ShardId shard, Generation gen, Path shardDir) {
+        try {
+            writerState.backup(shard, gen, shardDir);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Writer-state backup of shard {} generation {} failed (publish succeeded): {}",
+                    shard, gen.value(), e.toString());
+        }
     }
 
     private void runGc(ShardId shard) {

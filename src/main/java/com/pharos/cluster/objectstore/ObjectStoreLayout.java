@@ -55,4 +55,22 @@ public final class ObjectStoreLayout {
     public String refsKey(ShardId shard, Generation gen, String checksumHex) {
         return shardPrefix(shard) + "refs/gen-" + gen.value() + "@" + checksumHex + ".json.gz";
     }
+
+    /** Writer-only state of a shard (embedding caches, file state): {@code shards/<shard>/writer-state/}. */
+    public String writerStatePrefix(ShardId shard) { return shardPrefix(shard) + "writer-state/"; }
+
+    /** Per-generation writer-state files: {@code writer-state/gen-N/}. */
+    public String writerStateGenPrefix(ShardId shard, Generation gen) {
+        return writerStatePrefix(shard) + "gen-" + gen.value() + "/";
+    }
+
+    /** The index of a writer-state backup, written last: {@code writer-state/gen-N/index.json}. */
+    public String writerStateIndexKey(ShardId shard, Generation gen) {
+        return writerStateGenPrefix(shard, gen) + "index.json";
+    }
+
+    /** Content-addressed writer-state blob (embedding cache files): {@code writer-state/blobs/<sha256>}. */
+    public String writerStateBlobKey(ShardId shard, String sha256Hex) {
+        return writerStatePrefix(shard) + "blobs/" + sha256Hex;
+    }
 }

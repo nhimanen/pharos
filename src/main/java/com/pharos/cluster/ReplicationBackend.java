@@ -15,4 +15,7 @@ public interface ReplicationBackend extends Closeable {
 
     /** Where readers fetch generations from; unsupported by backends without replication. */
     ReplicaSource source();
+
+    /** Writer state backed up after each publish and restored on takeover; {@link WriterStateStore#NONE} when not kept. */
+    WriterStateStore writerState();
 }
