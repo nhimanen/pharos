@@ -256,6 +256,8 @@ public final class WorkLoop implements Closeable {
     /** The index store's free bytes when {@link #admitted} last admitted a run (loop thread). */
     private long admittedFree = -1;
     private final Object diskMu = new Object();
+    /** The low-disk WARN of this episode was logged (loop thread). */
+    private boolean announcedLow;
     private ScheduledExecutorService diskWatch;
     /** Change detection at a fixed rate, on its own thread: it runs while the loop thread indexes. */
     private ScheduledExecutorService detector;
@@ -363,8 +365,20 @@ public final class WorkLoop implements Closeable {
             }
             Map<ShardId, ShardSource> sources = resolveSources(entries);
             if (diskLow()) {
-                log.debug("Writer {} is low on disk: acquiring no lease", settings.node());
+                if (!announcedLow) {
+                    announcedLow = true;
+                    DiskGuard.Status d = disk.status();
+                    log.warn("Writer {} is low on disk ({} free, threshold {}): acquiring no lease and starting no"
+                                    + " run until it recovers", settings.node(),
+                            d == null ? "?" : DiskGuard.bytes(d.freeBytes()), DiskGuard.bytes(disk.indexStoreThreshold()));
+                } else {
+                    log.debug("Writer {} is low on disk: acquiring no lease", settings.node());
+                }
             } else {
+                if (announcedLow) {
+                    announcedLow = false;
+                    log.info("Writer {} is no longer low on disk: acquiring leases again", settings.node());
+                }
                 acquire(sources);
             }
             members.beat(); // announce the leases now, before a long run

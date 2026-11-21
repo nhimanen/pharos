@@ -1196,6 +1196,26 @@ class WorkLoopTest {
         assertThat(latest(hand).orElseThrow().value()).isEqualTo(g.value() + 1);
     }
 
+    /** Final review I5: a low writer says so at WARN once per low episode, not at DEBUG every tick. */
+    @Test
+    void lowDiskIsAWarnOncePerEpisode() throws IOException {
+        pathShard("solo");
+        FakeDisk fake = new FakeDisk();
+        Writer a = new Writer("node-a", fake);
+        a.loop.tick();
+        fake.set(THRESHOLD - 1);
+        List<String> logs = logsOf(WorkLoop.class, () -> rounds(3, 10, a));
+        assertThat(logs.stream().filter(l -> l.contains("is low on disk") && l.contains("starting no run until it recovers")))
+                .hasSize(1);
+        fake.set(50 * GIB);
+        logs = logsOf(WorkLoop.class, () -> rounds(1, 10, a));
+        assertThat(logs).anyMatch(l -> l.contains("no longer low on disk"));
+        fake.set(THRESHOLD - 1);
+        logs = logsOf(WorkLoop.class, () -> rounds(2, 10, a));
+        assertThat(logs.stream().filter(l -> l.contains("is low on disk") && l.contains("starting no run until it recovers")))
+                .as("a new episode").hasSize(1);
+    }
+
     @Test
     void recoversWithHysteresis() throws IOException {
         ShardId s = pathShard("solo");

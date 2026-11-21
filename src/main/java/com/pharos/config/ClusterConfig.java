@@ -455,12 +455,13 @@ public class ClusterConfig {
      * {@code cluster.writer.disk}: the writer disk guard. A watched file store is <i>low</i> when its
      * free space is below {@code minFreeBytes} or below {@code minFreePercent} of its size; it is
      * no longer low once free space is back above that threshold plus {@code hysteresisBytes}.
-     * The guard probes every {@code checkSeconds}.
+     * The guard probes every {@code checkSeconds}. {@code minFreePercent} defaults to 0: a
+     * percentage of a large disk (10 % of 2 TB is 200 GB) left upgraded writers permanently low.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class DiskConfig {
         private long minFreeBytes = 5L << 30;
-        private int minFreePercent = 10;
+        private int minFreePercent = 0;
         private int checkSeconds = 15;
         private long hysteresisBytes = 1L << 30;
 

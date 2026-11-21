@@ -52,6 +52,15 @@ class DiskGuardTest {
         assertThat(g.threshold(20 * GIB)).as("5 GiB beats 10 % of 20 GiB").isEqualTo(5 * GIB);
     }
 
+    /** Final review I5: a 2 TB disk with 150 GB free (7.5 %) is not low under the defaults. */
+    @Test
+    void defaultsDoNotMakeALargeDiskLow() {
+        DiskGuard g = new DiskGuard(DATA, List.of(), DiskGuard.Settings.of(new ClusterConfig.DiskConfig()),
+                new Stores().store("a", 150L * 1000 * 1000 * 1000, 2_000L * 1000 * 1000 * 1000, DATA));
+        assertThat(g.check().low()).isFalse();
+        assertThat(g.threshold(2_000L * 1000 * 1000 * 1000)).isEqualTo(5 * GIB);
+    }
+
     @Test
     void refusesRunThatWouldCrossThreshold() {
         Stores stores = new Stores().store("a", 12 * GIB, 100 * GIB, DATA);
@@ -145,9 +154,11 @@ class DiskGuardTest {
     void settingsComeFromTheClusterConfig() {
         ClusterConfig.DiskConfig c = new ClusterConfig.DiskConfig();
         assertThat(c.getMinFreeBytes()).isEqualTo(5 * GIB);
-        assertThat(c.getMinFreePercent()).isEqualTo(10);
+        assertThat(c.getMinFreePercent()).as("final review I5: no percentage by default").isZero();
         assertThat(c.getCheckSeconds()).isEqualTo(15);
         assertThat(c.getHysteresisBytes()).isEqualTo(GIB);
+        assertThat(DiskGuard.Settings.of(c)).isEqualTo(new DiskGuard.Settings(5 * GIB, 0, GIB, Duration.ofSeconds(15)));
+        c.setMinFreePercent(10);
         assertThat(DiskGuard.Settings.of(c)).isEqualTo(SETTINGS);
         c.setMinFreePercent(101);
         assertThatThrownBy(c::validate).hasMessageContaining("cluster.writer.disk.minFreePercent");
