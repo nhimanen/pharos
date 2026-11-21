@@ -37,25 +37,35 @@ public final class SourceCheckout {
     private static final Logger log = LoggerFactory.getLogger(SourceCheckout.class);
     private static final Pattern SHA = Pattern.compile("[0-9a-fA-F]{40}([0-9a-fA-F]{24})?");
     static final Duration DEFAULT_GIT_TIMEOUT = Duration.ofMinutes(10);
+    /** {@code cluster.writer.lsRemoteTimeoutSeconds} default: the change check's own, short timeout. */
+    public static final Duration DEFAULT_LS_REMOTE_TIMEOUT = Duration.ofSeconds(30);
 
     private final Path workDir;
     private final Duration gitTimeout;
+    private final Duration lsRemoteTimeout;
     private final String gitExecutable;
     private final Map<ShardId, ShardSource> prepared = new ConcurrentHashMap<>();
 
     public SourceCheckout(Path workDir) {
-        this(workDir, DEFAULT_GIT_TIMEOUT);
+        this(workDir, DEFAULT_LS_REMOTE_TIMEOUT);
     }
 
-    SourceCheckout(Path workDir, Duration gitTimeout) {
-        this(workDir, gitTimeout, "git");
+    /** @param lsRemoteTimeout how long a change check's {@code git ls-remote} may take */
+    public SourceCheckout(Path workDir, Duration lsRemoteTimeout) {
+        this(workDir, DEFAULT_GIT_TIMEOUT, lsRemoteTimeout, "git");
     }
 
     /** Tests only: another git executable (a fake that hangs). */
     SourceCheckout(Path workDir, Duration gitTimeout, String gitExecutable) {
+        this(workDir, gitTimeout, gitTimeout, gitExecutable);
+    }
+
+    /** Tests only: separate timeouts and another git executable. */
+    SourceCheckout(Path workDir, Duration gitTimeout, Duration lsRemoteTimeout, String gitExecutable) {
         this.gitExecutable = gitExecutable;
         this.workDir = Objects.requireNonNull(workDir, "workDir").toAbsolutePath().normalize();
         this.gitTimeout = gitTimeout;
+        this.lsRemoteTimeout = Objects.requireNonNull(lsRemoteTimeout, "lsRemoteTimeout");
     }
 
     /** Where a git shard's clone lives. */
@@ -147,7 +157,7 @@ public final class SourceCheckout {
         String ref = src.ref();
         // the url, not the clone's origin: read-only, and independent of a checkout a run is indexing
         Files.createDirectories(workDir);
-        String out = git(workDir, "ls-remote", "--", src.location(), ref, ref + "^{}");
+        String out = git(workDir, lsRemoteTimeout, "ls-remote", "--", src.location(), ref, ref + "^{}");
         String head = null, tag = null, peeledTag = null;
         for (String line : out.split("\n")) {
             String[] f = line.trim().split("\\s+");
@@ -174,6 +184,15 @@ public final class SourceCheckout {
     }
 
     private String git(Path dir, String... args) throws IOException {
+        return git(dir, gitTimeout, args);
+    }
+
+    /**
+     * Runs git with {@code timeout}. On a timeout (or an interrupt) the whole process tree is
+     * killed, not only git: a transport helper ({@code git-remote-https}, {@code ssh}) left alive
+     * would keep the output pipes, and with them the two pump threads, until it exits on its own.
+     */
+    private String git(Path dir, Duration timeout, String... args) throws IOException {
         List<String> cmd = new ArrayList<>();
         cmd.add(gitExecutable);
         cmd.addAll(List.of(args));
@@ -189,16 +208,15 @@ public final class SourceCheckout {
         Thread errPump = Thread.ofVirtual().start(() -> drain(p.getErrorStream(), err));
         Thread outPump = Thread.ofVirtual().start(() -> drain(p.getInputStream(), outBuf));
         try {
-            if (!p.waitFor(gitTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                p.destroyForcibly();
-                p.waitFor(5, TimeUnit.SECONDS);
+            if (!p.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+                killTree(p, errPump, outPump);
                 // the operation only: the command line may carry the source's url
-                throw new IOException("git " + args[0] + " timed out after " + gitTimeout.toMillis() + " ms");
+                throw new IOException("git " + args[0] + " timed out after " + timeout.toMillis() + " ms");
             }
             errPump.join(2000);
             outPump.join(2000);
         } catch (InterruptedException e) {
-            p.destroyForcibly();
+            killTree(p, errPump, outPump);
             Thread.currentThread().interrupt();
             throw new java.io.InterruptedIOException("interrupted while running git " + args[0]);
         }
@@ -210,6 +228,51 @@ public final class SourceCheckout {
                     + (msg.isEmpty() ? "" : ": " + msg));
         }
         return new String(out, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Kills {@code p} and every descendant (listed before {@code p} dies: an orphan is no longer its
+     * descendant), then closes the pipes so the pumps end even if something still holds them.
+     */
+    private static void killTree(Process p, Thread... pumps) {
+        List<ProcessHandle> tree = new ArrayList<>();
+        try {
+            p.descendants().forEach(tree::add);
+        } catch (RuntimeException e) {
+            log.debug("Listing the git process tree failed: {}", e.toString());
+        }
+        tree.forEach(ProcessHandle::destroyForcibly);
+        p.destroyForcibly();
+        for (ProcessHandle h : tree) {
+            try {
+                h.onExit().get(2, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            }
+        }
+        try {
+            p.waitFor(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        closeQuietly(p.getInputStream());
+        closeQuietly(p.getErrorStream());
+        for (Thread t : pumps) {
+            try {
+                t.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // nothing to do
+        }
     }
 
     private static void drain(InputStream in, ByteArrayOutputStream sink) {

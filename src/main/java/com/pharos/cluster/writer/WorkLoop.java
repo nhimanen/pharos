@@ -97,9 +97,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * cross the threshold is refused and its shard released like a low writer's. A released shard is
  * not re-acquired by this writer for {@code max(minHold, poll)}.
  *
- * <p><b>Failing shards</b>: a surplus shard (not pinned, past {@code minHold}) whose runs failed
- * {@code cluster.writer.maxConsecutiveFailures} times in a row is released so another writer can
- * try it. A surplus shard is released when idle only after a poll that succeeded.
+ * <p><b>Failing shards</b>: a surplus shard (not pinned, past {@code minHold}) whose runs or source
+ * checks failed {@code cluster.writer.maxConsecutiveFailures} times in a row is released so another
+ * writer can try it. A surplus shard is released when idle only after a poll that succeeded. Source
+ * checks run per shard, in parallel, under a per-shard lock: an unreachable remote (its
+ * {@code ls-remote} killed after {@code lsRemoteTimeoutSeconds}) stalls only its own shard.
  *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
@@ -154,8 +156,18 @@ public final class WorkLoop implements Closeable {
         volatile Instant acquiredAt;
         /** The last poll of this shard succeeded: its {@code pendingSince} is current (M5). */
         volatile boolean lastPollOk;
-        /** Failed runs in a row (reset by a publish); M4 releases a surplus shard at the limit. */
-        volatile int consecutiveFailures;
+        /**
+         * Failed runs and failed source checks in a row (reset by a publish, and by a check that
+         * finds the shard healthy and idle); M4 releases a surplus shard at the limit.
+         */
+        final java.util.concurrent.atomic.AtomicInteger consecutiveFailures = new java.util.concurrent.atomic.AtomicInteger();
+        /**
+         * Guards this shard's poll state ({@code sourceRevision}, {@code publishedRevision},
+         * {@code publishedGeneration}, {@code pendingSince}, {@code lastPollOk}, {@code upgrade})
+         * across the loop thread and the change detector. Per shard: a check that hangs on one
+         * unreachable remote (up to {@code lsRemoteTimeoutSeconds}) never holds up another shard.
+         */
+        final ReentrantLock pollLock = new ReentrantLock();
         /** The index format of the {@code LATEST} manifest ({@link #publishedGeneration}); -1 when unknown. */
         volatile int publishedFormat = -1;
         /** Why the local index needs a full run (loop thread, between runs); null when it doesn't. */
@@ -247,12 +259,6 @@ public final class WorkLoop implements Closeable {
     private ScheduledExecutorService diskWatch;
     /** Change detection at a fixed rate, on its own thread: it runs while the loop thread indexes. */
     private ScheduledExecutorService detector;
-    /**
-     * Guards a shard's poll state ({@code sourceRevision}, {@code publishedRevision},
-     * {@code publishedGeneration}, {@code pendingSince}, {@code lastPollOk}) across the loop thread
-     * and the change detector. Held only around one shard's read-only source check.
-     */
-    private final Object pollMu = new Object();
     private volatile boolean stopping;
     private final ReentrantLock tickLock = new ReentrantLock();
     private final Object stopMu = new Object();
@@ -380,6 +386,11 @@ public final class WorkLoop implements Closeable {
                 }
                 members.beat();
             }
+            // a shard whose source checks keep failing (an unreachable remote) is released like a failing run's
+            for (ShardId shard : shards.keySet().stream().sorted(Comparator.comparing(ShardId::value)).toList()) {
+                ShardState st = shards.get(shard);
+                if (st != null && !st.lastPollOk) maybeReleaseFailing(shard, currentShare(sources));
+            }
             releaseIdleSurplus(currentShare(sources));
             if (diskLow()) {
                 for (ShardId shard : shards.keySet().stream().sorted(Comparator.comparing(ShardId::value)).toList()) {
@@ -505,7 +516,8 @@ public final class WorkLoop implements Closeable {
 
     /** Polls every held shard's source; returns the pending ones, oldest unpublished change first. */
     private List<ShardId> poll() {
-        boolean announce = false;
+        java.util.concurrent.atomic.AtomicBoolean announce = new java.util.concurrent.atomic.AtomicBoolean();
+        List<Thread> checks = new ArrayList<>();
         for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
             if (stopping) break;
             ShardId shard = e.getKey();
@@ -521,14 +533,26 @@ public final class WorkLoop implements Closeable {
                 }
             } catch (IOException | RuntimeException ex) {
                 st.lastPollOk = false;
+                st.consecutiveFailures.incrementAndGet();
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
                 continue;
             }
             st.localUpgrade = localUpgradeReason(shard, st);
-            announce |= pollShard(shard, st);
+            checks.add(Thread.ofVirtual().name("pharos-writer-poll-" + shard.value()).start(() -> {
+                if (pollShard(shard, st)) announce.set(true);
+            }));
+        }
+        // in parallel: an unreachable remote delays only its own shard (bounded by lsRemoteTimeoutSeconds)
+        for (Thread t : checks) {
+            try {
+                t.join();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
         // a change this poll found first (before the detector) is announced now, not after the runs
-        if (announce && !stopping) members.beat();
+        if (announce.get() && !stopping) members.beat();
         return shards.entrySet().stream().filter(e -> e.getValue().pendingSince != null)
                 .sorted(Comparator.comparing((Map.Entry<ShardId, ShardState> e) -> e.getValue().pendingSince)
                         .thenComparing(e -> e.getKey().value()))
@@ -538,13 +562,17 @@ public final class WorkLoop implements Closeable {
     /**
      * One read-only source check of a prepared shard ({@code git ls-remote} of its url, or the tree
      * digest of a path source; never a fetch into the checkout a run may be indexing) against the
-     * revision {@code LATEST} holds. Safe on the loop thread and on the change detector.
+     * revision {@code LATEST} holds. Safe on the loop thread and on the change detector. When another
+     * check of the same shard is still in progress (a slow remote) this one is skipped: that check's
+     * result stands. A failed check counts toward {@code maxConsecutiveFailures} (M4); a check that
+     * finds the shard idle resets the count.
      *
      * @return true when this check found a new unpublished source revision: the shard turned pending,
      *     or a pending shard's source moved on again
      */
     private boolean pollShard(ShardId shard, ShardState st) {
-        synchronized (pollMu) {
+        if (!st.pollLock.tryLock()) return false;
+        try {
             boolean wasPending = st.pendingSince != null;
             String before = st.sourceRevision;
             try {
@@ -561,14 +589,19 @@ public final class WorkLoop implements Closeable {
                 } else {
                     st.sourceRevision = st.publishedRevision;
                     st.pendingSince = null;
+                    st.consecutiveFailures.set(0); // healthy and published
                 }
                 st.lastPollOk = true;
             } catch (IOException | RuntimeException ex) {
                 // pendingSince is now unknown: no idle release until a poll succeeds again (M5)
                 st.lastPollOk = false;
-                log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
+                int n = st.consecutiveFailures.incrementAndGet();
+                log.warn("Polling the source of shard {} failed ({} failure(s) in a row; retrying next poll): {}", shard,
+                        n, ex.toString());
             }
             return st.pendingSince != null && (!wasPending || !java.util.Objects.equals(before, st.sourceRevision));
+        } finally {
+            st.pollLock.unlock();
         }
     }
 
@@ -577,17 +610,29 @@ public final class WorkLoop implements Closeable {
      * check of every prepared held shard, also while the loop thread runs another shard (or this
      * one). A shard that turns pending, or whose pending source moves on, is announced at once by a
      * heartbeat, so the backlog shows the change
-     * within one poll. Run order, leases and releases stay with the loop thread.
+     * within one poll. Each shard is checked on its own virtual thread, so one unreachable remote
+     * delays only its own shard. Run order, leases and releases stay with the loop thread.
      */
     void detectChanges() {
-        boolean turned = false;
+        List<Thread> checks = new ArrayList<>();
         for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
-            if (stopping) return;
+            if (stopping) break;
+            ShardId shard = e.getKey();
             ShardState st = e.getValue();
-            if (!st.prepared || !checkout.isPrepared(e.getKey())) continue; // the loop thread checks it out first
-            turned |= pollShard(e.getKey(), st);
+            if (!st.prepared || !checkout.isPrepared(shard)) continue; // the loop thread checks it out first
+            if (st.pollLock.isLocked()) continue; // its previous check is still running
+            checks.add(Thread.ofVirtual().name("pharos-writer-detect-" + shard.value()).start(() -> {
+                if (pollShard(shard, st) && !stopping) members.beat(); // at once, not after the slowest check
+            }));
         }
-        if (turned && !stopping) members.beat();
+        for (Thread t : checks) {
+            try {
+                t.join();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt(); // stopping: the checks end within their git timeout
+                return;
+            }
+        }
     }
 
     private void detectChangesQuietly() {
@@ -685,8 +730,8 @@ public final class WorkLoop implements Closeable {
         busy = shard;
         try {
             Outcome o = attempt(shard, st);
-            if (o == Outcome.PUBLISHED) st.consecutiveFailures = 0;
-            else if (o == Outcome.FAILED) st.consecutiveFailures++;
+            if (o == Outcome.PUBLISHED) st.consecutiveFailures.set(0);
+            else if (o == Outcome.FAILED) st.consecutiveFailures.incrementAndGet();
             return o;
         } finally {
             busy = null;
@@ -784,7 +829,8 @@ public final class WorkLoop implements Closeable {
             String headAtStart = st.sourceRevision;
             indexer.index(root, shard.value(), !full, false, embeds(shard), settings.buildSynonyms(),
                     run.listener(), run.abort, revision);
-            synchronized (pollMu) {
+            st.pollLock.lock();
+            try {
                 if (full) { // rebuilt by this release: nothing left to upgrade
                     st.localUpgrade = null;
                     st.upgrade = null;
@@ -799,6 +845,8 @@ public final class WorkLoop implements Closeable {
                     st.sourceRevision = revision;
                     st.pendingSince = null;
                 }
+            } finally {
+                st.pollLock.unlock();
             }
             if (full) Files.deleteIfExists(indexDir.resolve(FULL_RUN_REQUIRED));
             publishes.merge(shard, 1, Integer::sum);
@@ -1089,15 +1137,16 @@ public final class WorkLoop implements Closeable {
     }
 
     /**
-     * M4: a surplus shard whose runs failed {@code maxConsecutiveFailures} times in a row is released
-     * (never a pinned one, never within {@code minHold}), so another writer can try it.
+     * M4: a surplus shard whose runs or source checks failed {@code maxConsecutiveFailures} times in a
+     * row is released (never a pinned one, never within {@code minHold}), so another writer can try it.
      */
     private void maybeReleaseFailing(ShardId shard, int share) {
         ShardState st = shards.get(shard);
-        if (st == null || st.consecutiveFailures < settings.maxConsecutiveFailures()) return;
+        if (st == null || st.consecutiveFailures.get() < settings.maxConsecutiveFailures()) return;
         if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
-            log.warn("Releasing shard {} after {} failed runs in a row so another writer can try it: writer {} holds"
-                            + " {} lease(s), its share is {}", shard, st.consecutiveFailures, settings.node(),
+            log.warn("Releasing shard {} after {} failed runs or source checks in a row so another writer can try it:"
+                            + " writer {} holds"
+                            + " {} lease(s), its share is {}", shard, st.consecutiveFailures.get(), settings.node(),
                     heldSet().size(), share);
             avoid(shard);
             release(shard);

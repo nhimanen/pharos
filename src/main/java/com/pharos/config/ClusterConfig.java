@@ -391,6 +391,11 @@ public class ClusterConfig {
          * held at least {@code minHoldSeconds}) the writer releases it so another writer can try.
          */
         private int maxConsecutiveFailures = 3;
+        /**
+         * Work-queue mode: a change check's {@code git ls-remote} is killed (with its transport
+         * helpers) after this many seconds, so an unreachable remote stalls only its own shard.
+         */
+        private int lsRemoteTimeoutSeconds = 30;
         /** Work-queue mode: the disk guard ({@code cluster.writer.disk}). */
         private DiskConfig disk = new DiskConfig();
 
@@ -414,6 +419,10 @@ public class ClusterConfig {
                 throw new IllegalStateException("cluster.writer.maxConsecutiveFailures must be at least 1, got "
                         + maxConsecutiveFailures);
             }
+            if (lsRemoteTimeoutSeconds < 1) {
+                throw new IllegalStateException("cluster.writer.lsRemoteTimeoutSeconds must be at least 1, got "
+                        + lsRemoteTimeoutSeconds);
+            }
             if (disk == null) disk = new DiskConfig();
             disk.validate();
         }
@@ -430,6 +439,8 @@ public class ClusterConfig {
         public void setMinHoldSeconds(int v) { this.minHoldSeconds = v; }
         public int getMaxConsecutiveFailures() { return maxConsecutiveFailures; }
         public void setMaxConsecutiveFailures(int v) { this.maxConsecutiveFailures = v; }
+        public int getLsRemoteTimeoutSeconds() { return lsRemoteTimeoutSeconds; }
+        public void setLsRemoteTimeoutSeconds(int v) { this.lsRemoteTimeoutSeconds = v; }
         public DiskConfig getDisk() { return disk; }
         public void setDisk(DiskConfig disk) { this.disk = disk == null ? new DiskConfig() : disk; }
 

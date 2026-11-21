@@ -8,6 +8,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.nio.file.attribute.FileTime;
 import java.util.Optional;
 
@@ -152,6 +153,43 @@ class SourceCheckoutTest {
                 .hasMessageContaining("timed out")
                 .hasMessageNotContaining("secret-host");
         assertThat(java.time.Duration.ofNanos(System.nanoTime() - t0)).isLessThan(java.time.Duration.ofSeconds(10));
+    }
+
+    /**
+     * A git that delegates to the real one, except that {@code ls-remote} hangs in a child process
+     * holding the output pipes (what a {@code git-remote-https} or {@code ssh} helper does on a
+     * black-holed remote); the child's pid goes to {@code pidFile}.
+     */
+    static Path hangingLsRemoteGit(Path dir, Path pidFile) throws IOException {
+        Path fake = dir.resolve("hanging-ls-remote-git");
+        Files.writeString(fake, "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then\n  sleep 300 &\n  echo $! > '"
+                + pidFile + "'\n  wait\nfi\nexec git \"$@\"\n");
+        assertThat(fake.toFile().setExecutable(true)).isTrue();
+        return fake;
+    }
+
+    /** Final review I4: ls-remote has its own short timeout, and the whole process tree is killed. */
+    @Test
+    void hangingLsRemoteTimesOutAndKillsItsProcessTree() throws Exception {
+        Path bare = bareRepoWithCommit(tmp.resolve("pusher"));
+        Path pidFile = tmp.resolve("child.pid");
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"), Duration.ofSeconds(60),
+                Duration.ofMillis(500), hangingLsRemoteGit(tmp, pidFile).toString());
+        ShardId shard = new ShardId("dead");
+        checkout.prepare(shard, ShardSource.git(bare.toString(), "main")); // clone and fetch: the real git
+
+        long t0 = System.nanoTime();
+        assertThatThrownBy(() -> checkout.changedSince(shard, null))
+                .isInstanceOf(IOException.class).hasMessageContaining("ls-remote timed out after 500 ms");
+        assertThat(Duration.ofNanos(System.nanoTime() - t0)).as("its own timeout, not the 60 s one")
+                .isLessThan(Duration.ofSeconds(15));
+        long child = Long.parseLong(Files.readString(pidFile).trim());
+        long until = System.currentTimeMillis() + 5_000;
+        while (ProcessHandle.of(child).map(ProcessHandle::isAlive).orElse(false) && System.currentTimeMillis() < until) {
+            Thread.sleep(20);
+        }
+        assertThat(ProcessHandle.of(child).map(ProcessHandle::isAlive).orElse(false))
+                .as("the helper holding the pipes is killed with git").isFalse();
     }
 
     @Test

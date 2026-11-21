@@ -460,7 +460,8 @@ public final class ClusterRuntime implements Closeable {
                     Duration.ofSeconds(w.getPollSeconds()), Duration.ofSeconds(w.getMinHoldSeconds()), true, true,
                     w.getMaxConsecutiveFailures()),
                     os.store(), os.layout(), os.objectStoreCatalog(), os.source(), os.writerState(), pim,
-                    luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir()),
+                    luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir(),
+                            Duration.ofSeconds(w.getLsRemoteTimeoutSeconds())),
                     java.time.Clock.systemUTC(), disk);
             os.workQueueGuard().ifPresent(g -> g.attach(loop));
             workLoop = loop;

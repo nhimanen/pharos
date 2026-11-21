@@ -123,6 +123,11 @@ class WorkLoopTest {
 
         /** @param probe the disk guard's probe; null runs without a guard */
         Writer(String node, DiskGuard.Probe probe) {
+            this(node, probe, SourceCheckout::new);
+        }
+
+        /** @param checkouts the checkout for the writer's work dir */
+        Writer(String node, DiskGuard.Probe probe, java.util.function.Function<Path, SourceCheckout> checkouts) {
             this.node = node;
             Path home = tmp.resolve("w" + (++writerSeq) + "-" + node);
             IndexConfig config = IndexConfig.defaults();
@@ -146,7 +151,7 @@ class WorkLoopTest {
                     DISK, probe);
             loop = new WorkLoop(new WorkLoop.Settings(node, TTL, HEARTBEAT, Duration.ofSeconds(60), MIN_HOLD, true, false),
                     store, layout, catalog, replicas, state, manager, lucene, registry,
-                    new SourceCheckout(home.resolve("work")), clock, disk);
+                    checkouts.apply(home.resolve("work")), clock, disk);
             guard.attach(loop);
             writers.add(this);
         }
@@ -846,6 +851,68 @@ class WorkLoopTest {
         assertThat(latest(s)).contains(new Generation(4));
     }
 
+    /**
+     * Final review I4: one shard's remote black-holes (its ls-remote hangs in a child process). Its
+     * checks time out after the short ls-remote timeout, run in parallel with the other shards', so
+     * the other shard's change is still seen and published at once; the failed checks count toward
+     * maxConsecutiveFailures, and the surplus shard is released to a writer that can reach it.
+     */
+    @Test
+    void unreachableRemoteStallsOnlyItsOwnShard() throws Exception {
+        Path pusher = tmp.resolve("pusher");
+        Path bare = tmp.resolve("dead.git");
+        Files.createDirectories(bare);
+        git(bare, "init", "--bare", "--initial-branch=main");
+        Files.createDirectories(pusher.resolve("src"));
+        Files.writeString(pusher.resolve("src/Svc.java"), "public class Svc {\n    public int a(int x) { return x; }\n}\n");
+        git(pusher, "init", "--initial-branch=main");
+        git(pusher, "add", ".");
+        git(pusher, "commit", "-m", "one");
+        git(pusher, "push", bare.toString(), "main");
+        ShardId dead = new ShardId("dead");
+        catalog.register(dead, Optional.of(ShardSource.git(bare.toString(), "main")));
+        ShardId live = pathShard("live");
+        Path fake = SourceCheckoutTest.hangingLsRemoteGit(Files.createDirectories(tmp.resolve("fake")),
+                tmp.resolve("fake/child.pid"));
+        Duration lsRemote = Duration.ofSeconds(2);
+        Writer a = new Writer("node-a", null, dir -> new SourceCheckout(dir, Duration.ofSeconds(60), lsRemote,
+                fake.toString()));
+
+        a.loop.tick();
+        assertThat(a.held()).containsExactlyInAnyOrder(dead, live);
+        assertThat(latest(live)).contains(Generation.FIRST);
+        assertThat(latest(dead)).as("its checks time out").isEmpty();
+
+        // the detector: live's change is announced while dead's check still hangs
+        change(live, "pushed");
+        clock.advance(10);
+        Thread detector = Thread.ofVirtual().start(a.loop::detectChanges);
+        long until = System.currentTimeMillis() + lsRemote.toMillis();
+        boolean seen = false;
+        while (!seen && System.currentTimeMillis() < until) {
+            seen = heartbeatOf("node-a").map(h -> h.path("backlog").path("live").path("pending").asBoolean())
+                    .orElse(false);
+            if (!seen) Thread.sleep(20);
+        }
+        assertThat(seen).as("live pending before dead's check timed out").isTrue();
+        assertThat(detector.isAlive()).as("dead's check was still running").isTrue();
+        detector.join();
+        long t0 = System.nanoTime();
+        rounds(1, 10, a);
+        assertThat(latest(live)).contains(new Generation(2));
+        assertThat(Duration.ofNanos(System.nanoTime() - t0)).as("one ls-remote timeout per tick, not one per shard")
+                .isLessThan(lsRemote.multipliedBy(3));
+
+        // a second writer: dead is a surplus shard of A, and its failed checks release it to B
+        Writer b = new Writer("node-b");
+        b.loop.tick();
+        clock.advance(MIN_HOLD.toSeconds() - 20);
+        rounds(3, 10, a, b);
+        assertThat(a.held()).containsExactly(live);
+        assertThat(b.held()).containsExactly(dead);
+        assertThat(latest(dead)).as("B reaches the remote").contains(Generation.FIRST);
+    }
+
     @Test
     void restoreStoreOutageRetriesInsteadOfAFullReembed() throws IOException {
         ShardId s = pathShard("solo");
@@ -1334,10 +1401,13 @@ class WorkLoopTest {
         Writer b = new Writer("node-b");
         // both of A's polls fail from now on: it can't confirm LATEST covers either source
         for (ShardId s : shards) store.failGetOn(layout.latestKey(s));
-        rounds(20, 10, a, b); // 200 s: far past minHold, A is over its share (2 > 1)
-        assertThat(a.held()).as("no idle release without a successful poll").hasSize(2);
-        assertThat(b.held()).isEmpty();
-        // polls succeed again: the surplus is released at an idle clean point
+        List<String> logs = logsOf(WorkLoop.class, () -> rounds(20, 10, a, b)); // 200 s: past minHold, 2 > 1
+        // never as an idle shard (M5); the failed checks release one as a failing shard (final review I4)
+        assertThat(logs).noneMatch(l -> l.startsWith("Releasing idle shard"));
+        assertThat(logs).anyMatch(l -> l.contains("failed runs or source checks in a row"));
+        assertThat(a.held()).hasSize(1);
+        assertThat(b.held()).hasSize(1);
+        // polls succeed again: nothing more moves
         store.clearFailures();
         rounds(2, 10, a, b);
         assertThat(a.held()).hasSize(1);
