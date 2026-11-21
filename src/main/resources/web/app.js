@@ -87,6 +87,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   initGraph();
   initControls();
   initContextMenu();
+  if (location.hash === '#cluster') {
+    // Deep link to the Cluster page: no module graph until the user asks for one.
+    showClusterView();
+    await loadPipelines();
+    await refreshProjects();
+    return;
+  }
   await loadPipelines();
   await refreshProjects();
   await loadModuleGraph();
@@ -268,6 +275,8 @@ function onCanvasContextMenu(ev) {
 // ── Controls ─────────────────────────────────────────────────
 function initControls() {
   document.getElementById('btn-modules').addEventListener('click', loadModuleGraph);
+  document.getElementById('btn-cluster').addEventListener('click', showClusterView);
+  document.getElementById('cluster-refresh').addEventListener('click', fetchClusterStatus);
 
   document.getElementById('btn-trace').addEventListener('click', () => {
     traceEnabled = !traceEnabled;
@@ -783,6 +792,7 @@ function eid(x) { return typeof x === 'string' ? x : (x?.id ?? String(x)); }
 
 // ── Rendering dispatcher ──────────────────────────────────────
 function renderGraph(nodes, edges, mode) {
+  hideClusterView();
   if (simulation) { simulation.stop(); simulation = null; }
   gSel.selectAll('*').remove();
   hullLayer.selectAll('*').remove();
@@ -2097,9 +2107,143 @@ function showTooltip(event, d) {
 }
 function hideTooltip() { document.getElementById('tooltip').style.display = 'none'; }
 
+// ── Cluster view ──────────────────────────────────────────────
+// The page is drawn by cluster.js (pure: status -> HTML) from GET /cluster/status, the public
+// view. /cluster/events (SSE) only says "something changed": every event refetches the status. When
+// the stream errors, is refused (406/503) or EventSource is missing, a 10 s poll takes over.
+const CLUSTER_POLL_MS = 10000;
+const CLUSTER_RECONNECT_MS = 60000;
+const CL = { open: false, es: null, poll: null, reconnect: null, debounce: null, status: null,
+             resize: null, observer: null, width: 0, inFlight: false };
+
+function showClusterView() {
+  setActiveBtn('btn-cluster');
+  if (CL.open) { fetchClusterStatus(); return; }
+  CL.open = true;
+  document.body.classList.add('cluster-mode');
+  document.getElementById('layout').style.display = 'none';
+  document.getElementById('cluster-view').style.display = '';
+  if (location.hash !== '#cluster') history.replaceState(null, '', '#cluster');
+  // Re-lay the diagram out when the page's width changes (window resize, scrollbar appearing).
+  if (typeof ResizeObserver !== 'undefined') {
+    CL.observer = CL.observer || new ResizeObserver(onClusterResize);
+    CL.observer.observe(document.getElementById('cluster-content'));
+  } else {
+    window.addEventListener('resize', onClusterResize);
+  }
+  fetchClusterStatus();
+  connectClusterEvents();
+}
+
+function hideClusterView() {
+  if (!CL.open) return;
+  CL.open = false;
+  document.body.classList.remove('cluster-mode');
+  document.getElementById('cluster-view').style.display = 'none';
+  document.getElementById('layout').style.display = '';
+  if (location.hash === '#cluster') history.replaceState(null, '', location.pathname + location.search);
+  if (CL.observer) CL.observer.disconnect();
+  window.removeEventListener('resize', onClusterResize);
+  // Give the node its SSE slot back (64 per node) and stop polling.
+  if (CL.es) { CL.es.close(); CL.es = null; }
+  clearInterval(CL.poll); CL.poll = null;
+  clearTimeout(CL.reconnect); CL.reconnect = null;
+  clearTimeout(CL.debounce); CL.debounce = null;
+}
+
+function setClusterLive(mode, title) {
+  const el = document.getElementById('cluster-live');
+  el.className = 'cl-live cl-live-' + mode;
+  el.textContent = mode === 'live' ? '● live' : mode === 'polling' ? '◌ polling every 10 s' : mode;
+  el.title = title || '';
+}
+
+function connectClusterEvents() {
+  if (!CL.open || CL.es) return;
+  if (typeof EventSource === 'undefined') {
+    startClusterPoll('this browser has no EventSource');
+    return;
+  }
+  const es = new EventSource('/cluster/events');
+  CL.es = es;
+  const onEvent = () => clusterRefetchSoon();
+  ['appeared', 'changed', 'cleared', 'layout'].forEach(t => es.addEventListener(t, onEvent));
+  es.onmessage = onEvent;
+  es.onopen = () => {
+    clearInterval(CL.poll); CL.poll = null;
+    setClusterLive('live', 'following /cluster/events');
+    clusterRefetchSoon(); // events may have been missed while disconnected
+  };
+  es.onerror = () => {
+    startClusterPoll('/cluster/events is unavailable; polling /cluster/status');
+    if (es.readyState === EventSource.CLOSED) {
+      // Refused (404/406/503): the browser does not retry by itself, so try again later.
+      es.close();
+      if (CL.es === es) CL.es = null;
+      clearTimeout(CL.reconnect);
+      CL.reconnect = setTimeout(connectClusterEvents, CLUSTER_RECONNECT_MS);
+    }
+  };
+}
+
+function startClusterPoll(why) {
+  setClusterLive('polling', why);
+  if (!CL.poll) CL.poll = setInterval(fetchClusterStatus, CLUSTER_POLL_MS);
+}
+
+function clusterRefetchSoon() {
+  clearTimeout(CL.debounce);
+  CL.debounce = setTimeout(fetchClusterStatus, 250); // one fetch for a burst of events
+}
+
+async function fetchClusterStatus() {
+  if (!CL.open || CL.inFlight) return;
+  CL.inFlight = true;
+  const box = document.getElementById('cluster-content');
+  try {
+    const res = await fetch('/cluster/status', { cache: 'no-store', headers: { Accept: 'application/json' } });
+    if (res.status === 404) {
+      CL.status = null;
+      box.innerHTML = '<div class="cl-empty">This node serves no cluster status (<code>/cluster/status</code> answered 404).</div>';
+      return;
+    }
+    if (!res.ok) throw new Error(`/cluster/status answered ${res.status}`);
+    CL.status = await res.json();
+    renderClusterView();
+  } catch (e) {
+    if (CL.status) {
+      renderClusterView();
+      box.insertAdjacentHTML('afterbegin', `<div class="cl-stale">Showing the last status: ${esc(e.message)}</div>`);
+    } else {
+      box.innerHTML = `<div class="cl-empty">Cluster status unavailable: ${esc(e.message)}</div>`;
+    }
+  } finally {
+    CL.inFlight = false;
+  }
+}
+
+function renderClusterView() {
+  if (!CL.open || !CL.status) return;
+  const box = document.getElementById('cluster-content');
+  const view = PharosCluster.toView(CL.status);
+  // Panel padding and border: the diagram is laid out for the panel's inner width.
+  const width = Math.max(280, box.clientWidth - 26);
+  CL.width = box.clientWidth;
+  const scroll = document.getElementById('cluster-view').scrollTop;
+  box.innerHTML = PharosCluster.renderPage(view, width);
+  document.getElementById('cluster-view').scrollTop = scroll;
+}
+
+function onClusterResize() {
+  if (document.getElementById('cluster-content').clientWidth === CL.width) return; // height-only change
+  clearTimeout(CL.resize);
+  CL.resize = setTimeout(renderClusterView, 120);
+}
+
 // ── Utilities ─────────────────────────────────────────────────
 function setStatus(txt)   { document.getElementById('status-bar').textContent = txt; }
 function setActiveBtn(id) {
+  if (id !== 'btn-cluster') hideClusterView();
   document.querySelectorAll('.btn-view').forEach(b => b.classList.remove('active'));
   if (id) { const el = document.getElementById(id); if (el) el.classList.add('active'); }
   // Restore toggle-buttons that track independent state
