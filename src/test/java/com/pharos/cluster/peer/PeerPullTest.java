@@ -269,12 +269,14 @@ class PeerPullTest {
         final List<String> peers = new java.util.concurrent.CopyOnWriteArrayList<>();
         final AtomicReference<String> synonyms = new AtomicReference<>();
         volatile int latestStatus = 200;
+        final java.util.concurrent.atomic.AtomicInteger requests = new java.util.concurrent.atomic.AtomicInteger();
         final Javalin app;
 
         FakeWriter(String node, String host, int port) {
             this.node = node;
             app = Javalin.create();
             app.before("/replication/*", ctx -> {
+                requests.incrementAndGet();
                 if (!TOKEN.equals(ctx.header(InternalApi.TOKEN_HEADER))) {
                     ctx.status(401).result("{\"error\":\"unauthorized\"}");
                     ctx.skipRemainingHandlers();
@@ -321,10 +323,15 @@ class PeerPullTest {
     }
 
     private PeerCatalog catalog(String discovery, PeerDiscovery.Resolver resolver) {
+        return catalog(discovery, resolver, null);
+    }
+
+    /** @param allowHosts {@code cluster.peers.allowHosts}; null: the seeds' hosts */
+    private PeerCatalog catalog(String discovery, PeerDiscovery.Resolver resolver, List<String> allowHosts) {
         PeerHttp http = new PeerHttp(TOKEN, null, Duration.ofMillis(500), Duration.ofSeconds(10));
         open.add(http);
-        return new PeerCatalog(new PeerDiscovery(PeerDiscovery.parse(discovery), "http", resolver, http), http,
-                Duration.ofSeconds(1), System::nanoTime);
+        return new PeerCatalog(new PeerDiscovery(PeerDiscovery.parse(discovery), "http", resolver, http, allowHosts),
+                http, Duration.ofSeconds(1), System::nanoTime);
     }
 
     private static List<String> nodes(List<PeerCatalog.WriterRef> writers) {
@@ -400,7 +407,7 @@ class PeerPullTest {
         s2.peers.add(s3.url() + "/");
         s3.peers.add(s1.url());
         s3.shards.put("only-on-3", 4L);
-        PeerCatalog seeds = catalog("seeds:" + s1.url(), PeerDiscovery.SYSTEM_RESOLVER);
+        PeerCatalog seeds = catalog("seeds:" + s1.url(), PeerDiscovery.SYSTEM_RESOLVER, List.of("localhost", "127.0.0.1"));
         seeds.refresh();
         assertThat(nodes(seeds.liveWriters())).containsExactly("seed-1", "seed-2", "seed-3");
         assertThat(seeds.shards()).containsExactly(new ShardId("only-on-3"));
@@ -437,10 +444,10 @@ class PeerPullTest {
                 .contains("shard s1 claimed by writer-a and writer-b").contains("syncing from writer-b");
         assertThat(cat.owner(new ShardId("only-a")).orElseThrow().node()).isEqualTo("writer-a");
 
-        a.shards.put("s1", 7L); // a tie: the current owner keeps it
+        a.shards.put("s1", 7L); // a tie: the lowest node id (P5-R9), the same on every refresh
         for (int i = 0; i < 3; i++) {
             cat.refresh();
-            assertThat(cat.owner(s1).orElseThrow().node()).isEqualTo("writer-b");
+            assertThat(cat.owner(s1).orElseThrow().node()).isEqualTo("writer-a");
         }
         a.shards.put("s1", 8L); // a newer generation on A: A wins
         cat.refresh();
@@ -738,6 +745,147 @@ class PeerPullTest {
                 .isInstanceOf(IOException.class).hasMessageContaining("stalled");
         assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(10));
         assertThat(tmp.resolve("stalled")).doesNotExist();
+    }
+
+    /**
+     * C1: the owner missing one or two refreshes keeps the shard while a lower claimer stays live:
+     * no owner change, no rollback of the served generation, no flip of the synonyms section.
+     */
+    @Test
+    void missedRefreshNeverRollsBackToALowerWriter() throws Exception {
+        String section = "# ── Auto-mined from '" + JAVA + "' ──\n";
+        Writer a = new Writer("writer-a").start();
+        Files.writeString(a.config.getSynonymsFile(), section + "alpha, apex # auto:" + JAVA + ":x\n");
+        a.index(JAVA, false);
+        a.addMethod("twice");
+        long high = a.addMethod("thrice");
+        Writer b = new Writer("writer-b").start();
+        Files.writeString(b.config.getSynonymsFile(), section + "beta, base # auto:" + JAVA + ":x\n");
+        long low = b.index(JAVA, false);
+        assertThat(high).isGreaterThan(low);
+        Reader r = reader("reader-1", "seeds:" + a.url() + "," + b.url(), c -> c.getPeers().setRefreshSeconds(3600));
+        r.runtime().startServing();
+        assertThat(r.runtime().served()).containsEntry(JAVA_SHARD, new Generation(high));
+        String synonyms = Files.readString(r.config().getSynonymsFile());
+        assertThat(synonyms).contains("alpha, apex").doesNotContain("beta, base");
+
+        a.stop();
+        for (int miss = 1; miss < PeerCatalog.DROP_AFTER; miss++) {
+            r.catalog().refresh();
+            r.runtime().syncNow();
+            assertThat(r.catalog().owner(JAVA_SHARD).orElseThrow().node()).as("owner after %d misses", miss)
+                    .isEqualTo("writer-a");
+            assertThat(r.runtime().served()).as("served after %d misses", miss)
+                    .containsEntry(JAVA_SHARD, new Generation(high));
+            assertThat(Files.readString(r.config().getSynonymsFile())).as("synonyms after %d misses", miss)
+                    .isEqualTo(synonyms);
+            assertThat(r.catalog().conflicts()).as("still reported").singleElement().asString()
+                    .contains("shard " + JAVA + " claimed by writer-a and writer-b", "syncing from writer-a");
+        }
+        a.start(); // back before it is dropped: nothing moved
+        r.catalog().refresh();
+        r.runtime().syncNow();
+        assertThat(r.catalog().owner(JAVA_SHARD).orElseThrow().node()).isEqualTo("writer-a");
+        assertThat(r.runtime().served()).containsEntry(JAVA_SHARD, new Generation(high));
+    }
+
+    /** P5-R9: what a reader serves depends on the claims only, not on which writers it saw before. */
+    @Test
+    void readersWithDifferentHistoriesConverge() throws Exception {
+        int portA;
+        try (ServerSocket sock = new ServerSocket(0)) {
+            portA = sock.getLocalPort();
+        }
+        FakeWriter b = new FakeWriter("writer-b");
+        FakeWriter c = new FakeWriter("writer-c");
+        b.shards.put("s1", 4L);
+        b.synonyms.set("# ── Auto-mined from 's1' ──\nb, rule # auto:s1:x\n");
+        c.shards.put("s2", 1L);
+        c.synonyms.set("# ── Auto-mined from 's2' ──\nc, rule # auto:s2:x\n");
+        String seeds = "seeds:http://localhost:" + portA + "," + b.url() + "," + c.url();
+        PeerHttp http = new PeerHttp(TOKEN, null, Duration.ofMillis(500), Duration.ofSeconds(10));
+        open.add(http);
+
+        // reader 1 starts early: it sees B and C, then C goes away for good
+        PeerCatalog cat1 = catalog(seeds, PeerDiscovery.SYSTEM_RESOLVER);
+        PeerReplicaSource src1 = new PeerReplicaSource(cat1, http, Duration.ofSeconds(2));
+        cat1.refresh();
+        assertThat(cat1.owner(new ShardId("s1")).orElseThrow().node()).isEqualTo("writer-b");
+        assertThat(new String(src1.synonyms().orElseThrow(), StandardCharsets.UTF_8)).contains("c, rule");
+        c.close();
+        for (int i = 0; i < PeerCatalog.DROP_AFTER; i++) cat1.refresh();
+        // A comes up claiming s1 at the same LATEST as B
+        FakeWriter a = new FakeWriter("writer-a", "localhost", portA);
+        a.shards.put("s1", 4L);
+        a.synonyms.set("# ── Auto-mined from 's1' ──\na, rule # auto:s1:x\n");
+        cat1.refresh();
+
+        // reader 2 starts now: it never saw C, and saw A and B together
+        PeerCatalog cat2 = catalog(seeds, PeerDiscovery.SYSTEM_RESOLVER);
+        PeerReplicaSource src2 = new PeerReplicaSource(cat2, http, Duration.ofSeconds(2));
+        cat2.refresh();
+
+        assertThat(cat1.owner(new ShardId("s1")).orElseThrow().node()).isEqualTo("writer-a");
+        assertThat(cat2.owner(new ShardId("s1")).orElseThrow().node()).isEqualTo("writer-a");
+        byte[] syn1 = src1.synonyms().orElseThrow();
+        byte[] syn2 = src2.synonyms().orElseThrow();
+        assertThat(new String(syn1, StandardCharsets.UTF_8)).isEqualTo(new String(syn2, StandardCharsets.UTF_8))
+                .contains("a, rule").doesNotContain("c, rule").doesNotContain("b, rule");
+    }
+
+    /** P5-R8: the token only goes to seeds and allow-listed (or, with TLS, https) gossiped writers. */
+    @Test
+    void gossipedUrlsAreFollowedOnlyWhenTrusted() throws Exception {
+        FakeWriter evil = new FakeWriter("evil", "127.0.0.1", 0); // host 127.0.0.1, not a seed host
+        evil.shards.put("stolen", 1L);
+        FakeWriter seed = new FakeWriter("seed");
+        seed.peers.add("http://127.0.0.1:" + evil.app.port());
+        PeerCatalog cat = catalog("seeds:" + seed.url(), PeerDiscovery.SYSTEM_RESOLVER);
+        for (int i = 0; i < 3; i++) cat.refresh();
+        assertThat(evil.requests.get()).as("a gossiped, non-allow-listed URL never receives a request").isZero();
+        assertThat(nodes(cat.liveWriters())).containsExactly("seed");
+
+        // allow-listed: the learned writer is followed
+        PeerCatalog allowed = catalog("seeds:" + seed.url(), PeerDiscovery.SYSTEM_RESOLVER, List.of("localhost", "127.0.0.1"));
+        allowed.refresh();
+        assertThat(nodes(allowed.liveWriters())).containsExactly("evil", "seed");
+        assertThat(allowed.shards()).contains(new ShardId("stolen"));
+
+        // with TLS only https gossip entries count, whatever the host
+        PeerHttp http = new PeerHttp(TOKEN, null, Duration.ofMillis(500), Duration.ofSeconds(10));
+        open.add(http);
+        PeerDiscovery tls = new PeerDiscovery(PeerDiscovery.parse("seeds:https://w1:7070"), "https",
+                PeerDiscovery.SYSTEM_RESOLVER, http, List.of("w2"));
+        assertThat(tls.accepted(URI.create("http://w2:7070"))).isFalse();
+        assertThat(tls.accepted(URI.create("https://anywhere:7070"))).isTrue();
+    }
+
+    /** I3: the direct DNS query honours the resolv.conf search list before falling back. */
+    @Test
+    void dnsQueryTriesTheSearchDomains() throws Exception {
+        String conf = "# generated\nnameserver 10.96.0.10\nsearch ns.svc.cluster.local svc.cluster.local cluster.local\n"
+                + "options ndots:5\n";
+        InetAddress w1 = InetAddress.getByName("10.1.0.7");
+        List<String> queried = new ArrayList<>();
+        Map<String, List<InetAddress>> dns = Map.of("pharos-writers.svc.cluster.local", List.of(w1));
+        List<String> fellBack = new ArrayList<>();
+        PeerDiscovery.DnsResolver resolver = new PeerDiscovery.DnsResolver(() -> conf, name -> {
+            queried.add(name);
+            return dns.getOrDefault(name, List.of());
+        }, host -> {
+            fellBack.add(host);
+            return List.of(InetAddress.getByName("127.0.0.1"));
+        });
+        assertThat(resolver.resolve("pharos-writers")).containsExactly(w1);
+        assertThat(queried).containsExactly("pharos-writers.ns.svc.cluster.local", "pharos-writers.svc.cluster.local");
+        assertThat(fellBack).isEmpty();
+
+        queried.clear();
+        assertThat(resolver.resolve("pharos-writers.example.")).hasSize(1); // qualified: no search, then fallback
+        assertThat(queried).containsExactly("pharos-writers.example");
+        assertThat(fellBack).containsExactly("pharos-writers.example.");
+        assertThat(PeerDiscovery.DnsResolver.searchDomains("domain corp.example\n")).containsExactly("corp.example");
+        assertThat(PeerDiscovery.DnsResolver.searchDomains("")).isEmpty();
     }
 
     @Test

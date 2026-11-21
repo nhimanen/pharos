@@ -44,9 +44,11 @@ import java.util.function.Supplier;
  * the list only when its owner is live and stops listing it with no one else claiming it.
  *
  * <p><b>Conflicts (Review Focus 0).</b> When several live writers list a shard, the one with the
- * higher {@code LATEST} owns it; on a tie the current owner keeps it (so the owner never alternates
- * between refreshes), else the lowest node id. Each conflict is reported as
- * {@code shard X claimed by A and B} (in {@code /health}).
+ * higher {@code LATEST} owns it, on a tie the lowest node id (P5-R9: a pure function of the claims).
+ * A writer that is missing but not yet dropped keeps its last-known claims and {@code LATEST} in
+ * this, and a shard never moves away from such an owner (C1): one missed refresh must not roll the
+ * reader back to a lower claimer. Each conflict is reported as {@code shard X claimed by A and B}
+ * (in {@code /health}), also while its owner is missing.
  *
  * <p>Before any writer ever answered, {@link #shards} lists the held shards, or throws when there
  * are none, so a reader whose writers are down at start serves what it has on disk.
@@ -300,10 +302,10 @@ public final class PeerCatalog implements ShardCatalog {
                 : errors.isEmpty() ? "no writer discovered" : String.join("; ", errors.entrySet().stream()
                         .map(e -> e.getKey() + ": " + e.getValue()).sorted().toList());
 
-        // claims of the live writers
+        // Claims of every tracked writer: a missing one (not yet dropped) keeps its last-known claim and
+        // LATEST, so one missed refresh never hands its shards to a lower claimer (C1).
         Map<ShardId, List<Tracked>> claims = new TreeMap<>(BY_ID);
         for (Tracked t : writers.values()) {
-            if (t.missed > 0) continue;
             for (ShardId s : t.shards.keySet()) claims.computeIfAbsent(s, k -> new ArrayList<>()).add(t);
         }
         List<String> newConflicts = new ArrayList<>();
@@ -311,15 +313,12 @@ public final class PeerCatalog implements ShardCatalog {
             ShardId shard = e.getKey();
             List<Tracked> by = e.getValue();
             String current = owner.get(shard);
-            Tracked win = null;
-            for (Tracked t : by) { // writers is a TreeMap: ties fall to the lowest node id
-                if (win == null) {
-                    win = t;
-                    continue;
-                }
-                long a = t.shards.get(shard);
-                long b = win.shards.get(shard);
-                if (a > b || (a == b && t.node.equals(current))) win = t;
+            Tracked currentOwner = current == null ? null : writers.get(current);
+            Tracked win;
+            if (currentOwner != null && currentOwner.missed > 0 && by.contains(currentOwner)) {
+                win = currentOwner; // never moves away from a missing, not yet dropped owner
+            } else {
+                win = winner(shard, by);
             }
             if (!win.node.equals(current)) {
                 if (current != null) log.info("Shard {}: now synced from writer {} (was {})", shard, win.node, current);
@@ -348,6 +347,21 @@ public final class PeerCatalog implements ShardCatalog {
             } // else: the owner is missing; it keeps the shard until it is dropped
         }
         conflicts = List.copyOf(newConflicts);
+    }
+
+    /**
+     * The claimer with the highest {@code LATEST}; on a tie the lowest node id (P5-R9): a pure
+     * function of the claims, so readers with different histories agree and it never alternates.
+     */
+    static Tracked winner(ShardId shard, List<Tracked> by) {
+        Tracked win = null;
+        for (Tracked t : by) {
+            if (win == null || t.shards.get(shard) > win.shards.get(shard)
+                    || (t.shards.get(shard).equals(win.shards.get(shard)) && t.node.compareTo(win.node) < 0)) {
+                win = t;
+            }
+        }
+        return win;
     }
 
     /** Of two URLs answering for one node: the one it is tracked at, else the lower URL. */

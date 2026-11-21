@@ -499,6 +499,13 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:w\"},"
                 + "\"tls\":{\"keystore\":\"/k.p12\",\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
                 .hasMessageContaining("cluster.tls is not supported").hasMessageContaining("cluster.tls.keystore");
+        // P5-R8: with a truststore every seed must be https
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":"
+                + "\"seeds:https://w1,http://w2\"}," + trust + "}}"))
+                .hasMessageContaining("every seed must be https://");
+        ClusterConfig httpsSeeds = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":"
+                + "\"seeds:https://w1\",\"allowHosts\":[\"w2\"]}," + trust + "}}");
+        assertThat(httpsSeeds.getPeers().getAllowHosts()).containsExactly("w2");
         // object-store readers and coordinators are unchanged: no truststore there yet
         assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
                 + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:1\",\"token\":\"t\"," + trust + "}}"))

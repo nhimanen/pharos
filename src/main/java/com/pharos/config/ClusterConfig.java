@@ -183,6 +183,14 @@ public class ClusterConfig {
             throw new IllegalStateException("cluster.peers.discovery is required on a peer-pull reader"
                     + " (dns:<name>[:port] or seeds:<url>,<url>)");
         }
+        if (tls != null && tls.getTruststore() != null && peers.getDiscovery() != null
+                && com.pharos.cluster.peer.PeerDiscovery.parse(peers.getDiscovery())
+                        instanceof com.pharos.cluster.peer.PeerDiscovery.Seeds seeds
+                && seeds.urls().stream().anyMatch(u -> !"https".equals(u.getScheme()))) {
+            // P5-R8: the cluster token must not travel in clear text to a seed when TLS is configured
+            throw new IllegalStateException("cluster.peers.discovery: every seed must be https:// when"
+                    + " cluster.tls.truststore is set");
+        }
         if (tls != null) {
             tls.validate();
             // Ruling P5-R7: only a peer-pull writer's /replication/* listens with TLS for now; elsewhere the
@@ -586,6 +594,12 @@ public class ClusterConfig {
         private int longPollSeconds = 30;
         private int maxLongPolls = 256;
         private Path storeDir = IndexConfig.DEFAULT_BASE.resolve("peer-store");
+        /**
+         * Seeds mode without TLS: the hosts a gossiped writer URL may name (every polled writer gets the
+         * cluster token); null means the seeds' hosts (P5-R8).
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private java.util.List<String> allowHosts;
 
         /** The longest {@code wait} a writer accepts on {@code latest}. */
         public static final int MAX_LONG_POLL_SECONDS = 300;
@@ -627,6 +641,8 @@ public class ClusterConfig {
         public void setLongPollSeconds(int v) { this.longPollSeconds = v; }
         public int getMaxLongPolls() { return maxLongPolls; }
         public void setMaxLongPolls(int v) { this.maxLongPolls = v; }
+        public java.util.List<String> getAllowHosts() { return allowHosts; }
+        public void setAllowHosts(java.util.List<String> v) { this.allowHosts = v; }
         public Path getStoreDir() { return storeDir; }
         public void setStoreDir(Path v) { this.storeDir = v; }
     }

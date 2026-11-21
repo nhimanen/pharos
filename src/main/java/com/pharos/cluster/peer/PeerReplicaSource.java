@@ -170,8 +170,8 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     /**
      * The cluster-wide synonyms (P5-R4): every live writer's {@code /replication/synonyms}
      * (conditional on its last {@code ETag}), merged canonically with the shards' owners winning
-     * conflicting sections ({@link SynonymsMerge#mergeWriters}). A writer that is away keeps its last
-     * file in the merge. Empty when no writer has any.
+     * conflicting sections ({@link SynonymsMerge#mergeWriters}). A writer that is missing (not yet
+     * dropped) keeps its last file in the merge; a dropped one's is forgotten (P5-R9). Empty when no writer has any.
      */
     @Override
     public Optional<byte[]> synonyms() throws IOException {
@@ -194,6 +194,10 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
                 log.debug("Synonyms of writer {} failed; keeping its last copy: {}", w, e.toString());
             }
         }
+        // the merge input is exactly the tracked writer set (P5-R9): a dropped writer's file goes with it
+        Set<String> tracked = new java.util.HashSet<>();
+        catalog.writers().forEach(w -> tracked.add(w.node()));
+        synonymsByWriter.keySet().retainAll(tracked);
         Map<String, String> texts = new TreeMap<>();
         synonymsByWriter.forEach((node, c) -> texts.put(node, c.text()));
         List<String> conflicts = new ArrayList<>();

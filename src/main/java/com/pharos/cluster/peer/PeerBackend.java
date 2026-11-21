@@ -71,7 +71,7 @@ public final class PeerBackend implements ReplicationBackend {
             this.publisher = NoOpPublisher.INSTANCE;
             this.http = PeerHttp.of(cfg);
             PeerDiscovery discovery = new PeerDiscovery(PeerDiscovery.parse(cfg.getPeers().getDiscovery()),
-                    http.tls() ? "https" : "http", resolver, http);
+                    http.tls() ? "https" : "http", resolver, http, cfg.getPeers().getAllowHosts());
             this.peerCatalog = new PeerCatalog(discovery, http, Duration.ofSeconds(cfg.getPeers().getRefreshSeconds()),
                     System::nanoTime);
             this.peerSource = new PeerReplicaSource(peerCatalog, http,
