@@ -397,4 +397,31 @@ class DrainTest {
             reader.lucene().close();
         }
     }
+
+    /** Final review minor 5: GET /cluster/readers (the internal topology) needs the cluster token. */
+    @Test
+    void clusterReadersNeedsTheClusterToken() throws Exception {
+        WebServer server = new WebServer(null, null, null, null, null, com.pharos.cluster.NodeRole.READER);
+        server.setLiveReaders(() -> List.of(new com.pharos.cluster.membership.ReaderRegistry.LiveReader(
+                new ReaderHeartbeat("r1", "http://10.0.0.1:7171", List.of("p"), false, null, 0, 0, 1L), 1)));
+        server.setInternalApi(new com.pharos.cluster.internal.InternalApi("test-token"));
+        io.javalin.Javalin app = server.start(0);
+        try {
+            HttpResponse<String> anonymous = get(app, "/cluster/readers");
+            assertThat(anonymous.statusCode()).isEqualTo(401);
+            assertThat(anonymous.body()).doesNotContain("10.0.0.1");
+            HttpResponse<String> wrong = HTTP.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + app.port()
+                    + "/cluster/readers")).header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER, "nope").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(wrong.statusCode()).isEqualTo(401);
+            HttpResponse<String> member = HTTP.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + app.port()
+                    + "/cluster/readers")).header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER, "test-token").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(member.statusCode()).isEqualTo(200);
+            assertThat(member.body()).contains("\"advertiseUrl\":\"http://10.0.0.1:7171\"");
+            assertThat(server.inFlightRequests()).isZero();
+        } finally {
+            app.stop();
+        }
+    }
 }

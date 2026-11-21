@@ -39,6 +39,8 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `X-Pharos-Warnings`.
 - Reader heartbeats carry `state` (`warming|ready|degraded|draining`) and `degradedShards`;
   coordinators skip a reader only for its degraded shards.
+  `GET /cluster/readers` on a reader lists the live readers; it needs the cluster token
+  (`X-Pharos-Cluster-Token`, 401 without it), as it names every reader's `advertiseUrl`.
 - Draining: on SIGTERM a serving reader announces `draining` (heartbeat and `/health` 503), keeps
   serving for a quiet period (at least 4 s and one heartbeat plus 2 s, and until nothing has been in flight
   for 1 s) and stops after at most `cluster.drainSeconds` (default 20). Give the process manager

@@ -234,8 +234,9 @@ def fetch(base, q, pipeline, project=None, limit=LIMIT, timeout=120):
     return dt, status, results, warnings
 
 
-def get_json(url, timeout=10):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+def get_json(url, timeout=10, headers=None):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
@@ -345,7 +346,8 @@ def wait_cluster(base, nodes, timeout=120):
     last = None
     while time.time() < end:
         try:
-            data = get_json(base + "/cluster/readers")
+            data = get_json(base + "/cluster/readers",  # members only: the cluster token
+                            headers={"X-Pharos-Cluster-Token": os.environ["GATE_TOKEN"]})
             rs = data.get("readers", data) if isinstance(data, dict) else data
             states = {r.get("node"): r.get("state") for r in rs}
             last = states

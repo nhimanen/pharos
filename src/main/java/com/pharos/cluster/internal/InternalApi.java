@@ -62,8 +62,11 @@ public final class InternalApi {
         }
     }
 
-    /** Hashing first makes the comparison length-independent as well as constant-time. */
-    private boolean authorized(Context ctx) {
+    /**
+     * True when the request carries the cluster token ({@link #TOKEN_HEADER}). Hashing first makes
+     * the comparison length-independent as well as constant-time. Also guards {@code /cluster/readers}.
+     */
+    public boolean authorized(Context ctx) {
         String presented = ctx.header(TOKEN_HEADER);
         if (presented == null) return false;
         return MessageDigest.isEqual(tokenDigest, sha256(presented));

@@ -166,7 +166,10 @@ public class WebServer {
         this.internalApi = java.util.Objects.requireNonNull(api, "api");
     }
 
-    /** Source of {@code GET /cluster/readers}; without one the endpoint answers 404. */
+    /**
+     * Source of {@code GET /cluster/readers}; without one the endpoint answers 404. It requires the
+     * cluster token ({@code X-Pharos-Cluster-Token}, checked by the internal API): 401 otherwise.
+     */
     public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> s) {
         this.liveReaders = java.util.Objects.requireNonNull(s, "s");
     }
@@ -823,9 +826,17 @@ public class WebServer {
             ctx.status(h.status()).json(h.body());
         });
 
+        // The internal topology (every reader's advertiseUrl): cluster members only, with the
+        // cluster token as on /internal/*. Nothing in pharos reads it (coordinators and the router
+        // list readers from the bucket); it is for operators and the gate scripts.
         app.get("/cluster/readers", ctx -> {
             if (liveReaders == null) {
                 ctx.status(404).result("not a cluster reader");
+                return;
+            }
+            com.pharos.cluster.internal.InternalApi api = internalApi;
+            if (api == null || !api.authorized(ctx)) {
+                ctx.status(401).json(Map.of("error", "unauthorized: send " + com.pharos.cluster.internal.InternalApi.TOKEN_HEADER));
                 return;
             }
             ctx.json(readersPayload());
