@@ -35,6 +35,11 @@ public class ClusterConfig {
     private WriterConfig writer = new WriterConfig();
     /** {@code /cluster/status}: proposal targets and windows, the events keep-alive and the webhook. */
     private StatusConfig status = new StatusConfig();
+    /** {@code cluster.peers}: the peer-pull backend (discovery, transfer cap, long-poll). */
+    private PeersConfig peers = new PeersConfig();
+    /** {@code cluster.tls}: absent means plain HTTP. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private TlsConfig tls;
     /** Base URL other nodes reach this reader at; required on readers. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String advertiseUrl;
@@ -91,8 +96,9 @@ public class ClusterConfig {
 
     /** @throws IllegalStateException when the combination of settings is unusable */
     public void validate() {
-        if (role != NodeRole.ALL && backend != BackendKind.OBJECT_STORE) {
-            throw new IllegalStateException("cluster.role '" + role.json() + "' requires cluster.backend 'object-store'");
+        if (role != NodeRole.ALL && backend == BackendKind.LOCAL) {
+            throw new IllegalStateException("cluster.role '" + role.json()
+                    + "' requires cluster.backend 'object-store' or 'peer-pull'");
         }
         if (role == NodeRole.ALL && backend != BackendKind.LOCAL) {
             throw new IllegalStateException("cluster.role 'all' requires cluster.backend 'local'");
@@ -159,6 +165,21 @@ public class ClusterConfig {
             throw new IllegalStateException("cluster.readerTtlSeconds must exceed cluster.heartbeatSeconds ("
                     + heartbeatSeconds + "), got " + readerTtlSeconds);
         }
+        setWriter(writer); // a default section when absent; syncs the peer-mode work-queue override
+        if (backend == BackendKind.PEER_PULL) {
+            // P5-R6: no leases, no takeover in peer mode; writers own their registry's shards statically
+            if (Boolean.TRUE.equals(writer.getWorkQueue())) {
+                throw new IllegalStateException("cluster.writer.workQueue cannot be true with cluster.backend 'peer-pull'"
+                        + " (peer mode has no leases or takeover; remove the setting)");
+            }
+            if (token == null || token.isBlank()) {
+                throw new IllegalStateException("cluster.token is required with cluster.backend 'peer-pull'"
+                        + " (every /replication/* route requires it)");
+            }
+        }
+        if (peers == null) peers = new PeersConfig();
+        peers.validate();
+        if (tls != null) tls.validate();
         if (role == NodeRole.WRITER && writer.isWorkQueue() && heartbeatSeconds >= writer.getLeaseTtlSeconds()) {
             // a writer's heartbeat is its liveness (TTL = the lease TTL) and the bucket's clock for its leases
             throw new IllegalStateException("cluster.heartbeatSeconds (" + heartbeatSeconds
@@ -217,7 +238,10 @@ public class ClusterConfig {
     public NodeRole getRole() { return role; }
     public void setRole(NodeRole role) { this.role = role; }
     public BackendKind getBackend() { return backend; }
-    public void setBackend(BackendKind backend) { this.backend = backend; }
+    public void setBackend(BackendKind backend) {
+        this.backend = backend;
+        if (writer != null) writer.peerMode = backend == BackendKind.PEER_PULL;
+    }
     public String getNodeId() { return nodeId; }
     public void setNodeId(String nodeId) { this.nodeId = nodeId; }
     public int getRetireGraceSeconds() { return retireGraceSeconds; }
@@ -234,7 +258,16 @@ public class ClusterConfig {
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
     public WriterConfig getWriter() { return writer; }
-    public void setWriter(WriterConfig writer) { this.writer = writer == null ? new WriterConfig() : writer; }
+    public void setWriter(WriterConfig writer) {
+        this.writer = writer == null ? new WriterConfig() : writer;
+        this.writer.peerMode = backend == BackendKind.PEER_PULL;
+    }
+    public PeersConfig getPeers() { return peers; }
+    public void setPeers(PeersConfig p) { this.peers = p == null ? new PeersConfig() : p; }
+    public TlsConfig getTls() { return tls; }
+    public void setTls(TlsConfig t) { this.tls = t; }
+    /** True when {@code cluster.tls.keystore} is set: the web server listens with TLS only. */
+    public boolean tlsServer() { return tls != null && tls.getKeystore() != null; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
     public StatusConfig getStatus() { return status; }
     public void setStatus(StatusConfig status) { this.status = status == null ? new StatusConfig() : status; }
@@ -374,7 +407,13 @@ public class ClusterConfig {
          * since the Phase 4 gate. {@code false} keeps the hand-run writer (index and publish by
          * hand under an implicit lease). Ignored on every other role.
          */
-        private boolean workQueue = true;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Boolean workQueue;
+        /**
+         * Set by {@link ClusterConfig} on {@code cluster.backend: peer-pull}: work-queue mode is forced
+         * off there (P5-R6). Not configuration: never serialised.
+         */
+        transient boolean peerMode;
         /**
          * Lease TTL in work-queue mode. A lease whose last write (by the bucket's LastModified) is
          * older than this may be taken over; the holder renews every TTL/3.
@@ -431,8 +470,17 @@ public class ClusterConfig {
         public void setWorkDir(Path workDir) { this.workDir = workDir; }
         public int getPollSeconds() { return pollSeconds; }
         public void setPollSeconds(int v) { this.pollSeconds = v; }
-        public boolean isWorkQueue() { return workQueue; }
-        public void setWorkQueue(boolean v) { this.workQueue = v; }
+        /**
+         * The effective work-queue mode: the configured value (default true), and always false with
+         * {@code cluster.backend: peer-pull}.
+         */
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        public boolean isWorkQueue() { return !peerMode && (workQueue == null || workQueue); }
+        /** The configured value; null when unset (the default applies). */
+        @com.fasterxml.jackson.annotation.JsonProperty("workQueue")
+        public Boolean getWorkQueue() { return workQueue; }
+        @com.fasterxml.jackson.annotation.JsonProperty("workQueue")
+        public void setWorkQueue(Boolean v) { this.workQueue = v; }
         public int getLeaseTtlSeconds() { return leaseTtlSeconds; }
         public void setLeaseTtlSeconds(int v) { this.leaseTtlSeconds = v; }
         public int getMinHoldSeconds() { return minHoldSeconds; }
@@ -490,6 +538,115 @@ public class ClusterConfig {
         public void setCheckSeconds(int v) { this.checkSeconds = v; }
         public long getHysteresisBytes() { return hysteresisBytes; }
         public void setHysteresisBytes(long v) { this.hysteresisBytes = v; }
+    }
+
+    /**
+     * {@code cluster.peers}: the peer-pull backend.
+     * <ul>
+     *   <li>{@code discovery}: {@code dns:<name>[:port]} or {@code seeds:<url>,<url>} (readers);</li>
+     *   <li>{@code refreshSeconds} (15): how often readers re-resolve discovery and re-read catalogs;</li>
+     *   <li>{@code maxTransfersPerWriter} (8): concurrent {@code /replication/<shard>/files} transfers a
+     *       writer serves; more get 503 with {@code Retry-After};</li>
+     *   <li>{@code longPollSeconds} (30): how long a reader's {@code latest} long-poll waits;</li>
+     *   <li>{@code maxLongPolls} (256): concurrent long-polls a writer holds; more get 503;</li>
+     *   <li>{@code storeDir}: where a writer keeps its published generations ({@code LATEST},
+     *       manifests and content-named files) for readers to pull; on the same file system as the
+     *       index directory, Lucene files are hard-linked rather than copied.</li>
+     * </ul>
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class PeersConfig {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private String discovery;
+        private int refreshSeconds = 15;
+        private int maxTransfersPerWriter = 8;
+        private int longPollSeconds = 30;
+        private int maxLongPolls = 256;
+        private Path storeDir = IndexConfig.DEFAULT_BASE.resolve("peer-store");
+
+        /** The longest {@code wait} a writer accepts on {@code latest}. */
+        public static final int MAX_LONG_POLL_SECONDS = 300;
+
+        void validate() {
+            if (refreshSeconds < 1) {
+                throw new IllegalStateException("cluster.peers.refreshSeconds must be at least 1, got " + refreshSeconds);
+            }
+            if (maxTransfersPerWriter < 1) {
+                throw new IllegalStateException("cluster.peers.maxTransfersPerWriter must be at least 1, got "
+                        + maxTransfersPerWriter);
+            }
+            if (longPollSeconds < 1 || longPollSeconds > MAX_LONG_POLL_SECONDS) {
+                throw new IllegalStateException("cluster.peers.longPollSeconds must be between 1 and "
+                        + MAX_LONG_POLL_SECONDS + ", got " + longPollSeconds);
+            }
+            if (maxLongPolls < 1) {
+                throw new IllegalStateException("cluster.peers.maxLongPolls must be at least 1, got " + maxLongPolls);
+            }
+            if (storeDir == null) {
+                throw new IllegalStateException("cluster.peers.storeDir must not be empty");
+            }
+        }
+
+        public String getDiscovery() { return discovery; }
+        public void setDiscovery(String v) { this.discovery = v; }
+        public int getRefreshSeconds() { return refreshSeconds; }
+        public void setRefreshSeconds(int v) { this.refreshSeconds = v; }
+        public int getMaxTransfersPerWriter() { return maxTransfersPerWriter; }
+        public void setMaxTransfersPerWriter(int v) { this.maxTransfersPerWriter = v; }
+        public int getLongPollSeconds() { return longPollSeconds; }
+        public void setLongPollSeconds(int v) { this.longPollSeconds = v; }
+        public int getMaxLongPolls() { return maxLongPolls; }
+        public void setMaxLongPolls(int v) { this.maxLongPolls = v; }
+        public Path getStoreDir() { return storeDir; }
+        public void setStoreDir(Path v) { this.storeDir = v; }
+    }
+
+    /**
+     * {@code cluster.tls}: {@code keystore} (PKCS12 or JKS, by {@code keystoreType}, default PKCS12)
+     * makes the web server listen with TLS only; {@code truststore} is what this node's clients trust
+     * (other nodes' certificates). Both are opened with the password in the environment variable
+     * named by {@code passwordEnv}: the password itself never goes into config.json.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class TlsConfig {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Path keystore;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Path truststore;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private String passwordEnv;
+        private String keystoreType = "PKCS12";
+
+        void validate() {
+            if ((keystore != null || truststore != null) && (passwordEnv == null || passwordEnv.isBlank())) {
+                throw new IllegalStateException("cluster.tls.passwordEnv is required with cluster.tls.keystore or"
+                        + " cluster.tls.truststore (the name of the environment variable holding the password)");
+            }
+            if (keystoreType == null || keystoreType.isBlank()) keystoreType = "PKCS12";
+        }
+
+        /**
+         * The keystore password from the environment variable {@code passwordEnv}.
+         *
+         * @throws IllegalStateException when the variable is unset (never names the value)
+         */
+        public char[] password() {
+            String v = passwordEnv == null ? null : System.getenv(passwordEnv);
+            if (v == null) {
+                throw new IllegalStateException("cluster.tls.passwordEnv names environment variable '" + passwordEnv
+                        + "', which is not set");
+            }
+            return v.toCharArray();
+        }
+
+        public Path getKeystore() { return keystore; }
+        public void setKeystore(Path v) { this.keystore = v; }
+        public Path getTruststore() { return truststore; }
+        public void setTruststore(Path v) { this.truststore = v; }
+        public String getPasswordEnv() { return passwordEnv; }
+        public void setPasswordEnv(String v) { this.passwordEnv = v; }
+        public String getKeystoreType() { return keystoreType; }
+        public void setKeystoreType(String v) { this.keystoreType = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
