@@ -75,8 +75,12 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   Vector first passes and unified recall pools are merged in two rounds (global top candidates,
   then rescored on their shards), so fan-out rankings equal a single node's. New config:
   `cluster.queryTimeoutMillis` (default 20000: one budget for all rounds of a query) and
-  `cluster.maxCatalogAgeSeconds` (600: past it, or before the catalog was first read, unscoped
-  queries answer from the reader's own shards with a warning naming the shards not searched). A
+  `cluster.maxCatalogAgeSeconds` (600: past it while catalog reads are failing, or before the
+  catalog was first read, unscoped queries answer from the reader's own shards with a warning naming
+  the shards not searched; the catalog is re-read every 5 s on a timer, so an idle reader is not
+  "stale"). After a `synonyms.txt` change, shard calls to readers that have not polled it yet are
+  refused (409) for up to one `pollIntervalSeconds`, and those shards are left out with a warning:
+  transient, it heals by itself. A
   shard without vectors of the coordinator's model is named in a warning and left out of the vector
   part (see Changed).
 
