@@ -93,10 +93,16 @@ public final class SourceCheckout {
         return Optional.of(git(cloneDir(shard), "rev-parse", "HEAD").trim());
     }
 
+    /** Whether {@link #prepare} checked out this shard (its source is known here). */
+    public boolean isPrepared(ShardId shard) {
+        return prepared.containsKey(shard);
+    }
+
     /**
      * The shard's source revision when it differs from {@code lastRevision} (null means never indexed),
-     * else empty. Git: {@code git ls-remote} of the ref, no fetch. Path: a digest of the tree's file
-     * names, sizes and modification times. Requires an earlier {@link #prepare} of the shard.
+     * else empty. Git: {@code git ls-remote} of the source url, no fetch, the clone untouched. Path: a
+     * digest of the tree's file names, sizes and modification times. Read-only, so it is safe while a
+     * run indexes the checkout. Requires an earlier {@link #prepare} of the shard.
      */
     public Optional<String> changedSince(ShardId shard, String lastRevision) throws IOException {
         ShardSource src = prepared.get(shard);
@@ -139,7 +145,9 @@ public final class SourceCheckout {
     private String remoteRevision(ShardId shard, ShardSource src) throws IOException {
         if (SHA.matcher(src.ref()).matches()) return src.ref().toLowerCase(java.util.Locale.ROOT);
         String ref = src.ref();
-        String out = git(cloneDir(shard), "ls-remote", "origin", ref, ref + "^{}");
+        // the url, not the clone's origin: read-only, and independent of a checkout a run is indexing
+        Files.createDirectories(workDir);
+        String out = git(workDir, "ls-remote", "--", src.location(), ref, ref + "^{}");
         String head = null, tag = null, peeledTag = null;
         for (String line : out.split("\n")) {
             String[] f = line.trim().split("\\s+");

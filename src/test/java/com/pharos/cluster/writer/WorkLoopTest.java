@@ -301,6 +301,88 @@ class WorkLoopTest {
         assertThat(a.embedder.calls.get()).as("the embedded shard still embeds").isGreaterThan(afterFirst);
     }
 
+    /** Runs {@code body} once, the first time shard {@code shard}'s run embeds (the run is parked there). */
+    private static java.util.function.Consumer<Integer> duringRunOf(Writer w, ShardId shard, IoRunnable body) {
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        return n -> {
+            if (!w.loop.running().equals(Optional.of(shard)) || !done.compareAndSet(false, true)) return;
+            try {
+                body.run();
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+    }
+
+    interface IoRunnable { void run() throws IOException; }
+
+    @Test
+    void changeOnIdleShardPendingWhileAnotherShardRuns() throws IOException {
+        ShardId busy = pathShard("busy");
+        ShardId idle = pathShard("idle");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        assertThat(latest(idle)).contains(Generation.FIRST);
+        AtomicReference<JsonNode> seen = new AtomicReference<>();
+        a.embedder.onBatch = duringRunOf(a, busy, () -> {
+            change(idle, "pushed");     // while busy's run is in progress
+            clock.advance(10);          // one poll later the detector fires (its own thread in production)
+            a.loop.detectChanges();
+            seen.set(heartbeatOf("node-a").orElseThrow());
+        });
+        change(busy, "two");
+        rounds(1, 10, a);
+        assertThat(seen.get()).as("busy's run reached the embed pass").isNotNull();
+        JsonNode backlog = seen.get().path("backlog").path("idle");
+        assertThat(backlog.path("pending").asBoolean()).as("idle shard pending during the other run").isTrue();
+        assertThat(seen.get().path("indexing").path("shard").asText()).isEqualTo("busy");
+        assertThat(backlog.path("sourceRevision").asText()).isNotEqualTo(backlog.path("publishedRevision").asText());
+        a.embedder.onBatch = n -> {};
+        rounds(1, 10, a);
+        assertThat(latest(idle)).contains(new Generation(2));
+    }
+
+    @Test
+    void pendingHeartbeatWrittenImmediately() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        assertThat(heartbeatOf("node-a").orElseThrow().path("backlog").path("solo").path("pending").asBoolean()).isFalse();
+        change(s, "pushed");
+        clock.advance(10);
+        a.loop.detectChanges(); // no tick, no heartbeat timer: the detector writes the heartbeat itself
+        JsonNode b = heartbeatOf("node-a").orElseThrow().path("backlog").path("solo");
+        assertThat(b.path("pending").asBoolean()).isTrue();
+        assertThat(b.path("sourceRevision").asText()).isNotEqualTo(b.path("publishedRevision").asText());
+        // nothing new: no further write
+        String etag = store.get(layout.writerKey("node-a")).orElseThrow().etag();
+        a.loop.detectChanges();
+        assertThat(store.get(layout.writerKey("node-a")).orElseThrow().etag()).isEqualTo(etag);
+    }
+
+    @Test
+    void changeDuringItsOwnRunStaysPendingAfterThePublish() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        a.embedder.onBatch = duringRunOf(a, s, () -> {
+            change(s, "later");         // pushed after the run checked out its revision
+            a.loop.detectChanges();
+        });
+        change(s, "first");
+        rounds(1, 10, a);
+        assertThat(latest(s)).contains(new Generation(2));
+        JsonNode b = heartbeatOf("node-a").orElseThrow().path("backlog").path("solo");
+        assertThat(b.path("pending").asBoolean()).as("the run did not include the later change").isTrue();
+        String head = b.path("sourceRevision").asText();
+        a.embedder.onBatch = n -> {};
+        rounds(1, 10, a);
+        assertThat(latest(s)).contains(new Generation(3));
+        assertThat(replicas.manifest(s, new Generation(3)).projectMeta().getSourceRevision()).isEqualTo(head);
+        assertThat(heartbeatOf("node-a").orElseThrow().path("backlog").path("solo").path("pending").asBoolean())
+                .isFalse();
+    }
+
     @Test
     void heartbeatReportsPendingBacklogAndIndexingPhase() throws IOException {
         ShardId s = pathShard("solo");

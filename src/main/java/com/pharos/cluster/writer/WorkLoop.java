@@ -227,6 +227,14 @@ public final class WorkLoop implements Closeable {
     private long admittedFree = -1;
     private final Object diskMu = new Object();
     private ScheduledExecutorService diskWatch;
+    /** Change detection at a fixed rate, on its own thread: it runs while the loop thread indexes. */
+    private ScheduledExecutorService detector;
+    /**
+     * Guards a shard's poll state ({@code sourceRevision}, {@code publishedRevision},
+     * {@code publishedGeneration}, {@code pendingSince}, {@code lastPollOk}) across the loop thread
+     * and the change detector. Held only around one shard's read-only source check.
+     */
+    private final Object pollMu = new Object();
     private volatile boolean stopping;
     private final ReentrantLock tickLock = new ReentrantLock();
     private final Object stopMu = new Object();
@@ -289,6 +297,14 @@ public final class WorkLoop implements Closeable {
                 long every = Math.max(1, disk.settings().check().toMillis());
                 diskWatch.scheduleWithFixedDelay(this::checkDiskQuietly, every, every, TimeUnit.MILLISECONDS);
             }
+            // fixed rate, not delay: a change is seen within one pollSeconds of its push, whatever a run takes
+            detector = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "pharos-writer-change-detector");
+                t.setDaemon(true);
+                return t;
+            });
+            long poll = Math.max(1, settings.poll().toMillis());
+            detector.scheduleAtFixedRate(this::detectChangesQuietly, poll, poll, TimeUnit.MILLISECONDS);
         }
         log.info("Writer {} runs the work queue (lease TTL {} s, poll every {} s, min hold {} s)", settings.node(),
                 settings.leaseTtl().toSeconds(), settings.poll().toSeconds(), settings.minHold().toSeconds());
@@ -471,7 +487,6 @@ public final class WorkLoop implements Closeable {
 
     /** Polls every held shard's source; returns the pending ones, oldest unpublished change first. */
     private List<ShardId> poll() {
-        Instant now = clock.instant();
         for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
             if (stopping) break;
             ShardId shard = e.getKey();
@@ -485,11 +500,35 @@ public final class WorkLoop implements Closeable {
                     checkout.prepare(shard, st.source);
                     st.prepared = true;
                 }
+            } catch (IOException | RuntimeException ex) {
+                st.lastPollOk = false;
+                log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
+                continue;
+            }
+            pollShard(shard, st);
+        }
+        return shards.entrySet().stream().filter(e -> e.getValue().pendingSince != null)
+                .sorted(Comparator.comparing((Map.Entry<ShardId, ShardState> e) -> e.getValue().pendingSince)
+                        .thenComparing(e -> e.getKey().value()))
+                .map(Map.Entry::getKey).toList();
+    }
+
+    /**
+     * One read-only source check of a prepared shard ({@code git ls-remote} of its url, or the tree
+     * digest of a path source; never a fetch into the checkout a run may be indexing) against the
+     * revision {@code LATEST} holds. Safe on the loop thread and on the change detector.
+     *
+     * @return true when the shard turned pending with this check
+     */
+    private boolean pollShard(ShardId shard, ShardState st) {
+        synchronized (pollMu) {
+            boolean wasPending = st.pendingSince != null;
+            try {
                 refreshPublished(shard, st);
                 Optional<String> changed = checkout.changedSince(shard, st.publishedRevision);
                 if (changed.isPresent()) {
                     st.sourceRevision = changed.get();
-                    if (st.pendingSince == null) st.pendingSince = now;
+                    if (st.pendingSince == null) st.pendingSince = clock.instant();
                 } else {
                     st.sourceRevision = st.publishedRevision;
                     st.pendingSince = null;
@@ -500,11 +539,33 @@ public final class WorkLoop implements Closeable {
                 st.lastPollOk = false;
                 log.warn("Polling the source of shard {} failed (retrying next poll): {}", shard, ex.toString());
             }
+            return !wasPending && st.pendingSince != null;
         }
-        return shards.entrySet().stream().filter(e -> e.getValue().pendingSince != null)
-                .sorted(Comparator.comparing((Map.Entry<ShardId, ShardState> e) -> e.getValue().pendingSince)
-                        .thenComparing(e -> e.getKey().value()))
-                .map(Map.Entry::getKey).toList();
+    }
+
+    /**
+     * The change detector: every {@code pollSeconds} at a fixed rate, on its own thread, a read-only
+     * check of every prepared held shard, also while the loop thread runs another shard (or this
+     * one). A shard that turns pending is announced at once by a heartbeat, so the backlog shows it
+     * within one poll. Run order, leases and releases stay with the loop thread.
+     */
+    void detectChanges() {
+        boolean turned = false;
+        for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
+            if (stopping) return;
+            ShardState st = e.getValue();
+            if (!st.prepared || !checkout.isPrepared(e.getKey())) continue; // the loop thread checks it out first
+            turned |= pollShard(e.getKey(), st);
+        }
+        if (turned && !stopping) members.beat();
+    }
+
+    private void detectChangesQuietly() {
+        try {
+            detectChanges();
+        } catch (RuntimeException | Error e) {
+            log.warn("Change detection failed (retrying next poll): {}", e.toString());
+        }
     }
 
     /** The source revision {@code LATEST} holds (from its manifest's project meta); null when unknown. */
@@ -622,12 +683,21 @@ public final class WorkLoop implements Closeable {
         try {
             if (stopping) run.abort.request("stopping");
             if (diskLow()) run.abort.request("writer low on disk");
+            String headAtStart = st.sourceRevision;
             indexer.index(root, shard.value(), !full, false, embeds(shard), settings.buildSynonyms(),
                     run.listener(), run.abort, revision);
-            st.publishedRevision = revision;
-            st.sourceRevision = revision;
-            st.pendingSince = null;
-            st.publishedGeneration = null; // re-read on the next poll
+            synchronized (pollMu) {
+                st.publishedRevision = revision;
+                st.publishedGeneration = null; // re-read on the next poll
+                String head = st.sourceRevision;
+                if (head != null && !head.equals(headAtStart) && !head.equals(revision)) {
+                    // the detector saw a newer source during the run: still pending after this publish
+                    if (st.pendingSince == null) st.pendingSince = clock.instant();
+                } else {
+                    st.sourceRevision = revision;
+                    st.pendingSince = null;
+                }
+            }
             publishes.merge(shard, 1, Integer::sum);
             leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::renew);
             estimateFloor.remove(shard);
@@ -1044,6 +1114,8 @@ public final class WorkLoop implements Closeable {
             scheduler = null;
             if (diskWatch != null) diskWatch.shutdownNow(); // a probe only: nothing to drain
             diskWatch = null;
+            if (detector != null) detector.shutdownNow(); // read-only source checks: nothing to drain
+            detector = null;
         }
         stopping = true;
         long start = System.nanoTime();
