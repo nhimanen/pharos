@@ -241,4 +241,44 @@ class CompactGraphParityTest {
                 .isInstanceOf(java.io.UncheckedIOException.class)
                 .hasMessageContaining(GraphViews.COMPACT_FILE);
     }
+
+    /**
+     * A writer taking over a shard rebuilds its ArcadeDB graph from the published compact file:
+     * every vertex (all properties) and every edge survive, in the same per-vertex order, so the
+     * imported graph exports to the identical compact file.
+     */
+    @Test
+    void importRebuildsAnIdenticalArcadeGraph() throws Exception {
+        Path db = tempDir.resolve("imported.arcadedb");
+        CompactGraphImport.importInto(compactFile, db);
+        try (CallGraph imported = CallGraph.openExisting(db)) {
+            List<CallGraph.VertexRecord> want = new ArrayList<>(), got = new ArrayList<>();
+            arcade.forEachVertex(want::add);
+            imported.forEachVertex(got::add);
+            assertThat(got).containsExactlyInAnyOrderElementsOf(want);
+            for (String type : CallGraph.EDGE_TYPES) {
+                List<CallGraph.EdgeRecord> we = new ArrayList<>(), ge = new ArrayList<>();
+                arcade.forEachEdgeRecord(type, we::add);
+                imported.forEachEdgeRecord(type, ge::add);
+                assertThat(ge).as(type).containsExactlyInAnyOrderElementsOf(we);
+            }
+            assertThat(imported.methodCount()).isEqualTo(arcade.methodCount());
+            Path again = tempDir.resolve("again.cgf.gz");
+            CompactGraphWriter.export(imported, again);
+            assertThat(gunzip(again)).isEqualTo(gunzip(compactFile));
+        }
+        assertThatThrownBy(() -> CompactGraphImport.importInto(compactFile, db))
+                .isInstanceOf(IOException.class).hasMessageContaining("already exists");
+        Path garbage = tempDir.resolve("garbage.cgf.gz");
+        Files.writeString(garbage, "garbage");
+        assertThatThrownBy(() -> CompactGraphImport.importInto(garbage, tempDir.resolve("never.arcadedb")))
+                .isInstanceOf(IOException.class);
+        assertThat(tempDir.resolve("never.arcadedb")).doesNotExist();
+    }
+
+    private static byte[] gunzip(Path f) throws IOException {
+        try (var in = new java.util.zip.GZIPInputStream(Files.newInputStream(f))) {
+            return in.readAllBytes();
+        }
+    }
 }

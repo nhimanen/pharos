@@ -38,7 +38,7 @@ public final class CompactGraph implements GraphView {
             WRITES = 5, RETURNS = 6, TAKES = 7, ANNOTATED = 8;
 
     /** Sanity limits: counts / string sizes above these mean a corrupt file, not a big graph. */
-    private static final int MAX_COUNT = 50_000_000;
+    static final int MAX_COUNT = 50_000_000;
     private static final int MAX_STRING_BYTES = 64 * 1024;
     private static final int INITIAL_CAPACITY = 1 << 16;
 
@@ -198,7 +198,7 @@ public final class CompactGraph implements GraphView {
         return old != null ? old : s;
     }
 
-    private static String readString(DataInputStream in) throws IOException {
+    static String readString(DataInputStream in) throws IOException {
         int len = in.readInt();
         if (len == -1) return null;
         if (len < 0 || len > MAX_STRING_BYTES) throw new IOException("corrupt compact graph: string length " + len);
