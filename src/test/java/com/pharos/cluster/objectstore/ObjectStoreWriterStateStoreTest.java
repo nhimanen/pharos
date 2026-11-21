@@ -262,6 +262,13 @@ class ObjectStoreWriterStateStoreTest {
         Node b = new Node("node-b");
         Files.createDirectories(b.indexDir());
         Files.writeString(b.indexDir().resolve("stale-leftover"), "x"); // replaced as a whole
+        // a stale local Lucene dir: one file reusable, one of the same name and length but other bytes
+        Path staleLucene = Files.createDirectories(b.indexDir().resolve("lucene"));
+        List<String> names = new ArrayList<>(luceneFiles(a.indexDir()));
+        Files.copy(a.indexDir().resolve("lucene").resolve(names.get(0)), staleLucene.resolve(names.get(0)));
+        byte[] other = Files.readAllBytes(a.indexDir().resolve("lucene").resolve(names.get(1)));
+        other[other.length - 1] ^= 0x01; // footer checksum differs
+        Files.write(staleLucene.resolve(names.get(1)), other);
         assertThat(b.state.restore(SHARD, b.indexDir())).contains(Generation.FIRST);
 
         Map<String, byte[]> want = stateFiles(a.indexDir()), got = stateFiles(b.indexDir());

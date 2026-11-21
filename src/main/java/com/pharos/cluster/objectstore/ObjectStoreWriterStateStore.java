@@ -372,9 +372,21 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
                 shard, gen.value(), linked, downloaded, (System.nanoTime() - start) / 1_000_000);
     }
 
+    /**
+     * Hard-links {@code existing} when it is the manifest's file: same length and the same footer
+     * checksum (Lucene reuses file names across indexes, so a stale local file of the same name and
+     * length is common). The end-to-end check after materialising still covers its body.
+     */
     private static boolean reuse(Path existing, Path target, ManifestFile f) {
         try {
-            if (!Files.isRegularFile(existing) || Files.size(existing) != f.length()) return false;
+            if (!Files.isRegularFile(existing) || Files.size(existing) != f.length() || f.length() < 8) return false;
+            java.nio.ByteBuffer footer = java.nio.ByteBuffer.allocate(8);
+            try (var ch = java.nio.channels.FileChannel.open(existing, java.nio.file.StandardOpenOption.READ)) {
+                while (footer.hasRemaining()) {
+                    if (ch.read(footer, f.length() - 8 + footer.position()) < 0) return false;
+                }
+            }
+            if (footer.flip().getLong() != GenerationFiles.parseChecksum(f)) return false;
             Files.createLink(target, existing);
             return true;
         } catch (IOException | UnsupportedOperationException | SecurityException e) {
