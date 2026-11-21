@@ -130,9 +130,12 @@ class PeerPullTest {
             open.add(this);
         }
 
+        ReplicationEndpoint endpoint;
+
         Writer start() {
             app = Javalin.create();
-            backend.endpoint().mount(app);
+            endpoint = backend.endpoint();
+            endpoint.mount(app);
             app.start(port); // 0 the first time; the same port again after a stop
             port = app.port();
             return this;
@@ -886,6 +889,333 @@ class PeerPullTest {
         assertThat(fellBack).containsExactly("pharos-writers.example.");
         assertThat(PeerDiscovery.DnsResolver.searchDomains("domain corp.example\n")).containsExactly("corp.example");
         assertThat(PeerDiscovery.DnsResolver.searchDomains("")).isEmpty();
+    }
+
+    // ── peer readers (Task 3) ────────────────────────────────────────────────
+
+    /** A reader serving its held generations on its own port (advertised), as {@code pharos web} does. */
+    private record PeerReader(Reader reader, PeerFileSource files, String url, java.util.concurrent.atomic.AtomicInteger requests) {}
+
+    private PeerReader peerReader(String home, String discovery, boolean heartbeat, Consumer<ClusterConfig> tune)
+            throws Exception {
+        int port;
+        try (ServerSocket s = new ServerSocket(0)) {
+            port = s.getLocalPort();
+        }
+        String url = "http://localhost:" + port;
+        Reader r = reader(home, discovery, c -> {
+            c.setAdvertiseUrl(url);
+            c.setHeartbeatSeconds(1);
+            tune.accept(c);
+        });
+        PeerFileSource files = r.runtime().peerFileSource().orElseThrow();
+        java.util.concurrent.atomic.AtomicInteger requests = new java.util.concurrent.atomic.AtomicInteger();
+        Javalin app = Javalin.create();
+        app.before("/replication/*", ctx -> requests.incrementAndGet());
+        files.mount(app);
+        app.start(port);
+        open.add(app::stop);
+        r.runtime().startServing(heartbeat);
+        return new PeerReader(r, files, url, requests);
+    }
+
+    private static final java.net.http.HttpClient CLIENT = java.net.http.HttpClient.newHttpClient();
+
+    private static java.net.http.HttpResponse<byte[]> get(String url, String token, String range) throws Exception {
+        java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder(URI.create(url)).GET();
+        if (token != null) b.header(InternalApi.TOKEN_HEADER, token);
+        if (range != null) b.header("Range", range);
+        return CLIENT.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    /** A heartbeat as a reader POSTs it, holding {@code held}. */
+    private static int heartbeat(Writer w, String node, String advertise, Map<String, Long> held) throws Exception {
+        String body = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(Map.of("node", node,
+                "advertiseUrl", advertise, "shards", List.of(JAVA), "startedAt", 1, "state", "ready",
+                PeerReaderRegistry.GENERATIONS_HELD, held));
+        return CLIENT.send(java.net.http.HttpRequest.newBuilder(URI.create(w.url() + "/replication/readers"))
+                .header(InternalApi.TOKEN_HEADER, TOKEN).header("Content-Type", "application/json")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body)).build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode();
+    }
+
+    /** The {@code peers} of the writer's {@code latest} answer for the Java shard. */
+    private static List<String> listedPeers(Writer w) throws Exception {
+        var r = get(w.url() + "/replication/" + JAVA + "/latest", TOKEN, null);
+        assertThat(r.statusCode()).isEqualTo(200);
+        List<String> out = new ArrayList<>();
+        new com.fasterxml.jackson.databind.ObjectMapper().readTree(r.body()).path("peers")
+                .forEach(n -> out.add(n.asText()));
+        return out;
+    }
+
+    private static String fileUrl(String base, String key) {
+        StringBuilder sb = new StringBuilder(base).append("/replication/").append(JAVA).append("/files");
+        for (String seg : key.split("/")) sb.append('/').append(java.net.URLEncoder.encode(seg, StandardCharsets.UTF_8));
+        return sb.toString();
+    }
+
+    private static long stat(Reader r, String name) {
+        return ((Number) r.source().peerFetchStats().get(name)).longValue();
+    }
+
+    private static List<ManifestFile> luceneFiles(Writer w, long gen) throws IOException {
+        return w.backend.peerStore().source().manifest(JAVA_SHARD, new Generation(gen)).files().stream()
+                .filter(f -> ManifestFile.LUCENE.equals(f.role())).toList();
+    }
+
+    @Test
+    void secondReaderFetchesFromFirst() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long gen = w.index(JAVA, false);
+        PeerReader first = peerReader("reader-1", "seeds:" + w.url(), true, c -> { });
+        assertThat(first.reader().runtime().served()).containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(first.files().generationsHeld()).containsEntry(JAVA, gen);
+        // the heartbeat carries generationsHeld, and the writer lists the reader as a holder
+        await("the first reader listed as a holder", () -> {
+            try {
+                return listedPeers(w).equals(List.of(first.url()));
+            } catch (Exception e) {
+                return false;
+            }
+        }, Duration.ofSeconds(20));
+        long writerTransfers = w.endpoint.transfersServed();
+        assertThat(writerTransfers).as("the first reader fetched from the writer").isPositive();
+
+        Reader second = reader("reader-2", "seeds:" + w.url(), c -> { });
+        second.runtime().startServing();
+        assertThat(second.runtime().served()).containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(w.endpoint.transfersServed()).as("no file of the second reader came from the writer")
+                .isEqualTo(writerTransfers);
+        assertThat(first.files().transfersServed()).isEqualTo(writerTransfers);
+        assertThat(stat(second, "filesFromPeers")).isEqualTo(writerTransfers);
+        assertThat(stat(second, "rejected")).isZero();
+        for (String q : List.of("Calculator", "add two numbers", "getName")) {
+            assertThat(ids(second.engine(), JAVA, q)).as(q).isEqualTo(ids(first.reader().engine(), JAVA, q));
+        }
+        assertThat(second.runtime().peerStatus().get("peerFetch")).asString().contains("filesFromPeers=" + writerTransfers);
+    }
+
+    /** Review Focus 2: a peer serving bytes that do not match the manifest is rejected, suspected, and replaced by the writer. */
+    @Test
+    void corruptPeerFileRejectedAndWriterUsed() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long gen = w.index(JAVA, false);
+        PeerReader first = peerReader("reader-1", "seeds:" + w.url(), false, c -> { });
+        assertThat(heartbeat(w, "reader-1", first.url(), Map.of(JAVA, gen))).isEqualTo(204);
+        List<ManifestFile> files = luceneFiles(w, gen).stream()
+                .sorted(Comparator.comparingLong(ManifestFile::length).reversed()).toList();
+        ManifestFile body = files.get(0);
+        ManifestFile tail = files.get(1);
+        Path firstLucene = first.reader().genDir(gen).resolve("lucene");
+        flip(firstLucene.resolve(body.name()), body.length() / 2); // same length, one byte off in the middle
+
+        Reader second = reader("reader-2", "seeds:" + w.url(), c -> { });
+        java.util.concurrent.atomic.AtomicLong skew = new java.util.concurrent.atomic.AtomicLong();
+        second.source().setClock(() -> System.nanoTime() + skew.get());
+        long before = w.endpoint.transfersServed();
+        second.runtime().startServing();
+        assertThat(second.runtime().served()).as("the corrupt copy never reached the generation")
+                .containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(stat(second, "rejected")).isEqualTo(1);
+        assertThat(second.source().peerFetchStats().get("suspects")).asList().containsExactly(first.url());
+        assertThat(w.endpoint.transfersServed() - before).as("the rejected file (and the rest, the peer being suspect)"
+                + " came from the writer").isPositive();
+        Path secondCopy = second.genDir(gen).resolve("lucene").resolve(body.name());
+        assertThat(Files.readAllBytes(secondCopy)).isEqualTo(Files.readAllBytes(
+                w.backend.peerStore().store().pathOf(body.key())));
+        assertThat(ids(second.engine(), JAVA, "Calculator")).isNotEmpty();
+
+        // while suspect the peer is not asked at all
+        int asked = first.requests().get();
+        second.source().openRange(tail, 0, 16).close();
+        assertThat(first.requests().get()).isEqualTo(asked);
+
+        // after the backoff: a range whose tail does not match the manifest footer is rejected too
+        skew.addAndGet(PeerReplicaSource.SUSPECT_FOR.toNanos() + 1);
+        flip(firstLucene.resolve(tail.name()), tail.length() - 1);
+        byte[] real = Files.readAllBytes(w.backend.peerStore().store().pathOf(tail.key()));
+        byte[] got;
+        try (var in = second.source().openRange(tail, tail.length() - 32, 32)) {
+            got = in.readAllBytes();
+        }
+        assertThat(first.requests().get()).as("the peer was asked again").isGreaterThan(asked);
+        assertThat(got).isEqualTo(java.util.Arrays.copyOfRange(real, real.length - 32, real.length));
+        assertThat(stat(second, "rejected")).isEqualTo(2);
+        // a range that does not cover the footer is checked for its exact length only, and served by the peer
+        skew.addAndGet(PeerReplicaSource.SUSPECT_FOR.toNanos() + 1);
+        long ranges = stat(second, "rangesFromPeers");
+        try (var in = second.source().openRange(tail, 0, 64)) {
+            assertThat(in.readAllBytes()).isEqualTo(java.util.Arrays.copyOf(real, 64));
+        }
+        assertThat(stat(second, "rangesFromPeers")).isEqualTo(ranges + 1);
+    }
+
+    private static void flip(Path file, long at) throws IOException {
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(file,
+                java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)) {
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(1);
+            ch.read(b, at);
+            b.put(0, (byte) (b.get(0) ^ 0x5A)).position(0);
+            ch.write(b, at);
+        }
+    }
+
+    @Test
+    void stalePeerGenerationIgnored() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long g1 = w.index(JAVA, false);
+        PeerReader first = peerReader("reader-1", "seeds:" + w.url(), false, c -> { });
+        first.reader().runtime().close(); // it stays on generation 1 and keeps serving its files
+        assertThat(first.files().generationsHeld()).containsEntry(JAVA, g1);
+        long g2 = w.addMethod("tripleTheValue");
+
+        // a reader that holds an older generation is not listed for the current one
+        assertThat(heartbeat(w, "reader-1", first.url(), Map.of(JAVA, g1))).isEqualTo(204);
+        assertThat(listedPeers(w)).isEmpty();
+        Reader second = reader("reader-2", "seeds:" + w.url(), c -> { });
+        second.runtime().startServing();
+        assertThat(second.runtime().served()).containsEntry(JAVA_SHARD, new Generation(g2));
+        assertThat(first.requests().get()).isZero();
+
+        // one that claims the current generation but still holds the old one serves only the old one's files
+        assertThat(heartbeat(w, "reader-1", first.url(), Map.of(JAVA, g2))).isEqualTo(204);
+        assertThat(listedPeers(w)).containsExactly(first.url());
+        java.util.Set<String> oldKeys = new java.util.HashSet<>();
+        luceneFiles(w, g1).forEach(f -> oldKeys.add(f.key()));
+        ManifestFile newOnly = luceneFiles(w, g2).stream().filter(f -> !oldKeys.contains(f.key())).findFirst()
+                .orElseThrow();
+        assertThat(get(fileUrl(first.url(), newOnly.key()), TOKEN, null).statusCode()).isEqualTo(404);
+
+        long before = w.endpoint.transfersServed();
+        Reader third = reader("reader-3", "seeds:" + w.url(), c -> { });
+        third.runtime().startServing();
+        assertThat(third.runtime().served()).containsEntry(JAVA_SHARD, new Generation(g2));
+        assertThat(ids(third.engine(), JAVA, "tripleTheValue"))
+                .contains(JAVA + ":com.example.Calculator#tripleTheValue(int)");
+        // which files the two generations share depends on Lucene's merges: count them rather than assume
+        long shared = luceneFiles(w, g2).stream().filter(f -> oldKeys.contains(f.key())).count();
+        assertThat(stat(third, "filesFromPeers")).as("the files both generations share").isEqualTo(shared);
+        assertThat(first.files().transfersServed()).isEqualTo(shared);
+        assertThat(w.endpoint.transfersServed() - before).as("the new generation's own files").isPositive();
+        assertThat(stat(third, "rejected")).isZero();
+        assertThat(third.source().peerFetchStats().get("suspects")).asList()
+                .as("a peer without the file is passed over, not suspected").isEmpty();
+    }
+
+    @Test
+    void peerFetchHonoursToken() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long gen = w.index(JAVA, false);
+        PeerReader first = peerReader("reader-1", "seeds:" + w.url(), false,
+                c -> c.getPeers().setMaxTransfersPerReader(1));
+        ManifestFile f = luceneFiles(w, gen).getFirst();
+        byte[] real = Files.readAllBytes(w.backend.peerStore().store().pathOf(f.key()));
+        String url = fileUrl(first.url(), f.key());
+
+        for (String bad : java.util.Arrays.asList(null, "", "wrong", TOKEN + "x")) {
+            var r = get(url, bad, null);
+            assertThat(r.statusCode()).as("token %s", bad).isEqualTo(401);
+            assertThat(new String(r.body(), StandardCharsets.UTF_8)).isEqualTo("{\"error\":\"unauthorized\"}");
+        }
+        assertThat(get(first.url() + "/replication/" + JAVA + "/latest", null, null).statusCode()).isEqualTo(401);
+        var ok = get(url, TOKEN, null);
+        assertThat(ok.statusCode()).isEqualTo(200);
+        assertThat(ok.body()).isEqualTo(real);
+        var range = get(url, TOKEN, "bytes=1-10");
+        assertThat(range.statusCode()).isEqualTo(206);
+        assertThat(range.headers().firstValue("Content-Range")).hasValue("bytes 1-10/" + real.length);
+        assertThat(range.body()).isEqualTo(java.util.Arrays.copyOfRange(real, 1, 11));
+
+        // keys: data dirs of this shard only, no traversal; files not held are 404
+        assertThat(get(first.url() + "/replication/" + JAVA + "/files/shards/" + JAVA + "/lucene/..%2F..%2Fmanifest.json",
+                TOKEN, null).statusCode()).isEqualTo(400);
+        assertThat(get(fileUrl(first.url(), "shards/" + JAVA + "/manifests/gen-" + gen + ".json"), TOKEN, null)
+                .statusCode()).isEqualTo(400);
+        assertThat(get(fileUrl(first.url(), "shards/other/lucene/" + f.name()), TOKEN, null).statusCode())
+                .isEqualTo(400);
+        assertThat(get(fileUrl(first.url(), "shards/" + JAVA + "/lucene/missing@0"), TOKEN, null).statusCode())
+                .isEqualTo(404);
+
+        // above maxTransfersPerReader: 503 with Retry-After at once
+        try (TransferLimiter.Permit held = first.files().transfers().tryAcquire().orElseThrow()) {
+            var busy = get(url, TOKEN, null);
+            assertThat(busy.statusCode()).isEqualTo(503);
+            assertThat(busy.headers().firstValue("Retry-After")).hasValue("2");
+        }
+        assertThat(get(url, TOKEN, null).statusCode()).isEqualTo(200);
+
+        // the fetching side: the token goes only to trusted peer hosts (a heartbeat is no credential)
+        String untrusted = first.url().replace("localhost", "127.0.0.1");
+        assertThat(heartbeat(w, "reader-x", untrusted, Map.of(JAVA, gen))).isEqualTo(204);
+        assertThat(listedPeers(w)).containsExactly(untrusted);
+        int asked = first.requests().get();
+        Reader strict = reader("reader-2", "seeds:" + w.url(), c -> { }); // allowHosts: the seeds' host
+        strict.runtime().startServing();
+        assertThat(strict.runtime().served()).containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(first.requests().get()).as("no request, so no token, to an untrusted host").isEqualTo(asked);
+        assertThat(stat(strict, "filesFromPeers")).isZero();
+
+        Reader allowing = reader("reader-3", "seeds:" + w.url(),
+                c -> c.getPeers().setAllowHosts(List.of("localhost", "127.0.0.1")));
+        allowing.runtime().startServing();
+        assertThat(allowing.runtime().served()).containsEntry(JAVA_SHARD, new Generation(gen));
+        assertThat(stat(allowing, "filesFromPeers")).isPositive();
+
+        // with a truststore only https peers are trusted
+        PeerHttp http = new PeerHttp(TOKEN, null, Duration.ofMillis(500), Duration.ofSeconds(5));
+        open.add(http);
+        PeerDiscovery tls = new PeerDiscovery(PeerDiscovery.parse("seeds:https://localhost:1"), "https",
+                PeerDiscovery.SYSTEM_RESOLVER, http, null);
+        assertThat(tls.trustedPeer(URI.create("http://localhost:2"), Set.of("localhost"))).isFalse();
+        assertThat(tls.trustedPeer(URI.create("https://elsewhere:2"), Set.of())).isTrue();
+        PeerDiscovery plain = new PeerDiscovery(PeerDiscovery.parse("dns:writers"), "http",
+                PeerDiscovery.SYSTEM_RESOLVER, http, null);
+        assertThat(plain.trustedPeer(URI.create("http://writer-host:7070"), Set.of("writer-host"))).isTrue();
+        assertThat(plain.trustedPeer(URI.create("http://reader-host:7070"), Set.of("writer-host"))).isFalse();
+    }
+
+    /** A lazy reader holds a generation in full only once every block of its remote files is cached. */
+    @Test
+    void lazyReaderServesFullyCachedFiles() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        long gen = w.publishWithoutCompoundFiles();
+        PeerReader lazy = peerReader("lazy", "seeds:" + w.url(), false, PeerPullTest::lazy);
+        List<ManifestFile> remote = luceneFiles(w, gen).stream()
+                .filter(f -> !Files.exists(lazy.reader().genDir(gen).resolve("lucene").resolve(f.name()))).toList();
+        assertThat(remote).isNotEmpty();
+        com.pharos.cluster.warm.BlockCache bc = ClusterTestAccess.lazyGenerations(lazy.reader().runtime()).blockCache();
+        ManifestFile cold = null;
+        for (ManifestFile f : remote) {
+            long blocks = (f.length() + bc.blockSize() - 1) / bc.blockSize();
+            for (long i = 0; i < blocks && cold == null; i++) {
+                if (!bc.isCached(new com.pharos.cluster.warm.BlockKey(f.key(), i))) cold = f;
+            }
+        }
+        if (cold != null) { // some block not cached yet: not held in full, and that file is not served
+            assertThat(lazy.files().generationsHeld()).doesNotContainKey(JAVA);
+            assertThat(get(fileUrl(lazy.url(), cold.key()), TOKEN, null).statusCode()).isEqualTo(404);
+        }
+        com.pharos.cluster.ReplicaSource source = lazy.reader().backend().source();
+        for (ManifestFile f : remote) { // cache every block (what queries would do over time)
+            long blocks = (f.length() + bc.blockSize() - 1) / bc.blockSize();
+            for (long i = 0; i < blocks; i++) {
+                long off = i * bc.blockSize();
+                long len = Math.min(bc.blockSize(), f.length() - off);
+                bc.acquire(new com.pharos.cluster.warm.BlockKey(f.key(), i), len,
+                        (key, o, l, target) -> source.downloadRange(f, o, l, target)).close();
+            }
+        }
+        Thread.sleep(PeerFileSource.LAZY_RECHECK_NANOS / 1_000_000 + 100); // the held state is re-checked
+        assertThat(lazy.files().generationsHeld()).containsEntry(JAVA, gen);
+        ManifestFile f = remote.getFirst();
+        byte[] real = Files.readAllBytes(w.backend.peerStore().store().pathOf(f.key()));
+        var whole = get(fileUrl(lazy.url(), f.key()), TOKEN, null);
+        assertThat(whole.statusCode()).isEqualTo(200);
+        assertThat(whole.body()).as("served from the cached blocks").isEqualTo(real);
+        var range = get(fileUrl(lazy.url(), f.key()), TOKEN, "bytes=" + (real.length - 20) + "-");
+        assertThat(range.statusCode()).isEqualTo(206);
+        assertThat(range.body()).isEqualTo(java.util.Arrays.copyOfRange(real, real.length - 20, real.length));
     }
 
     @Test

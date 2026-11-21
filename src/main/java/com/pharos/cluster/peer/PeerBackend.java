@@ -76,6 +76,7 @@ public final class PeerBackend implements ReplicationBackend {
                     System::nanoTime);
             this.peerSource = new PeerReplicaSource(peerCatalog, http,
                     Duration.ofSeconds(cfg.getPeers().getLongPollSeconds()));
+            peerSource.setSelf(cfg.getAdvertiseUrl()); // never fetch from ourselves when a writer lists us
             return;
         }
         if (cfg.getRole() != NodeRole.WRITER) {

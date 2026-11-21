@@ -44,7 +44,9 @@ import java.util.regex.Pattern;
  *   <li>{@code GET /replication/catalog}: {@code {"writer": node, "shards": [{"shard", "latest"}]}}, the
  *       shards this writer published that have a {@code LATEST}.</li>
  *   <li>{@code GET /replication/<shard>/latest?wait=<s>&after=<gen>}: {@code {"generation": N,
- *       "manifest": "gen-N.json"}}. With {@code wait > 0} and no generation newer than {@code after}
+ *       "manifest": "gen-N.json", "peers": [url, …]}}, {@code peers} being up to
+ *       {@value #MAX_LISTED_PEERS} live readers whose heartbeat says they hold generation N in full
+ *       ({@code generationsHeld}; a reader verifies whatever they send). With {@code wait > 0} and no generation newer than {@code after}
  *       (default 0), the request waits on the {@link GenerationSignal} (no thread held) until one is
  *       published or {@code wait} seconds pass ({@value ClusterConfig.PeersConfig#MAX_LONG_POLL_SECONDS} at most),
  *       then answers with {@code LATEST} as it is then. 404 when the shard has no generation. At most
@@ -333,6 +335,9 @@ public final class ReplicationEndpoint {
         }, answers));
     }
 
+    /** The most peer readers one {@code latest} answer lists. */
+    static final int MAX_LISTED_PEERS = 4;
+
     /** Idle allowance on top of a long-poll's wait. */
     static final long IDLE_MARGIN_MILLIS = 15_000;
 
@@ -382,9 +387,7 @@ public final class ReplicationEndpoint {
     private void file(Context ctx) throws IOException {
         ShardId shard = shard(ctx);
         String key = ctx.pathParam("key");
-        String shardPrefix = peer.layout().shardPrefix(shard);
-        if (!key.startsWith(shardPrefix) || !FsObjectStore.validKey(key)
-                || DATA_DIRS.stream().noneMatch(key.substring(shardPrefix.length())::startsWith)) {
+        if (!validFileKey(peer.layout(), shard, key)) {
             error(ctx, 400, "not a file key of shard " + shard);
             return;
         }
@@ -409,9 +412,36 @@ public final class ReplicationEndpoint {
             }
             // Open: GC may unlink the file now, the bytes stay readable until the channel closes.
             try (ch) {
-                serve(ctx, ch, ctx.header("Range"), held);
+                transfersServed.incrementAndGet();
+                serve(ctx, ch.size(), ch::read, ctx.header("Range"), held);
             }
         }
+    }
+
+    /** File transfers this writer started (whole or ranged), for tests and metrics. */
+    private final java.util.concurrent.atomic.AtomicLong transfersServed = new java.util.concurrent.atomic.AtomicLong();
+
+    /** The file transfers ({@code /files/<key>}) this writer has started serving. */
+    public long transfersServed() { return transfersServed.get(); }
+
+    /**
+     * A manifest file key of {@code shard} that {@code /files/<key>} may serve: under the shard's
+     * prefix, in {@code lucene/}, {@code graph/} or {@code refs/}, and made of plain segments only
+     * ({@link FsObjectStore#validKey}), so it cannot name anything outside the data dirs (no
+     * traversal, no manifests, no {@code LATEST}). Shared by the reader's {@link PeerFileSource}.
+     */
+    static boolean validFileKey(ObjectStoreLayout layout, ShardId shard, String key) {
+        if (key == null) return false;
+        String shardPrefix = layout.shardPrefix(shard);
+        return key.startsWith(shardPrefix) && FsObjectStore.validKey(key)
+                && DATA_DIRS.stream().anyMatch(key.substring(shardPrefix.length())::startsWith);
+    }
+
+    /** Positional reads of the bytes being served: a file channel, or cached blocks. */
+    @FunctionalInterface
+    interface Positional {
+        /** Reads up to {@code buf.remaining()} bytes at {@code pos}; -1 past the end. */
+        int read(java.nio.ByteBuffer buf, long pos) throws IOException;
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -421,8 +451,8 @@ public final class ReplicationEndpoint {
      * the response completes inside that write, and a reader that issues its next range as soon as it
      * has this one must find the slot free (not a spurious 503).
      */
-    private void serve(Context ctx, FileChannel ch, String range, TransferLimiter.Permit slot) throws IOException {
-        long size = ch.size();
+    static void serve(Context ctx, long size, Positional ch, String range, TransferLimiter.Permit slot)
+            throws IOException {
         long start = 0;
         long end = size - 1; // inclusive
         int status = 200;
@@ -430,7 +460,8 @@ public final class ReplicationEndpoint {
             long[] r = parseRange(range, size);
             if (r == null) {
                 ctx.header("Content-Range", "bytes */" + size);
-                error(ctx, 416, "range not satisfiable (one bytes=start-end range within " + size + " bytes)");
+                ctx.status(416).contentType("application/json").result("{\"error\":\"range not satisfiable (one"
+                        + " bytes=start-end range within " + size + " bytes)\"}");
                 return;
             }
             start = r[0];
@@ -498,6 +529,9 @@ public final class ReplicationEndpoint {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("generation", gen.getAsLong());
         out.put("manifest", ObjectStoreLayout.manifestName(new Generation(gen.getAsLong())));
+        // readers that hold this generation in full (their heartbeats' generationsHeld): readers
+        // fetch from them first and verify every byte against the manifest (Task 3)
+        out.put("peers", readers.holders(shard.value(), gen.getAsLong(), MAX_LISTED_PEERS));
         json(ctx, 200, out);
     }
 

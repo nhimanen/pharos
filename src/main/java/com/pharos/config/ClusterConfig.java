@@ -591,6 +591,8 @@ public class ClusterConfig {
         private String discovery;
         private int refreshSeconds = 15;
         private int maxTransfersPerWriter = 8;
+        /** Concurrent file transfers a reader serves to peer readers; more get 503 (its own queries come first). */
+        private int maxTransfersPerReader = 4;
         private int longPollSeconds = 30;
         private int maxLongPolls = 256;
         private Path storeDir = IndexConfig.DEFAULT_BASE.resolve("peer-store");
@@ -611,6 +613,10 @@ public class ClusterConfig {
             if (maxTransfersPerWriter < 1) {
                 throw new IllegalStateException("cluster.peers.maxTransfersPerWriter must be at least 1, got "
                         + maxTransfersPerWriter);
+            }
+            if (maxTransfersPerReader < 1) {
+                throw new IllegalStateException("cluster.peers.maxTransfersPerReader must be at least 1, got "
+                        + maxTransfersPerReader);
             }
             if (longPollSeconds < 1 || longPollSeconds > MAX_LONG_POLL_SECONDS) {
                 throw new IllegalStateException("cluster.peers.longPollSeconds must be between 1 and "
@@ -637,6 +643,8 @@ public class ClusterConfig {
         public void setRefreshSeconds(int v) { this.refreshSeconds = v; }
         public int getMaxTransfersPerWriter() { return maxTransfersPerWriter; }
         public void setMaxTransfersPerWriter(int v) { this.maxTransfersPerWriter = v; }
+        public int getMaxTransfersPerReader() { return maxTransfersPerReader; }
+        public void setMaxTransfersPerReader(int v) { this.maxTransfersPerReader = v; }
         public int getLongPollSeconds() { return longPollSeconds; }
         public void setLongPollSeconds(int v) { this.longPollSeconds = v; }
         public int getMaxLongPolls() { return maxLongPolls; }

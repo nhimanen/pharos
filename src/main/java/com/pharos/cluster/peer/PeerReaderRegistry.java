@@ -163,6 +163,32 @@ public final class PeerReaderRegistry {
         return out;
     }
 
+    /** The heartbeat field naming the generations a reader holds in full: {@code {shard: generation}} (P5-R5). */
+    public static final String GENERATIONS_HELD = "generationsHeld";
+
+    /**
+     * The advertised URLs (base {@code http(s)://host[:port]}) of the live, non-draining readers whose
+     * heartbeat says they hold generation {@code gen} of {@code shard} in full, in random order, at most
+     * {@code max} of them. No heartbeat is copied. A reader's claim is only a hint: whoever fetches from
+     * it checks the bytes against the manifest.
+     */
+    public synchronized List<String> holders(String shard, long gen, int max) {
+        prune(nanoClock.getAsLong());
+        List<String> out = new ArrayList<>();
+        for (Held h : readers.values()) {
+            if (h.heartbeat().draining() || h.heartbeat().advertiseUrl() == null) continue;
+            JsonNode held = h.raw().path(GENERATIONS_HELD).path(shard);
+            if (!held.isIntegralNumber() || !held.canConvertToLong() || held.asLong() != gen) continue;
+            try {
+                out.add(PeerDiscovery.baseUrl(h.heartbeat().advertiseUrl().strip()).toString());
+            } catch (IllegalArgumentException notAUrl) {
+                // a reader without a usable advertised URL cannot be fetched from
+            }
+        }
+        java.util.Collections.shuffle(out); // spread the readers' fetches over the holders
+        return out.size() > max ? List.copyOf(out.subList(0, max)) : out;
+    }
+
     /** The withdrawn reader processes still tombstoned: node id → the {@code startedAt} withdrawn. */
     public synchronized Map<String, Long> withdrawn() {
         prune(nanoClock.getAsLong());

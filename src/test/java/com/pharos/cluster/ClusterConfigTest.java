@@ -438,6 +438,7 @@ class ClusterConfigTest {
         ClusterConfig c = parse("{}");
         assertThat(c.getPeers().getRefreshSeconds()).isEqualTo(15);
         assertThat(c.getPeers().getMaxTransfersPerWriter()).isEqualTo(8);
+        assertThat(c.getPeers().getMaxTransfersPerReader()).isEqualTo(4);
         assertThat(c.getPeers().getLongPollSeconds()).isEqualTo(30);
         assertThat(c.getPeers().getMaxLongPolls()).isEqualTo(256);
         assertThat(c.getPeers().getStoreDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("peer-store"));
@@ -445,6 +446,8 @@ class ClusterConfigTest {
         assertThat(c.tlsServer()).isFalse();
         assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxTransfersPerWriter\":0}}}"))
                 .hasMessageContaining("cluster.peers.maxTransfersPerWriter");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxTransfersPerReader\":0}}}"))
+                .hasMessageContaining("cluster.peers.maxTransfersPerReader");
         assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"longPollSeconds\":301}}}"))
                 .hasMessageContaining("cluster.peers.longPollSeconds");
         assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxLongPolls\":0}}}"))

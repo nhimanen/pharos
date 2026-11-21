@@ -119,6 +119,17 @@ public final class PeerMembership implements MembershipSource {
         return hb.compareTo(PeerHttp.CONTROL_TIMEOUT) < 0 ? hb : PeerHttp.CONTROL_TIMEOUT;
     }
 
+    /** The generations this reader holds in full, {@code {shard: generation}}; none by default. */
+    private volatile Supplier<Map<String, Long>> generationsHeld = Map::of;
+
+    /**
+     * Where the heartbeat's {@code generationsHeld} comes from ({@link PeerFileSource#generationsHeld}):
+     * writers list this reader as a peer for those generations.
+     */
+    public void setGenerationsHeld(Supplier<Map<String, Long>> held) {
+        this.generationsHeld = Objects.requireNonNull(held, "held");
+    }
+
     /** The catalog whose live writers this membership heartbeats to. */
     public PeerCatalog catalog() { return catalog; }
 
@@ -186,7 +197,13 @@ public final class PeerMembership implements MembershipSource {
         byte[] body;
         try {
             ReaderHeartbeat hb = self.get();
-            body = MAPPER.writeValueAsBytes(hb.with(draining || hb.draining(), startedAt));
+            com.fasterxml.jackson.databind.node.ObjectNode json =
+                    MAPPER.valueToTree(hb.with(draining || hb.draining(), startedAt));
+            Map<String, Long> held = generationsHeld.get();
+            if (held != null && !held.isEmpty()) { // P5-R5: optional; older readers omit it
+                json.set(PeerReaderRegistry.GENERATIONS_HELD, MAPPER.valueToTree(new TreeMap<>(held)));
+            }
+            body = MAPPER.writeValueAsBytes(json);
         } catch (IOException | RuntimeException e) {
             log.warn("Building the reader heartbeat failed (retrying next tick): {}", e.toString());
             return 0;

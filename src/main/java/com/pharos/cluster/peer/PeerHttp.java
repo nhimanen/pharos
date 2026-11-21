@@ -144,6 +144,19 @@ public final class PeerHttp implements AutoCloseable {
     }
 
     /**
+     * One attempt, no retry (a peer reader: on any failure the caller moves on to the next holder
+     * or the writer instead of waiting out a backoff).
+     */
+    <T> HttpResponse<T> sendOnce(HttpRequest req, HttpResponse.BodyHandler<T> body) throws IOException {
+        try {
+            return client.send(req, body);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("interrupted calling " + req.uri().getHost());
+        }
+    }
+
+    /**
      * {@code GET base+path} as JSON (200 only): one attempt bounded by {@link #CONTROL_TIMEOUT} (the
      * catalog and gossip reads of a refresh; a writer that misses one is retried on the next).
      */

@@ -200,6 +200,13 @@ public final class ClusterRuntime implements Closeable {
         List<String> conflicts = new ArrayList<>(cat.conflicts());
         peer.peerSource().ifPresent(src -> conflicts.addAll(src.synonymsConflicts()));
         out.put("conflicts", conflicts);
+        peer.peerSource().ifPresent(src -> {
+            Map<String, Object> fetch = new LinkedHashMap<>(src.peerFetchStats());
+            com.pharos.cluster.peer.PeerFileSource files;
+            synchronized (this) { files = peerFiles; }
+            if (files != null) fetch.put("servedToPeers", files.transfersServed());
+            out.put("peerFetch", fetch);
+        });
         List<Map<String, Object>> unavailable = new ArrayList<>();
         List<String> pin = config.getCluster().getReader().getShards();
         for (ShardId shard : cat.knownShards()) {
@@ -461,8 +468,13 @@ public final class ClusterRuntime implements Closeable {
                         config.getCluster(), this::selfHeartbeat);
             } else if (backend instanceof com.pharos.cluster.peer.PeerBackend peer && peer.isReader()) {
                 // no bucket: heartbeats POSTed to every live writer, their lists merged (Task 2b)
-                readerRegistry = new com.pharos.cluster.peer.PeerMembership(peer.peerCatalog().orElseThrow(),
-                        peer.peerHttp().orElseThrow(), config.getCluster(), this::selfHeartbeat);
+                com.pharos.cluster.peer.PeerMembership member = new com.pharos.cluster.peer.PeerMembership(
+                        peer.peerCatalog().orElseThrow(), peer.peerHttp().orElseThrow(), config.getCluster(),
+                        this::selfHeartbeat);
+                // the generations it holds in full: writers list it as a peer for them (Task 3)
+                Optional<com.pharos.cluster.peer.PeerFileSource> files = peerFileSourceLocked();
+                files.ifPresent(f -> member.setGenerationsHeld(f::generationsHeld));
+                readerRegistry = member;
             } else {
                 return;
             }
@@ -769,6 +781,32 @@ public final class ClusterRuntime implements Closeable {
 
     /** Built on first use; guarded by this. */
     private com.pharos.cluster.peer.ReplicationEndpoint replication;
+    /** Built on first use; guarded by this. */
+    private com.pharos.cluster.peer.PeerFileSource peerFiles;
+
+    /**
+     * What a peer-mode reader serves to other readers ({@code GET /replication/<shard>/files/<key>}
+     * for the generations it holds in full, token-guarded, at most
+     * {@code cluster.peers.maxTransfersPerReader} at once); empty on every other node.
+     */
+    public synchronized Optional<com.pharos.cluster.peer.PeerFileSource> peerFileSource() {
+        return peerFileSourceLocked();
+    }
+
+    // Holding the monitor of this.
+    private Optional<com.pharos.cluster.peer.PeerFileSource> peerFileSourceLocked() {
+        if (!isReader() || !(backend instanceof com.pharos.cluster.peer.PeerBackend peer) || !peer.isReader()
+                || !(backend.localCache() instanceof ReaderLocalCache readerCache)) {
+            return Optional.empty();
+        }
+        if (peerFiles == null) {
+            LazyGenerations l = lazy;
+            peerFiles = new com.pharos.cluster.peer.PeerFileSource(readerCache, l == null ? null : l::blockCache,
+                    com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken()),
+                    config.getCluster().getPeers().getMaxTransfersPerReader(), System::nanoTime);
+        }
+        return Optional.of(peerFiles);
+    }
 
     /**
      * The {@code /replication/*} routes of a peer-mode writer ({@code cluster.backend: peer-pull},

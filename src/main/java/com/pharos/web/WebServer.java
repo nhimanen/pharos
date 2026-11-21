@@ -96,6 +96,14 @@ public class WebServer {
         this.peers = java.util.Objects.requireNonNull(peers, "peers");
     }
 
+    /** {@code /replication/<shard>/files/*} on a peer-mode reader; null elsewhere. */
+    private volatile com.pharos.cluster.peer.PeerFileSource peerFiles = null;
+
+    /** Mounts a peer-mode reader's {@code /replication/<shard>/files/<key>} (serving other readers). */
+    public void setPeerFileSource(com.pharos.cluster.peer.PeerFileSource files) {
+        this.peerFiles = java.util.Objects.requireNonNull(files, "files");
+    }
+
     /** Mounts {@code /replication/*} (a peer-mode writer). */
     public void setReplicationEndpoint(com.pharos.cluster.peer.ReplicationEndpoint endpoint) {
         this.replication = java.util.Objects.requireNonNull(endpoint, "endpoint");
@@ -989,6 +997,8 @@ public class WebServer {
         if (readerNode && internalApi != null) internalApi.mount(app);
         com.pharos.cluster.peer.ReplicationEndpoint repl = replication;
         if (repl != null) repl.mount(app);
+        com.pharos.cluster.peer.PeerFileSource files = peerFiles;
+        if (files != null && repl == null) files.mount(app);
 
         app.start(port);
         System.out.printf("Web UI available at %s://localhost:%d%n", tls != null ? "https" : "http", port);

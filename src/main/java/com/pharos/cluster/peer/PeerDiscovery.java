@@ -299,6 +299,36 @@ public final class PeerDiscovery {
         return false;
     }
 
+    /** Peer-reader hosts already warned about (logged once per host). */
+    private final Set<String> refusedPeerHosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Whether a peer reader's URL may receive the cluster token (Task 3). Writers list peer readers
+     * from heartbeats, which anyone holding the token can POST, so the URL alone is not trusted; the
+     * gossip rule (P5-R8) applies: with a truststore only {@code https} URLs (the truststore
+     * authenticates the peer); without TLS only hosts in {@code cluster.peers.allowHosts} (default: the
+     * seeds' hosts) or hosts of the writers this node discovered itself ({@code writerHosts}, lower
+     * case). Hosts named only by heartbeats are never trusted on their own. Refusals are logged once
+     * per host.
+     */
+    public boolean trustedPeer(URI u, Set<String> writerHosts) {
+        String host = u.getHost() == null ? "" : u.getHost().toLowerCase(Locale.ROOT);
+        String why;
+        if ("https".equals(scheme)) {
+            if ("https".equals(u.getScheme())) return true;
+            why = "it is not https and this node has a truststore";
+        } else {
+            if (!host.isEmpty() && (allowHosts.contains(host) || writerHosts.contains(host))) return true;
+            why = "its host is neither in cluster.peers.allowHosts " + new TreeSet<>(allowHosts)
+                    + " nor a discovered writer's host";
+        }
+        if (refusedPeerHosts.add(host)) {
+            log.info("Not fetching from peer reader {}: {} (the cluster token is only sent to trusted hosts);"
+                    + " its files come from the writer", u, why);
+        }
+        return false;
+    }
+
     public Spec spec() { return spec; }
 
     /**
