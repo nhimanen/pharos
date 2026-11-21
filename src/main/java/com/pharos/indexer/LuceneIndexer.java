@@ -208,6 +208,24 @@ public class LuceneIndexer implements Closeable {
         return indexExists(getLucenePath(projectName));
     }
 
+    /**
+     * The live document count of the project's latest commit, read from its segment infos only (no
+     * reader is opened, and the cached readers are not refreshed); -1 when there is no index or it
+     * can't be read. For {@code /cluster/status} on a single node.
+     */
+    public long committedDocCount(String projectName) {
+        Path luceneDir = getLucenePath(projectName);
+        if (!indexExists(luceneDir)) return -1;
+        try (Directory dir = openDirectory(luceneDir)) {
+            org.apache.lucene.index.SegmentInfos infos = org.apache.lucene.index.SegmentInfos.readLatestCommit(dir);
+            long n = 0;
+            for (org.apache.lucene.index.SegmentCommitInfo si : infos) n += si.info.maxDoc() - si.getDelCount();
+            return n;
+        } catch (IOException | RuntimeException e) {
+            return -1;
+        }
+    }
+
     private boolean indexExists(Path luceneDir) {
         if (!Files.exists(luceneDir)) return false;
         try {

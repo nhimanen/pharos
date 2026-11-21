@@ -28,6 +28,12 @@ public final class ObjectStoreLayout {
 
     public String writersPrefix() { return root + "catalog/writers/"; }
 
+    /**
+     * The shared state of {@code /cluster/status} (proposal hysteresis, first-seen backlog stamps):
+     * {@code catalog/status/state.json}, updated by compare-and-set by every node.
+     */
+    public String statusStateKey() { return root + "catalog/status/state.json"; }
+
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
     public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }

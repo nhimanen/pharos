@@ -33,6 +33,8 @@ public class ClusterConfig {
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
     private ReaderConfig reader = new ReaderConfig();
     private WriterConfig writer = new WriterConfig();
+    /** {@code /cluster/status}: proposal targets and windows, the events keep-alive and the webhook. */
+    private StatusConfig status = new StatusConfig();
     /** Base URL other nodes reach this reader at; required on readers. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String advertiseUrl;
@@ -186,6 +188,8 @@ public class ClusterConfig {
         reader.validate();
         if (writer == null) writer = new WriterConfig();
         writer.validate();
+        if (status == null) status = new StatusConfig();
+        status.validate();
         if (backend == BackendKind.OBJECT_STORE) {
             objectStore.validate();
             String prefix = objectStore.getPrefix();
@@ -232,6 +236,8 @@ public class ClusterConfig {
     public WriterConfig getWriter() { return writer; }
     public void setWriter(WriterConfig writer) { this.writer = writer == null ? new WriterConfig() : writer; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
+    public StatusConfig getStatus() { return status; }
+    public void setStatus(StatusConfig status) { this.status = status == null ? new StatusConfig() : status; }
     public int getDrainSeconds() { return drainSeconds; }
     public void setDrainSeconds(int v) { this.drainSeconds = v; }
     public String getAdvertiseUrl() { return advertiseUrl; }
@@ -523,5 +529,127 @@ public class ClusterConfig {
         public void setAccessKeyEnv(String v) { this.accessKeyEnv = v; }
         public String getSecretKeyEnv() { return secretKeyEnv; }
         public void setSecretKeyEnv(String v) { this.secretKeyEnv = v; }
+    }
+
+    /**
+     * {@code cluster.status}: what {@code /cluster/status} proposes and when.
+     * <ul>
+     *   <li>{@code targets.warmP95Millis} (default 500): a reader's p95 request latency target;</li>
+     *   <li>{@code targets.qpsPerReader} (default 50): the query rate one reader is sized for;</li>
+     *   <li>{@code targets.backlog} (default 600): seconds an unpublished source change may wait;</li>
+     *   <li>{@code windows.*Seconds}: how long a rule's condition must hold before its proposal is
+     *       raised (add readers 300, remove readers 1800, add writers 0, remove writers 1800, reshard 0,
+     *       writer disk 0), and {@code windows.clearGraceSeconds} (default 60) how long it must be
+     *       false before a raised proposal clears (or a pending condition resets);</li>
+     *   <li>{@code eventsKeepAliveSeconds} (default 15): the SSE keep-alive comment interval of
+     *       {@code /cluster/events} (the router cuts a stream idle for twice that);</li>
+     *   <li>{@code webhookUrl} (optional): receives every event as a JSON POST.</li>
+     * </ul>
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class StatusConfig {
+        private Targets targets = new Targets();
+        private Windows windows = new Windows();
+        private int eventsKeepAliveSeconds = 15;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private String webhookUrl;
+
+        static final int MAX_KEEP_ALIVE_SECONDS = 300;
+
+        public void validate() {
+            if (targets == null) targets = new Targets();
+            if (windows == null) windows = new Windows();
+            targets.validate();
+            windows.validate();
+            if (eventsKeepAliveSeconds < 1 || eventsKeepAliveSeconds > MAX_KEEP_ALIVE_SECONDS) {
+                throw new IllegalStateException("cluster.status.eventsKeepAliveSeconds must be between 1 and "
+                        + MAX_KEEP_ALIVE_SECONDS + ", got " + eventsKeepAliveSeconds);
+            }
+            if (webhookUrl != null && !webhookUrl.isBlank()) {
+                try {
+                    java.net.URI u = new java.net.URI(webhookUrl.trim());
+                    String scheme = u.getScheme();
+                    if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
+                            || u.getHost() == null) {
+                        throw new IllegalStateException("cluster.status.webhookUrl must be an http:// or https:// URL with a host");
+                    }
+                } catch (java.net.URISyntaxException e) {
+                    // never echo the value: it may carry a secret
+                    throw new IllegalStateException("cluster.status.webhookUrl is not a valid URL");
+                }
+            }
+        }
+
+        public Targets getTargets() { return targets; }
+        public void setTargets(Targets t) { this.targets = t == null ? new Targets() : t; }
+        public Windows getWindows() { return windows; }
+        public void setWindows(Windows w) { this.windows = w == null ? new Windows() : w; }
+        public int getEventsKeepAliveSeconds() { return eventsKeepAliveSeconds; }
+        public void setEventsKeepAliveSeconds(int v) { this.eventsKeepAliveSeconds = v; }
+        public String getWebhookUrl() { return webhookUrl; }
+        public void setWebhookUrl(String v) { this.webhookUrl = v; }
+    }
+
+    /** {@code cluster.status.targets}. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Targets {
+        private long warmP95Millis = 500;
+        private double qpsPerReader = 50;
+        /** Seconds the oldest unpublished source change of a shard may wait. */
+        private long backlog = 600;
+
+        void validate() {
+            if (warmP95Millis <= 0) {
+                throw new IllegalStateException("cluster.status.targets.warmP95Millis must be positive, got " + warmP95Millis);
+            }
+            if (!(qpsPerReader > 0) || Double.isInfinite(qpsPerReader)) {
+                throw new IllegalStateException("cluster.status.targets.qpsPerReader must be positive, got " + qpsPerReader);
+            }
+            if (backlog <= 0) {
+                throw new IllegalStateException("cluster.status.targets.backlog must be positive (seconds), got " + backlog);
+            }
+        }
+
+        public long getWarmP95Millis() { return warmP95Millis; }
+        public void setWarmP95Millis(long v) { this.warmP95Millis = v; }
+        public double getQpsPerReader() { return qpsPerReader; }
+        public void setQpsPerReader(double v) { this.qpsPerReader = v; }
+        public long getBacklog() { return backlog; }
+        public void setBacklog(long v) { this.backlog = v; }
+    }
+
+    /** {@code cluster.status.windows}: rule durations in seconds (shortened by the Phase 4 gate). */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Windows {
+        private long addReadersSeconds = 300;
+        private long removeReadersSeconds = 1800;
+        private long addWritersSeconds = 0;
+        private long removeWritersSeconds = 1800;
+        private long reshardSeconds = 0;
+        private long writerDiskSeconds = 0;
+        private long clearGraceSeconds = 60;
+
+        void validate() {
+            long[] all = {addReadersSeconds, removeReadersSeconds, addWritersSeconds, removeWritersSeconds,
+                    reshardSeconds, writerDiskSeconds, clearGraceSeconds};
+            for (long v : all) {
+                if (v < 0) throw new IllegalStateException("cluster.status.windows.* must not be negative, got " + v);
+            }
+        }
+
+        public long getAddReadersSeconds() { return addReadersSeconds; }
+        public void setAddReadersSeconds(long v) { this.addReadersSeconds = v; }
+        public long getRemoveReadersSeconds() { return removeReadersSeconds; }
+        public void setRemoveReadersSeconds(long v) { this.removeReadersSeconds = v; }
+        public long getAddWritersSeconds() { return addWritersSeconds; }
+        public void setAddWritersSeconds(long v) { this.addWritersSeconds = v; }
+        public long getRemoveWritersSeconds() { return removeWritersSeconds; }
+        public void setRemoveWritersSeconds(long v) { this.removeWritersSeconds = v; }
+        public long getReshardSeconds() { return reshardSeconds; }
+        public void setReshardSeconds(long v) { this.reshardSeconds = v; }
+        public long getWriterDiskSeconds() { return writerDiskSeconds; }
+        public void setWriterDiskSeconds(long v) { this.writerDiskSeconds = v; }
+        public long getClearGraceSeconds() { return clearGraceSeconds; }
+        public void setClearGraceSeconds(long v) { this.clearGraceSeconds = v; }
     }
 }
