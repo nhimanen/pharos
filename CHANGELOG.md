@@ -117,7 +117,23 @@ All notable changes to Pharos. Every release section starts with an `**Index for
     `./pharos` uses.
   - `cluster.peers.maxLongPolls` defaults to 4096; size it to readers × shards per writer.
 
+- Scaling proposals for an operator: every scaling proposal on `/cluster/status`, in
+  `/cluster/events` and to the webhook carries a signed `delta` (`+N` start, `-N` stop, the N its
+  `action` names; none on `reshard` and `writer-disk`). New `cluster.status` keys for what were
+  constants: `removeReadersLoad` (0.2), `writers.backlogShards` (1),
+  `writers.oldestPendingSeconds` (300) and `writers.idleSeconds` (the remove-writers window;
+  unset, `windows.removeWritersSeconds` applies). README "Scaling proposals".
+- `cluster.tokenEnv`: read the cluster token from the named environment variable instead of
+  `cluster.token` (mutually exclusive with it; an unset or empty variable is a startup error).
+- `pharos config validate <file>` (and `./pharos config validate <file>`): runs a node's startup
+  validation on a config file; prints `ok` and exits 0, or prints the problem and exits 2.
+
 ### Changed (upgrade note)
+- `add-writers` is now raised when a shard's unpublished change is older than
+  `cluster.status.writers.oldestPendingSeconds` (default 300 s), no longer
+  `cluster.status.targets.backlog` (600 s), which now drives only the `shard-lagging` health
+  finding. The proposal's metric `targetBacklogSeconds` is replaced by `targetOldestPendingSeconds`
+  and `targetBacklogShards`. Set `writers.oldestPendingSeconds` to keep the old threshold.
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
   writer config without the key now runs the work queue and refuses hand-run `pharos index` /
   `pharos publish` (exit 2); add `"writer": {"workQueue": false}` to keep indexing and publishing

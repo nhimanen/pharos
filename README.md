@@ -424,6 +424,8 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
 ```
 
 - Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv` (set both or neither; a named variable that is unset or empty is an error, not a silent fallback), or, when neither is configured, the AWS default credential chain. Use `"pathStyle": true` for MinIO.
+- **Token from the environment.** Instead of `cluster.token`, set `"tokenEnv": "PHAROS_CLUSTER_TOKEN"` to read the token from that environment variable (as Kubernetes passes a Secret), so it never sits in `config.json`. The two are mutually exclusive, and a named variable that is unset or empty is an error at startup.
+- **Check a config file:** `pharos config validate <file>` (`./pharos config validate <file>`) reads the file as `config.json` and runs the validation a node runs at startup (`tokenEnv` is read from the current environment). It prints `ok` and exits 0, or prints the problem to stderr and exits 2. It reads only that file, so it works when the node's own config is broken, and its messages never echo a value from the file.
 - `nodeId` defaults to the host name. `pollIntervalSeconds` must be positive, `retentionMinutes` non-negative, `retentionGenerations` at least 2, and `prefix` must not start with `/` or contain `.`/`..` segments.
 - `objectStore.readTimeoutSeconds` (default 10, 1–3600) bounds the store's connect time and each attempt of a reader's ranged read; a whole ranged read, retries included, gets three times that (30 s). A query whose block can't be fetched in that time fails with an error naming the shard and object key, instead of stalling while the bucket is unreachable. That wait starts when the query asks for the block, so it includes time queued behind other fetches (`maxConcurrentFetches` at once): under a burst of cold misses a block can time out although the bucket answers each fetch quickly. Raise `maxConcurrentFetches` or `readTimeoutSeconds` if timeouts appear only under load. Other calls (whole-object downloads, the writer's uploads, catalog reads) wait up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a response.
 - `retireGraceSeconds` (default 120) is how long a reader keeps a shard's directory after it stops serving it, so queries and shard calls already reading it finish. It must be at least `2 x pollIntervalSeconds` and at least the fan-out timeout (`fanoutTimeoutMillis`, default 5000; `connectTimeoutMillis`, default 1000, bounds the connect). Both rules are checked at startup and the message names the fields.
@@ -550,6 +552,26 @@ A `role: writer` node runs the **work queue** by default (`cluster.writer.workQu
 - **Disk guard** (`cluster.writer.disk`): a writer whose free space is below `max(minFreeBytes, minFreePercent % of the disk)` (defaults 5 GiB and 0 %, so 5 GiB; raise `minFreeBytes`, or set a percentage, to keep more headroom) takes no new shard, refuses or aborts (at a safe point, never half committed) a run that would cross it, hands its pending shards to other writers and reports `low` in its heartbeat (`/cluster/status` health `writer-low-disk`) and in a WARN, once per low episode; it is back once free space exceeds the threshold plus `hysteresisBytes` (1 GiB).
 - **Synonyms.** Each publish merges the writer's mined rules for that shard into the cluster's `catalog/synonyms.txt` (a conditional read-modify-write that replaces only that shard's section and keeps every other shard's), so all readers serve the same file whichever writer published last. Hand-written rules come from the publishing writer's `synonyms.txt`: keep them the same on every writer.
 - A writer serves no search: `pharos web` on a writer does not load the search models (its index runs load the embedding models they use). Writers heartbeat into `catalog/writers/<node>.json` every `heartbeatSeconds` (which must stay below `leaseTtlSeconds`) with their leases, backlog and current job; `/cluster/status` and the Cluster page show them.
+
+### Scaling proposals
+
+`GET /cluster/status` (and `/cluster/events`, and the optional `cluster.status.webhookUrl`) lists the scaling proposals in force. Pharos applies none of them; an operator or a person does. Each scaling proposal carries a signed `delta`, the node count its `action` names: `+N` to start N readers or writers, `-N` to stop N. `reshard` and `writer-disk` proposals carry no `delta`. The rules and their keys under `cluster.status`, with defaults:
+
+| Proposal | Raised when | Keys |
+|---|---|---|
+| `add-readers` | the highest warm p95 or the QPS per reader is above target for the window | `targets.warmP95Millis` (500), `targets.qpsPerReader` (50), `windows.addReadersSeconds` (300) |
+| `remove-readers` | more than one reader, QPS per reader below `removeReadersLoad` of the target, warm p95 within target | `removeReadersLoad` (0.2, above 0 and below 1), `windows.removeReadersSeconds` (1800) |
+| `add-writers` | at least `writers.backlogShards` shards have an unpublished change older than `writers.oldestPendingSeconds`, and there are fewer live writers than workable shards | `writers.backlogShards` (1), `writers.oldestPendingSeconds` (300), `windows.addWritersSeconds` (0) |
+| `remove-writers` | more than one live writer, none indexing and nothing pending, for `writers.idleSeconds` | `writers.idleSeconds` (unset: `windows.removeWritersSeconds`, 1800) |
+| `reshard` | a shard is above half of the smallest reader cache cap | `windows.reshardSeconds` (0) |
+| `writer-disk` | a writer reports low disk | `windows.writerDiskSeconds` (0) |
+
+`targets.backlog` (600) sets when a pending shard is reported as `shard-lagging` in `health`. A proposal clears after its condition has been false for `windows.clearGraceSeconds` (60).
+
+```json
+"status": {"removeReadersLoad": 0.2,
+           "writers": {"backlogShards": 1, "oldestPendingSeconds": 300, "idleSeconds": 1800}}
+```
 
 ### Cluster page
 

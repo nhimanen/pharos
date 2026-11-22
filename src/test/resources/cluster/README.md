@@ -35,10 +35,11 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
 - `health[]`: `{kind, target, message}`. The kinds are `lease-expired`, `no-readers`,
   `reader-degraded`, `reader-draining`, `reader-warming`, `shard-lagging`, `shard-unassigned`,
   `shard-unserved`, `writer-low-disk` and `writer-stopping`.
-- `proposals[]`: `{id (sha1 of kind+target), kind, target, reason, metrics, action, since}`.
+- `proposals[]`: `{id (sha1 of kind+target), kind, target, reason, metrics, action, delta, since}`.
   The kinds are `add-readers`, `remove-readers`, `add-writers`, `remove-writers`, `reshard` and
-  `writer-disk`.
+  `writer-disk`. `delta` is the signed node count of the four scaling kinds (`+N` start, `-N`
+  stop, the N the `action` names); it is absent on `reshard` and `writer-disk`.
 
-`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` and `{type: layout, summary}`.
+`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` (a change of reason, action or delta is `changed`) and `{type: layout, summary}`.
 Events carry no addresses, with or without the token. The stream needs `Accept: text/event-stream`
 (which `EventSource` sends), and a node allows at most 64 streams; above that it answers 503.
