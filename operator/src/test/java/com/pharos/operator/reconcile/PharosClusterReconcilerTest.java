@@ -92,17 +92,6 @@ class PharosClusterReconcilerTest {
     }
 
     @Test
-    void replicasStayWithinTheRoleRange() {
-        PharosClusterSpec.RoleSpec role = new PharosClusterSpec.RoleSpec(2, 5, null, null, null, null);
-        assertThat(PharosClusterReconciler.replicas(role, null)).isEqualTo(2); // not created yet: min
-        assertThat(PharosClusterReconciler.replicas(role, 4)).isEqualTo(4);    // the autoscaler's count is kept
-        assertThat(PharosClusterReconciler.replicas(role, 9)).isEqualTo(5);
-        assertThat(PharosClusterReconciler.replicas(role, 1)).isEqualTo(2);
-        assertThat(PharosClusterReconciler.replicas(new PharosClusterSpec.RoleSpec(null, null, null, null, null, null), 3))
-                .isEqualTo(1); // min 1, max = min
-    }
-
-    @Test
     void unchangedStatusIsNotPatchedAndKeepsTransitionTime() {
         PharosCluster c = cluster(spec(new PharosClusterSpec.Storage(null, null), 1, 1));
         c.setStatus(at(T0).reconcile(c, null).getResource().orElseThrow().getStatus());

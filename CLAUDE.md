@@ -41,6 +41,13 @@ from the root. Modules:
   plans them from the Jobs in the informer (pure, unit-tested) and the reconciler creates/deletes them.
   Writers mount each project's `git.credentialsSecret` at `/etc/pharos/git/<k8sName>`, named in
   `cluster.writer.gitCredentials`, which `SourceCheckout` applies to that project's git calls only.
+  Replicas come from `scale/Autoscaler` (pure; fake clock in tests): pharos's proposals from
+  `/cluster/status`, read by `status/ClusterStatusClient` straight from the pods (readers' headless
+  Service, then writers'; never the router) on its own threads, behind the JOSDK event source
+  `ClusterStatusEventSource`. Its only memory is `status.proposals` (cooldown and episodes survive a
+  restart); writer scale-down passes `ScaleDownGate` (removed ordinals' heartbeats and leases gone);
+  `ScheduleFloors` raises `min` (cron via `CronSchedule`, also the validator's parser). Tests use
+  `ClusterStatusEventSource.NEVER_ANSWERS` or a fake `Watch`.
 
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency

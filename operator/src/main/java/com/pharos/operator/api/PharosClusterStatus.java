@@ -36,6 +36,10 @@ public record PharosClusterStatus(
     public static final String CONDITION_VOLUME_CHANGE_NOT_APPLIED = "VolumeChangeNotApplied";
     /** Applying the desired objects failed; the message says which and why. */
     public static final String CONDITION_APPLY_FAILED = "ApplyFailed";
+    /** A pharos node answers {@code /cluster/status}; without one no proposal is applied (the floors still are). */
+    public static final String CONDITION_STATUS_AVAILABLE = "ClusterStatusAvailable";
+    /** Pharos raised a {@code writer-disk} proposal; v1 only reports it (no volume resize). */
+    public static final String CONDITION_WRITER_LOW_DISK = "WriterLowDisk";
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Replicas(Integer desired, Integer ready) {}
@@ -64,8 +68,12 @@ public record PharosClusterStatus(
     }
 
     /**
-     * A scaling proposal the operator has seen: pharos's {@code id}, {@code kind}, {@code target} and
-     * {@code since} (the episode), and the operator's last application of it.
+     * A proposal the operator has seen (scaling or writer-disk): pharos's {@code id}, {@code kind},
+     * {@code target} and {@code since} (the episode). {@code applied}: this episode was applied at
+     * least once (null for writer-disk, which is never applied). {@code appliedAt},
+     * {@code fromReplicas} and {@code toReplicas}: the id's last application, kept across episodes so
+     * the role's cooldown survives a new {@code since} and an operator restart. A cleared proposal's
+     * record stays until its cooldown has passed.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ProposalStatus(String id, String kind, String target, String since, Boolean applied,

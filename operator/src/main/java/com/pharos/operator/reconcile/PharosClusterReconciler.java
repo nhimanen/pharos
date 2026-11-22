@@ -1,5 +1,6 @@
 package com.pharos.operator.reconcile;
 
+import com.pharos.cluster.status.ClusterStatus;
 import com.pharos.operator.Defaults;
 import com.pharos.operator.Names;
 import com.pharos.operator.OperatorSettings;
@@ -9,13 +10,21 @@ import com.pharos.operator.api.PharosClusterStatus;
 import com.pharos.operator.api.PharosClusterStatus.Phase;
 import com.pharos.operator.render.ConfigRenderer;
 import com.pharos.operator.render.DesiredState;
+import com.pharos.operator.render.Labels;
 import com.pharos.operator.render.StorageRenderer;
+import com.pharos.operator.render.WorkloadRenderer;
+import com.pharos.operator.scale.Autoscaler;
+import com.pharos.operator.status.ClusterStatusClient;
+import com.pharos.operator.status.ClusterStatusEventSource;
+import com.pharos.operator.status.StatusReading;
 import com.pharos.operator.validate.SpecValidator;
 import io.fabric8.kubernetes.api.model.Condition;
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
+import io.fabric8.kubernetes.api.model.EventBuilder;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
 import io.fabric8.kubernetes.api.model.Quantity;
+import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.StatefulSet;
 import io.fabric8.kubernetes.api.model.batch.v1.Job;
@@ -24,17 +33,22 @@ import io.javaoperatorsdk.operator.AggregatedOperatorException;
 import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration;
 import io.javaoperatorsdk.operator.api.reconciler.ErrorStatusUpdateControl;
+import io.javaoperatorsdk.operator.api.reconciler.EventSourceContext;
 import io.javaoperatorsdk.operator.api.reconciler.Reconciler;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import io.javaoperatorsdk.operator.api.reconciler.Workflow;
 import io.javaoperatorsdk.operator.api.reconciler.dependent.Dependent;
+import io.javaoperatorsdk.operator.processing.event.source.EventSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -54,6 +68,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * ({@code VolumeChangeNotApplied}), the storage kind never changes ({@code SpecInvalid}), and a failed
  * apply is reported as {@code ApplyFailed}. This reconciler is the only writer of {@code .status}
  * (ruling OP-R3).
+ *
+ * <p>Replicas come from the {@link Autoscaler}: pharos's proposals, read from {@code /cluster/status}
+ * by the {@link ClusterStatusEventSource} on its own threads, applied within the spec's bounds and
+ * schedule floors. Its records ({@code status.proposals}, {@code status.reshardProposals}) and the
+ * {@code ClusterStatusAvailable} and {@code WriterLowDisk} conditions are merged into the one status
+ * patch of each reconcile.
  */
 @Workflow(explicitInvocation = true, dependents = {
         @Dependent(name = DesiredState.TOKEN, type = Dependents.Secrets.class),
@@ -103,6 +123,13 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
     static final String REASON_NONE = "None";
     static final String REASON_APPLY_FAILED = "ApplyFailed";
     static final String REASON_APPLIED = "Applied";
+    static final String REASON_ANSWERED = "Answered";
+    static final String REASON_NO_ANSWER = "NoNodeAnswered";
+    static final String REASON_LOW_DISK = "LowDisk";
+    static final String REASON_UNKNOWN = "Unknown";
+
+    /** A status read older than this counts as no answer (the client re-reads every 60 s). */
+    static final Duration STATUS_STALE_AFTER = ClusterStatusClient.REFRESH.multipliedBy(2).plusSeconds(30);
 
     /** Backoff of the failed bucket Job: 60 s, doubling per retry, at most 15 min. */
     static final long BUCKET_RETRY_FIRST_SECONDS = 60;
@@ -114,20 +141,34 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
 
     private final Clock clock;
     private final OperatorSettings settings;
+    private final ClusterStatusEventSource statusSource;
     /** Completed reconciles; lets tests wait for one. */
     final AtomicLong reconciles = new AtomicLong();
 
+    /** Production: status read from the pods over HTTP. */
     public PharosClusterReconciler(OperatorSettings settings) {
-        this(Clock.systemUTC(), settings);
+        this(Clock.systemUTC(), settings,
+                new ClusterStatusEventSource(ClusterStatusEventSource.http(Clock.systemUTC())));
     }
 
+    /** Tests without pharos nodes: no node ever answers. */
     PharosClusterReconciler(Clock clock) {
         this(clock, OperatorSettings.defaults());
     }
 
     PharosClusterReconciler(Clock clock, OperatorSettings settings) {
+        this(clock, settings, new ClusterStatusEventSource(ClusterStatusEventSource.NEVER_ANSWERS));
+    }
+
+    PharosClusterReconciler(Clock clock, OperatorSettings settings, ClusterStatusEventSource statusSource) {
         this.clock = clock;
         this.settings = settings;
+        this.statusSource = statusSource;
+    }
+
+    @Override
+    public List<EventSource<?, PharosCluster>> prepareEventSources(EventSourceContext<PharosCluster> context) {
+        return List.of(statusSource);
     }
 
     @Override
@@ -148,8 +189,17 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
             } else {
                 PharosClusterSpec spec = resource.getSpec();
                 Observed before = Observed.of(resource, context);
-                int writers = replicas(spec.writers(), before.writersReplicas());
-                int readers = replicas(spec.readers(), before.readersReplicas());
+                ClusterStatusEventSource.Watch watch = statusSource.watch(resource);
+                watch.token(token(resource, context));
+                Instant now = clock.instant();
+                StatusReading reading = watch.latest()
+                        .filter(r -> !now.isAfter(r.fetchedAt().plus(STATUS_STALE_AFTER))).orElse(null);
+                Autoscaler.Plan scale = Autoscaler.plan(resource, before.writersReplicas(), before.readersReplicas(),
+                        reading, now);
+                int writers = scale.writers().target();
+                int readers = scale.readers().target();
+                logScaling(resource, "writers", before.writersReplicas(), scale.writers());
+                logScaling(resource, "readers", before.readersReplicas(), scale.readers());
                 List<String> volumeNotes = new ArrayList<>();
                 String work = keepSize(before.workVolume(), Defaults.workVolume(spec), "spec.writers.workVolume",
                         volumeNotes);
@@ -160,7 +210,6 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 Integer retries = previousRetries(resource);
                 if (StorageRenderer.minioMode(spec) && before.bucketFailedAt() != null && !before.bucketDeleting()) {
                     Instant due = before.bucketFailedAt().plusSeconds(bucketBackoffSeconds(retries));
-                    Instant now = clock.instant();
                     if (now.isBefore(due)) {
                         reschedule = Duration.between(now, due);
                     } else {
@@ -187,7 +236,13 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 if (projects.reschedule() != null && (reschedule == null || projects.reschedule().compareTo(reschedule) < 0)) {
                     reschedule = projects.reschedule();
                 }
-                desired = provisionedStatus(resource, writers, readers, after, volumeNotes, retries, projects);
+                if (scale.recheck() != null && (reschedule == null || scale.recheck().compareTo(reschedule) < 0)) {
+                    reschedule = scale.recheck();
+                }
+                raise(resource, context, scale.notices());
+                desired = provisionedStatus(resource, writers, readers, after, volumeNotes, retries, projects,
+                        scale, reading == null ? null : reading.status(),
+                        reading == null ? (watch.problem() == null ? "no pharos node answered" : watch.problem()) : null);
             }
             UpdateControl<PharosCluster> control = Objects.equals(desired, resource.getStatus())
                     ? UpdateControl.noUpdate() : UpdateControl.patchStatus(statusPatch(resource, desired));
@@ -293,15 +348,55 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
         return s == null || s.storage() == null ? null : s.storage().bucketRetries();
     }
 
+    /** The cluster token from its Secret (the informer's cache; held in memory only), or null. */
+    private static String token(PharosCluster resource, Context<PharosCluster> context) {
+        Optional<Secret> secret = context.getSecondaryResource(Secret.class, DesiredState.TOKEN,
+                Names.token(resource.getMetadata().getName()));
+        String b64 = secret.map(Secret::getData).map(d -> d.get(WorkloadRenderer.TOKEN_KEY)).orElse(null);
+        if (b64 == null) return null;
+        try {
+            return new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8).strip();
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static void logScaling(PharosCluster resource, String role, Integer before, Autoscaler.Decision d) {
+        if (before != null && before != d.target()) {
+            LOG.info("PharosCluster {}/{}: {} {} -> {}: {}", resource.getMetadata().getNamespace(),
+                    resource.getMetadata().getName(), role, before, d.target(), d.reason());
+        } else if (before != null) {
+            LOG.debug("PharosCluster {}/{}: {} stay at {}: {}", resource.getMetadata().getNamespace(),
+                    resource.getMetadata().getName(), role, before, d.reason());
+        }
+    }
+
     /**
-     * A role's replica count: the current one kept within {@code [min, max]} (the autoscaler moves it),
-     * or {@code min} when the StatefulSet does not exist yet.
+     * Raises the autoscaler's Events on the {@code PharosCluster}. Best effort: a failure is logged and
+     * changes nothing else.
      */
-    static int replicas(PharosClusterSpec.RoleSpec role, Integer current) {
-        int min = Defaults.min(role);
-        int max = Defaults.max(role);
-        int n = current == null ? min : current;
-        return Math.max(min, Math.min(max, n));
+    private void raise(PharosCluster resource, Context<PharosCluster> context, List<Autoscaler.Notice> notices) {
+        if (notices.isEmpty() || context == null) return;
+        String ns = resource.getMetadata().getNamespace();
+        String now = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+        for (Autoscaler.Notice n : notices) {
+            try {
+                context.getClient().v1().events().inNamespace(ns).resource(new EventBuilder()
+                        .withNewMetadata().withGenerateName(resource.getMetadata().getName() + "-")
+                        .withNamespace(ns).endMetadata()
+                        .withNewInvolvedObject().withApiVersion(resource.getApiVersion()).withKind(resource.getKind())
+                        .withName(resource.getMetadata().getName()).withNamespace(ns)
+                        .withUid(resource.getMetadata().getUid()).endInvolvedObject()
+                        .withReason(n.reason()).withType(n.type()).withMessage(n.message())
+                        .withFirstTimestamp(now).withLastTimestamp(now).withCount(1)
+                        .withNewSource().withComponent(Labels.OPERATOR).endSource()
+                        .build()).create();
+            } catch (RuntimeException e) {
+                LOG.warn("PharosCluster {}/{}: raising Event {} failed: {}", ns, resource.getMetadata().getName(),
+                        n.reason(), e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage().lines()
+                                .findFirst().orElse(""));
+            }
+        }
     }
 
     /** The status of an invalid spec: {@code Pending} with every error in {@code SpecInvalid}. */
@@ -320,9 +415,9 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 conditions.build());
     }
 
-    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer, ProjectReconciler.Plan)} with nothing to note. */
+    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer, ProjectReconciler.Plan, Autoscaler.Plan, ClusterStatus, String)} with nothing to note. */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed) {
-        return provisionedStatus(resource, writers, readers, observed, List.of(), null, null);
+        return provisionedStatus(resource, writers, readers, observed, List.of(), null, null, null, null, null);
     }
 
     /** The storage is usable: minio is ready with its bucket created, or an (unprobed) s3 bucket. */
@@ -334,11 +429,13 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
      * The status once the objects are applied: {@code Ready} when the storage is ready and at least
      * {@code min} writers and readers and one router are ready, else {@code Provisioning};
      * {@code Degraded} when a project Job failed. {@code projects}: the project plan of this reconcile,
-     * or null to keep the listed projects.
+     * or null to keep the listed projects. {@code scale}: the autoscaler's plan, or null to keep its
+     * records; {@code status}: the {@code /cluster/status} read, or null with {@code noAnswer} saying why.
      */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed,
                                           List<String> volumeNotes, Integer bucketRetries,
-                                          ProjectReconciler.Plan projects) {
+                                          ProjectReconciler.Plan projects, Autoscaler.Plan scale,
+                                          ClusterStatus status, String noAnswer) {
         PharosClusterSpec spec = resource.getSpec();
         PharosClusterStatus previous = resource.getStatus();
         boolean minio = StorageRenderer.minioMode(spec);
@@ -393,16 +490,92 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                         volumeNotes.isEmpty() ? REASON_NONE : REASON_IMMUTABLE_VOLUME, String.join("; ", volumeNotes))
                 .set(PharosClusterStatus.CONDITION_APPLY_FAILED, false, REASON_APPLIED, "")
                 .set(PharosClusterStatus.CONDITION_SPEC_INVALID, false, REASON_SPEC_VALID, "");
+        if (status != null) {
+            conditions.set(PharosClusterStatus.CONDITION_STATUS_AVAILABLE, true, REASON_ANSWERED,
+                    "A pharos node answers /cluster/status.");
+        } else {
+            conditions.set(PharosClusterStatus.CONDITION_STATUS_AVAILABLE, false, REASON_NO_ANSWER,
+                    (noAnswer == null ? "no pharos node answered" : noAnswer)
+                            + "; the min floors still apply, no proposal is applied.");
+        }
+        List<String> lowDisk = scale == null ? null : scale.lowDisk();
+        if (lowDisk != null) {
+            conditions.set(PharosClusterStatus.CONDITION_WRITER_LOW_DISK, !lowDisk.isEmpty(),
+                    lowDisk.isEmpty() ? REASON_NONE : REASON_LOW_DISK,
+                    lowDisk.isEmpty() ? "" : String.join("; ", lowDisk) + " (v1 does not resize volumes)");
+        } else {
+            Condition was = previousCondition(previous, PharosClusterStatus.CONDITION_WRITER_LOW_DISK);
+            if (was != null) {
+                conditions.set(was.getType(), "True".equals(was.getStatus()), was.getReason(), was.getMessage());
+            } else {
+                conditions.set(PharosClusterStatus.CONDITION_WRITER_LOW_DISK, false, REASON_UNKNOWN,
+                        "No pharos node has answered yet.");
+            }
+        }
+        List<PharosClusterStatus.ProjectStatus> projectList = projects != null
+                ? (projects.projects().isEmpty() ? null : projects.projects())
+                : previous == null ? null : previous.projects();
+        projectList = withClusterStatus(projectList, status, previous);
         Phase phase = degraded ? Phase.Degraded : ready ? Phase.Ready : Phase.Provisioning;
         return new PharosClusterStatus(phase.name(), generation(resource),
                 new PharosClusterStatus.Replicas(writers, observed.writersReady()),
                 new PharosClusterStatus.Replicas(readers, observed.readersReady()),
                 new PharosClusterStatus.StorageStatus(minio ? "minio" : "s3", storageReady,
                         observed.bucketCreated() ? null : bucketRetries),
-                projects != null ? (projects.projects().isEmpty() ? null : projects.projects())
-                        : previous == null ? null : previous.projects(),
-                previous == null ? null : previous.proposals(),
-                previous == null ? null : previous.reshardProposals(), conditions.build());
+                projectList,
+                scale != null ? scale.proposals() : previous == null ? null : previous.proposals(),
+                scale != null ? scale.reshardProposals() : previous == null ? null : previous.reshardProposals(),
+                conditions.build());
+    }
+
+    private static Condition previousCondition(PharosClusterStatus previous, String type) {
+        if (previous == null || previous.conditions() == null) return null;
+        return previous.conditions().stream().filter(c -> type.equals(c.getType())).findFirst().orElse(null);
+    }
+
+    /**
+     * The projects with what {@code /cluster/status} reports for their shard: {@code generation},
+     * {@code docCount} and {@code pending} (a change not yet published). Without a status, the values
+     * of the previous status stand; a project without a shard yet has none.
+     */
+    static List<PharosClusterStatus.ProjectStatus> withClusterStatus(List<PharosClusterStatus.ProjectStatus> projects,
+                                                                     ClusterStatus status,
+                                                                     PharosClusterStatus previous) {
+        if (projects == null) return null;
+        Map<String, PharosClusterStatus.ProjectStatus> before = new HashMap<>();
+        if (previous != null && previous.projects() != null) {
+            for (var p : previous.projects()) if (p != null && p.name() != null) before.put(p.name(), p);
+        }
+        Map<String, ClusterStatus.Shard> shards = new HashMap<>();
+        if (status != null && status.layout() != null && status.layout().shards() != null) {
+            for (ClusterStatus.Shard s : status.layout().shards()) {
+                if (s == null) continue;
+                String project = s.keys() != null && s.keys().get("project") != null ? s.keys().get("project") : s.shard();
+                if (project != null) shards.put(project, s);
+            }
+        }
+        List<PharosClusterStatus.ProjectStatus> out = new ArrayList<>();
+        for (var p : projects) {
+            Long generation = null;
+            Long docCount = null;
+            Boolean pending = null;
+            if (status != null) {
+                ClusterStatus.Shard s = shards.get(p.name());
+                if (s != null) {
+                    generation = s.generation();
+                    docCount = s.docCount();
+                    pending = s.backlog() != null ? s.backlog().pending() : "lagging".equals(s.state());
+                }
+            } else if (before.get(p.name()) != null) {
+                var b = before.get(p.name());
+                generation = b.generation();
+                docCount = b.docCount();
+                pending = b.pending();
+            }
+            out.add(new PharosClusterStatus.ProjectStatus(p.name(), p.registered(), generation, docCount, pending,
+                    p.retries()));
+        }
+        return out;
     }
 
     private StatusConditions conditions(PharosCluster resource) {

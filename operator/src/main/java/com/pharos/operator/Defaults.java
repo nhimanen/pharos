@@ -47,6 +47,14 @@ public final class Defaults {
         return role == null || role.max() == null ? min(role) : role.max();
     }
 
+    /**
+     * {@code autoscaling.enabled}: on unless set to {@code false}. Off, the operator applies no
+     * proposal and no schedule floor; replicas stay within {@code [min, max]}.
+     */
+    public static boolean autoscalingEnabled(Autoscaling a) {
+        return a == null || a.enabled() == null || a.enabled();
+    }
+
     public static int cooldownSeconds(Autoscaling a) {
         return a == null || a.cooldownSeconds() == null ? COOLDOWN_SECONDS : a.cooldownSeconds();
     }

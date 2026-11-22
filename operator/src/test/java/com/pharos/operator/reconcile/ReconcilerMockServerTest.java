@@ -5,12 +5,16 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.pharos.cluster.status.ClusterStatus;
+import com.pharos.cluster.status.StatusState;
 import com.pharos.operator.OperatorSettings;
 import com.pharos.operator.TestClusters;
 import com.pharos.operator.api.PharosCluster;
 import com.pharos.operator.api.PharosClusterSpec;
 import com.pharos.operator.api.PharosClusterStatus;
 import com.pharos.operator.render.Labels;
+import com.pharos.operator.status.ClusterStatusEventSource;
+import com.pharos.operator.status.StatusReading;
 import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
@@ -39,7 +43,9 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
 
@@ -122,7 +128,11 @@ class ReconcilerMockServerTest {
     }
 
     private void startOperator(OperatorSettings settings) {
-        reconciler = new PharosClusterReconciler(clock, settings);
+        startOperator(new PharosClusterReconciler(clock, settings));
+    }
+
+    private void startOperator(PharosClusterReconciler r) {
+        reconciler = r;
         operator = new Operator(o -> o.withKubernetesClient(client)
                 .withCloseClientOnStop(false)
                 .withSSABasedCreateUpdateMatchForDependentResources(false)
@@ -440,5 +450,79 @@ class ReconcilerMockServerTest {
             return now != null && !now.getMetadata().getUid().equals(firstUid);
         });
         await("retries counted", () -> Integer.valueOf(1).equals(current("demo").getStatus().storage().bucketRetries()));
+    }
+
+    @Test
+    void proposalsScaleTheStatefulSetsAndAreRecorded() throws Exception {
+        AtomicReference<StatusReading> reading = new AtomicReference<>();
+        AtomicReference<String> token = new AtomicReference<>();
+        AtomicReference<Runnable> update = new AtomicReference<>();
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { token.set(t); }
+
+                @Override public Optional<StatusReading> latest() { return Optional.ofNullable(reading.get()); }
+
+                @Override public String problem() { return reading.get() == null ? "nobody home" : null; }
+
+                @Override public void close() { }
+            };
+        });
+        startOperator(new PharosClusterReconciler(clock, SETTINGS, source));
+        client.resource(TestClusters.minio()).create();
+
+        // no node answers: the floors (readers min 2) apply and the status says why nothing else does
+        await("readers at the floor", () -> replicas("demo-readers") == 2);
+        await("ClusterStatusAvailable=False", () -> condition("demo", "ClusterStatusAvailable")
+                .map(c -> "False".equals(c.getStatus()) && c.getMessage().startsWith("nobody home")).orElse(false));
+        await("the token handed to the watch", () -> token.get() != null);
+        assertThat(token.get()).isEqualTo(secretValue("demo-token", "token"));
+
+        var add = new ClusterStatus.Proposal("add-r", "add-readers", "readers", "p95 above target", Map.of(),
+                "start 3 readers", 3, "2026-11-22T09:50:00Z");
+        var reshard = new ClusterStatus.Proposal("rs", "reshard", "lucene", "big", Map.of("sizeBytes", 5),
+                "split lucene", null, "2026-11-22T09:40:00Z");
+        reading.set(new StatusReading(new ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                new ClusterStatus.Layout(new StatusState.Summary(1, 1, 2), List.of(), List.of(), List.of()),
+                new ClusterStatus.BacklogSummary(0, null), List.of(), List.of(add, reshard)), clock.instant(), "test"));
+        update.get().run();
+
+        // maxStepUp 2 (the example): 2 -> 4, once
+        await("readers scaled", () -> replicas("demo-readers") == 4);
+        await("the application recorded", () -> {
+            PharosClusterStatus st = current("demo").getStatus();
+            return st.proposals() != null && st.reshardProposals() != null;
+        });
+        PharosClusterStatus st = current("demo").getStatus();
+        assertThat(st.proposals()).containsExactly(new PharosClusterStatus.ProposalStatus("add-r", "add-readers",
+                "readers", "2026-11-22T09:50:00Z", true, "2026-11-22T10:00:00Z", 2, 4));
+        assertThat(st.reshardProposals()).singleElement().satisfies(r -> assertThat(r.target()).isEqualTo("lucene"));
+        assertThat(st.readers().desired()).isEqualTo(4);
+        assertThat(condition("demo", "ClusterStatusAvailable").orElseThrow().getStatus()).isEqualTo("True");
+        assertThat(replicas("demo-writers")).isEqualTo(1);
+        await("the Events", () -> client.v1().events().inNamespace(NS).list().getItems().stream()
+                .map(e -> e.getReason()).toList().containsAll(List.of("Scaled", "ReshardProposed")));
+
+        // still in force, inside the cooldown: further reads change nothing
+        long reconciles = reconciler.reconciles.get();
+        update.get().run();
+        await("another reconcile", () -> reconciler.reconciles.get() > reconciles);
+        assertThat(replicas("demo-readers")).isEqualTo(4);
+        // after the cooldown (300 s), the next step
+        clock.advance(Duration.ofSeconds(300));
+        update.get().run();
+        await("readers ramped", () -> replicas("demo-readers") == 6);
+    }
+
+    private int replicas(String sts) {
+        StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(sts).get();
+        return s == null ? -1 : s.getSpec().getReplicas();
+    }
+
+    private Optional<io.fabric8.kubernetes.api.model.Condition> condition(String cluster, String type) {
+        PharosCluster c = current(cluster);
+        if (c == null || c.getStatus() == null || c.getStatus().conditions() == null) return Optional.empty();
+        return c.getStatus().conditions().stream().filter(x -> type.equals(x.getType())).findFirst();
     }
 }
