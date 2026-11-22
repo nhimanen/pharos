@@ -165,22 +165,22 @@ class SplitProjectSearchTest {
     }
 
     /**
-     * P6-R6, in the Phase 3 harness's style: through DistributedSearch, a query scoped to the split
-     * project scores bitwise as a single node searching the same shards locally (one MultiReader over
-     * them: the reference with the same documents and the same doc ids), with all three shards remote
-     * and with all three held here. And it scores bitwise as the unsplit project whenever both keep the
-     * same ten documents: the unsplit project is another index build of the same files, whose doc ids
-     * differ, so a tie in the raw ranking at the cut can let one build keep a document the other drops
-     * (and the graph boost, relative to the kept list's largest in-degree, then shapes the two lists
-     * differently).
+     * P6-R6 and ruling P6-R11. (a) In the Phase 3 harness's style: through DistributedSearch, every query
+     * scoped to the split project is bitwise (ids, scores, order) what a single node searching the same
+     * shards locally returns (one MultiReader over them: the same documents and doc ids), with all three
+     * shards remote and with all three held here. (b) Against the unsplit project, another index build of
+     * the same files: bitwise for every query whose rank-10 and rank-11 raw BM25 scores are not tied. A tie
+     * at the cut is broken by doc id, which differs between the builds, so either may keep the tied
+     * document; for those queries the top 9 must be the same documents in the same order.
      */
     @Test
     void splitProjectScoresBitwiseAsTheUnsplitProject() throws Exception {
         SearchEngine single = new SearchEngine(r.parts.lucene(), EMBEDDER, r.parts.registry(),
                 new com.pharos.search.pipeline.NoOpCrossEncoder(), new com.pharos.search.FstQueryClassifier(), r.configBase);
+        com.pharos.search.KeywordSearchStrategy keyword = r.engine.shardService(x -> true, null).keyword();
+        com.pharos.search.FstQueryClassifier classifier = new com.pharos.search.FstQueryClassifier();
         List<String> shardNames = SPLIT_SHARDS.stream().map(ShardId::value).toList();
-        int compared = 0, identical = 0;
-        List<String> diffs = new ArrayList<>();
+        int compared = 0, tied = 0;
         for (String q : ParityCorpus.PHAROS_QUERIES) {
             List<SearchResult> local = single.searchWithTrace(new SearchRequest(q, SearchType.KEYWORD, null, shardNames,
                     10, "text", null, null, 0), false).results();
@@ -194,19 +194,29 @@ class SplitProjectSearchTest {
             List<SearchResult> whole = searchList(r, q, WHOLE); // the unsplit project, locally
             if (whole.isEmpty()) continue;
             compared++;
-            Set<String> a = remote.stream().map(x -> fqn(x.id())).collect(Collectors.toCollection(TreeSet::new));
-            Set<String> b = whole.stream().map(x -> fqn(x.id())).collect(Collectors.toCollection(TreeSet::new));
-            if (!a.equals(b)) { // a raw tie at the cut, broken by the two builds' doc ids: the shaping differs
-                diffs.add(q);
-                continue;
+            // the unsplit build's raw keyword ranking, as the pipeline's keyword stage retrieves it
+            SearchRequest raw = new SearchRequest(q, SearchType.KEYWORD, null, List.of(WHOLE), 50, "text", null, null, 0)
+                    .withClassification(classifier.classify(q));
+            List<RawCandidate> rawTop = keyword.retrieveRaw(
+                    new org.apache.lucene.search.IndexSearcher(r.parts.lucene().openReader(WHOLE)), raw);
+            boolean tieAtCut = rawTop.size() >= 11 && rawTop.get(9).rawScore() == rawTop.get(10).rawScore();
+            if (!tieAtCut) {
+                assertThat(compareBitwise(remote, whole)).as(q).isNull();
+            } else {
+                // The documents tied at the cut: which of them each build keeps is its doc-id order, and the
+                // shaping (graph boost) may lift a kept one anywhere in the page. Every other document is in
+                // both pages, in the same order.
+                tied++;
+                float cut = rawTop.get(9).rawScore();
+                Set<String> tiedDocs = rawTop.stream().filter(x -> x.rawScore() == cut)
+                        .map(x -> fqn(x.result().id())).collect(Collectors.toSet());
+                assertThat(remote.stream().map(x -> fqn(x.id())).filter(f -> !tiedDocs.contains(f)).toList())
+                        .as(q + " (tied at the cut: " + tiedDocs + ")")
+                        .isEqualTo(whole.stream().map(x -> fqn(x.id())).filter(f -> !tiedDocs.contains(f)).toList());
             }
-            String d = compareBitwise(remote, whole);
-            assertThat(d).as(q).isNull();
-            identical++;
         }
         assertThat(compared).isGreaterThan(5);
-        assertThat(identical).as("the same top 10 as the unsplit project except for raw ties at the cut: " + diffs)
-                .isGreaterThanOrEqualTo(compared / 2);
+        assertThat(tied).as("most queries have no tie at the cut").isLessThan(compared);
     }
 
     static List<SearchResult> searchList(TestReaderNode node, String q, String project) throws Exception {
