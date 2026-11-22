@@ -180,20 +180,30 @@ public final class ClusterRuntime implements Closeable {
      * this reader does not serve; {@code error} when no writer answered the last refresh.
      */
     public Map<String, Object> peerStatus() {
+        return peerStatus(true);
+    }
+
+    /**
+     * {@link #peerStatus()} as the token view ({@code member}) or the public view, which names no
+     * address (Phase 5 I2): no {@code discovery}, no writer {@code url} or {@code error}, no
+     * {@code peerFetch.suspects} (only their count), and {@code unavailable} reasons and the refresh
+     * {@code error} by node id only.
+     */
+    public Map<String, Object> peerStatus(boolean member) {
         if (!isReader() || !(backend instanceof com.pharos.cluster.peer.PeerBackend peer)) return null;
         com.pharos.cluster.peer.PeerCatalog cat = peer.peerCatalog().orElse(null);
         if (cat == null) return null;
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("discovery", cat.discovery().spec().text());
+        if (member) out.put("discovery", cat.discovery().spec().text());
         List<Map<String, Object>> writers = new ArrayList<>();
         for (var w : cat.writers()) {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("node", w.node());
-            m.put("url", w.url());
+            if (member) m.put("url", w.url());
             m.put("live", w.live());
             m.put("missedRefreshes", w.missedRefreshes());
             m.put("shards", w.shards());
-            if (w.error() != null) m.put("error", w.error());
+            if (member && w.error() != null) m.put("error", w.error());
             writers.add(m);
         }
         out.put("writers", writers);
@@ -205,6 +215,9 @@ public final class ClusterRuntime implements Closeable {
             com.pharos.cluster.peer.PeerFileSource files;
             synchronized (this) { files = peerFiles; }
             if (files != null) fetch.put("servedToPeers", files.transfersServed());
+            if (!member && fetch.remove("suspects") instanceof java.util.Collection<?> sus) {
+                fetch.put("suspectCount", sus.size()); // peer reader URLs: token view only
+            }
             out.put("peerFetch", fetch);
         });
         List<Map<String, Object>> unavailable = new ArrayList<>();
@@ -214,24 +227,26 @@ public final class ClusterRuntime implements Closeable {
             if (servesShard(shard.value())) continue;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("shard", shard.value());
-            m.put("reason", unavailableReason(cat, shard));
+            m.put("reason", unavailableReason(cat, shard, member));
             unavailable.add(m);
         }
         out.put("unavailable", unavailable);
         String error = cat.lastError();
-        if (error != null) out.put("error", "no writer answered the last refresh: " + error);
+        if (error != null) out.put("error", "no writer answered the last refresh" + (member ? ": " + error : ""));
         return out;
     }
 
-    private static String unavailableReason(com.pharos.cluster.peer.PeerCatalog cat, ShardId shard) {
+    private static String unavailableReason(com.pharos.cluster.peer.PeerCatalog cat, ShardId shard, boolean member) {
         var owner = cat.owner(shard);
         if (owner.isEmpty()) {
             return "shard " + shard + " is unavailable on this reader: never synced, and no live writer lists it";
         }
         String why = cat.ownerLive(shard) ? "not synced yet (or its last sync failed)"
-                : "its writer is unreachable" + cat.writers().stream().filter(w -> w.node().equals(owner.get().node()))
-                        .map(w -> w.error() == null ? "" : ": " + w.error()).findFirst().orElse("");
-        return "shard " + shard + " is unavailable on this reader: never synced from writer " + owner.get() + "; " + why;
+                : "its writer is unreachable" + (!member ? "" : cat.writers().stream()
+                        .filter(w -> w.node().equals(owner.get().node()))
+                        .map(w -> w.error() == null ? "" : ": " + w.error()).findFirst().orElse(""));
+        return "shard " + shard + " is unavailable on this reader: never synced from writer "
+                + (member ? owner.get().toString() : owner.get().node()) + "; " + why;
     }
 
     /** Lazy mode's directory factory and block cache; null unless this is a reader (a full-mode reader reports mode {@code full} and zeros). */

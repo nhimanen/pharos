@@ -77,7 +77,7 @@ public class WebCommand implements Callable<Integer> {
                 webServer.setDegradation(clusterRuntime::degradation);
                 webServer.setDegradedShards(clusterRuntime::degradedShards);
                 webServer.setLiveReaders(clusterRuntime::liveReaders);
-                if (clusterRuntime.peerStatus() != null) webServer.setPeers(clusterRuntime::peerStatus);
+                if (clusterRuntime.peerStatus() != null) webServer.setPeerViews(clusterRuntime::peerStatus);
                 // With the engine, this reader also coordinates queries over shards it does not hold.
                 com.pharos.cluster.internal.InternalApi internal = searchEngine != null
                         ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();

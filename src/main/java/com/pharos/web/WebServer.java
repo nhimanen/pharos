@@ -54,8 +54,11 @@ public class WebServer {
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
     private volatile java.util.function.Supplier<Map<String, Object>> writerDisk = () -> null;
-    /** A peer-pull reader's writers, conflicts and unavailable shards; null result: omitted. */
-    private volatile java.util.function.Supplier<Map<String, Object>> peers = () -> null;
+    /**
+     * A peer-pull reader's writers, conflicts and unavailable shards, by view (true: the token view,
+     * with addresses); null result: omitted.
+     */
+    private volatile java.util.function.Function<Boolean, Map<String, Object>> peers = member -> null;
     private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
     private volatile java.util.function.BooleanSupplier draining = () -> false;
     /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
@@ -94,7 +97,17 @@ public class WebServer {
      * readiness.
      */
     public void setPeers(java.util.function.Supplier<Map<String, Object>> peers) {
-        this.peers = java.util.Objects.requireNonNull(peers, "peers");
+        java.util.Objects.requireNonNull(peers, "peers");
+        this.peers = member -> peers.get(); // one view: it must carry no address
+    }
+
+    /**
+     * Like {@link #setPeers}, with a public view ({@code false}: no discovery spec, writer or peer URL)
+     * and a token view ({@code true}), chosen by {@code X-Pharos-Cluster-Token} as on
+     * {@code /cluster/status} (see {@link #setClusterToken}).
+     */
+    public void setPeerViews(java.util.function.Function<Boolean, Map<String, Object>> views) {
+        this.peers = java.util.Objects.requireNonNull(views, "views");
     }
 
     /** {@code /replication/<shard>/files/*} on a peer-mode reader; null elsewhere. */
@@ -307,6 +320,11 @@ public class WebServer {
      * liveness treats any answer as "running". Every signal is read once.
      */
     HealthAnswer healthAnswer() {
+        return healthAnswer(false);
+    }
+
+    /** @param member the request carried the cluster token: the {@code peers} token view */
+    HealthAnswer healthAnswer(boolean member) {
         boolean drain = draining.getAsBoolean();
         boolean ready = readiness.getAsBoolean();
         if (drain) { // wins over every other state: the node is going away
@@ -327,7 +345,7 @@ public class WebServer {
         if (cache != null) out.put("readerCache", cache);
         Map<String, Object> disk = writerDisk.get();
         if (disk != null) out.put("writerDisk", disk);
-        Map<String, Object> peerView = peers.get();
+        Map<String, Object> peerView = peers.apply(member);
         if (peerView != null) out.put("peers", peerView);
         return new HealthAnswer(ready ? 200 : 503, out);
     }
@@ -932,7 +950,9 @@ public class WebServer {
 
         // Health check (used by daemon client to detect readiness)
         app.get("/health", ctx -> {
-            HealthAnswer h = healthAnswer(); // status and body from the same reads
+            // addresses (peers) only with the cluster token, as on /cluster/status (Phase 5 I2)
+            boolean member = clusterToken.test(ctx.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER));
+            HealthAnswer h = healthAnswer(member); // status and body from the same reads
             ctx.status(h.status()).json(h.body());
         });
 

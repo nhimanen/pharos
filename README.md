@@ -482,6 +482,8 @@ Readers long-poll each shard's `latest` (`cluster.peers.longPollSeconds`, defaul
 
 A writer missing for 3 refreshes is dropped, and the generations readers hold of its shards keep serving. When two writers claim one shard, the reader syncs from the one with the higher `LATEST`; on a tie, the lowest node id wins. A writer that misses a refresh keeps its claim until it is dropped. `/health` reports each such conflict under `peers.conflicts` as `shard X claimed by A and B`.
 
+**`/health` and addresses.** Like `/cluster/status`, a peer-mode reader's `/health` has a public view and a token view. Without `X-Pharos-Cluster-Token` (and through `pharos router`, which never forwards the token) `peers` names nodes only: no `discovery` spec, no writer `url` or `error`, no peer reader URLs (`peerFetch.suspectCount` instead of `peerFetch.suspects`), and `unavailable` reasons by node id. With the token (compared in constant time) it shows all of them. The status code and readiness are the same in both views.
+
 ### Work-queue writers
 
 A `role: writer` node runs the **work queue** by default (`cluster.writer.workQueue`, default `true` since the Phase 4 gate): `pharos web` on the writer takes shards from the catalog, polls each shard's source, indexes its changes and publishes them, and any number of writers share the shards. Add `"writer": {"workQueue": false}` to the writer example above to keep the hand-run writer (`pharos index` / `pharos publish` under an implicit lease); a work-queue writer refuses hand runs (`index`, `publish`, `remove-index`, `embed`: exit 2; `upgrade-indexes`: exit 5).

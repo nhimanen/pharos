@@ -629,6 +629,10 @@ class PeerPullTest {
         Map<String, Object> peers = r.runtime().peerStatus();
         assertThat(peers.get("unavailable")).asList().singleElement().asString()
                 .contains("ghost", "unavailable on this reader", "never synced from writer ghost-writer");
+        String open = r.runtime().peerStatus(false).toString(); // I2: the public view names no address
+        assertThat(open).contains("ghost-writer", "unavailable on this reader")
+                .doesNotContain(URI.create(ghost.url()).getAuthority()).doesNotContain(URI.create(a.url()).getAuthority())
+                .doesNotContain("localhost").doesNotContain("discovery");
 
         // the writer comes back with a new generation: picked up by the long-poll loop, no explicit sync
         a.start();
@@ -675,6 +679,13 @@ class PeerPullTest {
         assertThat(r.runtime().degradation()).as("an outage is not a garbage-collected generation").isNull();
         assertThat(r.runtime().peerStatus().get("writers")).asList().singleElement().asString()
                 .contains("live=false");
+
+        // I2: /health's public view names no address (no discovery spec, writer URL or URL in an error)
+        String host = URI.create(a.url()).getAuthority();
+        assertThat(r.runtime().peerStatus(true).toString()).contains(host).contains("discovery");
+        String open = r.runtime().peerStatus(false).toString();
+        assertThat(open).doesNotContain(host).doesNotContain("localhost").doesNotContain("discovery")
+                .contains("writer-a", "live=false");
     }
 
     @Test
