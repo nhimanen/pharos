@@ -99,3 +99,13 @@ jobs:
           tags: ghcr.io/${{ steps.ver.outputs.owner }}/pharos:${{ steps.ver.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push the pharos-operator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/operator/Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.ver.outputs.owner }}/pharos-operator:${{ steps.ver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}

@@ -1,0 +1,61 @@
+package com.pharos.operator.api;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.JsonNode;
+import io.fabric8.kubernetes.api.model.Condition;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Observed state, written only by the reconciler (ruling OP-R3). Never holds a secret.
+ *
+ * <p>{@code phase} is one of {@link Phase}; each phase is also a condition of the same type with a
+ * reason, next to {@code SpecInvalid} and {@code UpgradeBlocked}.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record PharosClusterStatus(
+        String phase,
+        Long observedGeneration,
+        Replicas writers,
+        Replicas readers,
+        StorageStatus storage,
+        List<ProjectStatus> projects,
+        List<ProposalStatus> proposals,
+        List<ReshardProposal> reshardProposals,
+        List<Condition> conditions) {
+
+    /** The status phases (spec, resolved detail 9). */
+    public enum Phase { Pending, Provisioning, Ready, Degraded }
+
+    /** Condition types besides the phases. */
+    public static final String CONDITION_SPEC_INVALID = "SpecInvalid";
+    public static final String CONDITION_UPGRADE_BLOCKED = "UpgradeBlocked";
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record Replicas(Integer desired, Integer ready) {}
+
+    /** {@code kind}: {@code minio} | {@code s3}. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record StorageStatus(String kind, Boolean ready) {}
+
+    /** A project: whether its registration Job succeeded, plus what {@code /cluster/status} reports. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ProjectStatus(String name, Boolean registered, Long generation, Long docCount, Boolean pending) {}
+
+    /**
+     * A scaling proposal the operator has seen: pharos's {@code id}, {@code kind}, {@code target} and
+     * {@code since} (the episode), and the operator's last application of it.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ProposalStatus(String id, String kind, String target, String since, Boolean applied,
+                                 String appliedAt, Integer fromReplicas, Integer toReplicas) {}
+
+    /**
+     * A reshard proposal, copied as pharos reports it ({@code ClusterStatus.Proposal}); surfaced only,
+     * never applied in v1. {@code metrics} values are free-form numbers or strings.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ReshardProposal(String id, String kind, String target, String reason, Map<String, JsonNode> metrics,
+                                  String action, String since) {}
+}

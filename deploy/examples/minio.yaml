@@ -1,0 +1,55 @@
+# A small PharosCluster with operator-managed MinIO storage.
+# Create it in the operator's namespace:  kubectl apply -f deploy/examples/minio.yaml
+apiVersion: pharos.dev/v1alpha1
+kind: PharosCluster
+metadata:
+  name: demo
+  namespace: pharos
+spec:
+  version: "1.6.0"                    # pharos image tag
+  storage:
+    minio:
+      storage: 20Gi                   # MinIO PVC size
+  embeddings:
+    model: granite-r2                 # or "none"; same choices as `pharos embeddings enable`
+  projects:
+    - name: lucene
+      git: { url: https://github.com/apache/lucene.git, ref: main }
+      embed: false
+    - name: mypal
+      # credentialsSecret: a Secret in this namespace with the git credentials (e.g. an SSH deploy key)
+      git: { url: git@github.com:org/mypal.git, ref: main, credentialsSecret: mypal-deploy-key }
+  writers:
+    min: 1
+    max: 4
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { memory: 3Gi }
+    workVolume: 50Gi
+  readers:
+    min: 2
+    max: 8
+    mode: lazy                        # lazy | full
+    cacheVolume: 20Gi
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { memory: 2Gi }
+  router:
+    replicas: 2
+    service: { type: ClusterIP }
+  autoscaling:
+    enabled: true
+    cooldownSeconds: 300
+    maxStepUp: 2
+    maxStepDown: 1
+    triggers:                         # rendered into pharos's cluster.status.* config; pharos raises the proposals
+      readers:
+        scaleUp:   { warmP95Millis: 500, qpsPerReader: 50, forSeconds: 300 }
+        scaleDown: { loadBelowPercent: 20, forSeconds: 1800 }   # % of scaleUp.qpsPerReader, below 100
+      writers:
+        scaleUp:   { backlogShards: 1, oldestPendingSeconds: 300, forSeconds: 120 }
+        scaleDown: { idleForSeconds: 1800 }
+    schedule:                         # optional: move the floors on a timetable (5-field cron, timezone)
+      - { cron: "0 8 * * 1-5", timezone: Europe/Helsinki, readers: { min: 4 } }
+      - { cron: "0 18 * * 1-5", timezone: Europe/Helsinki, readers: { min: 2 } }
+  pharosConfig: {}                    # extra keys merged into cluster.* (validated by ClusterConfig)

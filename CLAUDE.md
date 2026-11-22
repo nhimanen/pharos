@@ -27,7 +27,10 @@ from the root. Modules:
   `StatusEvent`, `WriterHeartbeat`), same packages as before. Jackson only — `ApiModuleHasNoHeavyDepsTest`
   fails if Lucene, DJL/ONNX or Javalin reach its dependency tree. Code that needs them stays in `src/`
   (move a constant into the api class rather than referencing e.g. `LuceneIndexer` from it).
-- `operator/` — the Kubernetes operator; depends on `pharos-api`, never on the fat jar.
+- `operator/` — the Kubernetes operator (plain JOSDK on the fabric8 client); depends on `pharos-api`, never
+  on the fat jar. The `PharosCluster` CRD is generated from `com.pharos.operator.api` into `operator/target/crd/`;
+  the committed copy is `deploy/crd/`, and `CrdGenerationTest` fails when they drift. After changing the api
+  classes: `mvn -pl operator -am test -Dtest=CrdGenerationTest -Dpharos.regenerateCrd=true`.
 
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency
