@@ -14,6 +14,7 @@ import com.pharos.operator.render.Labels;
 import com.pharos.operator.render.StorageRenderer;
 import com.pharos.operator.render.WorkloadRenderer;
 import com.pharos.operator.scale.Autoscaler;
+import com.pharos.operator.scale.LastScale;
 import com.pharos.operator.status.ClusterStatusClient;
 import com.pharos.operator.status.ClusterStatusEventSource;
 import com.pharos.operator.status.StatusReading;
@@ -195,6 +196,7 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 StatusReading reading = watch.latest()
                         .filter(r -> !now.isAfter(r.fetchedAt().plus(STATUS_STALE_AFTER))).orElse(null);
                 Autoscaler.Plan scale = Autoscaler.plan(resource, before.writersReplicas(), before.readersReplicas(),
+                        LastScale.parse(before.writersLastScale()), LastScale.parse(before.readersLastScale()),
                         reading, now);
                 int writers = scale.writers().target();
                 int readers = scale.readers().target();
@@ -223,7 +225,8 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 }
 
                 DesiredState state = DesiredState.render(resource, configs, settings,
-                        new DesiredState.Sizing(writers, readers, work, cache, minioSize));
+                        new DesiredState.Sizing(writers, readers, work, cache, minioSize,
+                                json(scale.writersLastScale()), json(scale.readersLastScale())));
                 var workflow = context.managedWorkflowAndDependentResourceContext();
                 workflow.put(DesiredState.KEY, state);
                 workflow.reconcileManagedWorkflow();
@@ -347,6 +350,10 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
     private static Integer previousRetries(PharosCluster resource) {
         PharosClusterStatus s = resource.getStatus();
         return s == null || s.storage() == null ? null : s.storage().bucketRetries();
+    }
+
+    private static String json(LastScale s) {
+        return s == null ? null : s.toJson();
     }
 
     /** The cluster token from its Secret (the informer's cache; held in memory only), or null. */
@@ -596,13 +603,14 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
      */
     record Observed(Integer writersReplicas, Integer readersReplicas, int writersReady, int readersReady,
                     int routerReady, int minioReady, boolean bucketCreated, String workVolume, String cacheVolume,
-                    String minioStorage, Instant bucketFailedAt, String bucketFailure, boolean bucketDeleting) {
+                    String minioStorage, Instant bucketFailedAt, String bucketFailure, boolean bucketDeleting,
+                    String writersLastScale, String readersLastScale) {
 
         /** Readiness only, for status tests. */
         Observed(Integer writersReplicas, Integer readersReplicas, int writersReady, int readersReady,
                  int routerReady, int minioReady, boolean bucketCreated) {
             this(writersReplicas, readersReplicas, writersReady, readersReady, routerReady, minioReady, bucketCreated,
-                    null, null, null, null, null, false);
+                    null, null, null, null, null, false, null, null);
         }
 
         static Observed of(PharosCluster resource, Context<PharosCluster> context) {
@@ -639,7 +647,12 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                     failed.map(c -> c.getLastTransitionTime() == null ? Instant.EPOCH
                             : Instant.parse(c.getLastTransitionTime())).orElse(null),
                     failed.map(c -> c.getReason()).orElse(null),
-                    bucket.map(j -> j.getMetadata().getDeletionTimestamp() != null).orElse(false));
+                    bucket.map(j -> j.getMetadata().getDeletionTimestamp() != null).orElse(false),
+                    annotation(writers, Labels.LAST_SCALE), annotation(readers, Labels.LAST_SCALE));
+        }
+
+        private static String annotation(Optional<StatefulSet> s, String key) {
+            return s.map(x -> x.getMetadata().getAnnotations()).map(a -> a.get(key)).orElse(null);
         }
 
         private static int ready(Optional<StatefulSet> s) {

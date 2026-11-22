@@ -523,4 +523,60 @@ class ReconcilerMockServerTest {
         StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(sts).get();
         return s == null ? -1 : s.getSpec().getReplicas();
     }
+
+    @Test
+    void aFailedDependentDoesNotLetAProposalApplyTwice() throws Exception {
+        // the NetworkPolicy never applies, so no reconcile ends in a status patch with the record
+        server.expect().post().withPath("/apis/networking.k8s.io/v1/namespaces/pharos/networkpolicies")
+                .andReturn(500, "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\","
+                        + "\"message\":\"denied by a webhook\",\"code\":500}")
+                .always();
+        var add = new ClusterStatus.Proposal("add-r", "add-readers", "readers", "p95 above target", Map.of(),
+                "start 1 reader", 1, "2026-11-22T09:50:00Z");
+        AtomicReference<Runnable> update = new AtomicReference<>();
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { }
+
+                @Override public Optional<StatusReading> latest() {
+                    return Optional.of(new StatusReading(new ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                            new ClusterStatus.Layout(new StatusState.Summary(1, 1, 2), List.of(), List.of(), List.of()),
+                            new ClusterStatus.BacklogSummary(0, null), List.of(), List.of(add)), clock.instant(), "t"));
+                }
+
+                @Override public String problem() { return null; }
+
+                @Override public void close() { }
+            };
+        });
+        startOperator(new PharosClusterReconciler(clock, SETTINGS, source));
+        client.resource(TestClusters.minio()).create();
+
+        // the first reconcile creates the readers at the floor 2, a retry applies the proposal: 3
+        await("readers scaled once", () -> replicas("demo-readers") == 3);
+        await("ApplyFailed", () -> conditionTrue("demo", "ApplyFailed"));
+        StatefulSet readers = client.apps().statefulSets().inNamespace(NS).withName("demo-readers").get();
+        assertThat(readers.getMetadata().getAnnotations()).containsEntry(Labels.LAST_SCALE,
+                new com.pharos.operator.scale.LastScale("add-r", "add-readers", "readers", "2026-11-22T09:50:00Z",
+                        "2026-11-22T10:00:00Z", 2, 3).toJson());
+        assertThat(current("demo").getStatus().proposals()).isNull(); // the status never got the record
+
+        // more reconciles inside the cooldown (JOSDK retries, status reads): replicas stay
+        for (int i = 0; i < 3; i++) {
+            long n = reconciler.reconciles.get();
+            update.get().run();
+            await("another reconcile", () -> reconciler.reconciles.get() > n);
+        }
+        assertThat(replicas("demo-readers")).isEqualTo(3);
+
+        // after the cooldown, one more step
+        clock.advance(Duration.ofSeconds(300));
+        update.get().run();
+        await("the next step", () -> replicas("demo-readers") == 4);
+        Thread.sleep(500);
+        update.get().run();
+        Thread.sleep(500);
+        assertThat(replicas("demo-readers")).isEqualTo(4);
+    }
 }

@@ -49,12 +49,20 @@ public record DesiredState(Map<String, HasMetadata> objects, Set<String> secrets
     }
 
     /**
-     * Replica counts and volume sizes. The sizes are the spec's, except where an existing object
+     * Replica counts, volume sizes and each role's last-scale annotation (null for none). The sizes are the spec's, except where an existing object
      * cannot take a change (see the reconciler): a StatefulSet's volume claim templates are immutable,
      * and the MinIO PVC never shrinks.
      */
     public record Sizing(int writerReplicas, int readerReplicas, String workVolume, String cacheVolume,
-                         String minioStorage) {
+                         String minioStorage, String writerLastScale, String readerLastScale) {
+
+        /**
+         * Without the autoscaler's {@code pharos.dev/last-scale} annotations.
+         */
+        public Sizing(int writerReplicas, int readerReplicas, String workVolume, String cacheVolume,
+                      String minioStorage) {
+            this(writerReplicas, readerReplicas, workVolume, cacheVolume, minioStorage, null, null);
+        }
 
         /** The spec's sizes, as for a cluster whose objects do not exist yet. */
         public static Sizing fromSpec(PharosCluster cluster, int writerReplicas, int readerReplicas) {

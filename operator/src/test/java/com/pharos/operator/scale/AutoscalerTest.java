@@ -311,6 +311,43 @@ class AutoscalerTest {
         assertThat(Autoscaler.plan(c, 2, 1, null, T0).readers().target()).isEqualTo(2);
     }
 
+    @Test
+    void restartWithoutTheStatusRecordDoesNotReapplyInsideTheCooldown() {
+        PharosCluster c = readers(1, 8);
+        Autoscaler.Plan p = Autoscaler.plan(c, 1, 2, reading(T0, addReaders(2, S1)), T0);
+        assertThat(p.readers().target()).isEqualTo(4);
+        LastScale applied = p.readersLastScale();
+        assertThat(applied).isEqualTo(new LastScale(ADD_READERS_ID, "add-readers", "readers", S1,
+                "2026-11-23T10:00:00Z", 2, 4));
+        assertThat(p.writersLastScale()).isNull();
+        // the annotation is what the StatefulSet carries; read back from its JSON
+        LastScale onSts = LastScale.parse(applied.toJson());
+        assertThat(onSts).isEqualTo(applied);
+        assertThat(LastScale.parse("not json")).isNull();
+
+        // the status patch never happened (a crash, or another dependent failed): no record at all
+        PharosCluster restarted = readers(1, 8);
+        Instant at = T0.plusSeconds(10);
+        p = Autoscaler.plan(restarted, 1, 4, null, onSts, reading(at, addReaders(2, S1)), at);
+        assertThat(p.readers().target()).isEqualTo(4);
+        assertThat(p.readers().reason()).contains("cooldown until 2026-11-23T10:05:00Z");
+        assertThat(p.readersLastScale()).isEqualTo(onSts); // carried, so the next apply keeps it
+        assertThat(p.proposals()).containsExactly(onSts.record()); // the status copy is restored
+        // nor through a new episode
+        assertThat(Autoscaler.plan(restarted, 1, 4, null, onSts, reading(at, addReaders(2, S2)), at).readers()
+                .target()).isEqualTo(4);
+        // a stale status record (an older application) loses to the annotation
+        restarted.setStatus(new PharosClusterStatus("Ready", 1L, null, null, null, null, List.of(new ProposalStatus(
+                ADD_READERS_ID, "add-readers", "readers", S1, true, "2026-11-23T09:50:00Z", 1, 2)), null, List.of()));
+        assertThat(Autoscaler.plan(restarted, 1, 4, null, onSts, reading(at, addReaders(2, S1)), at).readers()
+                .target()).isEqualTo(4);
+
+        at = T0.plusSeconds(300);
+        p = Autoscaler.plan(restarted, 1, 4, null, onSts, reading(at, addReaders(2, S1)), at);
+        assertThat(p.readers().target()).isEqualTo(6);
+        assertThat(p.readersLastScale().appliedAt()).isEqualTo("2026-11-23T10:05:00Z");
+    }
+
     private static Proposal removeReaders(Integer delta) {
         return proposal(REMOVE_READERS_ID, "remove-readers", "readers", delta, S1);
     }

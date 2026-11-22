@@ -93,10 +93,10 @@ public final class WorkloadRenderer {
         out.put(DesiredState.CONFIG_WRITER, configMap(cluster, configs.get(Role.WRITER)));
         out.put(DesiredState.CONFIG_READER, configMap(cluster, configs.get(Role.READER)));
         out.put(DesiredState.CONFIG_ROUTER, configMap(cluster, configs.get(Role.ROUTER)));
-        out.put(DesiredState.WRITERS, statefulSet(cluster, configs.get(Role.WRITER), settings, sizing.writerReplicas(),
-                sizing.workVolume()));
-        out.put(DesiredState.READERS, statefulSet(cluster, configs.get(Role.READER), settings, sizing.readerReplicas(),
-                sizing.cacheVolume()));
+        out.put(DesiredState.WRITERS, lastScale(statefulSet(cluster, configs.get(Role.WRITER), settings,
+                sizing.writerReplicas(), sizing.workVolume()), sizing.writerLastScale()));
+        out.put(DesiredState.READERS, lastScale(statefulSet(cluster, configs.get(Role.READER), settings,
+                sizing.readerReplicas(), sizing.cacheVolume()), sizing.readerLastScale()));
         out.put(DesiredState.ROUTER, router(cluster, configs.get(Role.ROUTER), settings));
         out.put(DesiredState.WRITERS_HEADLESS, headless(cluster, Role.WRITER));
         out.put(DesiredState.READERS_HEADLESS, headless(cluster, Role.READER));
@@ -131,6 +131,15 @@ public final class WorkloadRenderer {
                 .withLabels(Labels.of(name, Labels.CONFIG)).endMetadata()
                 .addToData(ConfigRenderer.CONFIG_KEY, rc.json())
                 .build();
+    }
+
+    /**
+     * The autoscaler's last application on the StatefulSet's own metadata (not the pod template, so it
+     * rolls nothing), applied together with {@code replicas} (ruling OP-R5).
+     */
+    static StatefulSet lastScale(StatefulSet s, String value) {
+        if (value != null) s.getMetadata().setAnnotations(new java.util.TreeMap<>(Map.of(Labels.LAST_SCALE, value)));
+        return s;
     }
 
     static StatefulSet statefulSet(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, int replicas,

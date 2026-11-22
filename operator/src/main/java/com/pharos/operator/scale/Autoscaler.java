@@ -37,6 +37,8 @@ import java.util.stream.Collectors;
  *       again once per cooldown, so the role ramps towards {@code max};</li>
  *   <li>the floor ({@code min}, raised by a schedule entry) is enforced at once, even when no pharos
  *       node answers, and is not a proposal application (it starts no cooldown);</li>
+ *   <li>each application is also returned as the role's {@link LastScale}, which the reconciler
+ *       writes onto the StatefulSet in the same apply as {@code replicas} (ruling OP-R5);</li>
  *   <li>writers go down one at a time, each step only once the previously removed writers have
  *       drained ({@link ScaleDownGate}); readers above {@code max} are cut to it at once.</li>
  * </ul>
@@ -78,7 +80,7 @@ public final class Autoscaler {
      */
     public record Plan(Decision writers, Decision readers, List<ProposalStatus> proposals,
                        List<ReshardProposal> reshardProposals, List<String> lowDisk, List<Notice> notices,
-                       Duration recheck) {}
+                       Duration recheck, LastScale writersLastScale, LastScale readersLastScale) {}
 
     /**
      * One role's decision.
@@ -157,9 +159,19 @@ public final class Autoscaler {
      */
     public static Plan plan(PharosCluster cluster, Integer writersNow, Integer readersNow, StatusReading reading,
                             Instant now) {
+        return plan(cluster, writersNow, readersNow, null, null, reading, now);
+    }
+
+    /**
+     * {@link #plan(PharosCluster, Integer, Integer, StatusReading, Instant)} with the roles' last
+     * applications read from their StatefulSets ({@link LastScale}, null when absent), which take
+     * precedence over {@code status.proposals}.
+     */
+    public static Plan plan(PharosCluster cluster, Integer writersNow, Integer readersNow, LastScale writersLast,
+                            LastScale readersLast, StatusReading reading, Instant now) {
         PharosClusterSpec spec = cluster.getSpec();
         PharosClusterStatus previous = cluster.getStatus();
-        AppliedHistory history = AppliedHistory.of(previous);
+        AppliedHistory history = AppliedHistory.of(previous, writersLast, readersLast);
         ClusterStatus status = reading == null ? null : reading.status();
         List<Proposal> inForce = status == null ? null
                 : status.proposals() == null ? List.of() : status.proposals().stream().filter(Objects::nonNull).toList();
@@ -193,9 +205,12 @@ public final class Autoscaler {
             }
         }
 
+        String appliedAt = now.truncatedTo(ChronoUnit.SECONDS).toString();
+        LastScale wl = lastScale(writers, writersNow, applicable, appliedAt, writersLast, Role.WRITERS);
+        LastScale rl = lastScale(readers, readersNow, applicable, appliedAt, readersLast, Role.READERS);
         if (status == null) {
             return new Plan(writers, readers, previous == null ? null : previous.proposals(),
-                    previous == null ? null : previous.reshardProposals(), null, notices, recheck);
+                    previous == null ? null : previous.reshardProposals(), null, notices, recheck, wl, rl);
         }
         List<ProposalStatus> records = records(inForce, history, Map.of(Role.WRITERS, writers, Role.READERS, readers),
                 writersNow, readersNow, wb, rb, now, notices);
@@ -204,7 +219,16 @@ public final class Autoscaler {
                 .map(p -> "writer " + p.target() + ": " + (p.reason() == null ? "low on disk" : p.reason()))
                 .sorted().toList();
         return new Plan(writers, readers, records.isEmpty() ? null : records, reshards.isEmpty() ? null : reshards,
-                lowDisk, notices, recheck);
+                lowDisk, notices, recheck, wl, rl);
+    }
+
+    /** The role's annotation to apply: this reconcile's application, else the one already there. */
+    private static LastScale lastScale(Decision d, Integer current, List<Proposal> applicable, String appliedAt,
+                                       LastScale observed, Role role) {
+        if (d.proposalId() == null || applicable == null) return observed;
+        Proposal p = applicable.stream().filter(x -> d.proposalId().equals(x.id())).findFirst().orElseThrow();
+        return new LastScale(p.id(), p.kind(), p.target() == null ? role.target() : p.target(), p.since(), appliedAt,
+                current, d.target());
     }
 
     private static Decision role(Role role, Integer current, Bounds bounds, List<Proposal> applicable,

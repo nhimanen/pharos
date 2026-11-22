@@ -42,6 +42,9 @@ public final class Labels {
      */
     public static final String PROJECT_ANNOTATION = "pharos.dev/project";
 
+    /** On the writer and reader StatefulSets: the autoscaler's last application ({@code scale.LastScale}). */
+    public static final String LAST_SCALE = "pharos.dev/last-scale";
+
     private Labels() {}
 
     /** Every object's labels: app, instance, component, managed-by and the cluster. */

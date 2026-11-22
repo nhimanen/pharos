@@ -44,8 +44,9 @@ from the root. Modules:
   Replicas come from `scale/Autoscaler` (pure; fake clock in tests): pharos's proposals from
   `/cluster/status`, read by `status/ClusterStatusClient` straight from the pods (readers' headless
   Service, then writers'; never the router) on its own threads, behind the JOSDK event source
-  `ClusterStatusEventSource`. Its only memory is `status.proposals` (cooldown and episodes survive a
-  restart); writer scale-down passes `ScaleDownGate` (removed ordinals' heartbeats and leases gone);
+  `ClusterStatusEventSource`. Its source of truth is each StatefulSet's `pharos.dev/last-scale`
+  annotation (`LastScale`, applied together with `replicas`, OP-R5), with `status.proposals` as the
+  informational copy, so cooldown and episodes survive a restart or a failed status patch; writer scale-down passes `ScaleDownGate` (removed ordinals' heartbeats and leases gone);
   `ScheduleFloors` raises `min` (cron via `CronSchedule`, also the validator's parser). Tests use
   `ClusterStatusEventSource.NEVER_ANSWERS` or a fake `Watch`.
 
