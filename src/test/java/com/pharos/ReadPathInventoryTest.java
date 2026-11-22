@@ -75,7 +75,8 @@ class ReadPathInventoryTest {
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
         assertThat(files("DirectoryReader.open(")).containsExactlyInAnyOrder(
                 "indexer/LuceneIndexer.java",
-                "indexer/ProjectIndexManager.java"); // writer: reshard build lists each local shard's files
+                "indexer/ProjectIndexManager.java", // writer: reshard build lists each local shard's files
+                "indexer/ShardedWriter.java");      // writer: a reshard applies its deletes (NRT) to expunge them
         // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
         // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
         assertThat(files("FSDirectory::open")).isEmpty();
