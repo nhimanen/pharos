@@ -143,7 +143,8 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
 - Resharding is visible: `/cluster/status` gains `projects[]` (a split project is one entry over
   its shards, with its staged and retired spec versions and the reshard's phase — requested,
   building, pinned, flipped, abandoned — progress in shards and in files, and the reshard lease
-  holder) and `specs[]` (every spec version: active, staged, requested, retired, abandoned or
+  holder, and `published`, `generation`, `docCount` and `pending` over its active shards only) and
+  `specs[]` (every spec version: active, staged, requested, retired, abandoned or
   superseded); shards gain `project`, `role`, `staged` and `stagedGeneration` (fields are only
   added). `/cluster/events` sends a `reshard` event at each phase and at each quarter of the
   shards or files. The Cluster page shows a Resharding panel, one sharding table per spec version,

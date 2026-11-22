@@ -159,6 +159,54 @@ class ReshardStatusTest {
         while (r.reshards().size() < n && System.nanoTime() < deadline) Thread.sleep(5);
     }
 
+    /** Ruling P6-R15: the project view of the active shards: published, min generation, summed docs. */
+    private static void assertActiveView(ClusterStatus.Project p, long generation, long docs) {
+        assertThat(p.published()).as(p.project() + " published").isTrue();
+        assertThat(p.generation()).isEqualTo(generation);
+        assertThat(p.docCount()).isEqualTo(docs);
+        assertThat(p.pending()).isFalse();
+    }
+
+    /**
+     * Ruling P6-R15 (a per-project consumer, like the operator, must not pick up a staged shard): mid-reshard,
+     * the project is published at the lowest generation of its active shards, with their docs summed, and
+     * pending when one of them is; the staged-only shard, unpublished and with its own docs, counts for none.
+     */
+    @Test
+    void projectViewCountsTheActiveShardsOnly() {
+        String a = S01.value(), b = S02.value(), c = S03.value();
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        ShardSpec ring3 = ShardSpec.parse("[project, ring(path, shards=3)]");
+        StatusSnapshot.ProjectObs lucene = new StatusSnapshot.ProjectObs("lucene", 1, ring2, List.of(a, b),
+                new StatusSnapshot.StagedObs(2, ring3, List.of(a, b, c), Map.of(), null), null,
+                new StatusSnapshot.RequestObs(2, ring3, T0), null, null, null);
+        java.util.function.Function<Boolean, StatusSnapshot> snap = pending -> new StatusSnapshot(
+                StatusSnapshot.CLUSTER, T0,
+                List.of(new StatusSnapshot.ShardObs(a, true, 4L, 100L, 10L, "w1", T0, "r1", null),
+                        new StatusSnapshot.ShardObs(b, true, 2L, 50L, 10L, "w1", T0, "r1", null),
+                        new StatusSnapshot.ShardObs(c, true, null, 999L, 10L, null, null, null, null)),
+                List.of(new StatusSnapshot.WriterObs(StatusFixtures.writer("w1", List.of(a, b),
+                        Map.of(a, pending ? StatusFixtures.pending(10) : new WriterHeartbeat.Backlog("r1", "r1", false,
+                                null)), null, null), T0)),
+                List.of(), Duration.ofSeconds(30), false, List.of(lucene), null, null);
+        StatusSettings cfg = StatusSettings.defaults();
+        ClusterStatus.Project p = StatusBuilder.build(snap.apply(false), null, cfg).projects().get(0);
+        assertThat(p.published()).isTrue();
+        assertThat(p.generation()).isEqualTo(2L);
+        assertThat(p.docCount()).isEqualTo(150L);
+        assertThat(p.pending()).isFalse();
+        assertThat(StatusBuilder.build(snap.apply(true), null, cfg).projects().get(0).pending()).isTrue();
+
+        // an active shard without a generation: not published
+        StatusSnapshot unpublished = new StatusSnapshot(StatusSnapshot.CLUSTER, T0,
+                List.of(new StatusSnapshot.ShardObs(a, true, 4L, 100L, 10L, "w1", T0, "r1", null),
+                        new StatusSnapshot.ShardObs(b, true, null, null, null, null, null, null, null)),
+                List.of(), List.of(), Duration.ofSeconds(30), false, List.of(lucene), null, null);
+        ClusterStatus.Project u = StatusBuilder.build(unpublished, null, cfg).projects().get(0);
+        assertThat(u.published()).isFalse();
+        assertThat(u.generation()).isEqualTo(4L);
+    }
+
     @Test
     void statusShowsReshardProgress() throws Exception {
         // lucene on [project, ring(path, shards=2)] (spec version 1), docs on the implicit [project]
@@ -242,6 +290,7 @@ class ReshardStatusTest {
         assertThat(shard(st, S01).staged()).isTrue();
         assertThat(st.health()).as("a staged shard is neither unassigned nor unserved")
                 .noneMatch(h -> h.target().equals(S03.value()));
+        assertActiveView(project(st, "lucene"), 2L, 200L); // P6-R15: s03 (staged, unpublished) not counted
 
         // progress inside the same quarter: no event; the next quarter of shards and files: one
         job(v2, "built", List.of(), List.of(), 19, 40);
@@ -264,6 +313,7 @@ class ReshardStatusTest {
         assertThat(shard(st, S01).stagedGeneration()).isEqualTo(5L);
         assertThat(shard(st, S01).generation()).isEqualTo(4L);
         assertThat(shard(st, S02).stagedGeneration()).isEqualTo(2L);
+        assertActiveView(project(st, "lucene"), 2L, 200L);
 
         // flipped: version 2 active, version 1 retired and kept
         catalog.flipReshard("lucene", v2, Map.of(S01, 4L, S02, 2L), T0.plusSeconds(60));

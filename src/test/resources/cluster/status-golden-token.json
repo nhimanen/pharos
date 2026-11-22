@@ -253,7 +253,10 @@
     "sizeBytes" : 734003200,
     "staged" : null,
     "previous" : null,
-    "reshard" : null
+    "reshard" : null,
+    "published" : true,
+    "generation" : 12,
+    "pending" : true
   }, {
     "project" : "beta",
     "specVersion" : null,
@@ -263,7 +266,10 @@
     "sizeBytes" : 88080384,
     "staged" : null,
     "previous" : null,
-    "reshard" : null
+    "reshard" : null,
+    "published" : true,
+    "generation" : 7,
+    "pending" : true
   }, {
     "project" : "gamma",
     "specVersion" : null,
@@ -273,7 +279,10 @@
     "sizeBytes" : 6291456,
     "staged" : null,
     "previous" : null,
-    "reshard" : null
+    "reshard" : null,
+    "published" : true,
+    "generation" : 3,
+    "pending" : false
   } ],
   "specs" : [ ]
 }

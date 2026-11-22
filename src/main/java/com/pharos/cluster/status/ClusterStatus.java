@@ -95,11 +95,17 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
      * shards, the docs and bytes of those shards, the staged version of a reshard ({@code null} without
      * one), the version a flip retired while it is kept ({@code null} otherwise), and the reshard's
      * progress ({@code null} when none is visible).
+     *
+     * <p>Ruling P6-R15, the per-project view of the active shards only (never a staged, retired or
+     * abandoned one, so a reshard in progress doesn't change it): {@code published} when every active
+     * shard has a generation, {@code generation} the lowest of their generations (null when none has
+     * one), {@code docCount} their sum, and {@code pending} when any of them has an unpublished change.
      */
     @JsonPropertyOrder({"project", "specVersion", "spec", "shards", "docCount", "sizeBytes", "staged", "previous",
-            "reshard"})
+            "reshard", "published", "generation", "pending"})
     public record Project(String project, Integer specVersion, String spec, List<String> shards, Long docCount,
-                          Long sizeBytes, StagedVersion staged, PreviousVersion previous, Reshard reshard) {}
+                          Long sizeBytes, StagedVersion staged, PreviousVersion previous, Reshard reshard,
+                          boolean published, Long generation, boolean pending) {}
 
     /** A staged spec version: its shards and {@code state} {@code building}, {@code pinned} or {@code abandoned}. */
     @JsonPropertyOrder({"specVersion", "spec", "shards", "state"})

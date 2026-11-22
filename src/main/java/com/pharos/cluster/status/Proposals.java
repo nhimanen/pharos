@@ -279,7 +279,7 @@ public final class Proposals {
             if (largest == null) continue;
             boolean open = p.request() != null || (p.staged() != null && p.staged().abandonedAt() == null);
             int ringShards = p.spec().ring().map(r -> r.shards().size()).orElse(0);
-            int suggested = suggestedRingShards(projectBytes, trigger, ringShards);
+            int suggested = suggestedRingShards(largest, trigger, ringShards);
             String spec = proposedSpec(p.spec(), suggested);
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("sizeBytes", projectBytes);
@@ -295,14 +295,16 @@ public final class Proposals {
     }
 
     /**
-     * Ruling P6-R14: the ring size a reshard proposal suggests. {@code S = ceil(projectBytes / trigger)},
-     * at least 2, where the trigger is the reshard threshold ({@value StatusSettings#RESHARD_CACHE_SHARE} of
-     * the smallest reader cache cap); a project already on a ring of {@code N} shards gets
-     * {@code max(N + 1, S)}.
+     * Rulings P6-R14 and P6-R15: the ring size a reshard proposal suggests.
+     * {@code S = ceil(largestActiveShardBytes / trigger)}, at least 2, where the trigger is the reshard
+     * threshold ({@value StatusSettings#RESHARD_CACHE_SHARE} of the smallest reader cache cap). The ring
+     * splits each existing shard (under {@code [project, module]} every module gets its own ring), so the
+     * largest shard sizes it, not the whole project; for {@code [project]} the two are the same. A project
+     * already on a ring of {@code N} shards gets {@code max(N + 1, S)}.
      */
-    static int suggestedRingShards(long projectBytes, double trigger, int ringShards) {
+    static int suggestedRingShards(long largestShardBytes, double trigger, int ringShards) {
         int s = (int) Math.max(2, Math.min(com.pharos.cluster.sharding.ShardSpec.MAX_RING_SHARDS,
-                Math.ceil(projectBytes / trigger)));
+                Math.ceil(largestShardBytes / trigger)));
         return ringShards > 0 ? Math.min(com.pharos.cluster.sharding.ShardSpec.MAX_RING_SHARDS,
                 Math.max(ringShards + 1, s)) : s;
     }

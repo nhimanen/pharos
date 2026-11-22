@@ -317,6 +317,7 @@ public final class ReshardJob {
                 job.generations = new LinkedHashMap<>();
                 job.basedOn = null;
                 job.pinnedAt = null;
+                resetProgress(job); // the rebuild counts its shards and files from 0
                 job.phase = "rebuilding";
                 job.error = e.getMessage();
                 writeJob(project, job);
@@ -367,6 +368,7 @@ public final class ReshardJob {
         }
         job.basedOn = current;
         if (!built) {
+            resetProgress(job); // a build (first, after Stale, or on a takeover) counts from 0
             ProjectIndexManager.ReshardBuild b = indexer.reshard(root, project, active, to, embed,
                     buildProgress(project, job), abort);
             job.moved = b.movedFiles();
@@ -642,6 +644,13 @@ public final class ReshardJob {
         if (j.error != null) n.put("error", j.error);
         n.put("updatedAt", clock.instant().toString());
         store.put(layout.reshardJobKey(project), JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(n));
+    }
+
+    /** Clears the job's shard and file progress (a new build of the staged version starts). */
+    private static void resetProgress(Job job) {
+        job.affected = List.of();
+        job.unaffected = List.of();
+        job.filesDone = null;
     }
 
     /** Steps of the build's file progress the job record is written at (every tenth), not every file. */

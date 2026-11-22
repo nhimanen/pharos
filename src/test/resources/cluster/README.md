@@ -47,9 +47,13 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
   The kinds are `add-readers`, `remove-readers`, `add-writers`, `remove-writers`, `reshard` and
   `writer-disk`. A `reshard` proposal targets a project and its action names the exact command, e.g.
   `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` (ruling P6-R14: an unringed project gets
-  a ring of `S = ceil(projectBytes / trigger)` shards, at least 2; a ringed one `max(N + 1, S)`).
+  a ring of `S = ceil(largestShardBytes / trigger)` shards, at least 2; a ringed one `max(N + 1, S)`;
+  ruling P6-R15).
 - `projects[]` (Phase 6): `{project, specVersion (null: [project]), spec, shards, docCount, sizeBytes,
-  staged, previous, reshard}`. A split project is one entry over its shards.
+  staged, previous, reshard, published, generation, pending}`. A split project is one entry over its
+  shards. `published` (every active shard has a generation), `generation` (their lowest), `docCount`
+  (their sum) and `pending` (one of them has an unpublished change) count the active shards only, never a
+  staged or retired one (ruling P6-R15): per-project consumers read these, not `layout.shards[]`.
   - `staged`: `{specVersion, spec, shards, state building|pinned|abandoned}` or null;
   - `previous`: `{specVersion, spec, shards, retiredAt}` or null (the version a flip retired);
   - `reshard`: null, or `{specVersion, spec, from, phase requested|building|pinned|flipped|abandoned,

@@ -823,6 +823,9 @@ class ReshardJobTest {
         a.loop.tick(); // staged, published, pinned; the reader lags: waits
         ProjectShards.Staged staged = catalog.projectShards().stagedOf(P).orElseThrow();
         assertThat(staged.pinned()).isTrue();
+        com.pharos.cluster.status.ClusterStatus.Reshard pinnedStatus = observeStatus();
+        assertThat(pinnedStatus.phase()).isEqualTo("pinned");
+        assertThat(pinnedStatus.shardsDone()).isEqualTo(5);
         Map<ShardId, byte[]> stagedManifests = new HashMap<>();
         for (Map.Entry<ShardId, Long> e : staged.generations().entrySet()) {
             stagedManifests.put(e.getKey(), store.get(layout.manifestKey(e.getKey(), new Generation(e.getValue())))
@@ -851,11 +854,23 @@ class ReshardJobTest {
         a.loop.tick();
         ProjectShards map = catalog.projectShards();
         assertThat(map.specVersionOf(P)).as("not flipped onto the stale version").isNotEqualTo(java.util.OptionalInt.of(v));
+        // fix round 1, I2: the rebuild's progress starts again from 0 shards and files
+        JsonNode job = JSON.readTree(store.get(layout.reshardJobKey(P)).orElseThrow().data());
+        assertThat(job.path("phase").asText()).isEqualTo("rebuilding");
+        assertThat(job.path("affected")).isEmpty();
+        assertThat(job.path("unaffected")).isEmpty();
+        assertThat(job.has("filesDone")).isFalse();
+        com.pharos.cluster.status.ClusterStatus.Reshard rebuilding = observeStatus();
+        assertThat(rebuilding.phase()).isEqualTo("building");
+        assertThat(rebuilding.shardsDone()).isZero();
+        assertThat(rebuilding.filesDone()).isNull();
         for (int i = 0; i < 4 && !map.specVersionOf(P).equals(java.util.OptionalInt.of(v)); i++) {
             clock.advance(10);
             a.loop.tick();
+            observeStatus();
             map = catalog.projectShards();
         }
+        assertMarksNeverGoBackwards();
         assertThat(map.specVersionOf(P)).as("rebuilt from the new run and flipped").hasValue(v);
         clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
         r.sync();
@@ -996,6 +1011,37 @@ class ReshardJobTest {
             assertThat(r.syncer.served().get(s).value()).as(s + " at the new version").isEqualTo(pins.get(s));
         }
         assertEveryFileOnce(r, files, "fresh coordinator, after the hold");
+    }
+
+    private com.pharos.cluster.status.StatusState statusState;
+    private final List<com.pharos.cluster.status.StatusState.ReshardMark> marks = new ArrayList<>();
+
+    /**
+     * The project's reshard as {@code /cluster/status} shows it now (read from the bucket as a node reads
+     * it), advancing the shared status state so its reshard marks (the {@code reshard} events) are recorded.
+     */
+    private com.pharos.cluster.status.ClusterStatus.Reshard observeStatus() throws IOException {
+        var settings = com.pharos.cluster.status.StatusSettings.defaults();
+        var snap = new com.pharos.cluster.status.BucketStatusSource(store, layout, catalog, replicas,
+                Duration.ofSeconds(30), TTL, clock).read();
+        statusState = com.pharos.cluster.status.Proposals.advance(snap, statusState, settings);
+        marks.add(statusState.reshards().get(P));
+        return com.pharos.cluster.status.StatusBuilder.build(snap, statusState, settings).projects().stream()
+                .filter(p -> p.project().equals(P)).findFirst().orElseThrow().reshard();
+    }
+
+    /** Within one spec version and phase, a recorded reshard mark's step and shards never go down. */
+    private void assertMarksNeverGoBackwards() {
+        com.pharos.cluster.status.StatusState.ReshardMark prev = null;
+        for (var m : marks) {
+            if (prev != null && m != null && m.specVersion() == prev.specVersion() && m.phase().equals(prev.phase())) {
+                assertThat(m.step()).as("step within " + m.phase()).isGreaterThanOrEqualTo(prev.step());
+                if (m.shardsDone() != null && prev.shardsDone() != null) {
+                    assertThat(m.shardsDone()).as("shards within " + m.phase()).isGreaterThanOrEqualTo(prev.shardsDone());
+                }
+            }
+            prev = m;
+        }
     }
 
     /** The job's record of the generations it published. */

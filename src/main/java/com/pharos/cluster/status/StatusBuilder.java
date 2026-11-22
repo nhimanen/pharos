@@ -132,6 +132,7 @@ public final class StatusBuilder {
         List<ClusterStatus.Shard> shards = new ArrayList<>();
         int pendingCount = 0;
         Long oldest = null;
+        java.util.Set<String> pendingShards = new java.util.HashSet<>();
         for (ShardObs sh : s.shards()) {
             Membership m = member.getOrDefault(sh.shard(),
                     new Membership(null, ROLE_ORPHAN, SPEC_VERSION, false, null));
@@ -161,6 +162,7 @@ public final class StatusBuilder {
             }
             if (pendingAge != null) {
                 pendingCount++;
+                pendingShards.add(sh.shard());
                 oldest = oldest == null ? pendingAge : Math.max(oldest, pendingAge);
                 if (pendingAge > cfg.backlogSeconds()) {
                     health.add(new Health("shard-lagging", sh.shard(), "shard " + sh.shard()
@@ -225,19 +227,30 @@ public final class StatusBuilder {
         return new ClusterStatus(s.mode(), s.asOf().toString(),
                 new ClusterStatus.Layout(Proposals.summary(s), shards, writers, readers),
                 new ClusterStatus.BacklogSummary(pendingCount, oldest), health, Proposals.inForce(st, cands),
-                projects(s, projects), specs(s));
+                projects(s, projects, pendingShards), specs(s));
     }
 
-    private static List<ClusterStatus.Project> projects(StatusSnapshot s, List<ProjectObs> projects) {
+    private static List<ClusterStatus.Project> projects(StatusSnapshot s, List<ProjectObs> projects,
+                                                        java.util.Set<String> pendingShards) {
         Map<String, ShardObs> byId = new HashMap<>();
         for (ShardObs sh : s.shards()) byId.put(sh.shard(), sh);
         List<ClusterStatus.Project> out = new ArrayList<>();
         for (ProjectObs p : projects) {
             Long docs = null;
             Long bytes = null;
-            for (String id : p.shards()) {
+            Long generation = null;
+            boolean published = !p.shards().isEmpty();
+            boolean pending = false;
+            boolean cluster = StatusSnapshot.CLUSTER.equals(s.mode());
+            for (String id : p.shards()) { // the active shards only
                 ShardObs sh = byId.get(id);
+                pending |= pendingShards.contains(id);
+                // a single node has no generations: there a project is published once it was indexed
+                if (sh == null || (cluster ? sh.generation() == null : sh.publishedAt() == null)) published = false;
                 if (sh == null) continue;
+                if (sh.generation() != null) {
+                    generation = generation == null ? sh.generation() : Math.min(generation, sh.generation());
+                }
                 if (sh.docCount() != null) docs = (docs == null ? 0 : docs) + sh.docCount();
                 if (sh.sizeBytes() != null) bytes = (bytes == null ? 0 : bytes) + sh.sizeBytes();
             }
@@ -248,7 +261,7 @@ public final class StatusBuilder {
                     p.previous().specVersion(), p.previous().spec().toString(), p.previous().shards(),
                     p.previous().retiredAt() == null ? null : p.previous().retiredAt().toString());
             out.add(new ClusterStatus.Project(p.project(), p.specVersion(), p.spec().toString(), p.shards(), docs,
-                    bytes, staged, previous, ReshardProgress.of(s, p)));
+                    bytes, staged, previous, ReshardProgress.of(s, p), published, generation, pending));
         }
         return out;
     }

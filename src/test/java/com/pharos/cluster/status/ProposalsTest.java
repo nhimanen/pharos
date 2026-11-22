@@ -210,8 +210,8 @@ class ProposalsTest {
     }
 
     /**
-     * Ruling P6-R14: the proposal names a concrete spec and the exact command. An unringed project gets
-     * {@code [project, ring(path, shards=S)]} with {@code S = ceil(projectBytes / trigger)}, at least 2 (the
+     * Rulings P6-R14/R15: the proposal names a concrete spec and the exact command. An unringed project gets
+     * the ring appended with {@code S = ceil(largestShardBytes / trigger)}, at least 2 (the
      * trigger: 50% of the smallest reader cache cap); a ringed project of N shards gets
      * {@code shards = max(N + 1, S)}. A split project is one proposal, targeting the project.
      */
@@ -241,7 +241,24 @@ class ProposalsTest {
         assertThat(pm.target()).isEqualTo("app");
         assertThat(pm.action()).endsWith("pharos reshard app --spec \"[project, module, ring(path, shards=2)]\"");
 
-        // ringed, N = 4, one shard over the trigger, 1500 bytes in all → S = 2: max(N + 1, S) = 5
+        // fix round 1, I3 (P6-R15): [project, module] with 20 modules, one over the trigger: the ring splits
+        // every module, so S comes from the largest shard (1500 → 2), not the project's 1500 + 19 × 300 (→ 8)
+        List<StatusSnapshot.ShardObs> modules = new ArrayList<>();
+        List<String> moduleIds = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            String id = String.format("big~module=m%02d", i);
+            moduleIds.add(id);
+            modules.add(shard(id, true, i == 0 ? 1500L : 300L, null, null));
+        }
+        StatusSnapshot twenty = withProjects(modules, r, List.of(project("big", 5, "[project, module]", moduleIds,
+                false)));
+        ClusterStatus.Proposal p20 = StatusBuilder.build(twenty, Proposals.advance(twenty, null, CFG), CFG)
+                .proposals().get(0);
+        assertThat(p20.target()).isEqualTo("big");
+        assertThat(p20.metrics()).containsEntry("sizeBytes", 7200L).containsEntry("suggestedRingShards", 2);
+        assertThat(p20.action()).endsWith("pharos reshard big --spec \"[project, module, ring(path, shards=2)]\"");
+
+        // ringed, N = 4, the largest shard 1200 bytes → S = 2: max(N + 1, S) = 5
         List<String> ring4 = List.of("idx~ring=s01", "idx~ring=s02", "idx~ring=s03", "idx~ring=s04");
         StatusSnapshot ringed = withProjects(List.of(shard(ring4.get(0), true, 1200L, null, null),
                         shard(ring4.get(1), true, 100L, null, null), shard(ring4.get(2), true, 100L, null, null),
@@ -257,8 +274,10 @@ class ProposalsTest {
                     .containsEntry("largestShardBytes", 1200L).containsEntry("suggestedRingShards", 5);
         });
 
-        // ringed, N = 4, 4 × 2500 bytes → S = 10 > N + 1
-        StatusSnapshot heavy = withProjects(ring4.stream().map(id -> shard(id, true, 2500L, null, null)).toList(), r,
+        // ringed, N = 4, the largest shard 9500 bytes → S = 10 > N + 1 (from the largest shard, not the project)
+        StatusSnapshot heavy = withProjects(List.of(shard(ring4.get(0), true, 9500L, null, null),
+                        shard(ring4.get(1), true, 2500L, null, null), shard(ring4.get(2), true, 2500L, null, null),
+                        shard(ring4.get(3), true, 2500L, null, null)), r,
                 List.of(project("idx", 2, "[project, ring(path, shards=4)]", ring4, false)));
         assertThat(StatusBuilder.build(heavy, Proposals.advance(heavy, null, CFG), CFG).proposals().get(0).action())
                 .endsWith("--spec \"[project, ring(path, shards=10, vnodes=512)]\"");
