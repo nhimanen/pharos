@@ -263,9 +263,14 @@ class Node(p2.Reader):
         cfg = {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
-            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": True,
+            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"],
+            # hybrid-reranked needs it; GATE_CROSS_ENCODER=0 saves its memory where no query reranks
+            "crossEncoderEnabled": os.environ.get("GATE_CROSS_ENCODER", "1") == "1",
         }
-        if self.kind != "reference":
+        if self.kind != "reference" and p2.peer_mode():
+            cfg["cluster"] = p2.peer_cluster(self.name, self.port, self.cache_dir,
+                                             {"mode": "lazy", "shards": self.shards})
+        elif self.kind != "reference":
             cfg["cluster"] = {
                 "role": "reader", "backend": "object-store", "nodeId": "gate-" + self.name,
                 "pollIntervalSeconds": 10, "cacheDir": str(self.cache_dir),

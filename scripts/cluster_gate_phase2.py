@@ -214,6 +214,25 @@ def health(base):
 # --------------------------------------------------------------------------- readers
 
 
+def peer_mode():
+    """GATE_BACKEND=peer-pull (the Phase 5 gate, scripts/cluster-gate-phase5.sh): no bucket; readers
+    pull from the writers they find through cluster.peers.discovery (GATE_DISCOVERY)."""
+    return os.environ.get("GATE_BACKEND", "object-store") == "peer-pull"
+
+
+def peer_cluster(name, port, cache_dir, reader_cfg):
+    """The `cluster` section of a peer-pull reader: seeds discovery only (never a static writer map),
+    the cluster token, and an advertised URL (membership; peer readers fetch from it). Without
+    `shards` in reader_cfg, GATE_READER_SHARDS (comma separated) pins it."""
+    rc = dict(reader_cfg)
+    if "shards" not in rc and os.environ.get("GATE_READER_SHARDS"):
+        rc["shards"] = [x for x in os.environ["GATE_READER_SHARDS"].split(",") if x]
+    return {"role": "reader", "backend": "peer-pull", "nodeId": "gate-" + name, "cacheDir": str(cache_dir),
+            "reader": rc, "token": os.environ["GATE_TOKEN"], "advertiseUrl": f"http://127.0.0.1:{port}",
+            "peers": {"discovery": os.environ.get("GATE_DISCOVERY", "seeds:http://127.0.0.1:7300"),
+                      "refreshSeconds": int(os.environ.get("GATE_REFRESH_SECONDS", "10"))}}
+
+
 class Reader:
     """One reader web JVM with its own user.home / pharos.home under $GATE/readers/<name>."""
 
@@ -237,6 +256,15 @@ class Reader:
             link.symlink_to(os.environ["GATE_MODELS"])
         rc = {"mode": self.mode}
         rc.update(self.reader_cfg)
+        if peer_mode():
+            cfg = {
+                "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
+                                        "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
+                "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": False,
+                "cluster": peer_cluster(self.name, self.port, self.cache_dir, rc),
+            }
+            (self.ph / "config.json").write_text(json.dumps(cfg, indent=2))
+            return
         cfg = {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
@@ -244,6 +272,9 @@ class Reader:
             "cluster": {
                 "role": "reader", "backend": "object-store", "nodeId": "gate-" + self.name,
                 "pollIntervalSeconds": 10, "cacheDir": str(self.cache_dir), "reader": rc,
+                # required on readers since Phase 3
+                "advertiseUrl": f"http://127.0.0.1:{self.port}",
+                "token": os.environ.get("GATE_TOKEN", "gate2-cluster-token-0123456789"),
                 "objectStore": {
                     "endpoint": "http://127.0.0.1:9000", "region": "us-east-1", "bucket": "pharos-gate",
                     "prefix": "pharos", "pathStyle": True,
