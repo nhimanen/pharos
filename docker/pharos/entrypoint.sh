@@ -15,16 +15,38 @@ home="${PHAROS_HOME:-/data/pharos}"
 config="${PHAROS_CONFIG:-/etc/pharos/config.json}"
 
 mkdir -p "$home"
+
+# A cluster role must never fall back to pharos's default single node: no config is an error.
+if [ ! -f "$config" ]; then
+    case "$role" in
+        writer|reader|router)
+            echo "pharos-entrypoint: PHAROS_ROLE=$role needs a config at $config (mount the ConfigMap)" >&2
+            exit 78 ;;
+    esac
+fi
+
 # pharos reads $PHAROS_HOME/config.json and has no option for another path; link the mounted
 # file in rather than copying, so a ConfigMap update is seen on the next start.
 if [ -f "$config" ]; then
     ln -sf "$config" "$home/config.json"
-elif [ ! -f "$home/config.json" ]; then
+else
     echo "pharos-entrypoint: no config at $config; starting with defaults" >&2
 fi
 
 jar=/opt/pharos/pharos.jar
-set -- -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Dpharos.home="$home" ${JAVA_OPTS:-} -jar "$jar"
+# The flags ./pharos always passes, plus container-aware heap sizing.
+set -- -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError \
+    --enable-native-access=ALL-UNNAMED \
+    --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
+    --add-modules jdk.incubator.vector \
+    -Dpolyglot.engine.WarnInterpreterOnly=false \
+    -Dpharos.home="$home" ${JAVA_OPTS:-} -jar "$jar"
+
+case "$role" in
+    writer|reader|router)
+        # Same validation a node runs at startup; fail before serving anything.
+        java "$@" config validate "$config" || exit $? ;;
+esac
 
 case "$role" in
     writer|reader|all)

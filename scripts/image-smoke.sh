@@ -52,7 +52,7 @@ echo "image-smoke: indexing"
 docker run --rm -v "$vol:/data" -v "$tmp/project:/project:ro" -v "$tmp/etc:/etc/pharos:ro" \
     --entrypoint sh "$image" -c \
     'mkdir -p /data/pharos && ln -sf /etc/pharos/config.json /data/pharos/config.json
-     exec java -Dpharos.home=/data/pharos -jar /opt/pharos/pharos.jar index /project --project demo --no-embed --no-progress'
+     exec java --enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED --add-modules jdk.incubator.vector -Dpolyglot.engine.WarnInterpreterOnly=false -Dpharos.home=/data/pharos -jar /opt/pharos/pharos.jar index /project --project demo --no-embed --no-progress'
 
 echo "image-smoke: starting the node"
 docker run -d --name "$cname" -p 127.0.0.1::7070 -e PHAROS_ROLE=all \

@@ -597,6 +597,8 @@ Entrypoint contract:
 | `PHAROS_HOME` | State and model cache, `/data/pharos` (put a PVC on `/data`). |
 | `PHAROS_PORT`, `JAVA_OPTS` | Optional port and JVM options. |
 
+Pods must set `securityContext` `runAsUser: 10001` and `fsGroup: 10001` when a PVC is mounted on `/data` (the operator sets these). With `PHAROS_ROLE` writer, reader or router a missing config makes the container exit 78, and an invalid one fails `pharos config validate` before serving.
+
 Secrets reach the process only as env vars named by the config (`cluster.tokenEnv`, the object-store key envs); the entrypoint never writes them. It ends in `exec java`, so SIGTERM reaches the JVM. There is no `HEALTHCHECK`; use Kubernetes probes on `/health`. `scripts/image-smoke.sh` builds the image, runs one node and searches once; it needs a Docker daemon.
 
 ## How it works

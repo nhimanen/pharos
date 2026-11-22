@@ -87,6 +87,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push the pharos image
         uses: docker/build-push-action@v6
@@ -94,4 +95,6 @@ jobs:
           context: .
           file: docker/pharos/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/pharos:${{ steps.ver.outputs.version }}
+          tags: ghcr.io/${{ steps.ver.outputs.owner }}/pharos:${{ steps.ver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
