@@ -474,8 +474,10 @@ class ReconcilerMockServerTest {
 
         // no node answers: the floors (readers min 2) apply and the status says why nothing else does
         await("readers at the floor", () -> replicas("demo-readers") == 2);
-        await("ClusterStatusAvailable=False", () -> condition("demo", "ClusterStatusAvailable")
-                .map(c -> "False".equals(c.getStatus()) && c.getMessage().startsWith("nobody home")).orElse(false));
+        await("ClusterStatusAvailable=False", () -> {
+            var c = current("demo") == null ? null : condition("demo", "ClusterStatusAvailable");
+            return c != null && "False".equals(c.getStatus()) && c.getMessage().startsWith("nobody home");
+        });
         await("the token handed to the watch", () -> token.get() != null);
         assertThat(token.get()).isEqualTo(secretValue("demo-token", "token"));
 
@@ -499,7 +501,7 @@ class ReconcilerMockServerTest {
                 "readers", "2026-11-22T09:50:00Z", true, "2026-11-22T10:00:00Z", 2, 4));
         assertThat(st.reshardProposals()).singleElement().satisfies(r -> assertThat(r.target()).isEqualTo("lucene"));
         assertThat(st.readers().desired()).isEqualTo(4);
-        assertThat(condition("demo", "ClusterStatusAvailable").orElseThrow().getStatus()).isEqualTo("True");
+        assertThat(condition("demo", "ClusterStatusAvailable").getStatus()).isEqualTo("True");
         assertThat(replicas("demo-writers")).isEqualTo(1);
         await("the Events", () -> client.v1().events().inNamespace(NS).list().getItems().stream()
                 .map(e -> e.getReason()).toList().containsAll(List.of("Scaled", "ReshardProposed")));
@@ -511,6 +513,8 @@ class ReconcilerMockServerTest {
         assertThat(replicas("demo-readers")).isEqualTo(4);
         // after the cooldown (300 s), the next step
         clock.advance(Duration.ofSeconds(300));
+        StatusReading old = reading.get();
+        reading.set(new StatusReading(old.status(), clock.instant(), old.from())); // a fresh read
         update.get().run();
         await("readers ramped", () -> replicas("demo-readers") == 6);
     }
@@ -518,11 +522,5 @@ class ReconcilerMockServerTest {
     private int replicas(String sts) {
         StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(sts).get();
         return s == null ? -1 : s.getSpec().getReplicas();
-    }
-
-    private Optional<io.fabric8.kubernetes.api.model.Condition> condition(String cluster, String type) {
-        PharosCluster c = current(cluster);
-        if (c == null || c.getStatus() == null || c.getStatus().conditions() == null) return Optional.empty();
-        return c.getStatus().conditions().stream().filter(x -> type.equals(x.getType())).findFirst();
     }
 }

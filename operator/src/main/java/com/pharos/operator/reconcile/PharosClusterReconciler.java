@@ -228,6 +228,7 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 workflow.put(DesiredState.KEY, state);
                 workflow.reconcileManagedWorkflow();
                 Observed after = Observed.of(resource, context);
+                watch.token(token(resource, context)); // the first reconcile has just created the Secret
                 // every Job of this cluster: the informer is shared by name with the bucket Job's dependent
                 List<Job> jobs = context.getSecondaryResourcesAsStream(Job.class, DesiredState.MINIO_BUCKET).toList();
                 ProjectReconciler.Plan projects = ProjectReconciler.plan(resource, settings, jobs,

@@ -117,7 +117,9 @@ public final class ClusterStatusClient implements ClusterStatusEventSource.Watch
 
     @Override
     public void token(String token) {
+        String was = this.token;
         this.token = token == null || token.isBlank() ? null : token.strip();
+        if (was == null && this.token != null) wake.release(); // read now rather than at the next refresh
     }
 
     /** The latest read when it succeeded; empty when the last attempt found no node answering. */
@@ -133,6 +135,7 @@ public final class ClusterStatusClient implements ClusterStatusEventSource.Watch
 
     /** Starts the poller and the event subscription (virtual threads). */
     public ClusterStatusClient start() {
+        wake.drainPermits(); // the first read happens anyway
         poller = Thread.ofVirtual().name("pharos-status-" + label).start(this::pollLoop);
         events = Thread.ofVirtual().name("pharos-events-" + label).start(this::eventLoop);
         return this;
