@@ -199,7 +199,9 @@ public class ReplicaSyncer implements Closeable {
             boolean catalogEmpty;
             try {
                 java.util.Optional<List<ShardId>> listed = catalog.authoritativeShards();
-                shards = listed.orElse(List.of());
+                // not authoritative: missing, a transient empty read, or entries this build cannot
+                // parse (a newer release's ids); the readable ones still sync, nothing is dropped
+                shards = listed.isPresent() ? listed.get() : catalog.shards();
                 catalogEmpty = listed.isEmpty();
             } catch (RuntimeException e) {
                 throw new IOException("unreadable shard catalog: " + e.getMessage(), e);
@@ -208,9 +210,9 @@ public class ReplicaSyncer implements Closeable {
             if (!pin.isEmpty()) shards = shards.stream().filter(pin::contains).toList();
             wanted = List.copyOf(shards);
             if (catalogEmpty && !served.isEmpty()) {
-                // no catalog (or a non-authoritative empty read) may be transient: drop nothing
-                log.warn("The shard catalog is missing or lists no shard; keeping the {} served shard(s)",
-                        served.size());
+                // no catalog, a non-authoritative empty read or unreadable entries: drop nothing
+                log.warn("The shard catalog is missing, lists no shard or has entries this build cannot read;"
+                        + " keeping the {} served shard(s)", served.size());
             } else {
                 dropUnwanted(shards);
             }

@@ -149,6 +149,9 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   index: with an object-store backend it reads every catalog shard's `LATEST` manifest from the
   bucket (on any role, work-queue writers included), otherwise the local
   registry's projects. The Kubernetes operator runs it with the new image before an upgrade.
+  A catalog entry this release cannot parse (a newer release's shard id) counts as refused, and
+  readers no longer treat such a catalog as authoritative: they keep serving what they have instead
+  of dropping every shard.
 
 ### Changed (upgrade note)
 - `add-writers` is now raised when a shard's unpublished change is older than

@@ -37,6 +37,25 @@ class ObjectStoreCatalogTest {
         }
     }
 
+    /** Final review I2: a newer release's keyed id (Phase 6) after a downgrade. */
+    @Test
+    void anUnparseableEntryMakesTheCatalogNotAuthoritative() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"proj~k=v\"}]}".getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.shards()).isEmpty();
+        assertThat(catalog.unparseableEntries()).containsExactly("proj~k=v");
+        assertThat(catalog.authoritativeShards()).isEmpty(); // readers keep what they serve
+
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~k=v\"}]}"
+                .getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.authoritativeShards()).isEmpty();
+
+        store.put(layout.catalogKey(), "{\"shards\":[]}".getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.unparseableEntries()).isEmpty();
+        assertThat(catalog.authoritativeShards()).contains(List.of()); // really empty: authoritative
+    }
+
     @Test
     void invalidShardIdsAreSkipped() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();

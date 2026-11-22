@@ -18,4 +18,12 @@ public interface ShardCatalog {
         List<ShardId> s = shards();
         return s.isEmpty() ? Optional.empty() : Optional.of(s);
     }
+
+    /**
+     * The raw ids of catalog entries this build cannot parse as a shard id (e.g. a newer release's keyed
+     * ids), which {@link #shards()} skips. Empty by default.
+     */
+    default List<String> unparseableEntries() throws IOException {
+        return List.of();
+    }
 }

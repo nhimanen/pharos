@@ -392,6 +392,19 @@ class ReplicaSyncerTest {
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
     }
 
+    /** Final review I2: after a downgrade from a release with keyed ids, the reader drops nothing. */
+    @Test
+    void catalogOfOnlyUnparseableIdsDropsNothing() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+
+        store.put(layout.catalogKey(), "{\"shards\": [ {\"id\": \"proj~k=v\"} ]}".getBytes(StandardCharsets.UTF_8));
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+    }
+
     @Test
     void corruptedGraphIsRejected() throws Exception {
         publishFull();

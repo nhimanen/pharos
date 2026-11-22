@@ -253,14 +253,21 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
      */
     static int checkShards(com.pharos.cluster.ShardCatalog catalog, com.pharos.cluster.ReplicaSource source) {
         List<com.pharos.cluster.ShardId> shards;
+        List<String> unparseable;
         try {
             shards = catalog.shards();
+            unparseable = catalog.unparseableEntries();
         } catch (java.io.IOException e) {
             System.err.println("Reading the shard catalog failed: " + e.getMessage());
             return EXIT_INCOMPLETE;
         }
         int refused = 0;
         int unreadable = 0;
+        // an id this build cannot parse (a newer release's keyed shard): its readers could not serve it
+        for (String id : unparseable) {
+            System.out.printf("  %-25s  catalog entry this pharos cannot read: refused%n", id);
+            refused++;
+        }
         for (com.pharos.cluster.ShardId shard : shards) {
             try {
                 var gen = source.latest(shard);
@@ -278,7 +285,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
                 unreadable++;
             }
         }
-        return checkSummary(shards.size(), refused, unreadable, "shard");
+        return checkSummary(shards.size() + unparseable.size(), refused, unreadable, "shard");
     }
 
     /** {@code --check} without a bucket: the registry's projects, as this build would judge their indexes. */
