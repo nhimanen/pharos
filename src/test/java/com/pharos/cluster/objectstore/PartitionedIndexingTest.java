@@ -95,6 +95,9 @@ class PartitionedIndexingTest {
     private ObjectStoreCatalog catalog;
     private ObjectStoreReplicaSource replicas;
     private final List<Node> nodes = new ArrayList<>();
+    /** Catalog reads that succeed before an injected failure. */
+    private final java.util.concurrent.atomic.AtomicInteger catalogGetsLeft =
+            new java.util.concurrent.atomic.AtomicInteger(Integer.MAX_VALUE);
 
     /** One node: its own index dir and registry; publishes to the shared bucket unless {@code local}. */
     final class Node {
@@ -141,8 +144,16 @@ class PartitionedIndexingTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        store = new InMemoryObjectStore(clock);
         layout = new ObjectStoreLayout("pharos");
+        store = new InMemoryObjectStore(clock) {
+            @Override
+            public Optional<StoredObject> get(String key) {
+                if (key.equals(layout.catalogKey()) && catalogGetsLeft.getAndDecrement() <= 0) {
+                    throw new java.io.UncheckedIOException(new IOException("injected catalog read failure"));
+                }
+                return super.get(key);
+            }
+        };
         catalog = new ObjectStoreCatalog(store, layout);
         replicas = new ObjectStoreReplicaSource(store, layout);
         source = tmp.resolve("checkout");
@@ -514,5 +525,69 @@ class PartitionedIndexingTest {
                 .isInstanceOf(com.pharos.cluster.PublishConflictException.class)
                 .hasMessageContaining("resharded");
         for (ShardId s : SHARDS) assertThat(replicas.latest(s)).isEmpty();
+    }
+
+    @Test
+    void catalogFailureBeforeTheCommitsLeavesNoShardCommitted() throws IOException {
+        registerSplitProject();
+        Node a = new Node("node-a", false);
+        a.index(false, PLAN);
+        // the run's catalog check reads the catalog once, then each shard is registered (one read each):
+        // the second registration fails
+        Path changed = source.resolve("src/main/java/com/example/pkg2/C2.java");
+        Files.writeString(changed, Files.readString(changed).replace("}\n}\n",
+                "}\n    public int more(int x) { return x; }\n}\n"));
+        Files.setLastModifiedTime(changed, FileTime.fromMillis(Files.getLastModifiedTime(changed).toMillis() + 5000));
+        catalogGetsLeft.set(2);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> a.index(true, PLAN))
+                .hasMessageContaining("injected catalog read failure");
+        catalogGetsLeft.set(Integer.MAX_VALUE);
+        for (ShardId s : SHARDS) assertThat(replicas.latest(s)).as("shard %s", s).contains(Generation.FIRST);
+    }
+
+    @Test
+    void moduleChangeWithoutAnEditMovesDocuments() throws IOException {
+        ShardSpec byModule = ShardSpec.parse("[project, module]");
+        ShardId none = new ShardId("lib~module=_");
+        ShardId sub = new ShardId("lib~module=core-sub");
+        ShardPlan plan = new ShardPlan(PROJECT, byModule, List.of(none, sub));
+        Path s0 = writeClassAt("core/sub/src/main/java/com/example/sub/S0.java", "sub", "S0", 3);
+        writeClassAt("core/sub/src/main/java/com/example/sub/S1.java", "sub", "S1", 4);
+        Node a = new Node("node-a", true);
+        a.index(false, plan);
+        int total = docs(a.shardLucene(none)).size();
+        assertThat(docs(a.shardLucene(sub))).isEmpty();
+
+        // a build file appears: core/sub is a module now, and no source file was edited
+        Path pom = source.resolve("core/sub/pom.xml");
+        Files.writeString(pom, "<project/>\n");
+        a.index(true, plan);
+        Map<String, String> inSub = docs(a.shardLucene(sub));
+        assertThat(inSub).isNotEmpty();
+        assertThat(inSub.values()).allMatch(p -> p.startsWith(source.resolve("core/sub").toString()));
+        assertThat(inSub.values()).contains(s0.toString());
+        assertThat(docs(a.shardLucene(none)).values()).noneMatch(p -> p.startsWith(source.resolve("core").toString()));
+        assertThat(docs(a.shardLucene(none)).size() + inSub.size()).isEqualTo(total);
+        assertThat(LocalShardLayout.read(a.dir()).orElseThrow().modules()).containsExactly("core/sub");
+
+        // and goes again: the files return to the shard without a module
+        Files.delete(pom);
+        a.index(true, plan);
+        assertThat(docs(a.shardLucene(sub))).isEmpty();
+        assertThat(docs(a.shardLucene(none))).hasSize(total);
+
+        // a new module without a catalog shard fails the run before anything is written
+        Files.writeString(source.resolve("core/sub/build.gradle"), "");
+        Files.createDirectories(source.resolve("core/other"));
+        Path other = writeClassAt("core/other/src/main/java/com/example/other/O.java", "other", "O", 5);
+        Files.writeString(source.resolve("core/other/pom.xml"), "<project/>\n");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> a.index(true, plan))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("lib~module=core-other")
+                .hasMessageContaining("reshard");
+        assertThat(docs(a.shardLucene(none))).hasSize(total);
+        assertThat(docs(a.shardLucene(sub))).isEmpty();
+        assertThat(Files.exists(a.dir().resolve(LocalShardLayout.COMMITTING))).isFalse();
+        assertThat(other).exists();
     }
 }

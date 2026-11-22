@@ -98,13 +98,22 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
      * {@code [project]} shard) or a split project's ({@code projects/<project>/writer-state/}, ruling
      * P6-R2), with the same layout below it. {@code name} is what a backup index records as its owner.
      */
-    private record Scope(String label, String name, String prefix) {
+    private record Scope(String label, String name, String prefix, boolean project) {
         static Scope shard(ObjectStoreLayout layout, ShardId shard) {
-            return new Scope("Shard " + shard, shard.value(), layout.writerStatePrefix(shard));
+            return new Scope("Shard " + shard, shard.value(), layout.writerStatePrefix(shard), false);
         }
 
         static Scope project(ObjectStoreLayout layout, String project) {
-            return new Scope("Project " + project, project, layout.projectWriterStatePrefix(project));
+            return new Scope("Project " + project, project, layout.projectWriterStatePrefix(project), true);
+        }
+
+        /**
+         * A file this scope backs up besides {@code file-state.json}: the embedding caches, and for a split
+         * project its {@code shard-layout.json} (it records the build-module dirs the file state was built
+         * under).
+         */
+        boolean backsUp(String name) {
+            return EMBED_CACHE.matcher(name).matches() || (project && LocalShardLayout.FILE_NAME.equals(name));
         }
 
         String genPrefix(long gen) { return prefix + "gen-" + gen + "/"; }
@@ -141,7 +150,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         names.add(FILE_STATE);
         try (Stream<Path> s = Files.list(indexDir)) {
             s.map(p -> p.getFileName().toString())
-                    .filter(n -> EMBED_CACHE.matcher(n).matches())
+                    .filter(scope::backsUp)
                     .filter(n -> Files.isRegularFile(indexDir.resolve(n)))
                     .sorted()
                     .forEach(names::add);
@@ -280,7 +289,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
                 throw new Unusable(key + " has an invalid entry " + e);
             }
             boolean fileState = FILE_STATE.equals(e.name());
-            if (!fileState && !EMBED_CACHE.matcher(e.name()).matches()) {
+            if (!fileState && !scope.backsUp(e.name())) {
                 throw new Unusable(key + " lists an unexpected file " + e.name());
             }
             if (fileState ? !e.key().equals(genPrefix + FILE_STATE) : !e.key().equals(blobPrefix + e.sha256())) {
@@ -517,7 +526,10 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
                 if (materialiseProjectFile(runGen, f, staging)) downloaded++;
             }
             if (newest.indexFormat() != null) IndexFormat.write(staging, newest.indexFormat());
-            LocalShardLayout.write(staging, plan);
+            // the backed-up layout's module dirs describe the restored file state; the shards are the plan's
+            List<String> modules = LocalShardLayout.read(staging).filter(l -> l.matches(plan))
+                    .map(LocalShardLayout.Layout::modules).orElse(List.of());
+            LocalShardLayout.write(staging, plan, modules);
             CrossProjectLinker.touchStamp(staging.resolve("graph.stamp"));
             swap(staging, dir);
             // the shards are not all at one run: the local index mixes runs, which no file state describes

@@ -42,9 +42,14 @@ public final class LocalShardLayout {
     private LocalShardLayout() {}
 
     /** A recorded layout: the spec and the shards the local index holds. */
-    public record Layout(ShardSpec spec, List<ShardId> shards) {
+    public record Layout(ShardSpec spec, List<ShardId> shards, List<String> modules) {
         public Layout {
             shards = List.copyOf(shards);
+            modules = modules == null ? List.of() : List.copyOf(modules);
+        }
+
+        public Layout(ShardSpec spec, List<ShardId> shards) {
+            this(spec, shards, List.of());
         }
 
         /** True when this is exactly the layout {@code plan} indexes into. */
@@ -67,8 +72,10 @@ public final class LocalShardLayout {
             ShardSpec spec = ShardSpec.parse(root.path("spec").asText(null));
             List<ShardId> shards = new ArrayList<>();
             for (JsonNode s : root.path("shards")) shards.add(new ShardId(s.asText()));
+            List<String> modules = new ArrayList<>();
+            for (JsonNode m : root.path("modules")) modules.add(m.asText());
             if (spec.isDefault() || shards.isEmpty()) return Optional.empty();
-            return Optional.of(new Layout(spec, shards));
+            return Optional.of(new Layout(spec, shards, modules));
         } catch (IOException | RuntimeException e) {
             // an unreadable layout matches no plan: the next run is a full one, which rewrites it
             return Optional.of(new Layout(ShardSpec.PROJECT, List.of()));
@@ -77,10 +84,23 @@ public final class LocalShardLayout {
 
     /** Records {@code plan}'s layout (atomically replaced). */
     public static void write(Path projectDir, ShardPlan plan) throws IOException {
+        write(projectDir, plan, List.of());
+    }
+
+    /**
+     * Records {@code plan}'s layout and, for a spec keyed on {@code module}, the build-module dirs the run
+     * found: an incremental run that finds others is turned into a full one (files moved between modules
+     * without being edited).
+     */
+    public static void write(Path projectDir, ShardPlan plan, List<String> modules) throws IOException {
         ObjectNode root = JSON.createObjectNode();
         root.put("spec", plan.spec().toString());
         var arr = root.putArray("shards");
         plan.shards().forEach(s -> arr.add(s.value()));
+        if (!modules.isEmpty()) {
+            var mods = root.putArray("modules");
+            modules.forEach(mods::add);
+        }
         Path tmp = projectDir.resolve(FILE_NAME + ".tmp");
         Files.write(tmp, JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
         Files.move(tmp, projectDir.resolve(FILE_NAME), StandardCopyOption.REPLACE_EXISTING,

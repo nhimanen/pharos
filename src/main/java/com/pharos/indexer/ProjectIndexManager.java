@@ -682,6 +682,23 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
+        // [project, module]: a build file added or removed moves every file below it to another shard
+        // without editing any of them, so the run is full whenever the module dirs changed.
+        List<String> modules = keysOnModule(plan) ? moduleDirs(projectRoot) : List.of();
+        if (incremental && keysOnModule(plan)) {
+            List<String> recorded = luceneIndexer.localLayout(projectName)
+                    .map(LocalShardLayout.Layout::modules).orElse(List.of());
+            if (!recorded.equals(modules)) {
+                String msg = "build modules changed (" + recorded + " → " + modules + ") under spec " + plan.spec()
+                        + ": running a full re-index";
+                log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
+        RunPlan run = new RunPlan(plan, plan.isSplit()
+                ? new FileShardRouter(plan, projectRoot, f -> parserFor(f) instanceof GenericFileParser) : null,
+                modules);
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -704,26 +721,76 @@ public class ProjectIndexManager {
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, plan);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, run);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, plan);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, run);
         }
+    }
+
+    /**
+     * One run's shard routing: the plan, its file router (null for {@code [project]}) and the build-module
+     * dirs found at the start of the run (recorded in the layout for a spec keyed on {@code module}).
+     */
+    private record RunPlan(ShardPlan plan, FileShardRouter router, List<String> modules) {
+        /**
+         * Routes every file now, before anything is parsed or written: a file whose shard the catalog
+         * doesn't list (a new module, language, ...) fails the run here rather than after parsing and
+         * embedding.
+         */
+        void preRoute(java.util.Collection<Path> files) {
+            if (router == null) return;
+            for (Path f : files) router.shardOf(f.toAbsolutePath().toString());
+        }
+    }
+
+    /** True when the plan splits by the {@code module} key. */
+    static boolean keysOnModule(ShardPlan plan) {
+        return plan.isSplit() && plan.spec().fields().stream()
+                .anyMatch(f -> f instanceof com.pharos.cluster.sharding.ShardSpec.KeyField k && k.key().equals("module"));
+    }
+
+    /**
+     * The build-module dirs below {@code root} ({@link FileShardRouter#BUILD_FILES}), as normalised relative
+     * paths, sorted; the dirs a run skips ({@link #SKIP_DIRS}, dot dirs) are skipped, as their files are
+     * never indexed.
+     */
+    static List<String> moduleDirs(Path root) throws IOException {
+        Path abs = root.toAbsolutePath().normalize();
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        Files.walkFileTree(abs, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                if (!dir.equals(abs) && (SKIP_DIRS.contains(name) || name.startsWith("."))) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                Path dir = file.getParent();
+                if (dir != null && !dir.equals(abs) && FileShardRouter.BUILD_FILES.contains(file.getFileName().toString())) {
+                    out.add(com.pharos.cluster.sharding.DocKeys.normalizePath(abs, dir));
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return List.copyOf(out);
     }
 
     /**
      * The run's Lucene writers: the project's one writer for {@code [project]}, else one per shard of
      * {@code plan} with routing by file ({@link FileShardRouter}).
      */
-    private ShardedWriter openWriters(String projectName, Path projectRoot, ShardPlan plan, boolean fresh)
-            throws IOException {
-        if (!plan.isSplit()) {
+    private ShardedWriter openWriters(String projectName, RunPlan run, boolean fresh) throws IOException {
+        if (!run.plan().isSplit()) {
             return ShardedWriter.single(fresh ? luceneIndexer.openWriterFresh(projectName)
                     : luceneIndexer.openWriter(projectName));
         }
-        FileShardRouter router = new FileShardRouter(plan, projectRoot, f -> parserFor(f) instanceof GenericFileParser);
-        return ShardedWriter.split(ShardedWriter.openAll(plan.shards(),
-                s -> luceneIndexer.openShardWriter(projectName, s, fresh)), router);
+        return ShardedWriter.split(ShardedWriter.openAll(run.plan().shards(),
+                s -> luceneIndexer.openShardWriter(projectName, s, fresh)), run.router());
     }
 
     /** Before a split run commits its shards one by one: a crash in between makes the next run full. */
@@ -736,10 +803,11 @@ public class ProjectIndexManager {
      * commit marker; a full run also removes the Lucene dirs of any other layout (a {@code [project]}
      * run those of an earlier split). A {@code [project]} project that was never split has nothing to do.
      */
-    private void finishLayout(String projectName, Path projectIndexDir, ShardPlan plan, boolean full)
+    private void finishLayout(String projectName, Path projectIndexDir, RunPlan run, boolean full)
             throws IOException {
+        ShardPlan plan = run.plan();
         if (plan.isSplit()) {
-            LocalShardLayout.write(projectIndexDir, plan);
+            LocalShardLayout.write(projectIndexDir, plan, run.modules());
             if (full) luceneIndexer.dropOtherLayouts(projectName, plan.shards());
         } else if (full && (Files.exists(projectIndexDir.resolve(LocalShardLayout.FILE_NAME))
                 || Files.exists(projectIndexDir.resolve(LocalShardLayout.SHARDS_DIR)))) {
@@ -753,7 +821,8 @@ public class ProjectIndexManager {
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
                                    ProgressListener progress,
-                                   List<EmbedRuntime> runtimes, IndexAbort abort, ShardPlan plan) throws IOException {
+                                   List<EmbedRuntime> runtimes, IndexAbort abort, RunPlan run) throws IOException {
+        ShardPlan plan = run.plan();
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
         // Check dirty status against the pre-existing state before clearing it, so synonym mining
@@ -792,6 +861,7 @@ public class ProjectIndexManager {
 
         oversized.report(projectName);
         abort.checkpoint();
+        for (List<Path> files : filesByParser.values()) run.preRoute(files);
 
         // Also treat removed files as a change.
         if (!anyChanges[0]) {
@@ -838,7 +908,7 @@ public class ProjectIndexManager {
         // fails to get it before it can touch this run's graph generation. Lucene keeps the
         // previous commit visible to readers until the commit below.
         GraphIndexData graphData;
-        try (ShardedWriter writer = openWriters(projectName, projectRoot, plan, true)) {
+        try (ShardedWriter writer = openWriters(projectName, run, true)) {
           try {
             // No other run is in progress, so every graph dir but the live one is a leftover.
             CallGraph.removeUnusedGraphs(projectIndexDir);
@@ -886,7 +956,7 @@ public class ProjectIndexManager {
 
         // Save file state
         stateTracker.save();
-        finishLayout(projectName, projectIndexDir, plan, true);
+        finishLayout(projectName, projectIndexDir, run, true);
 
         // Update registry — record which models actually wrote vectors so the
         // search engine can validate per-project model availability later.
@@ -927,7 +997,8 @@ public class ProjectIndexManager {
                                           boolean generateEmbeddings, boolean buildSynonyms,
                                           ProgressListener progress,
                                           List<EmbedRuntime> runtimes, IndexAbort abort,
-                                          ShardPlan plan) throws IOException {
+                                          RunPlan run) throws IOException {
+        ShardPlan plan = run.plan();
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -1024,7 +1095,8 @@ public class ProjectIndexManager {
         // Collect parsed dirty files so we can use them for graph patching later (avoids re-parse)
         List<ParsedFile> parsedDirtyFiles = new ArrayList<>();
 
-        try (ShardedWriter writer = openWriters(projectName, projectRoot, plan, false)) {
+        run.preRoute(dirtyFiles);
+        try (ShardedWriter writer = openWriters(projectName, run, false)) {
           try {
             // Remove documents for deleted source files
             for (Path deleted : deletedFiles) {
@@ -1169,7 +1241,7 @@ public class ProjectIndexManager {
         }
 
         stateTracker.save();
-        finishLayout(projectName, projectIndexDir, plan, false);
+        finishLayout(projectName, projectIndexDir, run, false);
 
         // Patch call graph in-place — load existing graph, evict stale entries for
         // dirty/deleted files, splice in fresh edges from newly-parsed files.

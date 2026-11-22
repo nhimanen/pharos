@@ -375,9 +375,9 @@ public final class ObjectStorePublisher implements IndexPublisher {
      *
      * <p>Order: read every shard's {@code LATEST} → check the catalog still maps the project to exactly
      * this run's spec and shards (a reshard since the run started is a {@link PublishConflictException})
-     * → upload the project files → ship synonyms → upload every shard's new Lucene files → then, shard
-     * after shard in plan order with nothing slow in between, register, write the manifest and CAS
-     * {@code LATEST}, each under that shard's lease check → back up the project's writer state once →
+     * → upload the project files → ship synonyms → upload every shard's new Lucene files → register every
+     * shard in the catalog → then, shard after shard in plan order with nothing else in between, write the
+     * manifest and CAS {@code LATEST}, each under that shard's lease check → back up the project's writer state once →
      * GC every shard, then the project's files.
      *
      * <p><b>What readers see</b> (Review Focus 3): each shard's {@code LATEST} CAS is its own commit
@@ -469,7 +469,11 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 bytesUploaded += sl.bytesUploaded();
             }
 
-            // 5. Commit every shard: register, manifest, LATEST CAS (each under its lease check).
+            // 5. Register every shard before the first commit (idempotent), so a catalog failure leaves no
+            //    shard committed and nothing slow runs between the commits.
+            for (ShardId shard : plan.shards()) catalog.register(shard);
+
+            // 6. Commit every shard: manifest, LATEST CAS (each under its lease check), back to back.
             ProjectMeta meta = ShardManifest.stripRefs(snapshot.meta());
             IndexFormat.Stamp stamp = formatStamp(projectDir);
             Generation firstGen = null;
@@ -478,7 +482,6 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 Generation gen = p.map(l -> l.generation().next()).orElse(Generation.FIRST);
                 if (firstGen == null) firstGen = gen;
                 ShardLucene sl = lucene.get(shard);
-                catalog.register(shard);
                 long sizeBytes = sl.files().stream().mapToLong(ManifestFile::length).sum() + projectBytes;
                 ShardManifest manifest = new ShardManifest(ShardManifest.FORMAT_VERSION, shard.value(), gen.value(),
                         p.map(l -> l.generation().value()).orElse(null), Instant.now(), nodeId,
@@ -487,7 +490,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 commit(shard, gen, p, manifest.toJson());
             }
 
-            // 6. Best-effort: the project's writer state once, then GC of every shard and the project files.
+            // 7. Best-effort: the project's writer state once, then GC of every shard and the project files.
             try {
                 writerState.backupProject(project, projectGen, projectDir);
             } catch (IOException | RuntimeException e) {
