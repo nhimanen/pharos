@@ -30,14 +30,17 @@ import java.util.regex.Pattern;
  *       a file in the project root has the value {@code _});</li>
  *   <li>{@code ring(path, shards=N, vnodes=V)}: a consistent-hash ring over the normalised path, with
  *       shards {@code s01 … sNN}, or an explicit set {@code shards=[s01, s02, s04]} once a shard has been
- *       removed (names are stable and never renumbered). {@code vnodes} defaults to {@value #DEFAULT_VNODES}.
- *       At most one ring, and it is the last field.</li>
+ *       removed (names are stable and never renumbered). {@code vnodes} defaults to {@value #DEFAULT_VNODES}
+ *       (ruling P6-R10: with 128 a shard's share varied ±23% between projects) and is always written in the
+ *       canonical form, so a stored spec keeps its meaning if the default changes. At most one ring, and it
+ *       is the last field.</li>
  * </ul>
  *
  * <p><b>Shard ids</b> ({@link #assign}): the project, then {@code ~<key>=<value>} per field after it, in
  * spec order: {@code lucene~module=core~ring=s03}. Under {@code [project]} the id is the project name,
- * as in Phases 1–5. A key value is made id-safe: characters outside {@code [A-Za-z0-9._-]} become
- * {@code -}, a run of dots becomes one dot, a missing value is {@code _}, and a value longer than
+ * as in Phases 1–5. A key value is made id-safe: upper-case letters become lower-case (on a
+ * case-insensitive file system {@code Docs} and {@code docs} would share a cache dir), other characters
+ * outside {@code [a-z0-9._-]} become {@code -}, a run of dots becomes one dot, a missing value is {@code _}, and a value longer than
  * {@value #MAX_VALUE_LENGTH} characters is cut and suffixed with a hash of the original. Two values that
  * map to the same id-safe form share a shard; pruning (Task 3) applies the same mapping, so this is
  * always correct, just coarser.
@@ -55,7 +58,7 @@ import java.util.regex.Pattern;
  */
 public final class ShardSpec {
 
-    public static final int DEFAULT_VNODES = 128;
+    public static final int DEFAULT_VNODES = 512;
     public static final int MAX_VNODES = 1024;
     public static final int MAX_RING_SHARDS = 999;
     public static final int MAX_PREFIX_DEPTH = 16;
@@ -107,7 +110,8 @@ public final class ShardSpec {
         public String toString() {
             boolean contiguous = shards.first() == 1 && shards.last() == shards.size();
             String s = contiguous ? String.valueOf(shards.size()) : "[" + String.join(", ", names()) + "]";
-            return "ring(path, shards=" + s + (vnodes == DEFAULT_VNODES ? "" : ", vnodes=" + vnodes) + ")";
+            // vnodes always written: a stored spec must not change meaning if the default ever does
+            return "ring(path, shards=" + s + ", vnodes=" + vnodes + ")";
         }
     }
 
@@ -203,9 +207,11 @@ public final class ShardSpec {
         StringBuilder sb = new StringBuilder(raw.length());
         for (int i = 0; i < raw.length(); i++) {
             char c = raw.charAt(i);
-            boolean ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
             if (c == '.') {
                 if (sb.isEmpty() || sb.charAt(sb.length() - 1) != '.') sb.append('.');
+            } else if (c >= 'A' && c <= 'Z') {
+                sb.append((char) (c + ('a' - 'A'))); // case-insensitive file systems: Docs and docs are one dir
             } else {
                 sb.append(ok ? c : '-');
             }

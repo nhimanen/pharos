@@ -184,14 +184,15 @@ class ObjectStoreCatalogTest {
         ShardSpec ring4 = ShardSpec.parse("[project, ring(path, shards=4)]");
         assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).isEqualTo(2);
         String etag = store.get(layout.catalogKey()).orElseThrow().etag();
-        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project,ring(path,shards=4,vnodes=128)]")))
+        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project,ring(path,shards=4,vnodes=512)]")))
                 .as("same as the newest of its scope: no new version").isEqualTo(2);
         assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
         assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=5)]"))).isEqualTo(3);
         assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).as("going back is a new version").isEqualTo(4);
         assertThat(catalog.projectShards().specs()).extracting(v -> v.version() + " " + v.project().orElse("-") + " " + v.spec())
-                .containsExactly("1 - [project]", "2 lucene [project, ring(path, shards=4)]",
-                        "3 lucene [project, ring(path, shards=5)]", "4 lucene [project, ring(path, shards=4)]");
+                .containsExactly("1 - [project]", "2 lucene [project, ring(path, shards=4, vnodes=512)]",
+                        "3 lucene [project, ring(path, shards=5, vnodes=512)]",
+                        "4 lucene [project, ring(path, shards=4, vnodes=512)]");
         catalog.setActiveVersion(1);
         assertThat(catalog.projectShards().activeVersion()).hasValue(1);
         assertThatThrownBy(() -> catalog.setActiveVersion(2)).hasMessageContaining("belongs to project 'lucene'");

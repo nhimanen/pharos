@@ -875,7 +875,8 @@ public class ClusterConfig {
      *   <li>{@code projects.<name>}: the spec of one project, for example
      *       {@code "lucene": "[project, ring(path, shards=8)]"}.</li>
      * </ul>
-     * A spec other than {@code [project]} needs {@code cluster.backend: object-store} (ruling P6-R9).
+     * A spec other than {@code [project]} needs {@code cluster.backend: object-store} (ruling P6-R9); with
+     * {@code local} or {@code peer-pull} it is a validation error.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ShardingConfig {
@@ -895,12 +896,13 @@ public class ClusterConfig {
                 }
                 parsed.put(where, parse(where, e.getValue()));
             }
-            if (backend == BackendKind.PEER_PULL) {
+            // P6-R9: only the object store splits projects; peer-pull and the local single node keep [project]
+            if (backend != BackendKind.OBJECT_STORE) {
                 for (java.util.Map.Entry<String, com.pharos.cluster.sharding.ShardSpec> e : parsed.entrySet()) {
                     if (!e.getValue().isDefault()) {
-                        throw new IllegalStateException(e.getKey() + " is " + e.getValue() + ", but cluster.backend"
-                                + " 'peer-pull' supports only the default spec [project]: splitting a project into"
-                                + " several shards needs cluster.backend 'object-store'");
+                        throw new IllegalStateException(e.getKey() + " is " + e.getValue() + ", but cluster.backend '"
+                                + backend.json() + "' supports only the default spec [project]: splitting a project"
+                                + " into several shards needs cluster.backend 'object-store'");
                     }
                 }
             }

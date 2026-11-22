@@ -532,9 +532,10 @@ class ClusterConfigTest {
 
     @Test
     void shardingByDefaultAndPerProject() throws Exception {
-        ClusterConfig c = parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, module]\","
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"writer\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                + "\"sharding\":{\"default\":\"[project, module]\","
                 + "\"projects\":{\"lucene\":\"[project, ring(path, shards=8)]\"}}}}");
-        assertThat(c.getSharding().specFor("lucene").toString()).isEqualTo("[project, ring(path, shards=8)]");
+        assertThat(c.getSharding().specFor("lucene").toString()).isEqualTo("[project, ring(path, shards=8, vnodes=512)]");
         assertThat(c.getSharding().specFor("pharos").toString()).isEqualTo("[project, module]");
         String saved = mapper.writeValueAsString(c);
         assertThat(saved).contains("\"default\":\"[project, module]\"");
@@ -558,6 +559,23 @@ class ClusterConfigTest {
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("must not be empty");
     }
 
+    /** Ruling P6-R9: the local single node keeps [project] too; the message names the backend. */
+    @Test
+    void localBackendAllowsOnlyTheDefaultSpec() throws Exception {
+        assertThat(parse("{\"cluster\":{\"sharding\":{\"projects\":{\"a\":\"[project]\"}}}}")
+                .getSharding().specFor("a")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, module]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("cluster.sharding.default is [project, module], but cluster.backend 'local' supports only"
+                        + " the default spec [project]: splitting a project into several shards needs cluster.backend"
+                        + " 'object-store'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"backend\":\"local\",\"sharding\":{\"projects\":"
+                + "{\"lucene\":\"[project, ring(path, shards=4)]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.projects.lucene is [project, ring(path, shards=4, vnodes=512)],"
+                        + " but cluster.backend 'local'");
+    }
+
     /** Ruling P6-R9: a split project needs the object store; peer mode keeps [project]. */
     @Test
     void peerPullAllowsOnlyTheDefaultSpec() throws Exception {
@@ -566,7 +584,7 @@ class ClusterConfigTest {
                 .getSharding().specFor("a")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
         assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"projects\":{\"lucene\":\"[project, ring(path, shards=4)]\"}}}}"))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessage("cluster.sharding.projects.lucene is [project, ring(path, shards=4)], but cluster.backend"
+                .hasMessage("cluster.sharding.projects.lucene is [project, ring(path, shards=4, vnodes=512)], but cluster.backend"
                         + " 'peer-pull' supports only the default spec [project]: splitting a project into several"
                         + " shards needs cluster.backend 'object-store'");
         assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"default\":\"[project, module]\"}}}"))
