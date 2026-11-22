@@ -195,6 +195,28 @@ class SpecValidatorTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"a", "demo", "prod-eu-1"})
+    void clusterNamesThatFitTheDerivedObjectNamesAreValid(String name) {
+        assertThat(SpecValidator.validate(cluster(name))).isEmpty();
+        assertThat(SpecValidator.validate(cluster("a".repeat(40)))).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1demo", "demo.eu", "Demo", "demo-", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+    void clusterNameIsBoundedForDerivedObjectNames(String name) {
+        // at most 40 characters (OP-R4), and a DNS-1035 label since it prefixes Service names
+        assertThat(SpecValidator.validate(cluster(name))).singleElement().asString()
+                .startsWith("metadata.name: '" + name + "' must be at most 40 characters");
+    }
+
+    private static PharosCluster cluster(String name) {
+        PharosCluster c = new PharosCluster();
+        c.setMetadata(new io.fabric8.kubernetes.api.model.ObjectMetaBuilder().withName(name).build());
+        c.setSpec(valid());
+        return c;
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"minio.yaml", "s3.yaml"})
     void deployExamplesAreValid(String file) throws Exception {
         Path path = Path.of(System.getProperty("pharos.crdCommitted", "../deploy/crd"), "..", "examples", file);
@@ -206,6 +228,6 @@ class SpecValidatorTest {
                     .readValue(in, PharosCluster.class);
         }
         assertThat(cluster.getMetadata().getName()).isNotBlank();
-        assertThat(SpecValidator.validate(cluster.getSpec())).isEmpty();
+        assertThat(SpecValidator.validate(cluster)).isEmpty();
     }
 }

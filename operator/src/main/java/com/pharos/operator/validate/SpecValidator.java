@@ -1,6 +1,9 @@
 package com.pharos.operator.validate;
 
 import com.pharos.cluster.ShardId;
+import com.pharos.operator.Defaults;
+import com.pharos.operator.Names;
+import com.pharos.operator.api.PharosCluster;
 import com.pharos.operator.api.PharosClusterSpec;
 import com.pharos.operator.api.PharosClusterSpec.Autoscaling;
 import com.pharos.operator.api.PharosClusterSpec.Floor;
@@ -27,9 +30,9 @@ public final class SpecValidator {
 
     /** The scale-up load as a fraction of the target: pharos proposes add-readers at qps/reader ≥ qpsPerReader. */
     static final double SCALE_UP_LOAD_FRACTION = 1.0;
-    /** pharos's default {@code cluster.status.targets.qpsPerReader}. */
-    static final int DEFAULT_QPS_PER_READER = 50;
 
+    /** A DNS-1035 label: the cluster's name prefixes Service names, which must start with a letter. */
+    private static final Pattern DNS_LABEL = Pattern.compile("[a-z]([-a-z0-9]*[a-z0-9])?");
     private static final Pattern IMAGE_TAG = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}");
     private static final Pattern DNS_SUBDOMAIN =
             Pattern.compile("[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*");
@@ -37,6 +40,24 @@ public final class SpecValidator {
     private static final Set<String> SERVICE_TYPES = Set.of("ClusterIP", "NodePort", "LoadBalancer");
 
     private SpecValidator() {}
+
+    /**
+     * The resource: its name, which prefixes every object the operator creates (at most
+     * {@value Names#MAX_CLUSTER_NAME} characters, ruling OP-R4), and its spec.
+     *
+     * @return the problems found; empty when the resource is valid
+     */
+    public static List<String> validate(PharosCluster cluster) {
+        List<String> errors = new ArrayList<>();
+        String name = cluster.getMetadata() == null ? null : cluster.getMetadata().getName();
+        if (name == null || name.length() > Names.MAX_CLUSTER_NAME || !DNS_LABEL.matcher(name).matches()) {
+            errors.add("metadata.name: '" + name + "' must be at most " + Names.MAX_CLUSTER_NAME
+                    + " characters of a-z, 0-9 and '-', starting with a letter (it prefixes the names of the"
+                    + " objects the operator creates)");
+        }
+        errors.addAll(validate(cluster.getSpec()));
+        return errors;
+    }
 
     /** @return the problems found; empty when the spec is valid */
     public static List<String> validate(PharosClusterSpec spec) {
@@ -61,16 +82,6 @@ public final class SpecValidator {
             errors.add("spec.pharosConfig.token: not allowed; the operator generates the cluster token into a Secret");
         }
         return errors;
-    }
-
-    /** The role's floor: {@code min}, default 1. */
-    public static int min(RoleSpec role) {
-        return role == null || role.min() == null ? 1 : role.min();
-    }
-
-    /** The role's ceiling: {@code max}, default its {@code min}. */
-    public static int max(RoleSpec role) {
-        return role == null || role.max() == null ? min(role) : role.max();
     }
 
     private static void storage(PharosClusterSpec.Storage storage, List<String> errors) {
@@ -133,8 +144,8 @@ public final class SpecValidator {
             errors.add(path + ": is required (min and max)");
             return;
         }
-        int min = min(role);
-        int max = max(role);
+        int min = Defaults.min(role);
+        int max = Defaults.max(role);
         if (min < 1) errors.add(path + ".min: must be at least 1, got " + min);
         if (min > max) errors.add(path + ": min (" + min + ") is above max (" + max + ")");
         if (name.equals("writers")) {
@@ -198,8 +209,8 @@ public final class SpecValidator {
         if (floor == null) return;
         if (floor.min() == null || floor.min() < 1) {
             errors.add(path + ".min: must be at least 1, got " + floor.min());
-        } else if (spec != null && floor.min() > max(spec)) {
-            errors.add(path + ".min (" + floor.min() + ") is above spec." + role + ".max (" + max(spec) + ")");
+        } else if (spec != null && floor.min() > Defaults.max(spec)) {
+            errors.add(path + ".min (" + floor.min() + ") is above spec." + role + ".max (" + Defaults.max(spec) + ")");
         }
     }
 
@@ -224,7 +235,7 @@ public final class SpecValidator {
                     // Both loads as fractions of the target qpsPerReader: scale-down below pct/100,
                     // scale-up at SCALE_UP_LOAD_FRACTION. Scale-down must sit strictly below scale-up.
                     double downFraction = pct / 100.0;
-                    int target = qpsPerReader == null ? DEFAULT_QPS_PER_READER : qpsPerReader;
+                    int target = qpsPerReader == null ? Defaults.QPS_PER_READER : qpsPerReader;
                     if (pct < 1) {
                         errors.add(r + ".scaleDown.loadBelowPercent: must be at least 1, got " + pct);
                     } else if (downFraction >= SCALE_UP_LOAD_FRACTION) {

@@ -65,12 +65,41 @@ class PharosClusterReconcilerTest {
     }
 
     @Test
-    void validSpecIsPendingWithoutSpecInvalid() {
+    void validSpecIsProvisioningUntilStorageAndMinReplicasAreReady() {
         PharosCluster c = cluster(spec(new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("20Gi"), null), 1, 2));
-        PharosClusterStatus status = at(T0).reconcile(c, null).getResource().orElseThrow().getStatus();
-        assertThat(status.phase()).isEqualTo("Pending");
+        PharosClusterStatus status = at(T0).provisionedStatus(c, 1, 1,
+                new PharosClusterReconciler.Observed(null, null, 0, 0, 0, 0, false));
+        assertThat(status.phase()).isEqualTo("Provisioning");
         assertThat(condition(status, "SpecInvalid").getStatus()).isEqualTo("False");
-        assertThat(condition(status, "Pending").getReason()).isEqualTo("NotProvisioned");
+        assertThat(condition(status, "Pending").getStatus()).isEqualTo("False");
+        assertThat(condition(status, "Provisioning").getStatus()).isEqualTo("True");
+        assertThat(condition(status, "Provisioning").getMessage())
+                .isEqualTo("Waiting for MinIO, writers (0/1 ready), readers (0/1 ready), the router.");
+        assertThat(condition(status, "Ready").getStatus()).isEqualTo("False");
+        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false));
+
+        // MinIO up but the bucket Job not done yet: storage is still not ready
+        assertThat(at(T0).provisionedStatus(c, 1, 1, new PharosClusterReconciler.Observed(1, 1, 1, 1, 1, 1, false))
+                .phase()).isEqualTo("Provisioning");
+
+        PharosClusterStatus ready = at(T0).provisionedStatus(c, 2, 1,
+                new PharosClusterReconciler.Observed(2, 1, 2, 1, 1, 1, true));
+        assertThat(ready.phase()).isEqualTo("Ready");
+        assertThat(condition(ready, "Ready").getStatus()).isEqualTo("True");
+        assertThat(condition(ready, "Provisioning").getStatus()).isEqualTo("False");
+        assertThat(ready.writers()).isEqualTo(new PharosClusterStatus.Replicas(2, 2));
+        assertThat(ready.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", true));
+    }
+
+    @Test
+    void replicasStayWithinTheRoleRange() {
+        PharosClusterSpec.RoleSpec role = new PharosClusterSpec.RoleSpec(2, 5, null, null, null, null);
+        assertThat(PharosClusterReconciler.replicas(role, null)).isEqualTo(2); // not created yet: min
+        assertThat(PharosClusterReconciler.replicas(role, 4)).isEqualTo(4);    // the autoscaler's count is kept
+        assertThat(PharosClusterReconciler.replicas(role, 9)).isEqualTo(5);
+        assertThat(PharosClusterReconciler.replicas(role, 1)).isEqualTo(2);
+        assertThat(PharosClusterReconciler.replicas(new PharosClusterSpec.RoleSpec(null, null, null, null, null, null), 3))
+                .isEqualTo(1); // min 1, max = min
     }
 
     @Test

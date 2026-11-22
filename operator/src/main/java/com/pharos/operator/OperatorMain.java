@@ -31,9 +31,10 @@ public final class OperatorMain {
             throw new IllegalStateException("set WATCH_NAMESPACE: the operator watches one namespace only");
         }
         String ns = namespace;
-        operator.register(new PharosClusterReconciler(), c -> c.settingNamespace(ns));
+        OperatorSettings settings = OperatorSettings.fromEnv(System.getenv());
+        operator.register(new PharosClusterReconciler(settings), c -> c.settingNamespace(ns));
         operator.installShutdownHook(Duration.ofSeconds(30));
         operator.start();
-        LOG.info("pharos operator started, watching namespace {}", ns);
+        LOG.info("pharos operator started, watching namespace {} (pharos image {})", ns, settings.pharosImage());
     }
 }

@@ -34,6 +34,12 @@ spec:
             - name: WATCH_NAMESPACE
               valueFrom:
                 fieldRef: { fieldPath: metadata.namespace }
+            # The pharos image repository; each PharosCluster's spec.version is the tag.
+            - name: PHAROS_IMAGE
+              value: ghcr.io/OWNER/pharos
+            # minio mode only; pinned releases by default (uncomment to override):
+            # - { name: MINIO_IMAGE, value: "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z" }
+            # - { name: MC_IMAGE, value: "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z" }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { memory: 512Mi }

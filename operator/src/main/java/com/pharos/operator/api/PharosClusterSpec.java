@@ -71,14 +71,13 @@ public record PharosClusterSpec(
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record RouterService(String type) {}
 
-    /** Defaults: {@code cooldownSeconds} 300, {@code maxStepUp} 2, {@code maxStepDown} 1. */
+    /**
+     * Defaults ({@link com.pharos.operator.Defaults}): {@code cooldownSeconds} 300, {@code maxStepUp} 2,
+     * {@code maxStepDown} 1.
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Autoscaling(Boolean enabled, Integer cooldownSeconds, Integer maxStepUp, Integer maxStepDown,
-                              Triggers triggers, List<ScheduleEntry> schedule) {
-        public static final int DEFAULT_COOLDOWN_SECONDS = 300;
-        public static final int DEFAULT_MAX_STEP_UP = 2;
-        public static final int DEFAULT_MAX_STEP_DOWN = 1;
-    }
+                              Triggers triggers, List<ScheduleEntry> schedule) {}
 
     /** Rendered into pharos's {@code cluster.status.*} config; pharos raises the proposals. */
     @JsonInclude(JsonInclude.Include.NON_NULL)

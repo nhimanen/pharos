@@ -31,6 +31,11 @@ from the root. Modules:
   on the fat jar. The `PharosCluster` CRD is generated from `com.pharos.operator.api` into `operator/target/crd/`;
   the committed copy is `deploy/crd/`, and `CrdGenerationTest` fails when they drift. After changing the api
   classes: `mvn -pl operator -am test -Dtest=CrdGenerationTest -Dpharos.regenerateCrd=true`.
+  Spec defaults live only in `operator/.../Defaults.java` (validator, renderers and autoscaler share them);
+  every derived object name comes from `Names` (project names only via `Names.k8sName`). The renderers
+  (`render/`) build a `DesiredState` that JOSDK dependent resources apply with server-side apply.
+  `ReconcilerMockServerTest` runs a real `Operator` on fabric8's mock server, which has no SSA, so it
+  switches JOSDK to create/update; a second reconcile must leave every resourceVersion unchanged.
 
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency
