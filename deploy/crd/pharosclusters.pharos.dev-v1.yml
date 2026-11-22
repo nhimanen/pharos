@@ -283,6 +283,8 @@ spec:
                       type: "boolean"
                     registered:
                       type: "boolean"
+                    retries:
+                      type: "integer"
                   type: "object"
                 type: "array"
               proposals:

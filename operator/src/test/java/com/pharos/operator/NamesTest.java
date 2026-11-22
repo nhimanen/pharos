@@ -39,6 +39,19 @@ class NamesTest {
     }
 
     @Test
+    void projectObjectNames() {
+        assertThat(Names.registerJob("demo", "lucene", "1a2b3c")).isEqualTo("demo-register-lucene-" + hash("lucene") + "-1a2b3c");
+        assertThat(Names.removeJob("demo", "lucene")).isEqualTo("demo-remove-lucene-" + hash("lucene"));
+        assertThat(Names.gitCredentialsVolume("My.Repo")).isEqualTo("git-my-repo-" + hash("My.Repo"));
+        String cluster = "c".repeat(Names.MAX_CLUSTER_NAME);
+        String project = "Some.Very_Long-project-name-that-goes-on";
+        for (String n : java.util.List.of(Names.registerJob(cluster, project, "1a2b3c"), Names.removeJob(cluster, project),
+                Names.gitCredentialsVolume(project.repeat(3)))) {
+            assertThat(n).hasSizeLessThanOrEqualTo(Names.MAX_NAME).matches("[a-z0-9]([-a-z0-9]*[a-z0-9])?");
+        }
+    }
+
+    @Test
     void clusterObjectNames() {
         assertThat(Names.token("demo")).isEqualTo("demo-token");
         assertThat(Names.config("demo", "writer")).isEqualTo("demo-config-writer");

@@ -47,9 +47,21 @@ public record PharosClusterStatus(
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record StorageStatus(String kind, Boolean ready, Integer bucketRetries) {}
 
-    /** A project: whether its registration Job succeeded, plus what {@code /cluster/status} reports. */
+    /**
+     * A project: whether the catalog holds it ({@code registered}: a registration Job succeeded, and no
+     * removal has since), plus what {@code /cluster/status} reports. A project removed from the spec is
+     * listed until its removal Job succeeds. {@code retries}: how often its failed registration or
+     * removal Job was re-created (drives the backoff); cleared on success.
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ProjectStatus(String name, Boolean registered, Long generation, Long docCount, Boolean pending) {}
+    public record ProjectStatus(String name, Boolean registered, Long generation, Long docCount, Boolean pending,
+                                Integer retries) {
+
+        /** Name and registration only (the rest comes from {@code /cluster/status}). */
+        public ProjectStatus(String name, Boolean registered) {
+            this(name, registered, null, null, null, null);
+        }
+    }
 
     /**
      * A scaling proposal the operator has seen: pharos's {@code id}, {@code kind}, {@code target} and

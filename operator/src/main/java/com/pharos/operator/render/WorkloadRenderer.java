@@ -63,6 +63,10 @@ import java.util.random.RandomGenerator;
  * {@code terminationGracePeriodSeconds} = {@code drainSeconds} + 30 so pharos's SIGTERM drain finishes.
  * Each pod's own name (its node id, and the host of its advertised URL) is filled into its config by
  * an init container, since a ConfigMap is shared by the role.
+ *
+ * <p>Every writer mounts each project's {@code git.credentialsSecret} read-only at
+ * {@code /etc/pharos/git/<k8sName>} ({@link ConfigRenderer#gitCredentialsDir}); the writer config's
+ * {@code writer.gitCredentials} points that project's git calls at it.
  */
 public final class WorkloadRenderer {
 
@@ -77,6 +81,8 @@ public final class WorkloadRenderer {
 
     static final String CONFIG_MOUNT = "/etc/pharos";
     static final String CONFIG_TEMPLATE_MOUNT = "/etc/pharos-template";
+    /** Git credentials files: readable by the owner and the pod's group (fsGroup), as ssh requires of a key. */
+    static final int GIT_CREDENTIALS_MODE = 0440;
 
     private WorkloadRenderer() {}
 
@@ -208,6 +214,19 @@ public final class WorkloadRenderer {
 
         List<Volume> volumes = new ArrayList<>();
         List<Container> init = new ArrayList<>();
+        List<String> gitDirs = new ArrayList<>();
+        if (role == Role.WRITER) {
+            for (PharosClusterSpec.Project p : credentialProjects(cluster)) {
+                String volume = Names.gitCredentialsVolume(p.name());
+                String dir = ConfigRenderer.gitCredentialsDir(p.name());
+                gitDirs.add(dir);
+                // optional: a missing Secret fails only that project's git calls, not every writer's start
+                volumes.add(new VolumeBuilder().withName(volume).withNewSecret()
+                        .withSecretName(p.git().credentialsSecret()).withDefaultMode(GIT_CREDENTIALS_MODE)
+                        .withOptional(true).endSecret().build());
+                main.addNewVolumeMount().withName(volume).withMountPath(dir).withReadOnly(true).endVolumeMount();
+            }
+        }
         if (role == Role.ROUTER) {
             // no per-pod values in the router's config: mount the ConfigMap as is
             volumes.add(new VolumeBuilder().withName("config").withNewConfigMap().withName(configMap).endConfigMap().build());
@@ -215,7 +234,7 @@ public final class WorkloadRenderer {
             volumes.add(new VolumeBuilder().withName("config-template").withNewConfigMap().withName(configMap)
                     .endConfigMap().build());
             volumes.add(new VolumeBuilder().withName("config").withNewEmptyDir().endEmptyDir().build());
-            init.add(podConfigInit(image));
+            init.add(podConfigInit(image, gitDirs));
         }
         if (dataClaim == null) volumes.add(new VolumeBuilder().withName("data").withNewEmptyDir().endEmptyDir().build());
         volumes.add(new VolumeBuilder().withName("tmp").withNewEmptyDir().endEmptyDir().build());
@@ -234,17 +253,36 @@ public final class WorkloadRenderer {
                 .build();
     }
 
+    /** The projects with a {@code git.credentialsSecret}, in spec order. */
+    static List<PharosClusterSpec.Project> credentialProjects(PharosCluster cluster) {
+        List<PharosClusterSpec.Project> out = new ArrayList<>();
+        if (cluster.getSpec().projects() == null) return out;
+        for (PharosClusterSpec.Project p : cluster.getSpec().projects()) {
+            if (p != null && p.git() != null && p.git().credentialsSecret() != null) out.add(p);
+        }
+        return out;
+    }
+
+    /** {@link #podConfigInit(String, List)} with no git credentials directories. */
+    static Container podConfigInit(String image) {
+        return podConfigInit(image, List.of());
+    }
+
     /**
      * Copies the role's config into the pod, with {@link ConfigRenderer#POD_NAME_PLACEHOLDER} replaced by
      * the pod's name. The script avoids the {@code $(} sequence, which Kubernetes would expand itself.
+     * It also creates the mount points of the git credentials ({@code gitDirs}, under the config
+     * directory), so the main container's read-only config mount never needs a directory made in it.
      */
-    static Container podConfigInit(String image) {
+    static Container podConfigInit(String image, List<String> gitDirs) {
         String from = CONFIG_TEMPLATE_MOUNT + "/" + ConfigRenderer.CONFIG_KEY;
         String to = CONFIG_MOUNT + "/" + ConfigRenderer.CONFIG_KEY;
+        String script = "sed \"s/[$][(]POD_NAME[)]/${POD_NAME}/g\" " + from + " > " + to
+                + (gitDirs.isEmpty() ? "" : " && mkdir -p " + String.join(" ", gitDirs));
         return new ContainerBuilder()
                 .withName("pod-config")
                 .withImage(image)
-                .withCommand("sh", "-c", "sed \"s/[$][(]POD_NAME[)]/${POD_NAME}/g\" " + from + " > " + to)
+                .withCommand("sh", "-c", script)
                 .withEnv(new EnvVarBuilder().withName("POD_NAME")
                         .withNewValueFrom().withNewFieldRef().withFieldPath("metadata.name").endFieldRef().endValueFrom()
                         .build())

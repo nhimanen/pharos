@@ -178,8 +178,16 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 var workflow = context.managedWorkflowAndDependentResourceContext();
                 workflow.put(DesiredState.KEY, state);
                 workflow.reconcileManagedWorkflow();
-                desired = provisionedStatus(resource, writers, readers, Observed.of(resource, context), volumeNotes,
-                        retries);
+                Observed after = Observed.of(resource, context);
+                // every Job of this cluster: the informer is shared by name with the bucket Job's dependent
+                List<Job> jobs = context.getSecondaryResourcesAsStream(Job.class, DesiredState.MINIO_BUCKET).toList();
+                ProjectReconciler.Plan projects = ProjectReconciler.plan(resource, settings, jobs,
+                        storageReady(spec, after), clock.instant());
+                ProjectReconciler.apply(projects, resource, context);
+                if (projects.reschedule() != null && (reschedule == null || projects.reschedule().compareTo(reschedule) < 0)) {
+                    reschedule = projects.reschedule();
+                }
+                desired = provisionedStatus(resource, writers, readers, after, volumeNotes, retries, projects);
             }
             UpdateControl<PharosCluster> control = Objects.equals(desired, resource.getStatus())
                     ? UpdateControl.noUpdate() : UpdateControl.patchStatus(statusPatch(resource, desired));
@@ -312,22 +320,30 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 conditions.build());
     }
 
-    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer)} with nothing to note. */
+    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer, ProjectReconciler.Plan)} with nothing to note. */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed) {
-        return provisionedStatus(resource, writers, readers, observed, List.of(), null);
+        return provisionedStatus(resource, writers, readers, observed, List.of(), null, null);
+    }
+
+    /** The storage is usable: minio is ready with its bucket created, or an (unprobed) s3 bucket. */
+    static boolean storageReady(PharosClusterSpec spec, Observed observed) {
+        return !StorageRenderer.minioMode(spec) || (observed.minioReady() >= 1 && observed.bucketCreated());
     }
 
     /**
      * The status once the objects are applied: {@code Ready} when the storage is ready and at least
-     * {@code min} writers and readers and one router are ready, else {@code Provisioning}.
+     * {@code min} writers and readers and one router are ready, else {@code Provisioning};
+     * {@code Degraded} when a project Job failed. {@code projects}: the project plan of this reconcile,
+     * or null to keep the listed projects.
      */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed,
-                                          List<String> volumeNotes, Integer bucketRetries) {
+                                          List<String> volumeNotes, Integer bucketRetries,
+                                          ProjectReconciler.Plan projects) {
         PharosClusterSpec spec = resource.getSpec();
         PharosClusterStatus previous = resource.getStatus();
         boolean minio = StorageRenderer.minioMode(spec);
         // s3: an existing bucket the operator does not probe; reachability is reported by the nodes
-        boolean storageReady = !minio || (observed.minioReady() >= 1 && observed.bucketCreated());
+        boolean storageReady = storageReady(spec, observed);
         String storageReason;
         String storageMessage;
         if (!minio) {
@@ -360,23 +376,32 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
         if (observed.routerReady() < 1) waiting.add("the router");
         boolean ready = waiting.isEmpty();
         String waitingFor = "Waiting for " + String.join(", ", waiting) + ".";
+        boolean degraded = projects != null && !projects.failures().isEmpty();
+        String degradedMessage = degraded ? String.join("; ", projects.failures()) : "";
         var conditions = conditions(resource)
                 .set(Phase.Pending.name(), false, REASON_PROVISIONED, "The objects are created.")
                 .set(Phase.Provisioning.name(), !ready, ready ? REASON_READY : REASON_WAITING,
                         ready ? "" : waitingFor)
-                .set(Phase.Ready.name(), ready, ready ? REASON_READY : REASON_WAITING,
-                        ready ? "Storage, writers, readers and the router are ready." : waitingFor)
+                .set(Phase.Ready.name(), ready && !degraded,
+                        degraded ? Phase.Degraded.name() : ready ? REASON_READY : REASON_WAITING,
+                        degraded ? degradedMessage
+                                : ready ? "Storage, writers, readers and the router are ready." : waitingFor)
+                .set(Phase.Degraded.name(), degraded, degraded ? projects.degradedReason() : REASON_NONE,
+                        degradedMessage)
                 .set(PharosClusterStatus.CONDITION_STORAGE_READY, storageReady, storageReason, storageMessage)
                 .set(PharosClusterStatus.CONDITION_VOLUME_CHANGE_NOT_APPLIED, !volumeNotes.isEmpty(),
                         volumeNotes.isEmpty() ? REASON_NONE : REASON_IMMUTABLE_VOLUME, String.join("; ", volumeNotes))
                 .set(PharosClusterStatus.CONDITION_APPLY_FAILED, false, REASON_APPLIED, "")
                 .set(PharosClusterStatus.CONDITION_SPEC_INVALID, false, REASON_SPEC_VALID, "");
-        return new PharosClusterStatus((ready ? Phase.Ready : Phase.Provisioning).name(), generation(resource),
+        Phase phase = degraded ? Phase.Degraded : ready ? Phase.Ready : Phase.Provisioning;
+        return new PharosClusterStatus(phase.name(), generation(resource),
                 new PharosClusterStatus.Replicas(writers, observed.writersReady()),
                 new PharosClusterStatus.Replicas(readers, observed.readersReady()),
                 new PharosClusterStatus.StorageStatus(minio ? "minio" : "s3", storageReady,
                         observed.bucketCreated() ? null : bucketRetries),
-                previous == null ? null : previous.projects(), previous == null ? null : previous.proposals(),
+                projects != null ? (projects.projects().isEmpty() ? null : projects.projects())
+                        : previous == null ? null : previous.projects(),
+                previous == null ? null : previous.proposals(),
                 previous == null ? null : previous.reshardProposals(), conditions.build());
     }
 

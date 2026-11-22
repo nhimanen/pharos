@@ -63,6 +63,44 @@ class SpecValidatorTest {
                 new Triggers.ReaderScaleDown(loadBelowPercent, 1800)), null);
     }
 
+    private static List<String> gitErrors(String url, String ref) {
+        return SpecValidator.validate(spec(MINIO, List.of(new Project("p", new Git(url, ref, null), null)),
+                WRITERS, READERS, null));
+    }
+
+    @Test
+    void gitSourcesNeedARefAndNoCredentialsInTheUrl() {
+        assertThat(gitErrors("git@github.com:org/mypal.git", "main")).isEmpty();
+        assertThat(gitErrors("ssh://git@github.com/org/mypal.git", "v1.2")).isEmpty();
+        assertThat(gitErrors("https://github.com/apache/lucene.git", null))
+                .containsExactly("spec.projects[0].git.ref: is required (a branch, tag or commit)");
+        assertThat(gitErrors("https://github.com/apache/lucene.git", "--upload-pack=x"))
+                .containsExactly("spec.projects[0].git.ref: '--upload-pack=x' is not a valid git ref");
+        assertThat(gitErrors("--upload-pack=x", "main")).containsExactly("spec.projects[0].git.url: is not a valid git url");
+        // a password or token in the url is refused, and never echoed
+        for (String url : List.of("https://user:hunter2@github.com/o/r.git", "https://hunter2@github.com/o/r.git",
+                "ssh://git:hunter2@github.com/o/r.git")) {
+            assertThat(gitErrors(url, "main")).singleElement().asString()
+                    .startsWith("spec.projects[0].git.url: must not embed credentials").doesNotContain("hunter2");
+        }
+    }
+
+    @Test
+    void graniteR2NeedsPharos150() {
+        java.util.function.Function<String, List<String>> errors = version -> SpecValidator.validate(
+                new PharosClusterSpec(version, MINIO, new PharosClusterSpec.Embeddings("granite-r2"), List.of(),
+                        WRITERS, READERS, null, null, null));
+        assertThat(errors.apply("1.5.0")).isEmpty();
+        assertThat(errors.apply("1.6.0-rc1")).isEmpty();
+        assertThat(errors.apply("2.0.0")).isEmpty();
+        assertThat(errors.apply("1.4.9")).singleElement().asString()
+                .contains("granite-r2 needs pharos 1.5.0 or later").contains("'1.4.9'");
+        assertThat(errors.apply("latest")).singleElement().asString().contains("granite-r2 needs pharos 1.5.0");
+        assertThat(SpecValidator.validate(new PharosClusterSpec("1.4.1", MINIO,
+                new PharosClusterSpec.Embeddings("jina-v2-code"), List.of(), WRITERS, READERS, null, null, null)))
+                .as("other models: no version floor").isEmpty();
+    }
+
     @Test
     void validSpecHasNoErrors() {
         assertThat(SpecValidator.validate(valid())).isEmpty();

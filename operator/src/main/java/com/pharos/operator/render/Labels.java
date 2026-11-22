@@ -32,6 +32,15 @@ public final class Labels {
     public static final String TOKEN = "token";
     public static final String CONFIG = "config";
     public static final String NETWORK = "network";
+    /** A project's registration and removal Jobs. */
+    public static final String REGISTER = "register";
+    public static final String REMOVE = "remove";
+
+    /**
+     * Annotation on a project Job: the project's name as pharos knows it. A label could not hold every
+     * valid project name; object names only carry {@code Names.k8sName}.
+     */
+    public static final String PROJECT_ANNOTATION = "pharos.dev/project";
 
     private Labels() {}
 

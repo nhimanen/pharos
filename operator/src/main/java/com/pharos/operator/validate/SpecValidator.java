@@ -38,6 +38,10 @@ public final class SpecValidator {
     private static final Pattern DNS_SUBDOMAIN =
             Pattern.compile("[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*");
     private static final Set<String> READER_MODES = Set.of("lazy", "full");
+    /** The release a version tag starts with: {@code 1.6.0}, {@code 1.6.0-rc1}. */
+    private static final Pattern RELEASE = Pattern.compile("(\\d+)\\.(\\d+)\\.(\\d+)([-+.].*)?");
+    /** The first pharos release whose granite-r2 preset pools as the model needs (CLS). */
+    static final int[] GRANITE_R2_SINCE = {1, 5, 0};
     private static final Set<String> SERVICE_TYPES = Set.of("ClusterIP", "NodePort", "LoadBalancer");
 
     private SpecValidator() {}
@@ -74,6 +78,10 @@ public final class SpecValidator {
         if (spec.embeddings() != null && !EmbeddingPresets.names().contains(spec.embeddings().model())) {
             errors.add("spec.embeddings.model: must be one of " + new java.util.TreeSet<>(EmbeddingPresets.names())
                     + " (the models of `pharos embeddings enable`), got '" + spec.embeddings().model() + "'");
+        } else if (spec.embeddings() != null && EmbeddingPresets.GRANITE_R2.equals(spec.embeddings().model())
+                && spec.version() != null && !atLeast(spec.version(), GRANITE_R2_SINCE)) {
+            errors.add("spec.embeddings.model: granite-r2 needs pharos 1.5.0 or later (CLS pooling), and spec.version"
+                    + " is '" + spec.version() + "'");
         }
         projects(spec.projects(), errors);
         role("writers", spec.writers(), errors);
@@ -131,13 +139,57 @@ public final class SpecValidator {
             }
             if (p.git() == null || blank(p.git().url())) {
                 errors.add(path + ".git.url: is required");
-            } else if (p.git().credentialsSecret() != null) {
-                secretName(path + ".git.credentialsSecret", p.git().credentialsSecret(), errors);
+            } else {
+                String urlProblem = gitUrlProblem(p.git().url());
+                if (urlProblem != null) errors.add(path + ".git.url: " + urlProblem);
+                if (p.git().credentialsSecret() != null) {
+                    secretName(path + ".git.credentialsSecret", p.git().credentialsSecret(), errors);
+                }
             }
-            if (p.git() != null && p.git().ref() != null && blank(p.git().ref())) {
-                errors.add(path + ".git.ref: must not be blank");
+            if (p.git() != null && blank(p.git().ref())) {
+                errors.add(path + ".git.ref: is required (a branch, tag or commit)");
+            } else if (p.git() != null && (p.git().ref().startsWith("-") || p.git().ref().chars().anyMatch(Character::isWhitespace))) {
+                errors.add(path + ".git.ref: '" + p.git().ref() + "' is not a valid git ref");
             }
         }
+    }
+
+    /**
+     * Why a git url is unusable, or null. As pharos's own check: a url carrying a password (or a token as
+     * the user name) would be written into the catalog and the Job's arguments, so credentials come only
+     * from {@code credentialsSecret}. The url itself is never echoed: it may hold a secret.
+     */
+    static String gitUrlProblem(String url) {
+        if (url.startsWith("-") || url.chars().anyMatch(c -> Character.isWhitespace(c) || Character.isISOControl(c))) {
+            return "is not a valid git url";
+        }
+        if (!url.contains("://")) return null; // scp-style git@host:path carries no password
+        String userInfo;
+        try {
+            userInfo = new java.net.URI(url).getRawUserInfo();
+        } catch (java.net.URISyntaxException e) {
+            return "is not a valid URI";
+        }
+        if (userInfo == null) return null;
+        String scheme = url.substring(0, url.indexOf("://")).toLowerCase(java.util.Locale.ROOT);
+        boolean sshUser = scheme.startsWith("ssh") && !userInfo.contains(":");
+        return sshUser ? null : "must not embed credentials; put them in a Secret named by git.credentialsSecret";
+    }
+
+    /** Whether version tag {@code version} is at least release {@code min}; false for a tag that is no release. */
+    static boolean atLeast(String version, int[] min) {
+        var m = RELEASE.matcher(version);
+        if (!m.matches()) return false;
+        for (int i = 0; i < 3; i++) {
+            long v;
+            try {
+                v = Long.parseLong(m.group(i + 1));
+            } catch (NumberFormatException e) {
+                return true; // more digits than a long: a very large version
+            }
+            if (v != min[i]) return v > min[i];
+        }
+        return true;
     }
 
     private static void role(String name, RoleSpec role, List<String> errors) {

@@ -31,6 +31,11 @@ class NoSecretsRenderedTest {
         ConfigRenderer.Result configs = ConfigRenderer.render(cluster);
         assertThat(configs.errors()).isEmpty();
         List<HasMetadata> all = new ArrayList<>(DesiredState.render(cluster, configs, SETTINGS, 2, 3).objects().values());
+        // the project Jobs the reconciler creates on the side
+        for (var p : cluster.getSpec().projects()) {
+            all.add(ProjectJobRenderer.registration(cluster, p, SETTINGS));
+            all.add(ProjectJobRenderer.removal(cluster, p.name(), SETTINGS));
+        }
         all.add(DesiredState.secret(DesiredState.TOKEN, cluster, random));
         if (StorageRenderer.minioMode(cluster.getSpec())) {
             all.add(DesiredState.secret(DesiredState.MINIO_CREDENTIALS, cluster, random));

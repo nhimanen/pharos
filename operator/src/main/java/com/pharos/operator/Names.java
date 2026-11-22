@@ -43,6 +43,28 @@ public final class Names {
 
     public static String minioBucketJob(String cluster) { return cluster + "-minio-bucket"; }
 
+    /** Hex characters of the spec hash in a registration Job's name. */
+    public static final int SPEC_HASH_LENGTH = 6;
+
+    /**
+     * A project's registration Job for one source: {@code <name>-register-<k8sName>-<specHash>}, so a
+     * changed source gets a new Job (Jobs are create-only). {@code specHash}: {@value #SPEC_HASH_LENGTH}
+     * hex characters.
+     */
+    public static String registerJob(String cluster, String project, String specHash) {
+        return withProject(cluster + "-register-", project, "-" + specHash);
+    }
+
+    /** A project's removal Job: {@code <name>-remove-<k8sName>}. */
+    public static String removeJob(String cluster, String project) {
+        return withProject(cluster + "-remove-", project, "");
+    }
+
+    /** A project's git credentials volume on the writers: {@code git-<k8sName>}. */
+    public static String gitCredentialsVolume(String project) {
+        return "git-" + k8sName(project, MAX_NAME - 4);
+    }
+
     /** The NetworkPolicy fencing the writers' and readers' port. */
     public static String networkPolicy(String cluster) { return cluster + "-internal"; }
 

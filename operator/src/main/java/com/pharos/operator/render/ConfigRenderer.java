@@ -71,6 +71,8 @@ public final class ConfigRenderer {
     public static final String WORK_DIR = "/data/work";
     /** A reader's block cache, on its {@code cache} PVC. */
     public static final String CACHE_DIR = "/data/cache";
+    /** Where each project's git credentials Secret is mounted on the writers: {@code <here>/<k8sName>}. */
+    public static final String GIT_CREDENTIALS_DIR = "/etc/pharos/git";
     /** Share of the reader's cache PVC its block cache may fill; the rest holds the small eager files and the model. */
     static final double CACHE_SHARE = 0.75;
 
@@ -80,7 +82,7 @@ public final class ConfigRenderer {
      */
     public static final List<String> OWNED_KEYS = List.of(
             "role", "backend", "objectStore", "token", "tokenEnv", "nodeId", "advertiseUrl",
-            "writer.workQueue", "writer.workDir", "cacheDir", "reader.mode",
+            "writer.workQueue", "writer.workDir", "writer.gitCredentials", "cacheDir", "reader.mode",
             "status.targets.warmP95Millis", "status.targets.qpsPerReader", "status.windows.addReadersSeconds",
             "status.removeReadersLoad", "status.windows.removeReadersSeconds",
             "status.writers.backlogShards", "status.writers.oldestPendingSeconds", "status.windows.addWritersSeconds",
@@ -215,6 +217,7 @@ public final class ConfigRenderer {
         if (role == Role.WRITER) {
             c.getWriter().setWorkQueue(true);
             c.getWriter().setWorkDir(Path.of(WORK_DIR));
+            c.getWriter().setGitCredentials(gitCredentials(spec));
         }
         if (role == Role.READER) {
             c.setCacheDir(Path.of(CACHE_DIR));
@@ -223,6 +226,26 @@ public final class ConfigRenderer {
         }
         triggers(spec, c.getStatus());
         return c;
+    }
+
+    /**
+     * {@code writer.gitCredentials}: each project with a {@code git.credentialsSecret}, to the directory
+     * the writers mount that Secret at. Paths only; the Secret's values never reach a config.
+     */
+    static Map<String, Path> gitCredentials(PharosClusterSpec spec) {
+        Map<String, Path> out = new java.util.TreeMap<>();
+        if (spec.projects() == null) return out;
+        for (PharosClusterSpec.Project p : spec.projects()) {
+            if (p != null && p.git() != null && p.git().credentialsSecret() != null) {
+                out.put(p.name(), Path.of(gitCredentialsDir(p.name())));
+            }
+        }
+        return out;
+    }
+
+    /** The mount path of {@code project}'s git credentials on the writers. */
+    public static String gitCredentialsDir(String project) {
+        return GIT_CREDENTIALS_DIR + "/" + Names.k8sName(project);
     }
 
     /** A reader's block-cache cap: {@value #CACHE_SHARE} of its cache PVC. */
