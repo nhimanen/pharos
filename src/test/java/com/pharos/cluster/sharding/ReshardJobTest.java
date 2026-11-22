@@ -905,6 +905,57 @@ class ReshardJobTest {
     }
 
     /**
+     * Fix round 2: a writer that takes a project over while its reshard is pinned, with a source commit
+     * pending, flips the reshard first (it needs neither a local build nor the source), then indexes the
+     * commit on the new version.
+     */
+    @Test
+    void aTakeoverWithAPendingCommitFlipsThenIndexesIt() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        int v = catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        assertThat(catalog.projectShards().stagedOf(P).orElseThrow().pinned()).isTrue();
+
+        Path f = src.resolve(files.getFirst());
+        Files.writeString(f, Files.readString(f).replace("Part 0 of", "Part zero of"));
+        Files.setLastModifiedTime(f, FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        Writer b = new Writer("node-b");
+        clock.advance(TTL.toSeconds() + 5); // A is gone
+        b.loop.tick();
+        assertThat(b.loop.heldShards()).containsAll(ring(4));
+        r.sync(); // the reader prepares the new version
+        for (int i = 0; i < 3 && !catalog.projectShards().specVersionOf(P).equals(java.util.OptionalInt.of(v)); i++) {
+            clock.advance(10);
+            b.loop.tick();
+        }
+        assertThat(catalog.projectShards().specVersionOf(P)).as("flipped despite the pending commit").hasValue(v);
+        for (int i = 0; i < 4 && !catalog.projectShards().pinsOf(P).isEmpty(); i++) {
+            clock.advance(10);
+            b.loop.tick();
+        }
+        assertThat(catalog.projectShards().pinsOf(P)).as("the commit was indexed on the new version").isEmpty();
+        r.sync();
+        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        r.sync();
+        assertEveryFileOnce(r, files, "after the flip and the commit");
+        ShardId holder = shardOf(RING5, files.getFirst());
+        try (FSDirectory d = FSDirectory.open(r.cache.active(holder.value()).orElseThrow().resolve("lucene"));
+             DirectoryReader dr = DirectoryReader.open(d)) {
+            boolean found = false;
+            StoredFields sf = dr.storedFields();
+            for (int doc = 0; doc < dr.maxDoc() && !found; doc++) {
+                String body = sf.document(doc).get("javadoc");
+                found = body != null && body.contains("Part zero of");
+            }
+            assertThat(found).as("the committed text is served").isTrue();
+        }
+    }
+
+    /**
      * Fix round 1, I2: right after the flip a reader keeps serving the rewritten shards at their previous
      * generations for the activation hold, so a coordinator still routing the previous version (its catalog
      * read predates the flip) reads it complete; once the hold is over the reader serves the new version.

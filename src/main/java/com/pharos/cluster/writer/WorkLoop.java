@@ -1097,41 +1097,46 @@ public final class WorkLoop implements Closeable {
             ShardState st = shards.get(unit);
             if (st == null || diskLow()) continue;
             boolean built = job.builtLocally(project, map);
-            if (st.pendingSince != null && !built) continue; // the source changed: its index run goes first
+            // A pinned reshard is published: the step only waits for the readers and flips, which needs neither a
+            // local build nor the source. It goes first whatever else the project waits for (a source change, a
+            // restore or a full run): those are done after the flip, on the new version.
+            boolean pinned = reshardPinned(unit);
+            if (!pinned && st.pendingSince != null && !built) continue; // the source changed: its index run goes first
             busy = unit;
             try {
                 Path indexDir = lucene.getProjectIndexDir(project);
-                Path root;
-                try {
-                    root = checkout.prepare(unit, st.source).toAbsolutePath().normalize();
-                    st.prepared = true;
-                } catch (IOException | RuntimeException e) {
-                    log.warn("Reshard of project {}: checking out the source failed (retrying next poll): {}", project,
-                            e.toString());
-                    continue;
-                }
-                if (!lucene.indexExists(project)) {
-                    Restore r = restoreLocal(unit, st, root, indexDir);
-                    if (r == null) continue;
-                    if (r.full()) { // its full run goes first
-                        st.upgrade = r.why();
+                Path root = indexDir; // unused by a pinned step
+                if (!pinned) {
+                    try {
+                        root = checkout.prepare(unit, st.source).toAbsolutePath().normalize();
+                        st.prepared = true;
+                    } catch (IOException | RuntimeException e) {
+                        log.warn("Reshard of project {}: checking out the source failed (retrying next poll): {}",
+                                project, e.toString());
+                        continue;
+                    }
+                    if (!lucene.indexExists(project)) {
+                        Restore r = restoreLocal(unit, st, root, indexDir);
+                        if (r == null) continue;
+                        if (r.full()) { // its full run goes first
+                            st.upgrade = r.why();
+                            if (st.pendingSince == null) st.pendingSince = clock.instant();
+                            continue;
+                        }
+                    }
+                    Optional<ProjectMeta> local = projects.find(project);
+                    if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED)) || local.isEmpty()
+                            || !sameRoot(local.get().getRootPath(), root)) {
+                        log.info("Reshard of project {}: its local index needs a full run first", project);
+                        continue;
+                    }
+                    if (!built && !atPublishedRevision(unit, st)) {
+                        // the reshard splits the published run: what changed since is indexed (and published) first
+                        log.info("Reshard of project {}: its source moved past the published revision; indexing it"
+                                + " first", project);
                         if (st.pendingSince == null) st.pendingSince = clock.instant();
                         continue;
                     }
-                }
-                Optional<ProjectMeta> local = projects.find(project);
-                if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED)) || local.isEmpty()
-                        || !sameRoot(local.get().getRootPath(), root)) {
-                    log.info("Reshard of project {}: its local index needs a full run first", project);
-                    continue;
-                }
-                boolean pinned = map.stagedOf(project).filter(x -> !x.abandoned() && x.pinned()).isPresent();
-                if (!built && !pinned && !atPublishedRevision(unit, st)) {
-                    // the reshard splits the published run: what changed since is indexed (and published) first
-                    log.info("Reshard of project {}: its source moved past the published revision; indexing it first",
-                            project);
-                    if (st.pendingSince == null) st.pendingSince = clock.instant();
-                    continue;
                 }
                 Run run = new Run(unit, st.leaseShards, clock.millis());
                 current = run;

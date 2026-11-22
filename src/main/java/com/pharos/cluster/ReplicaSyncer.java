@@ -154,6 +154,8 @@ public class ReplicaSyncer implements Closeable {
     private java.util.function.LongSupplier clock = System::currentTimeMillis;
     private Duration retireGrace = Duration.ofSeconds(120);
     private volatile Duration activationHold = Duration.ofSeconds(15);
+    /** When this reader first saw each flip (project@retiredAt): the activation hold starts there. */
+    private final Map<String, Long> flipSeen = new HashMap<>();
     private boolean swept;
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
@@ -201,7 +203,7 @@ public class ReplicaSyncer implements Closeable {
     }
 
     /**
-     * How long after a reshard flip ({@code previous.retiredAt}) a shard the flip rewrote keeps serving its
+     * How long after this reader first sees a reshard flip a shard the flip rewrote keeps serving its
      * previous generation: at least the time every coordinator takes to re-read the catalog, so none still
      * routing the previous version finds the shard gone ({@code 3 × catalog cache}, as the flip's own
      * minimum pinned age).
@@ -267,6 +269,7 @@ public class ReplicaSyncer implements Closeable {
             Set<ShardId> wantedSet = new HashSet<>(shards);
             Set<ShardId> inSets = new HashSet<>();
             List<SyncSet> sets = new ArrayList<>();
+            Set<String> flipsNow = new HashSet<>();
             for (String project : map.projects()) { // split projects' active, staged and retired sets (pinned part)
                 Set<ShardId> active = new HashSet<>(map.shardsOf(project));
                 Map<ShardId, Long> pins = map.pinsOf(project);
@@ -287,7 +290,11 @@ public class ReplicaSyncer implements Closeable {
                             rewritten.add(sh);
                         }
                     }
-                    holdUntil = prev.get().retiredAt().plus(activationHold).toEpochMilli();
+                    // timed from this reader's first sight of the flip: no dependence on the writer's clock
+                    String flipKey = project + "@" + prev.get().retiredAt();
+                    flipsNow.add(flipKey);
+                    long seen = flipSeen.computeIfAbsent(flipKey, k -> clock.getAsLong());
+                    holdUntil = seen + activationHold.toMillis();
                 }
                 if (map.isSplit(project) || !pins.isEmpty()) {
                     addSet(sets, inSets, wantedSet, new SyncSet(project, SetRole.ACTIVE, map.shardsOf(project), pins,
@@ -311,6 +318,7 @@ public class ReplicaSyncer implements Closeable {
                 }
             }
             syncSets(sets);
+            flipSeen.keySet().retainAll(flipsNow);
             prepared.keySet().retainAll(wantedSet);
             snapshotPrepared();
             if (lazy != null) lazy.sweep();
