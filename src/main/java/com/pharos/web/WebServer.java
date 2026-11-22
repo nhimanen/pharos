@@ -1378,7 +1378,7 @@ public class WebServer {
     /** Returns a sorted map of file-extension → doc count for the given project. */
     private Map<String, Integer> buildLanguageBreakdown(ProjectMeta meta) throws IOException {
         if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
-        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(meta.getName()));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();
@@ -1413,7 +1413,7 @@ public class WebServer {
                 : null;
         final int depthLimit = depth; // -1 = unlimited
 
-        IndexReader reader = luceneIndexer.openReader(projectName);
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(projectName));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();
@@ -1477,7 +1477,7 @@ public class WebServer {
     /** Builds a FQN → filePath map by scanning the Lucene index for a project. */
     private Map<String, String> buildFqnToFilePath(ProjectMeta meta) throws IOException {
         if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
-        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(meta.getName()));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();
