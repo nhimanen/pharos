@@ -49,6 +49,13 @@ from the root. Modules:
   informational copy, so cooldown and episodes survive a restart or a failed status patch; writer scale-down passes `ScaleDownGate` (removed ordinals' heartbeats and leases gone);
   `ScheduleFloors` raises `min` (cron via `CronSchedule`, also the validator's parser). Tests use
   `ClusterStatusEventSource.NEVER_ANSWERS` or a fake `Watch`.
+  Workload versions come from `upgrade/UpgradeCoordinator` (pure): a changed `spec.version` first runs
+  Job `<name>-preflight-<version>` (`PreflightJobRenderer`: the new image, `pharos upgrade-indexes --check`,
+  exit 3 = a shard refused → `UpgradeBlocked`, nothing applied), then rolls readers, writers, router, each
+  only once the previous role is rolled out and every pod heartbeats in `/cluster/status` (started after
+  the `pharos.dev/version-since` annotation, applied with the image). Project Jobs use the writers' version.
+  Phase and conditions (StorageReady, ReadersReady, WritersReady, ProjectsPublished, UpgradeBlocked) come
+  from `status/PhaseEvaluator` (pure), merged by the reconciler into its one status patch.
 
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency

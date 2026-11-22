@@ -365,7 +365,7 @@ class ReconcilerMockServerTest {
     }
 
     @Test
-    void volumeChangeIsNotAppliedButReplicasAndVersionAre() throws Exception {
+    void volumeChangeIsNotAppliedButReplicasAre() throws Exception {
         PharosCluster c = provisionedMinio();
         PharosClusterSpec s = c.getSpec();
         c.setSpec(spec(s, new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("10Gi"), null), "1.6.1",
@@ -375,7 +375,9 @@ class ReconcilerMockServerTest {
 
         StatefulSet writers = client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get();
         assertThat(writers.getSpec().getReplicas()).isEqualTo(2);
-        assertThat(writers.getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("pharos:1.6.1");
+        // a version change waits for its pre-flight check (the storage is not even ready here)
+        assertThat(writers.getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("pharos:1.6.0");
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("WaitingForStorage");
         assertThat(writers.getSpec().getVolumeClaimTemplates().getFirst().getSpec().getResources().getRequests()
                 .get("storage").toString()).isEqualTo("50Gi");
         assertThat(client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
@@ -578,5 +580,252 @@ class ReconcilerMockServerTest {
         update.get().run();
         Thread.sleep(500);
         assertThat(replicas("demo-readers")).isEqualTo(4);
+    }
+
+    // ── upgrades ────────────────────────────────────────────────────────────────────────────────
+
+    /** A watch whose reading the test sets; {@code update} triggers a reconcile like a real read. */
+    private final AtomicReference<StatusReading> reading = new AtomicReference<>();
+    private final AtomicReference<Runnable> update = new AtomicReference<>();
+
+    private PharosClusterReconciler withFakeWatch() {
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { }
+
+                @Override public Optional<StatusReading> latest() { return Optional.ofNullable(reading.get()); }
+
+                @Override public String problem() { return reading.get() == null ? "nobody home" : null; }
+
+                @Override public void close() { }
+            };
+        });
+        return new PharosClusterReconciler(clock, SETTINGS, source);
+    }
+
+    /** A fresh {@code /cluster/status} read listing these reader and writer heartbeats, started at {@code startedAt}. */
+    private void heartbeats(long startedAt, List<String> readers, List<String> writers) {
+        List<ClusterStatus.Reader> rs = readers.stream().map(n -> new ClusterStatus.Reader(n, null, List.of(), "ready",
+                List.of(), Map.of(), 0, 0.0, startedAt, null, null, 2)).toList();
+        List<ClusterStatus.Writer> ws = writers.stream().map(n -> new ClusterStatus.Writer(n, true, List.of(), List.of(),
+                null, startedAt, false, null, 2)).toList();
+        reading.set(new StatusReading(new ClusterStatus("cluster", clock.instant().toString(),
+                new ClusterStatus.Layout(new StatusState.Summary(0, ws.size(), rs.size()), List.of(), ws, rs),
+                new ClusterStatus.BacklogSummary(0, null), List.of(), List.of()), clock.instant(), "test"));
+        if (update.get() != null) update.get().run();
+    }
+
+    /** MinIO ready and the bucket created: the storage is ready. */
+    private void storageReady() {
+        StatefulSet minio = client.apps().statefulSets().inNamespace(NS).withName("demo-minio").get();
+        minio.setStatus(new io.fabric8.kubernetes.api.model.apps.StatefulSetStatusBuilder().withReplicas(1)
+                .withReadyReplicas(1).build());
+        client.apps().statefulSets().resource(minio).updateStatus();
+        Job bucket = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        bucket.setStatus(new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withSucceeded(1).build());
+        client.batch().v1().jobs().resource(bucket).updateStatus();
+    }
+
+    /** Kubernetes' view of a finished rollout of StatefulSet {@code name}: every replica updated and ready. */
+    private void rolledOut(String name) {
+        StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(name).get();
+        int n = s.getSpec().getReplicas();
+        long gen = s.getMetadata().getGeneration() == null ? 1 : s.getMetadata().getGeneration();
+        s.setStatus(new io.fabric8.kubernetes.api.model.apps.StatefulSetStatusBuilder().withObservedGeneration(gen)
+                .withReplicas(n).withReadyReplicas(n).withUpdatedReplicas(n).withCurrentRevision("r2")
+                .withUpdateRevision("r2").build());
+        client.apps().statefulSets().resource(s).updateStatus();
+    }
+
+    private void routerRolledOut() {
+        Deployment d = client.apps().deployments().inNamespace(NS).withName("demo-router").get();
+        int n = d.getSpec().getReplicas();
+        long gen = d.getMetadata().getGeneration() == null ? 1 : d.getMetadata().getGeneration();
+        d.setStatus(new io.fabric8.kubernetes.api.model.apps.DeploymentStatusBuilder().withObservedGeneration(gen)
+                .withReplicas(n).withReadyReplicas(n).withUpdatedReplicas(n).withAvailableReplicas(n).build());
+        client.apps().deployments().resource(d).updateStatus();
+    }
+
+    private String image(String workload) {
+        var template = workload.equals("demo-router")
+                ? client.apps().deployments().inNamespace(NS).withName(workload).get().getSpec().getTemplate()
+                : client.apps().statefulSets().inNamespace(NS).withName(workload).get().getSpec().getTemplate();
+        return template.getSpec().getContainers().getFirst().getImage();
+    }
+
+    private Job job(String name) {
+        return client.batch().v1().jobs().inNamespace(NS).withName(name).get();
+    }
+
+    private void finish(String jobName, boolean ok, String reason) {
+        Job j = job(jobName);
+        j.setStatus(ok
+                ? new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withSucceeded(1).addNewCondition()
+                        .withType("Complete").withStatus("True").endCondition().build()
+                : new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withFailed(1).addNewCondition()
+                        .withType("Failed").withStatus("True").withReason(reason)
+                        .withLastTransitionTime(clock.instant().toString()).endCondition().build());
+        client.batch().v1().jobs().resource(j).updateStatus();
+    }
+
+    /** A provisioned minio cluster with ready storage, everything on 1.6.0, then {@code spec.version} set to {@code version}. */
+    private void upgradeTo(String version) throws InterruptedException {
+        startOperator(withFakeWatch());
+        client.resource(TestClusters.minio()).create();
+        await("every workload", () -> managedVersions().keySet().containsAll(List.of("StatefulSet/demo-writers",
+                "StatefulSet/demo-readers", "Deployment/demo-router", "Job/demo-minio-bucket")));
+        storageReady();
+        await("storage ready", () -> conditionTrue("demo", "StorageReady"));
+        PharosCluster c = current("demo");
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, s.storage(), version, s.writers()));
+        client.resource(c).update();
+    }
+
+    /** kind/name → resourceVersion of the workloads and their ConfigMaps. */
+    private Map<String, String> workloadVersions() {
+        Map<String, String> m = new TreeMap<>(managedVersions());
+        m.keySet().removeIf(k -> !(k.startsWith("StatefulSet/") || k.startsWith("Deployment/") || k.startsWith("ConfigMap/")));
+        return m;
+    }
+
+    /**
+     * Review Focus 5: an upgrade to a version that would refuse existing indexes. The pre-flight Job runs
+     * the new image with {@code upgrade-indexes --check}; when it fails on a refused shard, the cluster is
+     * Degraded with {@code UpgradeBlocked} and no workload changes, also across its retries.
+     */
+    @Test
+    void upgradeBlockedWhenPreflightRefusesChangesNoWorkload() throws Exception {
+        startOperator(withFakeWatch());
+        client.resource(TestClusters.minio()).create();
+        await("every workload", () -> managedVersions().keySet().containsAll(List.of("StatefulSet/demo-writers",
+                "StatefulSet/demo-readers", "Deployment/demo-router", "Job/demo-minio-bucket")));
+        storageReady();
+        await("storage ready", () -> conditionTrue("demo", "StorageReady"));
+        await("a quiet reconcile loop", () -> {
+            long n = reconciler.reconciles.get();
+            try { Thread.sleep(300); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return reconciler.reconciles.get() == n;
+        });
+        Map<String, String> before = workloadVersions();
+
+        PharosCluster c = current("demo");
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, s.storage(), "1.7.0", s.writers()));
+        client.resource(c).update();
+
+        await("the pre-flight Job", () -> job("demo-preflight-1.7.0") != null);
+        Job preflight = job("demo-preflight-1.7.0");
+        var container = preflight.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getImage()).isEqualTo("pharos:1.7.0"); // the NEW image
+        assertThat(container.getArgs()).containsExactly("upgrade-indexes", "--check");
+        assertThat(container.getEnv()).anySatisfy(e -> assertThat(e.getName()).isEqualTo("PHAROS_ROLE"));
+        assertThat(preflight.getSpec().getTemplate().getSpec().getVolumes())
+                .anySatisfy(v -> assertThat(v.getConfigMap() == null ? null : v.getConfigMap().getName())
+                        .isEqualTo("demo-config-writer"));
+        assertThat(preflight.getSpec().getPodFailurePolicy().getRules()).singleElement()
+                .satisfies(r -> assertThat(r.getOnExitCodes().getValues()).containsExactly(3));
+        assertThat(preflight.getMetadata().getOwnerReferences()).singleElement()
+                .satisfies(o -> assertThat(o.getName()).isEqualTo("demo"));
+        await("UpgradeBlocked=False while it runs", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "PreflightRunning".equals(cond.getReason());
+        });
+        assertThat(current("demo").getStatus().upgrade())
+                .isEqualTo(new PharosClusterStatus.UpgradeStatus("1.6.0", "1.7.0", "Preflight", null));
+        assertThat(workloadVersions()).isEqualTo(before);
+
+        finish("demo-preflight-1.7.0", false, "PodFailurePolicy"); // exit 3: a shard would be refused
+        await("UpgradeBlocked", () -> conditionTrue("demo", "UpgradeBlocked"));
+        PharosClusterStatus st = current("demo").getStatus();
+        assertThat(st.phase()).isEqualTo("Degraded");
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("PreflightRefused");
+        assertThat(condition("demo", "UpgradeBlocked").getMessage()).contains("would refuse")
+                .contains("No workload is changed").contains("after 60 s");
+        assertThat(condition("demo", "Degraded").getReason()).isEqualTo("UpgradeBlocked");
+        assertThat(workloadVersions()).isEqualTo(before);
+        for (String w : List.of("demo-writers", "demo-readers", "demo-router")) {
+            assertThat(image(w)).as(w).isEqualTo("pharos:1.6.0");
+        }
+
+        // after the backoff the check runs again (the shards may have been re-indexed); still blocked meanwhile
+        String firstUid = job("demo-preflight-1.7.0").getMetadata().getUid();
+        clock.advance(Duration.ofSeconds(61));
+        update.get().run();
+        await("a new pre-flight Job", () -> {
+            Job j = job("demo-preflight-1.7.0");
+            return j != null && !j.getMetadata().getUid().equals(firstUid);
+        });
+        await("the retry counted", () -> {
+            var u = current("demo").getStatus().upgrade();
+            return u != null && Integer.valueOf(1).equals(u.preflightRetries());
+        });
+        assertThat(conditionTrue("demo", "UpgradeBlocked")).isTrue();
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("PreflightRetrying");
+        assertThat(workloadVersions()).isEqualTo(before);
+
+        // setting the version back ends the upgrade: the pre-flight Job goes, nothing was ever rolled
+        PharosCluster back = current("demo");
+        back.setSpec(spec(back.getSpec(), back.getSpec().storage(), "1.6.0", back.getSpec().writers()));
+        client.resource(back).update();
+        await("UpgradeBlocked=False, up to date", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "UpToDate".equals(cond.getReason()) && current("demo").getStatus().upgrade() == null;
+        });
+        await("the pre-flight Job deleted", () -> job("demo-preflight-1.7.0") == null);
+        assertThat(workloadVersions()).isEqualTo(before);
+    }
+
+    /** The roll after a passed pre-flight: readers, then writers, then the router, each gated on the previous. */
+    @Test
+    void upgradeRollsReadersThenWritersThenRouter() throws Exception {
+        upgradeTo("1.7.0");
+        await("the pre-flight Job", () -> job("demo-preflight-1.7.0") != null);
+        long t0 = clock.instant().toEpochMilli();
+        finish("demo-preflight-1.7.0", true, null);
+
+        await("the readers take 1.7.0", () -> image("demo-readers").equals("pharos:1.7.0"));
+        StatefulSet readers = client.apps().statefulSets().inNamespace(NS).withName("demo-readers").get();
+        assertThat(readers.getMetadata().getAnnotations()).containsEntry(Labels.VERSION_SINCE,
+                "1.7.0@" + clock.instant());
+        assertThat(image("demo-writers")).isEqualTo("pharos:1.6.0");
+        assertThat(image("demo-router")).isEqualTo("pharos:1.6.0");
+        await("step Readers", () -> current("demo").getStatus().upgrade() != null
+                && "Readers".equals(current("demo").getStatus().upgrade().step()));
+
+        // Kubernetes says the readers are rolled, but /cluster/status still shows the old pods: writers wait
+        rolledOut("demo-readers");
+        heartbeats(t0 - Duration.ofMinutes(10).toMillis(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the message names the missing heartbeats", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && cond.getMessage().contains("heartbeats of demo-readers-0, demo-readers-1");
+        });
+        assertThat(image("demo-writers")).isEqualTo("pharos:1.6.0");
+
+        // new reader pods answer: the writers roll, the router still waits
+        clock.advance(Duration.ofSeconds(30));
+        heartbeats(clock.instant().toEpochMilli(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the writers take 1.7.0", () -> image("demo-writers").equals("pharos:1.7.0"));
+        assertThat(image("demo-router")).isEqualTo("pharos:1.6.0");
+        assertThat(image("demo-readers")).isEqualTo("pharos:1.7.0");
+
+        // the writers rolled and heartbeating: the router rolls last
+        rolledOut("demo-writers");
+        clock.advance(Duration.ofSeconds(30));
+        heartbeats(clock.instant().toEpochMilli(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the router takes 1.7.0", () -> image("demo-router").equals("pharos:1.7.0"));
+
+        // every workload on 1.7.0: the upgrade is over and its pre-flight Job is cleaned up
+        routerRolledOut();
+        await("up to date", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "UpToDate".equals(cond.getReason()) && current("demo").getStatus().upgrade() == null;
+        });
+        await("the pre-flight Job deleted", () -> job("demo-preflight-1.7.0") == null);
+        assertThat(conditionTrue("demo", "Degraded")).isFalse();
     }
 }

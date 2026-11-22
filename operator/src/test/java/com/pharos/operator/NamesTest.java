@@ -52,6 +52,20 @@ class NamesTest {
     }
 
     @Test
+    void preflightJobNames() {
+        assertThat(Names.preflightJob("demo", "1.7.0")).isEqualTo("demo-preflight-1.7.0");
+        assertThat(Names.preflightJob("demo", "1.7.0-rc.1")).isEqualTo("demo-preflight-1.7.0-rc.1");
+        // a tag that is no valid name part, or too long, still gets its own name
+        assertThat(Names.preflightJob("demo", "1.7.0_RC1")).isEqualTo("demo-preflight-1-7-0-rc1-" + hash("1.7.0_RC1"));
+        String cluster = "c".repeat(Names.MAX_CLUSTER_NAME);
+        for (String v : java.util.List.of("1.7.0", "1.10.10-rc.10", "x".repeat(128), "A_".repeat(60))) {
+            assertThat(Names.preflightJob(cluster, v)).hasSizeLessThanOrEqualTo(Names.MAX_NAME)
+                    .matches("[a-z0-9]([-a-z0-9.]*[a-z0-9])?");
+        }
+        assertThat(Names.preflightJob(cluster, "x".repeat(128))).isNotEqualTo(Names.preflightJob(cluster, "x".repeat(127)));
+    }
+
+    @Test
     void clusterObjectNames() {
         assertThat(Names.token("demo")).isEqualTo("demo-token");
         assertThat(Names.config("demo", "writer")).isEqualTo("demo-config-writer");

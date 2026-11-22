@@ -35,6 +35,8 @@ public final class Labels {
     /** A project's registration and removal Jobs. */
     public static final String REGISTER = "register";
     public static final String REMOVE = "remove";
+    /** The pre-flight Job of an upgrade ({@code pharos upgrade-indexes --check} with the new image). */
+    public static final String PREFLIGHT = "preflight";
 
     /**
      * Annotation on a project Job: the project's name as pharos knows it. A label could not hold every
@@ -44,6 +46,15 @@ public final class Labels {
 
     /** On the writer and reader StatefulSets: the autoscaler's last application ({@code scale.LastScale}). */
     public static final String LAST_SCALE = "pharos.dev/last-scale";
+
+    /**
+     * On the writer and reader StatefulSets and the router Deployment: the version their pods were last
+     * moved to and when ({@code upgrade.VersionSince}), applied together with the new image so the
+     * upgrade gate knows which heartbeats come from the new pods.
+     */
+    public static final String VERSION_SINCE = "pharos.dev/version-since";
+    /** On a pre-flight Job: the version it checks. */
+    public static final String VERSION_ANNOTATION = "pharos.dev/version";
 
     private Labels() {}
 

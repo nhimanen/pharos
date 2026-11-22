@@ -345,6 +345,17 @@ spec:
                   ready:
                     type: "boolean"
                 type: "object"
+              upgrade:
+                properties:
+                  from:
+                    type: "string"
+                  preflightRetries:
+                    type: "integer"
+                  step:
+                    type: "string"
+                  to:
+                    type: "string"
+                type: "object"
               writers:
                 properties:
                   desired:

@@ -86,18 +86,33 @@ public final class WorkloadRenderer {
 
     private WorkloadRenderer() {}
 
-    /** The cluster's workload objects by dependent name (see {@link DesiredState}). */
+    /** The cluster's workload objects by dependent name (see {@link DesiredState}), all on {@code spec.version}. */
     public static Map<String, HasMetadata> render(PharosCluster cluster, ConfigRenderer.Result configs,
                                                   OperatorSettings settings, DesiredState.Sizing sizing) {
+        return render(cluster, configs, settings, sizing, DesiredState.Versions.of(cluster));
+    }
+
+    /** The cluster's workload objects by dependent name, each workload on its version of {@code versions}. */
+    public static Map<String, HasMetadata> render(PharosCluster cluster, ConfigRenderer.Result configs,
+                                                  OperatorSettings settings, DesiredState.Sizing sizing,
+                                                  DesiredState.Versions versions) {
         Map<String, HasMetadata> out = new LinkedHashMap<>();
         out.put(DesiredState.CONFIG_WRITER, configMap(cluster, configs.get(Role.WRITER)));
         out.put(DesiredState.CONFIG_READER, configMap(cluster, configs.get(Role.READER)));
         out.put(DesiredState.CONFIG_ROUTER, configMap(cluster, configs.get(Role.ROUTER)));
-        out.put(DesiredState.WRITERS, lastScale(statefulSet(cluster, configs.get(Role.WRITER), settings,
-                sizing.writerReplicas(), sizing.workVolume()), sizing.writerLastScale()));
-        out.put(DesiredState.READERS, lastScale(statefulSet(cluster, configs.get(Role.READER), settings,
-                sizing.readerReplicas(), sizing.cacheVolume()), sizing.readerLastScale()));
-        out.put(DesiredState.ROUTER, router(cluster, configs.get(Role.ROUTER), settings));
+        StatefulSet writers = statefulSet(cluster, configs.get(Role.WRITER), settings, versions.writers(),
+                sizing.writerReplicas(), sizing.workVolume());
+        annotate(writers.getMetadata(), Labels.LAST_SCALE, sizing.writerLastScale());
+        annotate(writers.getMetadata(), Labels.VERSION_SINCE, versions.writersSince());
+        out.put(DesiredState.WRITERS, writers);
+        StatefulSet readers = statefulSet(cluster, configs.get(Role.READER), settings, versions.readers(),
+                sizing.readerReplicas(), sizing.cacheVolume());
+        annotate(readers.getMetadata(), Labels.LAST_SCALE, sizing.readerLastScale());
+        annotate(readers.getMetadata(), Labels.VERSION_SINCE, versions.readersSince());
+        out.put(DesiredState.READERS, readers);
+        Deployment router = router(cluster, configs.get(Role.ROUTER), settings, versions.router());
+        annotate(router.getMetadata(), Labels.VERSION_SINCE, versions.routerSince());
+        out.put(DesiredState.ROUTER, router);
         out.put(DesiredState.WRITERS_HEADLESS, headless(cluster, Role.WRITER));
         out.put(DesiredState.READERS_HEADLESS, headless(cluster, Role.READER));
         out.put(DesiredState.ROUTER_SERVICE, routerService(cluster));
@@ -134,16 +149,24 @@ public final class WorkloadRenderer {
     }
 
     /**
-     * The autoscaler's last application on the StatefulSet's own metadata (not the pod template, so it
-     * rolls nothing), applied together with {@code replicas} (ruling OP-R5).
+     * An annotation on a workload's own metadata (not its pod template, so it rolls nothing), applied
+     * together with what it explains: the autoscaler's last application with {@code replicas} (ruling
+     * OP-R5), the version's start with the image. Null adds nothing.
      */
-    static StatefulSet lastScale(StatefulSet s, String value) {
-        if (value != null) s.getMetadata().setAnnotations(new java.util.TreeMap<>(Map.of(Labels.LAST_SCALE, value)));
-        return s;
+    static void annotate(io.fabric8.kubernetes.api.model.ObjectMeta meta, String key, String value) {
+        if (value == null) return;
+        Map<String, String> a = new java.util.TreeMap<>(meta.getAnnotations() == null ? Map.of() : meta.getAnnotations());
+        a.put(key, value);
+        meta.setAnnotations(a);
     }
 
     static StatefulSet statefulSet(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, int replicas,
                                    String size) {
+        return statefulSet(cluster, rc, settings, cluster.getSpec().version(), replicas, size);
+    }
+
+    static StatefulSet statefulSet(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, String version,
+                                   int replicas, String size) {
         String name = cluster.getMetadata().getName();
         boolean writer = rc.role() == Role.WRITER;
         String component = writer ? Labels.WRITER : Labels.READER;
@@ -166,13 +189,18 @@ public final class WorkloadRenderer {
                 .withPodManagementPolicy("Parallel")
                 .withNewUpdateStrategy().withType("RollingUpdate").endUpdateStrategy()
                 .withNewSelector().withMatchLabels(Labels.selector(name, component)).endSelector()
-                .withTemplate(podTemplate(cluster, rc, settings, component, claim, role == null ? null : role.resources()))
+                .withTemplate(podTemplate(cluster, rc, settings, version, component, claim,
+                        role == null ? null : role.resources()))
                 .withVolumeClaimTemplates(template)
                 .endSpec()
                 .build();
     }
 
     static Deployment router(PharosCluster cluster, RoleConfig rc, OperatorSettings settings) {
+        return router(cluster, rc, settings, cluster.getSpec().version());
+    }
+
+    static Deployment router(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, String version) {
         String name = cluster.getMetadata().getName();
         return new DeploymentBuilder()
                 .withNewMetadata().withName(Names.router(name)).withNamespace(cluster.getMetadata().getNamespace())
@@ -180,7 +208,7 @@ public final class WorkloadRenderer {
                 .withNewSpec()
                 .withReplicas(Defaults.routerReplicas(cluster.getSpec()))
                 .withNewSelector().withMatchLabels(Labels.selector(name, Labels.ROUTER)).endSelector()
-                .withTemplate(podTemplate(cluster, rc, settings, Labels.ROUTER, null, null))
+                .withTemplate(podTemplate(cluster, rc, settings, version, Labels.ROUTER, null, null))
                 .endSpec()
                 .build();
     }
@@ -190,11 +218,12 @@ public final class WorkloadRenderer {
      * {@code PHAROS_HOME} and the work dir or cache), or null for an emptyDir (the router).
      */
     static PodTemplateSpec podTemplate(PharosCluster cluster, RoleConfig rc, OperatorSettings settings,
-                                       String component, String dataClaim, ResourceRequirements resources) {
+                                       String version, String component, String dataClaim,
+                                       ResourceRequirements resources) {
         String name = cluster.getMetadata().getName();
         Role role = rc.role();
         int port = role == Role.ROUTER ? ConfigRenderer.ROUTER_PORT : ConfigRenderer.WEB_PORT;
-        String image = settings.pharosImage(cluster.getSpec().version());
+        String image = settings.pharosImage(version);
         String configMap = Names.config(name, role.id());
 
         List<EnvVar> env = new ArrayList<>();

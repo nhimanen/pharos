@@ -60,6 +60,18 @@ public final class Names {
         return withProject(cluster + "-remove-", project, "");
     }
 
+    /**
+     * The pre-flight Job of an upgrade to {@code version}: {@code <name>-preflight-<version>}. A tag that
+     * is not a valid name part as written (upper case, {@code _}) or too long becomes {@link #k8sName}
+     * text plus a hash, so every version still gets its own Job.
+     */
+    public static String preflightJob(String cluster, String version) {
+        String prefix = cluster + "-preflight-";
+        int room = MAX_NAME - prefix.length();
+        boolean plain = version.matches("[a-z0-9]([a-z0-9.-]*[a-z0-9])?") && version.length() <= room;
+        return prefix + (plain ? version : k8sName(version, room));
+    }
+
     /** A project's git credentials volume on the writers: {@code git-<k8sName>}. */
     public static String gitCredentialsVolume(String project) {
         return "git-" + k8sName(project, MAX_NAME - 4);

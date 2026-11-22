@@ -51,26 +51,45 @@ public final class ProjectJobRenderer {
         return project.embed() == null || project.embed();
     }
 
-    /** The registration Job of {@code project}'s current source. */
+    /** The registration Job of {@code project}'s current source, with the image of {@code spec.version}. */
     public static Job registration(PharosCluster cluster, PharosClusterSpec.Project project, OperatorSettings settings) {
+        return registration(cluster, project, settings, cluster.getSpec().version());
+    }
+
+    /**
+     * The registration Job with the image of {@code version}: the writers' (during an upgrade, the
+     * version the writers run until their turn comes).
+     */
+    public static Job registration(PharosCluster cluster, PharosClusterSpec.Project project, OperatorSettings settings,
+                                   String version) {
         String name = cluster.getMetadata().getName();
         List<String> args = new ArrayList<>(List.of("index", "--project", project.name(),
                 "--source-git", project.git().url(), "--ref", project.git().ref()));
         if (!embed(project)) args.add("--no-embed");
-        return job(cluster, settings, Names.registerJob(name, project.name(), specHash(project)), Labels.REGISTER,
-                project.name(), args);
+        return job(cluster, settings, version, Names.registerJob(name, project.name(), specHash(project)),
+                Labels.REGISTER, Map.of(Labels.PROJECT_ANNOTATION, project.name()), args);
     }
 
     /** The removal Job of {@code project} (a name no longer in the spec). */
     public static Job removal(PharosCluster cluster, String project, OperatorSettings settings) {
-        return job(cluster, settings, Names.removeJob(cluster.getMetadata().getName(), project), Labels.REMOVE,
-                project, List.of("remove-index", "--from-catalog", project));
+        return removal(cluster, project, settings, cluster.getSpec().version());
     }
 
-    private static Job job(PharosCluster cluster, OperatorSettings settings, String jobName, String component,
-                           String project, List<String> args) {
+    /** The removal Job with the image of {@code version} (the writers'). */
+    public static Job removal(PharosCluster cluster, String project, OperatorSettings settings, String version) {
+        return job(cluster, settings, version, Names.removeJob(cluster.getMetadata().getName(), project),
+                Labels.REMOVE, Map.of(Labels.PROJECT_ANNOTATION, project),
+                List.of("remove-index", "--from-catalog", project));
+    }
+
+    /**
+     * A one-shot pharos Job on a writer-shaped pod (see the class comment) running {@code args} with the
+     * image of {@code version}; {@code annotations} go on the Job and its pod.
+     */
+    static Job job(PharosCluster cluster, OperatorSettings settings, String version, String jobName,
+                   String component, Map<String, String> annotations, List<String> args) {
         String name = cluster.getMetadata().getName();
-        String image = settings.pharosImage(cluster.getSpec().version());
+        String image = settings.pharosImage(version);
         List<EnvVar> env = new ArrayList<>();
         env.add(plain("PHAROS_ROLE", Role.WRITER.id()));
         env.add(plain("PHAROS_HOME", ConfigRenderer.PHAROS_HOME));
@@ -80,13 +99,13 @@ public final class ProjectJobRenderer {
         return new JobBuilder()
                 .withNewMetadata().withName(jobName).withNamespace(cluster.getMetadata().getNamespace())
                 .withLabels(Labels.of(name, component))
-                .withAnnotations(Map.of(Labels.PROJECT_ANNOTATION, project)).endMetadata()
+                .withAnnotations(annotations).endMetadata()
                 .withNewSpec()
                 .withBackoffLimit(BACKOFF_LIMIT)
                 .withActiveDeadlineSeconds(ACTIVE_DEADLINE_SECONDS)
                 .withNewTemplate()
                 .withNewMetadata().withLabels(Labels.of(name, component))
-                .withAnnotations(Map.of(Labels.PROJECT_ANNOTATION, project)).endMetadata()
+                .withAnnotations(annotations).endMetadata()
                 .withNewSpec()
                 .withRestartPolicy("Never")
                 .withAutomountServiceAccountToken(false)

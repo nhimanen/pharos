@@ -155,6 +155,16 @@ public final class ProjectReconciler {
     /** Plans the project Jobs of a valid spec from the Jobs the informer shows. */
     static Plan plan(PharosCluster cluster, OperatorSettings settings, Collection<Job> jobs, boolean storageReady,
                      Instant now) {
+        return plan(cluster, settings, jobs, storageReady, now, cluster.getSpec().version());
+    }
+
+    /**
+     * {@link #plan(PharosCluster, OperatorSettings, Collection, boolean, Instant)} with the image of
+     * {@code version} for new Jobs: the writers' (during an upgrade they keep the old version until
+     * their turn).
+     */
+    static Plan plan(PharosCluster cluster, OperatorSettings settings, Collection<Job> jobs, boolean storageReady,
+                     Instant now, String version) {
         String name = cluster.getMetadata().getName();
         PharosClusterSpec spec = cluster.getSpec();
         PharosClusterStatus status = cluster.getStatus();
@@ -174,7 +184,7 @@ public final class ProjectReconciler {
             }
         }
 
-        Builder b = new Builder(cluster, settings, storageReady, now);
+        Builder b = new Builder(cluster, settings, storageReady, now, version);
         for (PharosClusterSpec.Project p : wanted.values()) {
             b.wanted(p, previous.get(p.name()), registrations.getOrDefault(p.name(), List.of()),
                     removals.get(p.name()));
@@ -199,6 +209,8 @@ public final class ProjectReconciler {
     private static final class Builder {
         private final PharosCluster cluster;
         private final OperatorSettings settings;
+        /** The image version of new Jobs. */
+        private final String version;
         private final boolean storageReady;
         private final Instant now;
         private final List<Job> create = new ArrayList<>();
@@ -208,7 +220,8 @@ public final class ProjectReconciler {
         private final Set<String> reasons = new LinkedHashSet<>();
         private Duration reschedule;
 
-        Builder(PharosCluster cluster, OperatorSettings settings, boolean storageReady, Instant now) {
+        Builder(PharosCluster cluster, OperatorSettings settings, boolean storageReady, Instant now, String version) {
+            this.version = version;
             this.cluster = cluster;
             this.settings = settings;
             this.storageReady = storageReady;
@@ -293,7 +306,7 @@ public final class ProjectReconciler {
             final ProjectJob mine = job;
             boolean superseded = mine != null && regs.stream().anyMatch(j -> j != mine && j.newerThan(mine));
             if (job == null) {
-                if (!olderActive) create(ProjectJobRenderer.registration(cluster, p, settings));
+                if (!olderActive) create(ProjectJobRenderer.registration(cluster, p, settings, version));
             } else if (job.succeeded() && superseded) {
                 // A -> B -> A: B's Job ran after this one, so the catalog may hold B; run this one again
                 delete(job, DeletionPropagation.BACKGROUND);
@@ -318,7 +331,7 @@ public final class ProjectReconciler {
                 }
             }
             if (removal == null) {
-                if (!registering) create(ProjectJobRenderer.removal(cluster, project, settings));
+                if (!registering) create(ProjectJobRenderer.removal(cluster, project, settings, version));
             } else if (removal.succeeded()) {
                 boolean left = false;
                 for (ProjectJob j : regs) {

@@ -23,7 +23,16 @@ public record PharosClusterStatus(
         List<ProjectStatus> projects,
         List<ProposalStatus> proposals,
         List<ReshardProposal> reshardProposals,
-        List<Condition> conditions) {
+        List<Condition> conditions,
+        UpgradeStatus upgrade) {
+
+    /** Without an upgrade in progress. */
+    public PharosClusterStatus(String phase, Long observedGeneration, Replicas writers, Replicas readers,
+                               StorageStatus storage, List<ProjectStatus> projects, List<ProposalStatus> proposals,
+                               List<ReshardProposal> reshardProposals, List<Condition> conditions) {
+        this(phase, observedGeneration, writers, readers, storage, projects, proposals, reshardProposals, conditions,
+                null);
+    }
 
     /** The status phases (spec, resolved detail 9). */
     public enum Phase { Pending, Provisioning, Ready, Degraded }
@@ -40,6 +49,22 @@ public record PharosClusterStatus(
     public static final String CONDITION_STATUS_AVAILABLE = "ClusterStatusAvailable";
     /** Pharos raised a {@code writer-disk} proposal; v1 only reports it (no volume resize). */
     public static final String CONDITION_WRITER_LOW_DISK = "WriterLowDisk";
+    /** At least {@code min} readers are ready ({@code /health} 200). */
+    public static final String CONDITION_READERS_READY = "ReadersReady";
+    /** At least {@code min} writers are ready and report heartbeats in {@code /cluster/status}. */
+    public static final String CONDITION_WRITERS_READY = "WritersReady";
+    /** Every project of the spec has a published generation ({@code LATEST}). */
+    public static final String CONDITION_PROJECTS_PUBLISHED = "ProjectsPublished";
+
+    /**
+     * A version change in progress ({@code spec.version} differs from what a workload runs):
+     * {@code from} the version being replaced, {@code to} the spec's, {@code step} one of
+     * {@code Preflight}, {@code Readers}, {@code Writers}, {@code Router}; {@code preflightRetries}: how
+     * often a failed pre-flight Job was re-created (drives its backoff). Null when every workload runs
+     * {@code spec.version}.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record UpgradeStatus(String from, String to, String step, Integer preflightRetries) {}
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Replicas(Integer desired, Integer ready) {}

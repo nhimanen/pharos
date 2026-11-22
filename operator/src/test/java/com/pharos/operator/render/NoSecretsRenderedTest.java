@@ -36,6 +36,7 @@ class NoSecretsRenderedTest {
             all.add(ProjectJobRenderer.registration(cluster, p, SETTINGS));
             all.add(ProjectJobRenderer.removal(cluster, p.name(), SETTINGS));
         }
+        all.add(PreflightJobRenderer.render(cluster, SETTINGS, "9.9.9")); // an upgrade's pre-flight Job
         all.add(DesiredState.secret(DesiredState.TOKEN, cluster, random));
         if (StorageRenderer.minioMode(cluster.getSpec())) {
             all.add(DesiredState.secret(DesiredState.MINIO_CREDENTIALS, cluster, random));

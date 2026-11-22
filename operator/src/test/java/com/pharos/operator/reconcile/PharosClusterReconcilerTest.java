@@ -82,9 +82,27 @@ class PharosClusterReconcilerTest {
         assertThat(at(T0).provisionedStatus(c, 1, 1, new PharosClusterReconciler.Observed(1, 1, 1, 1, 1, 1, false))
                 .phase()).isEqualTo("Provisioning");
 
-        PharosClusterStatus ready = at(T0).provisionedStatus(c, 2, 1,
+        // every pod ready, but no node answers /cluster/status: no writer heartbeat is known yet
+        PharosClusterStatus noHeartbeats = at(T0).provisionedStatus(c, 2, 1,
                 new PharosClusterReconciler.Observed(2, 1, 2, 1, 1, 1, true));
+        assertThat(noHeartbeats.phase()).isEqualTo("Provisioning");
+        assertThat(condition(noHeartbeats, "WritersReady").getReason()).isEqualTo("NoClusterStatus");
+        assertThat(condition(noHeartbeats, "Provisioning").getMessage())
+                .isEqualTo("Waiting for writer heartbeats (no /cluster/status answer).");
+
+        var heartbeat = new com.pharos.cluster.status.ClusterStatus.Writer("demo-writers-0", true, List.of(), List.of(),
+                null, 0, false, null, 3);
+        var answer = new com.pharos.cluster.status.ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                new com.pharos.cluster.status.ClusterStatus.Layout(null, List.of(), List.of(heartbeat), List.of()),
+                null, List.of(), List.of());
+        PharosClusterStatus ready = at(T0).provisionedStatus(c, 2, 1,
+                new PharosClusterReconciler.Observed(2, 1, 2, 1, 1, 1, true), List.of(), null, null, null, answer, null,
+                null);
         assertThat(ready.phase()).isEqualTo("Ready");
+        assertThat(condition(ready, "WritersReady").getStatus()).isEqualTo("True");
+        assertThat(condition(ready, "ReadersReady").getStatus()).isEqualTo("True");
+        assertThat(condition(ready, "ProjectsPublished").getReason()).isEqualTo("NoProjects");
+        assertThat(condition(ready, "UpgradeBlocked").getStatus()).isEqualTo("False");
         assertThat(condition(ready, "Ready").getStatus()).isEqualTo("True");
         assertThat(condition(ready, "Provisioning").getStatus()).isEqualTo("False");
         assertThat(ready.writers()).isEqualTo(new PharosClusterStatus.Replicas(2, 2));

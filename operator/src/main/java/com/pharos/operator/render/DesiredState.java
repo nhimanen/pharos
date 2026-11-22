@@ -72,6 +72,21 @@ public record DesiredState(Map<String, HasMetadata> objects, Set<String> secrets
         }
     }
 
+    /**
+     * The pharos version each workload runs and its {@code pharos.dev/version-since} annotation (null
+     * for none). They differ from {@code spec.version} only during an upgrade, which moves readers,
+     * then writers, then the router (see {@code upgrade.UpgradeCoordinator}).
+     */
+    public record Versions(String writers, String readers, String router, String writersSince, String readersSince,
+                           String routerSince) {
+
+        /** Every workload on {@code spec.version}, without annotations. */
+        public static Versions of(PharosCluster cluster) {
+            String v = cluster.getSpec().version();
+            return new Versions(v, v, v, null, null, null);
+        }
+    }
+
     /** {@link #render(PharosCluster, ConfigRenderer.Result, OperatorSettings, Sizing)} with the spec's sizes. */
     public static DesiredState render(PharosCluster cluster, ConfigRenderer.Result configs, OperatorSettings settings,
                                       int writerReplicas, int readerReplicas) {
@@ -81,8 +96,14 @@ public record DesiredState(Map<String, HasMetadata> objects, Set<String> secrets
     /** Renders the desired objects of a valid spec whose configs rendered without errors. */
     public static DesiredState render(PharosCluster cluster, ConfigRenderer.Result configs, OperatorSettings settings,
                                       Sizing sizing) {
+        return render(cluster, configs, settings, sizing, Versions.of(cluster));
+    }
+
+    /** {@link #render(PharosCluster, ConfigRenderer.Result, OperatorSettings, Sizing)} with each workload's version. */
+    public static DesiredState render(PharosCluster cluster, ConfigRenderer.Result configs, OperatorSettings settings,
+                                      Sizing sizing, Versions versions) {
         Map<String, HasMetadata> objects = new LinkedHashMap<>();
-        objects.putAll(WorkloadRenderer.render(cluster, configs, settings, sizing));
+        objects.putAll(WorkloadRenderer.render(cluster, configs, settings, sizing, versions));
         objects.putAll(StorageRenderer.render(cluster, settings, sizing.minioStorage()));
         Set<String> secrets = StorageRenderer.minioMode(cluster.getSpec())
                 ? Set.of(TOKEN, MINIO_CREDENTIALS) : Set.of(TOKEN);

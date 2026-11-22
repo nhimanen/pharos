@@ -11,13 +11,16 @@ import com.pharos.operator.api.PharosClusterStatus.Phase;
 import com.pharos.operator.render.ConfigRenderer;
 import com.pharos.operator.render.DesiredState;
 import com.pharos.operator.render.Labels;
+import com.pharos.operator.render.PreflightJobRenderer;
 import com.pharos.operator.render.StorageRenderer;
 import com.pharos.operator.render.WorkloadRenderer;
 import com.pharos.operator.scale.Autoscaler;
 import com.pharos.operator.scale.LastScale;
 import com.pharos.operator.status.ClusterStatusClient;
 import com.pharos.operator.status.ClusterStatusEventSource;
+import com.pharos.operator.status.PhaseEvaluator;
 import com.pharos.operator.status.StatusReading;
+import com.pharos.operator.upgrade.UpgradeCoordinator;
 import com.pharos.operator.validate.SpecValidator;
 import io.fabric8.kubernetes.api.model.Condition;
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
@@ -75,6 +78,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * schedule floors. Its records ({@code status.proposals}, {@code status.reshardProposals}) and the
  * {@code ClusterStatusAvailable} and {@code WriterLowDisk} conditions are merged into the one status
  * patch of each reconcile.
+ *
+ * <p>Each workload's version comes from the {@link UpgradeCoordinator}: a changed {@code spec.version}
+ * first runs the pre-flight Job, then rolls readers, writers and the router in that order; project Jobs
+ * use the writers' version. The phase and its conditions come from the {@link PhaseEvaluator}.
  */
 @Workflow(explicitInvocation = true, dependents = {
         @Dependent(name = DesiredState.TOKEN, type = Dependents.Secrets.class),
@@ -209,6 +216,11 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                         volumeNotes);
                 String minioSize = noShrink(before.minioStorage(), Defaults.minioStorage(spec), volumeNotes);
 
+                // every Job of this cluster: the informer is shared by name with the bucket Job's dependent
+                List<Job> jobsBefore = context.getSecondaryResourcesAsStream(Job.class, DesiredState.MINIO_BUCKET).toList();
+                UpgradeCoordinator.Plan upgrade = UpgradeCoordinator.plan(upgradeInput(resource, before, jobsBefore,
+                        storageReady(spec, before), reading == null ? null : reading.status(), now));
+
                 Integer retries = previousRetries(resource);
                 if (StorageRenderer.minioMode(spec) && before.bucketFailedAt() != null && !before.bucketDeleting()) {
                     Instant due = before.bucketFailedAt().plusSeconds(bucketBackoffSeconds(retries));
@@ -226,17 +238,20 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
 
                 DesiredState state = DesiredState.render(resource, configs, settings,
                         new DesiredState.Sizing(writers, readers, work, cache, minioSize,
-                                json(scale.writersLastScale()), json(scale.readersLastScale())));
+                                json(scale.writersLastScale()), json(scale.readersLastScale())), upgrade.versions());
                 var workflow = context.managedWorkflowAndDependentResourceContext();
                 workflow.put(DesiredState.KEY, state);
                 workflow.reconcileManagedWorkflow();
                 Observed after = Observed.of(resource, context);
                 watch.token(token(resource, context)); // the first reconcile has just created the Secret
-                // every Job of this cluster: the informer is shared by name with the bucket Job's dependent
+                applyUpgrade(upgrade, resource, context);
                 List<Job> jobs = context.getSecondaryResourcesAsStream(Job.class, DesiredState.MINIO_BUCKET).toList();
                 ProjectReconciler.Plan projects = ProjectReconciler.plan(resource, settings, jobs,
-                        storageReady(spec, after), clock.instant());
+                        storageReady(spec, after), clock.instant(), upgrade.versions().writers());
                 ProjectReconciler.apply(projects, resource, context);
+                if (upgrade.recheck() != null && (reschedule == null || upgrade.recheck().compareTo(reschedule) < 0)) {
+                    reschedule = upgrade.recheck();
+                }
                 if (projects.reschedule() != null && (reschedule == null || projects.reschedule().compareTo(reschedule) < 0)) {
                     reschedule = projects.reschedule();
                 }
@@ -246,7 +261,12 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 raise(resource, context, scale.notices());
                 desired = provisionedStatus(resource, writers, readers, after, volumeNotes, retries, projects,
                         scale, reading == null ? null : reading.status(),
-                        reading == null ? (watch.problem() == null ? "no pharos node answered" : watch.problem()) : null);
+                        reading == null ? (watch.problem() == null ? "no pharos node answered" : watch.problem()) : null,
+                        upgrade);
+                Duration phaseRecheck = phaseRecheck(desired, clock.instant());
+                if (phaseRecheck != null && (reschedule == null || phaseRecheck.compareTo(reschedule) < 0)) {
+                    reschedule = phaseRecheck;
+                }
             }
             UpdateControl<PharosCluster> control = Objects.equals(desired, resource.getStatus())
                     ? UpdateControl.noUpdate() : UpdateControl.patchStatus(statusPatch(resource, desired));
@@ -276,7 +296,7 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                         null, List.copyOf(conditions))
                 : new PharosClusterStatus(previous.phase(), previous.observedGeneration(), previous.writers(),
                         previous.readers(), previous.storage(), previous.projects(), previous.proposals(),
-                        previous.reshardProposals(), List.copyOf(conditions));
+                        previous.reshardProposals(), List.copyOf(conditions), previous.upgrade());
         LOG.warn("PharosCluster {}/{}: applying the desired state failed: {}", resource.getMetadata().getNamespace(),
                 resource.getMetadata().getName(), failed.getMessage());
         return ErrorStatusUpdateControl.patchStatus(statusPatch(resource, status));
@@ -420,12 +440,12 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 previous == null ? null : previous.writers(), previous == null ? null : previous.readers(),
                 previous == null ? null : previous.storage(), previous == null ? null : previous.projects(),
                 previous == null ? null : previous.proposals(), previous == null ? null : previous.reshardProposals(),
-                conditions.build());
+                conditions.build(), previous == null ? null : previous.upgrade());
     }
 
-    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer, ProjectReconciler.Plan, Autoscaler.Plan, ClusterStatus, String)} with nothing to note. */
+    /** {@link #provisionedStatus(PharosCluster, int, int, Observed, List, Integer, ProjectReconciler.Plan, Autoscaler.Plan, ClusterStatus, String, UpgradeCoordinator.Plan)} with nothing to note. */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed) {
-        return provisionedStatus(resource, writers, readers, observed, List.of(), null, null, null, null, null);
+        return provisionedStatus(resource, writers, readers, observed, List.of(), null, null, null, null, null, null);
     }
 
     /** The storage is usable: minio is ready with its bucket created, or an (unprobed) s3 bucket. */
@@ -434,16 +454,16 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
     }
 
     /**
-     * The status once the objects are applied: {@code Ready} when the storage is ready and at least
-     * {@code min} writers and readers and one router are ready, else {@code Provisioning};
-     * {@code Degraded} when a project Job failed. {@code projects}: the project plan of this reconcile,
-     * or null to keep the listed projects. {@code scale}: the autoscaler's plan, or null to keep its
-     * records; {@code status}: the {@code /cluster/status} read, or null with {@code noAnswer} saying why.
+     * The status once the objects are applied, with the phase and its conditions from the
+     * {@link PhaseEvaluator}. {@code projects}: the project plan of this reconcile, or null to keep the
+     * listed projects. {@code scale}: the autoscaler's plan, or null to keep its records;
+     * {@code status}: the {@code /cluster/status} read, or null with {@code noAnswer} saying why;
+     * {@code upgrade}: the upgrade's plan, or null when there is none to report.
      */
     PharosClusterStatus provisionedStatus(PharosCluster resource, int writers, int readers, Observed observed,
                                           List<String> volumeNotes, Integer bucketRetries,
                                           ProjectReconciler.Plan projects, Autoscaler.Plan scale,
-                                          ClusterStatus status, String noAnswer) {
+                                          ClusterStatus status, String noAnswer, UpgradeCoordinator.Plan upgrade) {
         PharosClusterSpec spec = resource.getSpec();
         PharosClusterStatus previous = resource.getStatus();
         boolean minio = StorageRenderer.minioMode(spec);
@@ -470,30 +490,31 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
             storageReason = REASON_READY;
             storageMessage = "MinIO is ready and the bucket exists.";
         }
-        List<String> waiting = new ArrayList<>();
-        if (!storageReady) waiting.add(observed.minioReady() < 1 ? "MinIO" : "the bucket");
-        if (observed.writersReady() < Defaults.min(spec.writers())) {
-            waiting.add("writers (" + observed.writersReady() + "/" + Defaults.min(spec.writers()) + " ready)");
+        List<PharosClusterStatus.ProjectStatus> projectList = projects != null
+                ? (projects.projects().isEmpty() ? null : projects.projects())
+                : previous == null ? null : previous.projects();
+        projectList = withClusterStatus(projectList, status, previous);
+        Map<String, Long> published = new java.util.TreeMap<>();
+        if (spec.projects() != null) {
+            Map<String, Long> generations = new HashMap<>();
+            if (projectList != null) for (var p : projectList) if (p.generation() != null) generations.put(p.name(), p.generation());
+            for (PharosClusterSpec.Project p : spec.projects()) {
+                if (p != null && p.name() != null) published.put(p.name(), generations.get(p.name()));
+            }
         }
-        if (observed.readersReady() < Defaults.min(spec.readers())) {
-            waiting.add("readers (" + observed.readersReady() + "/" + Defaults.min(spec.readers()) + " ready)");
-        }
-        if (observed.routerReady() < 1) waiting.add("the router");
-        boolean ready = waiting.isEmpty();
-        String waitingFor = "Waiting for " + String.join(", ", waiting) + ".";
-        boolean degraded = projects != null && !projects.failures().isEmpty();
-        String degradedMessage = degraded ? String.join("; ", projects.failures()) : "";
-        var conditions = conditions(resource)
-                .set(Phase.Pending.name(), false, REASON_PROVISIONED, "The objects are created.")
-                .set(Phase.Provisioning.name(), !ready, ready ? REASON_READY : REASON_WAITING,
-                        ready ? "" : waitingFor)
-                .set(Phase.Ready.name(), ready && !degraded,
-                        degraded ? Phase.Degraded.name() : ready ? REASON_READY : REASON_WAITING,
-                        degraded ? degradedMessage
-                                : ready ? "Storage, writers, readers and the router are ready." : waitingFor)
-                .set(Phase.Degraded.name(), degraded, degraded ? projects.degradedReason() : REASON_NONE,
-                        degradedMessage)
-                .set(PharosClusterStatus.CONDITION_STORAGE_READY, storageReady, storageReason, storageMessage)
+        Instant now = clock.instant();
+        boolean blocked = upgrade != null && upgrade.blocked();
+        String upgradeReason = upgrade != null ? upgrade.reason() : UpgradeCoordinator.REASON_UP_TO_DATE;
+        String upgradeMessage = upgrade != null ? upgrade.message() : "Every workload runs " + spec.version() + ".";
+        PhaseEvaluator.Result phase = PhaseEvaluator.evaluate(new PhaseEvaluator.Input(storageReady, storageReason,
+                storageMessage, minio && observed.bucketFailedAt() != null, minio, Defaults.min(spec.writers()),
+                observed.writersReady(), Defaults.min(spec.readers()), observed.readersReady(), observed.routerReady(),
+                status, published, projects == null ? List.of() : projects.failures(),
+                projects == null ? null : projects.degradedReason(), blocked, upgradeReason, upgradeMessage,
+                previous == null ? null : previous.conditions(), now));
+        var conditions = conditions(resource);
+        for (PhaseEvaluator.Cond c : phase.conditions()) conditions.set(c.type(), c.status(), c.reason(), c.message());
+        conditions
                 .set(PharosClusterStatus.CONDITION_VOLUME_CHANGE_NOT_APPLIED, !volumeNotes.isEmpty(),
                         volumeNotes.isEmpty() ? REASON_NONE : REASON_IMMUTABLE_VOLUME, String.join("; ", volumeNotes))
                 .set(PharosClusterStatus.CONDITION_APPLY_FAILED, false, REASON_APPLIED, "")
@@ -520,12 +541,7 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                         "No pharos node has answered yet.");
             }
         }
-        List<PharosClusterStatus.ProjectStatus> projectList = projects != null
-                ? (projects.projects().isEmpty() ? null : projects.projects())
-                : previous == null ? null : previous.projects();
-        projectList = withClusterStatus(projectList, status, previous);
-        Phase phase = degraded ? Phase.Degraded : ready ? Phase.Ready : Phase.Provisioning;
-        return new PharosClusterStatus(phase.name(), generation(resource),
+        return new PharosClusterStatus(phase.phase().name(), generation(resource),
                 new PharosClusterStatus.Replicas(writers, observed.writersReady()),
                 new PharosClusterStatus.Replicas(readers, observed.readersReady()),
                 new PharosClusterStatus.StorageStatus(minio ? "minio" : "s3", storageReady,
@@ -533,7 +549,89 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 projectList,
                 scale != null ? scale.proposals() : previous == null ? null : previous.proposals(),
                 scale != null ? scale.reshardProposals() : previous == null ? null : previous.reshardProposals(),
-                conditions.build());
+                conditions.build(),
+                upgrade != null ? upgrade.upgrade() : previous == null ? null : previous.upgrade());
+    }
+
+    /**
+     * When the readers' grace runs out: readers below {@code min} since a transition time turn the
+     * phase Degraded {@link PhaseEvaluator#READERS_GRACE} later, with no event of their own.
+     */
+    static Duration phaseRecheck(PharosClusterStatus status, Instant now) {
+        Condition readers = previousCondition(status, PharosClusterStatus.CONDITION_READERS_READY);
+        if (readers == null || !"False".equals(readers.getStatus())
+                || !PhaseEvaluator.REASON_BELOW_MIN.equals(readers.getReason())
+                || readers.getLastTransitionTime() == null) {
+            return null;
+        }
+        Instant due = Instant.parse(readers.getLastTransitionTime()).plus(PhaseEvaluator.READERS_GRACE).plusSeconds(1);
+        return now.isBefore(due) ? Duration.between(now, due) : null;
+    }
+
+    /** What the {@link UpgradeCoordinator} needs, from the informer caches. */
+    UpgradeCoordinator.Input upgradeInput(PharosCluster resource, Observed observed, List<Job> jobs,
+                                          boolean storageReady, ClusterStatus status, Instant now) {
+        String name = resource.getMetadata().getName();
+        String target = resource.getSpec().version();
+        String targetJob = Names.preflightJob(name, target);
+        UpgradeCoordinator.Preflight preflight = UpgradeCoordinator.Preflight.ABSENT;
+        List<String> others = new ArrayList<>();
+        for (Job j : jobs) {
+            Map<String, String> labels = j.getMetadata().getLabels();
+            if (labels == null || !name.equals(labels.get(Labels.CLUSTER))
+                    || !Labels.PREFLIGHT.equals(labels.get(Labels.COMPONENT))) {
+                continue;
+            }
+            ProjectReconciler.ProjectJob pj = new ProjectReconciler.ProjectJob(j);
+            if (!targetJob.equals(pj.name())) {
+                if (!pj.deleting()) others.add(pj.name());
+                continue;
+            }
+            if (pj.deleting()) {
+                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.DELETING, null, null);
+            } else if (pj.succeeded()) {
+                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.SUCCEEDED, null, null);
+            } else if (pj.failed()) {
+                boolean refused = PreflightJobRenderer.REASON_REFUSED.equals(pj.failure());
+                preflight = new UpgradeCoordinator.Preflight(refused ? UpgradeCoordinator.PreflightState.REFUSED
+                        : UpgradeCoordinator.PreflightState.FAILED, pj.failedAt(), pj.failure());
+            } else {
+                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.RUNNING, null, null);
+            }
+        }
+        java.util.Collections.sort(others);
+        PharosClusterStatus previous = resource.getStatus();
+        return new UpgradeCoordinator.Input(name, target, observed.readersWorkload(), observed.writersWorkload(),
+                observed.routerWorkload(), preflight, List.copyOf(others), storageReady, status,
+                previous == null ? null : previous.upgrade(), now);
+    }
+
+    /**
+     * Applies the upgrade's Job changes: deletes pre-flight Jobs (Background), then creates the spec's
+     * version's (owned by the cluster; one that exists already is left alone). Names only are logged.
+     */
+    private void applyUpgrade(UpgradeCoordinator.Plan plan, PharosCluster resource, Context<PharosCluster> context) {
+        String ns = resource.getMetadata().getNamespace();
+        String name = resource.getMetadata().getName();
+        for (String job : plan.deleteJobs()) {
+            LOG.info("PharosCluster {}/{}: deleting pre-flight Job {}", ns, name, job);
+            context.getClient().batch().v1().jobs().inNamespace(ns).withName(job)
+                    .withPropagationPolicy(DeletionPropagation.BACKGROUND).delete();
+        }
+        if (plan.createPreflight()) {
+            Job job = PreflightJobRenderer.render(resource, settings, resource.getSpec().version());
+            job.addOwnerReference(resource);
+            LOG.info("PharosCluster {}/{}: creating pre-flight Job {} ({})", ns, name, job.getMetadata().getName(),
+                    plan.message());
+            try {
+                context.resourceOperations().create(job);
+            } catch (io.fabric8.kubernetes.client.KubernetesClientException e) {
+                if (e.getCode() != 409) {
+                    throw new IllegalStateException("creating Job " + job.getMetadata().getName() + " failed (HTTP "
+                            + e.getCode() + ")", e);
+                }
+            }
+        }
     }
 
     private static Condition previousCondition(PharosClusterStatus previous, String type) {
@@ -599,18 +697,21 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
     /**
      * What the cluster's workloads report, from the informer caches. {@code bucketFailedAt}: when the
      * bucket Job's {@code Failed} condition became true, or null; {@code bucketDeleting}: it is being
-     * deleted (a retry is under way).
+     * deleted (a retry is under way). The {@code *Workload}s: each workload's version and rollout for
+     * the {@link UpgradeCoordinator}.
      */
     record Observed(Integer writersReplicas, Integer readersReplicas, int writersReady, int readersReady,
                     int routerReady, int minioReady, boolean bucketCreated, String workVolume, String cacheVolume,
                     String minioStorage, Instant bucketFailedAt, String bucketFailure, boolean bucketDeleting,
-                    String writersLastScale, String readersLastScale) {
+                    String writersLastScale, String readersLastScale, UpgradeCoordinator.Workload writersWorkload,
+                    UpgradeCoordinator.Workload readersWorkload, UpgradeCoordinator.Workload routerWorkload) {
 
         /** Readiness only, for status tests. */
         Observed(Integer writersReplicas, Integer readersReplicas, int writersReady, int readersReady,
                  int routerReady, int minioReady, boolean bucketCreated) {
             this(writersReplicas, readersReplicas, writersReady, readersReady, routerReady, minioReady, bucketCreated,
-                    null, null, null, null, null, false, null, null);
+                    null, null, null, null, null, false, null, null, UpgradeCoordinator.Workload.ABSENT,
+                    UpgradeCoordinator.Workload.ABSENT, UpgradeCoordinator.Workload.ABSENT);
         }
 
         static Observed of(PharosCluster resource, Context<PharosCluster> context) {
@@ -648,7 +749,56 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                             : Instant.parse(c.getLastTransitionTime())).orElse(null),
                     failed.map(c -> c.getReason()).orElse(null),
                     bucket.map(j -> j.getMetadata().getDeletionTimestamp() != null).orElse(false),
-                    annotation(writers, Labels.LAST_SCALE), annotation(readers, Labels.LAST_SCALE));
+                    annotation(writers, Labels.LAST_SCALE), annotation(readers, Labels.LAST_SCALE),
+                    writers.map(Observed::workload).orElse(UpgradeCoordinator.Workload.ABSENT),
+                    readers.map(Observed::workload).orElse(UpgradeCoordinator.Workload.ABSENT),
+                    router.map(Observed::workload).orElse(UpgradeCoordinator.Workload.ABSENT));
+        }
+
+        /**
+         * A StatefulSet as the upgrade sees it: rolled out when the controller has seen its current
+         * generation, every replica is updated to the current template and ready, and the current
+         * revision is the update revision.
+         */
+        static UpgradeCoordinator.Workload workload(StatefulSet s) {
+            int replicas = s.getSpec().getReplicas() == null ? 1 : s.getSpec().getReplicas();
+            var st = s.getStatus();
+            boolean rolledOut = st != null && seen(st.getObservedGeneration(), s.getMetadata().getGeneration())
+                    && nz(st.getUpdatedReplicas()) >= replicas && nz(st.getReadyReplicas()) >= replicas
+                    && (st.getUpdateRevision() == null || st.getUpdateRevision().equals(st.getCurrentRevision()));
+            return new UpgradeCoordinator.Workload(version(s.getSpec().getTemplate()), rolledOut, replicas,
+                    s.getMetadata().getAnnotations() == null ? null
+                            : s.getMetadata().getAnnotations().get(Labels.VERSION_SINCE));
+        }
+
+        /** The router Deployment: rolled out when every replica is updated and available, and no old one is left. */
+        static UpgradeCoordinator.Workload workload(Deployment d) {
+            int replicas = d.getSpec().getReplicas() == null ? 1 : d.getSpec().getReplicas();
+            var st = d.getStatus();
+            boolean rolledOut = st != null && seen(st.getObservedGeneration(), d.getMetadata().getGeneration())
+                    && nz(st.getUpdatedReplicas()) >= replicas && nz(st.getAvailableReplicas()) >= replicas
+                    && nz(st.getReplicas()) <= replicas;
+            return new UpgradeCoordinator.Workload(version(d.getSpec().getTemplate()), rolledOut, replicas,
+                    d.getMetadata().getAnnotations() == null ? null
+                            : d.getMetadata().getAnnotations().get(Labels.VERSION_SINCE));
+        }
+
+        private static boolean seen(Long observed, Long generation) {
+            return observed != null && observed >= (generation == null ? 0 : generation);
+        }
+
+        private static int nz(Integer i) {
+            return i == null ? 0 : i;
+        }
+
+        /** The tag of the pod template's {@code pharos} container image ({@code repo[:port]/name:tag}), or "". */
+        static String version(io.fabric8.kubernetes.api.model.PodTemplateSpec template) {
+            if (template == null || template.getSpec() == null || template.getSpec().getContainers() == null) return "";
+            String image = template.getSpec().getContainers().stream().filter(c -> "pharos".equals(c.getName()))
+                    .map(io.fabric8.kubernetes.api.model.Container::getImage).findFirst().orElse(null);
+            if (image == null) return "";
+            int colon = image.lastIndexOf(':');
+            return colon > image.lastIndexOf('/') ? image.substring(colon + 1) : "";
         }
 
         private static String annotation(Optional<StatefulSet> s, String key) {
