@@ -917,6 +917,9 @@ public class ProjectIndexManager {
                 for (String path : moved.keySet()) writer.deleteFile(path);
                 indexProject(writer, subset, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir,
                         runtimes, abort);
+                abort.checkpoint();
+                // the moved files' old documents must leave the term statistics too, not only the live docs
+                writer.expungeDeletes();
                 abort.enterCommit();
                 markCommitting(projectIndexDir, to);
                 writer.commit();

@@ -589,6 +589,46 @@ class ReshardJobTest {
     }
 
     /**
+     * Found by the Phase 6 gate: the shards a ring change rewrites carry no deleted documents, so their
+     * term statistics count every moved file once (Lucene counts deleted documents in docFreq and docCount
+     * until a merge drops them; with them left in, every BM25 score shifted after the reshard).
+     */
+    @Test
+    void ringChangeLeavesNoDeletedDocumentsInTheShardsItRewrites() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        Set<ShardId> sources = movedFrom(files, RING4, RING5);
+        assertThat(sources).as("the fixture moves files out of some shards").isNotEmpty();
+
+        catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        r.sync();
+        a.loop.tick();
+        r.sync();
+        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        r.sync();
+
+        assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
+        long live = 0;
+        long counted = 0;
+        for (ShardId s : ring(5)) {
+            try (FSDirectory d = FSDirectory.open(r.cache.active(s.value()).orElseThrow().resolve("lucene"));
+                 DirectoryReader dr = DirectoryReader.open(d)) {
+                assertThat(dr.numDeletedDocs()).as(s + " has no deleted documents").isZero();
+                live += dr.numDocs();
+                org.apache.lucene.index.Terms t = org.apache.lucene.index.MultiTerms.getTerms(dr,
+                        DocumentMapper.F_FILE_PATH);
+                counted += t == null ? 0 : t.getDocCount();
+            }
+        }
+        assertThat(counted).as("the term statistics count each document once").isEqualTo(live);
+        assertEveryFileOnce(r, files, "after");
+    }
+
+    /**
      * Review Focus 1: the publish of version N+1 is interrupted; N keeps serving and the half-built N+1 is
      * invisible; the writer resumes, reusing what it published; it then dies, and another writer takes
      * the project over and finishes the reshard from the shards already published.

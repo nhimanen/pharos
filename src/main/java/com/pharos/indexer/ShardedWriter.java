@@ -4,6 +4,7 @@ import com.pharos.cluster.ShardId;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TieredMergePolicy;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -90,6 +91,27 @@ final class ShardedWriter implements Closeable {
             return;
         }
         for (IndexWriter w : writers.values()) w.deleteDocuments(t);
+    }
+
+    /**
+     * Merges away every deleted document of the split run's writers (no deleted document is left: the
+     * merge policy's allowance is set to 0 for this call). A reshard calls it on the shards it rewrites:
+     * the moved files' documents it deleted from their old shards would otherwise stay in those shards'
+     * term statistics (Lucene counts deleted documents in {@code docFreq} and {@code docCount} until a
+     * merge drops them), so every moved file would be counted twice in the global BM25 statistics and
+     * every score would shift (found by the Phase 6 gate: about 2 % after a 4 to 5 ring change).
+     */
+    void expungeDeletes() throws IOException {
+        if (single != null) throw new IllegalStateException("only a split run expunges deletes");
+        for (IndexWriter w : writers.values()) {
+            if (w.getConfig().getMergePolicy() instanceof TieredMergePolicy t) t.setForceMergeDeletesPctAllowed(0.0);
+            // buffered term deletes are not counted by the merge policy until they are applied: an NRT
+            // reader applies them (nothing is committed; a flush alone does not)
+            try (org.apache.lucene.index.DirectoryReader applied = org.apache.lucene.index.DirectoryReader.open(w)) {
+                // opened only to apply the deletes
+            }
+            w.forceMergeDeletes(true);
+        }
     }
 
     /** Commits every writer, in plan order. */
