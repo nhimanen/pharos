@@ -198,7 +198,8 @@ public final class GenerationGc {
         Set<Long> keptGens = new HashSet<>();
         for (Manifest m : kept) keptGens.add(m.generation());
         keptGens.add(latestGen);
-        collectWriterState(shard, objects, keptGens, cutoff, protectedKeys, deleted);
+        collectWriterState(shard.toString(), layout.writerStatePrefix(shard), objects, keptGens, cutoff,
+                protectedKeys, deleted);
         if (deleted[0] > 0) {
             log.info("GC of shard {}: deleted {} objects ({} manifests), LATEST generation {}",
                     shard, deleted[0], doomed.size(), latestGen);
@@ -212,9 +213,8 @@ public final class GenerationGc {
      * re-checked just before its delete, like data files). When a surviving index cannot be read or
      * parsed, no blob is deleted.
      */
-    private void collectWriterState(ShardId shard, List<ObjectInfo> objects, Set<Long> keptGens, Instant cutoff,
-                                    Set<String> protectedKeys, int[] deleted) throws Abort {
-        String prefix = layout.writerStatePrefix(shard);
+    private void collectWriterState(String shard, String prefix, List<ObjectInfo> objects, Set<Long> keptGens,
+                                    Instant cutoff, Set<String> protectedKeys, int[] deleted) throws Abort {
         String blobPrefix = prefix + "blobs/";
         Map<Long, List<ObjectInfo>> byGen = new TreeMap<>();
         List<ObjectInfo> blobs = new ArrayList<>();
@@ -233,7 +233,7 @@ public final class GenerationGc {
         boolean referencesKnown = true;
         for (long gen : byGen.keySet()) {
             if (!keptGens.contains(gen)) continue;
-            String indexKey = layout.writerStateIndexKey(shard, new Generation(gen));
+            String indexKey = prefix + "gen-" + gen + "/index.json";
             if (byGen.get(gen).stream().noneMatch(o -> o.key().equals(indexKey))) continue; // backup never completed
             Optional<StoredObject> obj;
             try {
@@ -258,7 +258,7 @@ public final class GenerationGc {
 
         for (Map.Entry<Long, List<ObjectInfo>> e : byGen.entrySet()) {
             if (keptGens.contains(e.getKey())) continue;
-            String indexKey = layout.writerStateIndexKey(shard, new Generation(e.getKey()));
+            String indexKey = prefix + "gen-" + e.getKey() + "/index.json";
             List<ObjectInfo> files = new ArrayList<>(e.getValue());
             files.sort(Comparator.comparing((ObjectInfo o) -> !o.key().equals(indexKey))); // index first
             for (ObjectInfo o : files) deleted[0] += delete(shard, o.key(), protectedKeys);
@@ -271,6 +271,96 @@ public final class GenerationGc {
             if (!stillOld(o.key(), cutoff)) continue;
             deleted[0] += delete(shard, o.key(), protectedKeys);
         }
+    }
+
+    /**
+     * GC of a split project's own objects under {@code projects/<project>/} (ruling P6-R2), run after the
+     * GC of each of its shards. Kept: every {@code graph/} and {@code refs/} object some manifest of any
+     * of {@code shards} still lists in its {@code projectFiles} (the manifests the shard GCs kept, and any
+     * newer orphan), and anything younger than {@code minAge}. The project writer state of a run survives
+     * while a manifest of that run does, and the newest backup always does. Same safety rules as
+     * {@link #collect}: any listing, read or validation failure deletes nothing; never throws.
+     *
+     * @param now the store's clock; null skips the GC
+     * @return the number of objects deleted
+     */
+    public int collectProject(String project, List<ShardId> shards, Instant now) {
+        int[] deleted = {0};
+        if (now == null) {
+            log.warn("GC of project {} skipped: no store time", project);
+            return 0;
+        }
+        try {
+            runProject(project, shards, now, deleted);
+        } catch (Abort e) {
+            log.warn("GC of project {} aborted after {} deletes: {}", project, deleted[0], e.getMessage());
+        } catch (RuntimeException e) {
+            log.warn("GC of project {} failed after {} deletes: {}", project, deleted[0], e.toString());
+        }
+        return deleted[0];
+    }
+
+    private void runProject(String project, List<ShardId> shards, Instant now, int[] deleted) throws Abort {
+        Instant cutoff = now.minus(minAge);
+        String prefix = layout.projectPrefix(project);
+        Set<String> referenced = new HashSet<>();
+        Set<String> protectedKeys = new HashSet<>();
+        Set<Long> keptGens = new HashSet<>();
+        for (ShardId shard : shards) {
+            String manifestsPrefix = layout.shardPrefix(shard) + "manifests/";
+            String latestManifest = null;
+            try {
+                Optional<StoredObject> latest = store.get(layout.latestKey(shard));
+                if (latest.isPresent()) {
+                    JsonNode m = JSON.readTree(latest.get().data()).get("manifest");
+                    if (m != null && m.isTextual()) latestManifest = manifestsPrefix + m.asText();
+                }
+                for (ObjectInfo o : store.list(manifestsPrefix)) {
+                    Matcher mm = MANIFEST_NAME.matcher(o.key().substring(manifestsPrefix.length()));
+                    if (!mm.matches()) continue;
+                    StoredObject obj = store.get(o.key()).orElseThrow(() -> new Abort("manifest " + o.key()
+                            + " vanished during GC"));
+                    ShardManifest parsed;
+                    try {
+                        parsed = ShardManifest.read(obj.data());
+                    } catch (IOException e) {
+                        throw new Abort("unparseable manifest " + o.key() + ": " + e);
+                    }
+                    validate(shard, o.key(), Long.parseLong(mm.group(1)), parsed);
+                    if (parsed.projectGeneration() != null) keptGens.add(parsed.projectGeneration());
+                    for (ManifestFile f : parsed.projectFileList()) {
+                        referenced.add(f.key());
+                        if (o.key().equals(latestManifest)) protectedKeys.add(f.key());
+                    }
+                }
+            } catch (IOException e) {
+                throw new Abort("listing shard " + shard + " failed: " + e);
+            }
+        }
+        List<ObjectInfo> objects;
+        try {
+            objects = store.list(prefix);
+        } catch (IOException e) {
+            throw new Abort("listing failed: " + e);
+        }
+        for (ObjectInfo o : objects) {
+            String rel = o.key().substring(prefix.length());
+            if (!rel.startsWith("graph/") && !rel.startsWith("refs/")) continue;
+            if (referenced.contains(o.key()) || !o.lastModified().isBefore(cutoff)) continue;
+            if (!stillOld(o.key(), cutoff)) continue;
+            deleted[0] += delete("project " + project, o.key(), protectedKeys);
+        }
+        // the newest backup stays even when no manifest names its run (yet)
+        String statePrefix = layout.projectWriterStatePrefix(project);
+        long newest = -1;
+        for (ObjectInfo o : objects) {
+            if (!o.key().startsWith(statePrefix)) continue;
+            Matcher m = WRITER_STATE_GEN.matcher(o.key().substring(statePrefix.length()));
+            if (m.matches()) newest = Math.max(newest, Long.parseLong(m.group(1)));
+        }
+        if (newest >= 0) keptGens.add(newest);
+        collectWriterState("project " + project, statePrefix, objects, keptGens, cutoff, protectedKeys, deleted);
+        if (deleted[0] > 0) log.info("GC of project {}: deleted {} objects", project, deleted[0]);
     }
 
     /** Rejects manifests that parse leniently but cannot be trusted to list their references. */
@@ -299,7 +389,7 @@ public final class GenerationGc {
                 .map(o -> o.lastModified().isBefore(cutoff)).orElse(false);
     }
 
-    private int delete(ShardId shard, String key, Set<String> protectedKeys) {
+    private int delete(Object shard, String key, Set<String> protectedKeys) {
         if (protectedKeys.contains(key)) {
             log.error("GC of shard {} refused to delete {}: referenced by the LATEST generation", shard, key);
             return 0;

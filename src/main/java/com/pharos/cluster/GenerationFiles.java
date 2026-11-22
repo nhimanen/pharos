@@ -39,7 +39,10 @@ public final class GenerationFiles {
         public IntegrityException(String message, Throwable cause) { super(message, cause); }
     }
 
-    /** Every entry needs a role and a plain file name; at least one Lucene file, at most one graph. */
+    /**
+     * Every entry needs a role and a plain file name; at least one Lucene file, at most one graph (in
+     * {@code files} and the project files together); project files are never Lucene files.
+     */
     public static void checkFiles(ShardManifest manifest) throws IntegrityException {
         Set<String> luceneNames = new HashSet<>();
         int graphs = 0;
@@ -51,6 +54,13 @@ public final class GenerationFiles {
             if (f.length() < 0) throw new IntegrityException("negative length in " + f);
             if (ManifestFile.LUCENE.equals(f.role()) && !luceneNames.add(f.name())) {
                 throw new IntegrityException("duplicate Lucene file " + f.name());
+            }
+            if (ManifestFile.GRAPH.equals(f.role())) graphs++;
+        }
+        for (ManifestFile f : manifest.projectFileList()) {
+            if (f.role() == null || f.name() == null || !PLAIN_NAME.matcher(f.name()).matches() || f.length() < 0
+                    || ManifestFile.LUCENE.equals(f.role())) {
+                throw new IntegrityException("manifest gen-" + manifest.generation() + " has an invalid project file: " + f);
             }
             if (ManifestFile.GRAPH.equals(f.role())) graphs++;
         }

@@ -220,6 +220,10 @@ public final class PeerBackend implements ReplicationBackend {
 
         @Override
         public Optional<Generation> publish(LocalSnapshot snapshot) throws IOException {
+            if (snapshot.plan().isSplit()) { // P6-R9: config validation refuses this; never publish it here
+                throw new com.pharos.cluster.PublishException("peer mode publishes only the default spec [project];"
+                        + " project " + snapshot.project() + " was indexed as spec " + snapshot.plan().spec());
+            }
             Optional<Generation> gen = inner.publish(snapshot);
             gen.ifPresent(g -> signal.published(ShardId.ofProject(snapshot.project()), g));
             return gen;

@@ -88,4 +88,31 @@ public final class ObjectStoreLayout {
     public String writerStateBlobKey(ShardId shard, String sha256Hex) {
         return writerStatePrefix(shard) + "blobs/" + sha256Hex;
     }
+
+    // ---- project-level keys (split projects, Phase 6) ---------------------------------------
+
+    /**
+     * {@code projects/<project>/}: what belongs to a split project as a whole rather than to one shard
+     * (ruling P6-R2): its call graph and refs per index run, and its writer state. The name is checked
+     * as a project name ({@link ShardId#ofProject}) and encoded like a shard id (a project name encodes
+     * to itself).
+     */
+    public String projectPrefix(String project) {
+        return root + "projects/" + ShardId.ofProject(project).pathSegment() + "/";
+    }
+
+    /** The project's call graph of index run {@code projectGen}, content-named like {@link #graphKey}. */
+    public String projectGraphKey(String project, long projectGen, String checksumHex) {
+        return projectPrefix(project) + "graph/gen-" + projectGen + "@" + checksumHex + ".cgf.gz";
+    }
+
+    /** The project's unresolved refs of index run {@code projectGen}, content-named. */
+    public String projectRefsKey(String project, long projectGen, String checksumHex) {
+        return projectPrefix(project) + "refs/gen-" + projectGen + "@" + checksumHex + ".json.gz";
+    }
+
+    /** A split project's writer state: {@code projects/<project>/writer-state/} (once per project). */
+    public String projectWriterStatePrefix(String project) {
+        return projectPrefix(project) + "writer-state/";
+    }
 }

@@ -20,8 +20,9 @@ public final class ManifestValidation {
 
     /**
      * Rejects an unsupported {@code formatVersion}, a {@code generation} or {@code shard} not
-     * matching where the manifest was read from, an empty file list, and any file entry whose key
-     * is blank or outside this shard's prefix.
+     * matching where the manifest was read from, an empty file list, any file entry whose key
+     * is blank or outside this shard's prefix, and (split projects) project files without a
+     * {@code projectGeneration} or outside the prefix of the project the manifest's meta names.
      *
      * @param key the object key the manifest was read from (for messages)
      */
@@ -43,6 +44,25 @@ public final class ManifestValidation {
         for (ManifestFile f : m.files()) {
             if (f == null || f.key() == null || f.key().isBlank() || !f.key().startsWith(prefix)) {
                 throw new InvalidManifestException("manifest " + key + " has an invalid file entry " + f);
+            }
+        }
+        if (m.projectGeneration() == null && m.projectFiles() == null) return;
+        // A split project's shard: its project files live under projects/<project>/, the project being
+        // the one its meta names (never derived from the shard id).
+        if (m.projectGeneration() == null || m.projectGeneration() < 1 || m.projectFiles() == null) {
+            throw new InvalidManifestException("manifest " + key + " has project files without a valid"
+                    + " projectGeneration (or the reverse)");
+        }
+        String project = m.projectMeta() == null ? null : m.projectMeta().getName();
+        String projectPrefix;
+        try {
+            projectPrefix = layout.projectPrefix(project);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new InvalidManifestException("manifest " + key + " has project files but names no valid project");
+        }
+        for (ManifestFile f : m.projectFiles()) {
+            if (f == null || f.key() == null || !f.key().startsWith(projectPrefix)) {
+                throw new InvalidManifestException("manifest " + key + " has an invalid project file entry " + f);
             }
         }
     }

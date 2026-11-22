@@ -6,6 +6,8 @@ import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.WriterStateStore;
 import com.pharos.cluster.WriterStateStore.Restored;
+import com.pharos.cluster.sharding.ShardPlan;
+import com.pharos.indexer.LocalShardLayout;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphImport;
 import com.pharos.graph.CrossProjectLinker;
@@ -28,7 +30,9 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -57,6 +61,12 @@ import java.util.zip.GZIPInputStream;
  * then swaps the staging dir in. A backup that is missing or fails its checks, and a {@code LATEST}
  * generation that cannot be used as a writer base, are WARNs and an empty result (the caller runs a
  * full index); a failure to reach the store is thrown.
+ *
+ * <p><b>Split projects</b> (ruling P6-R2): the writer state belongs to the project, so it is backed up
+ * once per index run under {@code projects/<project>/writer-state/} with the same layout, numbered by
+ * the run's {@code projectGeneration} ({@link #backupProject}). {@link #restoreProject} materialises
+ * every shard's {@code LATEST} into the project's local shard dirs, imports the project's graph once, and
+ * overlays that backup. A {@code [project]} project keeps the Phase 4 path {@code shards/<project>/}.
  */
 public final class ObjectStoreWriterStateStore implements WriterStateStore {
 
@@ -83,6 +93,27 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         this.nodeId = nodeId;
     }
 
+    /**
+     * Where one writer state lives: a shard's ({@code shards/<shard>/writer-state/}, Phase 4 and every
+     * {@code [project]} shard) or a split project's ({@code projects/<project>/writer-state/}, ruling
+     * P6-R2), with the same layout below it. {@code name} is what a backup index records as its owner.
+     */
+    private record Scope(String label, String name, String prefix) {
+        static Scope shard(ObjectStoreLayout layout, ShardId shard) {
+            return new Scope("Shard " + shard, shard.value(), layout.writerStatePrefix(shard));
+        }
+
+        static Scope project(ObjectStoreLayout layout, String project) {
+            return new Scope("Project " + project, project, layout.projectWriterStatePrefix(project));
+        }
+
+        String genPrefix(long gen) { return prefix + "gen-" + gen + "/"; }
+
+        String indexKey(long gen) { return genPrefix(gen) + "index.json"; }
+
+        String blobKey(String sha256Hex) { return prefix + "blobs/" + sha256Hex; }
+    }
+
     /** The backup or the generation cannot be used; the caller falls back to a full index. */
     private static final class Unusable extends Exception {
         Unusable(String message) { super(message, null, false, false); }
@@ -92,6 +123,16 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
 
     @Override
     public void backup(ShardId shard, Generation gen, Path indexDir) throws IOException {
+        backup(Scope.shard(layout, shard), gen.value(), indexDir);
+    }
+
+    @Override
+    public void backupProject(String project, long projectGeneration, Path indexDir) throws IOException {
+        if (projectGeneration < 1) throw new IllegalArgumentException("project generation " + projectGeneration);
+        backup(Scope.project(layout, project), projectGeneration, indexDir);
+    }
+
+    private void backup(Scope scope, long gen, Path indexDir) throws IOException {
         Path fileState = indexDir.resolve(FILE_STATE);
         if (!Files.isRegularFile(fileState)) {
             throw new IOException("no " + FILE_STATE + " in " + indexDir + ": nothing to back up");
@@ -119,12 +160,12 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
                 long length = Files.size(copy);
                 String key;
                 if (FILE_STATE.equals(name)) {
-                    key = layout.writerStateGenPrefix(shard, gen) + FILE_STATE;
+                    key = scope.genPrefix(gen) + FILE_STATE;
                     store.put(key, copy);
                     uploaded++;
                     bytesUploaded += length;
                 } else {
-                    key = layout.writerStateBlobKey(shard, sha);
+                    key = scope.blobKey(sha);
                     Optional<ObjectInfo> existing = store.stat(key);
                     if (existing.isPresent() && existing.get().size() == length) {
                         unchanged++;
@@ -136,11 +177,11 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
                 }
                 entries.add(new WriterStateIndex.Entry(name, key, length, sha));
             }
-            WriterStateIndex index = new WriterStateIndex(WriterStateIndex.FORMAT_VERSION, shard.value(),
-                    gen.value(), Instant.now(), nodeId, IndexVersions.CHUNKING_VERSION, entries);
-            store.put(layout.writerStateIndexKey(shard, gen), index.toJson());
-            log.info("Backed up writer state of shard {} generation {}: {} files uploaded ({} bytes), {} unchanged",
-                    shard, gen.value(), uploaded, bytesUploaded, unchanged);
+            WriterStateIndex index = new WriterStateIndex(WriterStateIndex.FORMAT_VERSION, scope.name(),
+                    gen, Instant.now(), nodeId, IndexVersions.CHUNKING_VERSION, entries);
+            store.put(scope.indexKey(gen), index.toJson());
+            log.info("Backed up writer state of {} generation {}: {} files uploaded ({} bytes), {} unchanged",
+                    scope.label().toLowerCase(java.util.Locale.ROOT), gen, uploaded, bytesUploaded, unchanged);
         } finally {
             deleteQuietly(snapshot);
         }
@@ -164,7 +205,8 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
             return Optional.empty();
         }
         Generation latest = latestOpt.get();
-        Optional<Generation> backup = newestBackup(shard, latest);
+        Scope scope = Scope.shard(layout, shard);
+        Optional<Generation> backup = newestBackup(scope, latest);
         if (backup.isEmpty()) {
             log.warn("Shard {}: no writer-state backup at or below generation {}; falling back to a full index",
                     shard, latest.value());
@@ -178,8 +220,8 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         deleteRecursively(root.resolve("." + dir.getFileName() + ".replaced")); // ditto, crashed mid-swap
         Files.createDirectories(staging);
         try {
-            WriterStateIndex index = readIndex(shard, backup.get());
-            List<Path> state = downloadState(shard, index, staging);
+            WriterStateIndex index = readIndex(scope, backup.get());
+            List<Path> state = downloadState(index, staging);
             ShardManifest manifest = manifest(shard, latest);
             materialise(shard, latest, manifest, dir, staging);
             swap(staging, dir);
@@ -202,8 +244,8 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
     }
 
     /** The newest generation at or below {@code latest} with a backup index. */
-    private Optional<Generation> newestBackup(ShardId shard, Generation latest) throws IOException {
-        String prefix = layout.writerStatePrefix(shard);
+    private Optional<Generation> newestBackup(Scope scope, Generation latest) throws IOException {
+        String prefix = scope.prefix();
         long best = -1;
         for (ObjectInfo o : store.list(prefix)) {
             Matcher m = INDEX_KEY.matcher(o.key().substring(prefix.length()));
@@ -214,8 +256,8 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         return best < 0 ? Optional.empty() : Optional.of(new Generation(best));
     }
 
-    private WriterStateIndex readIndex(ShardId shard, Generation gen) throws IOException, Unusable {
-        String key = layout.writerStateIndexKey(shard, gen);
+    private WriterStateIndex readIndex(Scope scope, Generation gen) throws IOException, Unusable {
+        String key = scope.indexKey(gen.value());
         StoredObject obj = store.get(key).orElseThrow(() -> new Unusable(key + " vanished"));
         WriterStateIndex index;
         try {
@@ -226,11 +268,11 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         if (index == null || index.formatVersion() != WriterStateIndex.FORMAT_VERSION) {
             throw new Unusable(key + " has an unsupported format");
         }
-        if (index.generation() != gen.value() || !shard.value().equals(index.shard())) {
-            throw new Unusable(key + " describes shard " + index.shard() + " generation " + index.generation());
+        if (index.generation() != gen.value() || !scope.name().equals(index.shard())) {
+            throw new Unusable(key + " describes " + index.shard() + " generation " + index.generation());
         }
-        String genPrefix = layout.writerStateGenPrefix(shard, gen);
-        String blobPrefix = layout.writerStateBlobKey(shard, "");
+        String genPrefix = scope.genPrefix(gen.value());
+        String blobPrefix = scope.blobKey("");
         Set<String> names = new HashSet<>();
         for (WriterStateIndex.Entry e : index.files()) {
             if (e == null || e.name() == null || e.key() == null || e.sha256() == null || e.length() < 0
@@ -250,7 +292,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
     }
 
     /** Downloads every file of the backup into {@code staging} and checks its length and SHA-256. */
-    private List<Path> downloadState(ShardId shard, WriterStateIndex index, Path staging)
+    private List<Path> downloadState(WriterStateIndex index, Path staging)
             throws IOException, Unusable {
         List<Path> out = new ArrayList<>();
         for (WriterStateIndex.Entry e : index.files()) {
@@ -296,7 +338,7 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         } catch (GenerationFiles.IntegrityException e) {
             throw new Unusable(e.getMessage());
         }
-        if (manifest.files().stream().noneMatch(f -> ManifestFile.GRAPH.equals(f.role()))) {
+        if (manifest.graphFile().isEmpty()) {
             throw new Unusable("generation " + gen.value() + " was published without a call graph");
         }
         return manifest;
@@ -310,55 +352,40 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
     private void materialise(ShardId shard, Generation gen, ShardManifest manifest, Path indexDir, Path staging)
             throws IOException, Unusable {
         long start = System.nanoTime();
-        Path lucene = Files.createDirectories(staging.resolve("lucene"));
-        Path existingLucene = indexDir.resolve("lucene");
+        int[] counts = materialiseLucene(gen, manifest, indexDir.resolve("lucene"),
+                Files.createDirectories(staging.resolve("lucene")));
+        for (ManifestFile f : manifest.files()) {
+            if (!ManifestFile.LUCENE.equals(f.role()) && materialiseProjectFile(gen, f, staging)) counts[1]++;
+        }
+        if (manifest.indexFormat() != null) IndexFormat.write(staging, manifest.indexFormat());
+        // a project new to this node: the cross-project graph picks it up on its next rebuild
+        CrossProjectLinker.touchStamp(staging.resolve("graph.stamp"));
+        log.info("Shard {}: materialised generation {} for the writer ({} files hard-linked, {} downloaded) in {} ms",
+                shard, gen.value(), counts[0], counts[1], (System.nanoTime() - start) / 1_000_000);
+    }
+
+    /**
+     * The Lucene files of {@code manifest} into {@code lucene}: hard-linked from {@code existingLucene}
+     * when the same file is there, else downloaded; all checksummed end to end.
+     *
+     * @return {@code {hard-linked, downloaded}}
+     */
+    private int[] materialiseLucene(Generation gen, ShardManifest manifest, Path existingLucene, Path lucene)
+            throws IOException, Unusable {
         Set<String> local = new HashSet<>();
         int linked = 0, downloaded = 0;
         try {
             for (ManifestFile f : manifest.files()) {
-                switch (f.role()) {
-                    case ManifestFile.LUCENE -> {
-                        Path target = lucene.resolve(f.name());
-                        if (reuse(existingLucene.resolve(f.name()), target, f)) {
-                            linked++;
-                        } else {
-                            source.download(f, target);
-                            downloaded++;
-                        }
-                        GenerationFiles.checkLength(target, f);
-                        local.add(f.name());
-                    }
-                    case ManifestFile.GRAPH -> {
-                        Path compact = staging.resolve(GRAPH_TMP);
-                        source.download(f, compact);
-                        downloaded++;
-                        GenerationFiles.checkLength(compact, f);
-                        GenerationFiles.checkCrc32(compact, f);
-                        Path graphDir = CallGraph.newGenerationDir(staging);
-                        try {
-                            CompactGraphImport.importInto(compact, graphDir);
-                        } catch (IOException e) {
-                            throw new Unusable("call graph of generation " + gen.value() + " cannot be imported: "
-                                    + e.getMessage());
-                        }
-                        CallGraph.publish(staging, graphDir);
-                        Files.delete(compact);
-                    }
-                    case ManifestFile.REFS -> {
-                        Path gz = staging.resolve(REFS_TMP);
-                        source.download(f, gz);
-                        downloaded++;
-                        GenerationFiles.checkLength(gz, f);
-                        GenerationFiles.checkCrc32(gz, f);
-                        try (InputStream in = new GZIPInputStream(Files.newInputStream(gz))) {
-                            Files.copy(in, staging.resolve(ObjectStorePublisher.REFS_FILE));
-                        } catch (java.util.zip.ZipException e) {
-                            throw new Unusable("refs of generation " + gen.value() + " are not gzip: " + e.getMessage());
-                        }
-                        Files.delete(gz);
-                    }
-                    default -> { } // unknown roles are not part of a writer's index
+                if (!ManifestFile.LUCENE.equals(f.role())) continue;
+                Path target = lucene.resolve(f.name());
+                if (reuse(existingLucene.resolve(f.name()), target, f)) {
+                    linked++;
+                } else {
+                    source.download(f, target);
+                    downloaded++;
                 }
+                GenerationFiles.checkLength(target, f);
+                local.add(f.name());
             }
             // every local file is checked end to end: hard-linked ones were never verified downloads
             GenerationFiles.checkLuceneChecksums(lucene, manifest, local, local);
@@ -367,11 +394,149 @@ public final class ObjectStoreWriterStateStore implements WriterStateStore {
         } catch (ObjectMissingException e) {
             throw new Unusable("file " + e.key() + " of generation " + gen.value() + " is missing");
         }
-        if (manifest.indexFormat() != null) IndexFormat.write(staging, manifest.indexFormat());
-        // a project new to this node: the cross-project graph picks it up on its next rebuild
-        CrossProjectLinker.touchStamp(staging.resolve("graph.stamp"));
-        log.info("Shard {}: materialised generation {} for the writer ({} files hard-linked, {} downloaded) in {} ms",
-                shard, gen.value(), linked, downloaded, (System.nanoTime() - start) / 1_000_000);
+        return new int[]{linked, downloaded};
+    }
+
+    /**
+     * A graph file becomes a fresh writer graph generation plus its pointer in {@code staging}; a refs
+     * file becomes {@code unresolved-refs.json}. Other roles are not part of a writer's index.
+     *
+     * @return true when the file was downloaded
+     */
+    private boolean materialiseProjectFile(Generation gen, ManifestFile f, Path staging) throws IOException, Unusable {
+        try {
+            switch (f.role()) {
+                case ManifestFile.GRAPH -> {
+                    Path compact = staging.resolve(GRAPH_TMP);
+                    source.download(f, compact);
+                    GenerationFiles.checkLength(compact, f);
+                    GenerationFiles.checkCrc32(compact, f);
+                    Path graphDir = CallGraph.newGenerationDir(staging);
+                    try {
+                        CompactGraphImport.importInto(compact, graphDir);
+                    } catch (IOException e) {
+                        throw new Unusable("call graph of generation " + gen.value() + " cannot be imported: "
+                                + e.getMessage());
+                    }
+                    CallGraph.publish(staging, graphDir);
+                    Files.delete(compact);
+                    return true;
+                }
+                case ManifestFile.REFS -> {
+                    Path gz = staging.resolve(REFS_TMP);
+                    source.download(f, gz);
+                    GenerationFiles.checkLength(gz, f);
+                    GenerationFiles.checkCrc32(gz, f);
+                    try (InputStream in = new GZIPInputStream(Files.newInputStream(gz))) {
+                        Files.copy(in, staging.resolve(ObjectStorePublisher.REFS_FILE));
+                    } catch (java.util.zip.ZipException e) {
+                        throw new Unusable("refs of generation " + gen.value() + " are not gzip: " + e.getMessage());
+                    }
+                    Files.delete(gz);
+                    return true;
+                }
+                default -> {
+                    return false; // unknown roles are not part of a writer's index
+                }
+            }
+        } catch (GenerationFiles.IntegrityException e) {
+            throw new Unusable(e.getMessage());
+        } catch (ObjectMissingException e) {
+            throw new Unusable("file " + e.key() + " of generation " + gen.value() + " is missing");
+        }
+    }
+
+    // ---- restore of a split project (ruling P6-R2) --------------------------------------------
+
+    @Override
+    public Optional<Restored> restoreProject(ShardPlan plan, Path indexDir) throws IOException {
+        if (!plan.isSplit()) return restore(ShardId.ofProject(plan.project()), indexDir);
+        String project = plan.project();
+        Map<ShardId, Generation> latest = new LinkedHashMap<>();
+        List<ShardId> unpublished = new ArrayList<>();
+        for (ShardId shard : plan.shards()) {
+            Optional<Generation> g = source.latest(shard);
+            if (g.isPresent()) latest.put(shard, g.get()); else unpublished.add(shard);
+        }
+        if (latest.isEmpty()) {
+            log.info("Project {}: nothing published yet, nothing to restore", project);
+            return Optional.empty();
+        }
+        if (!unpublished.isEmpty()) {
+            log.warn("Project {}: shards {} have no published generation; falling back to a full index",
+                    project, unpublished);
+            return Optional.empty();
+        }
+        Scope scope = Scope.project(layout, project);
+        Path dir = indexDir.toAbsolutePath().normalize();
+        Path root = parentOf(dir);
+        Files.createDirectories(root);
+        Path staging = root.resolve("." + dir.getFileName() + ".restoring");
+        Long run = null;
+        Optional<Generation> backup = Optional.empty();
+        try {
+            Map<ShardId, ShardManifest> manifests = new LinkedHashMap<>();
+            long minRun = Long.MAX_VALUE, maxRun = 0;
+            ShardManifest newest = null;
+            for (Map.Entry<ShardId, Generation> e : latest.entrySet()) {
+                ShardManifest m = manifest(e.getKey(), e.getValue());
+                if (!m.isProjectShard()) {
+                    throw new Unusable("shard " + e.getKey() + " generation " + e.getValue().value()
+                            + " was not published as a shard of a split project");
+                }
+                manifests.put(e.getKey(), m);
+                minRun = Math.min(minRun, m.projectGeneration());
+                if (m.projectGeneration() > maxRun) {
+                    maxRun = m.projectGeneration();
+                    newest = m;
+                }
+            }
+            run = maxRun;
+            backup = newestBackup(scope, new Generation(maxRun));
+            if (backup.isEmpty()) {
+                log.warn("Project {}: no writer-state backup at or below run {}; falling back to a full index",
+                        project, maxRun);
+                return Optional.empty();
+            }
+            deleteRecursively(staging); // left by a crashed restore
+            deleteRecursively(root.resolve("." + dir.getFileName() + ".replaced")); // ditto, crashed mid-swap
+            Files.createDirectories(staging);
+            long start = System.nanoTime();
+            WriterStateIndex index = readIndex(scope, backup.get());
+            downloadState(index, staging);
+            int linked = 0, downloaded = 0;
+            for (Map.Entry<ShardId, ShardManifest> e : manifests.entrySet()) {
+                int[] c = materialiseLucene(latest.get(e.getKey()), e.getValue(),
+                        LocalShardLayout.luceneDir(dir, e.getKey()),
+                        Files.createDirectories(LocalShardLayout.luceneDir(staging, e.getKey())));
+                linked += c[0];
+                downloaded += c[1];
+            }
+            Generation runGen = new Generation(maxRun);
+            for (ManifestFile f : newest.projectFileList()) {
+                if (materialiseProjectFile(runGen, f, staging)) downloaded++;
+            }
+            if (newest.indexFormat() != null) IndexFormat.write(staging, newest.indexFormat());
+            LocalShardLayout.write(staging, plan);
+            CrossProjectLinker.touchStamp(staging.resolve("graph.stamp"));
+            swap(staging, dir);
+            // the shards are not all at one run: the local index mixes runs, which no file state describes
+            long stateRun = minRun == maxRun ? backup.get().value() : Math.min(backup.get().value(), minRun);
+            log.info("Project {}: restored run {} ({} shards, {} files hard-linked, {} downloaded) in {} ms", project,
+                    maxRun, manifests.size(), linked, downloaded, (System.nanoTime() - start) / 1_000_000);
+            if (stateRun < maxRun) {
+                log.warn("Project {}: restored run {} with the writer state of run {}{}: the next run is a full"
+                        + " index (embeddings from the restored cache)", project, maxRun, stateRun,
+                        minRun < maxRun ? " (its shards were published by runs " + minRun + " to " + maxRun + ")" : "");
+            }
+            return Optional.of(new Restored(runGen, new Generation(stateRun)));
+        } catch (Unusable e) {
+            log.warn("Project {}: cannot restore from writer-state backup {} on run {} ({}); falling back to a full"
+                    + " index", project, backup.map(Generation::value).orElse(null), run, e.getMessage());
+            return Optional.empty();
+        } finally {
+            deleteQuietly(staging);
+        }
     }
 
     /**
