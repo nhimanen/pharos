@@ -784,6 +784,15 @@ public final class ClusterRuntime implements Closeable {
         return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().effectiveToken());
     }
 
+    /**
+     * The object-store backend (catalog and published generations in the bucket), or empty on another
+     * backend; {@code upgrade-indexes --check} reads the bucket through it.
+     */
+    public Optional<ReplicationBackend> objectStoreBackend() {
+        return backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend ? Optional.of(backend)
+                : Optional.empty();
+    }
+
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
     public Optional<com.pharos.cluster.objectstore.ObjectStoreCatalog> sourceCatalog() {
         return backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os

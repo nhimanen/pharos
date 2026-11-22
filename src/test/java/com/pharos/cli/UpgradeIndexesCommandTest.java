@@ -293,4 +293,87 @@ class UpgradeIndexesCommandTest {
         assertThat(usage).contains("Exit codes:").contains("0").contains("1").contains("2")
                 .contains("5").contains("reader node");
     }
+
+    // ── --check: read-only, run by the Kubernetes operator's pre-flight Job with the new image ──
+
+    /** A bucket view: shard → LATEST manifest's index format (null: no LATEST yet; MIN_VALUE: unreadable manifest). */
+    private static int check(java.util.Map<String, Integer> formats) {
+        java.util.List<com.pharos.cluster.ShardId> shards = formats.keySet().stream().sorted()
+                .map(com.pharos.cluster.ShardId::ofProject).toList();
+        com.pharos.cluster.ReplicaSource source = new com.pharos.cluster.ReplicaSource() {
+            @Override public java.util.Optional<com.pharos.cluster.Generation> latest(com.pharos.cluster.ShardId s) {
+                return formats.get(s.value()) == null ? java.util.Optional.empty()
+                        : java.util.Optional.of(new com.pharos.cluster.Generation(7));
+            }
+
+            @Override public com.pharos.cluster.objectstore.ShardManifest manifest(com.pharos.cluster.ShardId s,
+                    com.pharos.cluster.Generation g) throws java.io.IOException {
+                int f = formats.get(s.value());
+                if (f == Integer.MIN_VALUE) throw new java.io.IOException("missing manifest");
+                return new com.pharos.cluster.objectstore.ShardManifest(1, s.value(), g.value(), null,
+                        java.time.Instant.EPOCH, "w-0", 1, 1, null, List.of(), null,
+                        new IndexFormat.Stamp(f, "x", java.time.Instant.EPOCH));
+            }
+
+            @Override public void download(com.pharos.cluster.objectstore.ManifestFile f, Path t) { throw new AssertionError(); }
+
+            @Override public void downloadRange(com.pharos.cluster.objectstore.ManifestFile f, long o, long l, Path t) {
+                throw new AssertionError();
+            }
+
+            @Override public java.io.InputStream openRange(com.pharos.cluster.objectstore.ManifestFile f, long o, long l) {
+                throw new AssertionError();
+            }
+
+            @Override public java.util.Optional<byte[]> synonyms() { throw new AssertionError(); }
+        };
+        return UpgradeIndexesCommand.checkShards(() -> shards, source);
+    }
+
+    @Test
+    void checkRefusesBucketShardsThisBuildWouldNotServe() {
+        int n = com.pharos.indexer.IndexVersions.INDEX_FORMAT;
+        java.util.Map<String, Integer> servable = new java.util.HashMap<>();
+        servable.put("current", n);
+        servable.put("previous", n - 1);
+        servable.put("fresh", null);
+        assertThat(check(servable)).isZero();
+        assertThat(out.toString()).contains("current").contains("upgrade-available").contains("not published yet")
+                .contains("0 refused");
+
+        java.util.Map<String, Integer> older = new java.util.HashMap<>(servable);
+        older.put("ancient", n - 2); // N-2: a reader of this build refuses it
+        assertThat(check(older)).isEqualTo(3);
+        java.util.Map<String, Integer> newer = new java.util.HashMap<>(servable);
+        newer.put("future", n + 1); // a downgrade
+        assertThat(check(newer)).isEqualTo(3);
+        assertThat(out.toString()).contains("outdated").contains("newer").contains("would refuse 1 shard");
+
+        java.util.Map<String, Integer> broken = new java.util.HashMap<>(servable);
+        broken.put("broken", Integer.MIN_VALUE);
+        assertThat(check(broken)).isEqualTo(1);
+        assertThat(UpgradeIndexesCommand.checkShards(() -> { throw new java.io.IOException("no bucket"); }, null))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void checkRunsOnAWorkQueueWriterAndChangesNothing() throws Exception {
+        indexProject("ok", false);
+        indexProject("n", false);
+        Files.writeString(dir("n").resolve("index-format.json"),
+                "{\"format\":99,\"pharosVersion\":\"9.9.9\",\"writtenAt\":\"2030-01-01T00:00:00Z\"}");
+        com.pharos.config.ClusterConfig cluster = new com.pharos.config.ClusterConfig();
+        cluster.setRole(com.pharos.cluster.NodeRole.WRITER);
+        cluster.getWriter().setWorkQueue(true);
+        config.setCluster(cluster);
+
+        assertThat(run(cmd(), "--check")).isEqualTo(3);
+        assertThat(err.toString()).doesNotContain("work-queue mode");
+        assertThat(out.toString()).contains("newer").doesNotContain("Re-indexing");
+        assertThat(IndexFormat.status(dir("n"))).isEqualTo(IndexFormat.Status.NEWER);
+
+        Files.delete(dir("n").resolve("index-format.json")); // format 0: N-1 or older
+        int expected = IndexFormat.servable(IndexFormat.statusOf(0)) ? 0 : 3;
+        assertThat(run(cmd(), "--check")).isEqualTo(expected);
+    }
 }

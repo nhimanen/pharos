@@ -145,6 +145,10 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   the files when git asks; the config holds paths only.
 - Container image: arguments run one pharos command instead of the server (`docker run pharos:<v>
   index --project p --source-git <url> --ref main`).
+- `pharos upgrade-indexes --check` changes nothing and exits 3 when this release would refuse an
+  index: with an object-store backend it reads every catalog shard's `LATEST` manifest from the
+  bucket (on any role, work-queue writers included), otherwise the local
+  registry's projects. The Kubernetes operator runs it with the new image before an upgrade.
 
 ### Changed (upgrade note)
 - `add-writers` is now raised when a shard's unpublished change is older than

@@ -54,7 +54,9 @@ and [CHANGELOG.md](CHANGELOG.md).
 
 `pharos upgrade-indexes` exit codes: **0** nothing to upgrade, all upgraded, or aborted at the prompt;
 **1** a project was skipped (unknown, missing index, root gone) or failed; **2** confirmation needed but
-no terminal (re-run with `--yes`); **5** refused on a cluster reader node (upgrade and re-publish on the
+no terminal (re-run with `--yes`); **3** (`--check`, which changes nothing) an index has a format this release
+refuses (older than N-1, or newer; with an object-store backend: any shard published in the bucket); **5**
+refused on a cluster reader node (upgrade and re-publish on the
 writer) or on a work-queue writer (it upgrades by itself: restart it on the new release, see
 "Work-queue writers"). `./setup.sh --upgrade-indexes` exits with the same code.
 

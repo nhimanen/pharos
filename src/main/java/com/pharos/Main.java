@@ -210,7 +210,7 @@ public class Main {
                 return (K) new IndexStatusCommand(registry, config.getCluster().getRole(),
                         clusterRuntime::readerCacheStats);
             if (cls == UpgradeIndexesCommand.class)
-                return (K) new UpgradeIndexesCommand(indexManager, registry, config);
+                return (K) new UpgradeIndexesCommand(indexManager, registry, config, clusterRuntime);
             if (cls == MineCommand.class)
                 return (K) new MineCommand(registry, luceneIndexer, config);
             if (cls == EmbedCommand.class)
