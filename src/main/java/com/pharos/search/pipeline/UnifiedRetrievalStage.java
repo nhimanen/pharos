@@ -186,7 +186,7 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         Query bm25Query = keywordStrategy.buildQuery(new SearchRequest(
                 req.query(), SearchRequest.SearchType.KEYWORD, req.project(),
                 req.projects(), candidateSize, req.outputFormat(),
-                req.docType(), req.scope(), req.oversampleFactor()));
+                req.docType(), req.scope(), req.oversampleFactor()).withKeyFilter(req.keyFilter()));
 
         return (bm25Query != null)
                 ? searcher.search(bm25Query, candidateSize)
@@ -342,6 +342,11 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         if (req.scope() != null && !req.scope().isEmpty()) {
             filter.add(new TermQuery(new Term(DocumentMapper.F_SCOPE, req.scope())),
                     BooleanClause.Occur.MUST);
+            hasFilter = true;
+        }
+        org.apache.lucene.search.Query keys = DocumentMapper.keyFilterQuery(req.keyFilter());
+        if (keys != null) {
+            filter.add(keys, BooleanClause.Occur.MUST);
             hasFilter = true;
         }
         return hasFilter ? filter.build() : null;

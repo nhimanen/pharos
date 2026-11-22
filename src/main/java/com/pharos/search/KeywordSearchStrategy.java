@@ -357,6 +357,11 @@ public class KeywordSearchStrategy {
                     BooleanClause.Occur.FILTER);
             hasFilter = true;
         }
+        Query keys = DocumentMapper.keyFilterQuery(req.keyFilter()); // non-scoring: BM25 is unchanged
+        if (keys != null) {
+            filtered.add(keys, BooleanClause.Occur.FILTER);
+            hasFilter = true;
+        }
         return hasFilter ? filtered.build() : query;
     }
 

@@ -5,7 +5,8 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 
 ## [Unreleased]
 
-**Index format:** 1 (unchanged)
+**Index format:** 1 → 2 (documents carry key fields for the new search filters; format-1 indexes
+stay searchable unfiltered, re-index to filter — see UPGRADING.md)
 
 ### Added
 - Multi-node (experimental, README "Multi-node"): a `cluster` section in `config.json` with
@@ -116,6 +117,19 @@ All notable changes to Pharos. Every release section starts with an `**Index for
     `127.0.0.1:<cluster.tls.localPort>` (default web port + 1, no `/replication/*`), which
     `./pharos` uses.
   - `cluster.peers.maxLongPolls` defaults to 4096; size it to readers × shards per writer.
+
+- Search key filters: `module` (the module's directory relative to the project root, the
+  nearest directory holding a build file — not the Maven artifactId; `_` for files outside any
+  module), `pathPrefix` (a directory relative to the project root, whole path segments),
+  `language` (the file extension, case-insensitive) and `kind` (`code` or `doc`), on `/api/search`
+  (`module`, `pathPrefix`, `language`, `kind`), `pharos search` (`--module`, `--path-prefix`,
+  `--language`, `--kind`) and MCP `search_code` (`module`, `path_prefix`, `language`, `kind`).
+  They only select documents: scores are those of the unfiltered query. On a cluster they also
+  prune the shards of split projects; `--trace` shows the routing notes, and a filter that matches
+  no shard of a project says so in the warnings. Readers advertise filter support in their
+  heartbeat; a coordinator never sends a filtered query to a reader without it.
+- `cluster.reader.shards` accepts shard ids of split projects and project wildcards (`lucene~*`:
+  every shard of the project).
 
 ### Changed (upgrade note)
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A

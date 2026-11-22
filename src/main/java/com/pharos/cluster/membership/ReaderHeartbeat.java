@@ -27,12 +27,29 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
                               Map<String, Object> readerCache, int inFlight, double qps, long startedAt,
                               String state, List<String> degradedShards,
                               @JsonInclude(JsonInclude.Include.NON_NULL) Long warmP95Millis,
-                              @JsonInclude(JsonInclude.Include.NON_NULL) Long catalogAgeSeconds) {
+                              @JsonInclude(JsonInclude.Include.NON_NULL) Long catalogAgeSeconds,
+                              @JsonInclude(JsonInclude.Include.NON_NULL) Boolean filters) {
 
     public static final String WARMING = "warming";
     public static final String READY = "ready";
     public static final String DEGRADED = "degraded";
     public static final String DRAINING = "draining";
+
+    /**
+     * A heartbeat without the {@code filters} capability (key filters on {@code /internal} search, P6-R12):
+     * an older reader's, which would ignore a filter it does not know and answer unfiltered.
+     */
+    public ReaderHeartbeat(String node, String advertiseUrl, List<String> shards, boolean draining,
+                           Map<String, Object> readerCache, int inFlight, double qps, long startedAt,
+                           String state, List<String> degradedShards, Long warmP95Millis, Long catalogAgeSeconds) {
+        this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, state, degradedShards,
+                warmP95Millis, catalogAgeSeconds, null);
+    }
+
+    /** True when the reader applies key filters on {@code /internal} search requests. */
+    public boolean supportsFilters() {
+        return Boolean.TRUE.equals(filters);
+    }
 
     public ReaderHeartbeat {
         if (draining) state = DRAINING;
@@ -57,6 +74,6 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
     /** This heartbeat as a membership writes it: {@code draining} and the process start set. */
     public ReaderHeartbeat with(boolean draining, long startedAt) {
         return new ReaderHeartbeat(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt,
-                state, degradedShards, warmP95Millis, catalogAgeSeconds);
+                state, degradedShards, warmP95Millis, catalogAgeSeconds, filters);
     }
 }

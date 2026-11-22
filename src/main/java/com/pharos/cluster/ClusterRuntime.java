@@ -472,7 +472,7 @@ public final class ClusterRuntime implements Closeable {
         Long catalogAge = cat == null || cat.ageSeconds() < 0 ? null : cat.ageSeconds();
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
-                catalogAge);
+                catalogAge, Boolean.TRUE); // applies key filters on /internal search (P6-R12)
     }
 
     // Holding the monitor of this.

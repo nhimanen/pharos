@@ -200,6 +200,16 @@ public class VectorSearchStrategy {
     }
 
     private static Query buildFilter(SearchRequest req) {
+        Query base = buildBaseFilter(req);
+        Query keys = DocumentMapper.keyFilterQuery(req.keyFilter());
+        if (keys == null) return base;
+        BooleanQuery.Builder b = new BooleanQuery.Builder();
+        if (base != null) b.add(base, BooleanClause.Occur.FILTER);
+        b.add(keys, BooleanClause.Occur.FILTER);
+        return b.build();
+    }
+
+    private static Query buildBaseFilter(SearchRequest req) {
         boolean hasProject = req.project() != null && !req.project().isEmpty();
         boolean hasDocType = req.docType() != null && !req.docType().isEmpty();
         boolean hasScope   = req.scope()   != null && !req.scope().isEmpty();

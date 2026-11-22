@@ -205,8 +205,19 @@ public final class DistributedSearch implements Closeable {
         }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
         Query q = new Query(shards, start + queryTimeout.toNanos(), explicitSingle, plan);
+        // a split project whose shards a filter all pruned still runs here (empty, with its warning)
+        for (String p : unscoped ? plan.catalog().projects() : new LinkedHashSet<>(projects)) {
+            if (plan.catalog().isSplit(p)) q.hasSplitProject = true;
+        }
         long age = unscoped ? catalogAgeSeconds.getAsLong() : -1;
         if (age > CATALOG_AGE_WARNING_SECONDS) q.warn("routing with a catalog " + age + " s old");
+        for (String w : plan.warnings()) q.warn(w);
+        java.util.Set<String> noFilters = new java.util.TreeSet<>();
+        for (ShardRouter.PlannedShard p : plan.shards()) noFilters.addAll(p.route().noFilters());
+        if (!noFilters.isEmpty()) {
+            q.warn("key filters: reader(s) " + String.join(", ", noFilters)
+                    + " run a pharos without key filter support and do not answer this query");
+        }
         return q;
     }
 
@@ -299,6 +310,8 @@ public final class DistributedSearch implements Closeable {
         private final ShardRouter.RoutePlan plan;
         /** Result id → the shard that returned it (a split project's results name the project, not the shard). */
         private final Map<String, ShardState> owners = new java.util.concurrent.ConcurrentHashMap<>();
+        /** The query names (or, unscoped, covers) a split project. */
+        private volatile boolean hasSplitProject;
         /** Every split project's shards were pinned to one index run ({@link #reconcileRuns}). */
         private boolean reconciled;
 
@@ -315,6 +328,7 @@ public final class DistributedSearch implements Closeable {
          * in process when held, never through the local path that knows projects only by name).
          */
         public boolean fansOut() {
+            if (hasSplitProject) return true;
             for (ShardState s : shards) {
                 if (s.split) return true;
                 if (!s.local && !s.route.candidates().isEmpty()) return true;
@@ -384,6 +398,10 @@ public final class DistributedSearch implements Closeable {
         /** Why no reader is a candidate for {@code s}: none serves it, or every one is degraded for it. */
         private static String noReaderReason(ShardState s) {
             List<String> degraded = s.route.degraded();
+            if (degraded.isEmpty() && !s.route.noFilters().isEmpty()) {
+                return "every live reader serving it lacks key filter support (" + String.join(", ", s.route.noFilters())
+                        + "); upgrade them to filter";
+            }
             return degraded.isEmpty() ? "no live reader serves it"
                     : "every live reader serving it is degraded (" + String.join(", ", degraded) + ")";
         }
@@ -739,6 +757,7 @@ public final class DistributedSearch implements Closeable {
                 return "its generation changed during the query (" + gm.getMessage() + ")";
             }
             if (t instanceof ShardCallException) return t.getMessage();
+            if (t instanceof com.pharos.search.KeyFiltersUnsupportedException) return t.getMessage();
             return t == null ? null : t.toString();
         }
 

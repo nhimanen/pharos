@@ -33,6 +33,8 @@ public final class InternalApi {
     public static final String SYNONYMS_MISMATCH = "synonyms mismatch";
     /** The {@code error} of a 409 refusing a vector request the shard has no vectors for. */
     public static final String MODEL_MISMATCH = "model mismatch";
+    /** 409: the request has key filters, and the shard's index predates the key fields. */
+    public static final String KEY_FILTERS_UNSUPPORTED = "key filters unsupported";
 
     /** Null until the shard search is wired: authenticated calls then get 503 and fail over. */
     private volatile ShardSearchService service;
@@ -182,6 +184,9 @@ public final class InternalApi {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage(),
                             "reason", e.reason().name())));
+        } catch (com.pharos.search.KeyFiltersUnsupportedException e) {
+            ctx.status(409).contentType("application/json")
+                    .result(mapper.writeValueAsBytes(Map.of("error", KEY_FILTERS_UNSUPPORTED, "detail", e.getMessage())));
         } catch (SynonymsMismatchException e) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));

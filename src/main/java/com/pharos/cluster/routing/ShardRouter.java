@@ -40,9 +40,15 @@ public final class ShardRouter {
      * {@code candidates} is empty when no live reader serves {@code shard}; {@code degraded} names the
      * live readers left out because the shard is degraded on them.
      */
-    public record Route(ShardId shard, List<ReaderHeartbeat> candidates, List<String> degraded) {
+    public record Route(ShardId shard, List<ReaderHeartbeat> candidates, List<String> degraded,
+                        List<String> noFilters) {
         public Route {
             degraded = degraded == null ? List.of() : List.copyOf(degraded);
+            noFilters = noFilters == null ? List.of() : List.copyOf(noFilters);
+        }
+
+        public Route(ShardId shard, List<ReaderHeartbeat> candidates, List<String> degraded) {
+            this(shard, candidates, degraded, List.of());
         }
 
         public Route(ShardId shard, List<ReaderHeartbeat> candidates) {
@@ -99,10 +105,12 @@ public final class ShardRouter {
      * requested projects' order, else project name order; within a project, catalog order), and the
      * routing notes (what a filter pruned or could not prune).
      */
-    public record RoutePlan(ProjectShards catalog, List<PlannedShard> shards, List<String> notes) {
+    public record RoutePlan(ProjectShards catalog, List<PlannedShard> shards, List<String> notes,
+                            List<String> warnings) {
         public RoutePlan {
             shards = List.copyOf(shards);
             notes = List.copyOf(notes);
+            warnings = List.copyOf(warnings);
         }
 
         public List<Route> routes() {
@@ -156,17 +164,23 @@ public final class ShardRouter {
         }
         List<String> names = unscoped ? new ArrayList<>(mapping.projects()) : requested;
         ShardFilter f = filter == null ? ShardFilter.NONE : filter;
+        boolean needsFilters = !f.isEmpty();
         List<ReaderHeartbeat> readers = live.get();
         Map<String, Integer> loads = new java.util.HashMap<>(); // one load snapshot per plan
         for (ReaderHeartbeat r : readers) loads.put(r.node(), r.inFlight() + coordinatorInFlight.applyAsInt(r.node()));
         List<PlannedShard> out = new ArrayList<>();
         List<String> notes = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
         for (String project : names) {
             List<ShardId> shards = mapping.shardsOf(project);
             boolean split = mapping.isSplit(project);
             if (shards.isEmpty()) shards = List.of(ShardId.ofProject(project)); // unknown: its [project] shard
             if (split) {
                 ShardFilter.Pruned pruned = f.prune(project, mapping.specOf(project), shards);
+                if (pruned.kept().isEmpty()) {
+                    warnings.add("project " + project + ": the key filter matches none of its " + shards.size()
+                            + " shards under spec " + mapping.specOf(project) + "; no results from it");
+                }
                 shards = pruned.kept();
                 notes.addAll(pruned.notes());
             }
@@ -178,11 +192,20 @@ public final class ShardRouter {
                     turn = rotation.computeIfAbsent(key, k -> new AtomicLong()).getAndIncrement();
                 }
                 List<String> degraded = new ArrayList<>();
-                out.add(new PlannedShard(new Route(shard, candidates(shard, readers, degraded, loads, turn), degraded),
-                        project, split));
+                List<String> noFilters = new ArrayList<>();
+                List<ReaderHeartbeat> usable = readers;
+                if (needsFilters) { // a reader that would ignore the filter must not answer the query
+                    usable = new ArrayList<>();
+                    for (ReaderHeartbeat r : readers) {
+                        if (r.supportsFilters()) usable.add(r);
+                        else if (r.shards() != null && r.shards().contains(shard.value())) noFilters.add(r.node());
+                    }
+                }
+                out.add(new PlannedShard(new Route(shard, candidates(shard, usable, degraded, loads, turn), degraded,
+                        noFilters), project, split));
             }
         }
-        return new RoutePlan(mapping, out, notes);
+        return new RoutePlan(mapping, out, notes, warnings);
     }
 
     /**

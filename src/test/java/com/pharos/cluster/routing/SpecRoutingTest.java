@@ -174,6 +174,37 @@ class SpecRoutingTest {
         assertThat(plain.notes()).isEmpty();
     }
 
+    /**
+     * P6-R12: a reader that does not advertise key filter support would ignore the filter and answer
+     * unfiltered, so a filtered query never routes to it; unfiltered queries still do.
+     */
+    @Test
+    void aFilteredQueryNeverRoutesToAReaderWithoutFilterSupport() throws IOException {
+        mapping.set(catalog(""));
+        ReaderHeartbeat old = hb("old", 0, "app", "mod~module=core");
+        ReaderHeartbeat current = new ReaderHeartbeat("new", "http://new", List.of("mod~module=core"), false, Map.of(),
+                5, 0, 0L, null, null, null, null, Boolean.TRUE);
+        live = List.of(old, current);
+        ShardRouter.RoutePlan filtered = router().plan(List.of("mod", "app"), ShardFilter.module("core"));
+        assertThat(filtered.shards()).extracting(s -> s.shard().value()).containsExactly("mod~module=core", "app");
+        assertThat(filtered.shards().get(0).route().candidates()).extracting(ReaderHeartbeat::node).containsExactly("new");
+        assertThat(filtered.shards().get(0).route().noFilters()).containsExactly("old");
+        assertThat(filtered.shards().get(1).route().candidates()).as("app's only reader lacks filters").isEmpty();
+        assertThat(filtered.shards().get(1).route().noFilters()).containsExactly("old");
+        ShardRouter.RoutePlan plain = router().plan(List.of("app"), ShardFilter.NONE);
+        assertThat(plain.shards().get(0).route().candidates()).extracting(ReaderHeartbeat::node).containsExactly("old");
+
+        DistributedSearch ds = new DistributedSearch(router(), new com.pharos.cluster.internal.ShardClient(health, "t",
+                Duration.ofMillis(100), Duration.ofMillis(100)), null, null, null, Duration.ofSeconds(5), () -> -1L);
+        try (DistributedSearch.Query q = ds.open(List.of("app"), new ShardFilter(null, null, "java", null))) {
+            assertThat(q.warnings()).anySatisfy(w -> assertThat(w).contains("old", "without key filter support"))
+                    .anySatisfy(w -> assertThat(w).contains("shard app unavailable",
+                            "every live reader serving it lacks key filter support (old)"));
+        } finally {
+            ds.close();
+        }
+    }
+
     @Test
     void theShardsOfASplitProjectPreferTheSameReader() throws IOException {
         mapping.set(catalog(""));

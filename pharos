@@ -712,6 +712,11 @@ def cmd_search(args):
         params["snippetLines"] = args.snippet_lines
     if getattr(args, "trace", False):
         params["trace"] = "true"
+    # key filters (same values as the server's: module dir, whole-directory path prefix, extension, code|doc)
+    for flag, param in (("module", "module"), ("path_prefix", "pathPrefix"),
+                        ("language", "language"), ("kind", "kind")):
+        if getattr(args, flag, None):
+            params[param] = getattr(args, flag)
 
     raw = _api_get("/api/search", params)
 
@@ -1502,6 +1507,15 @@ EXIT CODES
                           help="Print pipeline trace (resolved type, stage timings) after results")
     p_search.add_argument("--snippet-lines", dest="snippet_lines", type=int, default=15, metavar="N",
                           help="Lines of source per snippet centred on best keyword/vector match (default: 15)")
+    p_search.add_argument("--module", metavar="DIR",
+                          help="Filter by build module: the module's directory relative to the project root "
+                               "(e.g. core, services/api; the nearest directory with a build file), not the "
+                               "Maven artifactId. '_' selects files outside any module")
+    p_search.add_argument("--path-prefix", dest="path_prefix", metavar="DIR",
+                          help="Filter by a directory relative to the project root (whole path segments)")
+    p_search.add_argument("--language", metavar="EXT",
+                          help="Filter by file extension, case-insensitive (java, py, md, ...)")
+    p_search.add_argument("--kind", choices=["code", "doc"], help="Filter by file kind")
     p_search.set_defaults(func=cmd_search)
 
     # method

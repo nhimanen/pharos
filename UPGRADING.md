@@ -1,5 +1,30 @@
 # Upgrading
 
+## Index format 2 (search key filters)
+
+### What changed
+
+Documents now carry key fields (module directory, directory prefixes, file extension, file kind)
+for the `module`, `pathPrefix`, `language` and `kind` search filters. That is index format 2.
+
+### What you need to do
+
+Nothing, unless you want the filters:
+
+- A format-1 index keeps working unchanged for every unfiltered search, call-graph and lookup
+  query (status `upgrade-available` in `pharos index-status`).
+- A *filtered* search over a format-1 project is refused with a message naming the project and the
+  fix (`pharos index --full <project>`; the web API answers 409, `pharos search` exits 4). It is
+  never answered silently empty.
+- The next index run of a project (incremental or not) is a full one, which writes format 2;
+  `pharos upgrade-indexes` re-indexes every project.
+- Format-0 indexes (before 1.x stamps) are now outside the read window (N-1 = 1) and must be
+  re-indexed.
+
+**Clusters:** readers serve format-1 generations unfiltered until the writers republish at
+format 2. Upgrade readers before relying on filters: a coordinator skips readers that do not
+advertise filter support (with a warning) for filtered queries.
+
 ## Invalid project names (e.g. ".")
 
 ### What happened

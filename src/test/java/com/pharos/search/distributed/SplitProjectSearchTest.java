@@ -69,7 +69,9 @@ class SplitProjectSearchTest {
         ParityCorpus.unzip(ParityCorpus.PHAROS_CORPUS, pharosRoot);
         cluster.indexSource(pharosRoot, WHOLE);
         cluster.indexSplit(pharosRoot, SPLIT, RING3, SPLIT_SHARDS, false);
-        cluster.indexSplit(moduleSource(shared.resolve("mod-src")), MOD, BY_MODULE, MOD_SHARDS, false);
+        Path modSrc = moduleSource(shared.resolve("mod-src"));
+        cluster.indexSplit(modSrc, MOD, BY_MODULE, MOD_SHARDS, false);
+        cluster.indexSource(modSrc, MOD_WHOLE);
         cluster.index(JAVA, false);
         c = new TestReaderNode(shared.resolve("c"), store, BUCKET, "c", List.of(JAVA), EMBEDDER, null);
         r = new TestReaderNode(shared.resolve("r"), store, BUCKET, "r", List.of(), EMBEDDER, null);
@@ -77,6 +79,7 @@ class SplitProjectSearchTest {
             for (ShardId s : SPLIT_SHARDS) n.awaitShard(s.value(), 1);
             for (ShardId s : MOD_SHARDS) n.awaitShard(s.value(), 1);
             n.awaitShard(WHOLE, 1);
+            n.awaitShard(MOD_WHOLE, 1);
         }
         assertThat(c.parts.runtime().servesShard(SPLIT_SHARDS.get(0).value())).isFalse();
     }
@@ -289,9 +292,64 @@ class SplitProjectSearchTest {
         assertThat(resp.trace().notes()).singleElement().asString().contains("project " + SPLIT,
                 "path prefix 'src/main/java' cannot prune a ring", "fans out to all 3 shards");
         assertThat(resp.trace().format()).contains("routing: project " + SPLIT);
-        // the same results as without the filter: routing never filters documents itself
-        assertThat(resp.results()).extracting(SearchResult::id)
-                .isEqualTo(search(c, "search engine", SPLIT, ShardFilter.NONE).results().stream().map(SearchResult::id).toList());
+        // the documents are filtered on every shard: only files below the prefix
+        assertThat(resp.results()).allSatisfy(x -> assertThat(x.filePath()).contains("/src/main/java/"));
+    }
+
+    static final String MOD_WHOLE = "modwhole";
+
+    /**
+     * P6-R12: key filters are non-scoring. With every shard searched (a [project] project, or a split
+     * project whose spec can't prune by the filter), a filtered query scores each document exactly as the
+     * unfiltered query does; it only drops the documents that don't match. (modproj has no calls: the
+     * graph boost, relative to each list's largest in-degree, can't differ between the two lists.)
+     */
+    @Test
+    void keyFiltersSelectDocumentsWithoutChangingScores() throws Exception {
+        for (String[] pq : new String[][]{{MOD_WHOLE, "module", "core"}, {MOD, "language", "java"},
+                {MOD_WHOLE, "pathPrefix", "web/src"}, {MOD_WHOLE, "kind", "code"}}) {
+            ShardFilter f = switch (pq[1]) {
+                case "module" -> ShardFilter.module(pq[2]);
+                case "language" -> new ShardFilter(null, null, pq[2], null);
+                case "kind" -> new ShardFilter(null, null, null, pq[2]);
+                default -> ShardFilter.pathPrefix(pq[2]);
+            };
+            for (TestReaderNode n : List.of(c, r)) {
+                List<SearchResult> filtered = n.engine.searchWithTrace(new SearchRequest("widget helper tool",
+                        SearchType.KEYWORD, pq[0], null, 50, "text", null, null, 0), false, f).results();
+                List<SearchResult> all = n.engine.searchWithTrace(new SearchRequest("widget helper tool",
+                        SearchType.KEYWORD, pq[0], null, 50, "text", null, null, 0), false).results();
+                assertThat(filtered).as(n.id + " " + pq[0] + " " + pq[1]).isNotEmpty();
+                java.util.Map<String, Float> scores = new java.util.HashMap<>();
+                for (SearchResult x : all) scores.put(x.id(), x.score());
+                for (SearchResult x : filtered) {
+                    assertThat(scores).as(x.id()).containsKey(x.id());
+                    assertThat(bits(x.score())).as(n.id + " " + x.id()).isEqualTo(bits(scores.get(x.id())));
+                }
+                switch (pq[1]) {
+                    case "module" -> assertThat(filtered).allSatisfy(x -> assertThat(x.filePath()).contains("/core/"));
+                    case "pathPrefix" -> assertThat(filtered).allSatisfy(x -> assertThat(x.filePath()).contains("/web/src/"));
+                    default -> { }
+                }
+                if (pq[1].equals("module") || pq[1].equals("pathPrefix")) {
+                    assertThat(filtered.size()).isLessThan(all.size());
+                }
+            }
+        }
+        // whole path segments only: "web/s" is not a directory of any file
+        assertThat(search(r, "widget", MOD_WHOLE, ShardFilter.pathPrefix("web/s")).results()).isEmpty();
+        // the module filter is the module's directory, not its artifactId; normalised like routing
+        assertThat(search(r, "widget", MOD_WHOLE, ShardFilter.module("./core/")).results()).isNotEmpty()
+                .allSatisfy(x -> assertThat(x.filePath()).contains("/core/"));
+    }
+
+    /** P6-R12: a filter that selects no shard of a split project says so in the response's warnings. */
+    @Test
+    void aFilterMatchingNoShardWarns() throws Exception {
+        SearchResponse resp = search(c, "widget", MOD, ShardFilter.module("nowhere"));
+        assertThat(resp.results()).isEmpty();
+        assertThat(resp.warnings()).anySatisfy(w -> assertThat(w).contains("project " + MOD,
+                "the key filter matches none of its 3 shards"));
     }
 
     /**

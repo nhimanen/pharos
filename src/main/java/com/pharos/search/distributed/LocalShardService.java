@@ -281,6 +281,9 @@ public final class LocalShardService implements ShardSearchService {
     public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
                                       GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
                                       boolean chunkVectors) throws IOException {
+        if (req != null && req.hasKeyFilter()) {
+            com.pharos.search.KeyFiltersUnsupportedException.check(pin.project(), pin.shardDir());
+        }
         IndexSearcher searcher = stats == null ? new IndexSearcher(pin.reader())
                 : new GlobalStatsSearcher(pin.reader(), stats);
         List<RawCandidate> raw;

@@ -166,7 +166,8 @@ public final class ShardClient implements AutoCloseable {
             } catch (RetryableFailure f) {
                 if (f.suspect) health.markSuspect(reader.node()); // not for a timeout the query budget cut short
                 last = f;
-            } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException n) {
+            } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException
+                     | KeyFiltersRefused n) {
                 last = n; // not a sick reader
             }
         }
@@ -274,6 +275,9 @@ public final class ShardClient implements AutoCloseable {
                 if (InternalApi.MODEL_MISMATCH.equals(error)) {
                     throw new ModelMismatchException(reasonOf(body), detailOf(body));
                 }
+                if (InternalApi.KEY_FILTERS_UNSUPPORTED.equals(error)) {
+                    throw new KeyFiltersRefused(reader.node() + ": " + detailOf(body));
+                }
                 if (InternalApi.SYNONYMS_MISMATCH.equals(error)) {
                     throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
                             + " (synonyms.txt differs from this coordinator's)");
@@ -314,6 +318,11 @@ public final class ShardClient implements AutoCloseable {
         } catch (IOException e) {
             return "model mismatch";
         }
+    }
+
+    /** The reader's index of the shard predates the key fields: it refuses a filtered query (not sick). */
+    private static final class KeyFiltersRefused extends ShardCallException {
+        KeyFiltersRefused(String message) { super(message); }
     }
 
     /** This coordinator already has {@code perNodeConcurrency} calls open to the reader: try another. */

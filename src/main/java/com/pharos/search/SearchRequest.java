@@ -16,8 +16,28 @@ public record SearchRequest(
         String docType,              // null = all, "method", "class", "chunk"
         String scope,                // null = all, "prod", "test", "docs"
         int oversampleFactor,        // 0 = use pipeline default; >0 overrides retriever fetch multiplier
-        QueryClassification classification  // null until a QueryRouter runs; read-only after that
+        QueryClassification classification, // null until a QueryRouter runs; read-only after that
+        com.pharos.cluster.routing.ShardFilter keyFilter // module / pathPrefix / language / kind; null = none
 ) {
+    /** Without key filters. */
+    public SearchRequest(String query, SearchType type, String project, List<String> projects,
+                         int limit, String outputFormat, String docType, String scope,
+                         int oversampleFactor, QueryClassification classification) {
+        this(query, type, project, projects, limit, outputFormat, docType, scope, oversampleFactor, classification, null);
+    }
+
+    /** A copy with {@code filter} as its key filters (null or empty: none). */
+    public SearchRequest withKeyFilter(com.pharos.cluster.routing.ShardFilter filter) {
+        return new SearchRequest(query, type, project, projects, limit, outputFormat, docType, scope,
+                oversampleFactor, classification, filter == null || filter.isEmpty() ? null : filter);
+    }
+
+    /** True when the request filters by module, path prefix, language or kind. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public boolean hasKeyFilter() {
+        return keyFilter != null && !keyFilter.isEmpty();
+    }
+
     /** Backward-compatible constructor without classification (most callers use this). */
     public SearchRequest(String query, SearchType type, String project, List<String> projects,
                          int limit, String outputFormat, String docType, String scope,
@@ -33,7 +53,7 @@ public record SearchRequest(
     public SearchRequest withClassification(QueryClassification c) {
         String effectiveDocType = (docType == null && c.docType() != null) ? c.docType() : docType;
         return new SearchRequest(query, type, project, projects, limit, outputFormat,
-                effectiveDocType, scope, oversampleFactor, c);
+                effectiveDocType, scope, oversampleFactor, c, keyFilter);
     }
 
     public enum SearchType {

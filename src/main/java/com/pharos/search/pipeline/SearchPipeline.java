@@ -90,7 +90,7 @@ public final class SearchPipeline {
         SearchRequest fetchReq = effectiveFactor > 1
                 ? new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
                                     req.limit() * effectiveFactor, req.outputFormat(),
-                                    req.docType(), req.scope(), 0, req.classification())
+                                    req.docType(), req.scope(), 0, req.classification(), req.keyFilter())
                 : req;
 
         // ── Retrieval ─────────────────────────────────────────────────────────

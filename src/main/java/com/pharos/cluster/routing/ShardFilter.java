@@ -20,8 +20,17 @@ import java.util.Map;
  * a ring (files are placed by the hash of their path), or a filter whose key the spec doesn't have.
  * The project then fans out to all its shards and a routing note says why. Matching is conservative:
  * a shard is dropped only when none of its files can match (key values are compared in their id-safe
- * form, so two raw values sharing one id value keep both). Routing never filters documents itself.
+ * form, so two raw values sharing one id value keep both). Routing never filters documents itself:
+ * documents carry the same values as key fields ({@code DocumentMapper#addKeyFields}) and a query
+ * filters them with {@code DocumentMapper#keyFilterQuery}.
+ *
+ * <p><b>Values</b> (P6-R12), normalised the same way for routing and for documents: {@code module} is
+ * the module's directory relative to the project root (the nearest directory holding a build file, not
+ * the Maven artifactId), through {@link DocKeys#normalizePath}; {@code pathPrefix} is a directory relative
+ * to the project root, matched on whole segments; {@code language} is the file extension, lower case
+ * (a leading dot is dropped); {@code kind} is {@code code} or {@code doc}.
  */
+@com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
 public record ShardFilter(String module, String pathPrefix, String language, String kind) {
 
     public static final ShardFilter NONE = new ShardFilter(null, null, null, null);
@@ -41,7 +50,52 @@ public record ShardFilter(String module, String pathPrefix, String language, Str
         return new ShardFilter(null, prefix, null, null);
     }
 
+    /**
+     * Checks the values can be normalised.
+     *
+     * @throws IllegalArgumentException naming the bad value (an absolute path, or one with '..')
+     */
+    public ShardFilter validated() {
+        if (module != null) normalizedModule();
+        if (pathPrefix != null) normalizedPathPrefix();
+        return this;
+    }
+
+    /** The module directory, normalised ({@link DocKeys#normalizePath}); {@code "_"} for the project root. */
+    public String normalizedModule() {
+        if (module == null) return null;
+        String m = normalize("module", module);
+        return m.isEmpty() ? ShardSpec.NO_VALUE : m;
+    }
+
+    /** The path prefix, normalised ({@link DocKeys#normalizePath}); empty for the project root. */
+    public String normalizedPathPrefix() {
+        return pathPrefix == null ? null : normalize("pathPrefix", pathPrefix);
+    }
+
+    /** The file extension, lower case, without a leading dot. */
+    public String normalizedLanguage() {
+        if (language == null) return null;
+        String l = language.startsWith(".") ? language.substring(1) : language;
+        return l.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** The file kind, lower case. */
+    public String normalizedKind() {
+        return kind == null ? null : kind.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static String normalize(String what, String path) {
+        try {
+            return DocKeys.normalizePath(path);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(what + " '" + path + "' must be a directory relative to the project root: "
+                    + e.getMessage(), e);
+        }
+    }
+
     /** True when it filters nothing. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
     public boolean isEmpty() {
         return module == null && pathPrefix == null && language == null && kind == null;
     }
@@ -104,9 +158,9 @@ public record ShardFilter(String module, String pathPrefix, String language, Str
         }
         if (!prunes[0] && !prunes[1] && !prunes[2] && !prunes[3]) return new Pruned(shards, notes);
 
-        String moduleValue = prunes[0] ? ShardSpec.keyValue(module) : null;
-        String languageValue = prunes[2] ? ShardSpec.keyValue(language.toLowerCase(java.util.Locale.ROOT)) : null;
-        String kindValue = prunes[3] ? ShardSpec.keyValue(kind) : null;
+        String moduleValue = prunes[0] ? moduleKeyValue() : null;
+        String languageValue = prunes[2] ? ShardSpec.keyValue(normalizedLanguage()) : null;
+        String kindValue = prunes[3] ? ShardSpec.keyValue(normalizedKind()) : null;
         String prefixValue = prunes[1] ? ShardSpec.keyValue(prefixWanted) : null;
         int depthWanted = pathSegs == null ? 0 : pathSegs.length;
         List<ShardId> kept = new ArrayList<>();
@@ -126,6 +180,16 @@ public record ShardFilter(String module, String pathPrefix, String language, Str
         notes.add("project " + project + ": " + String.join(", ", selected) + " selects " + kept.size() + " of "
                 + shards.size() + " shards" + (kept.isEmpty() ? "" : " (" + names(kept) + ")"));
         return new Pruned(kept, notes);
+    }
+
+    /** The module as a shard id value; an unnormalisable module keeps every shard (the query refuses it). */
+    private String moduleKeyValue() {
+        try {
+            String m = normalizedModule();
+            return ShardSpec.NO_VALUE.equals(m) ? ShardSpec.NO_VALUE : ShardSpec.keyValue(m);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /**

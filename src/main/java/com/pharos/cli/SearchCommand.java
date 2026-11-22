@@ -55,6 +55,25 @@ public class SearchCommand implements Callable<Integer> {
             defaultValue = "all")
     private String scope;
 
+    @Option(names = {"--module"},
+            description = "Filter by build module: the module's directory relative to the project root"
+                    + " (e.g. core or services/api; the nearest directory holding a build file), not the Maven"
+                    + " artifactId. '_' selects files outside any module")
+    private String module;
+
+    @Option(names = {"--path-prefix"},
+            description = "Filter by a directory relative to the project root (whole path segments: src/main"
+                    + " matches src/main/java/..., not src/mainframe)")
+    private String pathPrefix;
+
+    @Option(names = {"--language"},
+            description = "Filter by file extension, case-insensitive (java, py, md, ...)")
+    private String language;
+
+    @Option(names = {"--kind"},
+            description = "Filter by file kind: code | doc")
+    private String kind;
+
     @Option(names = {"--trace"},
             description = "Print pipeline trace (resolved type, stage timings) to stderr after results")
     private boolean trace = false;
@@ -77,7 +96,8 @@ public class SearchCommand implements Callable<Integer> {
             String resolvedScope   = "all".equalsIgnoreCase(scope)   ? null : scope;
             SearchRequest req = new SearchRequest(
                     query, SearchRequest.SearchType.from(type),
-                    project, null, limit, format, resolvedDocType, resolvedScope, 0);
+                    project, null, limit, format, resolvedDocType, resolvedScope, 0)
+                    .withKeyFilter(new com.pharos.cluster.routing.ShardFilter(module, pathPrefix, language, kind));
 
             SearchResponse response = searchEngine.searchWithTrace(req, expand);
             for (String w : response.warnings()) System.err.println("warning: " + w);
@@ -107,7 +127,7 @@ public class SearchCommand implements Callable<Integer> {
                 for (String note : response.trace().notes()) System.err.printf("[trace]   routing: %s%n", note);
             }
             return 0;
-        } catch (com.pharos.indexer.IncompatibleIndexException e) {
+        } catch (com.pharos.indexer.IncompatibleIndexException | com.pharos.search.KeyFiltersUnsupportedException e) {
             System.err.println(e.getMessage());
             return 4;
         } catch (Exception e) {

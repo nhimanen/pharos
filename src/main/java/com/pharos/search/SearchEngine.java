@@ -379,21 +379,27 @@ public class SearchEngine {
         return searchWithTrace(req, expand).results();
     }
 
-    /**
-     * Search and return results together with a detailed timing trace.
-     * Use this from {@link com.pharos.cli.SearchCommand} when {@code --debug} is set.
-     */
-    public SearchResponse searchWithTrace(SearchRequest req, boolean expand) throws IOException {
-        return searchWithTrace(req, expand, com.pharos.cluster.routing.ShardFilter.NONE);
+    /** {@link #searchWithTrace(SearchRequest, boolean)} with {@code keyFilter} as the request's key filters. */
+    public SearchResponse searchWithTrace(SearchRequest req, boolean expand,
+                                          com.pharos.cluster.routing.ShardFilter keyFilter) throws IOException {
+        return searchWithTrace(req.withKeyFilter(keyFilter), expand);
     }
 
     /**
-     * As {@link #searchWithTrace(SearchRequest, boolean)}; on a cluster reader, {@code shardFilter} prunes
-     * the shards of split projects the query reads (Phase 6), and the trace notes what it pruned and
-     * why it could not prune where it could not. It selects shards only: it filters no documents.
+     * Search and return results together with a detailed timing trace.
+     *
+     * <p><b>Key filters</b> ({@link SearchRequest#keyFilter}: module, pathPrefix, language, kind, P6-R12)
+     * select documents as non-scoring filters, so scores are those of the unfiltered query. On a cluster
+     * reader they also prune the shards of split projects (Phase 6), and the trace notes what was pruned
+     * and why it could not be. A project indexed before documents carried the key fields refuses a
+     * filtered query ({@link KeyFiltersUnsupportedException}).
+     *
+     * @throws IllegalArgumentException a key filter that is not a relative path (module, pathPrefix)
      */
-    public SearchResponse searchWithTrace(SearchRequest req, boolean expand,
-                                          com.pharos.cluster.routing.ShardFilter shardFilter) throws IOException {
+    public SearchResponse searchWithTrace(SearchRequest req, boolean expand) throws IOException {
+        if (req.hasKeyFilter()) req.keyFilter().validated();
+        com.pharos.cluster.routing.ShardFilter shardFilter = req.hasKeyFilter() ? req.keyFilter()
+                : com.pharos.cluster.routing.ShardFilter.NONE;
         SearchTrace trace = new SearchTrace();
         trace.start();
 
@@ -401,7 +407,8 @@ public class SearchEngine {
         QueryHints hints = parseQueryHints(req.query(), knownProjects());
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
-                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor());
+                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())
+                    .withKeyFilter(req.keyFilter());
             log.debug("Query rewritten: '{}' → project={} lang={} query='{}'",
                     hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
         }
@@ -461,6 +468,9 @@ public class SearchEngine {
             }
         }
 
+        if (req.hasKeyFilter()) { // an index without key fields would silently match nothing
+            for (String p : projects) KeyFiltersUnsupportedException.check(p, luceneIndexer.getProjectIndexDir(p));
+        }
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
         // Classification for AUTO and UNIFIED is now handled inside SearchPipeline via QueryRouter.
@@ -477,7 +487,8 @@ public class SearchEngine {
             int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
             if (adaptive > 0) {
                 req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
-                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive)
+                        .withKeyFilter(req.keyFilter());
                 log.debug("Adaptive oversample: type={} query='{}' factor={}",
                         resolvedTypeName, hints.cleanedQuery(), adaptive);
             }
@@ -555,7 +566,8 @@ public class SearchEngine {
             int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
             if (adaptive > 0) {
                 req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
-                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive)
+                        .withKeyFilter(req.keyFilter());
             }
         }
         Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();

@@ -183,6 +183,7 @@ public class MultiModelEmbedder {
                 snap.filePath  = doc.get(DocumentMapper.F_FILE_PATH);
                 snap.docType   = doc.get(DocumentMapper.F_DOC_TYPE);
                 snap.scope     = doc.get(DocumentMapper.F_SCOPE);
+                snap.stored    = DocumentMapper.keyFieldsOf(doc); // carried over to the rewrite
                 IndexableField sl = doc.getField(DocumentMapper.F_START_LINE);
                 snap.startLine = sl != null && sl.numericValue() != null ? sl.numericValue().intValue() : -1;
                 IndexableField deg = doc.getField(DocumentMapper.F_IN_DEGREE);
@@ -289,6 +290,7 @@ public class MultiModelEmbedder {
                     Document fresh = buildUpdatedDoc(snap, byId, byClassId, fileLines,
                             provider, targetField, cache, projectName);
                     if (fresh == null) { skippedNoMatch++; continue; }
+                    if (snap.stored != null) DocumentMapper.copyKeyFields(snap.stored, fresh);
                     // Replace exactly this document. updateDocument(Term(id)) would delete every
                     // doc sharing the id and write back only one of them.
                     writer.updateDocuments(docKeyQuery(snap), List.of(fresh));
@@ -448,6 +450,8 @@ public class MultiModelEmbedder {
         String filePath;
         String docType;
         String scope;
+        /** The stored document's key fields only (P6-R12); empty for an older index. */
+        Document stored;
         int startLine;
         /** True when no other snapshot in the same file has this id. */
         boolean idUniqueInFile;

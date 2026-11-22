@@ -617,12 +617,10 @@ class ReplicaSyncerTest {
 
         syncer.syncOnce();
 
-        // format 0 is N-1 for this build: materialised and served, status upgrade-available
-        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
-        assertThat(genDir(1).resolve("index-format.json")).doesNotExist();
-        assertThat(com.pharos.indexer.IndexFormat.status(genDir(1)))
-                .isEqualTo(com.pharos.indexer.IndexFormat.statusOf(0))
-                .isEqualTo(com.pharos.indexer.IndexFormat.Status.UPGRADE_AVAILABLE);
+        // format 0 is below the read window since format 2 (N-1 = 1): the format gate refuses it
+        assertThat(com.pharos.indexer.IndexFormat.statusOf(0)).isEqualTo(com.pharos.indexer.IndexFormat.Status.OUTDATED);
+        assertThat(syncer.served()).isEmpty();
+        assertThat(genDir(1)).doesNotExist();
     }
 
     @Test

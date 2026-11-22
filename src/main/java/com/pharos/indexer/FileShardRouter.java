@@ -39,8 +39,14 @@ final class FileShardRouter {
     private final Map<String, ShardId> byFile = new ConcurrentHashMap<>();
     private final Map<Path, Optional<String>> moduleOfDir = new ConcurrentHashMap<>();
 
+    /** Key values per file (the document key fields every plan writes, P6-R12). */
+    private final Map<String, DocKeys> keysByFile = new ConcurrentHashMap<>();
+
+    /**
+     * @param plan a split plan routes files to shards ({@link #shardOf}); any plan computes the files'
+     *             key values ({@link #keysOf(String)}), which every document carries for key filters
+     */
     FileShardRouter(ShardPlan plan, Path projectRoot, Predicate<Path> isDocument) {
-        if (!plan.isSplit()) throw new IllegalArgumentException("a [project] plan has no shard routing");
         this.plan = plan;
         this.root = projectRoot.toAbsolutePath().normalize();
         this.isDocument = isDocument;
@@ -53,7 +59,13 @@ final class FileShardRouter {
      *         shard for ({@link ShardPlan#assign})
      */
     ShardId shardOf(String filePath) {
-        return byFile.computeIfAbsent(filePath, p -> plan.assign(keysOf(Path.of(p))));
+        if (!plan.isSplit()) throw new IllegalStateException("a [project] plan has no shard routing");
+        return byFile.computeIfAbsent(filePath, p -> plan.assign(keysOf(p)));
+    }
+
+    /** The key values of the file at {@code filePath} (as stored in the documents), cached for the run. */
+    DocKeys keysOf(String filePath) {
+        return keysByFile.computeIfAbsent(filePath, p -> keysOf(Path.of(p)));
     }
 
     DocKeys keysOf(Path file) {

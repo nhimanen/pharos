@@ -101,6 +101,23 @@ public class DocumentMapper {
      * Values: "prod" (production Java), "test" (test/benchmark Java), "docs" (non-Java files)
      */
     public static final String F_SCOPE             = "scope";
+    /**
+     * Key fields (P6-R12; index format 2): the file's values as shard specs key them
+     * ({@link com.pharos.cluster.sharding.DocKeys}, computed by the indexer's {@code FileShardRouter}),
+     * so key filters select documents with the values routing prunes shards with. Keyword fields,
+     * matched only as non-scoring filters: no BM25 statistics of the query fields change.
+     * {@value #F_KEY_MODULE}: the module directory relative to the project root ({@value #NO_KEY} for
+     * none); {@value #F_KEY_DIR}: every ancestor directory of the file's relative path (not stored);
+     * {@value #F_KEY_PATH}: the relative path (stored only); {@value #F_KEY_LANGUAGE}: the lower-case
+     * file extension; {@value #F_KEY_KIND}: {@code code} or {@code doc}.
+     */
+    public static final String F_KEY_MODULE        = "keyModule";
+    public static final String F_KEY_DIR           = "keyDir";
+    public static final String F_KEY_PATH          = "keyPath";
+    public static final String F_KEY_LANGUAGE      = "keyLanguage";
+    public static final String F_KEY_KIND          = "keyKind";
+    /** The key value of a document without one (no module, no extension). */
+    public static final String NO_KEY              = "_";
 
     // Graph-derived fields (populated during two-pass indexing)
     /** Number of methods that call this method — used for graph-boosted ranking. */
@@ -933,5 +950,73 @@ public class DocumentMapper {
             result = result.substring(0, 20_000) + "\n// ... (truncated)\n}";
         }
         return result;
+    }
+
+    // ── key fields (P6-R12) ──────────────────────────────────────────────────
+
+    /** Adds the key fields of a file with key values {@code keys} to {@code doc} (see {@link #F_KEY_MODULE}). */
+    public static void addKeyFields(Document doc, com.pharos.cluster.sharding.DocKeys keys) {
+        addKeyFields(doc, keys.module(), keys.relativePath(), keys.language(), keys.fileKind());
+    }
+
+    /** As above, from the raw values (null: none). */
+    public static void addKeyFields(Document doc, String module, String relativePath, String language, String kind) {
+        doc.add(new StringField(F_KEY_MODULE, module == null || module.isEmpty() ? NO_KEY : module, Field.Store.YES));
+        doc.add(new StringField(F_KEY_LANGUAGE, language == null || language.isEmpty() ? NO_KEY : language, Field.Store.YES));
+        doc.add(new StringField(F_KEY_KIND, kind == null || kind.isEmpty() ? NO_KEY : kind, Field.Store.YES));
+        if (relativePath != null) {
+            doc.add(new StoredField(F_KEY_PATH, relativePath));
+            int slash = -1;
+            while ((slash = relativePath.indexOf('/', slash + 1)) > 0) {
+                doc.add(new StringField(F_KEY_DIR, relativePath.substring(0, slash), Field.Store.NO));
+            }
+        }
+    }
+
+    /**
+     * Copies the key fields of a stored document onto its rewrite (a document rebuilt from source, as
+     * {@code pharos embed} rebuilds one): nothing when {@code from} has none (an older index).
+     */
+    public static void copyKeyFields(Document from, Document to) {
+        String module = from.get(F_KEY_MODULE);
+        if (module == null) return;
+        addKeyFields(to, NO_KEY.equals(module) ? null : module, from.get(F_KEY_PATH),
+                NO_KEY.equals(from.get(F_KEY_LANGUAGE)) ? null : from.get(F_KEY_LANGUAGE),
+                NO_KEY.equals(from.get(F_KEY_KIND)) ? null : from.get(F_KEY_KIND));
+    }
+
+    /** Just the stored key fields of {@code stored} (for {@link #copyKeyFields}, without the rest of the document). */
+    public static Document keyFieldsOf(Document stored) {
+        Document out = new Document();
+        for (String f : List.of(F_KEY_MODULE, F_KEY_PATH, F_KEY_LANGUAGE, F_KEY_KIND)) {
+            String v = stored.get(f);
+            if (v != null) out.add(new StoredField(f, v));
+        }
+        return out;
+    }
+
+    /**
+     * The non-scoring filter clauses of {@code filter} (module, whole-directory path prefix, language,
+     * kind; normalised as {@link com.pharos.cluster.routing.ShardFilter} normalises them for routing),
+     * or null when it filters nothing.
+     */
+    public static org.apache.lucene.search.Query keyFilterQuery(com.pharos.cluster.routing.ShardFilter filter) {
+        if (filter == null || filter.isEmpty()) return null;
+        org.apache.lucene.search.BooleanQuery.Builder b = new org.apache.lucene.search.BooleanQuery.Builder();
+        if (filter.module() != null) b.add(term(F_KEY_MODULE, filter.normalizedModule()));
+        if (filter.pathPrefix() != null) {
+            String dir = filter.normalizedPathPrefix();
+            if (!dir.isEmpty()) b.add(term(F_KEY_DIR, dir));
+        }
+        if (filter.language() != null) b.add(term(F_KEY_LANGUAGE, filter.normalizedLanguage()));
+        if (filter.kind() != null) b.add(term(F_KEY_KIND, filter.normalizedKind()));
+        org.apache.lucene.search.BooleanQuery q = b.build();
+        return q.clauses().isEmpty() ? null : q;
+    }
+
+    private static org.apache.lucene.search.BooleanClause term(String field, String value) {
+        return new org.apache.lucene.search.BooleanClause(
+                new org.apache.lucene.search.TermQuery(new org.apache.lucene.index.Term(field, value)),
+                org.apache.lucene.search.BooleanClause.Occur.FILTER);
     }
 }

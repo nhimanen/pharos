@@ -696,9 +696,8 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
-        RunPlan run = new RunPlan(plan, plan.isSplit()
-                ? new FileShardRouter(plan, projectRoot, f -> parserFor(f) instanceof GenericFileParser) : null,
-                modules);
+        RunPlan run = new RunPlan(plan, new FileShardRouter(plan, projectRoot,
+                f -> parserFor(f) instanceof GenericFileParser), modules);
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -739,7 +738,7 @@ public class ProjectIndexManager {
          * embedding.
          */
         void preRoute(java.util.Collection<Path> files) {
-            if (router == null) return;
+            if (!plan.isSplit()) return;
             for (Path f : files) router.shardOf(f.toAbsolutePath().toString());
         }
     }
@@ -787,7 +786,7 @@ public class ProjectIndexManager {
     private ShardedWriter openWriters(String projectName, RunPlan run, boolean fresh) throws IOException {
         if (!run.plan().isSplit()) {
             return ShardedWriter.single(fresh ? luceneIndexer.openWriterFresh(projectName)
-                    : luceneIndexer.openWriter(projectName));
+                    : luceneIndexer.openWriter(projectName), run.router());
         }
         return ShardedWriter.split(ShardedWriter.openAll(run.plan().shards(),
                 s -> luceneIndexer.openShardWriter(projectName, s, fresh)), run.router());

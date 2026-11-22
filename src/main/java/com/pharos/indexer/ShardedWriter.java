@@ -42,9 +42,9 @@ final class ShardedWriter implements Closeable {
         this.router = router;
     }
 
-    /** The {@code [project]} run: one writer, no routing. */
-    static ShardedWriter single(IndexWriter writer) {
-        return new ShardedWriter(writer, Map.of(), null);
+    /** The {@code [project]} run: one writer, no routing ({@code keys} only gives documents their key fields). */
+    static ShardedWriter single(IndexWriter writer, FileShardRouter keys) {
+        return new ShardedWriter(writer, Map.of(), keys);
     }
 
     /** A split run over {@code writers} (one per shard of the plan, in plan order). */
@@ -52,14 +52,26 @@ final class ShardedWriter implements Closeable {
         return new ShardedWriter(null, new LinkedHashMap<>(writers), router);
     }
 
-    void addDocument(Iterable<? extends IndexableField> doc) throws IOException {
-        if (single != null) {
-            single.addDocument(doc);
-            return;
-        }
+    /**
+     * Adds a document with its file's key fields ({@link DocumentMapper#addKeyFields}: module, path,
+     * language, kind; what key filters match), to the shard of its file in a split run.
+     */
+    void addDocument(org.apache.lucene.document.Document doc) throws IOException {
         IndexableField path = null;
         for (IndexableField f : doc) {
             if (DocumentMapper.F_FILE_PATH.equals(f.name())) { path = f; break; }
+        }
+        if (router != null && path != null && path.stringValue() != null) {
+            try {
+                DocumentMapper.addKeyFields(doc, router.keysOf(path.stringValue()));
+            } catch (IllegalArgumentException e) {
+                if (single == null) throw e; // a split run can't place it either
+                // a [project] document outside the project root: no key fields, filters never match it
+            }
+        }
+        if (single != null) {
+            single.addDocument(doc);
+            return;
         }
         if (path == null || path.stringValue() == null) {
             throw new IllegalArgumentException("a document without " + DocumentMapper.F_FILE_PATH

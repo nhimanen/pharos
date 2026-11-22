@@ -83,15 +83,19 @@ public class McpToolRegistry {
         return List.of(
                 toolDef("search_code",
                         "Search for code across indexed Java projects using BM25, vector, or hybrid search",
-                        Map.of(
-                                "query", Map.of("type", "string", "description", "Natural language or keyword search query"),
-                                "type", Map.of("type", "string", "enum", List.of("auto", "keyword", "vector", "hybrid", "unified"), "description", "Search strategy: auto (default) classifies and picks automatically; keyword for identifiers; vector for semantic; hybrid for two-pass keyword+vector; unified for single-pass BM25 boosted by multi-vector similarity (requires re-indexed project)"),
-                                "project", Map.of("type", "string", "description", "Restrict search to a specific project (optional)"),
-                                "limit", Map.of("type", "integer", "description", "Maximum results (default: 10)"),
-                                "expand", Map.of("type", "boolean", "description", "Append callee methods of top-3 hits as related results (default: false)"),
-                                "doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)"),
-                                "scope", Map.of("type", "string", "enum", List.of("prod", "test", "docs", "all"), "description", "Filter by source scope: prod (production Java), test (test/benchmark), docs (non-Java files), or all (default: all)"),
-                                "snippet_lines", Map.of("type", "integer", "description", "Lines of source to include per result as a snippet centred on the best-matching content (default: 15, min: 5, max: 50)")
+                        Map.ofEntries(
+                                Map.entry("query", Map.of("type", "string", "description", "Natural language or keyword search query")),
+                                Map.entry("type", Map.of("type", "string", "enum", List.of("auto", "keyword", "vector", "hybrid", "unified"), "description", "Search strategy: auto (default) classifies and picks automatically; keyword for identifiers; vector for semantic; hybrid for two-pass keyword+vector; unified for single-pass BM25 boosted by multi-vector similarity (requires re-indexed project)")),
+                                Map.entry("project", Map.of("type", "string", "description", "Restrict search to a specific project (optional)")),
+                                Map.entry("limit", Map.of("type", "integer", "description", "Maximum results (default: 10)")),
+                                Map.entry("expand", Map.of("type", "boolean", "description", "Append callee methods of top-3 hits as related results (default: false)")),
+                                Map.entry("doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)")),
+                                Map.entry("scope", Map.of("type", "string", "enum", List.of("prod", "test", "docs", "all"), "description", "Filter by source scope: prod (production Java), test (test/benchmark), docs (non-Java files), or all (default: all)")),
+                                Map.entry("snippet_lines", Map.of("type", "integer", "description", "Lines of source to include per result as a snippet centred on the best-matching content (default: 15, min: 5, max: 50)")),
+                                Map.entry("module", Map.of("type", "string", "description", "Filter by build module: the module's directory relative to the project root (e.g. core or services/api; the nearest directory holding a build file), not the Maven artifactId. '_' selects files outside any module (optional)")),
+                                Map.entry("path_prefix", Map.of("type", "string", "description", "Filter by a directory relative to the project root, matched on whole path segments: src/main matches src/main/java/..., not src/mainframe (optional)")),
+                                Map.entry("language", Map.of("type", "string", "description", "Filter by file extension, case-insensitive: java, py, md, ... (optional)")),
+                                Map.entry("kind", Map.of("type", "string", "enum", List.of("code", "doc"), "description", "Filter by file kind (optional)"))
                         ),
                         List.of("query")),
                 toolDef("find_transitive_callers",
@@ -256,7 +260,10 @@ public class McpToolRegistry {
         if (project != null && project.isEmpty()) project = null;
 
         SearchRequest req = new SearchRequest(
-                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope, 0);
+                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope, 0)
+                .withKeyFilter(new com.pharos.cluster.routing.ShardFilter(args.path("module").asText(null),
+                        args.path("path_prefix").asText(null), args.path("language").asText(null),
+                        args.path("kind").asText(null)));
         SearchResponse response = searchEngine.searchWithTrace(req, expand);
         List<SearchResult> results = response.results();
         if (log.isDebugEnabled()) {
