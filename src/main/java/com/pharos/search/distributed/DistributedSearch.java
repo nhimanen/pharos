@@ -220,7 +220,12 @@ public final class DistributedSearch implements Closeable {
     static final class ShardState {
         final int ordinal;
         final Route route;
-        final boolean local;
+        /**
+         * Searched in process on this node's reader. Starts as "this node holds the shard"; turns false
+         * (served remotely for the rest of the query) when the local reader lags the run the query reads
+         * the shard's project from and a replica serves that run ({@code alignRuns}). Every branch reads it.
+         */
+        volatile boolean local;
         final String project;             // the project this shard serves (catalog mapping of the query)
         final boolean split;              // that project is split: its shards stay on one index run
         Long projectGeneration;           // split shards: the index run of the pinned generation
@@ -628,6 +633,10 @@ public final class DistributedSearch implements Closeable {
                     if (s.unavailable != null || s.projectGeneration == null || s.projectGeneration == target) continue;
                     long from = s.projectGeneration;
                     Long now = s.local ? repinLocal(s) : moveRemote(s, target);
+                    if (s.local && (now == null || now < target)) {
+                        // this node's reader lags the query's run: a replica at that run serves the shard instead
+                        now = moveRemote(s, target);
+                    }
                     if (now != null && now == target) {
                         log.debug("Query: shard {} moved from run {} to run {} of project {}", s.name(), from, target, project);
                         continue;
@@ -659,8 +668,9 @@ public final class DistributedSearch implements Closeable {
         }
 
         /**
-         * Asks the other live readers of a remote shard, in route order, for its generation at run
-         * {@code target}; pins the shard to the first that serves it. The run, or null when none does.
+         * Asks the other live readers of a shard, in route order, for its generation at run {@code target};
+         * pins the shard to the first that serves it (a local shard is then served remotely). The run, or
+         * null when none does.
          */
         private Long moveRemote(ShardState s, long target) {
             ReaderHeartbeat current;
@@ -679,6 +689,17 @@ public final class DistributedSearch implements Closeable {
                             s.reader = r;
                             s.generation = resp.generation();
                             s.projectGeneration = target;
+                            if (s.local) { // served remotely from now on: release the local reader
+                                s.local = false;
+                                if (s.pin != null) {
+                                    try {
+                                        s.pin.close();
+                                    } catch (IOException e) {
+                                        log.warn("Releasing the reader of shard {} failed: {}", s.name(), e.toString());
+                                    }
+                                    s.pin = null;
+                                }
+                            }
                         }
                         return target;
                     }

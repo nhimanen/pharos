@@ -358,6 +358,55 @@ class SplitProjectSearchTest {
         }
     }
 
+    /**
+     * I1: the coordinator holds a shard of a split project itself, but its reader lags the run the query
+     * reads the project from (another reader is at the newer run). The shard is served by that replica
+     * for the rest of the query: complete results, identical to the replica's own, and no warning.
+     */
+    @Test
+    void aLaggingLocalShardIsServedByAReplicaAtTheQueryRun() throws Exception {
+        Path tmp = Files.createTempDirectory("split-lag");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "lagger";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        ShardId s01 = new ShardId(project + "~ring=s01"), s02 = new ShardId(project + "~ring=s02");
+        List<ShardId> shards = List.of(s01, s02);
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 10; i++) writeClass(src, "src/main/java/com/example/p" + i + "/Plain" + i + ".java",
+                "com.example.p" + i, "Plain" + i, "plain words " + i);
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, null)) {
+            fx.indexSplit(src, project, ring2, shards, false);
+            fx.index(JAVA, false);
+            try (TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(s01.value(), JAVA),
+                    EMBEDDER, null)) {
+                k.awaitShard(s02.value(), 0);
+                // run 2 (every shard republished); only the replica that starts after it has it
+                writeClass(src, "src/main/java/com/example/p0/Plain0.java", "com.example.p0", "Plain0", "plain words changed");
+                Files.setLastModifiedTime(src.resolve("src/main/java/com/example/p0/Plain0.java"),
+                        FileTime.fromMillis(System.currentTimeMillis() + 5000));
+                fx.indexSplit(src, project, ring2, shards, true);
+                try (TestReaderNode z = new TestReaderNode(tmp.resolve("z"), store, BUCKET, "z",
+                        List.of(ShardId.wildcardOf(project)), EMBEDDER, null)) {
+                    k.awaitShard(s01.value(), 2);
+                    k.awaitShard(s02.value(), 1);
+                    assertThat(k.parts.runtime().servesShard(s01.value())).as("k holds s01 itself (run 1)").isTrue();
+                    SearchResponse reference = searchKeyword(z, "plain words", project);
+                    assertThat(reference.results()).hasSize(10);
+                    z.drainCalls();
+                    SearchResponse fromK = searchKeyword(k, "plain words", project);
+                    assertThat(fromK.warnings()).isEmpty();
+                    assertThat(DistributedSearchTest.bits(fromK.results()))
+                            .isEqualTo(DistributedSearchTest.bits(reference.results()));
+                    assertThat(z.drainCalls()).as("z served both shards, s01 included")
+                            .anySatisfy(x -> assertThat(x.shard()).isEqualTo(s01.value()))
+                            .anySatisfy(x -> assertThat(x.shard()).isEqualTo(s02.value()));
+                }
+            }
+        } finally {
+            deleteTree(tmp);
+        }
+    }
+
     private static SearchResponse searchKeyword(TestReaderNode n, String q, String project) throws Exception {
         return n.engine.searchWithTrace(new SearchRequest(q, SearchType.KEYWORD, project, null, 10, "text", null,
                 null, 0), false);
