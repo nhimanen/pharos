@@ -125,6 +125,36 @@ public final class ObjectStoreCatalog implements ShardCatalog {
                 + shard + " after " + MAX_ATTEMPTS + " attempts");
     }
 
+    /**
+     * Removes {@code shard}'s entry (with its source), so work-queue writers release it and readers stop
+     * serving it. Nothing else is touched: the shard's generations and writer state stay in the store,
+     * and registering it again resumes from them. CAS read-modify-write like {@link #register}. Idempotent.
+     *
+     * @return true when an entry was removed, false when the catalog did not list the shard
+     */
+    public boolean unregister(ShardId shard) throws IOException {
+        String key = layout.catalogKey();
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            if (attempt > 1) backoff(attempt);
+            Optional<StoredObject> current = store.get(key);
+            if (current.isEmpty()) return false;
+            ObjectNode root = parse(current.get().data());
+            ArrayNode shards = shardsArray(root);
+            boolean found = false;
+            for (int i = shards.size() - 1; i >= 0; i--) {
+                if (shard.value().equals(shards.get(i).path("id").asText())) {
+                    shards.remove(i);
+                    found = true;
+                }
+            }
+            if (!found) return false;
+            byte[] data = JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(root);
+            if (store.putIfMatch(key, data, current.get().etag()).isPresent()) return true;
+        }
+        throw new PublishConflictException("catalog " + key + " kept changing; could not unregister shard "
+                + shard + " after " + MAX_ATTEMPTS + " attempts");
+    }
+
     /** Sleeps a random time in [d/2, d] with d = base * 2^(attempt-2). */
     private void backoff(int attempt) throws IOException {
         long d = BASE_BACKOFF_MS << (attempt - 2);
@@ -133,7 +163,7 @@ public final class ObjectStoreCatalog implements ShardCatalog {
             sleeper.sleep(ms);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new InterruptedIOException("interrupted while registering in catalog " + layout.catalogKey());
+            throw new InterruptedIOException("interrupted while updating catalog " + layout.catalogKey());
         }
     }
 

@@ -238,4 +238,56 @@ class SourceCheckoutTest {
         Files.delete(gone);
         assertThatThrownBy(() -> checkout.changedSince(shard, null)).isInstanceOf(IOException.class);
     }
+    /** A credentials directory as Kubernetes mounts a Secret: each key a file (here plain files). */
+    private Path secretDir(String name, java.util.Map<String, String> files) throws IOException {
+        Path dir = Files.createDirectories(tmp.resolve("git-secrets").resolve(name));
+        for (var e : files.entrySet()) Files.writeString(dir.resolve(e.getKey()), e.getValue());
+        return dir;
+    }
+
+    /** The helper really answers git: {@code git credential fill} gets the files' values, newline-trimmed. */
+    @Test
+    void httpsCredentialsAreReadFromTheShardsDirectoryByGit() throws Exception {
+        Path dir = secretDir("it's", java.util.Map.of("username", "deploy\n", "password", "s3cr3t-t0ken\n"));
+        java.util.Map<String, String> env = SourceCheckout.credentialEnv(dir, tmp.resolve("work"));
+        assertThat(String.join("\n", env.values())).as("paths only, never a credential").doesNotContain("s3cr3t");
+        assertThat(env).doesNotContainKey("GIT_SSH_COMMAND");
+
+        ProcessBuilder pb = new ProcessBuilder("git", "credential", "fill").directory(tmp.toFile());
+        pb.environment().put("GIT_CONFIG_GLOBAL", "/dev/null");
+        pb.environment().put("GIT_CONFIG_SYSTEM", "/dev/null");
+        pb.environment().put("GIT_TERMINAL_PROMPT", "0");
+        pb.environment().putAll(env);
+        Process p = pb.start();
+        p.getOutputStream().write("protocol=https\nhost=example.org\npath=org/repo.git\n\n".getBytes());
+        p.getOutputStream().close();
+        String out = new String(p.getInputStream().readAllBytes());
+        assertThat(p.waitFor()).as(new String(p.getErrorStream().readAllBytes())).isZero();
+        assertThat(out).contains("username=deploy\n").contains("password=s3cr3t-t0ken\n");
+    }
+
+    @Test
+    void sshKeyGivesAGitSshCommandWithThatKeyOnly() throws Exception {
+        Path work = tmp.resolve("work");
+        Path tofu = secretDir("tofu", java.util.Map.of("ssh-privatekey", "KEY"));
+        assertThat(SourceCheckout.credentialEnv(tofu, work)).containsOnlyKeys("GIT_SSH_COMMAND")
+                .containsEntry("GIT_SSH_COMMAND", "ssh -i '" + tofu.resolve("ssh-privatekey")
+                        + "' -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile='"
+                        + work.resolve(".ssh-known-hosts") + "' -o StrictHostKeyChecking=accept-new");
+        Path pinned = secretDir("pinned", java.util.Map.of("ssh-privatekey", "KEY", "known_hosts", "h ssh-ed25519 AAA"));
+        assertThat(SourceCheckout.credentialEnv(pinned, work).get("GIT_SSH_COMMAND"))
+                .contains("-o UserKnownHostsFile='" + pinned.resolve("known_hosts") + "' -o StrictHostKeyChecking=yes");
+        assertThat(SourceCheckout.credentialEnv(secretDir("empty", java.util.Map.of()), work)).isEmpty();
+        assertThat(SourceCheckout.credentialEnv(tmp.resolve("missing"), work)).as("Secret not mounted").isEmpty();
+        assertThat(SourceCheckout.shellQuote("a'b")).isEqualTo("'a'\\''b'");
+    }
+
+    @Test
+    void onlyTheShardsOwnCredentialsAreOffered() throws Exception {
+        Path a = secretDir("a", java.util.Map.of("ssh-privatekey", "KEY"));
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"), Duration.ofSeconds(5),
+                java.util.Map.of("a", a));
+        assertThat(checkout.envFor(new ShardId("a")).get("GIT_SSH_COMMAND")).contains(a.toString());
+        assertThat(checkout.envFor(new ShardId("b"))).isEmpty();
+    }
 }

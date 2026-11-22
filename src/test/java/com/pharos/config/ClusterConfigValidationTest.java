@@ -33,6 +33,17 @@ class ClusterConfigValidationTest {
     }
 
     @Test
+    void gitCredentialsAreAbsoluteDirectoriesPerProject() throws Exception {
+        ClusterConfig c = parse(WRITER + ",\"writer\":{\"gitCredentials\":{\"mypal\":\"/etc/pharos/git/mypal-1a2b3c\"}}");
+        assertThat(c.getWriter().getGitCredentials())
+                .containsExactly(java.util.Map.entry("mypal", java.nio.file.Path.of("/etc/pharos/git/mypal-1a2b3c")));
+        assertThat(mapper.writeValueAsString(parse(WRITER).getWriter())).as("absent when empty")
+                .doesNotContain("gitCredentials");
+        assertThatThrownBy(() -> parse(WRITER + ",\"writer\":{\"gitCredentials\":{\"mypal\":\"relative/dir\"}}"))
+                .hasMessageContaining("cluster.writer.gitCredentials.mypal must be an absolute directory path");
+    }
+
+    @Test
     void hostnameIsNotResolvedOnConstructionOrSingleNodeUse() throws Exception {
         AtomicInteger lookups = new AtomicInteger();
         ClusterConfig.hostnameResolver = () -> {

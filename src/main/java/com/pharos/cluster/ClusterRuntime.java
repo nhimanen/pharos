@@ -577,7 +577,7 @@ public final class ClusterRuntime implements Closeable {
                     w.getMaxConsecutiveFailures()),
                     os.store(), os.layout(), os.objectStoreCatalog(), os.source(), os.writerState(), pim,
                     luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir(),
-                            Duration.ofSeconds(w.getLsRemoteTimeoutSeconds())),
+                            Duration.ofSeconds(w.getLsRemoteTimeoutSeconds()), w.getGitCredentials()),
                     java.time.Clock.systemUTC(), disk);
             os.workQueueGuard().ifPresent(g -> g.attach(loop));
             workLoop = loop;

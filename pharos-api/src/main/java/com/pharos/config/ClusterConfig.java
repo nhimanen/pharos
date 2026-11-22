@@ -523,6 +523,15 @@ public class ClusterConfig {
         private int lsRemoteTimeoutSeconds = 30;
         /** Work-queue mode: the disk guard ({@code cluster.writer.disk}). */
         private DiskConfig disk = new DiskConfig();
+        /**
+         * Per-project git credentials: project name to a directory holding them, used only for that
+         * project's git calls (clone, fetch, {@code ls-remote}). The directory holds an SSH key
+         * ({@code ssh-privatekey}, optional {@code known_hosts}) and/or HTTPS {@code username} and
+         * {@code password} files (the keys of the Kubernetes {@code ssh-auth} and {@code basic-auth}
+         * Secret types). Only paths live in the config; the files are read by git when it needs them.
+         */
+        @JsonInclude(JsonInclude.Include.NON_EMPTY)
+        private java.util.Map<String, Path> gitCredentials = new java.util.TreeMap<>();
 
         static final int MIN_LEASE_TTL_SECONDS = 5;
 
@@ -550,6 +559,15 @@ public class ClusterConfig {
             }
             if (disk == null) disk = new DiskConfig();
             disk.validate();
+            for (java.util.Map.Entry<String, Path> e : gitCredentials.entrySet()) {
+                if (e.getKey() == null || e.getKey().isBlank()) {
+                    throw new IllegalStateException("cluster.writer.gitCredentials: a project name must not be empty");
+                }
+                if (e.getValue() == null || !e.getValue().isAbsolute()) {
+                    throw new IllegalStateException("cluster.writer.gitCredentials." + e.getKey()
+                            + " must be an absolute directory path");
+                }
+            }
         }
 
         public Path getWorkDir() { return workDir; }
@@ -577,6 +595,11 @@ public class ClusterConfig {
         public void setLsRemoteTimeoutSeconds(int v) { this.lsRemoteTimeoutSeconds = v; }
         public DiskConfig getDisk() { return disk; }
         public void setDisk(DiskConfig disk) { this.disk = disk == null ? new DiskConfig() : disk; }
+        /** Project name to its git credentials directory; empty when none are configured. */
+        public java.util.Map<String, Path> getGitCredentials() { return gitCredentials; }
+        public void setGitCredentials(java.util.Map<String, Path> v) {
+            this.gitCredentials = v == null ? new java.util.TreeMap<>() : new java.util.TreeMap<>(v);
+        }
 
         /** {@code leaseTtlSeconds}. */
         public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }

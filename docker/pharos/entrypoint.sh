@@ -6,6 +6,9 @@
 #   PHAROS_PORT   HTTP port (default 7070 for web, 7080 for router)
 #   PHAROS_CONFIG config file to use (default /etc/pharos/config.json, a ConfigMap mount)
 #   JAVA_OPTS     extra JVM options
+# Arguments, when given, are one pharos command to run instead of the server (an operator Job:
+# `index --source-git <url> --ref <ref> --project <name>`, `remove-index --from-catalog <name>`);
+# the container exits with its code. The config is linked in the same way.
 # Secrets (the cluster token, object-store keys) arrive only as env vars named by the config;
 # nothing here writes them anywhere. The final `exec` makes the JVM PID 1, so SIGTERM reaches it.
 set -eu
@@ -34,13 +37,20 @@ else
 fi
 
 jar=/opt/pharos/pharos.jar
-# The flags ./pharos always passes, plus container-aware heap sizing.
+command_args=$#
+# The flags ./pharos always passes, plus container-aware heap sizing; a command's own arguments
+# stay after them.
 set -- -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError \
     --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
     --add-modules jdk.incubator.vector \
     -Dpolyglot.engine.WarnInterpreterOnly=false \
-    -Dpharos.home="$home" ${JAVA_OPTS:-} -jar "$jar"
+    -Dpharos.home="$home" ${JAVA_OPTS:-} -jar "$jar" "$@"
+
+if [ "$command_args" -gt 0 ]; then
+    # pharos loads (and validates) the config itself before running the command
+    exec java "$@"
+fi
 
 case "$role" in
     writer|reader|router)

@@ -30,7 +30,10 @@ import java.util.regex.Pattern;
  * kept under {@code <workDir>/<shard>} for a {@code git} source (cloned on first use, fetched before
  * every {@link #prepare}). Git runs as a subprocess with the writer's own environment, which is where
  * credentials come from (credential helper, ssh agent, {@code GIT_ASKPASS}); a prompt never blocks it.
- * Nothing here writes a URL or credential anywhere but the clone's own git config.
+ * A shard listed in {@code cluster.writer.gitCredentials} gets its own credentials directory on top
+ * (see {@link #credentialEnv}): only that shard's git calls see it. Nothing here writes a URL or
+ * credential anywhere but the clone's own git config, and the credentials directory's files are read
+ * by git only, never by pharos.
  */
 public final class SourceCheckout {
 
@@ -44,6 +47,8 @@ public final class SourceCheckout {
     private final Duration gitTimeout;
     private final Duration lsRemoteTimeout;
     private final String gitExecutable;
+    /** Shard (project) name to its credentials directory ({@code cluster.writer.gitCredentials}). */
+    private final Map<String, Path> credentials;
     private final Map<ShardId, ShardSource> prepared = new ConcurrentHashMap<>();
 
     public SourceCheckout(Path workDir) {
@@ -52,7 +57,15 @@ public final class SourceCheckout {
 
     /** @param lsRemoteTimeout how long a change check's {@code git ls-remote} may take */
     public SourceCheckout(Path workDir, Duration lsRemoteTimeout) {
-        this(workDir, DEFAULT_GIT_TIMEOUT, lsRemoteTimeout, "git");
+        this(workDir, lsRemoteTimeout, Map.of());
+    }
+
+    /**
+     * @param lsRemoteTimeout how long a change check's {@code git ls-remote} may take
+     * @param credentials     shard (project) name to its git credentials directory
+     */
+    public SourceCheckout(Path workDir, Duration lsRemoteTimeout, Map<String, Path> credentials) {
+        this(workDir, DEFAULT_GIT_TIMEOUT, lsRemoteTimeout, "git", credentials);
     }
 
     /** Tests only: another git executable (a fake that hangs). */
@@ -62,7 +75,13 @@ public final class SourceCheckout {
 
     /** Tests only: separate timeouts and another git executable. */
     SourceCheckout(Path workDir, Duration gitTimeout, Duration lsRemoteTimeout, String gitExecutable) {
+        this(workDir, gitTimeout, lsRemoteTimeout, gitExecutable, Map.of());
+    }
+
+    private SourceCheckout(Path workDir, Duration gitTimeout, Duration lsRemoteTimeout, String gitExecutable,
+                           Map<String, Path> credentials) {
         this.gitExecutable = gitExecutable;
+        this.credentials = Map.copyOf(Objects.requireNonNull(credentials, "credentials"));
         this.workDir = Objects.requireNonNull(workDir, "workDir").toAbsolutePath().normalize();
         this.gitTimeout = gitTimeout;
         this.lsRemoteTimeout = Objects.requireNonNull(lsRemoteTimeout, "lsRemoteTimeout");
@@ -100,7 +119,7 @@ public final class SourceCheckout {
     public Optional<String> checkedOutRevision(ShardId shard) throws IOException {
         ShardSource src = prepared.get(shard);
         if (src == null || src.kind() != ShardSource.Kind.GIT) return Optional.empty();
-        return Optional.of(git(cloneDir(shard), "rev-parse", "HEAD").trim());
+        return Optional.of(git(shard, cloneDir(shard), "rev-parse", "HEAD").trim());
     }
 
     /** Whether {@link #prepare} checked out this shard (its source is known here). */
@@ -128,25 +147,25 @@ public final class SourceCheckout {
         Files.createDirectories(workDir);
         if (!Files.exists(dir)) {
             log.info("Cloning source of shard {}", shard);
-            git(workDir, "clone", "--no-checkout", "--quiet", "--", src.location(), shard.value());
+            git(shard, workDir, "clone", "--no-checkout", "--quiet", "--", src.location(), shard.value());
         } else if (!Files.isDirectory(dir.resolve(".git"))) {
             throw new IOException("work directory " + dir + " exists but is not a git clone; remove it to let"
                     + " the writer clone shard " + shard + " again");
         } else {
-            git(dir, "remote", "set-url", "origin", src.location());
+            git(shard, dir, "remote", "set-url", "origin", src.location());
         }
-        git(dir, "fetch", "--quiet", "--prune", "--force", "--tags", "origin",
+        git(shard, dir, "fetch", "--quiet", "--prune", "--force", "--tags", "origin",
                 "+refs/heads/*:refs/remotes/origin/*");
-        String rev = resolve(dir, src.ref());
-        git(dir, "checkout", "--quiet", "--force", "--detach", rev);
-        git(dir, "clean", "--quiet", "-fdx");
+        String rev = resolve(shard, dir, src.ref());
+        git(shard, dir, "checkout", "--quiet", "--force", "--detach", rev);
+        git(shard, dir, "clean", "--quiet", "-fdx");
         return dir;
     }
 
     /** A branch (as fetched from origin), a tag, or a commit id, in that order. */
-    private String resolve(Path dir, String ref) throws IOException {
+    private String resolve(ShardId shard, Path dir, String ref) throws IOException {
         for (String candidate : List.of("refs/remotes/origin/" + ref, "refs/tags/" + ref, ref)) {
-            Optional<String> sha = tryGit(dir, "rev-parse", "--verify", "--quiet", candidate + "^{commit}");
+            Optional<String> sha = tryGit(shard, dir, "rev-parse", "--verify", "--quiet", candidate + "^{commit}");
             if (sha.isPresent()) return sha.get().trim();
         }
         throw new IOException("ref '" + ref + "' not found in the source of this shard");
@@ -157,7 +176,7 @@ public final class SourceCheckout {
         String ref = src.ref();
         // the url, not the clone's origin: read-only, and independent of a checkout a run is indexing
         Files.createDirectories(workDir);
-        String out = git(workDir, lsRemoteTimeout, "ls-remote", "--", src.location(), ref, ref + "^{}");
+        String out = git(shard, workDir, lsRemoteTimeout, "ls-remote", "--", src.location(), ref, ref + "^{}");
         String head = null, tag = null, peeledTag = null;
         for (String line : out.split("\n")) {
             String[] f = line.trim().split("\\s+");
@@ -171,9 +190,9 @@ public final class SourceCheckout {
         return rev;
     }
 
-    private Optional<String> tryGit(Path dir, String... args) throws IOException {
+    private Optional<String> tryGit(ShardId shard, Path dir, String... args) throws IOException {
         try {
-            return Optional.of(git(dir, args));
+            return Optional.of(git(shard, dir, args));
         } catch (GitFailed e) {
             return Optional.empty();
         }
@@ -183,8 +202,62 @@ public final class SourceCheckout {
         GitFailed(String m) { super(m); }
     }
 
-    private String git(Path dir, String... args) throws IOException {
-        return git(dir, gitTimeout, args);
+    private String git(ShardId shard, Path dir, String... args) throws IOException {
+        return git(shard, dir, gitTimeout, args);
+    }
+
+    /**
+     * The environment a shard's git calls get on top of the writer's: its credentials directory's
+     * ({@link #credentialEnv}), or nothing when it has none, so one project's credentials are never
+     * offered to another project's remote.
+     */
+    Map<String, String> envFor(ShardId shard) {
+        Path dir = credentials.get(shard.value());
+        return dir == null ? Map.of() : credentialEnv(dir, workDir);
+    }
+
+    /**
+     * Git settings for the credentials in {@code dir}, as environment variables; the variables hold
+     * paths only, never a credential:
+     * <ul>
+     *   <li>{@code ssh-privatekey}: {@code GIT_SSH_COMMAND} uses that key only, in batch mode. Host keys
+     *       are checked against {@code known_hosts} in the same directory when present, otherwise
+     *       learned on first contact into {@code <workDir>/.ssh-known-hosts} and checked from then on.</li>
+     *   <li>{@code username} and {@code password}: a credential helper (through {@code GIT_CONFIG_*},
+     *       after clearing any configured helper) that answers {@code get} by reading the two files
+     *       when git asks, so nothing is stored or cached.</li>
+     * </ul>
+     * Neither file present: no variables (git's own configuration applies).
+     */
+    static Map<String, String> credentialEnv(Path dir, Path workDir) {
+        Map<String, String> env = new java.util.LinkedHashMap<>();
+        Path key = dir.resolve("ssh-privatekey");
+        if (Files.isRegularFile(key)) {
+            Path known = dir.resolve("known_hosts");
+            String hosts = Files.isRegularFile(known)
+                    ? " -o UserKnownHostsFile=" + shellQuote(known.toString()) + " -o StrictHostKeyChecking=yes"
+                    : " -o UserKnownHostsFile=" + shellQuote(workDir.resolve(".ssh-known-hosts").toString())
+                    + " -o StrictHostKeyChecking=accept-new";
+            env.put("GIT_SSH_COMMAND", "ssh -i " + shellQuote(key.toString())
+                    + " -o IdentitiesOnly=yes -o BatchMode=yes" + hosts);
+        }
+        Path user = dir.resolve("username");
+        Path password = dir.resolve("password");
+        if (Files.isRegularFile(user) && Files.isRegularFile(password)) {
+            env.put("GIT_CONFIG_COUNT", "2");
+            env.put("GIT_CONFIG_KEY_0", "credential.helper");
+            env.put("GIT_CONFIG_VALUE_0", ""); // an empty value clears the helpers configured so far
+            env.put("GIT_CONFIG_KEY_1", "credential.helper");
+            env.put("GIT_CONFIG_VALUE_1", "!f() { test \"$1\" = get || exit 0;"
+                    + " printf 'username=%s\\n' \"$(cat " + shellQuote(user.toString()) + ")\";"
+                    + " printf 'password=%s\\n' \"$(cat " + shellQuote(password.toString()) + ")\"; }; f");
+        }
+        return env;
+    }
+
+    /** {@code s} as one single-quoted shell word. */
+    static String shellQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 
     /**
@@ -192,12 +265,13 @@ public final class SourceCheckout {
      * killed, not only git: a transport helper ({@code git-remote-https}, {@code ssh}) left alive
      * would keep the output pipes, and with them the two pump threads, until it exits on its own.
      */
-    private String git(Path dir, Duration timeout, String... args) throws IOException {
+    private String git(ShardId shard, Path dir, Duration timeout, String... args) throws IOException {
         List<String> cmd = new ArrayList<>();
         cmd.add(gitExecutable);
         cmd.addAll(List.of(args));
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(dir.toFile());
         Map<String, String> env = pb.environment();
+        env.putAll(envFor(shard));
         env.put("GIT_TERMINAL_PROMPT", "0");
         env.put("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh");
         env.put("LC_ALL", "C");

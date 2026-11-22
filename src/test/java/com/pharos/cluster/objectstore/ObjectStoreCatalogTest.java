@@ -82,6 +82,23 @@ class ObjectStoreCatalogTest {
     }
 
     @Test
+    void unregisterRemovesOnlyThatEntryAndIsIdempotent() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.unregister(new ShardId("s"))).as("no catalog yet").isFalse();
+        ShardSource src = ShardSource.git("https://example.org/r.git", "main");
+        catalog.register(new ShardId("s"), Optional.of(src));
+        catalog.register(new ShardId("t"), Optional.of(src));
+
+        assertThat(catalog.unregister(new ShardId("s"))).isTrue();
+        assertThat(catalog.entries()).containsExactly(new ShardEntry(new ShardId("t"), Optional.of(src)));
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.unregister(new ShardId("s"))).isFalse();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("absent: no write").isEqualTo(etag);
+        assertThat(sleeps).isEmpty();
+    }
+
+    @Test
     void registerRecordsAndUpdatesSourceIdempotently() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
         ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);

@@ -91,6 +91,66 @@ class SourceOptionsTest {
         }
     }
 
+    /** The operator's registration Job: no path, on a work-queue writer, with no writer running. */
+    @Test
+    void workQueueWriterRegistersASourceWithoutAPath() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            c.writerConfig.getCluster().getWriter().setWorkQueue(true);
+            assertThat(c.writerRuntime.isWorkQueueWriter()).isTrue();
+            java.util.function.Function<String[], Integer> run = args -> new CommandLine(new IndexCommand(
+                    c.writerManager, new com.pharos.graph.CrossProjectLinker(c.writerConfig, c.writerRegistry),
+                    c.writerRegistry, c.writerConfig, c.writerRuntime)).execute(args);
+
+            assertThat(run.apply(new String[]{"--project", "lucene", "--source-git", "https://example.org/l.git",
+                    "--ref", "main", "--no-embed"})).isZero();
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries()).singleElement().satisfies(e -> {
+                assertThat(e.id()).isEqualTo(new ShardId("lucene"));
+                assertThat(e.source()).contains(ShardSource.git("https://example.org/l.git", "main").withEmbed(false));
+            });
+            assertThat(c.writerRegistry.find("lucene")).as("nothing indexed here").isEmpty();
+
+            // a new ref replaces the recorded source
+            assertThat(run.apply(new String[]{"--project", "lucene", "--source-git", "https://example.org/l.git",
+                    "--ref", "v2"})).isZero();
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().entries()).singleElement().satisfies(e ->
+                    assertThat(e.source()).contains(ShardSource.git("https://example.org/l.git", "v2")));
+
+            // unusable: no project, no source, an invalid name, a url with a password
+            assertThat(run.apply(new String[]{"--source-git", "https://example.org/l.git", "--ref", "main"})).isEqualTo(2);
+            assertThat(run.apply(new String[]{"--project", "x"})).isEqualTo(2);
+            assertThat(run.apply(new String[]{"--project", "bad name", "--source-git", "https://example.org/l.git",
+                    "--ref", "main"})).isEqualTo(2);
+            assertThat(run.apply(new String[]{"--project", "y", "--source-git", "https://u:pw@example.org/l.git",
+                    "--ref", "main"})).isEqualTo(2);
+            assertThat(c.writerRuntime.sourceCatalog().orElseThrow().shards()).containsExactly(new ShardId("lucene"));
+        }
+    }
+
+    /** The operator's removal Job: only the catalog entry goes, on a work-queue writer too. */
+    @Test
+    void removeFromCatalogDropsOnlyTheEntry() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            c.writerConfig.getCluster().getWriter().setWorkQueue(true);
+            var catalog = c.writerRuntime.sourceCatalog().orElseThrow();
+            catalog.register(ShardId.ofProject("a"), Optional.of(ShardSource.git("https://example.org/a.git", "main")));
+            catalog.register(ShardId.ofProject("b"), Optional.of(ShardSource.git("https://example.org/b.git", "main")));
+            java.util.function.Function<String[], Integer> run = args -> new CommandLine(
+                    new com.pharos.cli.RemoveIndexCommand(c.writerRegistry, c.writerManager, c.writerConfig,
+                            c.writerRuntime)).execute(args);
+
+            assertThat(run.apply(new String[]{"a", "--from-catalog"})).isZero();
+            assertThat(catalog.shards()).containsExactly(new ShardId("b"));
+            assertThat(run.apply(new String[]{"a", "--from-catalog"})).as("already gone").isZero();
+            assertThat(run.apply(new String[]{"--all", "--from-catalog"})).isEqualTo(2);
+            assertThat(run.apply(new String[]{"bad name", "--from-catalog"})).isEqualTo(2);
+            assertThat(new CommandLine(new com.pharos.cli.RemoveIndexCommand(c.writerRegistry, c.writerManager,
+                    c.writerConfig)).execute("b", "--from-catalog")).as("no runtime wired").isEqualTo(2);
+            assertThat(catalog.shards()).containsExactly(new ShardId("b"));
+        }
+    }
+
     @Test
     void sourceForDiscoveredSubprojectIsRefused() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();

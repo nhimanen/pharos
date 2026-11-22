@@ -913,6 +913,16 @@ def cmd_index(args):
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
+    if not args.path:
+        # No path: only register --project's source in the cluster catalog (the jar checks the flags)
+        if not (args.source_git or args.source_path) or not args.project:
+            die("give a path to index, or --source-git URL --ref REF (or --source-path DIR) with --project NAME"
+                " to register a cluster source only")
+        cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", "--project", args.project] + _source_flags(args)
+        if args.no_embed:
+            cmd.append("--no-embed")
+        sys.exit(subprocess.run(cmd).returncode)
+
     # Parse path:name specs up front so we can validate the --project interaction
     specs = [_parse_path_spec(p) for p in args.path]
     any_inline_name = any(name is not None for _, name in specs)
@@ -1446,11 +1456,14 @@ EXAMPLES
   pharos index ~/git/yeast:y ~/git/reserve:r       # per-path name overrides
   pharos index /path/to/myproject --full           # force full re-index
   pharos index /path/to/myproject --force          # delete index then re-index
+  pharos index --project lucene --source-git https://github.com/apache/lucene.git --ref main
+                                                   # cluster: register the source only (no path)
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_index.add_argument("path", nargs="+",
-                         help="Path(s) — optionally 'path:name' to override the project name")
+    p_index.add_argument("path", nargs="*",
+                         help="Path(s) — optionally 'path:name' to override the project name. Omit with"
+                              " --source-git/--source-path and --project to only register a cluster source")
     p_index.add_argument("--project", "-p", metavar="NAME",
                          help="Project name (default: directory name)")
     p_index.add_argument("--full", action="store_true",

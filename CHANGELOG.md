@@ -129,6 +129,20 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   empty value, or one with inner whitespace or control characters, is a startup error).
 - `pharos config validate <file>` (and `./pharos config validate <file>`): runs a node's startup
   validation on a config file; prints `ok` and exits 0, or prints the problem and exits 2.
+- Registering a cluster source without indexing: `pharos index --project <name> --source-git <url>
+  --ref <ref> [--no-embed]` with no path only records the source in the shard catalog (also
+  `./pharos index` without a path). It publishes nothing, so a work-queue writer runs it too and no
+  writer needs to be running; the work queue then indexes the project. `pharos remove-index
+  --from-catalog <name>` drops a project's catalog entry: writers release it and readers stop
+  serving it (its generations stay in the bucket; registering it again resumes from them). The
+  Kubernetes operator runs both as Jobs.
+- Per-project git credentials on writers: `cluster.writer.gitCredentials` maps a project to a
+  directory holding `ssh-privatekey` (optional `known_hosts`; without it host keys are learned on
+  first contact into `<workDir>/.ssh-known-hosts`) and/or `username` and `password` (HTTPS). Only
+  that project's git calls use them, through `GIT_SSH_COMMAND` and a credential helper that reads
+  the files when git asks; the config holds paths only.
+- Container image: arguments run one pharos command instead of the server (`docker run pharos:<v>
+  index --project p --source-git <url> --ref main`).
 
 ### Changed (upgrade note)
 - `add-writers` is now raised when a shard's unpublished change is older than

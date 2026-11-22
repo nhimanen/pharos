@@ -202,7 +202,7 @@ public class Main {
                         moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, config.getCluster().getRole()),
                         searchEngine, clusterRuntime);
             if (cls == RemoveIndexCommand.class)
-                return (K) new RemoveIndexCommand(registry, indexManager, config);
+                return (K) new RemoveIndexCommand(registry, indexManager, config, clusterRuntime);
             if (cls == BackfillEmbeddingCacheCommand.class)
                 return (K) new BackfillEmbeddingCacheCommand(
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry), config);
