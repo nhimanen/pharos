@@ -699,6 +699,66 @@ class ReshardJobTest {
     }
 
     /**
+     * Found by the Phase 6 gate: a writer that takes a reshard over and checks the source out at another
+     * path than the writer that indexed it (git sources, each writer its own work dir) must run the full
+     * index the step waits for. It never did: the step logged "its local index needs a full run first"
+     * every poll and nothing scheduled that run, so the reshard stalled while the source did not change.
+     */
+    @Test
+    void takeoverAtAnotherCheckoutPathRunsTheFullRunAndFinishesTheReshard() throws Exception {
+        List<String> files = filesFor(RING4, RING5, 4);
+        writeFiles(files);
+        Path bare = tmp.resolve("origin.git");
+        Files.createDirectories(bare);
+        git(bare, "init", "--bare", "--initial-branch=main");
+        git(src, "init", "--initial-branch=main");
+        git(src, "add", ".");
+        git(src, "commit", "-m", "one");
+        git(src, "push", bare.toString(), "main");
+        catalog.register(new ShardId(P), Optional.of(ShardSource.git(bare.toString(), "main")));
+        int n = catalog.addSpec(Optional.of(P), RING4);
+        catalog.putProject(P, n, ring(4));
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        for (ShardId s : ring(4)) assertThat(replicas.latest(s)).as("published " + s).isPresent();
+        a.loop.close(); // releases the project: B takes it at once
+
+        catalog.requestReshard(P, RING5, clock.instant());
+        Writer b = new Writer("node-b");
+        for (int i = 0; i < 8 && !catalog.projectShards().shardsOf(P).equals(ring(5)); i++) {
+            clock.advance(10);
+            b.loop.tick();
+        }
+
+        assertThat(catalog.projectShards().shardsOf(P)).as("B ran the full index, then the reshard, and flipped")
+                .isEqualTo(ring(5));
+        Reader r = new Reader("r1");
+        r.sync();
+        // B's documents carry its own checkout's paths: every file once, by its path in the project
+        Map<String, Integer> copies = r.fileCopies(catalog);
+        assertThat(copies.values()).as("once").allMatch(c -> c == 1);
+        assertThat(copies.keySet().stream().map(k -> files.stream().filter(k::endsWith).findFirst().orElse(k)).toList())
+                .as("every file").containsExactlyInAnyOrderElementsOf(files);
+    }
+
+    private static String git(Path dir, String... args) throws Exception {
+        String[] cmd = new String[args.length + 1];
+        cmd[0] = "git";
+        System.arraycopy(args, 0, cmd, 1, args.length);
+        ProcessBuilder pb = new ProcessBuilder(cmd).directory(dir.toFile()).redirectErrorStream(true);
+        pb.environment().put("GIT_CONFIG_GLOBAL", "/dev/null");
+        pb.environment().put("GIT_CONFIG_SYSTEM", "/dev/null");
+        pb.environment().put("GIT_AUTHOR_NAME", "t");
+        pb.environment().put("GIT_AUTHOR_EMAIL", "t@example.org");
+        pb.environment().put("GIT_COMMITTER_NAME", "t");
+        pb.environment().put("GIT_COMMITTER_EMAIL", "t@example.org");
+        Process p = pb.start();
+        String out = new String(p.getInputStream().readAllBytes());
+        assertThat(p.waitFor()).as("git %s: %s", String.join(" ", args), out).isZero();
+        return out.trim();
+    }
+
+    /**
      * Review Focus 5: a reshard calls the embedding provider for nothing, on the writer that indexed the
      * project and on a writer that takes a reshard over with the restored writer state.
      */

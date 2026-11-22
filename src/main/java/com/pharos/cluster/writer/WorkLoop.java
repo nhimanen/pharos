@@ -194,6 +194,12 @@ public final class WorkLoop implements Closeable {
         volatile String localUpgrade;
         /** Why this shard needs a full run though its source is unchanged; null when it doesn't. */
         volatile String upgrade;
+        /**
+         * Why a reshard step needs a full run of this project first (a takeover restored an index built
+         * under another checkout path, or a writer state older than its generation); kept until a full run
+         * commits, so every poll keeps the project pending ({@link #upgradeReason}) and the run happens.
+         */
+        volatile String fullRunFirst;
         /** {@code file-state.json} size and mtime when {@link #embeddingsOutdated} was computed. */
         long stateStamp = Long.MIN_VALUE;
         boolean stateEmbed;
@@ -821,7 +827,7 @@ public final class WorkLoop implements Closeable {
             return "the published generation " + st.publishedGeneration.value() + " has index format "
                     + st.publishedFormat + ", this writer indexes format " + com.pharos.indexer.IndexVersions.INDEX_FORMAT;
         }
-        return st.localUpgrade;
+        return st.localUpgrade != null ? st.localUpgrade : st.fullRunFirst;
     }
 
     /**
@@ -949,6 +955,7 @@ public final class WorkLoop implements Closeable {
                 if (full) { // rebuilt by this release: nothing left to upgrade
                     st.localUpgrade = null;
                     st.upgrade = null;
+                    st.fullRunFirst = null;
                 }
                 st.publishedRevision = revision;
                 st.publishedGeneration = null; // re-read on the next poll
@@ -1087,6 +1094,13 @@ public final class WorkLoop implements Closeable {
         return unfinished;
     }
 
+    /** Marks the unit pending with a full run, which stays pending until a full run commits. */
+    private void needFullRunFirst(ShardState st, String why) {
+        st.fullRunFirst = why;
+        st.upgrade = why;
+        if (st.pendingSince == null) st.pendingSince = clock.instant();
+    }
+
     /**
      * One reshard step per held project with a reshard requested (and GC of retired versions for every
      * held project). The step needs this writer's local index of the active version's published run: a
@@ -1125,8 +1139,7 @@ public final class WorkLoop implements Closeable {
                         Restore r = restoreLocal(unit, st, root, indexDir);
                         if (r == null) continue;
                         if (r.full()) { // its full run goes first
-                            st.upgrade = r.why();
-                            if (st.pendingSince == null) st.pendingSince = clock.instant();
+                            needFullRunFirst(st, r.why());
                             continue;
                         }
                     }
@@ -1134,6 +1147,11 @@ public final class WorkLoop implements Closeable {
                     if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED)) || local.isEmpty()
                             || !sameRoot(local.get().getRootPath(), root)) {
                         log.info("Reshard of project {}: its local index needs a full run first", project);
+                        needFullRunFirst(st, local.isEmpty() ? "the local index is not registered"
+                                : Files.exists(indexDir.resolve(FULL_RUN_REQUIRED))
+                                ? "the restored writer state was older than the restored generation"
+                                : "the local index was built under " + local.get().getRootPath() + ", the checkout is at "
+                                        + root);
                         continue;
                     }
                     if (!built && !atPublishedRevision(unit, st)) {
