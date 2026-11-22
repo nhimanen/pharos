@@ -340,6 +340,9 @@ public final class WorkLoop implements Closeable {
             if (stopped || scheduler != null) return;
             members.start();
             leases.start();
+            // the reshard lease is renewed on its own thread too: a reshard build runs inside a tick, which
+            // would otherwise not renew it for the whole build (any build longer than the TTL lost it)
+            if (reshard != null) reshard.leases().start();
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "pharos-writer-work-loop");
                 t.setDaemon(true);
@@ -1052,6 +1055,9 @@ public final class WorkLoop implements Closeable {
                 members::bucketNow, clock, id -> layout.reshardLeaseKey(id.value()));
         this.reshard = new com.pharos.cluster.sharding.ReshardJob(settings.node(), store, layout, catalog, publisher,
                 replicas, writerState, indexer, lucene, reshardLeases, readers, gc, clock, reshardSettings);
+        synchronized (stopMu) {
+            if (scheduler != null) reshardLeases.start(); // enabled after start(): renew from now on
+        }
     }
 
     /** The reshard job, when {@link #enableResharding} turned it on. */
