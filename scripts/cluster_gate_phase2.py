@@ -276,7 +276,9 @@ class Reader:
                 "advertiseUrl": f"http://127.0.0.1:{self.port}",
                 "token": os.environ.get("GATE_TOKEN", "gate2-cluster-token-0123456789"),
                 "objectStore": {
-                    "endpoint": "http://127.0.0.1:9000", "region": "us-east-1", "bucket": "pharos-gate",
+                    # GATE_S3_ENDPOINT: another MinIO address (a host where :9000 is taken)
+                    "endpoint": os.environ.get("GATE_S3_ENDPOINT", "http://127.0.0.1:9000"),
+                    "region": "us-east-1", "bucket": "pharos-gate",
                     "prefix": "pharos", "pathStyle": True,
                     "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"},
             },

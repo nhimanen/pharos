@@ -34,12 +34,15 @@
 #   GATE_PHASES        driver phases (default "p1,p2cold,p2warm,p2cap,reference,ranking,router,down,load,check";
 #                      "none" stops after indexing)
 #   GATE_MIN_FREE_GIB  refuse to start below this much free space on $GATE's file system (default 10)
+#   GATE_DJL           where the models are copied from (default ~/.djl.ai; another host: a copy of it)
+#   GATE_LUCENE_SRC, GATE_MYPAL_SRC  git repos to snapshot (default: the rootPaths in ~/.pharos/registry.json)
+#   GATE_WITH_CE=0     do not copy the cross-encoder (no hybrid-reranked in the phases run)
 #   GATE_LOAD_ONLY=1   step 4 alone on another host (no models, no registry): W1 indexes lucene --no-embed
 #                      from the git repo GATE_LUCENE_GIT (a bare clone), then the driver runs "load,check"
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
@@ -54,6 +57,8 @@ INDEX_HEAP="${PHAROS_INDEX_HEAP:-3g}"
 MODEL_URL="${GATE_MODEL_URL:-hf://jinaai/jina-embeddings-v2-base-code}"
 MODEL_DIR_NAME="$(echo "${MODEL_URL#hf://}" | tr '/' '-')"
 CE_DIR_NAME="Xenova-ms-marco-MiniLM-L-6-v2"   # CrossEncoderProvider default (hybrid-reranked)
+DJL="${GATE_DJL:-$HOME/.djl.ai}"
+MODEL_DIRS=("$MODEL_DIR_NAME"); [[ "${GATE_WITH_CE:-1}" == 1 ]] && MODEL_DIRS+=("$CE_DIR_NAME")
 MODEL_ID="${GATE_MODEL_ID:-jina-code-v2}"
 PHASES="${GATE_PHASES:-p1,p2cold,p2warm,p2cap,reference,ranking,router,down,load,check}"
 MIN_FREE_GIB="${GATE_MIN_FREE_GIB:-10}"
@@ -127,8 +132,8 @@ JSON
   echo "== gate exit $rc (logs in $GATE)"
   exit "$rc"
 fi
-for d in "$MODEL_DIR_NAME" "$CE_DIR_NAME"; do
-  [[ -d "$HOME/.djl.ai/pharos/$d" ]] || { echo "cluster-gate-phase5: model not in ~/.djl.ai/pharos/$d" >&2; exit 2; }
+for d in "${MODEL_DIRS[@]}"; do
+  [[ -d "$DJL/pharos/$d" ]] || { echo "cluster-gate-phase5: model not in $DJL/pharos/$d" >&2; exit 2; }
 done
 
 src_of() {  # $1 = project: its rootPath in ~/.pharos/registry.json (only read)
@@ -140,8 +145,8 @@ except (OSError, ValueError, KeyError, TypeError) as e:
     sys.exit("cluster-gate-phase5: no usable '%s' entry in %s (%r)" % (sys.argv[2], sys.argv[1], e))
 PY
 }
-LUCENE_SRC="$(src_of lucene)" || exit 2
-MYPAL_SRC="$(src_of mypal)" || exit 2
+LUCENE_SRC="${GATE_LUCENE_SRC:-}"; [[ -n "$LUCENE_SRC" ]] || LUCENE_SRC="$(src_of lucene)" || exit 2
+MYPAL_SRC="${GATE_MYPAL_SRC:-}"; [[ -n "$MYPAL_SRC" ]] || MYPAL_SRC="$(src_of mypal)" || exit 2
 for s in "$LUCENE_SRC" "$MYPAL_SRC"; do
   git -C "$s" rev-parse --verify -q HEAD >/dev/null || { echo "cluster-gate-phase5: $s is not a git work tree" >&2; exit 2; }
 done
@@ -168,8 +173,8 @@ mkdir -p "$SRC" "$GATE/nodes"
 
 if [[ ! -f "$MODELS/pharos/.copied" ]]; then
   mkdir -p "$MODELS/pharos"
-  cp -r "$HOME/.djl.ai/pharos/$MODEL_DIR_NAME" "$HOME/.djl.ai/pharos/$CE_DIR_NAME" "$MODELS/pharos/"
-  for d in cache tokenizers; do [[ -d "$HOME/.djl.ai/$d" ]] && cp -r "$HOME/.djl.ai/$d" "$MODELS/"; done
+  for d in "${MODEL_DIRS[@]}"; do cp -r "$DJL/pharos/$d" "$MODELS/pharos/"; done
+  for d in cache tokenizers; do [[ -d "$DJL/$d" ]] && cp -r "$DJL/$d" "$MODELS/"; done
   touch "$MODELS/pharos/.copied"
 fi
 export MALLOC_ARENA_MAX=2

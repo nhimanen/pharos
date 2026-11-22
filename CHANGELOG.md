@@ -92,6 +92,20 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   the bucket. Writer disk guard (`cluster.writer.disk`), `/cluster/status`, `/cluster/events`, a
   webhook for scaling proposals (`cluster.status`) and the Cluster page. A writer's `pharos web`
   no longer loads the search models.
+- Peer-pull backend without a bucket (experimental, README "Without a bucket: peer-pull"):
+  `cluster.backend: peer-pull`. A writer keeps its published generations in a local peer store
+  (`cluster.peers.storeDir`; Lucene files hard-linked) and its `pharos web` serves them on the
+  token-guarded `/replication/*` endpoint (catalog, `latest` long-poll, manifests, whole files
+  and `Range`s, synonyms; at most `maxTransfersPerWriter` transfers, more get 503 with
+  `Retry-After`; optional TLS on writers via `cluster.tls`). Readers find writers through
+  `cluster.peers.discovery` (`dns:<name>[:port]` or `seeds:<url>,…` with gossip limited to
+  `allowHosts`), long-poll each shard's `latest` (`longPollSeconds`), merge the writers' catalogs
+  (a writer missing for 3 refreshes is dropped; its shards keep serving their cached generation)
+  and fetch whole files from peer readers that hold the generation (checked against the
+  manifest; `maxTransfersPerReader`). Reader membership and the cluster status state live on the
+  writers (`POST /replication/readers`), so coordinators and `pharos router` work without a
+  bucket. No writer takeover in this mode (`cluster.writer.workQueue` is forced off). `/health`
+  reports `peers` (writers, conflicts, `peerFetch` files and bytes; on a writer `transfers`).
 
 ### Changed (upgrade note)
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
