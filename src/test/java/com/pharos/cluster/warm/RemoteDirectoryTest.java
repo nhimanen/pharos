@@ -779,13 +779,21 @@ class RemoteDirectoryTest {
     private record Flat(Path files, ShardManifest manifest) {}
 
     private Flat flatFixture() throws IOException {
+        Path src = tmp.resolve("flat-src");
         Path dir = tmp.resolve("flat");
+        Files.createDirectories(src);
         Files.createDirectories(dir);
-        for (ManifestFile f : luceneFiles(manifest)) Files.copy(fullCopy.resolve(f.name()), dir.resolve(f.name()));
+        for (ManifestFile f : luceneFiles(manifest)) Files.copy(fullCopy.resolve(f.name()), src.resolve(f.name()));
         org.apache.lucene.index.TieredMergePolicy mp = new org.apache.lucene.index.TieredMergePolicy();
         mp.setNoCFSRatio(0.0);
-        try (FSDirectory fs = FSDirectory.open(dir); IndexWriter w = new IndexWriter(fs,
+        // rewritten into a fresh dir, so the result is never the source's (possibly compound) single segment
+        try (FSDirectory from = FSDirectory.open(src);
+             org.apache.lucene.index.DirectoryReader r = org.apache.lucene.index.DirectoryReader.open(from);
+             FSDirectory fs = FSDirectory.open(dir); IndexWriter w = new IndexWriter(fs,
                 new IndexWriterConfig(new StandardAnalyzer()).setUseCompoundFile(false).setMergePolicy(mp))) {
+            List<org.apache.lucene.index.CodecReader> leaves = new ArrayList<>();
+            for (var leaf : r.leaves()) leaves.add(org.apache.lucene.index.SlowCodecReaderWrapper.wrap(leaf.reader()));
+            w.addIndexes(leaves.toArray(new org.apache.lucene.index.CodecReader[0]));
             w.forceMerge(1);
             w.commit();
         }
