@@ -28,7 +28,17 @@ Phases (E2E_PHASES, comma-separated, default all, in this order):
               by its podFailurePolicy), an unreadable manifest -> PreflightFailed; no workload changes
   upgrade     the bucket restored, a version change rolls readers, writers, router in that order
   secrets     no token or MinIO key in any non-Secret object (-o yaml), Event, or the operator's logs
-  teardown    deletes the PharosCluster and the e2e pods; owned objects are garbage-collected
+  reapply     kubectl delete of the PharosCluster keeps the MinIO PVC and credentials Secret (no owner
+              reference); the same cluster applied again adopts them and answers every query as before
+  teardown    deletes the PharosCluster and the e2e pods; owned objects are garbage-collected; then
+              the documented full teardown: the cluster's PVCs and Secrets by label
+
+With E2E_EMBEDDINGS=<model> (operator-e2e.sh --with-embeddings) the vector run replaces the list:
+fixture,cluster,ready,reference,embedcache,generations,secrets,teardown on 1 writer and 1 reader that
+download the model on first start; beta is embedded, and the reference also compares vector and hybrid
+top-10. embedcache: the writer's work volume is emptied and its pod deleted; after a commit the next run
+must be incremental (no FULL run: file state and embed cache restored from the bucket), and vector and
+hybrid search must find the new file.
 
 Prints one line per check and ends with "E2E RESULT: PASS (n checks)" or "E2E RESULT: FAIL ...".
 Exit code 0 only on PASS.
@@ -59,7 +69,13 @@ V_REFUSED, V_FAILED, V_UPGRADE = (os.environ.get("E2E_VERSION_REFUSED", "1.4.2-e
 MC_IMAGE = os.environ.get("E2E_MC_IMAGE", "docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z")
 OUT = Path(os.environ.get("E2E_OUT", "e2e-out"))
 PHASES_ALL = ["fixture", "cluster", "ready", "infra", "reference", "load", "scaledown", "takeover",
-              "writerdown", "generations", "preflight", "upgrade", "secrets", "teardown"]
+              "writerdown", "generations", "preflight", "upgrade", "secrets", "reapply", "teardown"]
+
+# E2E_EMBEDDINGS=<model> (operator-e2e.sh --with-embeddings): the vector run. One writer and one reader
+# that download the model on first start; beta is embedded, alpha stays --no-embed.
+EMBEDDINGS = os.environ.get("E2E_EMBEDDINGS") or None
+PHASES_EMBEDDINGS = ["fixture", "cluster", "ready", "reference", "embedcache", "generations", "secrets",
+                     "teardown"]
 
 COOLDOWN = 60
 MAX_STEP_UP = 1
@@ -492,10 +508,10 @@ def node_port(service):
 
 # ------------------------------------------------------------------------------------------- search
 
-def search(base, query, project, timeout=10):
-    """Top-10 ids of a keyword search; raises on any failure (HTTP, timeout, shape, warnings)."""
+def search(base, query, project, timeout=10, pipeline="keyword"):
+    """Top-10 ids of a search; raises on any failure (HTTP, timeout, shape, warnings)."""
     url = f"{base}/api/search?" + urllib.parse.urlencode(
-        {"q": query, "pipeline": "keyword", "limit": 10, "project": project})
+        {"q": query, "pipeline": pipeline, "limit": 10, "project": project})
     with urllib.request.urlopen(url, timeout=timeout) as r:
         if r.status != 200:
             raise RuntimeError(f"HTTP {r.status}")
@@ -737,7 +753,7 @@ def ready_names():
 
 
 def cluster_resource():
-    return {
+    resource = {
         "apiVersion": "pharos.dev/v1alpha1", "kind": "PharosCluster",
         "metadata": {"name": NAME, "namespace": NS},
         "spec": {
@@ -762,6 +778,14 @@ def cluster_resource():
                                 "scaleDown": {"idleForSeconds": 3600}}}},
             "pharosConfig": {"writer.pollSeconds": 10},
         }}
+    if EMBEDDINGS:
+        spec = resource["spec"]
+        spec["embeddings"] = {"model": EMBEDDINGS}
+        # the model runs off-heap (ONNX Runtime): no limit below the heap plus ~1.5 GB of native memory
+        big = {"requests": {"cpu": "500m", "memory": "1536Mi"}, "limits": {"memory": "4Gi"}}
+        spec["writers"].update({"min": 1, "max": 1, "resources": big, "workVolume": "3Gi"})
+        spec["readers"].update({"min": 1, "max": 1, "resources": big, "cacheVolume": "3Gi"})
+    return resource
 
 
 def phase_cluster():
@@ -783,7 +807,7 @@ def phase_ready():
         return None
     t = time.time()
     try:
-        c = wait_for("phase Ready with every project published", ready, 900, 10)
+        c = wait_for("phase Ready with every project published", ready, 2400 if EMBEDDINGS else 900, 10)
     except Abort:
         c = cluster()
         log("status at timeout: " + json.dumps(c.get("status"), indent=1)[:3000])
@@ -854,23 +878,33 @@ def phase_infra():
 def phase_reference():
     image = f"{IMAGE_REPO}:{VERSION}"
     clone = " && ".join(f"git clone -q {GIT_URL}/{n}.git /data/src/{n}" for n, _ in PROJECTS)
-    index = " && ".join(f"pharos-entrypoint index /data/src/{n} --project {n} --no-embed" for n, _ in PROJECTS)
+    index = " && ".join(f"pharos-entrypoint index /data/src/{n} --project {n}"
+                        + ("" if EMBEDDINGS and e else " --no-embed") for n, e in PROJECTS)
     ref = pod("e2e-ref", image, ["sh", "-c", f"export HOME=/tmp; mkdir -p /data/src && {clone} && {index} "
                                              "&& exec pharos-entrypoint"],
               labels={"app": "e2e-ref"},
               env=[{"name": "PHAROS_ROLE", "value": "all"}, {"name": "PHAROS_HOME", "value": "/data/pharos"},
-                   {"name": "PHAROS_CONFIG", "value": "/data/none.json"}],
-              volumes=[{"name": "data", "emptyDir": {}}, {"name": "tmp", "emptyDir": {}}],
-              mounts=[{"name": "data", "mountPath": "/data"}, {"name": "tmp", "mountPath": "/tmp"}],
+                   {"name": "PHAROS_CONFIG", "value": "/etc/ref/config.json" if EMBEDDINGS else "/data/none.json"}],
+              volumes=[{"name": "data", "emptyDir": {}}, {"name": "tmp", "emptyDir": {}}]
+              + ([{"name": "ref-config", "configMap": {"name": "e2e-ref-config"}}] if EMBEDDINGS else []),
+              mounts=[{"name": "data", "mountPath": "/data"}, {"name": "tmp", "mountPath": "/tmp"}]
+              + ([{"name": "ref-config", "mountPath": "/etc/ref"}] if EMBEDDINGS else []),
               ports=[{"name": "http", "containerPort": 7070}])
+    if EMBEDDINGS:
+        # single node with exactly the embedding block the operator rendered for the cluster's readers
+        rendered = json.loads(kjson("get", "configmap", f"{NAME}-config-reader")["data"]["config.json"])
+        rendered.pop("cluster", None)
+        apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "e2e-ref-config", "namespace": NS},
+               "data": {"config.json": json.dumps(rendered, indent=1)}})
     ref["spec"]["containers"][0]["readinessProbe"] = {"httpGet": {"path": "/health", "port": 7070},
                                                       "periodSeconds": 3}
-    ref["spec"]["containers"][0]["resources"] = {"requests": {"cpu": "200m", "memory": "512Mi"},
-                                                 "limits": {"memory": "900Mi"}}
+    ref["spec"]["containers"][0]["resources"] = (
+        {"requests": {"cpu": "500m", "memory": "1536Mi"}, "limits": {"memory": "4Gi"}} if EMBEDDINGS
+        else {"requests": {"cpu": "200m", "memory": "512Mi"}, "limits": {"memory": "900Mi"}})
     apply(ref)
     apply({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "e2e-ref", "namespace": NS},
            "spec": {"type": "NodePort", "selector": {"app": "e2e-ref"}, "ports": [{"port": 7070, "targetPort": 7070}]}})
-    wait_for("the reference node", lambda: "e2e-ref" in ready_names(), 600, 5)
+    wait_for("the reference node", lambda: "e2e-ref" in ready_names(), 1800 if EMBEDDINGS else 600, 5)
     ST.ref_base = f"http://{minikube_ip()}:{node_port('e2e-ref')}"
     same = differ = empty = 0
     for q, project in QUERIES:
@@ -887,6 +921,23 @@ def phase_reference():
     check("reference: top-10 identical to a single-node pharos for every query",
           differ == 0 and same == len(QUERIES), f"{same} identical, {differ} differ, {empty} empty in the reference")
     check("reference: every query has results", empty == 0)
+    if EMBEDDINGS:
+        for pipeline in ("vector", "hybrid"):
+            same = differ = empty = 0
+            embedded = [(q, p) for q, p in QUERIES if dict(PROJECTS)[p]]
+            for q, project in embedded:
+                r = search(ST.ref_base, q, project, timeout=60, pipeline=pipeline)
+                c = search(router_base(), q, project, timeout=60, pipeline=pipeline)
+                empty += 0 if (r and c) else 1
+                if r == c:
+                    same += 1
+                else:
+                    differ += 1
+                    log(f"MISMATCH {pipeline} [{project}] {q!r}\n   reference: {r}\n   cluster:   {c}")
+            check(f"reference: {pipeline} search returns results for every embedded-project query", empty == 0,
+                  f"{len(embedded) - empty}/{len(embedded)} non-empty")
+            check(f"reference: {pipeline} top-10 identical to the single node", differ == 0,
+                  f"{same} identical, {differ} differ")
     kubectl("delete", "pod", "e2e-ref", "--wait=false", check_rc=False)
 
 
@@ -1271,6 +1322,71 @@ def phase_secrets():
     ST.secrets.clear()
 
 
+def phase_reapply():
+    answers = {(q, project): search(router_base(), q, project) for q, project in QUERIES}
+    gens = {p["name"]: p.get("generation") for p in (cluster().get("status") or {}).get("projects") or []}
+    kept = {kind: get_or_none(kind, f"{NAME}-minio")["metadata"]["uid"] for kind in ("pvc", "secret")}
+    kubectl("delete", "pharoscluster", NAME, "--wait=true", "--timeout=180s", timeout=200)
+    log("PharosCluster deleted")
+    wait_for("the owned workloads garbage-collected",
+             lambda: get_or_none("statefulset", f"{NAME}-minio") is None
+             and get_or_none("statefulset", f"{NAME}-writers") is None
+             and get_or_none("secret", f"{NAME}-token") is None, 240, 3)
+    after = {kind: (get_or_none(kind, f"{NAME}-minio") or {}).get("metadata", {}).get("uid") for kind in kept}
+    check("reapply: the MinIO PVC and credentials Secret survive kubectl delete of the PharosCluster",
+          after == kept, f"{after}")
+    resource = cluster_resource()
+    resource["spec"]["version"] = V_UPGRADE if "upgrade" in os.environ.get("E2E_PHASES", "upgrade") else VERSION
+    apply(resource)
+    log(f"PharosCluster applied again ({resource['spec']['version']})")
+
+    def ready():
+        c = cluster()
+        return c if (c.get("status") or {}).get("phase") == "Ready" and projects_published(c) else None
+    c = wait_for("phase Ready again", ready, 900, 10)
+    now = {p["name"]: p.get("generation") for p in c["status"]["projects"]}
+    check("reapply: Ready with the existing generations (the bucket was adopted, nothing re-indexed from scratch)",
+          all(now.get(n) is not None and gens.get(n) is not None and now[n] >= gens[n] for n, _ in PROJECTS),
+          f"before {gens}, after {now}")
+    check("reapply: the adopted PVC and Secret are the same objects, still without an owner reference",
+          all((get_or_none(k, f"{NAME}-minio") or {}).get("metadata", {}).get("uid") == kept[k]
+              and not (get_or_none(k, f"{NAME}-minio") or {}).get("metadata", {}).get("ownerReferences")
+              for k in kept))
+    ST.base = None
+    wait_for("the router answering", lambda: search(router_base(), *QUERIES[0]), 300, 5)
+    differ = sum(1 for (q, project), want in answers.items() if search(router_base(), q, project) != want)
+    check("reapply: top-10 of every query identical to before the delete", differ == 0,
+          f"{differ} differ of {len(answers)}")
+
+
+def phase_embedcache():
+    """A writer that loses its pod and everything on its work volume restores its writer state (file
+    state and embed cache) from the bucket: the next run is incremental, so only the new file is parsed
+    and embedded. pharos logs a FULL run at WARN (the pods' stderr shows WARN and above), with its reason."""
+    project = next(n for n, e in PROJECTS if e)
+    writer = f"{NAME}-writers-0"
+    gen = shard_generation(cluster_status(), project)["generation"]
+    # empty the work volume (index, file state, embed cache, model, checkouts), then kill the pod; deleting
+    # the claim instead races minikube's hostpath provisioner, which can re-create the dir root-owned 0755
+    pod_exec(writer, "rm -rf /data/pharos /data/work", container="pharos")
+    kubectl("delete", "pod", writer, "--force", "--grace-period=0")
+    log(f"{writer}'s work volume emptied and the pod deleted")
+    wait_for(f"{writer} ready again", lambda: writer in ready_pods("writer"), 1200, 5)
+    started = time.time()
+    commit(project, "embed cache")
+    wait_published(project, gen + 1, timeout=900)
+    wait_marker_searchable(project, ST.commits[project], timeout=600)
+    log(f"{project}: generation {gen} -> {gen + 1} in {time.time() - started:.0f}s after the commit")
+    text = kubectl("logs", writer, "-c", "pharos", "--tail=-1", check_rc=False, timeout=60)
+    full = [l for l in text.splitlines() if "running a FULL index" in l]
+    check("embedcache: after losing its pod and volume, the writer restores its state and indexes incrementally"
+          " (no FULL run, so nothing unchanged is re-embedded)", not full, "; ".join(full)[:300] or "no FULL run")
+    for pipeline in ("vector", "hybrid"):
+        ids = search(router_base(), "quokka marker", project, timeout=60, pipeline=pipeline)
+        check(f"embedcache: {pipeline} search finds the new file after the restart",
+              any("change_" in (i or "") for i in ids), f"{ids[:3]}")
+
+
 def phase_teardown():
     if ST.timeline:
         ST.timeline.stop()
@@ -1282,14 +1398,16 @@ def phase_teardown():
     kubectl("delete", "pod", "e2e-git", "e2e-mc", "e2e-probe", "e2e-ref", "--wait=false", "--ignore-not-found",
             check_rc=False)
     kubectl("delete", "service", "e2e-git", "e2e-ref", "--ignore-not-found", check_rc=False)
-    kubectl("delete", "configmap", "e2e-fixture-files", "e2e-fixture-scripts", "--ignore-not-found", check_rc=False)
+    kubectl("delete", "configmap", "e2e-fixture-files", "e2e-fixture-scripts", "e2e-ref-config", "--ignore-not-found",
+            check_rc=False)
 
     def gone():
         left = kubectl("get", "statefulset,deployment,service,configmap,job,secret,networkpolicy,"
                               "poddisruptionbudget", "-l", f"pharos.dev/cluster={NAME}", "-o", "name", check_rc=False)
         return True if not left.strip() else None
-    # the StatefulSets' volume claims outlive them by design (the operator never deletes data)
-    kubectl("delete", "pvc", "-l", f"pharos.dev/cluster={NAME}", "--wait=false", check_rc=False)
+    # the volume claims and the MinIO credentials outlive the cluster by design (the operator never
+    # deletes data): the documented full teardown deletes them by label
+    kubectl("delete", "pvc,secret", "-l", f"pharos.dev/cluster={NAME}", "--wait=false", check_rc=False)
     try:
         wait_for("the cluster's objects garbage-collected", gone, 240, 5)
         check("teardown: every object of the PharosCluster is garbage-collected", True)
@@ -1297,11 +1415,11 @@ def phase_teardown():
         check("teardown: every object of the PharosCluster is garbage-collected", False, str(e))
 
 
-PHASE_FUNCS = {n: globals()["phase_" + n] for n in PHASES_ALL}
+PHASE_FUNCS = {n: globals()["phase_" + n] for n in PHASES_ALL + ["embedcache"]}
 
 
 def main():
-    phases = os.environ.get("E2E_PHASES", ",".join(PHASES_ALL)).split(",")
+    phases = os.environ.get("E2E_PHASES", ",".join(PHASES_EMBEDDINGS if EMBEDDINGS else PHASES_ALL)).split(",")
     unknown = [p for p in phases if p not in PHASE_FUNCS]
     if unknown:
         print(f"unknown phases {unknown}; known: {PHASES_ALL}", file=sys.stderr)

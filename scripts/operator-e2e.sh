@@ -26,17 +26,20 @@
 #   --no-build       reuse the images already in minikube
 #   --keep           leave the operator, CRD and namespace installed afterwards
 #   --delete-profile delete the minikube profile at the end (even on failure)
+#   --with-embeddings the vector run instead (E2E_EMBEDDINGS, default model jina-v2-code, which the pods
+#                    download from Hugging Face on first start); --start then gives minikube 9g
 #   -h, --help
 set -euo pipefail
 
-usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
-START=0; BUILD=1; KEEP=0; DELETE_PROFILE=0
+usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+START=0; BUILD=1; KEEP=0; DELETE_PROFILE=0; EMBED=0
 for a in "$@"; do
   case "$a" in
     --start) START=1 ;;
     --no-build) BUILD=0 ;;
     --keep) KEEP=1 ;;
     --delete-profile) DELETE_PROFILE=1 ;;
+    --with-embeddings) EMBED=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "operator-e2e: unknown argument $a" >&2; exit 2 ;;
   esac
@@ -50,6 +53,11 @@ EXTRA_TAGS=(1.4.2-e2e 1.4.3-e2e 1.4.4-e2e)   # same image: pre-flight refused / 
 OPERATOR_IMAGE="pharos-operator:e2e"
 export E2E_OUT="${E2E_OUT:-$PWD/e2e-out}"
 export E2E_PROFILE="$PROFILE" E2E_NS="$NS"
+MEMORY=7g
+if [ "$EMBED" = 1 ]; then
+  export E2E_EMBEDDINGS="${E2E_EMBEDDINGS:-jina-v2-code}"
+  MEMORY=9g
+fi
 
 for tool in minikube kubectl docker python3; do
   command -v "$tool" >/dev/null || { echo "operator-e2e: $tool is not on PATH" >&2; exit 2; }
@@ -66,12 +74,17 @@ trap cleanup_profile EXIT
 if ! minikube -p "$PROFILE" status >/dev/null 2>&1; then
   if [ "$START" = 1 ]; then
     echo "== starting minikube profile $PROFILE (docker driver, calico)"
-    minikube start -p "$PROFILE" --driver=docker --cpus=4 --memory=7g --cni=calico
+    minikube start -p "$PROFILE" --driver=docker --cpus=4 --memory="$MEMORY" --cni=calico
   else
     echo "operator-e2e: minikube profile $PROFILE is not running (use --start)" >&2; exit 2
   fi
 fi
 kubectl config use-context "$PROFILE" >/dev/null
+# a profile just started may not have scheduled calico yet: give it two minutes
+for _ in $(seq 1 24); do
+  kubectl get pods -n kube-system -l k8s-app=calico-node -o name | grep -q . && break
+  sleep 5
+done
 if ! kubectl get pods -n kube-system -l k8s-app=calico-node -o name | grep -q .; then
   echo "operator-e2e: profile $PROFILE has no calico: NetworkPolicy would not be enforced" \
        "(recreate it with --cni=calico)" >&2
