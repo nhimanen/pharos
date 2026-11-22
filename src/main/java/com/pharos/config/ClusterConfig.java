@@ -79,6 +79,9 @@ public class ClusterConfig {
     /** A pinned local reader is retired this long after a swap: a query must finish well before. */
     static final long RETIRE_DELAY_MILLIS = com.pharos.indexer.LuceneIndexer.RETIRE_DELAY.toMillis();
 
+    /** How {@code tokenEnv} is read; package-private so tests can supply values (e.g. a trailing newline). */
+    static java.util.function.UnaryOperator<String> envReader = System::getenv;
+
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
 
@@ -110,10 +113,17 @@ public class ClusterConfig {
             if (tokenEnv.isBlank()) {
                 throw new IllegalStateException("cluster.tokenEnv must name an environment variable");
             }
-            String v = System.getenv(tokenEnv.trim());
-            if (v == null || v.isBlank()) {
+            String v = effectiveToken(); // surrounding whitespace stripped
+            if (v == null || v.isEmpty()) {
                 throw new IllegalStateException("cluster.tokenEnv names " + tokenEnv.trim()
                         + ", which is not set (or empty) in this process's environment");
+            }
+            if (v.chars().anyMatch(ch -> Character.isWhitespace(ch) || Character.isISOControl(ch)
+                    || Character.isSpaceChar(ch))) {
+                // never echo the value: it is the secret
+                throw new IllegalStateException("cluster.tokenEnv names " + tokenEnv.trim()
+                        + ", whose value contains whitespace or control characters inside it"
+                        + " (a token must be one printable word)");
             }
         }
         if (role != NodeRole.ALL && backend == BackendKind.LOCAL) {
@@ -340,13 +350,15 @@ public class ClusterConfig {
 
     /**
      * The cluster token in effect: {@code token}, else the value of the environment variable
-     * {@code tokenEnv} names, else null. Read on every call and never stored, so it is never
-     * written back to config.json.
+     * {@code tokenEnv} names with surrounding whitespace stripped (a Secret made with
+     * {@code --from-file} keeps the file's trailing newline), else null. Read on every call and
+     * never stored, so it is never written back to config.json.
      */
     public String effectiveToken() {
         if (token != null) return token;
         if (tokenEnv == null || tokenEnv.isBlank()) return null;
-        return System.getenv(tokenEnv.trim());
+        String v = envReader.apply(tokenEnv.trim());
+        return v == null ? null : v.strip();
     }
     public int getHeartbeatSeconds() { return heartbeatSeconds; }
     public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }
@@ -830,8 +842,8 @@ public class ClusterConfig {
      *       change is older than that ({@code targets.backlog} drives only the {@code shard-lagging}
      *       health finding);</li>
      *   <li>{@code writers.idleSeconds} (default: {@code windows.removeWritersSeconds}, 1800): how
-     *       long the writers must be idle before remove-writers; it wins over
-     *       {@code windows.removeWritersSeconds} when both are set;</li>
+     *       long the writers must be idle before remove-writers; setting both keys to different values
+     *       is an error;</li>
      *   <li>{@code eventsKeepAliveSeconds} (default 15): the SSE keep-alive comment interval of
      *       {@code /cluster/events} (the router cuts a stream idle for twice that);</li>
      *   <li>{@code webhookUrl} (optional): receives every event as a JSON POST.</li>
@@ -856,6 +868,14 @@ public class ClusterConfig {
             targets.validate();
             windows.validate();
             writers.validate();
+            Long idle = writers.getIdleSeconds();
+            Long window = windows.getRemoveWritersSeconds();
+            if (idle != null && window != null && !idle.equals(window)) {
+                throw new IllegalStateException("cluster.status.writers.idleSeconds (" + idle
+                        + ") and cluster.status.windows.removeWritersSeconds (" + window
+                        + ") set the same remove-writers window to different values: keep one"
+                        + " (writers.idleSeconds is preferred)");
+            }
             if (!(removeReadersLoad > 0 && removeReadersLoad < 1)) {
                 throw new IllegalStateException("cluster.status.removeReadersLoad must be above 0 and below 1"
                         + " (a share of targets.qpsPerReader), got " + removeReadersLoad);
@@ -890,7 +910,7 @@ public class ClusterConfig {
         /** The remove-writers window: {@code writers.idleSeconds} when set, else {@code windows.removeWritersSeconds}. */
         public long effectiveRemoveWritersSeconds() {
             Long idle = writers == null ? null : writers.getIdleSeconds();
-            return idle != null ? idle : windows.getRemoveWritersSeconds();
+            return idle != null ? idle : windows.effectiveRemoveWritersSeconds();
         }
         public int getEventsKeepAliveSeconds() { return eventsKeepAliveSeconds; }
         public void setEventsKeepAliveSeconds(int v) { this.eventsKeepAliveSeconds = v; }
@@ -964,13 +984,19 @@ public class ClusterConfig {
         private long addReadersSeconds = 300;
         private long removeReadersSeconds = 1800;
         private long addWritersSeconds = 0;
-        private long removeWritersSeconds = 1800;
+        /**
+         * Null until set explicitly (then {@link #DEFAULT_REMOVE_WRITERS_SECONDS} applies), so a conflict with
+         * {@code writers.idleSeconds} is told apart from the default, and a saved config keeps it unset.
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Long removeWritersSeconds;
+        static final long DEFAULT_REMOVE_WRITERS_SECONDS = 1800;
         private long reshardSeconds = 0;
         private long writerDiskSeconds = 0;
         private long clearGraceSeconds = 60;
 
         void validate() {
-            long[] all = {addReadersSeconds, removeReadersSeconds, addWritersSeconds, removeWritersSeconds,
+            long[] all = {addReadersSeconds, removeReadersSeconds, addWritersSeconds, effectiveRemoveWritersSeconds(),
                     reshardSeconds, writerDiskSeconds, clearGraceSeconds};
             for (long v : all) {
                 if (v < 0) throw new IllegalStateException("cluster.status.windows.* must not be negative, got " + v);
@@ -983,8 +1009,13 @@ public class ClusterConfig {
         public void setRemoveReadersSeconds(long v) { this.removeReadersSeconds = v; }
         public long getAddWritersSeconds() { return addWritersSeconds; }
         public void setAddWritersSeconds(long v) { this.addWritersSeconds = v; }
-        public long getRemoveWritersSeconds() { return removeWritersSeconds; }
-        public void setRemoveWritersSeconds(long v) { this.removeWritersSeconds = v; }
+        /** The configured value, or null when unset (see {@link #effectiveRemoveWritersSeconds()}). */
+        public Long getRemoveWritersSeconds() { return removeWritersSeconds; }
+        /** {@code removeWritersSeconds}, or its default (1800) when unset. */
+        public long effectiveRemoveWritersSeconds() {
+            return removeWritersSeconds != null ? removeWritersSeconds : DEFAULT_REMOVE_WRITERS_SECONDS;
+        }
+        public void setRemoveWritersSeconds(Long v) { this.removeWritersSeconds = v; }
         public long getReshardSeconds() { return reshardSeconds; }
         public void setReshardSeconds(long v) { this.reshardSeconds = v; }
         public long getWriterDiskSeconds() { return writerDiskSeconds; }

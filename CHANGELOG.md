@@ -122,9 +122,11 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `action` names; none on `reshard` and `writer-disk`). New `cluster.status` keys for what were
   constants: `removeReadersLoad` (0.2), `writers.backlogShards` (1),
   `writers.oldestPendingSeconds` (300) and `writers.idleSeconds` (the remove-writers window;
-  unset, `windows.removeWritersSeconds` applies). README "Scaling proposals".
+  unset, `windows.removeWritersSeconds` applies; both set to different values is a startup error).
+  README "Scaling proposals".
 - `cluster.tokenEnv`: read the cluster token from the named environment variable instead of
-  `cluster.token` (mutually exclusive with it; an unset or empty variable is a startup error).
+  `cluster.token` (mutually exclusive with it; surrounding whitespace is stripped; an unset or
+  empty value, or one with inner whitespace or control characters, is a startup error).
 - `pharos config validate <file>` (and `./pharos config validate <file>`): runs a node's startup
   validation on a config file; prints `ok` and exits 0, or prints the problem and exits 2.
 

@@ -583,6 +583,27 @@ class ClusterConfigTest {
                 "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}").getStatus());
         assertThat(legacy.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(60);
 
+        // writers.idleSeconds and windows.removeWritersSeconds set the same window: different values are refused
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60},"
+                + "\"writers\":{\"idleSeconds\":900}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.status.writers.idleSeconds")
+                .hasMessageContaining("cluster.status.windows.removeWritersSeconds");
+        var same = com.pharos.cluster.status.StatusSettings.of(parse("{\"cluster\":{\"status\":{\"windows\":"
+                + "{\"removeWritersSeconds\":900},\"writers\":{\"idleSeconds\":900}}}}").getStatus());
+        assertThat(same.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("equal: allowed").isEqualTo(900);
+        // the default (1800) is not a setting: idleSeconds alone, saved and reloaded, stays valid
+        String saved = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"writers\":{\"idleSeconds\":900}}}}", IndexConfig.class));
+        assertThat(saved).doesNotContain("removeWritersSeconds");
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(saved).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(900);
+        String savedLegacy = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}", IndexConfig.class));
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(savedLegacy).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("an explicit value round-trips")
+                .isEqualTo(60);
+
         for (String bad : new String[]{"0", "1", "-0.1", "1.5"}) {
             assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"removeReadersLoad\":" + bad + "}}}"))
                     .as(bad).hasMessageContaining("cluster.status.removeReadersLoad");

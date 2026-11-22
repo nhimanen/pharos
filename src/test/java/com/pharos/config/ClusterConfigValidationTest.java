@@ -18,9 +18,12 @@ class ClusterConfigValidationTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final Supplier<String> originalResolver = ClusterConfig.hostnameResolver;
 
+    private final java.util.function.UnaryOperator<String> originalEnv = ClusterConfig.envReader;
+
     @AfterEach
     void restoreResolver() {
         ClusterConfig.hostnameResolver = originalResolver;
+        ClusterConfig.envReader = originalEnv;
     }
 
     private ClusterConfig parse(String clusterJson) throws Exception {
@@ -94,5 +97,32 @@ class ClusterConfigValidationTest {
         assertThat(parse("\"role\":\"writer\",\"backend\":\"object-store\","
                 + "\"objectStore\":{\"bucket\":\"b\",\"prefix\":\"team/pharos.v1\"}").getObjectStore().getPrefix())
                 .isEqualTo("team/pharos.v1");
+    }
+
+    /** A Secret made with {@code kubectl create secret --from-file} keeps the file's trailing newline. */
+    @Test
+    void tokenEnvValueIsStrippedOfSurroundingWhitespace() throws Exception {
+        ClusterConfig.envReader = name -> "PHAROS_TOKEN".equals(name) ? "  s3cret-token\n" : null;
+        ClusterConfig c = parse("\"tokenEnv\":\"PHAROS_TOKEN\"");
+        assertThat(c.effectiveToken()).isEqualTo("s3cret-token");
+
+        ClusterConfig.envReader = name -> "\r\n\t";
+        assertThatThrownBy(() -> parse("\"tokenEnv\":\"PHAROS_TOKEN\""))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("PHAROS_TOKEN")
+                .hasMessageContaining("not set (or empty)");
+    }
+
+    @Test
+    void tokenEnvValueWithInnerWhitespaceOrControlCharactersIsRefused() {
+        for (String bad : new String[]{"s3cret token", "s3cret\ntoken", "s3cret\ttoken", "s3cret\u0000token",
+                "s3cret\u00a0token", "s3cret\u007ftoken"}) {
+            ClusterConfig.envReader = name -> bad;
+            assertThatThrownBy(() -> parse("\"tokenEnv\":\"PHAROS_TOKEN\""))
+                    .as(bad.replace("\n", "\\n"))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.tokenEnv names PHAROS_TOKEN")
+                    .hasMessageContaining("whitespace or control characters")
+                    .satisfies(e -> assertThat(e.getMessage()).doesNotContain("s3cret"));
+        }
     }
 }
