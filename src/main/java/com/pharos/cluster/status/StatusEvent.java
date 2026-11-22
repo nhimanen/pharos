@@ -14,7 +14,7 @@ import java.util.TreeSet;
 
 /**
  * One {@code /cluster/events} (and webhook) event: {@code {type: appeared|changed|cleared, proposal}}
- * when a proposal comes into force, changes its reason, action or delta, or clears, and
+ * when a proposal comes into force, changes its reason or action (with it the delta), or clears, and
  * {@code {type: layout, summary}} when the scale (shard, writer or reader count) changes.
  */
 @JsonPropertyOrder({"type", "proposal", "summary"})
@@ -56,8 +56,9 @@ public record StatusEvent(String type, ClusterStatus.Proposal proposal, StatusSt
                 out.add(new StatusEvent(APPEARED, proposal(id, is, cands), null));
             } else if (wasOn && !isOn) {
                 out.add(new StatusEvent(CLEARED, proposal(id, was, cands), null));
-            } else if (wasOn && (!Objects.equals(was.reason(), is.reason()) || !Objects.equals(was.action(), is.action())
-                    || !Objects.equals(was.delta(), is.delta()))) {
+            } else if (wasOn && (!Objects.equals(was.reason(), is.reason()) || !Objects.equals(was.action(), is.action()))) {
+                // the delta follows the action's count, so it needs no comparison of its own (and a rule an
+                // older node rewrote without it is no change)
                 out.add(new StatusEvent(CHANGED, proposal(id, is, cands), null));
             }
         }

@@ -345,6 +345,16 @@ class ProposalsTest {
         List<StatusEvent> events = StatusEvent.diff(StatusState.EMPTY, st,
                 Proposals.candidates(idle.apply(T0.plusSeconds(1800)), st, CFG));
         assertThat(events).singleElement().satisfies(e -> assertThat(e.proposal().delta()).isEqualTo(-2));
+
+        // a node older than delta rewrites the state without it: no event, and the status still shows the
+        // delta (from the candidate, whose action matches the recorded one)
+        java.util.TreeMap<String, StatusState.Rule> stripped = new java.util.TreeMap<>();
+        st.rules().forEach((id, r) -> stripped.put(id, new StatusState.Rule(r.kind(), r.target(), r.since(),
+                r.falseSince(), r.active(), r.reason(), r.action(), null)));
+        StatusState old = new StatusState(StatusState.VERSION, st.asOf(), stripped, st.pendingSince(), st.layout());
+        var cands = Proposals.candidates(idle.apply(T0.plusSeconds(1800)), old, CFG);
+        assertThat(StatusEvent.diff(old, st, cands)).isEmpty();
+        assertThat(proposals(idle, old, 1800).get(0).delta()).isEqualTo(-2);
     }
 
     @Test

@@ -40,6 +40,6 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
   `writer-disk`. `delta` is the signed node count of the four scaling kinds (`+N` start, `-N`
   stop, the N the `action` names); it is absent on `reshard` and `writer-disk`.
 
-`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` (a change of reason, action or delta is `changed`) and `{type: layout, summary}`.
+`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` (a change of reason or action, and so of delta, is `changed`) and `{type: layout, summary}`.
 Events carry no addresses, with or without the token. The stream needs `Accept: text/event-stream`
 (which `EventSource` sends), and a node allows at most 64 streams; above that it answers 503.
