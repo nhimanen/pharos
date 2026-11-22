@@ -17,7 +17,8 @@ import java.util.function.LongSupplier;
  * each checking the token again (P5-R3):
  * <ul>
  *   <li>{@code POST /replication/readers}: a reader's {@code ReaderHeartbeat} JSON, unchanged. 204;
- *       400 for a malformed body; 409 for a heartbeat of a process that withdrew; 503 when the
+ *       400 for a malformed body; 403 when the {@code advertiseUrl} host is neither the
+ *       request's remote address nor in {@code cluster.peers.allowHosts} ({@link ReaderAddressCheck}, P5-R12); 409 for a heartbeat of a process that withdrew; 503 when the
  *       registry is full.</li>
  *   <li>{@code GET /replication/readers}: {@code {"writer", "now", "ttlSeconds", "uptimeMillis", "readers":
  *       [{"ageMillis", "heartbeat"}], "withdrawn": [{"node", "startedAt"}]}}, the live readers by this writer's clock ({@code now}: its epoch
@@ -35,10 +36,12 @@ final class MembershipRoutes {
     private final PeerReaderRegistry readers;
     private final PeerStatusState statusState;
     private final LongSupplier wallMillis;
+    private final ReaderAddressCheck addressCheck;
     private final ObjectMapper mapper = new ObjectMapper();
 
     MembershipRoutes(String writerNode, PeerReaderRegistry readers, PeerStatusState statusState,
-                     LongSupplier wallMillis) {
+                     LongSupplier wallMillis, ReaderAddressCheck addressCheck) {
+        this.addressCheck = Objects.requireNonNull(addressCheck, "addressCheck");
         this.writerNode = Objects.requireNonNull(writerNode, "writerNode");
         this.readers = Objects.requireNonNull(readers, "readers");
         this.statusState = Objects.requireNonNull(statusState, "statusState");
@@ -61,6 +64,13 @@ final class MembershipRoutes {
             hb = PeerReaderRegistry.parse(body);
         } catch (IllegalArgumentException e) {
             error(ctx, 400, e.getMessage());
+            return;
+        }
+        com.fasterxml.jackson.databind.JsonNode url = hb.get("advertiseUrl");
+        String refusal = addressCheck.refusal(url == null || url.isNull() ? null : url.asText(),
+                ctx.req().getRemoteAddr());
+        if (refusal != null) { // P5-R12: the token alone does not let a client name any URL
+            error(ctx, 403, refusal);
             return;
         }
         switch (readers.accept(hb)) {

@@ -192,6 +192,9 @@ public final class PeerMembership implements MembershipSource {
     }
 
     // Holding mu. The number of writers that accepted the heartbeat.
+    /** Writers whose 403 to a heartbeat was logged (once each, P5-R12). */
+    private final java.util.Set<String> refusedBy = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private int post(List<PeerCatalog.WriterRef> writers) {
         if (writers.isEmpty()) return 0;
         byte[] body;
@@ -221,6 +224,10 @@ public final class PeerMembership implements MembershipSource {
                 HttpResponse<byte[]> r = e.getValue().get(timeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
                 if (r.statusCode() == 204) {
                     ok++;
+                } else if (r.statusCode() == 403 && refusedBy.add(e.getKey().url().toString())) {
+                    log.warn("Writer {} refuses this reader's heartbeats: {}. Its cluster.advertiseUrl host must resolve"
+                            + " to the address it connects from, or be in the writer's cluster.peers.allowHosts",
+                            e.getKey(), PeerHttp.describe(r.statusCode(), r.body()));
                 } else {
                     log.debug("Heartbeat to writer {} answered {}", e.getKey(), PeerHttp.describe(r.statusCode(), r.body()));
                 }

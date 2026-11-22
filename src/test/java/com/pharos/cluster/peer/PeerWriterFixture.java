@@ -36,14 +36,26 @@ public final class PeerWriterFixture implements AutoCloseable {
     private Javalin app;
     private int port;
 
+    /**
+     * Test readers advertise made-up host names ({@code http://r1:7070}): they all resolve to loopback,
+     * where the test's heartbeats come from (P5-R12).
+     */
+    public static final ReaderAddressCheck LOOPBACK_NAMES =
+            new ReaderAddressCheck(null, h -> List.of(java.net.InetAddress.getLoopbackAddress()));
+
     public PeerWriterFixture(String node, Path dir, int readerTtlSeconds, long wallMillis) throws IOException {
+        this(node, dir, readerTtlSeconds, wallMillis, LOOPBACK_NAMES);
+    }
+
+    public PeerWriterFixture(String node, Path dir, int readerTtlSeconds, long wallMillis,
+                             ReaderAddressCheck addressCheck) throws IOException {
         this.node = node;
         this.wallMillis = new AtomicLong(wallMillis);
         this.store = PeerStore.open(dir);
         this.readers = new PeerReaderRegistry(Duration.ofSeconds(readerTtlSeconds), nanos::get);
         this.endpoint = new ReplicationEndpoint(store, node, InternalApi.tokenMatcher(TOKEN), 8, 16,
                 () -> List.copyOf(peers),
-                readers, statusState, this.wallMillis::get);
+                readers, statusState, this.wallMillis::get, addressCheck);
     }
 
     /** Starts listening (on the same port again after a {@link #stop}). */

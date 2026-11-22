@@ -150,6 +150,55 @@ class PeerMembershipTest {
         assertThat(w.readers.withdrawn()).isEmpty();
     }
 
+    /** P5-R12: the token alone does not let a client advertise any URL; the address must match. */
+    @Test
+    void writerAdmitsAHeartbeatOnlyFromItsAdvertisedHostOrAnAllowedHost() throws Exception {
+        PeerWriterFixture w = new PeerWriterFixture("w", tmp.resolve("w"), 30, CLOCK_A,
+                new ReaderAddressCheck(List.of("Proxied.Example"), host -> switch (host) {
+                    case "localhost" -> List.of(java.net.InetAddress.getLoopbackAddress());
+                    case "elsewhere.example" -> List.of(java.net.InetAddress.ofLiteral("192.0.2.7"));
+                    default -> throw new java.io.IOException("cannot resolve " + host);
+                })).start();
+        open.add(w);
+        java.util.function.Function<String, String> hb = url -> {
+            try {
+                return MAPPER.writeValueAsString(new ReaderHeartbeat("r-" + Math.abs(url.hashCode()), url,
+                        List.of("p1"), false, Map.of(), 0, 0, 1L));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        };
+        // another host's address, an unresolvable host: 403, never registered
+        for (String url : List.of("http://elsewhere.example:7070", "http://192.0.2.9:7070", "http://nowhere.invalid:7070")) {
+            HttpResponse<String> r = call("POST", w.url() + "/replication/readers", TOKEN, hb.apply(url));
+            assertThat(r.statusCode()).as(url).isEqualTo(403);
+            assertThat(r.body()).contains("reader heartbeat refused");
+        }
+        assertThat(w.liveNodes()).isEmpty();
+        // the request's own address (by name or literal), or a host in allowHosts (NAT, proxy): admitted
+        for (String url : List.of("http://localhost:7070", "http://127.0.0.1:7070", "http://proxied.example:7070")) {
+            assertThat(call("POST", w.url() + "/replication/readers", TOKEN, hb.apply(url)).statusCode())
+                    .as(url).isEqualTo(204);
+        }
+        assertThat(w.liveNodes()).hasSize(3);
+    }
+
+    @Test
+    void readerAddressCheckComparesResolvedAddresses() throws Exception {
+        PeerDiscovery.Resolver dns = host -> switch (host) {
+            case "r1.example" -> List.of(java.net.InetAddress.ofLiteral("10.0.0.5"), java.net.InetAddress.ofLiteral("fd00::5"));
+            default -> throw new java.io.IOException("NXDOMAIN");
+        };
+        ReaderAddressCheck c = new ReaderAddressCheck(List.of("[FD00::9]"), dns);
+        assertThat(c.refusal("http://r1.example:7070", "10.0.0.5")).isNull();
+        assertThat(c.refusal("http://r1.example:7070", "[fd00:0:0:0:0:0:0:5]")).isNull();
+        assertThat(c.refusal("http://r1.example:7070", "10.0.0.6")).isNotNull();
+        assertThat(c.refusal("http://[fd00::9]:7070", "10.0.0.6")).isNull(); // allowHosts
+        assertThat(c.refusal("http://r2.example:7070", "10.0.0.5")).isNotNull(); // does not resolve
+        assertThat(c.refusal("http://r1.example:7070", "not-an-ip")).isNotNull();
+        assertThat(c.refusal(null, "10.0.0.6")).isNull(); // names no URL
+    }
+
     @Test
     void membershipRoutesRequireToken() throws Exception {
         PeerWriterFixture w = writer("w", CLOCK_A);

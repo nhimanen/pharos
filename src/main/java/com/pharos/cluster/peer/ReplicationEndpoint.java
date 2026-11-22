@@ -126,7 +126,16 @@ public final class ReplicationEndpoint {
                                int maxTransfers, int maxLongPolls, java.util.function.Supplier<List<String>> peers,
                                PeerReaderRegistry readers, PeerStatusState statusState,
                                java.util.function.LongSupplier wallMillis) {
-        this.membership = new MembershipRoutes(writerNode, readers, statusState, wallMillis);
+        this(peer, writerNode, token, maxTransfers, maxLongPolls, peers, readers, statusState, wallMillis,
+                ReaderAddressCheck.strict());
+    }
+
+    /** @param addressCheck which reader heartbeats are admitted (P5-R12) */
+    public ReplicationEndpoint(PeerStore peer, String writerNode, Predicate<String> token,
+                               int maxTransfers, int maxLongPolls, java.util.function.Supplier<List<String>> peers,
+                               PeerReaderRegistry readers, PeerStatusState statusState,
+                               java.util.function.LongSupplier wallMillis, ReaderAddressCheck addressCheck) {
+        this.membership = new MembershipRoutes(writerNode, readers, statusState, wallMillis, addressCheck);
         this.readers = readers;
         this.statusState = statusState;
         this.peers = Objects.requireNonNull(peers, "peers");
