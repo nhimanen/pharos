@@ -263,6 +263,30 @@ class SplitProjectSearchTest {
         assertThat(usageCalls).as("graph-file lookups ask one shard of the project").hasSize(1);
     }
 
+    /** MCP {@code list_projects} on a reader lists projects: a split project once, with its shards. */
+    @Test
+    void listProjectsShowsProjectsNotShardIds() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper();
+        com.fasterxml.jackson.databind.JsonNode out = m.readTree(r.mcp().call("list_projects", m.createObjectNode()));
+        List<String> names = new ArrayList<>();
+        out.path("projects").forEach(p -> names.add(p.path("name").asText()));
+        assertThat(names).contains(SPLIT, MOD, WHOLE, MOD_WHOLE).doesNotHaveDuplicates()
+                .noneMatch(n -> n.contains("~"));
+        assertThat(out.path("count").asInt()).isEqualTo(names.size());
+        for (com.fasterxml.jackson.databind.JsonNode p : out.path("projects")) {
+            List<String> shards = new ArrayList<>();
+            p.path("shards").forEach(x -> shards.add(x.asText()));
+            switch (p.path("name").asText()) {
+                case SPLIT -> assertThat(shards).containsExactlyInAnyOrderElementsOf(
+                        SPLIT_SHARDS.stream().map(ShardId::value).toList());
+                case MOD -> assertThat(shards).containsExactlyInAnyOrderElementsOf(
+                        MOD_SHARDS.stream().map(ShardId::value).toList());
+                default -> assertThat(p.has("shards")).as("a [project] project keeps its shape").isFalse();
+            }
+            assertThat(p.path("methodCount").asInt()).as(p.path("name").asText()).isPositive();
+        }
+    }
+
     /** The gate's second half: a key-filtered query touches only the matching shards (counted at the reader). */
     @Test
     void moduleFilterTouchesOnlyMatchingShards() throws Exception {

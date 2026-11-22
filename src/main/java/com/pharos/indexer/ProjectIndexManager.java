@@ -729,6 +729,9 @@ public class ProjectIndexManager {
 
     // ------------------------------------------------------------------------- resharding (Task 4)
 
+    /** The progress stage {@link #reshard} reports once it knows how many files move ({@code total}). */
+    public static final String RESHARD_MOVING = "Moving";
+
     /**
      * What a reshard build changed in the local index: the shards of the new version that gained or lost
      * files (or are new), those it left exactly as they were, the shards of the old version it dropped,
@@ -879,6 +882,7 @@ public class ProjectIndexManager {
         List<ShardId> removed = fromIds.stream().filter(sh -> !to.shards().contains(sh)).toList();
         log.info("Reshard of '{}' from {} to {}: {} of {} files move; shards written {}, kept {}, dropped {}",
                 projectName, from.spec(), to.spec(), moved.size(), holder.size(), affectedList, unaffected, removed);
+        progress.onProgress(RESHARD_MOVING, 0, moved.size());
 
         // Parse only the moved files, grouped by parser.
         Map<CodeParser, List<Path>> byParser = new LinkedHashMap<>();

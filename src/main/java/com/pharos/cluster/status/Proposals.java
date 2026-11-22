@@ -23,6 +23,9 @@ import java.util.TreeSet;
 /**
  * The proposal rules (spec table) and their hysteresis, as pure functions of a snapshot, the
  * previous {@link StatusState} and the settings. Pharos applies none of them.
+ * A {@value #RESHARD} proposal targets a project (a split project's shards together) and names the
+ * exact command that applies it ({@link #suggestedRingShards}, ruling P6-R14); while a reshard of the
+ * project is open it does not hold.
  *
  * <table>
  *   <tr><th>kind</th><th>target</th><th>condition</th><th>window</th></tr>
@@ -34,8 +37,8 @@ import java.util.TreeSet;
  *       change older than the backlog target, and fewer live writers than workable shards</td><td>0</td></tr>
  *   <tr><td>{@value #REMOVE_WRITERS}</td><td>{@code writers}</td><td>more than one live writer,
  *       none indexing, nothing pending</td><td>30 min</td></tr>
- *   <tr><td>{@value #RESHARD}</td><td>the shard</td><td>its size above 50% of the smallest reader
- *       cache cap</td><td>0</td></tr>
+ *   <tr><td>{@value #RESHARD}</td><td>the project</td><td>one of its shards above 50% of the smallest
+ *       reader cache cap, and no reshard of it open</td><td>0</td></tr>
  *   <tr><td>{@value #WRITER_DISK}</td><td>the writer</td><td>the writer reports low disk</td><td>0</td></tr>
  * </table>
  * Readers in state {@code draining} are not counted. Live writers are the work-queue writers that
@@ -220,8 +223,10 @@ public final class Proposals {
         int pending = 0;
         Long oldest = null;
         long now = s.asOf().getEpochSecond();
+        java.util.function.Predicate<String> routed = StatusBuilder.routed(s);
         for (ShardObs sh : s.shards()) {
-            if (sh.hasSource() || pinned.contains(sh.shard())) workable++;
+            // a reshard's staged-only (or retired) shard is not a unit of indexing work
+            if ((sh.hasSource() || pinned.contains(sh.shard())) && routed.test(sh.shard())) workable++;
             Long since = pendingSince(s, state, sh);
             if (since == null) continue;
             pending++;
@@ -259,19 +264,71 @@ public final class Proposals {
             cap = cap == null ? n.longValue() : Math.min(cap, n.longValue());
         }
         if (cap == null) return;
-        for (ShardObs sh : s.shards()) {
-            if (sh.sizeBytes() == null) continue;
-            double share = (double) sh.sizeBytes() / cap;
-            int parts = 2;
-            while (parts < 1024 && (double) sh.sizeBytes() / parts > StatusSettings.RESHARD_CACHE_SHARE * cap) parts *= 2;
+        double trigger = StatusSettings.RESHARD_CACHE_SHARE * cap;
+        Map<String, ShardObs> byId = new java.util.HashMap<>();
+        for (ShardObs sh : s.shards()) byId.put(sh.shard(), sh);
+        for (StatusSnapshot.ProjectObs p : s.projectsOrIdentity()) {
+            long projectBytes = 0;
+            Long largest = null;
+            for (String id : p.shards()) {
+                ShardObs sh = byId.get(id);
+                if (sh == null || sh.sizeBytes() == null) continue;
+                projectBytes += sh.sizeBytes();
+                largest = largest == null ? sh.sizeBytes() : Math.max(largest, sh.sizeBytes());
+            }
+            if (largest == null) continue;
+            boolean open = p.request() != null || (p.staged() != null && p.staged().abandonedAt() == null);
+            int ringShards = p.spec().ring().map(r -> r.shards().size()).orElse(0);
+            int suggested = suggestedRingShards(projectBytes, trigger, ringShards);
+            String spec = proposedSpec(p.spec(), suggested);
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("sizeBytes", sh.sizeBytes());
+            m.put("sizeBytes", projectBytes);
+            m.put("largestShardBytes", largest);
+            m.put("shards", p.shards().size());
             m.put("readerCacheMaxBytes", cap);
-            m.put("shareOfCache", round2(share));
-            put(out, RESHARD, sh.shard(), share > StatusSettings.RESHARD_CACHE_SHARE,
+            m.put("shareOfCache", round2((double) largest / cap));
+            m.put("suggestedRingShards", suggested);
+            put(out, RESHARD, p.project(), largest > trigger && !open,
                     "shard above " + Math.round(StatusSettings.RESHARD_CACHE_SHARE * 100) + "% of a reader's cache cap",
-                    "New shard spec, e.g. [project, hash(path) % " + parts + "]", m);
+                    "New shard spec " + spec + ": pharos reshard " + p.project() + " --spec \"" + spec + "\"", m);
         }
+    }
+
+    /**
+     * Ruling P6-R14: the ring size a reshard proposal suggests. {@code S = ceil(projectBytes / trigger)},
+     * at least 2, where the trigger is the reshard threshold ({@value StatusSettings#RESHARD_CACHE_SHARE} of
+     * the smallest reader cache cap); a project already on a ring of {@code N} shards gets
+     * {@code max(N + 1, S)}.
+     */
+    static int suggestedRingShards(long projectBytes, double trigger, int ringShards) {
+        int s = (int) Math.max(2, Math.min(com.pharos.cluster.sharding.ShardSpec.MAX_RING_SHARDS,
+                Math.ceil(projectBytes / trigger)));
+        return ringShards > 0 ? Math.min(com.pharos.cluster.sharding.ShardSpec.MAX_RING_SHARDS,
+                Math.max(ringShards + 1, s)) : s;
+    }
+
+    /**
+     * The spec a reshard proposal suggests: {@code spec} with a ring of {@code shards} shards, the ring
+     * appended to an unringed spec ({@code [project]} gives {@code [project, ring(path, shards=S)]}) or, on
+     * a ringed one, grown to {@code shards} names keeping its vnodes and existing names (new names take
+     * the lowest free numbers, so no existing ring shard is renamed).
+     */
+    static String proposedSpec(com.pharos.cluster.sharding.ShardSpec spec, int shards) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean ringed = false;
+        for (com.pharos.cluster.sharding.ShardSpec.Field f : spec.fields()) {
+            if (sb.length() > 1) sb.append(", ");
+            if (f instanceof com.pharos.cluster.sharding.ShardSpec.RingField r) {
+                ringed = true;
+                java.util.TreeSet<Integer> names = new java.util.TreeSet<>(r.shards());
+                for (int n = 1; names.size() < shards; n++) names.add(n);
+                sb.append(new com.pharos.cluster.sharding.ShardSpec.RingField(names, r.vnodes()));
+            } else {
+                sb.append(f);
+            }
+        }
+        if (!ringed) sb.append(", ring(path, shards=").append(shards).append(')');
+        return sb.append(']').toString();
     }
 
     // ── hysteresis ───────────────────────────────────────────────────────────────────────────────
@@ -313,8 +370,18 @@ public final class Proposals {
             if (since != null) pending.put(sh.shard(), since);
         }
 
+        TreeMap<String, StatusState.ReshardMark> reshards = new TreeMap<>();
+        for (StatusSnapshot.ProjectObs p : s.projects()) {
+            ClusterStatus.Reshard r = ReshardProgress.of(s, p);
+            if (r == null) continue;
+            StatusState.ReshardMark mark = new StatusState.ReshardMark(r.specVersion(), r.phase(),
+                    ReshardProgress.step(r), r.shardsDone(), r.shardsTotal(), r.filesDone(), r.filesTotal());
+            StatusState.ReshardMark was = base.reshards().get(p.project());
+            reshards.put(p.project(), mark.sameStep(was) ? was : mark); // counts move only with the step
+        }
+
         StatusState.Summary layout = summary(s);
-        StatusState next = new StatusState(StatusState.VERSION, now, rules, pending, layout);
+        StatusState next = new StatusState(StatusState.VERSION, now, rules, pending, layout, reshards);
         return next.sameContent(base) ? base : next;
     }
 

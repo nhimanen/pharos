@@ -178,6 +178,11 @@ public final class DistributedSearch implements Closeable {
         return router.catalogProjectNames();
     }
 
+    /** The catalog's project ↔ shards mapping (see {@link ShardRouter#catalogProjects}); never throws. */
+    public java.util.Optional<com.pharos.cluster.sharding.ProjectShards> catalogProjects() {
+        return router.catalogProjects();
+    }
+
     /** True while this coordinator marks {@code node} suspect (it failed a call). */
     public boolean suspect(String node) {
         return client.health().isSuspect(node);

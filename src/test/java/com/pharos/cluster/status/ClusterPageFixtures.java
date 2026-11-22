@@ -1,6 +1,7 @@
 package com.pharos.cluster.status;
 
 import com.pharos.cluster.membership.ReaderHeartbeat;
+import com.pharos.cluster.sharding.ShardSpec;
 import com.pharos.cluster.writer.WriterHeartbeat;
 import com.pharos.web.WebServer;
 
@@ -101,8 +102,79 @@ public final class ClusterPageFixtures {
     }
 
     /**
+     * A reshard in progress: project {@code lucene} on {@code [project, ring(path, shards=2)]} (spec
+     * version 1) being split to three ring shards (version 2, staged, building: 2 of 3 shards and 10 of 40
+     * files done, w1 holding the reshard lease), {@code s03} only in the staged version and {@code s01}
+     * rewritten in it; {@code docs} on the implicit {@code [project]}.
+     */
+    public static StatusSnapshot resharding() {
+        return resharding(false);
+    }
+
+    /**
+     * As {@link #resharding()}; {@code pinned}: every shard of version 2 published (s01 rewritten at
+     * generation 5, s02 kept at 2, s03 new at 1), all 40 files written, the flip waiting for the readers;
+     * and project {@code web}, flipped an hour ago from {@code [project, ring(path, shards=1)]} (version 3,
+     * retired and still kept) to {@code [project, module]} (version 4).
+     */
+    public static StatusSnapshot resharding(boolean pinned) {
+        String s01 = "lucene~ring=s01", s02 = "lucene~ring=s02", s03 = "lucene~ring=s03";
+        List<StatusSnapshot.ShardObs> shards = new ArrayList<>(List.of(
+                new StatusSnapshot.ShardObs("docs", true, 7L, 5_120L, 40L << 20, "w1", T0.minusSeconds(900), "d1",
+                        new StatusSnapshot.LeaseObs("w1", T0.minusSeconds(3), false)),
+                new StatusSnapshot.ShardObs(s01, true, 4L, 61_000L, 700L << 20, "w1", T0.minusSeconds(1_800), "r9",
+                        new StatusSnapshot.LeaseObs("w1", T0.minusSeconds(3), false)),
+                new StatusSnapshot.ShardObs(s02, true, 2L, 58_000L, 650L << 20, "w1", T0.minusSeconds(1_800), "r9",
+                        new StatusSnapshot.LeaseObs("w1", T0.minusSeconds(3), false)),
+                new StatusSnapshot.ShardObs(s03, true, null, null, null, null, null, null, null)));
+        if (pinned) {
+            shards.add(new StatusSnapshot.ShardObs("web~module=api", true, 3L, 900L, 9L << 20, "w1",
+                    T0.minusSeconds(3_000), "w2", new StatusSnapshot.LeaseObs("w1", T0.minusSeconds(3), false)));
+            shards.add(new StatusSnapshot.ShardObs("web~ring=s01", true, 6L, 880L, 8L << 20, "w1",
+                    T0.minusSeconds(4_000), "w1", null));
+        }
+        Map<String, WriterHeartbeat.Backlog> backlog = new LinkedHashMap<>();
+        for (String s : List.of("docs", s01, s02)) backlog.put(s, new WriterHeartbeat.Backlog("r9", "r9", false, null));
+        WriterHeartbeat w = new WriterHeartbeat("w1", true, List.of("docs", s01, s02), List.of(), backlog, null,
+                T0.minusSeconds(7_200).toEpochMilli(), false, new WriterHeartbeat.Disk(300L * GIB, 500L * GIB, false));
+        Map<String, Object> rc = new LinkedHashMap<>();
+        rc.put("mode", "lazy");
+        rc.put("cacheMaxBytes", 4L * GIB);
+        rc.put("bytesOnDisk", GIB);
+        rc.put("hitRate", 0.97);
+        ReaderHeartbeat r = new ReaderHeartbeat("r1", "http://r1", List.of("docs", s01, s02), false, rc, 0, 12.0,
+                T0.minusSeconds(5_000).toEpochMilli(), ReaderHeartbeat.READY, List.of(), 120L, 2L);
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        ShardSpec ring3 = ShardSpec.parse("[project, ring(path, shards=3)]");
+        StatusSnapshot.ProjectObs lucene = new StatusSnapshot.ProjectObs("lucene", 1, ring2, List.of(s01, s02),
+                new StatusSnapshot.StagedObs(2, ring3, List.of(s01, s02, s03),
+                        pinned ? Map.of(s01, 5L, s02, 2L, s03, 1L) : Map.of(), null),
+                null,
+                new StatusSnapshot.RequestObs(2, ring3, T0.minusSeconds(600)), null,
+                pinned ? new StatusSnapshot.JobObs(2, "waiting", "w1", 2, 1, 40, 40, "reader r1 (lucene~ring=s03)",
+                        null, T0.minusSeconds(20))
+                        : new StatusSnapshot.JobObs(2, "staged", "w1", 1, 1, 10, 40, null, null, T0.minusSeconds(20)),
+                new StatusSnapshot.LeaseObs("w1", T0.minusSeconds(4), false));
+        List<StatusSnapshot.ProjectObs> projects = new ArrayList<>(List.of(StatusSnapshot.ProjectObs.identity("docs"),
+                lucene));
+        List<StatusSnapshot.SpecObs> specs = new ArrayList<>(List.of(new StatusSnapshot.SpecObs(1, "lucene", ring2),
+                new StatusSnapshot.SpecObs(2, "lucene", ring3)));
+        if (pinned) {
+            ShardSpec ring1 = ShardSpec.parse("[project, ring(path, shards=1)]");
+            ShardSpec module = ShardSpec.parse("[project, module]");
+            projects.add(new StatusSnapshot.ProjectObs("web", 4, module, List.of("web~module=api"), null,
+                    new StatusSnapshot.PreviousObs(3, ring1, List.of("web~ring=s01"), T0.minusSeconds(3_600)), null,
+                    null, null, null));
+            specs.add(new StatusSnapshot.SpecObs(3, "web", ring1));
+            specs.add(new StatusSnapshot.SpecObs(4, "web", module));
+        }
+        return new StatusSnapshot(StatusSnapshot.CLUSTER, T0, shards, List.of(new StatusSnapshot.WriterObs(w, T0)),
+                List.of(new StatusSnapshot.ReaderObs(r, T0)), Duration.ofSeconds(30), false, projects, specs, null);
+    }
+
+    /**
      * Serves a fixture status on a local web server, for a visual check only:
-     * {@code ClusterPageFixtures <golden|single|large> <port>}. {@code golden} replays the golden
+     * {@code ClusterPageFixtures <golden|single|large|resharding> <port>}. {@code golden} replays the golden
      * cluster from T0 to T0 + 400 s, one 10 s step per refresh, so proposals appear and
      * {@code /cluster/events} fires. Run it with {@code -Dpharos.home} and {@code -Duser.home} set to
      * temp dirs.
@@ -115,7 +187,8 @@ public final class ClusterPageFixtures {
             case "golden" -> () -> GoldenStatusTest.cluster(Math.min(400, 10 * step.getAndIncrement()));
             case "single" -> ClusterPageFixtures::singleNode;
             case "large" -> ClusterPageFixtures::large;
-            default -> throw new IllegalArgumentException("scenario: golden, single or large");
+            case "resharding" -> ClusterPageFixtures::resharding;
+            default -> throw new IllegalArgumentException("scenario: golden, single, large or resharding");
         };
         StatusService status = new StatusService(source, StatusStateStore.memory(), StatusSettings.defaults(),
                 new StatusEvents(Duration.ofSeconds(15), null), Duration.ofMillis(300), Duration.ofSeconds(1),

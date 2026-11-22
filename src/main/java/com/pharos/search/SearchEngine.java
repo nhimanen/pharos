@@ -319,6 +319,15 @@ public class SearchEngine {
         return List.copyOf(names);
     }
 
+    /**
+     * The cluster catalog's project ↔ shards mapping on a node that routes queries (a reader or router):
+     * which project a registered shard serves. Empty on a single node, or when the catalog can't be read.
+     */
+    public java.util.Optional<com.pharos.cluster.sharding.ProjectShards> clusterProjects() {
+        DistributedSearch ds = distributed;
+        return ds == null ? java.util.Optional.empty() : ds.catalogProjects();
+    }
+
     static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
 
     /**

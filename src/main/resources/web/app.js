@@ -2167,7 +2167,7 @@ function connectClusterEvents() {
   const es = new EventSource('/cluster/events');
   CL.es = es;
   const onEvent = () => clusterRefetchSoon();
-  ['appeared', 'changed', 'cleared', 'layout'].forEach(t => es.addEventListener(t, onEvent));
+  ['appeared', 'changed', 'cleared', 'layout', 'reshard'].forEach(t => es.addEventListener(t, onEvent));
   es.onmessage = onEvent;
   es.onopen = () => {
     clearInterval(CL.poll); CL.poll = null;

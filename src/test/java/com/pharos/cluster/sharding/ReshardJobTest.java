@@ -563,6 +563,12 @@ class ReshardJobTest {
         assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
         assertThat(new HashSet<>(a.parser.parsed)).as("only the moved files were parsed").isEqualTo(moved);
         assertThat(a.parser.parsed).hasSize(moved.size());
+        // the job record's progress (status): every moved file written, every shard settled
+        JsonNode job = JSON.readTree(store.get(layout.reshardJobKey(P)).orElseThrow().data());
+        assertThat(job.path("filesTotal").asInt()).isEqualTo(moved.size());
+        assertThat(job.path("filesDone").asInt()).isEqualTo(moved.size());
+        assertThat(job.path("affected").size() + job.path("unaffected").size()).isEqualTo(5);
+        assertThat(job.path("unaffected").size()).isEqualTo(untouched.size());
         Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
         for (ShardId s : untouched) {
             assertThat(replicas.latest(s)).as(s + " keeps its generation").contains(before.get(s));

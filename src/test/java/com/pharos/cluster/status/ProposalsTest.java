@@ -185,12 +185,95 @@ class ProposalsTest {
         List<ClusterStatus.Proposal> ps = proposals(snap, st, 0);
         assertThat(kinds(ps)).containsExactly(Proposals.RESHARD);
         assertThat(ps.get(0).target()).as("501 bytes > 50% of 1000; 500 is not").isEqualTo("a");
-        assertThat(ps.get(0).action()).isEqualTo("New shard spec, e.g. [project, hash(path) % 2]");
+        assertThat(ps.get(0).action()).isEqualTo("New shard spec [project, ring(path, shards=2)]:"
+                + " pharos reshard a --spec \"[project, ring(path, shards=2)]\"");
         assertThat(ps.get(0).metrics()).containsEntry("sizeBytes", 501L).containsEntry("readerCacheMaxBytes", 1000L);
 
         var big = cluster(List.of(shard("a", true, 1900L, null, null)), List.of(), List.of(small));
         List<ClusterStatus.Proposal> bigPs = proposals(big, Proposals.advance(big.apply(T0), null, CFG), 0);
-        assertThat(bigPs.get(0).action()).isEqualTo("New shard spec, e.g. [project, hash(path) % 4]");
+        assertThat(bigPs.get(0).action()).contains("--spec \"[project, ring(path, shards=4)]\"");
+    }
+
+    /** One catalog project for the reshard tests: its active version and shards, optionally an open request. */
+    private static StatusSnapshot.ProjectObs project(String name, Integer version, String spec, List<String> shards,
+                                                     boolean requested) {
+        return new StatusSnapshot.ProjectObs(name, version, com.pharos.cluster.sharding.ShardSpec.parse(spec), shards,
+                null, null, requested ? new StatusSnapshot.RequestObs(9,
+                com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=9)]"), T0) : null,
+                null, null, null);
+    }
+
+    private static StatusSnapshot withProjects(List<StatusSnapshot.ShardObs> shards, ReaderHeartbeat reader,
+                                               List<StatusSnapshot.ProjectObs> projects) {
+        return new StatusSnapshot(StatusSnapshot.CLUSTER, T0, shards, List.of(),
+                List.of(new StatusSnapshot.ReaderObs(reader, T0)), Duration.ofSeconds(30), false, projects, null, null);
+    }
+
+    /**
+     * Ruling P6-R14: the proposal names a concrete spec and the exact command. An unringed project gets
+     * {@code [project, ring(path, shards=S)]} with {@code S = ceil(projectBytes / trigger)}, at least 2 (the
+     * trigger: 50% of the smallest reader cache cap); a ringed project of N shards gets
+     * {@code shards = max(N + 1, S)}. A split project is one proposal, targeting the project.
+     */
+    @Test
+    void reshardProposalSuggestsConcreteRingSpec() {
+        ReaderHeartbeat r = new ReaderHeartbeat("r1", "http://r1", List.of(), false, StatusFixtures.cache(2000), 0, 1,
+                1L, ReaderHeartbeat.READY, List.of(), 10L, 1L); // trigger: 1000 bytes
+
+        // unringed [project]: 3300 bytes → S = ceil(3.3) = 4
+        StatusSnapshot plain = withProjects(List.of(shard("lucene", true, 3300L, null, null)), r,
+                List.of(project("lucene", null, "[project]", List.of("lucene"), false)));
+        ClusterStatus.Proposal p = StatusBuilder.build(plain, Proposals.advance(plain, null, CFG), CFG).proposals().get(0);
+        assertThat(p.kind()).isEqualTo(Proposals.RESHARD);
+        assertThat(p.target()).isEqualTo("lucene");
+        assertThat(p.action()).isEqualTo("New shard spec [project, ring(path, shards=4)]:"
+                + " pharos reshard lucene --spec \"[project, ring(path, shards=4)]\"");
+        assertThat(p.metrics()).containsEntry("suggestedRingShards", 4).containsEntry("sizeBytes", 3300L);
+        // the spec is one pharos reshard accepts
+        assertThat(com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=4)]").ring()).isPresent();
+
+        // unringed [project, module]: the ring is appended after the existing keys
+        StatusSnapshot moduled = withProjects(List.of(shard("app~module=core", true, 1500L, null, null),
+                        shard("app~module=web", true, 200L, null, null)), r,
+                List.of(project("app", 3, "[project, module]", List.of("app~module=core", "app~module=web"), false)));
+        ClusterStatus.Proposal pm = StatusBuilder.build(moduled, Proposals.advance(moduled, null, CFG), CFG)
+                .proposals().get(0);
+        assertThat(pm.target()).isEqualTo("app");
+        assertThat(pm.action()).endsWith("pharos reshard app --spec \"[project, module, ring(path, shards=2)]\"");
+
+        // ringed, N = 4, one shard over the trigger, 1500 bytes in all → S = 2: max(N + 1, S) = 5
+        List<String> ring4 = List.of("idx~ring=s01", "idx~ring=s02", "idx~ring=s03", "idx~ring=s04");
+        StatusSnapshot ringed = withProjects(List.of(shard(ring4.get(0), true, 1200L, null, null),
+                        shard(ring4.get(1), true, 100L, null, null), shard(ring4.get(2), true, 100L, null, null),
+                        shard(ring4.get(3), true, 100L, null, null)), r,
+                List.of(project("idx", 2, "[project, ring(path, shards=4)]", ring4, false)));
+        List<ClusterStatus.Proposal> rps = StatusBuilder.build(ringed, Proposals.advance(ringed, null, CFG), CFG)
+                .proposals();
+        assertThat(rps).as("one proposal for the project, not one per shard").singleElement().satisfies(x -> {
+            assertThat(x.target()).isEqualTo("idx");
+            assertThat(x.action()).isEqualTo("New shard spec [project, ring(path, shards=5, vnodes=512)]:"
+                    + " pharos reshard idx --spec \"[project, ring(path, shards=5, vnodes=512)]\"");
+            assertThat(x.metrics()).containsEntry("shards", 4).containsEntry("sizeBytes", 1500L)
+                    .containsEntry("largestShardBytes", 1200L).containsEntry("suggestedRingShards", 5);
+        });
+
+        // ringed, N = 4, 4 × 2500 bytes → S = 10 > N + 1
+        StatusSnapshot heavy = withProjects(ring4.stream().map(id -> shard(id, true, 2500L, null, null)).toList(), r,
+                List.of(project("idx", 2, "[project, ring(path, shards=4)]", ring4, false)));
+        assertThat(StatusBuilder.build(heavy, Proposals.advance(heavy, null, CFG), CFG).proposals().get(0).action())
+                .endsWith("--spec \"[project, ring(path, shards=10, vnodes=512)]\"");
+
+        // a ring with a removed shard keeps its names: [s01, s02, s04] + one → s01..s04
+        assertThat(Proposals.proposedSpec(com.pharos.cluster.sharding.ShardSpec.parse(
+                "[project, ring(path, shards=[s01, s02, s04], vnodes=128)]"), 4))
+                .isEqualTo("[project, ring(path, shards=4, vnodes=128)]");
+        assertThat(Proposals.suggestedRingShards(100, 1000, 0)).as("at least 2").isEqualTo(2);
+        assertThat(Proposals.suggestedRingShards(100, 1000, 7)).isEqualTo(8);
+
+        // while a reshard of the project is open, nothing is proposed for it
+        StatusSnapshot open = withProjects(List.of(shard("lucene", true, 3300L, null, null)), r,
+                List.of(project("lucene", null, "[project]", List.of("lucene"), true)));
+        assertThat(StatusBuilder.build(open, Proposals.advance(open, null, CFG), CFG).proposals()).isEmpty();
     }
 
     @Test

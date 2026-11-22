@@ -368,8 +368,10 @@ public final class ReshardJob {
         job.basedOn = current;
         if (!built) {
             ProjectIndexManager.ReshardBuild b = indexer.reshard(root, project, active, to, embed,
-                    ProgressListener.SILENT, abort);
+                    buildProgress(project, job), abort);
             job.moved = b.movedFiles();
+            job.filesTotal = b.movedFiles();
+            job.filesDone = b.movedFiles();
             job.parsed = b.parsedFiles();
             job.removed = b.removed();
             job.phase = "built";
@@ -381,8 +383,11 @@ public final class ReshardJob {
         ObjectStorePublisher.ReshardReference ref = publisher.reshardReference(project, active.clusterShards(),
                 to.shards(), projectDir);
         Map<ShardId, Long> gens = new LinkedHashMap<>();
+        // shards done so far (status: shardsDone = rewritten + kept), recorded as each one is settled
         List<ShardId> affected = new ArrayList<>();
         List<ShardId> unaffected = new ArrayList<>();
+        job.affected = affected;
+        job.unaffected = unaffected;
         Set<ShardId> fromIds = new HashSet<>(active.clusterShards());
         for (ShardId s : to.shards()) {
             abort.checkpoint();
@@ -390,6 +395,7 @@ public final class ReshardJob {
             if (latest.isPresent() && publisher.publishedAs(s, latest.get(), projectDir)) {
                 gens.put(s, latest.get().value()); // untouched: N+1 references N's generation as it is
                 unaffected.add(s);
+                writeJob(project, job);
                 continue;
             }
             Long earlier = job.generations.get(s);
@@ -401,8 +407,6 @@ public final class ReshardJob {
             job.generations.put(s, g.value());
             writeJob(project, job);
         }
-        job.affected = affected;
-        job.unaffected = unaffected;
         try {
             // a takeover restores the project's writer state of this run (with the new layout's modules)
             writerState.backupProject(project, ref.projectGeneration(), projectDir);
@@ -554,6 +558,9 @@ public final class ReshardJob {
         List<ShardId> removed = List.of();
         Integer moved;
         Integer parsed;
+        /** Files the build moves, and how many of them are written so far (coarse steps, {@link #buildProgress}). */
+        Integer filesTotal;
+        Integer filesDone;
         Instant pinnedAt;
         Instant flippedAt;
         String waitingFor;
@@ -586,6 +593,8 @@ public final class ReshardJob {
             j.removed = ids(n.path("removed"));
             j.moved = n.hasNonNull("movedFiles") ? n.get("movedFiles").asInt() : null;
             j.parsed = n.hasNonNull("parsedFiles") ? n.get("parsedFiles").asInt() : null;
+            j.filesTotal = n.hasNonNull("filesTotal") ? n.get("filesTotal").asInt() : null;
+            j.filesDone = n.hasNonNull("filesDone") ? n.get("filesDone").asInt() : null;
             j.pinnedAt = n.hasNonNull("pinnedAt") ? Instant.parse(n.get("pinnedAt").asText()) : null;
             j.flippedAt = n.hasNonNull("flippedAt") ? Instant.parse(n.get("flippedAt").asText()) : null;
             j.waitingFor = n.hasNonNull("waitingFor") ? n.get("waitingFor").asText() : null;
@@ -625,12 +634,54 @@ public final class ReshardJob {
         j.removed.forEach(s -> r.add(s.value()));
         if (j.moved != null) n.put("movedFiles", j.moved);
         if (j.parsed != null) n.put("parsedFiles", j.parsed);
+        if (j.filesTotal != null) n.put("filesTotal", j.filesTotal);
+        if (j.filesDone != null) n.put("filesDone", j.filesDone);
         if (j.pinnedAt != null) n.put("pinnedAt", j.pinnedAt.toString());
         if (j.flippedAt != null) n.put("flippedAt", j.flippedAt.toString());
         if (j.waitingFor != null) n.put("waitingFor", j.waitingFor);
         if (j.error != null) n.put("error", j.error);
         n.put("updatedAt", clock.instant().toString());
         store.put(layout.reshardJobKey(project), JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(n));
+    }
+
+    /** Steps of the build's file progress the job record is written at (every tenth), not every file. */
+    static final int FILE_PROGRESS_STEPS = 10;
+
+    /**
+     * The build's progress into the job record: the files it moves ({@code Moving}), how many are written
+     * ({@code Indexing}, called from the indexing threads) and the end ({@code Done}); the record is
+     * written only when the progress reaches the next of {@value #FILE_PROGRESS_STEPS} steps.
+     */
+    private ProgressListener buildProgress(String project, Job job) {
+        return new ProgressListener() {
+            private int lastStep = -1;
+
+            @Override
+            public synchronized void onProgress(String stage, int current, int total) {
+                switch (stage) {
+                    case ProjectIndexManager.RESHARD_MOVING -> {
+                        job.filesTotal = total;
+                        job.filesDone = 0;
+                    }
+                    case "Indexing" -> {
+                        if (job.filesTotal == null) job.filesTotal = total;
+                        job.filesDone = Math.min(current, job.filesTotal);
+                    }
+                    case "Done" -> {
+                        job.filesTotal = total;
+                        job.filesDone = total;
+                    }
+                    default -> {
+                        return;
+                    }
+                }
+                int step = job.filesTotal == 0 ? FILE_PROGRESS_STEPS
+                        : (int) ((long) job.filesDone * FILE_PROGRESS_STEPS / job.filesTotal);
+                if (step == lastStep) return;
+                lastStep = step;
+                writeJobQuietly(project, job);
+            }
+        };
     }
 
     private void writeJobQuietly(String project, Job j) {
@@ -668,7 +719,16 @@ public final class ReshardJob {
             StringBuilder sb = new StringBuilder("  job: spec version " + n.path("spec").asInt() + ", "
                     + n.path("phase").asText() + " on " + n.path("writer").asText() + " (updated "
                     + n.path("updatedAt").asText() + ")");
-            if (n.hasNonNull("movedFiles")) sb.append(", ").append(n.get("movedFiles").asInt()).append(" file(s) moved");
+            if (n.hasNonNull("movedFiles")) {
+                sb.append(", ").append(n.get("movedFiles").asInt()).append(" file(s) moved");
+            } else if (n.hasNonNull("filesTotal")) {
+                sb.append(", files ").append(n.path("filesDone").asInt(0)).append(" of ")
+                        .append(n.get("filesTotal").asInt()).append(" written");
+            }
+            if (n.path("shards").size() > 0) {
+                sb.append(", shards done ").append(n.path("affected").size() + n.path("unaffected").size())
+                        .append(" of ").append(n.path("shards").size());
+            }
             if (n.path("affected").size() > 0 || n.path("unaffected").size() > 0) {
                 sb.append(", shards rewritten ").append(n.path("affected")).append(", kept ").append(n.path("unaffected"));
             }

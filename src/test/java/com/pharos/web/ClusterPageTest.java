@@ -80,13 +80,25 @@ class ClusterPageTest {
 
     // ── the field list ───────────────────────────────────────
 
+    /**
+     * Every field cluster.js reads is in the golden fixture's shape, and has a value in it or in the
+     * resharding fixtures (the golden cluster has no reshard: its {@code reshard} and {@code staged} are
+     * null and its {@code specs} empty).
+     */
     @Test
     void theGoldenFixtureHasEveryFieldClusterJsReads() throws Exception {
         List<String> fields = statusFields();
         assertThat(fields).hasSizeGreaterThan(40).doesNotHaveDuplicates()
                 .noneMatch(f -> f.contains("advertiseUrl")); // the page gets the public view
         JsonNode golden = JSON.readTree(GOLDEN.toFile());
-        for (String f : fields) assertPresent(golden, f);
+        JsonNode building = JSON.readTree(ClusterPageFixtures.json(ClusterPageFixtures.resharding(false)));
+        JsonNode pinned = JSON.readTree(ClusterPageFixtures.json(ClusterPageFixtures.resharding(true)));
+        for (String f : fields) {
+            List<JsonNode> values = new ArrayList<>(present(golden, f));
+            values.addAll(present(building, f));
+            values.addAll(present(pinned, f));
+            assertThat(values).as(f + " is non-null somewhere in the fixtures").anyMatch(n -> !n.isNull());
+        }
     }
 
     @Test
@@ -207,6 +219,72 @@ class ClusterPageTest {
         assertThat(names(grouped.get(0).path("names"), null)).hasSizeGreaterThan(1);
     }
 
+    /** A reshard in progress: staged shards marked, a table per spec version, progress in shards and files. */
+    @Test
+    void rendersAStagedVersion(@TempDir Path tmp) throws Exception {
+        JsonNode out = render(tmp, ClusterPageFixtures.json(ClusterPageFixtures.resharding()));
+        JsonNode view = out.path("view");
+        JsonNode r = view.path("reshards").get(0);
+        assertThat(view.path("reshards")).hasSize(1);
+        assertThat(r.path("project").asText()).isEqualTo("lucene");
+        assertThat(r.path("phase").asText()).isEqualTo("building");
+        assertThat(r.path("shardsDone").asInt()).isEqualTo(2);
+        assertThat(r.path("shardsTotal").asInt()).isEqualTo(3);
+        assertThat(r.path("filesDone").asInt()).isEqualTo(10);
+        assertThat(r.path("filesTotal").asInt()).isEqualTo(40);
+        assertThat(r.path("holder").asText()).isEqualTo("w1");
+
+        String page = out.path("html").asText();
+        Document doc = xml(page);
+        // diagram: s03 (only in the staged version) is marked staged on the bucket and on w1, the writer
+        // building it (the reshard lease holder); the reader serves the active version's s01 and s02,
+        // unmarked while nothing of them is rewritten yet
+        Element svg = (Element) doc.getElementsByTagName("svg").item(0);
+        assertThat(count(svg, "g", "cl-staged")).as("s03 on the bucket and on w1").isEqualTo(2);
+        assertThat(count(svg, "g", "cl-st-staged")).isEqualTo(2);
+        assertThat(boxes(view, "writers")).containsExactly("w1:docs,lucene~ring=s01,lucene~ring=s02,lucene~ring=s03");
+        assertThat(boxes(view, "readers")).containsExactly("r1:docs,lucene~ring=s01,lucene~ring=s02");
+        assertThat(byId(doc, "cl-layout").getTextContent()).contains("staged (reshard, not served yet)");
+
+        String reshards = byId(doc, "cl-reshards").getTextContent();
+        assertThat(reshards).contains("lucene", "building", "v1 → v2", "[project, ring(path, shards=3, vnodes=512)]",
+                "2 / 3", "10 / 40", "w1");
+        assertThat(page).contains("aria-valuenow=\"67\"", "aria-valuenow=\"25\"");
+
+        // sharding: spec versions, the project, and one shard table per version
+        String sharding = byId(doc, "cl-sharding").getTextContent();
+        assertThat(sharding).contains("Spec versions", "Spec version 1 · active", "Spec version 2 · staged",
+                "project=lucene, ring=s03", "not served yet").doesNotContain("rewritten in staged version");
+        assertThat(sharding.indexOf("Spec version 1 · active")).isLessThan(sharding.indexOf("Spec version 2 · staged"));
+        JsonNode versions = view.path("sharding").path("versions");
+        assertThat(versions.get(0).path("state").asText()).isEqualTo("active");
+        assertThat(versions.get(1).path("state").asText()).isEqualTo("staged");
+        JsonNode lucene = view.path("sharding").path("projects").get(1);
+        assertThat(lucene.path("project").asText()).isEqualTo("lucene");
+        assertThat(lucene.path("staged").path("state").asText()).isEqualTo("building");
+        assertThat(names(view.path("sharding").path("projects"), "project")).containsExactly("docs", "lucene");
+
+        assertLegible(out.path("layoutWide"), 1280);
+        assertLegible(out.path("layoutNarrow"), 420);
+        xml(out.path("htmlNarrow").asText());
+
+        // once pinned, a shard both versions share but the staged one rewrote is marked too, on every box;
+        // s02, kept as it is, is not
+        JsonNode pinnedOut = render(tmp, ClusterPageFixtures.json(ClusterPageFixtures.resharding(true)));
+        Document pinned = xml(pinnedOut.path("html").asText());
+        Element pinnedSvg = (Element) pinned.getElementsByTagName("svg").item(0);
+        assertThat(count(pinnedSvg, "g", "cl-staged")).as("s01 on bucket, w1, r1; s03 on bucket, w1").isEqualTo(5);
+        assertThat(byId(pinned, "cl-sharding").getTextContent()).contains("rewritten in staged version", "4 → 5");
+        assertThat(byId(pinned, "cl-reshards").getTextContent()).contains("pinned", "3 / 3", "40 / 40",
+                "reader r1 (lucene~ring=s03)");
+        // the version an earlier flip retired: its shard faded on the bucket, in no writer's box, its own table
+        assertThat(count(pinnedSvg, "g", "cl-retired")).isEqualTo(1);
+        assertThat(names(pinnedOut.path("view").path("diagram").path("writers"), null)).hasSize(1);
+        assertThat(byId(pinned, "cl-sharding").getTextContent()).contains("Spec version 3 · previous",
+                "[project, ring(path, shards=1, vnodes=512)]");
+        assertThat(byId(pinned, "cl-reshards").getTextContent()).contains("web", "flipped", "v3 → v4");
+    }
+
     /**
      * Status strings are data: a hostile heartbeat (any string as node id, state, shard, phase…)
      * must not break out of an attribute or inject markup. Classes come only from allow-lists.
@@ -299,10 +377,10 @@ class ClusterPageTest {
     }
 
     /**
-     * {@code a.b[].c}: every object on the path has the key (it may be null), lists are non-empty,
-     * and somewhere in the fixture the field has a non-null value.
+     * {@code a.b[].c}: every object on the path has the key (it may be null; lists may be empty); returns
+     * the field's values.
      */
-    private static void assertPresent(JsonNode root, String path) {
+    private static List<JsonNode> present(JsonNode root, String path) {
         List<JsonNode> cur = List.of(root);
         for (String seg : path.split("\\.")) {
             boolean list = seg.endsWith("[]");
@@ -314,7 +392,7 @@ class ClusterPageTest {
                 assertThat(n.has(key)).as(path + ": golden fixture lacks " + key).isTrue();
                 JsonNode v = n.get(key);
                 if (list) {
-                    assertThat(v.isArray() && !v.isEmpty()).as(path + ": " + key + " is a non-empty list").isTrue();
+                    assertThat(v.isArray()).as(path + ": " + key + " is a list").isTrue();
                     v.forEach(next::add);
                 } else {
                     next.add(v);
@@ -322,7 +400,7 @@ class ClusterPageTest {
             }
             cur = next;
         }
-        assertThat(cur).as(path + " is non-null somewhere in the fixture").anyMatch(n -> !n.isNull());
+        return cur;
     }
 
     /** Every object key in the status, except the open maps the page renders whole (metrics, keys). */

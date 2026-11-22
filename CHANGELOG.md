@@ -140,6 +140,17 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   right after the flip it reads the previous one until its readers serve the new one. The retired
   version is removed after `retentionMinutes`. An index run never adds shards: a new module under
   `[project, module]` needs `pharos reshard` with the same spec.
+- Resharding is visible: `/cluster/status` gains `projects[]` (a split project is one entry over
+  its shards, with its staged and retired spec versions and the reshard's phase — requested,
+  building, pinned, flipped, abandoned — progress in shards and in files, and the reshard lease
+  holder) and `specs[]` (every spec version: active, staged, requested, retired, abandoned or
+  superseded); shards gain `project`, `role`, `staged` and `stagedGeneration` (fields are only
+  added). `/cluster/events` sends a `reshard` event at each phase and at each quarter of the
+  shards or files. The Cluster page shows a Resharding panel, one sharding table per spec version,
+  and marks staged shards in the layout. The `reshard` proposal targets a project and names the
+  exact command, e.g. `pharos reshard lucene --spec "[project, ring(path, shards=4)]"` (a ringed
+  project gets one more shard, or more for its size). MCP `list_projects` on a reader lists a split
+  project once, with its shards.
 
 ### Changed (upgrade note)
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A

@@ -14,7 +14,9 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
 - `mode`: `cluster`, or `single-node` on `role: all` (one node, both writer and reader, holding every shard).
 - `asOf`: the snapshot's bucket time (the newest LastModified it read).
 - `layout.summary`: `{shards, writers, readers}`, the live counts. A change emits a `layout` event.
-- `layout.shards[]`: `shard`, `specVersion` (1), `keys` (`{project}`), and from the `LATEST`
+- `layout.shards[]`: `shard`, `specVersion` (the spec version of the project version the shard belongs
+  to; 1 for the implicit `[project]`), `keys` (`{project, …}`: the project and the shard id's key values),
+  and from the `LATEST`
   manifest `docCount`, `sizeBytes`, `generation`, `writer` (`writerNode`) plus `ageSeconds` of
   `LATEST`. Also:
   - `lease`: `{writer, ageSeconds, expired, released}` or null;
@@ -23,8 +25,14 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
     It comes from the lease holder's heartbeat, with the age in bucket time from the first
     sighting, so it survives a takeover. While no writer reports a pending shard, the shard keeps
     `pending: true` with a null `sourceRevision`;
-  - `state`: `current`, `lagging` (pending change), `lease-expired` or `unpublished`. It drives
-    the chip colour.
+  - `state`: `current`, `lagging` (pending change), `lease-expired`, `unpublished`, or `staged` (a
+    shard only a reshard's staged version has). It drives the chip colour;
+  - `project`: the project the shard serves (null for an orphan);
+  - `role`: `active`, `staged` (only in a reshard's staged version), `previous` (only in the version a
+    flip retired, kept for the retention window), `abandoned` (waiting for GC) or `orphan`. Health
+    findings about routing (`shard-unassigned`, `shard-unserved`) skip the non-active roles;
+  - `staged`: the staged version names the shard; `stagedGeneration`: the generation it pins for the
+    shard once published (a shared shard the reshard rewrote has one other than `generation`).
 - `layout.writers[]`: the writer heartbeat fields `node, workQueue, leases, pinned, indexing
   {shard, phase parse|embed|commit|publish, progress 0..1, startedAt} | null, startedAt, stopping,
   disk {freeBytes, totalBytes, low} | null`, plus `heartbeatAgeSeconds`.
@@ -37,8 +45,25 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
   `shard-unserved`, `writer-low-disk` and `writer-stopping`.
 - `proposals[]`: `{id (sha1 of kind+target), kind, target, reason, metrics, action, since}`.
   The kinds are `add-readers`, `remove-readers`, `add-writers`, `remove-writers`, `reshard` and
-  `writer-disk`.
+  `writer-disk`. A `reshard` proposal targets a project and its action names the exact command, e.g.
+  `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` (ruling P6-R14: an unringed project gets
+  a ring of `S = ceil(projectBytes / trigger)` shards, at least 2; a ringed one `max(N + 1, S)`).
+- `projects[]` (Phase 6): `{project, specVersion (null: [project]), spec, shards, docCount, sizeBytes,
+  staged, previous, reshard}`. A split project is one entry over its shards.
+  - `staged`: `{specVersion, spec, shards, state building|pinned|abandoned}` or null;
+  - `previous`: `{specVersion, spec, shards, retiredAt}` or null (the version a flip retired);
+  - `reshard`: null, or `{specVersion, spec, from, phase requested|building|pinned|flipped|abandoned,
+    requestedAt, shardsDone, shardsTotal, shardsRewritten, shardsKept, filesDone, filesTotal, holder (the
+    reshard lease holder), lease, jobPhase, jobWriter, jobAgeSeconds, waitingFor, error}`. Unknown counts
+    are null.
+- `specs[]`: `{version, project, spec, state active|staged|requested|retired|abandoned|superseded}`.
 
-`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` and `{type: layout, summary}`.
+The golden cluster has no reshard (its `specs` is empty); `ClusterPageFixtures.resharding()` is the
+fixture with one, building and pinned.
+
+`/cluster/events` sends `{type: appeared|changed|cleared, proposal}`, `{type: layout, summary}` and
+`{type: reshard, reshard: {project, specVersion, phase, shardsDone, shardsTotal, filesDone, filesTotal}}`
+at a reshard's phase transitions (`ended` once it is no longer shown) and at each quarter of its shards
+or files.
 Events carry no addresses, with or without the token. The stream needs `Accept: text/event-stream`
 (which `EventSource` sends), and a node allows at most 64 streams; above that it answers 503.

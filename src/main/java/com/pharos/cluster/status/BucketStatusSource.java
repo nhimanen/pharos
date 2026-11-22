@@ -14,6 +14,8 @@ import com.pharos.cluster.objectstore.ObjectStoreCatalog;
 import com.pharos.cluster.objectstore.ObjectStoreLayout;
 import com.pharos.cluster.objectstore.ShardManifest;
 import com.pharos.cluster.objectstore.StoredObject;
+import com.pharos.cluster.sharding.ProjectShards;
+import com.pharos.cluster.sharding.VersionedSpec;
 import com.pharos.cluster.writer.WriterHeartbeat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,6 +28,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -38,6 +42,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code readerTtlSeconds}, writers by the lease TTL), so the result depends on the bucket's
  * objects only, never on this node's clock. Only an empty bucket (no timestamp at all) falls back
  * to the node clock. A shard whose manifest or lease can't be read is listed with what is known.
+ *
+ * <p>The projects come from the same catalog read ({@link ObjectStoreCatalog#view}): spec versions,
+ * staged and retired versions ({@link ProjectShards}). For a project with a reshard to show (requested,
+ * staged, or flipped and still within retention) it also reads the job record
+ * ({@code projects/<p>/reshard/job.json}) and the reshard lease; their LastModified count towards the
+ * snapshot's "now" like the shards' leases.
  */
 public final class BucketStatusSource implements StatusSource {
 
@@ -72,7 +82,8 @@ public final class BucketStatusSource implements StatusSource {
     public StatusSnapshot read() throws IOException {
         List<ObjectInfo> readerInfos = heartbeats(layout.readersPrefix());
         List<ObjectInfo> writerInfos = heartbeats(layout.writersPrefix());
-        List<ShardEntry> entries = catalog.entries();
+        ObjectStoreCatalog.View view = catalog.view();
+        List<ShardEntry> entries = view.entries();
         List<ShardRead> reads = new ArrayList<>();
         Instant now = null;
         for (ObjectInfo i : readerInfos) now = max(now, i.lastModified());
@@ -83,6 +94,18 @@ public final class BucketStatusSource implements StatusSource {
             now = max(now, r.latestAt());
             if (r.lease() != null) now = max(now, r.lease().lastModified());
         }
+        List<StatusSnapshot.ProjectObs> projects = new ArrayList<>();
+        for (String p : view.projects().projects()) {
+            StatusSnapshot.ProjectObs o = project(view.projects(), p);
+            projects.add(o);
+            if (o.job() != null) now = max(now, o.job().lastModified());
+            if (o.reshardLease() != null) now = max(now, o.reshardLease().lastModified());
+        }
+        List<StatusSnapshot.SpecObs> specs = new ArrayList<>();
+        for (VersionedSpec v : view.projects().specs()) {
+            specs.add(new StatusSnapshot.SpecObs(v.version(), v.project().orElse(null), v.spec()));
+        }
+        OptionalInt active = view.projects().activeVersion();
         boolean nodeClock = now == null;
         if (nodeClock) now = fallback.instant();
 
@@ -104,7 +127,79 @@ public final class BucketStatusSource implements StatusSource {
                     r.gen() == null ? null : r.gen().value(), m == null ? null : m.docCount(),
                     m == null ? null : m.sizeBytes(), m == null ? null : m.writerNode(), r.latestAt(), rev, r.lease()));
         }
-        return new StatusSnapshot(StatusSnapshot.CLUSTER, now, shards, writers, readers, leaseTtl, nodeClock);
+        return new StatusSnapshot(StatusSnapshot.CLUSTER, now, shards, writers, readers, leaseTtl, nodeClock,
+                projects, specs, active.isPresent() ? active.getAsInt() : null);
+    }
+
+    private static List<String> names(List<ShardId> ids) {
+        return ids.stream().map(ShardId::value).toList();
+    }
+
+    private static Integer version(OptionalInt v) {
+        return v.isPresent() ? v.getAsInt() : null;
+    }
+
+    /** One project of the catalog read, with its reshard's job record and lease when one is visible. */
+    private StatusSnapshot.ProjectObs project(ProjectShards map, String p) {
+        StatusSnapshot.StagedObs staged = map.stagedOf(p).map(st -> {
+            Map<String, Long> gens = new TreeMap<>();
+            st.generations().forEach((id, g) -> gens.put(id.value(), g));
+            return new StatusSnapshot.StagedObs(st.specVersion(), st.spec(), names(st.shards()), gens,
+                    st.abandonedAt().orElse(null));
+        }).orElse(null);
+        StatusSnapshot.PreviousObs previous = map.previousOf(p).map(pr -> new StatusSnapshot.PreviousObs(
+                version(pr.specVersion()), pr.spec(), names(pr.shards()), pr.retiredAt())).orElse(null);
+        StatusSnapshot.RequestObs request = map.reshardRequestOf(p).map(r -> new StatusSnapshot.RequestObs(
+                r.specVersion(), r.spec(), r.requestedAt())).orElse(null);
+        List<StatusSnapshot.AbandonedObs> abandoned = map.abandonedOf(p).stream()
+                .map(a -> new StatusSnapshot.AbandonedObs(version(a.specVersion()), names(a.shards()))).toList();
+        StatusSnapshot.JobObs job = null;
+        StatusSnapshot.LeaseObs lease = null;
+        if (staged != null || previous != null || request != null) {
+            job = job(p);
+            lease = lease(layout.reshardLeaseKey(p), "reshard lease of project " + p);
+        }
+        return new StatusSnapshot.ProjectObs(p, version(map.specVersionOf(p)), map.specOf(p), names(map.shardsOf(p)),
+                staged, previous, request, abandoned, job, lease);
+    }
+
+    /** The job record of {@code project}'s reshard; null when there is none or it can't be read. */
+    private StatusSnapshot.JobObs job(String project) {
+        String key = layout.reshardJobKey(project);
+        try {
+            Optional<ObjectInfo> info = store.stat(key);
+            if (info.isEmpty() || info.get().lastModified() == null) return null;
+            Optional<StoredObject> body = store.get(key);
+            if (body.isEmpty()) return null;
+            JsonNode n = MAPPER.readTree(body.get().data());
+            return new StatusSnapshot.JobObs(n.path("spec").asInt(-1), n.path("phase").asText(null),
+                    n.path("writer").asText(null), n.path("affected").size(), n.path("unaffected").size(),
+                    n.hasNonNull("filesDone") ? n.get("filesDone").asInt() : null,
+                    n.hasNonNull("filesTotal") ? n.get("filesTotal").asInt() : null,
+                    n.hasNonNull("waitingFor") ? n.get("waitingFor").asText() : null,
+                    n.hasNonNull("error") ? n.get("error").asText() : null, info.get().lastModified());
+        } catch (IOException | RuntimeException e) {
+            log.debug("Status: reading the reshard job record of project {} failed: {}", project, e.toString());
+            return null;
+        }
+    }
+
+    /** A lease object ({@code writer}, {@code released}) with its LastModified; null when absent or unreadable. */
+    private StatusSnapshot.LeaseObs lease(String key, String what) {
+        try {
+            Optional<ObjectInfo> info = store.stat(key);
+            if (info.isPresent() && info.get().lastModified() != null) {
+                Optional<StoredObject> body = store.get(key);
+                if (body.isPresent()) {
+                    JsonNode n = MAPPER.readTree(body.get().data());
+                    return new StatusSnapshot.LeaseObs(n.path("writer").asText(null), info.get().lastModified(),
+                            n.path("released").asBoolean(false));
+                }
+            }
+        } catch (IOException | RuntimeException ex) {
+            log.debug("Status: reading the {} failed: {}", what, ex.toString());
+        }
+        return null;
     }
 
     private static Instant max(Instant a, Instant b) {
@@ -149,19 +244,7 @@ public final class BucketStatusSource implements StatusSource {
         } catch (IOException | RuntimeException ex) {
             log.debug("Status: reading LATEST of shard {} failed: {}", id, ex.toString());
         }
-        try {
-            Optional<ObjectInfo> info = store.stat(layout.leaseKey(id));
-            if (info.isPresent() && info.get().lastModified() != null) {
-                Optional<StoredObject> body = store.get(layout.leaseKey(id));
-                if (body.isPresent()) {
-                    JsonNode n = MAPPER.readTree(body.get().data());
-                    lease = new StatusSnapshot.LeaseObs(n.path("writer").asText(null), info.get().lastModified(),
-                            n.path("released").asBoolean(false));
-                }
-            }
-        } catch (IOException | RuntimeException ex) {
-            log.debug("Status: reading the lease of shard {} failed: {}", id, ex.toString());
-        }
+        lease = lease(layout.leaseKey(id), "lease of shard " + id);
         return new ShardRead(e, gen, manifest, latestAt, lease);
     }
 }

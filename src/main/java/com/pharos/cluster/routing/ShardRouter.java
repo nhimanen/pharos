@@ -337,15 +337,21 @@ public final class ShardRouter {
      * {@link #catalogShardNames}: a split project is one name, never one per shard.
      */
     public List<String> catalogProjectNames() {
-        ProjectShards mapping;
+        return catalogProjects().map(m -> List.copyOf(m.projects())).orElse(List.of());
+    }
+
+    /**
+     * The catalog's project ↔ shards mapping, with the same fallbacks as {@link #catalogShardNames}; empty
+     * when the catalog can't be read at all. Never throws.
+     */
+    public java.util.Optional<ProjectShards> catalogProjects() {
         try {
-            mapping = catalog.projectShards();
+            return java.util.Optional.of(catalog.projectShards());
         } catch (CatalogTooOldException e) {
-            mapping = e.lastKnownProjects();
+            return java.util.Optional.of(e.lastKnownProjects());
         } catch (IOException | RuntimeException e) {
-            return List.of();
+            return java.util.Optional.empty();
         }
-        return List.copyOf(mapping.projects());
     }
 
     /** True when this reader holds the shard. */

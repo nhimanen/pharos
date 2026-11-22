@@ -38,6 +38,10 @@ const STATUS_FIELDS = [
   'layout.shards[].backlog.pending',
   'layout.shards[].backlog.oldestUnpublishedChangeAgeSeconds',
   'layout.shards[].state',
+  'layout.shards[].project',
+  'layout.shards[].role',
+  'layout.shards[].staged',
+  'layout.shards[].stagedGeneration',
   'layout.writers[].node',
   'layout.writers[].leases',
   'layout.writers[].pinned',
@@ -76,10 +80,46 @@ const STATUS_FIELDS = [
   'proposals[].metrics',
   'proposals[].action',
   'proposals[].since',
+  'projects[].project',
+  'projects[].specVersion',
+  'projects[].spec',
+  'projects[].shards',
+  'projects[].docCount',
+  'projects[].sizeBytes',
+  'projects[].staged',
+  'projects[].staged.specVersion',
+  'projects[].staged.spec',
+  'projects[].staged.shards',
+  'projects[].staged.state',
+  'projects[].previous',
+  'projects[].previous.specVersion',
+  'projects[].previous.spec',
+  'projects[].previous.retiredAt',
+  'projects[].reshard',
+  'projects[].reshard.specVersion',
+  'projects[].reshard.spec',
+  'projects[].reshard.from',
+  'projects[].reshard.phase',
+  'projects[].reshard.shardsDone',
+  'projects[].reshard.shardsTotal',
+  'projects[].reshard.filesDone',
+  'projects[].reshard.filesTotal',
+  'projects[].reshard.holder',
+  'projects[].reshard.waitingFor',
+  'specs[].version',
+  'specs[].project',
+  'specs[].spec',
+  'specs[].state',
 ];
 
 /** Shard chip states, in the order the legend shows them. */
-const STATES = ['current', 'lagging', 'lease-expired', 'unpublished'];
+const STATES = ['current', 'lagging', 'lease-expired', 'unpublished', 'staged'];
+/** Which version of its project a shard belongs to (status `role`). */
+const ROLES = ['active', 'staged', 'previous', 'abandoned', 'orphan'];
+/** Reshard phases (status `projects[].reshard.phase`). */
+const PHASES = ['requested', 'building', 'pinned', 'flipped', 'abandoned'];
+/** Spec version states (status `specs[].state`). */
+const SPEC_STATES = ['active', 'staged', 'requested', 'retired', 'abandoned', 'superseded'];
 /** Reader heartbeat states; anything else (an older or newer node, a hostile heartbeat) is 'unknown'. */
 const READER_STATES = ['warming', 'ready', 'degraded', 'draining'];
 
@@ -183,18 +223,29 @@ function toView(st) {
   const byName = new Map(shards.map(s => [s.shard, s]));
   const liveWriters = new Set(writers.map(w => w.node));
 
-  // The current owner is the lease holder; without a lease (single node), the writer listing it.
+  // The current owner is the lease holder; without a lease (single node), the writer listing it; a
+  // shard only a reshard's staged version has is the reshard lease holder's (the writer building it).
+  const reshardHolder = new Map((st.projects || []).filter(p => p.reshard && p.reshard.holder != null)
+    .map(p => [p.project, p.reshard.holder]));
   const ownerOf = s => {
     if (s.lease) return s.lease.writer;
     const w = writers.find(x => (x.leases || []).includes(s.shard));
-    return w ? w.node : null;
+    if (w) return w.node;
+    if (s.role === 'staged' && reshardHolder.has(s.project)) return reshardHolder.get(s.project);
+    return null;
   };
+  // A staged chip: a shard of a reshard's staged version that is not served yet (new, or rewritten
+  // at a generation the active version does not serve); a retired chip: only an old version has it.
+  const roleOf = s => token(s.role, ROLES, 'active');
   const chip = (s, degraded) => ({
     shard: String(s.shard),
     state: token(s.state, STATES, 'unpublished'),
     pending: !!(s.backlog && s.backlog.pending),
     degraded: !!degraded,
     generation: s.generation == null ? null : s.generation,
+    staged: roleOf(s) === 'staged' || (s.staged === true && s.stagedGeneration != null
+      && s.stagedGeneration !== s.generation),
+    retired: roleOf(s) === 'previous' || roleOf(s) === 'abandoned',
   });
 
   const shardRows = shards.map(s => {
@@ -203,6 +254,10 @@ function toView(st) {
       shard: s.shard,
       state: chip(s).state,
       pending: chip(s).pending,
+      staged: chip(s).staged,
+      project: s.project == null ? null : s.project,
+      role: roleOf(s),
+      stagedGeneration: s.stagedGeneration == null ? null : s.stagedGeneration,
       specVersion: s.specVersion == null ? null : s.specVersion,
       keys: keysText(s.keys),
       owner,
@@ -242,6 +297,7 @@ function toView(st) {
   for (const s of shards) {
     const o = ownerOf(s);
     if (o != null && liveWriters.has(o)) continue;
+    if (o == null && chip(s).retired) continue; // a retired version's shard: nobody writes it any more
     const key = o == null ? '' : o;
     if (!ghosts.has(key)) ghosts.set(key, { names: [o == null ? 'no writer' : String(o)], kind: 'writer', live: false,
       unassigned: o == null,
@@ -316,7 +372,35 @@ function toView(st) {
   const jobs = writers.map(w => ({ node: w.node, job: job(w), stopping: !!w.stopping }));
 
   const summary = L.summary || {};
-  const specs = [...new Set(shards.map(s => s.specVersion).filter(v => v != null))];
+  const specs = [...new Set(shards.filter(s => roleOf(s) === 'active').map(s => s.specVersion)
+    .filter(v => v != null))];
+
+  // Projects (a split project is one row over its shards) and their reshards.
+  const num = v => (v == null || !isFinite(v) ? null : Number(v));
+  const projects = (st.projects || []).map(p => {
+    const r = p.reshard || null;
+    return {
+      project: p.project,
+      specVersion: p.specVersion == null ? null : p.specVersion,
+      spec: p.spec == null ? '[project]' : p.spec,
+      shards: p.shards || [],
+      docCount: num(p.docCount),
+      sizeBytes: num(p.sizeBytes),
+      staged: p.staged ? { specVersion: p.staged.specVersion, spec: p.staged.spec, shards: p.staged.shards || [],
+        state: token(p.staged.state, PHASES, 'building') } : null,
+      previous: p.previous ? { specVersion: p.previous.specVersion == null ? null : p.previous.specVersion,
+        spec: p.previous.spec, retiredAt: p.previous.retiredAt || null } : null,
+      reshard: r ? {
+        specVersion: r.specVersion, spec: r.spec, from: r.from == null ? null : r.from,
+        phase: token(r.phase, PHASES, 'unknown'),
+        shardsDone: num(r.shardsDone), shardsTotal: num(r.shardsTotal),
+        filesDone: num(r.filesDone), filesTotal: num(r.filesTotal),
+        holder: r.holder == null ? null : r.holder, waitingFor: r.waitingFor == null ? null : r.waitingFor,
+      } : null,
+    };
+  });
+  const specVersions = (st.specs || []).map(v => ({ version: v.version, project: v.project == null ? null : v.project,
+    spec: v.spec, state: token(v.state, SPEC_STATES, 'superseded') }));
   const keyNames = [...new Set(shards.flatMap(s => s.keys ? Object.keys(s.keys) : []))];
 
   return {
@@ -341,7 +425,8 @@ function toView(st) {
       readers: groupBoxes(readerBoxes, MAX_BOXES),
     },
     nodes,
-    sharding: { specVersions: specs, keys: keyNames, rows: shardRows },
+    sharding: { specVersions: specs, keys: keyNames, rows: shardRows, versions: specVersions, projects },
+    reshards: projects.filter(p => p.reshard).map(p => Object.assign({ project: p.project }, p.reshard)),
     scale: {
       writers: summary.writers != null ? summary.writers : writers.length,
       readers: summary.readers != null ? summary.readers : readers.length,
@@ -370,7 +455,8 @@ function groupBoxes(boxes, max) {
   const out = [], bySig = new Map();
   for (const b of boxes) {
     const sig = [b.kind, b.live, b.state, b.stopping, b.job ? 'job' : '', b.disk && b.disk.low ? 'low' : '',
-      b.chips.map(c => c.shard + ':' + c.state + ':' + c.pending + ':' + c.degraded).join(',')].join('|');
+      b.chips.map(c => c.shard + ':' + c.state + ':' + c.pending + ':' + c.degraded + ':' + c.staged + ':'
+        + c.retired).join(',')].join('|');
     if (bySig.has(sig)) bySig.get(sig).names.push(b.names[0]);
     else { const g = Object.assign({}, b, { names: b.names.slice() }); bySig.set(sig, g); out.push(g); }
   }
@@ -491,12 +577,15 @@ function chipTitle(c) {
   if (c.generation != null) t.push('generation ' + c.generation);
   if (c.pending) t.push('unpublished change pending');
   if (c.degraded) t.push('degraded on this reader');
+  if (c.staged) t.push('staged: a reshard\u2019s new version, not served yet');
+  if (c.retired) t.push('retired version, kept until retention ends');
   return t.join(' · ');
 }
 
 function svgChip(p, ox, oy) {
   const c = p.chip, x = ox + p.x, y = oy + p.y;
-  let s = `<g class="cl-chip cl-st-${token(c.state, STATES, 'unpublished')}${c.degraded ? ' cl-degraded' : ''}"><title>${esc(chipTitle(c))}</title>` +
+  let s = `<g class="cl-chip cl-st-${token(c.state, STATES, 'unpublished')}${c.degraded ? ' cl-degraded' : ''}` +
+    `${c.staged ? ' cl-staged' : ''}${c.retired ? ' cl-retired' : ''}"><title>${esc(chipTitle(c))}</title>` +
     `<rect x="${x}" y="${y}" width="${p.w}" height="${CHIP_H}" rx="4"/>` +
     `<text x="${x + p.w / 2}" y="${y + 12.5}" text-anchor="middle">${esc(c.shard)}</text>`;
   if (c.pending) s += `<circle class="cl-pending" cx="${x + p.w - 1}" cy="${y + 1}" r="3.5"/>`;
@@ -545,6 +634,8 @@ function legend() {
   const items = STATES.map(st => `<span class="cl-leg"><span class="cl-sw cl-st-${st}"></span>${st}</span>`);
   items.push('<span class="cl-leg"><span class="cl-dot"></span>change pending</span>');
   items.push('<span class="cl-leg"><span class="cl-sw cl-sw-degraded"></span>degraded on reader</span>');
+  items.push('<span class="cl-leg"><span class="cl-sw cl-sw-staged"></span>staged (reshard, not served yet)</span>');
+  items.push('<span class="cl-leg"><span class="cl-sw cl-sw-retired"></span>retired version</span>');
   return `<div class="cl-legend">${items.join('')}</div>`;
 }
 
@@ -585,30 +676,116 @@ function renderNodes(view) {
     `<tbody>${rows.join('')}</tbody></table>`;
 }
 
+function versionLabel(v) {
+  return v == null ? '[project]' : 'v' + v;
+}
+
+function renderSpecVersions(sh) {
+  if (!sh.versions.length) return '';
+  const head = ['Version', 'Project', 'Spec', 'State'];
+  const rows = sh.versions.map(v => '<tr>' + td('Version', esc(v.version), 'cl-num') +
+    td('Project', v.project == null ? '<span class="cl-dim">cluster default</span>' : `<span class="cl-mono">${esc(v.project)}</span>`) +
+    td('Spec', `<span class="cl-mono">${esc(v.spec)}</span>`) +
+    td('State', badge(v.state, v.state === 'active' ? 'cl-b-ok' : v.state === 'staged' || v.state === 'requested'
+      ? 'cl-b-accent' : '')) + '</tr>');
+  return `<div class="cl-sub-title">Spec versions</div><table class="cl-table cl-specs"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>` +
+    `<tbody>${rows.join('')}</tbody></table>`;
+}
+
+function renderProjects(sh) {
+  const split = sh.projects.filter(p => p.specVersion != null || p.staged || p.previous || p.reshard);
+  if (!split.length) return '';
+  const head = ['Project', 'Spec', 'Shards', 'Docs', 'Size', 'Staged', 'Retired'];
+  const rows = split.map(p => '<tr>' + td('Project', `<span class="cl-mono">${esc(p.project)}</span>`) +
+    td('Spec', `${esc(versionLabel(p.specVersion))} <span class="cl-mono">${esc(p.spec)}</span>`) +
+    td('Shards', fmtInt(p.shards.length), 'cl-num') + td('Docs', fmtInt(p.docCount), 'cl-num') +
+    td('Size', fmtBytes(p.sizeBytes), 'cl-num') +
+    td('Staged', p.staged ? `${esc(versionLabel(p.staged.specVersion))} <span class="cl-mono">${esc(p.staged.spec)}</span> ` +
+      badge(p.staged.state, p.staged.state === 'abandoned' ? '' : 'cl-b-accent') +
+      ` <span class="cl-dim">${plural(p.staged.shards.length, 'shard')}</span>` : '<span class="cl-dim">—</span>') +
+    td('Retired', p.previous ? `${esc(versionLabel(p.previous.specVersion))} <span class="cl-mono">${esc(p.previous.spec)}</span>` +
+      (p.previous.retiredAt ? ` <span class="cl-dim">at ${esc(p.previous.retiredAt)}</span>` : '') : '<span class="cl-dim">—</span>') +
+    '</tr>');
+  return `<div class="cl-sub-title">Projects</div><table class="cl-table cl-projects"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>` +
+    `<tbody>${rows.join('')}</tbody></table>`;
+}
+
+function renderShardTable(rows) {
+  const head = ['Shard', 'Project', 'State', 'Keys', 'Owner', 'Generation', 'Docs', 'Size', 'Published', 'Readers'];
+  const body = rows.map(r => {
+    let owner = r.owner == null ? '<span class="cl-dim">none</span>' : `<span class="cl-mono">${esc(r.owner)}</span>`;
+    if (r.owner != null && r.leaseExpired) owner += ' ' + badge('lease expired', 'cl-b-bad');
+    else if (r.owner != null && !r.ownerLive) owner += ' ' + badge('no heartbeat', 'cl-b-warn');
+    if (r.leaseReleased) owner += ' ' + badge('released', '');
+    if (r.publisher && r.publisher !== r.owner) owner += ` <span class="cl-dim">(last published by ${esc(r.publisher)})</span>`;
+    let state = chipHtml(r.state, r.state) + (r.pending ? ' <span class="cl-dot" title="unpublished change pending"></span>' : '');
+    if (r.staged && r.role !== 'staged') state += ' ' + badge('rewritten in staged version', 'cl-b-accent');
+    let gen = r.generation == null ? '—' : esc(r.generation);
+    if (r.stagedGeneration != null && r.stagedGeneration !== r.generation) {
+      gen += ` <span class="cl-dim">→ ${esc(r.stagedGeneration)}</span>`;
+    }
+    const readers = r.role === 'staged' && !r.readers.length ? '<span class="cl-dim">not served yet</span>'
+      : r.readers.length ? '<span>' + r.readers.map(n => `<span class="cl-mono">${esc(n)}</span>`).join(', ') + '</span>'
+      : badge('none', 'cl-b-bad');
+    return '<tr>' + td('Shard', `<span class="cl-mono">${esc(r.shard)}</span>`) +
+      td('Project', r.project == null ? '<span class="cl-dim">—</span>' : `<span class="cl-mono">${esc(r.project)}</span>`) +
+      td('State', state) + td('Keys', `<span class="cl-mono">${esc(r.keys)}</span>`) + td('Owner', owner) +
+      td('Generation', gen, 'cl-num') +
+      td('Docs', fmtInt(r.docCount), 'cl-num') + td('Size', fmtBytes(r.sizeBytes), 'cl-num') +
+      td('Published', r.publishedAge == null ? '—' : fmtAge(r.publishedAge) + ' ago', 'cl-num') +
+      td('Readers', readers) + '</tr>';
+  });
+  return `<table class="cl-table"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>` +
+    `<tbody>${body.join('')}</tbody></table>`;
+}
+
+/** The shard tables, one per spec version and role (active first), each under its own heading. */
 function renderSharding(view) {
   const sh = view.sharding;
   const spec = `<div class="cl-kv"><span>Spec version</span><b>${sh.specVersions.length ? sh.specVersions.map(esc).join(', ') : '—'}</b>` +
     `<span>Keys</span><b class="cl-mono">${sh.keys.length ? sh.keys.map(esc).join(', ') : '—'}</b>` +
     `<span>Shards</span><b>${sh.rows.length}</b></div>`;
   if (!sh.rows.length) return spec + '<div class="cl-empty">No shards in the catalog.</div>';
-  const head = ['Shard', 'State', 'Keys', 'Owner', 'Generation', 'Docs', 'Size', 'Published', 'Readers'];
-  const rows = sh.rows.map(r => {
-    let owner = r.owner == null ? '<span class="cl-dim">none</span>' : `<span class="cl-mono">${esc(r.owner)}</span>`;
-    if (r.owner != null && r.leaseExpired) owner += ' ' + badge('lease expired', 'cl-b-bad');
-    else if (r.owner != null && !r.ownerLive) owner += ' ' + badge('no heartbeat', 'cl-b-warn');
-    if (r.leaseReleased) owner += ' ' + badge('released', '');
-    if (r.publisher && r.publisher !== r.owner) owner += ` <span class="cl-dim">(last published by ${esc(r.publisher)})</span>`;
-    const state = chipHtml(r.state, r.state) + (r.pending ? ' <span class="cl-dot" title="unpublished change pending"></span>' : '');
-    return '<tr>' + td('Shard', `<span class="cl-mono">${esc(r.shard)}</span>`) + td('State', state) +
-      td('Keys', `<span class="cl-mono">${esc(r.keys)}</span>`) + td('Owner', owner) +
-      td('Generation', r.generation == null ? '—' : esc(r.generation), 'cl-num') +
-      td('Docs', fmtInt(r.docCount), 'cl-num') + td('Size', fmtBytes(r.sizeBytes), 'cl-num') +
-      td('Published', r.publishedAge == null ? '—' : fmtAge(r.publishedAge) + ' ago', 'cl-num') +
-      td('Readers', r.readers.length ? '<span>' + r.readers.map(n => `<span class="cl-mono">${esc(n)}</span>`).join(', ') + '</span>'
-        : badge('none', 'cl-b-bad')) + '</tr>';
+  const groups = new Map();
+  for (const r of sh.rows) {
+    const key = ROLES.indexOf(r.role) + '|' + (r.specVersion == null ? '' : r.specVersion);
+    if (!groups.has(key)) groups.set(key, { role: r.role, specVersion: r.specVersion, rows: [] });
+    groups.get(key).rows.push(r);
+  }
+  const ordered = [...groups.values()].sort((a, b) => ROLES.indexOf(a.role) - ROLES.indexOf(b.role)
+    || (a.specVersion == null ? -1 : a.specVersion) - (b.specVersion == null ? -1 : b.specVersion));
+  const tables = ordered.map(g => {
+    const projects = [...new Set(g.rows.map(r => r.project).filter(p => p != null))];
+    const title = `Spec version ${esc(g.specVersion == null ? '—' : g.specVersion)} · ${badge(g.role,
+      g.role === 'staged' ? 'cl-b-accent' : g.role === 'active' ? 'cl-b-ok' : '')}` +
+      ` <span class="cl-dim">${plural(g.rows.length, 'shard')}${projects.length && projects.length <= 3
+        ? ' of ' + projects.map(esc).join(', ') : ''}</span>`;
+    return `<div class="cl-sub-title cl-version-${token(g.role, ROLES, 'active')}">${title}</div>` + renderShardTable(g.rows);
   });
-  return spec + `<table class="cl-table"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>` +
-    `<tbody>${rows.join('')}</tbody></table>`;
+  return spec + renderSpecVersions(sh) + renderProjects(sh) + tables.join('');
+}
+
+function progressBar(done, total) {
+  if (done == null || total == null || !(total > 0)) return '<span class="cl-dim">—</span>';
+  const pct = Math.max(0, Math.min(100, Math.round(100 * done / total)));
+  return `<span class="cl-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">` +
+    `<span class="cl-progress-fill" style="width:${pct}%"></span></span>` +
+    `<span class="cl-num">${fmtInt(done)} / ${fmtInt(total)}</span>`;
+}
+
+/** Reshard progress: each project's from → to version, phase, shards and files done, the lease holder. */
+function renderReshards(view) {
+  if (!view.reshards.length) return '<div class="cl-empty">No reshard in progress.</div>';
+  return view.reshards.map(r => `<div class="cl-reshard">` +
+    `<div class="cl-prop-head"><span class="cl-mono">${esc(r.project)}</span> ` +
+    `${badge(r.phase, r.phase === 'flipped' ? 'cl-b-ok' : r.phase === 'abandoned' ? '' : 'cl-b-accent')}` +
+    `<span class="cl-prop-since">${esc(versionLabel(r.from))} → ${esc(versionLabel(r.specVersion))}</span></div>` +
+    `<div class="cl-mono cl-reshard-spec">${esc(r.spec)}</div>` +
+    `<div class="cl-reshard-row"><span>Shards</span>${progressBar(r.shardsDone, r.shardsTotal)}</div>` +
+    `<div class="cl-reshard-row"><span>Files</span>${progressBar(r.filesDone, r.filesTotal)}</div>` +
+    `<div class="cl-kv"><span>Lease holder</span><b class="cl-mono">${r.holder == null ? '—' : esc(r.holder)}</b>` +
+    (r.waitingFor ? `<span>Waiting for</span><b>${esc(r.waitingFor)}</b>` : '') + `</div>` +
+    `</div>`).join('');
 }
 
 function renderScale(view) {
@@ -688,6 +865,8 @@ function renderPage(view, width) {
     panel('cl-backlog', 'Indexing backlog', renderBacklog(view)) +
     panel('cl-scale', 'Scale', renderScale(view)) +
     `</div>` +
+    panel('cl-reshards', 'Resharding', renderReshards(view),
+      view.reshards.length ? ` <span class="cl-count">${view.reshards.length}</span>` : '') +
     panel('cl-health', 'Health', renderHealth(view), view.health.length ? ` <span class="cl-count">${view.health.length}</span>` : '') +
     panel('cl-nodes', 'Nodes', renderNodes(view)) +
     panel('cl-sharding', 'Sharding', renderSharding(view));

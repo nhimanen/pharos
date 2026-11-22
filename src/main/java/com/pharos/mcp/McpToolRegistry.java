@@ -516,14 +516,34 @@ public class McpToolRegistry {
         List<ProjectMeta> projects = registry.listAll();
         if (projects.isEmpty()) return "No projects indexed yet. Run `pharos index <path>` first.";
 
-        List<Map<String, Object>> projectList = projects.stream().map(p -> {
+        // On a cluster reader the registry holds shards: a split project's shards are one project, named
+        // by the catalog (never derived from the shard id), with its shards listed.
+        Optional<com.pharos.cluster.sharding.ProjectShards> catalog = searchEngine.clusterProjects();
+        Map<String, List<ProjectMeta>> byProject = new LinkedHashMap<>();
+        for (ProjectMeta p : projects) {
+            String name = p.getName();
+            String project = name;
+            if (catalog.isPresent() && name != null && com.pharos.cluster.ShardId.isValid(name)) {
+                project = catalog.get().projectOf(new com.pharos.cluster.ShardId(name)).orElse(name);
+            }
+            byProject.computeIfAbsent(project, k -> new ArrayList<>()).add(p);
+        }
+        List<Map<String, Object>> projectList = new ArrayList<>();
+        for (Map.Entry<String, List<ProjectMeta>> e : byProject.entrySet()) {
+            List<ProjectMeta> held = e.getValue();
+            // every shard of a split project carries the project's meta: show the newest, don't add them up
+            ProjectMeta p = held.stream().max(Comparator.comparing(ProjectMeta::getLastIndexed,
+                    Comparator.nullsFirst(Comparator.naturalOrder()))).orElse(held.get(0));
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("name", p.getName());
+            m.put("name", e.getKey());
             m.put("methodCount", p.getMethodCount());
             m.put("classCount", p.getClassCount());
             m.put("lastIndexed", p.getLastIndexed() != null ? p.getLastIndexed().toString() : null);
-            return m;
-        }).collect(Collectors.toList());
+            if (held.size() > 1 || !e.getKey().equals(held.get(0).getName())) {
+                m.put("shards", held.stream().map(ProjectMeta::getName).sorted().toList());
+            }
+            projectList.add(m);
+        }
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("count", projectList.size());
