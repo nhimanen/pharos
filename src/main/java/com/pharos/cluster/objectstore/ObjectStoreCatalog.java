@@ -90,6 +90,26 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         return List.copyOf(out);
     }
 
+    /** The listed entries and the project mapping, read from one catalog version. */
+    public record View(List<ShardEntry> entries, ProjectShards projects) {}
+
+    /** {@link #entries()} and {@link #projectShards()} from a single read, so they always agree. */
+    public View view() throws IOException {
+        Optional<StoredObject> current = store.get(layout.catalogKey());
+        if (current.isEmpty()) return new View(List.of(), ProjectShards.identity(List.of()));
+        ObjectNode root = parse(current.get().data());
+        List<ShardEntry> out = new ArrayList<>();
+        for (JsonNode s : shardsArray(root)) {
+            String id = s.path("id").asText();
+            try {
+                out.add(new ShardEntry(new ShardId(id), ShardSource.fromJson(s.get("source"))));
+            } catch (IllegalArgumentException e) {
+                log.warn("Catalog {} lists an invalid shard id '{}'; skipping it", layout.catalogKey(), id);
+            }
+        }
+        return new View(List.copyOf(out), ProjectShards.fromCatalog(root, validIds(root), this::warn));
+    }
+
     /**
      * The project ↔ shards mapping and spec versions; a catalog without {@code projects} gives the
      * {@code [project]} identity of its shards.

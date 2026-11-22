@@ -1025,6 +1025,90 @@ class WorkLoopTest {
         assertThatThrownBy(() -> detached.assertHeld(s)).hasMessageContaining("does not hold the lease");
     }
 
+    /**
+     * A project split into two ring shards whose source sits on the catalog entry named after it (its
+     * source before the split): {@code n} files in different packages, so both shards get some.
+     */
+    private List<ShardId> splitProject(String name, int files) throws IOException {
+        ShardId plain = pathShard(name);
+        Path dir = sourceDirs.get(plain);
+        for (int i = 0; i < files; i++) {
+            Path pkg = dir.resolve("src/main/java/com/example/p" + i);
+            Files.createDirectories(pkg);
+            Files.writeString(pkg.resolve("Part" + i + ".java"), "package com.example.p" + i + ";\n\n"
+                    + "public class Part" + i + " {\n    public int f" + i + "(int x) { return x + " + i + "; }\n}\n");
+        }
+        com.pharos.cluster.sharding.ShardSpec spec =
+                com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=2)]");
+        int v = catalog.addSpec(Optional.of(name), spec);
+        List<ShardId> ring = List.of(new ShardId(name + "~ring=s01"), new ShardId(name + "~ring=s02"));
+        catalog.putProject(name, v, ring);
+        sourceDirs.put(ShardId.ofProject(name), dir);
+        return ring;
+    }
+
+    @Test
+    void splitProjectIsOneWorkUnit() throws IOException {
+        List<ShardId> ring = splitProject("big", 12);
+        ShardId other = pathShard("other");
+        Writer a = new Writer("node-a");
+
+        a.loop.tick();
+        // both shard leases of the project, plus the [project] one
+        assertThat(a.held()).containsExactlyInAnyOrder(ring.get(0), ring.get(1), other);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(Generation.FIRST);
+            assertThat(replicas.manifest(s, Generation.FIRST).projectGeneration()).isEqualTo(1L);
+            assertThat(lease(s).path("writer").asText()).isEqualTo("node-a");
+        }
+        assertThat(latest(new ShardId("big"))).as("the project's plain id is never published").isEmpty();
+        assertThat(a.loop.publishes(new ShardId("big"))).isEqualTo(1);
+        JsonNode hb = heartbeatOf("node-a").orElseThrow();
+        assertThat(hb.path("leases")).hasSize(3);
+        assertThat(hb.path("backlog").has("big")).isTrue();
+        int docsA = a.lucene.openMultiReader(List.of("big")).numDocs();
+
+        // idle: no new generation of any shard
+        rounds(2, 10, a);
+        for (ShardId s : ring) assertThat(latest(s)).contains(Generation.FIRST);
+
+        // a change publishes every shard of the project once, as one run
+        change(new ShardId("big"), "three");
+        rounds(1, 10, a);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(new Generation(2));
+            assertThat(replicas.manifest(s, new Generation(2)).projectGeneration()).isEqualTo(2L);
+        }
+
+        // all or none: with one shard's lease taken elsewhere, a new owner takes neither
+        a.loop.stop(Duration.ofSeconds(5));
+        LeaseManager x = new LeaseManager(store, layout, "node-x", TTL, LeaseManager.BucketNow.NONE, clock);
+        Lease taken = x.tryAcquire(ring.get(1)).orElseThrow();
+        Writer b = new Writer("node-b");
+        change(new ShardId("big"), "four");
+        b.loop.tick();
+        assertThat(b.held()).containsExactly(other);
+        assertThat(lease(ring.get(0)).path("released").asBoolean()).as("the partial lease went back").isTrue();
+        assertThat(lease(ring.get(0)).path("writer").asText()).as("taken, then released by B").isEqualTo("node-b");
+        assertThat(latest(ring.get(0))).contains(new Generation(2));
+
+        // once free, the new owner takes both, restores the project and resumes incrementally
+        x.release(taken);
+        clock.advance(10);
+        int before = b.embedder.calls.get();
+        b.loop.tick();
+        assertThat(b.held()).containsExactlyInAnyOrder(ring.get(0), ring.get(1), other);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(new Generation(3));
+            assertThat(replicas.manifest(s, new Generation(3)).writerNode()).isEqualTo("node-b");
+            assertThat(replicas.manifest(s, new Generation(3)).projectGeneration()).isEqualTo(3L);
+        }
+        assertThat(b.embedder.calls.get() - before).as("the restored cache serves the unchanged texts")
+                .isLessThan(a.embedder.calls.get() / 2);
+        assertThat(b.lucene.openMultiReader(List.of("big")).numDocs()).isEqualTo(docsA + 2);
+        x.close();
+    }
+
     @Test
     void gracefulStopAbortsARunThatCannotFinishAndReleasesLeases() throws Exception {
         ShardId s = pathShard("solo");
