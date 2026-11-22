@@ -202,6 +202,13 @@ class ReconcilerMockServerTest {
         assertThat(client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get()
                 .getMetadata().getOwnerReferences()).singleElement()
                 .satisfies(o -> assertThat(o.getName()).isEqualTo("demo"));
+        // the bucket's data and keys outlive the cluster: no owner reference, so no garbage collection
+        assertThat(client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(client.secrets().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(client.secrets().inNamespace(NS).withName("demo-token").get()
+                .getMetadata().getOwnerReferences()).singleElement();
 
         // Let any reconcile triggered by our own writes finish, then: nothing changes any more.
         long seen = reconciler.reconciles.get();
@@ -239,6 +246,45 @@ class ReconcilerMockServerTest {
         assertThat(secretValue("demo-minio", "secretKey")).isEqualTo(minioSecret);
 
         assertNoSecretAnywhere("demo", List.of(token, secretValue("demo-minio", "accessKey"), minioSecret));
+    }
+
+    /**
+     * Final review I1: a cluster deleted and applied again under the same name adopts the MinIO PVC and
+     * the MinIO credentials Secret that survived it, so the keys still match the data.
+     */
+    @Test
+    void reappliedClusterAdoptsTheBucketsPvcAndKeys() throws Exception {
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("the MinIO PVC and Secret", () -> client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio")
+                .get() != null && client.secrets().inNamespace(NS).withName("demo-minio").get() != null);
+        String accessKey = secretValue("demo-minio", "accessKey");
+        String secretKey = secretValue("demo-minio", "secretKey");
+        String pvcUid = client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getUid();
+
+        client.resources(PharosCluster.class).inNamespace(NS).withName("demo").delete();
+        await("the cluster gone", () -> current("demo") == null);
+        // what the garbage collector would do (the mock server has none): delete every owned object
+        for (HasMetadata o : allManaged()) {
+            if (o.getMetadata().getOwnerReferences() != null && !o.getMetadata().getOwnerReferences().isEmpty()) {
+                client.resource(o).delete();
+            }
+        }
+        assertThat(client.secrets().inNamespace(NS).withName("demo-token").get()).isNull();
+
+        client.resource(TestClusters.minio()).create();
+        await("status Provisioning again", () -> {
+            PharosCluster c = current("demo");
+            return c != null && c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        await("a new token", () -> client.secrets().inNamespace(NS).withName("demo-token").get() != null);
+        assertThat(secretValue("demo-minio", "accessKey")).isEqualTo(accessKey);
+        assertThat(secretValue("demo-minio", "secretKey")).isEqualTo(secretKey);
+        var pvc = client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get();
+        assertThat(pvc.getMetadata().getUid()).isEqualTo(pvcUid);
+        assertThat(pvc.getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(pvc.getMetadata().getLabels()).containsEntry(Labels.CLUSTER, "demo");
     }
 
     /**

@@ -42,6 +42,14 @@ import java.util.Optional;
  * an owner reference to the cluster, so Kubernetes removes them only when the cluster is deleted. An
  * object the desired state does not contain (the minio objects in s3 mode) is left alone.
  *
+ * <p><b>The bucket outlives the cluster.</b> The MinIO PVC and the MinIO credentials Secret get no owner
+ * reference ({@link #keptAfterDelete}): deleting the {@code PharosCluster} and applying it again (how a
+ * volume size or the storage kind is changed) must not garbage-collect every index. A cluster applied
+ * again under the same name adopts them: the PVC by name, the Secret create-only, so the keys still match
+ * the data. A full teardown deletes them by label:
+ * {@code kubectl delete pvc,secret -l pharos.dev/cluster=<name>}. Events on them reach the cluster through
+ * the {@link Labels#CLUSTER} label.
+ *
  * <p>The informers select only objects labelled {@link Labels#MANAGED_SELECTOR}: the operator never
  * caches Secrets or other objects it does not own. The first dependent of each kind owns the
  * informer; the others share it by name.
@@ -54,6 +62,11 @@ public final class Dependents {
 
     private Dependents() {}
 
+    /** The dependents created without an owner reference: the bucket's data and its keys. */
+    static boolean keptAfterDelete(String dependent) {
+        return DesiredState.MINIO_PVC.equals(dependent) || DesiredState.MINIO_CREDENTIALS.equals(dependent);
+    }
+
     /** Owned by the cluster (owner reference), never deleted by the operator. */
     abstract static class Owned<R extends HasMetadata> extends KubernetesDependentResource<R, PharosCluster> {
 
@@ -63,13 +76,22 @@ public final class Dependents {
 
         @Override
         protected boolean addOwnerReference() {
-            return true;
+            return !keptAfterDelete(name());
         }
 
+        /** By owner reference, or for the objects without one, by the {@link Labels#CLUSTER} label. */
         @Override
         protected Optional<SecondaryToPrimaryMapper<R>> getSecondaryToPrimaryMapper(
                 EventSourceContext<PharosCluster> context) {
-            return Optional.of(Mappers.fromOwnerReferences(context.getPrimaryResourceClass(), false));
+            SecondaryToPrimaryMapper<R> owners = Mappers.fromOwnerReferences(context.getPrimaryResourceClass(), false);
+            return Optional.of(r -> {
+                var ids = owners.toPrimaryResourceIDs(r);
+                if (!ids.isEmpty()) return ids;
+                String cluster = r.getMetadata().getLabels() == null ? null
+                        : r.getMetadata().getLabels().get(Labels.CLUSTER);
+                return cluster == null ? java.util.Set.of()
+                        : java.util.Set.of(new ResourceID(cluster, r.getMetadata().getNamespace()));
+            });
         }
 
         static DesiredState state(Context<PharosCluster> context) {

@@ -1,5 +1,8 @@
 # A small PharosCluster with operator-managed MinIO storage.
 # Create it in the operator's namespace:  kubectl apply -f deploy/examples/minio.yaml
+# Deleting the PharosCluster keeps the bucket: the MinIO PVC and its credentials Secret have no owner
+# reference, and applying a cluster of the same name again adopts them (indexes and keys intact).
+# Full teardown, data included:  kubectl delete pvc,secret -l pharos.dev/cluster=demo
 apiVersion: pharos.dev/v1alpha1
 kind: PharosCluster
 metadata:
