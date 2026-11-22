@@ -99,6 +99,7 @@ class ReshardJobTest {
     private static final Duration MIN_HOLD = Duration.ofSeconds(120);
     private static final Duration RETENTION = Duration.ofMinutes(10);
     private static final Duration SYNC_TIMEOUT = Duration.ofSeconds(600);
+    private static final Duration ACTIVATION_HOLD = Duration.ofSeconds(15);
 
     /** One clock for the bucket and every writer; only the test moves it. */
     static final class TestClock extends Clock {
@@ -149,8 +150,14 @@ class ReshardJobTest {
         final CountingEmbedder embedder = new CountingEmbedder();
         final CountingParser parser = new CountingParser();
         final WorkLoop loop;
+        ProjectIndexManager manager;
 
         Writer(String node, Duration minPinned) {
+            this(node, minPinned, false);
+        }
+
+        /** @param handRun publishes under the implicit lease (a hand-run writer racing the work loop) */
+        Writer(String node, Duration minPinned, boolean handRun) {
             this.node = node;
             Path home = tmp.resolve("w" + (++seq) + "-" + node);
             IndexConfig config = IndexConfig.defaults();
@@ -160,15 +167,15 @@ class ReshardJobTest {
             ObjectStoreWriterStateStore state = new ObjectStoreWriterStateStore(store, layout, replicas, node);
             WorkQueueLeaseGuard guard = new WorkQueueLeaseGuard();
             GenerationGc gc = new GenerationGc(store, layout, 1, RETENTION);
-            ObjectStorePublisher publisher = new ObjectStorePublisher(store, layout, catalog, gc, node, null, guard,
-                    state);
+            ObjectStorePublisher publisher = new ObjectStorePublisher(store, layout, catalog, gc, node, null,
+                    handRun ? com.pharos.cluster.writer.LeaseGuard.IMPLICIT : guard, state);
             ModuleGraphBuilder noopModules = new ModuleGraphBuilder(registry) {
                 @Override
                 public synchronized List<String> incorporate(Path root, ProjectMeta meta, MavenPomReader.PomInfo pom) {
                     return List.of();
                 }
             };
-            ProjectIndexManager manager = new ProjectIndexManager(config, lucene, registry, List.of(embedder),
+            manager = new ProjectIndexManager(config, lucene, registry, List.of(embedder),
                     noopModules, List.of(parser), publisher);
             loop = new WorkLoop(new WorkLoop.Settings(node, TTL, HEARTBEAT, Duration.ofSeconds(60), MIN_HOLD, true, false),
                     store, layout, catalog, replicas, state, manager, lucene, registry,
@@ -222,6 +229,8 @@ class ReshardJobTest {
             source = new CountingSource(new ObjectStoreReplicaSource(store, layout));
             syncer = new ReplicaSyncer(catalog, source, cache, ProjectRegistry.at(tmp.resolve("r-" + node + ".json")),
                     cacheDir, null, Duration.ofSeconds(10));
+            syncer.setClock(clock::millis);
+            syncer.setActivationHold(ACTIVATION_HOLD);
             readers.add(this);
         }
 
@@ -247,7 +256,12 @@ class ReshardJobTest {
          * generation fails the check (the coordinator would leave it out).
          */
         Map<String, Integer> fileCopies() throws IOException {
-            ShardRouter router = new ShardRouter(() -> List.of(heartbeat()), catalog, new ReaderHealth(30), s -> false);
+            return fileCopies(catalog);
+        }
+
+        /** As {@link #fileCopies()}, routed with {@code routing} (a coordinator's catalog, maybe an old read). */
+        Map<String, Integer> fileCopies(com.pharos.cluster.ShardCatalog routing) throws IOException {
+            ShardRouter router = new ShardRouter(() -> List.of(heartbeat()), routing, new ReaderHealth(30), s -> false);
             List<ShardRouter.PlannedShard> planned = router.plan(List.of(P), ShardFilter.NONE).shards();
             List<ShardRouter.PlannedShard> primary = planned.stream().filter(ps -> !ps.alternate()).toList();
             List<ShardRouter.PlannedShard> alternate = planned.stream().filter(ShardRouter.PlannedShard::alternate).toList();
@@ -413,7 +427,12 @@ class ReshardJobTest {
 
     /** Every source file is read exactly once by a query on {@code r}. */
     private void assertEveryFileOnce(Reader r, List<String> files, String when) throws IOException {
-        Map<String, Integer> copies = r.fileCopies();
+        assertEveryFileOnce(r, files, when, catalog);
+    }
+
+    private void assertEveryFileOnce(Reader r, List<String> files, String when, com.pharos.cluster.ShardCatalog routing)
+            throws IOException {
+        Map<String, Integer> copies = r.fileCopies(routing);
         assertThat(copies.keySet()).as(when + ": every file").isEqualTo(sourcePaths(files));
         assertThat(copies.values()).as(when + ": once").allMatch(c -> c == 1);
     }
@@ -770,6 +789,156 @@ class ReshardJobTest {
         assertThat(map.listed()).doesNotContain(s03);
         r.sync();
         assertEveryFileOnce(r, files, "after the abandoned reshard");
+    }
+
+    /** A catalog frozen at one read: a coordinator whose cached catalog predates a change. */
+    static com.pharos.cluster.ShardCatalog frozen(ProjectShards snapshot) {
+        return new com.pharos.cluster.ShardCatalog() {
+            @Override public List<ShardId> shards() { return snapshot.listed(); }
+            @Override public ProjectShards projectShards() { return snapshot; }
+        };
+    }
+
+    /**
+     * Fix round 1, C1: an index run of the active version published while the staged version is pinned
+     * (a run racing the reshard, on another node) never makes the flip serve a moved file twice: its
+     * generations skip the staged numbers, so no staged manifest is overwritten, and the flip finds the
+     * active version changed, withdraws the staged generations and builds them again from the new run.
+     * The writer holding the project starts no index run of it while the reshard is pinned.
+     */
+    @Test
+    void aPublishDuringThePinnedWindowIsRebuiltNotServedTwice() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        int v = catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick(); // staged, published, pinned; the reader lags: waits
+        ProjectShards.Staged staged = catalog.projectShards().stagedOf(P).orElseThrow();
+        assertThat(staged.pinned()).isTrue();
+        Map<ShardId, byte[]> stagedManifests = new HashMap<>();
+        for (Map.Entry<ShardId, Long> e : staged.generations().entrySet()) {
+            stagedManifests.put(e.getKey(), store.get(layout.manifestKey(e.getKey(), new Generation(e.getValue())))
+                    .orElseThrow().data());
+        }
+
+        // a source change: the holder runs no index of the pinned project
+        Path f = src.resolve(files.getFirst());
+        Files.writeString(f, Files.readString(f).replace("Part 0 of", "Part zero of"));
+        Files.setLastModifiedTime(f, FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        Map<ShardId, Generation> beforeRun = latestOf(ring(4));
+        clock.advance(10);
+        a.loop.tick();
+        assertThat(latestOf(ring(4))).as("no index run while the reshard is pinned").isEqualTo(beforeRun);
+
+        // ... but a run racing it from another node publishes the active version anyway
+        Writer rogue = new Writer("node-rogue", Duration.ZERO, true);
+        rogue.manager.index(src, P, false, false, true, false, com.pharos.indexer.ProgressListener.SILENT,
+                com.pharos.indexer.IndexAbort.none(), null, new ShardPlan(P, RING4, ring(4)));
+        for (Map.Entry<ShardId, byte[]> e : stagedManifests.entrySet()) {
+            assertThat(store.get(layout.manifestKey(e.getKey(), new Generation(staged.generations().get(e.getKey()))))
+                    .orElseThrow().data()).as("staged manifest of " + e.getKey() + " untouched").isEqualTo(e.getValue());
+        }
+        heartbeats = List.of(); // no reader to wait for: the next step flips if it can
+        clock.advance(10);
+        a.loop.tick();
+        ProjectShards map = catalog.projectShards();
+        assertThat(map.specVersionOf(P)).as("not flipped onto the stale version").isNotEqualTo(java.util.OptionalInt.of(v));
+        for (int i = 0; i < 4 && !map.specVersionOf(P).equals(java.util.OptionalInt.of(v)); i++) {
+            clock.advance(10);
+            a.loop.tick();
+            map = catalog.projectShards();
+        }
+        assertThat(map.specVersionOf(P)).as("rebuilt from the new run and flipped").hasValue(v);
+        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        r.sync();
+        assertEveryFileOnce(r, files, "after the rebuilt flip");
+        Path changed = src.resolve(files.getFirst()).toAbsolutePath().normalize();
+        ShardId holder = shardOf(RING5, files.getFirst());
+        assertThat(filesIn(r.cache.active(holder.value()).orElseThrow().resolve("lucene"))).contains(changed.toString());
+    }
+
+    /**
+     * Fix round 1, I1: the reshard lease lives only as long as the project's work unit. The writer waiting
+     * for the flip loses the unit (it stops renewing, another writer takes it over); the new owner
+     * completes the reshard, and the old one, back, writes nothing.
+     */
+    @Test
+    void aWriterThatLostTheUnitWritesNothingOfTheReshard() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        int v = catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        assertThat(catalog.projectShards().stagedOf(P).orElseThrow().pinned()).isTrue();
+
+        Writer b = new Writer("node-b");
+        clock.advance(TTL.toSeconds() + 5); // A is stuck: its leases run out
+        b.loop.tick();
+        assertThat(b.loop.heldShards()).containsAll(ring(4));
+        assertThat(catalog.projectShards().specVersionOf(P)).as("B waits for the reader").isNotEqualTo(
+                java.util.OptionalInt.of(v));
+
+        byte[] catalogBefore = store.get(layout.catalogKey()).orElseThrow().data();
+        byte[] jobBefore = store.get(layout.reshardJobKey(P)).orElseThrow().data();
+        a.loop.tick(); // A is back: it lost the unit, and its reshard lease with it
+        assertThat(a.loop.heldShards()).isEmpty();
+        assertThat(a.loop.reshardJob().orElseThrow().leases().held()).isEmpty();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().data()).as("A wrote nothing to the catalog")
+                .isEqualTo(catalogBefore);
+        assertThat(store.get(layout.reshardJobKey(P)).orElseThrow().data()).as("nor to the job").isEqualTo(jobBefore);
+        assertThat(a.loop.reshardJob().orElseThrow().step(P, new ShardPlan(P, RING4, ring(4)),
+                ShardSource.path(src.toString()), src, true, com.pharos.indexer.IndexAbort.none(), shard -> {
+                    throw new com.pharos.cluster.PublishConflictException("node-a does not hold " + shard);
+                })).as("B holds the reshard lease").isEqualTo(ReshardJob.Step.REFUSED);
+
+        r.sync();
+        clock.advance(10);
+        b.loop.tick();
+        assertThat(catalog.projectShards().specVersionOf(P)).hasValue(v);
+        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        r.sync();
+        assertEveryFileOnce(r, files, "after B's flip");
+    }
+
+    /**
+     * Fix round 1, I2: right after the flip a reader keeps serving the rewritten shards at their previous
+     * generations for the activation hold, so a coordinator still routing the previous version (its catalog
+     * read predates the flip) reads it complete; once the hold is over the reader serves the new version.
+     */
+    @Test
+    void aCoordinatorWithThePreFlipCatalogStillReadsEveryFile() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        Map<ShardId, Generation> before = latestOf(ring(4));
+        catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        r.sync();
+        ProjectShards preFlip = catalog.projectShards(); // a coordinator's last read before the flip
+        a.loop.tick();
+        assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
+
+        r.sync(); // within the hold
+        Set<ShardId> rewritten = movedFrom(files, RING4, RING5);
+        for (ShardId s : rewritten) {
+            assertThat(r.syncer.served().get(s)).as(s + " keeps its previous generation").isEqualTo(before.get(s));
+        }
+        assertEveryFileOnce(r, files, "stale coordinator, within the hold", frozen(preFlip));
+        assertEveryFileOnce(r, files, "fresh coordinator, within the hold");
+
+        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        r.sync();
+        Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
+        for (ShardId s : rewritten) {
+            assertThat(r.syncer.served().get(s).value()).as(s + " at the new version").isEqualTo(pins.get(s));
+        }
+        assertEveryFileOnce(r, files, "fresh coordinator, after the hold");
     }
 
     /** The job's record of the generations it published. */

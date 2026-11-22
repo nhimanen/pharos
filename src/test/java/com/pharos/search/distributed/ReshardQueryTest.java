@@ -96,11 +96,13 @@ class ReshardQueryTest {
                 }
                 assertThat(fellBack).as("the coordinator saw the flip and read the previous version").isTrue();
 
-                x.parts.runtime().syncNow();
-                deadline = System.nanoTime() + 20_000_000_000L;
+                // x keeps the rewritten shard's previous generation for the activation hold (15 s after the
+                // flip), then serves the new version
+                deadline = System.nanoTime() + 45_000_000_000L;
                 boolean onNew = false;
                 while (!onNew && System.nanoTime() < deadline) {
-                    SearchResponse r = assertOnce(k, project, "flipped, x synced");
+                    x.parts.runtime().syncNow();
+                    SearchResponse r = assertOnce(k, project, "flipped, x syncing");
                     onNew = r.trace().notes().stream().noneMatch(n -> n.contains("previous version"));
                     if (!onNew) Thread.sleep(500);
                 }

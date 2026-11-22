@@ -1156,6 +1156,7 @@ public final class ClusterRuntime implements Closeable {
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
+        s.setActivationHold(CATALOG_CACHE.multipliedBy(3)); // as the reshard flip's minimum pinned age
         s.pin(readerPin());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
