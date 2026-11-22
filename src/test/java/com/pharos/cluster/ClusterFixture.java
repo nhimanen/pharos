@@ -132,6 +132,23 @@ public final class ClusterFixture implements AutoCloseable {
     }
 
     /**
+     * Splits {@code project} by {@code spec} into {@code shards} in the catalog (a new spec version and
+     * the project entry), then indexes {@code root} as that split project and publishes every shard.
+     * {@code incremental} runs after the first only re-index what changed.
+     */
+    public void indexSplit(Path root, String project, com.pharos.cluster.sharding.ShardSpec spec, List<ShardId> shards,
+                           boolean incremental) throws IOException {
+        var catalog = (com.pharos.cluster.objectstore.ObjectStoreCatalog) writerBackend.catalog();
+        var current = catalog.projectShards();
+        if (!current.specOf(project).equals(spec) || !current.shardsOf(project).equals(shards)) {
+            int v = catalog.addSpec(java.util.Optional.of(project), spec);
+            catalog.putProject(project, v, shards);
+        }
+        writerManager.index(root, project, incremental, false, embed, false, ProgressListener.SILENT,
+                com.pharos.indexer.IndexAbort.none(), null, new com.pharos.cluster.sharding.ShardPlan(project, spec, shards));
+    }
+
+    /**
      * A reader node of this cluster's bucket in its own home, as {@code Main} wires a serving
      * reader: its backend over {@code store}, registry, indexer and runtime. Not started.
      */

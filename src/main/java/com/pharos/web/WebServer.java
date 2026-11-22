@@ -601,6 +601,7 @@ public class WebServer {
                             Map<String, Object> stage = new LinkedHashMap<>();
                             stage.put("name", s.name()); stage.put("ms", s.durationMs()); return stage;
                         }).collect(Collectors.toList()));
+                        if (!resp.trace().notes().isEmpty()) meta.put("routing", resp.trace().notes());
                         var cls = resp.trace().getClassification();
                         if (cls != null) {
                             meta.put("classIntent",  cls.intent());

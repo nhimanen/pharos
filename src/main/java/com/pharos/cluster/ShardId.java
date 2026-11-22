@@ -65,6 +65,42 @@ public record ShardId(String value) {
         return new ShardId(sb.toString());
     }
 
+    /**
+     * The key values of this id in order ({@code lucene~module=core~ring=s03} gives
+     * {@code module=core, ring=s03}); empty for a {@code [project]} id. The values are the id's
+     * ({@code ShardSpec}'s id-safe form), so routing compares them with values made id-safe the same way.
+     * This is <b>not</b> how to find the project of a shard: that is
+     * {@link com.pharos.cluster.sharding.ProjectShards#projectOf}.
+     */
+    public SequencedMap<String, String> keyValues() {
+        java.util.LinkedHashMap<String, String> out = new java.util.LinkedHashMap<>();
+        if (value.indexOf('~') < 0) return out;
+        String[] parts = value.split("~", -1);
+        for (int i = 1; i < parts.length; i++) {
+            int eq = parts[i].indexOf('=');
+            out.put(parts[i].substring(0, eq), parts[i].substring(eq + 1));
+        }
+        return out;
+    }
+
+    /**
+     * The project of a reader-pin wildcard ({@code cluster.reader.shards}: {@code lucene~*} means every
+     * shard of project {@code lucene}, P6-R5), or empty when {@code pin} is not one.
+     */
+    public static Optional<String> projectWildcard(String pin) {
+        if (pin == null || !pin.endsWith("~*")) return Optional.empty();
+        String project = pin.substring(0, pin.length() - 2);
+        return isProjectName(project) ? Optional.of(project) : Optional.empty();
+    }
+
+    /** How a reader-pin wildcard is written, for messages. */
+    public static final String WILDCARD_HINT = "a project wildcard <project>~* (every shard of the project)";
+
+    /** The reader-pin wildcard of {@code project}: every shard of it ({@link #projectWildcard}). */
+    public static String wildcardOf(String project) {
+        return ofProject(project).value() + "~*";
+    }
+
     /** True when {@code value} is a valid shard id. */
     public static boolean isValid(String value) {
         return problem(value) == null;

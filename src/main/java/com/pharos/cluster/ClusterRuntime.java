@@ -221,9 +221,9 @@ public final class ClusterRuntime implements Closeable {
             out.put("peerFetch", fetch);
         });
         List<Map<String, Object>> unavailable = new ArrayList<>();
-        List<String> pin = config.getCluster().getReader().getShards();
+        ReaderPin pin = readerPin();
         for (ShardId shard : cat.knownShards()) {
-            if (!pin.isEmpty() && !pin.contains(shard.value())) continue;
+            if (!pin.matches(shard, this::projectOfShard)) continue;
             if (servesShard(shard.value())) continue;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("shard", shard.value());
@@ -460,8 +460,8 @@ public final class ClusterRuntime implements Closeable {
             if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
         }
         registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
-        List<String> pin = c.getReader().getShards();
-        if (!pin.isEmpty()) names.retainAll(pin);
+        ReaderPin pin = readerPin();
+        if (!pin.isEmpty()) names.removeIf(n -> !pin.matches(n, this::projectOfShard));
         List<String> shards = new ArrayList<>(names);
         List<String> degraded = degradedShards();
         String state = draining ? com.pharos.cluster.membership.ReaderHeartbeat.DRAINING
@@ -1127,7 +1127,7 @@ public final class ClusterRuntime implements Closeable {
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
-        s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
+        s.pin(readerPin());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);
@@ -1188,7 +1188,41 @@ public final class ClusterRuntime implements Closeable {
     public void repin() {
         ReplicaSyncer s;
         synchronized (this) { s = syncer; }
-        if (s != null) s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
+        if (s != null) s.pin(readerPin());
+    }
+
+    /** {@code cluster.reader.shards}: shard ids and project wildcards (P6-R5); validated with the config. */
+    private ReaderPin readerPin() {
+        return ReaderPin.of(config.getCluster().getReader().getShards());
+    }
+
+    /**
+     * The project of a shard this reader deals with: the syncer's catalog mapping, else (a follower,
+     * or before the first pass) the project its registered generation was published for.
+     */
+    Optional<String> projectOfShard(ShardId shard) {
+        ReplicaSyncer s;
+        synchronized (this) {
+            s = syncer;
+        }
+        if (s != null) {
+            Optional<String> p = s.projectOf(shard);
+            if (p.isPresent()) return p;
+        }
+        return registry.find(shard.value()).map(ProjectMeta::getIndexPath)
+                .flatMap(dir -> publishedProject(Path.of(dir)));
+    }
+
+    /** The project a generation dir's manifest was published for; empty when it has none. */
+    private static Optional<String> publishedProject(Path genDir) {
+        Path manifest = genDir.resolve(ReplicaSyncer.MANIFEST_FILE);
+        if (!Files.isRegularFile(manifest)) return Optional.empty();
+        try {
+            ProjectMeta meta = com.pharos.cluster.objectstore.ShardManifest.read(Files.readAllBytes(manifest)).projectMeta();
+            return Optional.ofNullable(meta == null ? null : meta.getName());
+        } catch (IOException | RuntimeException e) {
+            return Optional.empty();
+        }
     }
 
     /** Follower poll: pick up what the lock holder registered; take over once it is gone. */
@@ -1235,14 +1269,14 @@ public final class ClusterRuntime implements Closeable {
         for (ProjectMeta meta : registry.listAll()) {
             String name = meta.getName();
             if (name == null || meta.getIndexPath() == null) continue;
-            List<String> onlyPinned = config.getCluster().getReader().getShards();
-            if (!onlyPinned.isEmpty() && !onlyPinned.contains(name)) continue;
             ShardId shardId;
             try {
                 shardId = new ShardId(name);
             } catch (IllegalArgumentException e) {
                 continue;
             }
+            ReaderPin onlyPinned = readerPin();
+            if (!onlyPinned.matches(shardId, id -> publishedProject(Path.of(meta.getIndexPath())))) continue;
             Path shardRoot = root.resolve(shardId.pathSegment());
             Path dir = Path.of(meta.getIndexPath()).toAbsolutePath().normalize();
             if (!shardRoot.equals(dir.getParent()) || !completeGeneration(dir)) {
@@ -1280,9 +1314,9 @@ public final class ClusterRuntime implements Closeable {
         // before the owner deletes its directory.
         java.util.Set<String> registered = new java.util.HashSet<>();
         registry.listAll().forEach(m -> { if (m.getName() != null) registered.add(m.getName()); });
-        List<String> pin = config.getCluster().getReader().getShards();
+        ReaderPin pin = readerPin();
         for (String name : cache.activeProjects()) {
-            if (registered.contains(name) && (pin.isEmpty() || pin.contains(name))) continue;
+            if (registered.contains(name) && pin.matches(name, this::projectOfShard)) continue;
             cache.deactivate(name);
             log.info("Shard {} is no longer registered for this reader: stopped serving it", name);
         }

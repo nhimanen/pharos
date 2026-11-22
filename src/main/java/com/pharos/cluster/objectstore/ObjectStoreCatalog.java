@@ -114,6 +114,7 @@ public final class ObjectStoreCatalog implements ShardCatalog {
      * The project ↔ shards mapping and spec versions; a catalog without {@code projects} gives the
      * {@code [project]} identity of its shards.
      */
+    @Override
     public ProjectShards projectShards() throws IOException {
         Optional<StoredObject> current = store.get(layout.catalogKey());
         if (current.isEmpty()) return ProjectShards.identity(List.of());

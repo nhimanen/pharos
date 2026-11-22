@@ -251,6 +251,27 @@ class ClusterConfigTest {
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
     }
 
+    /** P6-R5: shard ids of split projects and project wildcards; a wildcard must name a valid project. */
+    @Test
+    void readerShardsAcceptKeyedIdsAndProjectWildcards() throws Exception {
+        ClusterConfig ok = parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
+                + "\"reader\":{\"shards\":[\"app\",\"lucene~ring=s01\",\"kafka~*\"]}"));
+        ReaderPin pin = ReaderPin.of(ok.getReader().getShards());
+        assertThat(pin.matches(new ShardId("app"), s -> java.util.Optional.empty())).isTrue();
+        assertThat(pin.matches(new ShardId("lucene~ring=s01"), s -> java.util.Optional.of("lucene"))).isTrue();
+        assertThat(pin.matches(new ShardId("lucene~ring=s02"), s -> java.util.Optional.of("lucene"))).isFalse();
+        assertThat(pin.matches(new ShardId("kafka~module=core"), s -> java.util.Optional.of("kafka"))).isTrue();
+        assertThat(pin.matches(new ShardId("kafka"), s -> java.util.Optional.of("kafka")))
+                .as("the [project] shard of a pinned project too").isTrue();
+        assertThat(pin.matches(new ShardId("kafkaesque~ring=s01"), s -> java.util.Optional.of("kafkaesque"))).isFalse();
+        assertThat(ReaderPin.of(java.util.List.of()).matches(new ShardId("x"), s -> java.util.Optional.empty())).isTrue();
+        for (String bad : java.util.List.of("~*", "../x~*", "a~", "a~ring")) {
+            assertThatThrownBy(() -> parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
+                    + "\"reader\":{\"shards\":[\"" + bad + "\"]}")))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
+        }
+    }
+
     @Test
     void ttlMustExceedHeartbeat() {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"heartbeatSeconds\":30,\"readerTtlSeconds\":30}}"))

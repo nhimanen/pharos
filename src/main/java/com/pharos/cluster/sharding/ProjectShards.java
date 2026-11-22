@@ -42,6 +42,10 @@ import java.util.function.Consumer;
  *       means {@code [project]};</li>
  *   <li>{@code projects}: a project's active spec version and its shards. A project's spec changes
  *       (a reshard flip) by replacing its entry in one CAS.</li>
+ *   <li>{@code projects[].staged}: optional {@code {"spec": N, "shards": [...]}}, the shards of a spec
+ *       version that is about to become the project's active one (a reshard in progress). Readers sync
+ *       them ahead ({@link #syncShards()}); nothing routes to them until the flip. Its shards may
+ *       overlap the active ones (a ring change keeps the shards that neither gain nor lose files).</li>
  * </ul>
  * <b>Backward compatibility.</b> A shard listed in {@code shards} but under no project entry, whose id
  * is a plain project name, is that project's only shard: the {@code [project]} identity of Phases 1–5.
@@ -58,18 +62,36 @@ public final class ProjectShards {
     private final List<VersionedSpec> specs;
     private final OptionalInt activeVersion;
     private final List<ShardId> orphans;
+    private final List<ShardId> listed;
+    private final Map<String, Staged> staged;
+
+    /**
+     * The staged spec version of a project (a reshard in progress): its number, its spec and its shards,
+     * in catalog order. Synced ahead by readers, never routed to before the flip.
+     */
+    public record Staged(int specVersion, ShardSpec spec, List<ShardId> shards) {
+        public Staged {
+            shards = List.copyOf(shards);
+        }
+    }
 
     private ProjectShards(Map<String, List<ShardId>> byProject, Map<String, ShardSpec> specOf,
                           Map<String, Integer> specVersionOf, List<VersionedSpec> specs,
-                          OptionalInt activeVersion, List<ShardId> orphans) {
+                          OptionalInt activeVersion, List<ShardId> orphans, List<ShardId> listed,
+                          Map<String, Staged> staged) {
         TreeMap<String, List<ShardId>> p = new TreeMap<>();
         Map<ShardId, String> s = new HashMap<>();
+        staged.forEach((name, st) -> {
+            for (ShardId id : st.shards()) s.put(id, name);
+        });
         byProject.forEach((name, shards) -> {
             p.put(name, List.copyOf(shards));
             for (ShardId id : shards) s.put(id, name);
         });
         this.byProject = Collections.unmodifiableMap(p);
         this.byShard = Map.copyOf(s);
+        this.listed = List.copyOf(new LinkedHashSet<>(listed));
+        this.staged = Map.copyOf(staged);
         this.specOf = Map.copyOf(specOf);
         this.specVersionOf = Map.copyOf(specVersionOf);
         this.specs = List.copyOf(specs);
@@ -85,7 +107,8 @@ public final class ProjectShards {
             if (isPlain(id)) byProject.put(id.value(), List.of(id));
             else orphans.add(id);
         }
-        return new ProjectShards(byProject, Map.of(), Map.of(), List.of(), OptionalInt.empty(), orphans);
+        return new ProjectShards(byProject, Map.of(), Map.of(), List.of(), OptionalInt.empty(), orphans,
+                List.copyOf(shards), Map.of());
     }
 
     /**
@@ -115,6 +138,8 @@ public final class ProjectShards {
         Map<String, ShardSpec> specOf = new HashMap<>();
         Map<String, Integer> specVersionOf = new HashMap<>();
         Set<ShardId> claimed = new java.util.HashSet<>();
+        Map<String, Staged> staged = new HashMap<>();
+        Map<String, JsonNode> stagedNodes = new LinkedHashMap<>();
         JsonNode projects = root.get("projects");
         if (projects != null && projects.isArray()) {
             for (JsonNode p : projects) {
@@ -139,15 +164,41 @@ public final class ProjectShards {
                     byProject.put(name, ids);
                     specOf.put(name, spec == null ? ShardSpec.PROJECT : spec.spec());
                     if (spec != null) specVersionOf.put(name, spec.version());
+                    JsonNode st = p.get("staged");
+                    if (st != null && !st.isNull()) stagedNodes.put(name, st);
                 } catch (IllegalArgumentException e) {
                     warn.accept("catalog project entry '" + name + "' skipped: " + e.getMessage());
                 }
             }
         }
 
+        // Staged versions, once every active claim is known: a staged shard may be an active shard of the
+        // same project (a ring change keeps unaffected shards), never one of another project.
+        Set<ShardId> stagedClaimed = new java.util.HashSet<>();
+        stagedNodes.forEach((name, st) -> {
+            try {
+                JsonNode sv = st.get("spec");
+                VersionedSpec spec = sv != null && sv.canConvertToInt() ? byVersion.get(sv.asInt()) : null;
+                if (spec == null) throw new IllegalArgumentException("unknown spec version " + sv);
+                List<ShardId> ids = new ArrayList<>();
+                for (JsonNode s : st.path("shards")) ids.add(new ShardId(s.asText()));
+                checkProject(name, spec, ids);
+                List<ShardId> own = byProject.getOrDefault(name, List.of());
+                for (ShardId id : ids) {
+                    if ((claimed.contains(id) && !own.contains(id)) || stagedClaimed.contains(id)) {
+                        throw new IllegalArgumentException("shard " + id + " is claimed by another project");
+                    }
+                }
+                stagedClaimed.addAll(ids);
+                staged.put(name, new Staged(spec.version(), spec.spec(), ids));
+            } catch (IllegalArgumentException e) {
+                warn.accept("catalog project entry '" + name + "': staged version skipped: " + e.getMessage());
+            }
+        });
+
         List<ShardId> orphans = new ArrayList<>();
         for (ShardId id : new LinkedHashSet<>(shards)) {
-            if (claimed.contains(id)) continue;
+            if (claimed.contains(id) || stagedClaimed.contains(id)) continue;
             if (isPlain(id) && !byProject.containsKey(id.value())) {
                 byProject.put(id.value(), List.of(id));
                 claimed.add(id);
@@ -155,7 +206,7 @@ public final class ProjectShards {
                 orphans.add(id);
             }
         }
-        return new ProjectShards(byProject, specOf, specVersionOf, specs, active, orphans);
+        return new ProjectShards(byProject, specOf, specVersionOf, specs, active, orphans, shards, staged);
     }
 
     /**
@@ -275,4 +326,31 @@ public final class ProjectShards {
 
     /** Listed shards that belong to no project. */
     public List<ShardId> orphans() { return orphans; }
+
+    /** Every valid id of the catalog's {@code shards} list, in catalog order (orphans and staged included). */
+    public List<ShardId> listed() { return listed; }
+
+    /** The staged spec version of {@code project} (a reshard in progress), if any. */
+    public Optional<Staged> stagedOf(String project) {
+        return Optional.ofNullable(staged.get(project));
+    }
+
+    /**
+     * True when {@code project}'s active spec is not {@code [project]}: its shards are activated and
+     * queried as one set, and its call graph is the project's.
+     */
+    public boolean isSplit(String project) {
+        return !specOf(project).isDefault();
+    }
+
+    /**
+     * What a reader syncs: every project's active shards, then the staged shards not among them (a
+     * reshard in progress, synced ahead of the flip), each once, in project order.
+     */
+    public List<ShardId> syncShards() {
+        LinkedHashSet<ShardId> out = new LinkedHashSet<>();
+        byProject.values().forEach(out::addAll);
+        for (String p : byProject.keySet()) stagedOf(p).ifPresent(st -> out.addAll(st.shards()));
+        return List.copyOf(out);
+    }
 }

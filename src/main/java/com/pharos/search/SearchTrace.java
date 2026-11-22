@@ -17,6 +17,8 @@ public class SearchTrace {
     }
 
     private final List<Span> spans = new ArrayList<>();
+    /** Routing notes of a cluster query: which shards a filter pruned, and why it could not prune. */
+    private final List<String> notes = new ArrayList<>();
     private long overallStart;
     private QueryClassification classification;
 
@@ -34,6 +36,13 @@ public class SearchTrace {
     }
 
     public List<Span> spans() { return List.copyOf(spans); }
+
+    /** Adds a note (a routing decision of a cluster query), once. */
+    public void note(String note) {
+        if (note != null && !notes.contains(note)) notes.add(note);
+    }
+
+    public List<String> notes() { return List.copyOf(notes); }
 
     public void setClassification(QueryClassification c) { this.classification = c; }
     public QueryClassification getClassification() { return classification; }
@@ -55,6 +64,7 @@ public class SearchTrace {
             sb.append(String.format("  [trace] %-26s %dms%n", s.name(), s.durationMs()));
         }
         sb.append(String.format("  [trace] %-26s %dms", "total", totalMs()));
+        for (String n : notes) sb.append(String.format("%n  [trace] routing: %s", n));
         return sb.toString();
     }
 }

@@ -104,6 +104,7 @@ public class SearchCommand implements Callable<Integer> {
                 for (var span : response.trace().spans()) {
                     System.err.printf("[trace]   %-28s %dms%n", span.name(), span.durationMs());
                 }
+                for (String note : response.trace().notes()) System.err.printf("[trace]   routing: %s%n", note);
             }
             return 0;
         } catch (com.pharos.indexer.IncompatibleIndexException e) {
@@ -190,6 +191,10 @@ public class SearchCommand implements Callable<Integer> {
             var stages = meta.putArray("stages");
             for (var span : response.trace().spans()) {
                 stages.addObject().put("name", span.name()).put("ms", span.durationMs());
+            }
+            if (!response.trace().notes().isEmpty()) {
+                var routing = meta.putArray("routing");
+                response.trace().notes().forEach(routing::add);
             }
         }
         // Enrich results with snippet fields before serialisation

@@ -2,6 +2,7 @@ package com.pharos.cluster.routing;
 
 import com.pharos.cluster.ShardCatalog;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.sharding.ProjectShards;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +29,11 @@ import java.util.function.LongSupplier;
  * failed, or one has been running longer than {@code refreshEvery}) does the age count:
  * {@link #staleSeconds} reports it (the query warning) and, past {@code maxAge}
  * ({@code cluster.maxCatalogAgeSeconds}), unscoped routing is refused ({@link CatalogTooOldException}).
+ *
+ * <p><b>One read, one version.</b> What is cached is one read of the base catalog as a whole: its
+ * shards and its project ↔ shards mapping ({@link #projectShards}) always come from the same version.
+ * A caller that needs both takes the {@link ProjectShards} once and uses only it, so a re-read landing
+ * meanwhile (a reshard flip) never mixes two versions in one query.
  */
 public final class CachedCatalog implements ShardCatalog {
 
@@ -57,7 +63,7 @@ public final class CachedCatalog implements ShardCatalog {
     /** The longest a query waits for the read in flight when the catalog is stale and nothing failed. */
     private final long maxWaitNanos;
 
-    private volatile List<ShardId> cached;
+    private volatile ProjectShards cached;
     private volatile long readAt;          // last good read
     private volatile long attemptAt;       // last attempt, good or not
     private volatile boolean attempted;
@@ -94,8 +100,17 @@ public final class CachedCatalog implements ShardCatalog {
 
     @Override
     public List<ShardId> shards() throws IOException {
+        return projectShards().listed();
+    }
+
+    /**
+     * The cached catalog version as a whole (see the class comment), with the same freshness rules and
+     * exceptions as {@link #shards}.
+     */
+    @Override
+    public ProjectShards projectShards() throws IOException {
         long now = clock.getAsLong();
-        List<ShardId> current = cached;
+        ProjectShards current = cached;
         if (current == null) return firstShards(now);
         startRefreshIfDue(now);
         if (now - readAt > 2 * refreshNanos && lastFailure == null) {
@@ -165,7 +180,7 @@ public final class CachedCatalog implements ShardCatalog {
         return since != IDLE && now - since > refreshNanos;
     }
 
-    private List<ShardId> firstShards(long now) {
+    private ProjectShards firstShards(long now) {
         if (attempted && now - attemptAt < refreshNanos) throw neverRead();
         if (!firstRead.tryLock()) throw neverRead(); // another query is reading it: do not wait
         try {
@@ -173,7 +188,7 @@ public final class CachedCatalog implements ShardCatalog {
             attempted = true;
             attemptAt = now;
             try {
-                List<ShardId> read = List.copyOf(base.shards());
+                ProjectShards read = base.projectShards();
                 readAt = clock.getAsLong();
                 lastFailure = null;
                 cached = read;
@@ -217,10 +232,10 @@ public final class CachedCatalog implements ShardCatalog {
     }
 
     private void refresh(long token) {
-        List<ShardId> read = null;
+        ProjectShards read = null;
         Exception failure = null;
         try {
-            read = List.copyOf(base.shards());
+            read = base.projectShards();
         } catch (IOException | RuntimeException e) {
             failure = e;
         }

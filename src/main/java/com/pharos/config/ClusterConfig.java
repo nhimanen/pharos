@@ -354,18 +354,19 @@ public class ClusterConfig {
         private int maxConcurrentFetches = 16;
         /** Cap of a private block cache (a second process on the cache dir); 0 derives it. */
         private long privateCacheMaxBytes = 0;
-        /** Project names this reader is pinned to; empty means every shard. */
+        /**
+         * Shards this reader is pinned to: shard ids ({@code lucene}, {@code lucene~ring=s01}) or project
+         * wildcards ({@code lucene~*}, every shard of the project); empty means every shard.
+         */
         private java.util.List<String> shards = java.util.List.of();
 
         /** @throws IllegalStateException naming the offending field */
         public void validate() {
             if (shards == null) shards = java.util.List.of();
-            for (String s : shards) {
-                try {
-                    new com.pharos.cluster.ShardId(s);
-                } catch (IllegalArgumentException e) {
-                    throw new IllegalStateException("cluster.reader.shards: " + e.getMessage());
-                }
+            try {
+                com.pharos.cluster.ReaderPin.of(shards); // shard ids and project wildcards (P6-R5)
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("cluster.reader.shards: " + e.getMessage());
             }
             if (!LAZY.equals(mode) && !FULL.equals(mode)) {
                 throw new IllegalStateException("cluster.reader.mode must be 'lazy' or 'full', got '" + mode + "'");

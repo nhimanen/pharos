@@ -89,12 +89,26 @@ import java.util.stream.Stream;
  * manifest. When the format gate refuses a newer generation, the served lazy generation is
  * materialised in the background ({@link LazyGenerations#materialiseInBackground}): the bucket's GC
  * would otherwise delete objects it still reads.
+ *
+ * <p><b>Projects and shards (Phase 6).</b> Each pass reads the catalog's project ↔ shards mapping once
+ * ({@link ShardCatalog#projectShards}) and syncs every project's active shards plus the shards of a
+ * staged spec version (a reshard in progress, synced ahead so they are served before the flip routes to
+ * them); shards that belong to no project are not synced. A {@code [project]} shard is synced as above.
+ * The shards of a split project are activated <b>only as a set</b>: each shard's new generation is
+ * materialised (not yet served), and the set's generations are activated together once every shard
+ * of the set (the ones this reader is pinned to) has one at the same index run
+ * ({@code projectGeneration}). Until then the previous complete set keeps serving, so a query on this
+ * reader never sees a file that moved between shards twice, or not at all. The project's graph
+ * ({@code projectFiles}, content-named) is downloaded once per reader into
+ * {@value #PROJECT_FILES_DIR} and hard-linked into each shard's generation dir; refs are not fetched.
  */
 public class ReplicaSyncer implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(ReplicaSyncer.class);
 
     static final String MANIFEST_FILE = "manifest.json";
+    /** Project files (a split project's graph), one per content-named key, linked into generation dirs. */
+    static final String PROJECT_FILES_DIR = ".project-files";
     static final String LUCENE_DIR = "lucene";
     private static final String PARTIAL_SUFFIX = ".partial";
     /** After a prefetch timeout, the warm open still gets this long before the generation is activated. */
@@ -119,7 +133,15 @@ public class ReplicaSyncer implements Closeable {
     /** Generation last refused per shard by the format gate; its WARN is not repeated every poll. */
     private final Map<ShardId, Generation> refused = new HashMap<>();
     /** Shards this reader is pinned to; empty serves every catalog shard. */
-    private volatile Set<ShardId> pinned = Set.of();
+    private volatile ReaderPin pinned = ReaderPin.none();
+    /** The catalog mapping of the last pass (a shard's project, for pin wildcards and status). */
+    private volatile com.pharos.cluster.sharding.ProjectShards mapping = com.pharos.cluster.sharding.ProjectShards.identity(List.of());
+    /** Index run ({@code projectGeneration}) of the served generation of each split project's shard. */
+    private final Map<ShardId, Long> servedRun = new ConcurrentHashMap<>();
+    /** Generation materialised but not activated per shard (waiting for its set); adopted quietly. */
+    private final Map<ShardId, Generation> prepared = new HashMap<>();
+    /** The last "waiting for a complete set" state logged per project, so it is not repeated every pass. */
+    private final Map<String, String> waitingLogged = new HashMap<>();
     /** Shards dropped by pinning: unregistered, directories removed one pass later (in-flight queries). */
     private final Map<ShardId, Long> retired = new HashMap<>();
     private java.util.function.LongSupplier clock = System::currentTimeMillis;
@@ -180,7 +202,17 @@ public class ReplicaSyncer implements Closeable {
 
     /** Pins this reader to {@code shards}; empty serves all. Takes effect on the next pass. */
     public void pin(Collection<ShardId> shards) {
-        this.pinned = Set.copyOf(shards);
+        this.pinned = ReaderPin.of(shards.stream().map(ShardId::value).toList());
+    }
+
+    /** Pins this reader ({@code cluster.reader.shards}, wildcards included). Takes effect on the next pass. */
+    public void pin(ReaderPin pin) {
+        this.pinned = Objects.requireNonNull(pin, "pin");
+    }
+
+    /** The project the last pass's catalog mapping puts {@code shard} in; empty before a pass or when none. */
+    public Optional<String> projectOf(ShardId shard) {
+        return mapping.projectOf(shard);
     }
 
     /** Generation currently served per shard. */
@@ -195,15 +227,17 @@ public class ReplicaSyncer implements Closeable {
      */
     public void syncOnce() throws IOException {
         synchronized (syncLock) {
-            List<ShardId> shards;
+            com.pharos.cluster.sharding.ProjectShards map;
             try {
-                shards = catalog.shards();
+                map = catalog.projectShards();
             } catch (RuntimeException e) {
                 throw new IOException("unreadable shard catalog: " + e.getMessage(), e);
             }
-            boolean catalogEmpty = shards.isEmpty();
-            Set<ShardId> pin = pinned;
-            if (!pin.isEmpty()) shards = shards.stream().filter(pin::contains).toList();
+            mapping = map;
+            List<ShardId> shards = map.syncShards();
+            boolean catalogEmpty = map.listed().isEmpty();
+            ReaderPin pin = pinned;
+            if (!pin.isEmpty()) shards = shards.stream().filter(sh -> pin.matches(sh, map::projectOf)).toList();
             wanted = List.copyOf(shards);
             if (catalogEmpty && !served.isEmpty()) {
                 // an empty read may be transient (a catalog object being rewritten): drop nothing
@@ -212,18 +246,35 @@ public class ReplicaSyncer implements Closeable {
             } else {
                 dropUnwanted(shards);
             }
+            Set<ShardId> wantedSet = new HashSet<>(shards);
+            Set<ShardId> inSets = new HashSet<>();
+            List<List<ShardId>> sets = new ArrayList<>();
+            List<String> setProjects = new ArrayList<>();
+            for (String project : map.projects()) { // split projects' active and staged sets (pinned part)
+                List<List<ShardId>> projectSets = new ArrayList<>();
+                if (map.isSplit(project)) projectSets.add(map.shardsOf(project));
+                map.stagedOf(project).filter(st -> !st.spec().isDefault()).ifPresent(st -> projectSets.add(st.shards()));
+                for (List<ShardId> set : projectSets) {
+                    List<ShardId> mine = set.stream().filter(wantedSet::contains).toList();
+                    if (mine.isEmpty()) continue;
+                    sets.add(mine);
+                    setProjects.add(project);
+                    inSets.addAll(mine);
+                }
+            }
             for (ShardId shard : shards) {
                 if (closed) return;
                 retired.remove(shard);
+                if (inSets.contains(shard)) continue;
                 try {
                     syncShard(shard);
                 } catch (IOException | RuntimeException e) {
-                    log.warn("Sync of shard {} failed; still serving generation {}: {}", shard,
-                            Optional.ofNullable(served.get(shard)).map(g -> String.valueOf(g.value())).orElse("none"),
-                            e.toString());
+                    logSyncFailure(shard, e);
                 }
             }
+            syncSets(sets, setProjects);
             if (lazy != null) lazy.sweep();
+            sweepProjectFiles();
             try {
                 syncSynonyms();
             } catch (IOException | RuntimeException e) {
@@ -302,6 +353,8 @@ public class ReplicaSyncer implements Closeable {
             if (active != null) GraphViews.evict(active);
             if (lazy != null) lazy.cancelShard(shard.value());
             served.remove(shard);
+            servedRun.remove(shard);
+            prepared.remove(shard);
             registered.remove(shard);
             refused.remove(shard);
             retired.put(shard, now);
@@ -387,14 +440,98 @@ public class ReplicaSyncer implements Closeable {
 
     // ---------------------------------------------------------------------------------------
 
+    private void logSyncFailure(ShardId shard, Exception e) {
+        log.warn("Sync of shard {} failed; still serving generation {}: {}", shard,
+                Optional.ofNullable(served.get(shard)).map(g -> String.valueOf(g.value())).orElse("none"),
+                e.toString());
+    }
+
     private void syncShard(ShardId shard) throws IOException {
+        Prepared p = prepare(shard);
+        if (p != null) activate(shard, p);
+    }
+
+    /** A generation materialised on disk and ready to be activated. */
+    private record Prepared(Generation gen, ShardManifest manifest, Path shardRoot, Path genDir) {
+        Long run() {
+            return manifest.projectGeneration();
+        }
+    }
+
+    /**
+     * Syncs the shards of split projects set by set (see the class comment): materialises every new
+     * generation, then activates a set's new generations together when all of its shards are (or would
+     * be) served at one index run. A shard in two sets (the active and the staged version of a ring
+     * change) is activated when either set is complete.
+     */
+    private void syncSets(List<List<ShardId>> sets, List<String> projects) {
+        if (sets.isEmpty()) return;
+        Map<ShardId, Prepared> ready = new HashMap<>();
+        Set<ShardId> failed = new HashSet<>();
+        for (List<ShardId> set : sets) {
+            for (ShardId shard : set) {
+                if (closed) return;
+                if (ready.containsKey(shard) || failed.contains(shard)) continue;
+                try {
+                    Prepared p = prepare(shard);
+                    if (p != null) ready.put(shard, p);
+                } catch (IOException | RuntimeException e) {
+                    failed.add(shard);
+                    logSyncFailure(shard, e);
+                }
+            }
+        }
+        Set<ShardId> activate = new java.util.LinkedHashSet<>();
+        for (int i = 0; i < sets.size(); i++) {
+            List<ShardId> set = sets.get(i);
+            String project = projects.get(i);
+            Long run = null;
+            boolean complete = true;
+            boolean anyNew = false;
+            List<String> state = new ArrayList<>();
+            for (ShardId shard : set) {
+                Prepared p = ready.get(shard);
+                anyNew |= p != null;
+                Long r = p != null ? p.run() : servedRun.get(shard);
+                state.add(shard + (p != null ? " new" : served.containsKey(shard) ? " served" : " none") + " run " + r);
+                if (r == null || (run != null && !run.equals(r))) complete = false;
+                if (run == null) run = r;
+            }
+            if (complete) {
+                for (ShardId shard : set) if (ready.containsKey(shard)) activate.add(shard);
+                waitingLogged.remove(project + set);
+            } else if (anyNew) {
+                String line = String.join(", ", state);
+                if (!line.equals(waitingLogged.put(project + set, line))) {
+                    log.info("Project {}: not activating new generations until every shard of the set is at one index"
+                            + " run; still serving the previous set ({})", project, line);
+                }
+            }
+        }
+        for (ShardId shard : activate) {
+            if (closed) return;
+            try {
+                activate(shard, ready.get(shard));
+            } catch (IOException | RuntimeException e) {
+                // registration failed: this shard keeps its previous generation; the next pass retries
+                logSyncFailure(shard, e);
+            }
+        }
+    }
+
+    /**
+     * Materialises (or adopts) {@code shard}'s published generation when it is newer than the served
+     * one; null when there is nothing to activate (no generation, the served one, or one the format
+     * gate refuses).
+     */
+    private Prepared prepare(ShardId shard) throws IOException {
         Optional<Generation> latest = source.latest(shard);
-        if (latest.isEmpty()) return;
+        if (latest.isEmpty()) return null;
         Generation gen = latest.get();
         Generation current = served.get(shard);
         if (current != null && gen.equals(current)) {
             retryRegistration(shard, current);
-            return;
+            return null;
         }
         if (current != null && gen.compareTo(current) < 0) {
             log.warn("Shard {}: LATEST points at generation {}, below the served generation {} (bucket wiped"
@@ -407,7 +544,7 @@ public class ReplicaSyncer implements Closeable {
             // Stuck on the served generation, whose objects the bucket's GC deletes after its retention:
             // a lazy one is made local in the background before that.
             if (lazy != null) cache.active(shard.value()).ifPresent(dir -> lazy.materialiseInBackground(shard, dir));
-            return;
+            return null;
         }
         checkFiles(manifest);
         byte[] manifestJson = manifest.toJson();
@@ -419,7 +556,11 @@ public class ReplicaSyncer implements Closeable {
         // A full-mode reader can't serve a lazy dir: it materialises the generation again.
         if (Files.isDirectory(genDir) && sameManifest(genDir, manifestJson)
                 && (lazy != null || !LazyGenerations.isLazy(genDir))) {
-            log.info("Shard {}: adopting complete generation {} found in {}", shard, gen.value(), genDir);
+            if (gen.equals(prepared.get(shard))) {
+                log.debug("Shard {}: generation {} still waits for its set", shard, gen.value());
+            } else {
+                log.info("Shard {}: adopting complete generation {} found in {}", shard, gen.value(), genDir);
+            }
             // materialised by a build that did not write the stamp yet
             if (!Files.exists(genDir.resolve(IndexFormat.FILE_NAME))) writeFormatStamp(genDir, manifest);
         } else {
@@ -432,16 +573,23 @@ public class ReplicaSyncer implements Closeable {
             }
             materialise(shard, gen, manifest, manifestJson, shardRoot, genDir);
         }
+        prepared.put(shard, gen);
+        return new Prepared(gen, manifest, shardRoot, genDir);
+    }
 
+    private void activate(ShardId shard, Prepared p) throws IOException {
         // Registry first, then the cache: graphs resolve through the registry's indexPath and
         // Lucene through the cache, so a generation is only activated once the registry names it.
         // A failed registration fails this shard's sync: it keeps serving the previous generation
         // (both views agree) and the next poll adopts the materialised dir and retries.
-        register(shard, gen, manifest.projectMeta(), genDir);
-        cache.activate(shard.value(), genDir);
-        served.put(shard, gen);
-        if (lazy != null) lazy.stopMaterialising(shard, genDir);
-        prune(shard, shardRoot, gen);
+        register(shard, p.gen(), p.manifest().projectMeta(), p.genDir());
+        cache.activate(shard.value(), p.genDir());
+        served.put(shard, p.gen());
+        prepared.remove(shard);
+        if (p.run() != null) servedRun.put(shard, p.run());
+        else servedRun.remove(shard);
+        if (lazy != null) lazy.stopMaterialising(shard, p.genDir());
+        prune(shard, p.shardRoot(), p.gen());
     }
 
     /**
@@ -516,6 +664,11 @@ public class ReplicaSyncer implements Closeable {
                 }
                 default -> { } // refs are not needed by readers; unknown roles are ignored
             }
+        }
+        for (ManifestFile f : manifest.projectFileList()) {
+            if (!ManifestFile.GRAPH.equals(f.role())) continue; // the project's refs: not needed by readers
+            if (projectFile(f, partial.resolve(GraphViews.COMPACT_FILE))) downloaded++;
+            else linked++;
         }
         checkLuceneChecksums(lucene, manifest, localLucene, downloadedLucene);
         writeFormatStamp(partial, manifest);
@@ -607,6 +760,62 @@ public class ReplicaSyncer implements Closeable {
             Thread.currentThread().interrupt();
             throw new java.io.InterruptedIOException("interrupted opening generation " + gen.value()
                     + " of shard " + shard);
+        }
+    }
+
+    /**
+     * Puts project file {@code f} (a split project's graph) at {@code target}: hard-linked from the one
+     * local copy of its content-named key in {@value #PROJECT_FILES_DIR}, downloaded and verified once
+     * per reader (every shard of the project and run lists the same key). True when it was downloaded.
+     */
+    private boolean projectFile(ManifestFile f, Path target) throws IOException {
+        if (f.key() == null || f.key().isEmpty()) throw new GenerationFiles.IntegrityException("project file without a key: " + f);
+        Path dir = cacheDir.resolve(PROJECT_FILES_DIR);
+        Files.createDirectories(dir);
+        Path stored = dir.resolve(java.net.URLEncoder.encode(f.key(), java.nio.charset.StandardCharsets.UTF_8));
+        boolean downloaded = false;
+        if (!Files.isRegularFile(stored) || Files.size(stored) != f.length()) {
+            Path tmp = dir.resolve(stored.getFileName() + PARTIAL_SUFFIX);
+            Files.deleteIfExists(tmp);
+            try {
+                source.download(f, tmp);
+                checkLength(tmp, f);
+                checkCrc32(tmp, f);
+                Files.move(tmp, stored, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(tmp);
+            }
+            downloaded = true;
+        }
+        try {
+            Files.createLink(target, stored);
+        } catch (IOException | UnsupportedOperationException e) {
+            Files.copy(stored, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+        checkLength(target, f);
+        return downloaded;
+    }
+
+    /**
+     * Deletes the project files no generation dir links any more (link count 1: only the stored copy);
+     * does nothing where the file system has no link counts.
+     */
+    private void sweepProjectFiles() {
+        Path dir = cacheDir.resolve(PROJECT_FILES_DIR);
+        if (!Files.isDirectory(dir)) return;
+        try (Stream<Path> s = Files.list(dir)) {
+            for (Path p : s.toList()) {
+                if (p.getFileName().toString().endsWith(PARTIAL_SUFFIX)) {
+                    Files.deleteIfExists(p);
+                    continue;
+                }
+                Object links = Files.getAttribute(p, "unix:nlink");
+                if (links instanceof Integer n && n <= 1) Files.deleteIfExists(p);
+            }
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+            log.debug("No link counts in {}: project files are not swept", dir);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Sweeping {} failed: {}", dir, e.toString());
         }
     }
 

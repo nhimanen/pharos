@@ -201,6 +201,19 @@ public final class ShardSpec {
         return String.join("/", Arrays.asList(segs).subList(0, dirs));
     }
 
+    /**
+     * A raw key value as it appears in a shard id ({@link #idValue}): what routing compares a filter's
+     * module, language or kind with.
+     */
+    public static String keyValue(String raw) {
+        return idValue(raw);
+    }
+
+    /** True when {@link #keyValue} keeps every character of {@code raw} (no cut and hash suffix). */
+    public static boolean keyValueIsWhole(String raw) {
+        return raw == null || raw.length() < MAX_VALUE_LENGTH - 9;
+    }
+
     /** A key value as it appears in a shard id; see the class comment. */
     static String idValue(String raw) {
         if (raw == null || raw.isEmpty()) return NO_VALUE;

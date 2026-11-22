@@ -5,6 +5,7 @@ import com.pharos.cluster.ShardId;
 import com.pharos.cluster.membership.ReaderHealth;
 import com.pharos.cluster.membership.MembershipSource;
 import com.pharos.cluster.membership.ReaderHeartbeat;
+import com.pharos.cluster.sharding.ProjectShards;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -12,7 +13,6 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
@@ -25,6 +25,14 @@ import java.util.function.ToIntFunction;
  * readers are skipped, and a reader is skipped for the shards its heartbeat lists as degraded (only
  * those); warming readers are a last resort and suspect ones are tried only when nothing else is
  * left (see {@link #candidates}); within a tier, by least {@code inFlight}, rotating among ties.
+ *
+ * <p><b>Projects and shards (Phase 6).</b> A query names projects; {@link #plan} resolves each to its
+ * shards through one read of the catalog's project ↔ shards mapping ({@link ProjectShards}), which the
+ * plan carries so the query uses that one version throughout. Nothing is derived from a shard id: a
+ * project the catalog does not know is routed as its {@code [project]} shard, as before. A
+ * {@link ShardFilter} prunes a split project's shards against its spec; what it can't prune fans out,
+ * and the plan's notes say why. The shards of one split project share one rotation turn and one load
+ * snapshot, so with readers holding the whole project they all go to the same reader first.
  */
 public final class ShardRouter {
 
@@ -47,7 +55,8 @@ public final class ShardRouter {
     private final ReaderHealth health;
     private final Predicate<ShardId> local;
     private final ToIntFunction<String> coordinatorInFlight;
-    private final Map<ShardId, AtomicLong> rotation = new ConcurrentHashMap<>();
+    /** Rotation turns: per shard, or per project for the shards of a split project. */
+    private final Map<String, AtomicLong> rotation = new ConcurrentHashMap<>();
 
     /**
      * @param live   the live readers (this node's own entry included)
@@ -80,32 +89,100 @@ public final class ShardRouter {
         this.local = local;
     }
 
-    /** One route per requested project in shard order; every catalog shard when {@code projects} is empty. */
+    /** One shard of a plan: its route, the project it serves, and whether that project is split. */
+    public record PlannedShard(Route route, String project, boolean split) {
+        public ShardId shard() { return route.shard(); }
+    }
+
+    /**
+     * A query's routing: the catalog version it was planned with, the shards in query order (the
+     * requested projects' order, else project name order; within a project, catalog order), and the
+     * routing notes (what a filter pruned or could not prune).
+     */
+    public record RoutePlan(ProjectShards catalog, List<PlannedShard> shards, List<String> notes) {
+        public RoutePlan {
+            shards = List.copyOf(shards);
+            notes = List.copyOf(notes);
+        }
+
+        public List<Route> routes() {
+            List<Route> out = new ArrayList<>(shards.size());
+            for (PlannedShard s : shards) out.add(s.route());
+            return out;
+        }
+    }
+
+    /** One route per shard of the requested projects in shard-name order; every project's shards when empty. */
     public List<Route> route(Collection<String> projects) {
-        TreeSet<String> names = new TreeSet<>();
-        if (projects == null || projects.isEmpty()) {
-            try {
-                for (ShardId s : catalog.shards()) names.add(s.value());
-            } catch (IOException e) {
-                throw new CatalogUnavailableException("unreadable shard catalog: " + e.getMessage(), e);
-            }
-        } else {
-            for (String p : projects) {
-                try {
-                    names.add(ShardId.ofProject(p).value());
-                } catch (IllegalArgumentException e) {
-                    throw new InvalidProjectException(e.getMessage(), e);
+        List<Route> out = new ArrayList<>(plan(projects, ShardFilter.NONE).routes());
+        out.sort(Comparator.comparing(r -> r.shard().value()));
+        return out;
+    }
+
+    /**
+     * Routes the shards of {@code projects} (empty: every project of the catalog) after pruning them
+     * with {@code filter}, from one read of the catalog mapping (see the class comment).
+     *
+     * @throws InvalidProjectException     a requested name is not a valid project name
+     * @throws CatalogUnavailableException unscoped, and the catalog cannot be used
+     */
+    public RoutePlan plan(Collection<String> projects, ShardFilter filter) {
+        boolean unscoped = projects == null || projects.isEmpty();
+        List<String> requested = new ArrayList<>();
+        if (!unscoped) {
+            for (String p : new java.util.LinkedHashSet<>(projects)) {
+                if (!ShardId.isProjectName(p)) {
+                    try {
+                        ShardId.ofProject(p);
+                    } catch (IllegalArgumentException e) {
+                        throw new InvalidProjectException(e.getMessage(), e);
+                    }
                 }
+                requested.add(p);
             }
         }
-        List<ReaderHeartbeat> readers = live.get();
-        List<Route> routes = new ArrayList<>(names.size());
-        for (String n : names) {
-            ShardId shard = new ShardId(n);
-            List<String> degraded = new ArrayList<>();
-            routes.add(new Route(shard, candidates(shard, readers, degraded), degraded));
+        ProjectShards mapping;
+        try {
+            mapping = catalog.projectShards();
+        } catch (CatalogTooOldException e) {
+            if (unscoped) throw e;
+            mapping = e.lastKnownProjects(); // a scoped query still maps its projects with the last good read
+        } catch (CatalogUnavailableException e) {
+            if (unscoped) throw e;
+            mapping = ProjectShards.identity(List.of()); // never read: every project is its [project] shard
+        } catch (IOException e) {
+            if (unscoped) throw new CatalogUnavailableException("unreadable shard catalog: " + e.getMessage(), e);
+            mapping = ProjectShards.identity(List.of());
         }
-        return routes;
+        List<String> names = unscoped ? new ArrayList<>(mapping.projects()) : requested;
+        ShardFilter f = filter == null ? ShardFilter.NONE : filter;
+        List<ReaderHeartbeat> readers = live.get();
+        Map<String, Integer> loads = new java.util.HashMap<>(); // one load snapshot per plan
+        for (ReaderHeartbeat r : readers) loads.put(r.node(), r.inFlight() + coordinatorInFlight.applyAsInt(r.node()));
+        List<PlannedShard> out = new ArrayList<>();
+        List<String> notes = new ArrayList<>();
+        for (String project : names) {
+            List<ShardId> shards = mapping.shardsOf(project);
+            boolean split = mapping.isSplit(project);
+            if (shards.isEmpty()) shards = List.of(ShardId.ofProject(project)); // unknown: its [project] shard
+            if (split) {
+                ShardFilter.Pruned pruned = f.prune(project, mapping.specOf(project), shards);
+                shards = pruned.kept();
+                notes.addAll(pruned.notes());
+            }
+            String turnKey = split ? project : null;
+            long turn = -1;
+            for (ShardId shard : shards) {
+                String key = turnKey != null ? turnKey : shard.value();
+                if (turnKey == null || turn < 0) {
+                    turn = rotation.computeIfAbsent(key, k -> new AtomicLong()).getAndIncrement();
+                }
+                List<String> degraded = new ArrayList<>();
+                out.add(new PlannedShard(new Route(shard, candidates(shard, readers, degraded, loads, turn), degraded),
+                        project, split));
+            }
+        }
+        return new RoutePlan(mapping, out, notes);
     }
 
     /**
@@ -127,6 +204,22 @@ public final class ShardRouter {
         return out;
     }
 
+    /**
+     * The project names of the catalog (e.g. a query mentioning a project), with the same fallbacks as
+     * {@link #catalogShardNames}: a split project is one name, never one per shard.
+     */
+    public List<String> catalogProjectNames() {
+        ProjectShards mapping;
+        try {
+            mapping = catalog.projectShards();
+        } catch (CatalogTooOldException e) {
+            mapping = e.lastKnownProjects();
+        } catch (IOException | RuntimeException e) {
+            return List.of();
+        }
+        return List.copyOf(mapping.projects());
+    }
+
     /** True when this reader holds the shard. */
     public boolean servesLocally(ShardId shard) {
         return local.test(shard);
@@ -141,7 +234,8 @@ public final class ShardRouter {
      *
      * @param degraded receives the readers left out because {@code shard} is degraded on them
      */
-    private List<ReaderHeartbeat> candidates(ShardId shard, List<ReaderHeartbeat> readers, List<String> degraded) {
+    private List<ReaderHeartbeat> candidates(ShardId shard, List<ReaderHeartbeat> readers, List<String> degraded,
+                                             Map<String, Integer> loads, long turn) {
         List<ReaderHeartbeat> eligible = new ArrayList<>();
         List<ReaderHeartbeat> warming = new ArrayList<>();
         List<ReaderHeartbeat> suspect = new ArrayList<>();
@@ -155,8 +249,8 @@ public final class ShardRouter {
             else if (ReaderHeartbeat.WARMING.equals(r.state())) warming.add(r);
             else eligible.add(r);
         }
-        List<ReaderHeartbeat> out = ordered(shard, eligible);
-        out.addAll(ordered(shard, warming));
+        List<ReaderHeartbeat> out = ordered(eligible, loads, turn);
+        out.addAll(ordered(warming, loads, turn));
         if (out.isEmpty() && !suspect.isEmpty()) {
             Map<String, Long> until = new java.util.HashMap<>();
             for (ReaderHeartbeat r : suspect) until.put(r.node(), health.suspectUntil(r.node()));
@@ -167,18 +261,15 @@ public final class ShardRouter {
         return out;
     }
 
-    /** {@code eligible} by least load, rotating among ties. */
-    private List<ReaderHeartbeat> ordered(ShardId shard, List<ReaderHeartbeat> eligible) {
+    /**
+     * {@code eligible} by least load, rotating among ties by {@code turn}. {@code loads} is one snapshot
+     * per plan: the coordinator's in-flight counts move while it runs, and a load read twice could break
+     * the sort's contract, leave an empty tie group, or order the shards of one project differently.
+     */
+    private List<ReaderHeartbeat> ordered(List<ReaderHeartbeat> eligible, Map<String, Integer> loads, long turn) {
         if (eligible.isEmpty()) return new ArrayList<>();
-        // One snapshot of each reader's load: the coordinator's in-flight counts move while this runs,
-        // and a load read twice could break the sort's contract or leave an empty tie group.
-        Map<String, Integer> loads = new java.util.HashMap<>();
-        for (ReaderHeartbeat r : eligible) {
-            loads.put(r.node(), r.inFlight() + coordinatorInFlight.applyAsInt(r.node()));
-        }
-        ToIntFunction<ReaderHeartbeat> load = r -> loads.get(r.node());
+        ToIntFunction<ReaderHeartbeat> load = r -> loads.getOrDefault(r.node(), r.inFlight());
         eligible.sort(Comparator.comparingInt(load).thenComparing(ReaderHeartbeat::node));
-        long turn = rotation.computeIfAbsent(shard, s -> new AtomicLong()).getAndIncrement();
         List<ReaderHeartbeat> out = new ArrayList<>(eligible.size());
         for (int i = 0; i < eligible.size(); ) {
             int j = i;

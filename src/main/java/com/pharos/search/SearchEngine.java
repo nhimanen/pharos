@@ -310,9 +310,12 @@ public class SearchEngine {
      */
     List<String> knownProjects() {
         Set<String> names = new java.util.LinkedHashSet<>();
-        for (ProjectMeta m : registry.listAll()) if (m.getName() != null) names.add(m.getName());
         DistributedSearch ds = distributed;
-        if (ds != null) names.addAll(ds.catalogShardNames());
+        for (ProjectMeta m : registry.listAll()) {
+            // a reader registers shards: a split project's shard ids are not project names
+            if (m.getName() != null && (ds == null || ShardId.isProjectName(m.getName()))) names.add(m.getName());
+        }
+        if (ds != null) names.addAll(ds.catalogProjectNames());
         return List.copyOf(names);
     }
 
@@ -327,7 +330,8 @@ public class SearchEngine {
         if (e instanceof CatalogTooOldException old) {
             Set<String> held = new java.util.HashSet<>();
             for (ProjectMeta m : registry.listAll()) if (m.getName() != null) held.add(m.getName());
-            List<String> missing = old.lastKnown().stream().map(ShardId::value).filter(n -> !held.contains(n)).toList();
+            List<String> missing = old.lastKnownProjects().shards().stream().map(ShardId::value)
+                    .filter(n -> !held.contains(n)).toList();
             if (missing.isEmpty()) { // this reader holds every shard of the last good catalog: nothing is lost
                 return "catalog is " + old.ageSeconds() + " s old; serving this reader's shards (complete)";
             }
@@ -380,6 +384,16 @@ public class SearchEngine {
      * Use this from {@link com.pharos.cli.SearchCommand} when {@code --debug} is set.
      */
     public SearchResponse searchWithTrace(SearchRequest req, boolean expand) throws IOException {
+        return searchWithTrace(req, expand, com.pharos.cluster.routing.ShardFilter.NONE);
+    }
+
+    /**
+     * As {@link #searchWithTrace(SearchRequest, boolean)}; on a cluster reader, {@code shardFilter} prunes
+     * the shards of split projects the query reads (Phase 6), and the trace notes what it pruned and
+     * why it could not prune where it could not. It selects shards only: it filters no documents.
+     */
+    public SearchResponse searchWithTrace(SearchRequest req, boolean expand,
+                                          com.pharos.cluster.routing.ShardFilter shardFilter) throws IOException {
         SearchTrace trace = new SearchTrace();
         trace.start();
 
@@ -401,7 +415,8 @@ public class SearchEngine {
         DistributedSearch.Query fanout = null;
         if (ds != null) {
             try {
-                fanout = ds.open(requestedProjects(req));
+                fanout = ds.open(requestedProjects(req), shardFilter);
+                for (String note : fanout.routingNotes()) trace.note(note);
             } catch (CatalogUnavailableException e) { // never read, or too old: as before fan-out, this reader's shards
                 warnings.add(catalogFallbackWarning(e));
             }

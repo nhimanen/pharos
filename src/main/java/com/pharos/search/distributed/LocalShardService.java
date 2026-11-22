@@ -75,13 +75,27 @@ public final class LocalShardService implements ShardSearchService {
     /**
      * One shard pinned: the generation and the reader of that generation, holding a reference on the
      * reader until {@link #close} (a swap retires the reader; it is closed only once released).
+     * {@code project} is the project whose documents the generation holds (their ids are
+     * {@code <project>:<fqn>}), {@code projectGeneration} the index run of a split project's shard
+     * (null otherwise); both from the generation's manifest.
      */
-    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) implements AutoCloseable {
+    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir, String project,
+                      Long projectGeneration) implements AutoCloseable {
+        public Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) {
+            this(shard, generation, reader, shardDir, shard.value(), null);
+        }
+
         @Override
         public void close() throws IOException {
             reader.decRef();
         }
     }
+
+    /** What a generation dir's manifest says about its documents; see {@link Pin}. */
+    private record GenInfo(String project, Long projectGeneration) {}
+
+    /** Per generation dir (immutable once materialised): read once, its manifest is small. */
+    private final Map<Path, GenInfo> genInfo = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** What a node knows of the search embedding model it serves vectors for. */
     public record Model(String modelId, int dims, String fingerprint) {}
@@ -137,9 +151,37 @@ public final class LocalShardService implements ShardSearchService {
             LuceneIndexer.PinnedReader p = lucene.openPinnedReader(shard.value());
             if (!p.reader().tryIncRef()) continue; // closed between the open and here: take the new one
             Path shardDir = p.luceneDir().getParent();
-            return new Pin(shard, generationOf(shardDir), p.reader(), shardDir);
+            GenInfo info = genInfo(shard, shardDir);
+            return new Pin(shard, generationOf(shardDir), p.reader(), shardDir, info.project(), info.projectGeneration());
         }
         throw new IOException("the reader of shard " + shard + " kept closing while being pinned");
+    }
+
+    /**
+     * The project and index run of a generation dir, from its {@code manifest.json} (a reader's
+     * generation); a dir without one (a single node's project dir) holds the documents of the project
+     * named like the shard. The project is the writer's: the one in the documents' ids.
+     */
+    private GenInfo genInfo(ShardId shard, Path shardDir) {
+        if (shardDir == null) return new GenInfo(shard.value(), null);
+        GenInfo cached = genInfo.get(shardDir);
+        if (cached != null) return cached;
+        GenInfo info = new GenInfo(shard.value(), null);
+        Path manifest = shardDir.resolve("manifest.json");
+        if (java.nio.file.Files.isRegularFile(manifest)) {
+            try {
+                com.pharos.cluster.objectstore.ShardManifest m = com.pharos.cluster.objectstore.ShardManifest.read(
+                        java.nio.file.Files.readAllBytes(manifest));
+                String project = m.projectMeta() != null && m.projectMeta().getName() != null
+                        ? m.projectMeta().getName() : shard.value();
+                info = new GenInfo(project, m.projectGeneration());
+            } catch (IOException | RuntimeException e) {
+                return info; // not cached: read again next time
+            }
+        }
+        if (genInfo.size() > 4096) genInfo.clear(); // generation dirs come and go; never grows without bound
+        genInfo.put(shardDir, info);
+        return info;
     }
 
     /**
@@ -202,7 +244,7 @@ public final class LocalShardService implements ShardSearchService {
         }
         List<String> fields = request.fields() == null ? List.of() : request.fields();
         try (Pin pin = pin(new ShardId(request.shard()))) {
-            return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms));
+            return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms), pin.projectGeneration());
         }
     }
 
@@ -364,7 +406,7 @@ public final class LocalShardService implements ShardSearchService {
         IndexSearcher searcher = new IndexSearcher(pin.reader());
         StoredFields stored = searcher.storedFields();
         for (String fqn : fqns) {
-            TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_ID, pin.shard().value() + ":" + fqn)), 1);
+            TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_ID, pin.project() + ":" + fqn)), 1);
             if (hits.scoreDocs.length == 0) continue;
             Document doc = stored.document(hits.scoreDocs[0].doc);
             out.put(fqn, List.of(doc.getValues(DocumentMapper.F_CALLED_METHODS)));
@@ -399,7 +441,7 @@ public final class LocalShardService implements ShardSearchService {
                         KeywordSearchStrategy.rawCandidates(searcher, hits, "graph"));
             }
             case "neighbors", "usages", "path" -> {
-                try (GraphView g = GraphViews.open(pin.shard().value(), pin.shardDir())) {
+                try (GraphView g = GraphViews.open(pin.project(), pin.shardDir())) {
                     yield new GraphResponse(pin.generation(), graphLists(g, op, fqns, request), null, null);
                 } catch (RuntimeException e) {
                     throw e;
@@ -452,11 +494,11 @@ public final class LocalShardService implements ShardSearchService {
     /** The documents of bare {@code fqns} on the pinned shard, keyed by fqn (score 1, type "exact"). */
     public Map<String, SearchResult> docsByFqn(Pin pin, List<String> fqns) throws IOException {
         List<String> ids = new ArrayList<>(fqns.size());
-        for (String fqn : fqns) ids.add(pin.shard().value() + ":" + fqn);
+        for (String fqn : fqns) ids.add(pin.project() + ":" + fqn);
         Map<String, SearchResult> byId = docsById(pin, ids);
         Map<String, SearchResult> out = new LinkedHashMap<>();
         for (String fqn : fqns) {
-            SearchResult r = byId.get(pin.shard().value() + ":" + fqn);
+            SearchResult r = byId.get(pin.project() + ":" + fqn);
             if (r != null) out.put(fqn, r);
         }
         return out;

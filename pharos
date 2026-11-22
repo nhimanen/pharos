@@ -748,6 +748,8 @@ def cmd_search(args):
         print(f"\n[trace] type={type_info}  total={total_ms}ms")
         for stage in meta.get("stages", []):
             print(f"[trace]   {stage['name']:<28} {stage['ms']}ms")
+        for note in meta.get("routing", []):
+            print(f"[trace]   routing: {note}")
 
 
 def cmd_pipelines(args):
