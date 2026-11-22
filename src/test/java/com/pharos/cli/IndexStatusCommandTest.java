@@ -47,6 +47,8 @@ class IndexStatusCommandTest {
         Path idx = Files.createDirectories(tmp.resolve("indexes").resolve(name));
         Files.writeString(idx.resolve("segments_1"), "x".repeat(100));
         if (stamped) IndexFormat.write(idx);
+        else IndexFormat.write(idx, new IndexFormat.Stamp(IndexFormat.MIN_READABLE_FORMAT, "0.0.0",
+                java.time.Instant.parse("2020-01-01T00:00:00Z"))); // the previous format: upgrade available
         registry.register(new ProjectMeta(name, root.toString(), idx.toString()));
     }
 
@@ -62,7 +64,7 @@ class IndexStatusCommandTest {
         j.get("projects").forEach(p -> byName.put(p.get("name").asText(), p));
         assertThat(byName.get("a").get("status").asText()).isEqualTo("ok");
         assertThat(byName.get("b").get("status").asText()).isEqualTo("upgrade-available");
-        assertThat(byName.get("b").get("format").asInt()).isZero();
+        assertThat(byName.get("b").get("format").asInt()).isEqualTo(IndexFormat.MIN_READABLE_FORMAT);
         assertThat(byName.get("a").get("indexBytes").asLong()).isGreaterThan(0);
         assertThat(byName.get("a").get("rootExists").asBoolean()).isTrue();
         for (String k : new String[]{"pharosVersion", "rootPath", "lastIndexed"}) {

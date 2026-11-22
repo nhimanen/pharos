@@ -80,12 +80,19 @@ class UpgradeIndexesCommandTest {
         return root;
     }
 
-    /** Index a project and optionally strip its stamp so it reads as format 0 (outdated). */
+    /** Index a project and optionally restamp it with the previous format (N-1: upgrade available). */
     private Path indexProject(String name, boolean outdated) throws Exception {
         Path root = copySample(name);
         manager.index(root, name, false, false, false, false, ProgressListener.SILENT);
-        if (outdated) Files.delete(dir(name).resolve("index-format.json"));
+        if (outdated) {
+            IndexFormat.write(dir(name), new IndexFormat.Stamp(IndexFormat.MIN_READABLE_FORMAT, "0.0.0",
+                    java.time.Instant.parse("2020-01-01T00:00:00Z")));
+        }
         return root;
+    }
+
+    private int format(String name) {
+        return IndexFormat.read(dir(name)).format();
     }
 
     private UpgradeIndexesCommand cmd() {
@@ -102,7 +109,7 @@ class UpgradeIndexesCommandTest {
         indexProject("b", true);
         int rc = run(cmd(), "--dry-run");
         assertThat(rc).isZero();
-        assertThat(Files.exists(dir("b").resolve("index-format.json"))).isFalse();
+        assertThat(format("b")).isEqualTo(IndexFormat.MIN_READABLE_FORMAT);
         assertThat(out.toString()).contains("b").doesNotContain("Re-index");
     }
 
@@ -208,7 +215,7 @@ class UpgradeIndexesCommandTest {
         assertThat(out.toString()).contains("0 upgraded").contains("1 failed");
         assertThat(err.toString()).contains("FAILED 'b'").contains("Call graph build failed")
                 .contains("simulated heap exhaustion");
-        assertThat(Files.exists(dir("b").resolve("index-format.json"))).as("not stamped").isFalse();
+        assertThat(format("b")).as("not stamped with this format").isNotEqualTo(com.pharos.indexer.IndexVersions.INDEX_FORMAT);
         assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
     }
 

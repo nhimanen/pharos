@@ -29,6 +29,7 @@ class LuceneIndexerSwapTest {
 
     private void writeIndex(Path dir, String... ids) throws IOException {
         shardDir.set(dir);
+        IndexFormat.write(dir); // a stamped generation (unstamped is format 0, below the read window)
         try (LuceneIndexer w = new LuceneIndexer(IndexConfig.defaults(), project -> shardDir.get());
              IndexWriter iw = w.openWriterFresh(PROJECT)) {
             for (String id : ids) {
