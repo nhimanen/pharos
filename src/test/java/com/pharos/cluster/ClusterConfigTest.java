@@ -519,4 +519,58 @@ class ClusterConfigTest {
                 + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:1\",\"token\":\"t\"," + trust + "}}"))
                 .hasMessageContaining("cluster.tls is not supported");
     }
+
+    // ── cluster.sharding (Phase 6) ──────────────────────────────────────────────────────────
+
+    @Test
+    void shardingDefaultsToProject() throws Exception {
+        ClusterConfig c = parse("{\"verbose\": true}");
+        assertThat(c.getSharding().defaultSpec()).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThat(c.getSharding().specFor("anything")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThat(c.getSharding().getProjects()).isEmpty();
+    }
+
+    @Test
+    void shardingByDefaultAndPerProject() throws Exception {
+        ClusterConfig c = parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, module]\","
+                + "\"projects\":{\"lucene\":\"[project, ring(path, shards=8)]\"}}}}");
+        assertThat(c.getSharding().specFor("lucene").toString()).isEqualTo("[project, ring(path, shards=8)]");
+        assertThat(c.getSharding().specFor("pharos").toString()).isEqualTo("[project, module]");
+        String saved = mapper.writeValueAsString(c);
+        assertThat(saved).contains("\"default\":\"[project, module]\"");
+        ClusterConfig back = mapper.readValue(saved, ClusterConfig.class);
+        back.validate();
+        assertThat(back.getSharding().specFor("lucene")).isEqualTo(c.getSharding().specFor("lucene"));
+    }
+
+    @Test
+    void invalidShardingIsRejected() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, hash(path) % 8]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.default: invalid shard spec '[project, hash(path) % 8]'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"projects\":{\"lucene\":\"[owner]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.projects.lucene: invalid shard spec");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"projects\":{\"my project\":\"[project]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not a valid cluster project name");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"\"}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("must not be empty");
+    }
+
+    /** Ruling P6-R9: a split project needs the object store; peer mode keeps [project]. */
+    @Test
+    void peerPullAllowsOnlyTheDefaultSpec() throws Exception {
+        String peer = "{\"cluster\":{\"role\":\"writer\",\"backend\":\"peer-pull\",\"token\":\"t\",";
+        assertThat(parse(peer + "\"sharding\":{\"default\":\"[project]\",\"projects\":{\"a\":\"[ project ]\"}}}}")
+                .getSharding().specFor("a")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"projects\":{\"lucene\":\"[project, ring(path, shards=4)]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("cluster.sharding.projects.lucene is [project, ring(path, shards=4)], but cluster.backend"
+                        + " 'peer-pull' supports only the default spec [project]: splitting a project into several"
+                        + " shards needs cluster.backend 'object-store'");
+        assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"default\":\"[project, module]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.default is [project, module], but cluster.backend 'peer-pull'");
+    }
 }

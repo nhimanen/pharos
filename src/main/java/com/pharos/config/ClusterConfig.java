@@ -37,6 +37,8 @@ public class ClusterConfig {
     private StatusConfig status = new StatusConfig();
     /** {@code cluster.peers}: the peer-pull backend (discovery, transfer cap, long-poll). */
     private PeersConfig peers = new PeersConfig();
+    /** {@code cluster.sharding}: the shard spec, by default and per project. */
+    private ShardingConfig sharding = new ShardingConfig();
     /** {@code cluster.tls}: absent means plain HTTP. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private TlsConfig tls;
@@ -179,6 +181,8 @@ public class ClusterConfig {
         }
         if (peers == null) peers = new PeersConfig();
         peers.validate();
+        if (sharding == null) sharding = new ShardingConfig();
+        sharding.validate(backend);
         if (backend == BackendKind.PEER_PULL && role == NodeRole.READER && peers.getDiscovery() == null) {
             throw new IllegalStateException("cluster.peers.discovery is required on a peer-pull reader"
                     + " (dns:<name>[:port] or seeds:<url>,<url>)");
@@ -289,6 +293,9 @@ public class ClusterConfig {
         this.writer.peerMode = backend == BackendKind.PEER_PULL;
     }
     public PeersConfig getPeers() { return peers; }
+
+    public ShardingConfig getSharding() { return sharding; }
+    public void setSharding(ShardingConfig s) { this.sharding = s == null ? new ShardingConfig() : s; }
     public void setPeers(PeersConfig p) { this.peers = p == null ? new PeersConfig() : p; }
     public TlsConfig getTls() { return tls; }
     public void setTls(TlsConfig t) { this.tls = t; }
@@ -859,6 +866,74 @@ public class ClusterConfig {
         public void setQpsPerReader(double v) { this.qpsPerReader = v; }
         public long getBacklog() { return backlog; }
         public void setBacklog(long v) { this.backlog = v; }
+    }
+
+    /**
+     * {@code cluster.sharding}: how projects are divided into shards ({@link com.pharos.cluster.sharding.ShardSpec}).
+     * <ul>
+     *   <li>{@code default} ({@code "[project]"}): the spec of every project without its own;</li>
+     *   <li>{@code projects.<name>}: the spec of one project, for example
+     *       {@code "lucene": "[project, ring(path, shards=8)]"}.</li>
+     * </ul>
+     * A spec other than {@code [project]} needs {@code cluster.backend: object-store} (ruling P6-R9).
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class ShardingConfig {
+        @com.fasterxml.jackson.annotation.JsonProperty("default")
+        private String defaultSpec = "[project]";
+        private java.util.Map<String, String> projects = new java.util.TreeMap<>();
+
+        void validate(BackendKind backend) {
+            if (projects == null) projects = new java.util.TreeMap<>();
+            java.util.Map<String, com.pharos.cluster.sharding.ShardSpec> parsed = new java.util.LinkedHashMap<>();
+            parsed.put("cluster.sharding.default", parse("cluster.sharding.default", defaultSpec));
+            for (java.util.Map.Entry<String, String> e : projects.entrySet()) {
+                String where = "cluster.sharding.projects." + e.getKey();
+                if (!com.pharos.cluster.ShardId.isProjectName(e.getKey())) {
+                    throw new IllegalStateException(where + ": '" + e.getKey() + "' is not a valid cluster project"
+                            + " name (letters, digits, '.', '_' or '-')");
+                }
+                parsed.put(where, parse(where, e.getValue()));
+            }
+            if (backend == BackendKind.PEER_PULL) {
+                for (java.util.Map.Entry<String, com.pharos.cluster.sharding.ShardSpec> e : parsed.entrySet()) {
+                    if (!e.getValue().isDefault()) {
+                        throw new IllegalStateException(e.getKey() + " is " + e.getValue() + ", but cluster.backend"
+                                + " 'peer-pull' supports only the default spec [project]: splitting a project into"
+                                + " several shards needs cluster.backend 'object-store'");
+                    }
+                }
+            }
+        }
+
+        private static com.pharos.cluster.sharding.ShardSpec parse(String where, String spec) {
+            if (spec == null || spec.isBlank()) throw new IllegalStateException(where + " must not be empty");
+            try {
+                return com.pharos.cluster.sharding.ShardSpec.parse(spec);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException(where + ": " + e.getMessage());
+            }
+        }
+
+        /** The configured spec of {@code project}: its own, else the default. */
+        public com.pharos.cluster.sharding.ShardSpec specFor(String project) {
+            String s = projects == null ? null : projects.get(project);
+            return com.pharos.cluster.sharding.ShardSpec.parse(s != null ? s : defaultSpec);
+        }
+
+        /** The configured default spec. */
+        public com.pharos.cluster.sharding.ShardSpec defaultSpec() {
+            return com.pharos.cluster.sharding.ShardSpec.parse(defaultSpec);
+        }
+
+        @com.fasterxml.jackson.annotation.JsonProperty("default")
+        public String getDefault() { return defaultSpec; }
+        @com.fasterxml.jackson.annotation.JsonProperty("default")
+        public void setDefault(String v) { this.defaultSpec = v; }
+        public java.util.Map<String, String> getProjects() { return projects; }
+        public void setProjects(java.util.Map<String, String> v) {
+            this.projects = v == null ? new java.util.TreeMap<>() : new java.util.TreeMap<>(v);
+        }
     }
 
     /** {@code cluster.status.windows}: rule durations in seconds (shortened by the Phase 4 gate). */
