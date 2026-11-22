@@ -100,8 +100,10 @@ public class WebCommand implements Callable<Integer> {
                 });
                 // a peer-mode reader serves the generations it holds in full to other readers (token-guarded)
                 clusterRuntime.peerFileSource().ifPresent(webServer::setPeerFileSource);
-                clusterRuntime.serverTls().ifPresent(t -> webServer.setTls(
-                        new WebServer.Tls(t.getKeystore(), t.getKeystoreType(), t.password())));
+                clusterRuntime.serverTls().ifPresent(t -> {
+                    webServer.setTls(new WebServer.Tls(t.getKeystore(), t.getKeystoreType(), t.password()));
+                    webServer.setLocalPlainPort(t.localPortFor(port)); // ./pharos on this host (I3)
+                });
             }
             webServer.start(port);
             if (!noOpen) {

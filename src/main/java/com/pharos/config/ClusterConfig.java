@@ -670,8 +670,17 @@ public class ClusterConfig {
         @JsonInclude(JsonInclude.Include.NON_NULL)
         private String passwordEnv;
         private String keystoreType = "PKCS12";
+        /**
+         * With {@code keystore}: the port of the plain-HTTP listener on 127.0.0.1 that {@code ./pharos}
+         * uses on this writer (everything except {@code /replication/*}); null means the web port + 1.
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Integer localPort;
 
         void validate() {
+            if (localPort != null && (localPort < 1 || localPort > 65535)) {
+                throw new IllegalStateException("cluster.tls.localPort must be between 1 and 65535, got " + localPort);
+            }
             if ((keystore != null || truststore != null) && (passwordEnv == null || passwordEnv.isBlank())) {
                 throw new IllegalStateException("cluster.tls.passwordEnv is required with cluster.tls.keystore or"
                         + " cluster.tls.truststore (the name of the environment variable holding the password)");
@@ -699,6 +708,13 @@ public class ClusterConfig {
         public void setTruststore(Path v) { this.truststore = v; }
         public String getPasswordEnv() { return passwordEnv; }
         public void setPasswordEnv(String v) { this.passwordEnv = v; }
+        public Integer getLocalPort() { return localPort; }
+        public void setLocalPort(Integer v) { this.localPort = v; }
+
+        /** The loopback plain-HTTP port next to TLS web port {@code webPort}: {@code localPort}, or {@code webPort + 1}. */
+        public int localPortFor(int webPort) {
+            return localPort != null ? localPort : webPort + 1;
+        }
         public String getKeystoreType() { return keystoreType; }
         public void setKeystoreType(String v) { this.keystoreType = v; }
     }

@@ -90,6 +90,21 @@ public class WebServer {
         this.tls = java.util.Objects.requireNonNull(tls, "tls");
     }
 
+    /** With {@link #setTls}: the loopback plain-HTTP port ({@code cluster.tls.localPort}); 0 = none. */
+    private volatile int localPlainPort = 0;
+
+    /**
+     * With {@link #setTls}, also listen with plain HTTP on {@code 127.0.0.1:port} (Phase 5 I3), so
+     * {@code ./pharos} on the writer reaches its own daemon without a truststore. That listener serves
+     * everything except {@code /replication/*} (404): peers only ever get replication over TLS. It
+     * cannot share the TLS port: the TLS connector binds the wildcard address, and Linux refuses a
+     * loopback bind on a port a wildcard socket holds.
+     */
+    public void setLocalPlainPort(int port) {
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("local port must be 1-65535, got " + port);
+        this.localPlainPort = port;
+    }
+
     /**
      * A peer-pull reader's writer view reported by {@code /health} as {@code peers} (writers,
      * {@code shard X claimed by A and B} conflicts, unavailable shards), or a peer-pull writer's
@@ -376,19 +391,35 @@ public class WebServer {
 
     /** @param pharosDir directory that receives the usage log ({@code logs/usage.jsonl}) */
     public Javalin start(int port, Path pharosDir) {
+        Tls t = tls;
+        int local = localPlainPort;
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
             // Global on a reader: Javalin has one request-size cap, so every route (not only /internal/*)
             // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
             if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
-            Tls t = tls;
             java.time.Duration idle = idleTimeout;
             if (t != null || idle != null) {
                 // Our own connector replaces Javalin's default one (which it adds only when none is set).
                 config.jetty.addConnector((server, http) -> connector(server, http, port, t, idle));
             }
+            if (t != null && local > 0) { // after the TLS one: app.port() stays the TLS port
+                config.jetty.addConnector((server, http) -> {
+                    org.eclipse.jetty.server.ServerConnector c = connector(server, http, local, null, idle);
+                    c.setHost("127.0.0.1");
+                    return c;
+                });
+            }
         });
+        if (t != null && local > 0) {
+            // First before-handler: no /replication/* route (nor its token filter) is reached on the plain listener.
+            app.before(ctx -> {
+                if (ctx.req().getLocalPort() == local && replicationPath(ctx)) {
+                    throw new io.javalin.http.NotFoundResponse("not served on the local plain-HTTP listener");
+                }
+            });
+        }
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
         UsageLogger usage = new UsageLogger(pharosDir);
@@ -1022,9 +1053,33 @@ public class WebServer {
         if (files != null && repl == null) files.mount(app);
 
         app.start(port);
-        System.out.printf("Web UI available at %s://localhost:%d%n", tls != null ? "https" : "http", port);
+        System.out.printf("Web UI available at %s://localhost:%d%n", t != null ? "https" : "http", port);
+        if (t != null && local > 0) {
+            System.out.printf("Local plain HTTP (127.0.0.1 only, no /replication/*) at http://127.0.0.1:%d%n", local);
+        }
         log.info("Web server started on port {}", port);
         return app;
+    }
+
+    /** {@code /replication} or below it, raw or percent-decoded. */
+    private static boolean replicationPath(io.javalin.http.Context ctx) {
+        String raw = ctx.req().getRequestURI();
+        String decoded;
+        try {
+            decoded = java.net.URLDecoder.decode(raw == null ? "" : raw.replace("+", "%2B"),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return true; // not decodable: refuse
+        }
+        for (String p : new String[]{ctx.path(), raw, decoded}) {
+            if (p == null) continue;
+            String n = p.replaceAll("/{2,}", "/").toLowerCase(java.util.Locale.ROOT);
+            if (n.equals(com.pharos.cluster.peer.ReplicationEndpoint.PREFIX)
+                    || n.startsWith(com.pharos.cluster.peer.ReplicationEndpoint.PREFIX + "/")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** The listening connector: TLS (from {@link Tls}) or plain HTTP; {@code idle} null keeps the default. */

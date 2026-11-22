@@ -13,7 +13,9 @@ JAR resolution order:
   1. <script-dir>/target/pharos-*.jar   (development / repo checkout)
   2. ~/.pharos/bin/pharos.jar            (installed)
 
-Daemon port: 7171  (override with PHAROS_PORT env var)
+Daemon port: 7171  (override with PHAROS_PORT env var). On a peer-pull writer with
+cluster.tls.keystore the client talks to the daemon's plain-HTTP loopback listener,
+http://127.0.0.1:<cluster.tls.localPort, default port + 1>.
 
 Env vars honored on every JVM launch:
   PHAROS_HEAP   pass -Xmx<value> (e.g. PHAROS_HEAP=16g pharos index ...)
@@ -48,7 +50,26 @@ PHAROS_DUMPS = PHAROS_DIR / "dumps"
 DAEMON_PORT = int(os.environ.get("PHAROS_PORT", "7171"))
 DAEMON_PID_FILE = PHAROS_DIR / "daemon.pid"
 DAEMON_LOG_FILE = PHAROS_DIR / "daemon.log"
-BASE_URL = f"http://localhost:{DAEMON_PORT}"
+
+
+def _local_daemon_url(config_file: Path, port: int) -> str:
+    """Where this client reaches its daemon.
+
+    Normally http://localhost:<port>. A peer-pull writer with cluster.tls.keystore listens with TLS
+    only on <port>, plus plain HTTP on 127.0.0.1:<cluster.tls.localPort> (default port + 1) that
+    serves everything except /replication/*: the client uses that one (no truststore needed).
+    """
+    try:
+        tls = (json.loads(config_file.read_text()).get("cluster") or {}).get("tls") or {}
+    except Exception:
+        tls = {}
+    if isinstance(tls, dict) and tls.get("keystore"):
+        local = tls.get("localPort")
+        return f"http://127.0.0.1:{int(local) if local else port + 1}"
+    return f"http://localhost:{port}"
+
+
+BASE_URL = _local_daemon_url(PHAROS_DIR / "config.json", DAEMON_PORT)
 
 
 # ── Shared JVM flags ─────────────────────────────────────────────────────────
@@ -970,7 +991,7 @@ def cmd_publish(args):
 def cmd_web(args):
     """Ensure the daemon is running and open the web UI in a browser."""
     ensure_daemon()
-    url = f"http://localhost:{DAEMON_PORT}"
+    url = BASE_URL  # the loopback plain-HTTP listener on a TLS writer
     print(f"Web UI available at {url}")
     if not args.no_open:
         try:

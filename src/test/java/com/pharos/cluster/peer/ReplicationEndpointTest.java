@@ -553,6 +553,56 @@ class ReplicationEndpointTest {
                 .isInstanceOf(IOException.class);
     }
 
+    /**
+     * Phase 5 I3: a TLS writer also listens with plain HTTP on 127.0.0.1 at {@code cluster.tls.localPort},
+     * so {@code ./pharos} reaches its own daemon; that listener serves everything but {@code /replication/*}.
+     */
+    @Test
+    void tlsWriterAlsoServesPlainHttpOnLoopbackWithoutReplication() throws Exception {
+        open(config);
+        indexFull();
+        char[] password = "changeit-test".toCharArray();
+        Path keystore = selfSignedKeystore(password);
+        int local;
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            local = s.getLocalPort();
+        }
+        WebServer web = new WebServer(null, ProjectRegistry.at(tmp.resolve("web-registry.json")), null, null, null,
+                NodeRole.WRITER);
+        web.setReplicationEndpoint(backend.endpoint());
+        web.setTls(new WebServer.Tls(keystore, "PKCS12", password));
+        web.setLocalPlainPort(local);
+        Javalin app = web.start(0, tmp.resolve("home"));
+        apps.add(app);
+        assertThat(app.port()).as("the TLS port is the main port").isNotEqualTo(local);
+
+        String base = "http://127.0.0.1:" + local;
+        HttpResponse<String> health = http.send(HttpRequest.newBuilder(URI.create(base + "/health")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(health.statusCode()).isEqualTo(200);
+        assertThat(health.body()).contains("\"ok\"");
+        HttpResponse<String> api = http.send(HttpRequest.newBuilder(URI.create(base + "/api/projects")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(api.statusCode()).isEqualTo(200);
+        assertThat(api.body()).startsWith("[");
+        for (String path : List.of("/catalog", "/" + PROJECT + "/latest", "/readers", "/peers", "/synonyms", "", "/")) {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(base + ReplicationEndpoint.PREFIX + path))
+                    .header(InternalApi.TOKEN_HEADER, TOKEN).build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(r.statusCode()).as(path).isEqualTo(404);
+            assertThat(r.body()).as(path).doesNotContain("generation");
+        }
+        // the plain listener is loopback only
+        java.net.InetAddress external = java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
+                .stream().flatMap(i -> java.util.Collections.list(i.getInetAddresses()).stream())
+                .filter(a -> !a.isLoopbackAddress() && a instanceof java.net.Inet4Address).findFirst().orElse(null);
+        if (external != null) {
+            try (java.net.Socket sock = new java.net.Socket()) {
+                assertThatThrownBy(() -> sock.connect(new java.net.InetSocketAddress(external, local), 2000))
+                        .isInstanceOf(IOException.class);
+            }
+        }
+    }
+
     @Test
     void tlsWithAMissingKeystoreFailsToStart() {
         WebServer web = new WebServer(null, null, null, null, null, NodeRole.WRITER);
