@@ -31,13 +31,21 @@ public record PharosClusterStatus(
     /** Condition types besides the phases. */
     public static final String CONDITION_SPEC_INVALID = "SpecInvalid";
     public static final String CONDITION_UPGRADE_BLOCKED = "UpgradeBlocked";
+    public static final String CONDITION_STORAGE_READY = "StorageReady";
+    /** A spec change to a volume that the existing object cannot take (v1 neither resizes nor shrinks). */
+    public static final String CONDITION_VOLUME_CHANGE_NOT_APPLIED = "VolumeChangeNotApplied";
+    /** Applying the desired objects failed; the message says which and why. */
+    public static final String CONDITION_APPLY_FAILED = "ApplyFailed";
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Replicas(Integer desired, Integer ready) {}
 
-    /** {@code kind}: {@code minio} | {@code s3}. */
+    /**
+     * {@code kind}: {@code minio} | {@code s3}; immutable once set (switching would orphan the indexes).
+     * {@code bucketRetries}: how often the failed minio bucket Job was re-created (drives its backoff).
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record StorageStatus(String kind, Boolean ready) {}
+    public record StorageStatus(String kind, Boolean ready, Integer bucketRetries) {}
 
     /** A project: whether its registration Job succeeded, plus what {@code /cluster/status} reports. */
     @JsonInclude(JsonInclude.Include.NON_NULL)

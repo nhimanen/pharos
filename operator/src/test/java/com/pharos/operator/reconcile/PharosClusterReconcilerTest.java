@@ -76,7 +76,7 @@ class PharosClusterReconcilerTest {
         assertThat(condition(status, "Provisioning").getMessage())
                 .isEqualTo("Waiting for MinIO, writers (0/1 ready), readers (0/1 ready), the router.");
         assertThat(condition(status, "Ready").getStatus()).isEqualTo("False");
-        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false));
+        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false, null));
 
         // MinIO up but the bucket Job not done yet: storage is still not ready
         assertThat(at(T0).provisionedStatus(c, 1, 1, new PharosClusterReconciler.Observed(1, 1, 1, 1, 1, 1, false))
@@ -88,7 +88,7 @@ class PharosClusterReconcilerTest {
         assertThat(condition(ready, "Ready").getStatus()).isEqualTo("True");
         assertThat(condition(ready, "Provisioning").getStatus()).isEqualTo("False");
         assertThat(ready.writers()).isEqualTo(new PharosClusterStatus.Replicas(2, 2));
-        assertThat(ready.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", true));
+        assertThat(ready.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", true, null));
     }
 
     @Test
@@ -115,5 +115,78 @@ class PharosClusterReconcilerTest {
         PharosClusterStatus next = at(T0.plusSeconds(900)).reconcile(c, null).getResource().orElseThrow().getStatus();
         assertThat(condition(next, "SpecInvalid").getLastTransitionTime()).isEqualTo(T0.toString());
         assertThat(condition(next, "SpecInvalid").getMessage()).contains("min (2) is above max (1)");
+    }
+
+    @Test
+    void noDependentCanDeleteAnything() {
+        // JOSDK deletes a Deleter whose precondition stops holding; data-bearing objects must never go that way
+        assertThat(Dependents.ALL).hasSize(9).allSatisfy(type -> {
+            assertThat(io.javaoperatorsdk.operator.api.reconciler.dependent.Deleter.class.isAssignableFrom(type))
+                    .as(type.getSimpleName()).isFalse();
+        });
+        assertThat(io.javaoperatorsdk.operator.processing.dependent.Updater.class.isAssignableFrom(Dependents.Secrets.class))
+                .isFalse();
+        assertThat(io.javaoperatorsdk.operator.processing.dependent.Updater.class.isAssignableFrom(Dependents.Jobs.class))
+                .isFalse();
+    }
+
+    @Test
+    void storageKindChangeIsRefused() {
+        PharosCluster c = cluster(spec(new PharosClusterSpec.Storage(null, new PharosClusterSpec.S3(
+                "https://s3.example", "b", null, null, "creds")), 1, 1));
+        assertThat(PharosClusterReconciler.storageKindChange(c)).isNull(); // no status yet
+        c.setStatus(new PharosClusterStatus("Ready", 1L, null, null,
+                new PharosClusterStatus.StorageStatus("minio", true, null), null, null, null, List.of()));
+        assertThat(PharosClusterReconciler.storageKindChange(c))
+                .startsWith("spec.storage: the storage kind is immutable (it is minio; the spec asks for s3)");
+        UpdateControl<PharosCluster> control = at(T0).reconcile(c, null); // invalid: the context is never used
+        PharosClusterStatus status = control.getResource().orElseThrow().getStatus();
+        assertThat(status.phase()).isEqualTo("Pending");
+        assertThat(status.storage().kind()).isEqualTo("minio");
+        assertThat(condition(status, "SpecInvalid").getMessage()).contains("the storage kind is immutable");
+    }
+
+    @Test
+    void volumesKeepTheirSizeAndNeverShrink() {
+        List<String> notes = new java.util.ArrayList<>();
+        assertThat(PharosClusterReconciler.keepSize(null, "80Gi", "f", notes)).isEqualTo("80Gi");
+        assertThat(PharosClusterReconciler.keepSize("50Gi", "51200Mi", "f", notes)).isEqualTo("50Gi");
+        assertThat(notes).isEmpty(); // the same size, written differently
+        assertThat(PharosClusterReconciler.keepSize("50Gi", "80Gi", "spec.writers.workVolume", notes)).isEqualTo("50Gi");
+        assertThat(PharosClusterReconciler.noShrink("20Gi", "30Gi", notes)).isEqualTo("30Gi");
+        assertThat(PharosClusterReconciler.noShrink("20Gi", "10Gi", notes)).isEqualTo("20Gi");
+        assertThat(notes).containsExactly(
+                "spec.writers.workVolume: 50Gi -> 80Gi is not applied (StatefulSet volumes cannot be resized in v1);"
+                        + " the volumes stay 50Gi",
+                "spec.storage.minio.storage: 20Gi -> 10Gi is not applied (a volume never shrinks); it stays 20Gi");
+    }
+
+    @Test
+    void bucketBackoffDoublesUpToFifteenMinutes() {
+        assertThat(PharosClusterReconciler.bucketBackoffSeconds(null)).isEqualTo(60);
+        assertThat(PharosClusterReconciler.bucketBackoffSeconds(1)).isEqualTo(120);
+        assertThat(PharosClusterReconciler.bucketBackoffSeconds(3)).isEqualTo(480);
+        assertThat(PharosClusterReconciler.bucketBackoffSeconds(4)).isEqualTo(900);
+        assertThat(PharosClusterReconciler.bucketBackoffSeconds(60)).isEqualTo(900);
+    }
+
+    @Test
+    void applyErrorsBecomeOneConditionKeepingTheStatus() {
+        PharosCluster c = cluster(spec(new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("20Gi"), null), 1, 2));
+        c.setStatus(new PharosClusterStatus("Provisioning", 3L, new PharosClusterStatus.Replicas(1, 0), null,
+                new PharosClusterStatus.StorageStatus("minio", false, null), null, null, null, List.of()));
+        var e = new io.javaoperatorsdk.operator.AggregatedOperatorException("workflow failed", java.util.Map.of(
+                "writers", new IllegalStateException("StatefulSet is invalid: spec: Forbidden\nmore lines"),
+                "token", new IllegalStateException("creating Secret demo-token failed (HTTP 500)")));
+        var control = at(T0).updateErrorStatus(c, null, e);
+        PharosClusterStatus status = control.getResource().orElseThrow().getStatus();
+        assertThat(status.phase()).isEqualTo("Provisioning");
+        assertThat(status.writers()).isEqualTo(new PharosClusterStatus.Replicas(1, 0));
+        Condition failed = condition(status, "ApplyFailed");
+        assertThat(failed.getStatus()).isEqualTo("True");
+        assertThat(failed.getMessage()).isEqualTo("token: creating Secret demo-token failed (HTTP 500);"
+                + " writers: StatefulSet is invalid: spec: Forbidden");
+        assertThat(PharosClusterReconciler.applyError(new RuntimeException("x".repeat(1000))))
+                .hasSize(PharosClusterReconciler.MAX_ERROR_TEXT + 3);
     }
 }

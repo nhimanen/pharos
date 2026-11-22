@@ -23,6 +23,7 @@ import io.fabric8.kubernetes.api.model.networking.v1.NetworkPolicy;
 import io.fabric8.kubernetes.api.model.policy.v1.PodDisruptionBudget;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
+import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
 import io.fabric8.kubernetes.client.utils.Serialization;
 import io.javaoperatorsdk.operator.Operator;
 import org.junit.jupiter.api.AfterEach;
@@ -62,6 +63,7 @@ class ReconcilerMockServerTest {
             PodDisruptionBudget.class, NetworkPolicy.class);
 
     KubernetesClient client;
+    KubernetesMockServer server;
 
     private Operator operator;
     private PharosClusterReconciler reconciler;
@@ -98,8 +100,29 @@ class ReconcilerMockServerTest {
         savedLevels.forEach((name, level) -> ((Logger) LoggerFactory.getLogger(name)).setLevel(level));
     }
 
+    private final MutableClock clock = new MutableClock(java.time.Instant.parse("2026-11-22T10:00:00Z"));
+
+    /** A clock the test moves by hand (the bucket Job's backoff). */
+    static final class MutableClock extends java.time.Clock {
+        private volatile java.time.Instant now;
+
+        MutableClock(java.time.Instant now) { this.now = now; }
+
+        void advance(Duration d) { now = now.plus(d); }
+
+        @Override public java.time.ZoneId getZone() { return java.time.ZoneOffset.UTC; }
+
+        @Override public java.time.Clock withZone(java.time.ZoneId zone) { return this; }
+
+        @Override public java.time.Instant instant() { return now; }
+    }
+
     private void startOperator() {
-        reconciler = new PharosClusterReconciler(SETTINGS);
+        startOperator(SETTINGS);
+    }
+
+    private void startOperator(OperatorSettings settings) {
+        reconciler = new PharosClusterReconciler(clock, settings);
         operator = new Operator(o -> o.withKubernetesClient(client)
                 .withCloseClientOnStop(false)
                 .withSSABasedCreateUpdateMatchForDependentResources(false)
@@ -165,7 +188,7 @@ class ReconcilerMockServerTest {
         PharosClusterStatus status = current("demo").getStatus();
         assertThat(status.writers()).isEqualTo(new PharosClusterStatus.Replicas(1, 0));
         assertThat(status.readers()).isEqualTo(new PharosClusterStatus.Replicas(2, 0));
-        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false));
+        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false, null));
         assertThat(client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get()
                 .getMetadata().getOwnerReferences()).singleElement()
                 .satisfies(o -> assertThat(o.getName()).isEqualTo("demo"));
@@ -278,6 +301,144 @@ class ReconcilerMockServerTest {
         assertThat(objects).containsKeys("Secret/prod-token", "StatefulSet/prod-writers", "Deployment/prod-router");
         assertThat(objects.keySet()).noneMatch(k -> k.contains("minio"));
         assertThat(objects.keySet()).filteredOn(k -> k.startsWith("Secret/")).containsExactly("Secret/prod-token");
-        assertThat(current("prod").getStatus().storage()).isEqualTo(new PharosClusterStatus.StorageStatus("s3", true));
+        assertThat(current("prod").getStatus().storage()).isEqualTo(new PharosClusterStatus.StorageStatus("s3", true, null));
+    }
+
+    private PharosCluster provisionedMinio() throws InterruptedException {
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("status Provisioning", () -> {
+            PharosCluster c = current("demo");
+            return c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        await("every minio object", () -> managedVersions().keySet().containsAll(List.of("PersistentVolumeClaim/demo-minio",
+                "Secret/demo-minio", "Secret/demo-token", "Job/demo-minio-bucket", "StatefulSet/demo-minio")));
+        return current("demo");
+    }
+
+    private io.fabric8.kubernetes.api.model.Condition condition(String cluster, String type) {
+        PharosClusterStatus st = current(cluster).getStatus();
+        return st == null || st.conditions() == null ? null
+                : st.conditions().stream().filter(c -> c.getType().equals(type)).findFirst().orElse(null);
+    }
+
+    private boolean conditionTrue(String cluster, String type) {
+        var c = condition(cluster, type);
+        return c != null && "True".equals(c.getStatus());
+    }
+
+    private static PharosClusterSpec spec(PharosClusterSpec s, PharosClusterSpec.Storage storage, String version,
+                                          PharosClusterSpec.RoleSpec writers) {
+        return new PharosClusterSpec(version, storage, s.embeddings(), s.projects(), writers, s.readers(), s.router(),
+                s.autoscaling(), s.pharosConfig());
+    }
+
+    @Test
+    void storageKindIsImmutableAndNothingIsDeleted() throws Exception {
+        PharosCluster c = provisionedMinio();
+        Map<String, String> uids = new TreeMap<>();
+        for (HasMetadata o : allManaged()) uids.put(o.getKind() + "/" + o.getMetadata().getName(), o.getMetadata().getUid());
+
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, TestClusters.s3().getSpec().storage(), s.version(), s.writers()));
+        client.resource(c).update();
+        await("SpecInvalid", () -> conditionTrue("demo", "SpecInvalid"));
+        assertThat(condition("demo", "SpecInvalid").getMessage())
+                .contains("spec.storage: the storage kind is immutable (it is minio; the spec asks for s3)");
+        assertThat(current("demo").getStatus().storage().kind()).isEqualTo("minio");
+
+        // The data-bearing objects (and everything else) are still there, the very same objects.
+        Map<String, String> after = new TreeMap<>();
+        for (HasMetadata o : allManaged()) after.put(o.getKind() + "/" + o.getMetadata().getName(), o.getMetadata().getUid());
+        assertThat(after).isEqualTo(uids);
+        assertThat(after).containsKeys("PersistentVolumeClaim/demo-minio", "Secret/demo-minio", "Secret/demo-token");
+    }
+
+    @Test
+    void volumeChangeIsNotAppliedButReplicasAndVersionAre() throws Exception {
+        PharosCluster c = provisionedMinio();
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("10Gi"), null), "1.6.1",
+                new PharosClusterSpec.RoleSpec(2, 4, s.writers().resources(), "80Gi", null, null)));
+        client.resource(c).update();
+        await("VolumeChangeNotApplied", () -> conditionTrue("demo", "VolumeChangeNotApplied"));
+
+        StatefulSet writers = client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get();
+        assertThat(writers.getSpec().getReplicas()).isEqualTo(2);
+        assertThat(writers.getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("pharos:1.6.1");
+        assertThat(writers.getSpec().getVolumeClaimTemplates().getFirst().getSpec().getResources().getRequests()
+                .get("storage").toString()).isEqualTo("50Gi");
+        assertThat(client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getSpec().getResources().getRequests().get("storage").toString()).isEqualTo("20Gi");
+        assertThat(condition("demo", "VolumeChangeNotApplied").getMessage())
+                .contains("spec.writers.workVolume: 50Gi -> 80Gi is not applied")
+                .contains("spec.storage.minio.storage: 20Gi -> 10Gi is not applied");
+        assertThat(conditionTrue("demo", "ApplyFailed")).isFalse();
+
+        // Growing the MinIO volume is applied.
+        PharosCluster again = current("demo");
+        again.setSpec(spec(again.getSpec(), new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("30Gi"), null),
+                "1.6.1", again.getSpec().writers()));
+        client.resource(again).update();
+        await("the MinIO PVC grows", () -> "30Gi".equals(client.persistentVolumeClaims().inNamespace(NS)
+                .withName("demo-minio").get().getSpec().getResources().getRequests().get("storage").toString()));
+    }
+
+    @Test
+    void bumpedMcImageChangesNoJobAndFailsNothing() throws Exception {
+        provisionedMinio();
+        Map<String, String> before = managedVersions();
+        operator.stop();
+        startOperator(new OperatorSettings("pharos", "minio:test", "mc:newer"));
+        await("the first reconcile after the restart", () -> reconciler.reconciles.get() >= 1);
+        assertThat(managedVersions()).isEqualTo(before);
+        assertThat(client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get()
+                .getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("mc:test");
+        assertThat(conditionTrue("demo", "ApplyFailed")).isFalse();
+    }
+
+    @Test
+    void applyFailureIsReportedAsACondition() throws Exception {
+        server.expect().post().withPath("/apis/networking.k8s.io/v1/namespaces/pharos/networkpolicies")
+                .andReturn(500, "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\","
+                        + "\"message\":\"injected failure\",\"code\":500}")
+                .always();
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("ApplyFailed", () -> conditionTrue("demo", "ApplyFailed"));
+        assertThat(condition("demo", "ApplyFailed").getReason()).isEqualTo("ApplyFailed");
+        assertThat(condition("demo", "ApplyFailed").getMessage()).contains("network-policy");
+        // everything else was still applied
+        assertThat(managedVersions()).containsKeys("StatefulSet/demo-writers", "Secret/demo-token");
+    }
+
+    @Test
+    void failedBucketJobIsReportedThenRetried() throws Exception {
+        provisionedMinio();
+        Job job = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        String firstUid = job.getMetadata().getUid();
+        job.setStatus(new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withFailed(7)
+                .addNewCondition().withType("Failed").withStatus("True").withReason("BackoffLimitExceeded")
+                .withLastTransitionTime(clock.instant().toString()).endCondition().build());
+        client.batch().v1().jobs().resource(job).updateStatus();
+
+        await("BucketJobFailed", () -> {
+            var c = condition("demo", "StorageReady");
+            return c != null && "BucketJobFailed".equals(c.getReason());
+        });
+        assertThat(condition("demo", "StorageReady").getMessage()).contains("BackoffLimitExceeded")
+                .contains("re-created after 60 s");
+        assertThat(client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get().getMetadata().getUid())
+                .isEqualTo(firstUid); // within the backoff: not retried yet
+
+        clock.advance(Duration.ofSeconds(61));
+        Job touch = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        touch.getMetadata().getAnnotations().put("test/touch", "1"); // any event: reconcile now
+        client.batch().v1().jobs().resource(touch).update();
+        await("a new bucket Job", () -> {
+            Job now = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+            return now != null && !now.getMetadata().getUid().equals(firstUid);
+        });
+        await("retries counted", () -> Integer.valueOf(1).equals(current("demo").getStatus().storage().bucketRetries()));
     }
 }

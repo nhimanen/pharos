@@ -97,15 +97,20 @@ public final class StorageRenderer {
     }
 
     /**
-     * The minio-mode objects other than the credentials Secret, by dependent name: StatefulSet, Service,
+     * The minio-mode objects (spec sizes) other than the credentials Secret, by dependent name: StatefulSet, Service,
      * PVC and the bucket Job. Empty in s3 mode.
      */
     public static Map<String, HasMetadata> render(PharosCluster cluster, OperatorSettings settings) {
+        return render(cluster, settings, Defaults.minioStorage(cluster.getSpec()));
+    }
+
+    /** As {@link #render(PharosCluster, OperatorSettings)}, with the MinIO PVC at {@code minioStorage}. */
+    public static Map<String, HasMetadata> render(PharosCluster cluster, OperatorSettings settings, String minioStorage) {
         Map<String, HasMetadata> out = new LinkedHashMap<>();
         if (!minioMode(cluster.getSpec())) return out;
         out.put(DesiredState.MINIO, minioStatefulSet(cluster, settings));
         out.put(DesiredState.MINIO_SERVICE, minioService(cluster));
-        out.put(DesiredState.MINIO_PVC, minioPvc(cluster));
+        out.put(DesiredState.MINIO_PVC, minioPvc(cluster, minioStorage));
         out.put(DesiredState.MINIO_BUCKET, bucketJob(cluster, settings));
         return out;
     }
@@ -194,14 +199,14 @@ public final class StorageRenderer {
                 .build();
     }
 
-    static PersistentVolumeClaim minioPvc(PharosCluster cluster) {
+    static PersistentVolumeClaim minioPvc(PharosCluster cluster, String size) {
         String name = cluster.getMetadata().getName();
         return new PersistentVolumeClaimBuilder()
                 .withNewMetadata().withName(Names.minio(name)).withNamespace(cluster.getMetadata().getNamespace())
                 .withLabels(Labels.of(name, Labels.MINIO)).endMetadata()
                 .withNewSpec()
                 .withAccessModes("ReadWriteOnce")
-                .withNewResources().addToRequests("storage", new Quantity(Defaults.minioStorage(cluster.getSpec())))
+                .withNewResources().addToRequests("storage", new Quantity(size))
                 .endResources()
                 .endSpec()
                 .build();
@@ -221,7 +226,6 @@ public final class StorageRenderer {
                 .withLabels(Labels.of(name, Labels.MINIO_BUCKET)).endMetadata()
                 .withNewSpec()
                 .withBackoffLimit(6)
-                .withActiveDeadlineSeconds(1800L)
                 .withNewTemplate()
                 .withNewMetadata().withLabels(Labels.of(name, Labels.MINIO_BUCKET)).endMetadata()
                 .withNewSpec()

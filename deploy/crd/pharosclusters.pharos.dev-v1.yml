@@ -336,6 +336,8 @@ spec:
                 type: "array"
               storage:
                 properties:
+                  bucketRetries:
+                    type: "integer"
                   kind:
                     type: "string"
                   ready:

@@ -82,13 +82,15 @@ public final class WorkloadRenderer {
 
     /** The cluster's workload objects by dependent name (see {@link DesiredState}). */
     public static Map<String, HasMetadata> render(PharosCluster cluster, ConfigRenderer.Result configs,
-                                                  OperatorSettings settings, int writerReplicas, int readerReplicas) {
+                                                  OperatorSettings settings, DesiredState.Sizing sizing) {
         Map<String, HasMetadata> out = new LinkedHashMap<>();
         out.put(DesiredState.CONFIG_WRITER, configMap(cluster, configs.get(Role.WRITER)));
         out.put(DesiredState.CONFIG_READER, configMap(cluster, configs.get(Role.READER)));
         out.put(DesiredState.CONFIG_ROUTER, configMap(cluster, configs.get(Role.ROUTER)));
-        out.put(DesiredState.WRITERS, statefulSet(cluster, configs.get(Role.WRITER), settings, writerReplicas));
-        out.put(DesiredState.READERS, statefulSet(cluster, configs.get(Role.READER), settings, readerReplicas));
+        out.put(DesiredState.WRITERS, statefulSet(cluster, configs.get(Role.WRITER), settings, sizing.writerReplicas(),
+                sizing.workVolume()));
+        out.put(DesiredState.READERS, statefulSet(cluster, configs.get(Role.READER), settings, sizing.readerReplicas(),
+                sizing.cacheVolume()));
         out.put(DesiredState.ROUTER, router(cluster, configs.get(Role.ROUTER), settings));
         out.put(DesiredState.WRITERS_HEADLESS, headless(cluster, Role.WRITER));
         out.put(DesiredState.READERS_HEADLESS, headless(cluster, Role.READER));
@@ -125,12 +127,12 @@ public final class WorkloadRenderer {
                 .build();
     }
 
-    static StatefulSet statefulSet(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, int replicas) {
+    static StatefulSet statefulSet(PharosCluster cluster, RoleConfig rc, OperatorSettings settings, int replicas,
+                                   String size) {
         String name = cluster.getMetadata().getName();
         boolean writer = rc.role() == Role.WRITER;
         String component = writer ? Labels.WRITER : Labels.READER;
         String claim = writer ? "work" : "cache";
-        String size = writer ? Defaults.workVolume(cluster.getSpec()) : Defaults.cacheVolume(cluster.getSpec());
         PharosClusterSpec.RoleSpec role = writer ? cluster.getSpec().writers() : cluster.getSpec().readers();
         PersistentVolumeClaim template = new PersistentVolumeClaimBuilder()
                 .withNewMetadata().withName(claim).withLabels(Labels.of(name, component)).endMetadata()
