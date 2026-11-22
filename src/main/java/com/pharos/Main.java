@@ -45,6 +45,11 @@ public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
 
     static void main(String[] args) {
+        if (ConfigCommand.handles(args)) {
+            // `config validate <file>` checks a file: it must work when the node's own config is
+            // broken, and it needs no backend, index or model
+            System.exit(ConfigCommand.execute(args));
+        }
         IndexConfig config = IndexConfig.load();
 
         // Core components. Readers serve the registry their syncer fills from the object
@@ -216,6 +221,10 @@ public class Main {
                 return (K) new PublishCommand(config, registry, clusterRuntime);
             if (cls == RouterCommand.class)
                 return (K) new RouterCommand(config);
+            if (cls == ConfigCommand.class)
+                return (K) new ConfigCommand(); // no dependencies: Main runs `config` before wiring any
+            if (cls == ConfigCommand.Validate.class)
+                return (K) new ConfigCommand.Validate();
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

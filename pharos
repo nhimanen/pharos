@@ -1016,6 +1016,19 @@ def cmd_router(args):
         sys.exit(130)
 
 
+def cmd_config(args):
+    """`pharos config validate <file>`: check a config.json as a node would at startup.
+
+    Runs the jar locally (a one-shot JVM, no daemon): it reads only the given file, so it works
+    when ~/.pharos/config.json itself is broken. Exit 0 and "ok", or exit 2 with the problem.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java", "-Xmx256m", "-jar", str(JAR), "config", args.config_action,
+           str(Path(args.file).expanduser().resolve())]
+    sys.exit(subprocess.run(cmd).returncode)
+
+
 def cmd_backfill_embedding_cache(args):
     """Seed the embedding cache from the existing Lucene index without calling ONNX."""
     if not JAR.exists():
@@ -1363,6 +1376,7 @@ COMMANDS
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   publish                   Publish a project's local index to the cluster object store (writer nodes)
   router                    Route queries over the cluster's healthy readers (runs in the foreground)
+  config validate <file>    Check a config.json as a node would at startup (exit 0 "ok", or 2)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
 
@@ -1891,6 +1905,29 @@ EXAMPLES
     )
     p_router.add_argument("--port", type=int, default=7080, help="HTTP port to listen on (default: 7080)")
     p_router.set_defaults(func=cmd_router)
+
+    # config
+    p_config = sub.add_parser(
+        "config",
+        help="Check a config.json file (config validate <file>)",
+        description="""\
+Commands on a pharos config.json file. They run the jar locally (no daemon) on the given
+file only, so they work even when ~/.pharos/config.json is broken.
+
+  validate <file>   Read the file and run the validation a node runs at startup
+                    (cluster.tokenEnv is read from this shell's environment).
+                    Prints "ok" and exits 0, or prints the problem and exits 2.
+
+EXAMPLES
+  pharos config validate ~/.pharos/config.json
+  pharos config validate /etc/pharos/reader.json
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_config.add_argument("config_action", choices=["validate"], metavar="validate",
+                          help="Action to perform (validate)")
+    p_config.add_argument("file", help="The config.json file to check")
+    p_config.set_defaults(func=cmd_config)
 
     # daemon
     p_daemon = sub.add_parser(

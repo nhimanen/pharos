@@ -36,6 +36,7 @@ import picocli.CommandLine.*;
                 UpgradeIndexesCommand.class,
                 PublishCommand.class,
                 RouterCommand.class,
+                ConfigCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,
