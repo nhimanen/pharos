@@ -173,15 +173,15 @@ class SplitProjectSearchTest {
      * shards locally returns (one MultiReader over them: the same documents and doc ids), with all three
      * shards remote and with all three held here. (b) Against the unsplit project, another index build of
      * the same files: bitwise for every query whose rank-10 and rank-11 raw BM25 scores are not tied. A tie
-     * at the cut is broken by doc id, which differs between the builds, so either may keep the tied
-     * document; for those queries the top 9 must be the same documents in the same order.
+     * at the cut is broken by doc id, which differs between the builds (documents are written in parallel),
+     * so either may keep other documents of the tied group; for those queries the raw top 10 must have the
+     * same scores rank by rank and the same documents outside the tied group ({@link #compareRaw}).
      */
     @Test
     void splitProjectScoresBitwiseAsTheUnsplitProject() throws Exception {
         SearchEngine single = new SearchEngine(r.parts.lucene(), EMBEDDER, r.parts.registry(),
                 new com.pharos.search.pipeline.NoOpCrossEncoder(), new com.pharos.search.FstQueryClassifier(), r.configBase);
         com.pharos.search.KeywordSearchStrategy keyword = r.engine.shardService(x -> true, null).keyword();
-        com.pharos.search.FstQueryClassifier classifier = new com.pharos.search.FstQueryClassifier();
         List<String> shardNames = SPLIT_SHARDS.stream().map(ShardId::value).toList();
         int compared = 0, tied = 0;
         for (String q : ParityCorpus.PHAROS_QUERIES) {
@@ -197,29 +197,59 @@ class SplitProjectSearchTest {
             List<SearchResult> whole = searchList(r, q, WHOLE); // the unsplit project, locally
             if (whole.isEmpty()) continue;
             compared++;
-            // the unsplit build's raw keyword ranking, as the pipeline's keyword stage retrieves it
-            SearchRequest raw = new SearchRequest(q, SearchType.KEYWORD, null, List.of(WHOLE), 50, "text", null, null, 0)
-                    .withClassification(classifier.classify(q));
-            List<RawCandidate> rawTop = keyword.retrieveRaw(
-                    new org.apache.lucene.search.IndexSearcher(r.parts.lucene().openReader(WHOLE)), raw);
-            boolean tieAtCut = rawTop.size() >= 11 && rawTop.get(9).rawScore() == rawTop.get(10).rawScore();
-            if (!tieAtCut) {
+            // The raw keyword rankings, as the keyword pipeline's retrieval produces them: that pipeline has
+            // no router, so no classification (a classified request filters by its docType, e.g. classes
+            // only for "interface ...", and probes another ranking than the one the page is shaped from).
+            List<RawCandidate> wholeRaw = keyword.retrieveRaw(new org.apache.lucene.search.IndexSearcher(
+                    r.parts.lucene().openReader(WHOLE)), rawRequest(q, List.of(WHOLE), 10));
+            List<RawCandidate> splitRaw = keyword.retrieveRaw(new org.apache.lucene.search.IndexSearcher(
+                    r.parts.lucene().openMultiReader(shardNames)), rawRequest(q, shardNames, 10));
+            String rawDiff = compareRaw(splitRaw, wholeRaw, 10);
+            if (rawDiff == null) {
                 assertThat(compareBitwise(remote, whole)).as(q).isNull();
             } else {
-                // The documents tied at the cut: which of them each build keeps is its doc-id order, and the
-                // shaping (graph boost) may lift a kept one anywhere in the page. Every other document is in
-                // both pages, in the same order.
+                // A tie at the cut, broken by doc id, which differs between the builds: each build may keep
+                // other documents of the tied group. Everything else is the same raw ranking, and the page
+                // is that ranking shaped (bitwise the local reference above).
                 tied++;
-                float cut = rawTop.get(9).rawScore();
-                Set<String> tiedDocs = rawTop.stream().filter(x -> x.rawScore() == cut)
-                        .map(x -> fqn(x.result().id())).collect(Collectors.toSet());
-                assertThat(remote.stream().map(x -> fqn(x.id())).filter(f -> !tiedDocs.contains(f)).toList())
-                        .as(q + " (tied at the cut: " + tiedDocs + ")")
-                        .isEqualTo(whole.stream().map(x -> fqn(x.id())).filter(f -> !tiedDocs.contains(f)).toList());
+                assertThat(rawDiff).as(q).startsWith("tied at the cut");
             }
         }
         assertThat(compared).isGreaterThan(5);
         assertThat(tied).as("most queries have no tie at the cut").isLessThan(compared);
+    }
+
+    static SearchRequest rawRequest(String q, List<String> projects, int limit) {
+        return new SearchRequest(q, SearchType.KEYWORD, null, projects, limit, "text", null, null, 0);
+    }
+
+    /**
+     * Null when two raw top-k lists are the same ranking: identical scores rank by rank and the same
+     * documents in each group of equal scores. "tied at the cut ..." when they differ only in which
+     * documents of the last group (a group cut by the limit, of a full list) they keep. Else what differs.
+     */
+    static String compareRaw(List<RawCandidate> split, List<RawCandidate> whole, int limit) {
+        if (split.size() != whole.size()) return "raw length " + split.size() + " vs " + whole.size();
+        for (int i = 0; i < split.size(); i++) {
+            if (Float.floatToRawIntBits(split.get(i).rawScore()) != Float.floatToRawIntBits(whole.get(i).rawScore())) {
+                return "raw rank " + (i + 1) + ": " + bits(split.get(i).rawScore()) + " vs " + bits(whole.get(i).rawScore());
+            }
+        }
+        for (int i = 0; i < split.size(); ) {
+            int j = i;
+            while (j + 1 < split.size() && split.get(j + 1).rawScore() == split.get(i).rawScore()) j++;
+            Set<String> a = new TreeSet<>(), b = new TreeSet<>();
+            for (int k = i; k <= j; k++) {
+                a.add(fqn(split.get(k).result().id()));
+                b.add(fqn(whole.get(k).result().id()));
+            }
+            if (!a.equals(b)) {
+                String d = "raw ranks " + (i + 1) + "-" + (j + 1) + ": " + a + " vs " + b;
+                return j == split.size() - 1 && split.size() == limit ? "tied at the cut, " + d : d;
+            }
+            i = j + 1;
+        }
+        return null;
     }
 
     static List<SearchResult> searchList(TestReaderNode node, String q, String project) throws Exception {
