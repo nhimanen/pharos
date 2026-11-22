@@ -59,6 +59,9 @@ import urllib.request
 from pathlib import Path
 
 NS = os.environ.get("E2E_NS", "pharos")
+PROFILE = os.environ.get("E2E_PROFILE", "pharos-e2e")
+# every kubectl call names the e2e context; main() refuses to start without the run's own kubeconfig
+KUBECTL = ["kubectl", "--context", PROFILE]
 NAME = "e2e"
 IMAGE_REPO = os.environ.get("E2E_PHAROS_IMAGE", "pharos")
 VERSION = os.environ.get("E2E_VERSION", "1.4.1-e2e")
@@ -407,7 +410,7 @@ class Abort(Exception):
 # ------------------------------------------------------------------------------------------ kubectl
 
 def kubectl(*args, stdin=None, check_rc=True, timeout=180):
-    p = subprocess.run(["kubectl", "-n", NS, *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run([*KUBECTL, "-n", NS, *args], input=stdin, capture_output=True, text=True, timeout=timeout)
     if check_rc and p.returncode != 0:
         raise RuntimeError(f"kubectl {' '.join(args[:3])}... failed: {p.stderr.strip()[:400]}")
     return p.stdout
@@ -423,7 +426,7 @@ def apply(obj):
 
 
 def get_or_none(kind, name):
-    p = subprocess.run(["kubectl", "-n", NS, "get", kind, name, "-o", "json"], capture_output=True, text=True)
+    p = subprocess.run([*KUBECTL, "-n", NS, "get", kind, name, "-o", "json"], capture_output=True, text=True)
     return json.loads(p.stdout) if p.returncode == 0 else None
 
 
@@ -497,7 +500,7 @@ def ready_pods(component):
 
 def minikube_ip():
     return os.environ.get("E2E_NODE_IP") or subprocess.run(
-        ["minikube", "-p", os.environ.get("E2E_PROFILE", "pharos-e2e"), "ip"],
+        ["minikube", "-p", PROFILE, "ip"],
         capture_output=True, text=True, check=True).stdout.strip()
 
 
@@ -1418,7 +1421,25 @@ def phase_teardown():
 PHASE_FUNCS = {n: globals()["phase_" + n] for n in PHASES_ALL + ["embedcache"]}
 
 
+def kubeconfig_problem():
+    """Why this run must not start, or None: it needs its own kubeconfig (operator-e2e.sh exports
+    $E2E_OUT/kubeconfig) whose current context is the e2e profile, never the user's ~/.kube/config."""
+    kc = os.environ.get("KUBECONFIG", "")
+    if not kc or os.pathsep in kc:
+        return "KUBECONFIG must name the run's own kubeconfig (operator-e2e.sh exports $E2E_OUT/kubeconfig)"
+    if Path(kc).expanduser().resolve() == (Path.home() / ".kube" / "config").resolve():
+        return "KUBECONFIG points at ~/.kube/config; the e2e never uses the user's kubeconfig"
+    p = subprocess.run(["kubectl", "config", "current-context"], capture_output=True, text=True)
+    if p.returncode != 0 or p.stdout.strip() != PROFILE:
+        return f"the current context of {kc} is {p.stdout.strip() or 'unset'!r}, not {PROFILE!r}"
+    return None
+
+
 def main():
+    problem = kubeconfig_problem()
+    if problem:
+        print(f"operator_e2e: refusing to start: {problem}", file=sys.stderr)
+        return 2
     phases = os.environ.get("E2E_PHASES", ",".join(PHASES_EMBEDDINGS if EMBEDDINGS else PHASES_ALL)).split(",")
     unknown = [p for p in phases if p not in PHASE_FUNCS]
     if unknown:
