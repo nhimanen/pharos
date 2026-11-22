@@ -2,7 +2,8 @@
 # Entrypoint of the pharos image.
 #   PHAROS_ROLE   writer | reader | all -> `pharos web`; router -> `pharos router`.
 #                 The node's cluster role itself comes from cluster.role in the config.
-#   PHAROS_HOME   state directory (default /data/pharos, on the PVC)
+#   PHAROS_HOME   state directory (default /data/pharos, on the PVC); also the JVM's user.home, so
+#                 the embedding model cache (~/.djl.ai) lands on the PVC: uid 10001 has no home dir
 #   PHAROS_PORT   HTTP port (default 7070 for web, 7080 for router)
 #   PHAROS_CONFIG config file to use (default /etc/pharos/config.json, a ConfigMap mount)
 #   JAVA_OPTS     extra JVM options
@@ -45,7 +46,7 @@ set -- -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
     --add-modules jdk.incubator.vector \
     -Dpolyglot.engine.WarnInterpreterOnly=false \
-    -Dpharos.home="$home" ${JAVA_OPTS:-} -jar "$jar" "$@"
+    -Dpharos.home="$home" -Duser.home="$home" ${JAVA_OPTS:-} -jar "$jar" "$@"
 
 if [ "$command_args" -gt 0 ]; then
     # pharos loads (and validates) the config itself before running the command
