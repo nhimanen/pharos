@@ -1,0 +1,17 @@
+{
+  "embeddingProviders" : [ {
+    "type" : "djl",
+    "modelId" : "granite-r2",
+    "url" : "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+    "model" : null,
+    "apiKeyEnv" : null,
+    "dimensions" : 768,
+    "maxTokens" : 512,
+    "batchSize" : 0,
+    "timeoutMillis" : 60000,
+    "embeddingThreads" : 0,
+    "fallbacks" : [ ],
+    "pooling" : "cls"
+  } ],
+  "searchEmbeddingModel" : "granite-r2"
+}

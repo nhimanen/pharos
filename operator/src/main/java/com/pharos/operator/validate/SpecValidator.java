@@ -5,6 +5,7 @@ import com.pharos.operator.Defaults;
 import com.pharos.operator.Names;
 import com.pharos.operator.api.PharosCluster;
 import com.pharos.operator.api.PharosClusterSpec;
+import com.pharos.operator.render.EmbeddingPresets;
 import com.pharos.operator.api.PharosClusterSpec.Autoscaling;
 import com.pharos.operator.api.PharosClusterSpec.Floor;
 import com.pharos.operator.api.PharosClusterSpec.Project;
@@ -70,8 +71,9 @@ public final class SpecValidator {
             errors.add("spec.version: must be a pharos image tag such as 1.6.0, got '" + spec.version() + "'");
         }
         storage(spec.storage(), errors);
-        if (spec.embeddings() != null && blank(spec.embeddings().model())) {
-            errors.add("spec.embeddings.model: must be a model name or 'none'");
+        if (spec.embeddings() != null && !EmbeddingPresets.names().contains(spec.embeddings().model())) {
+            errors.add("spec.embeddings.model: must be one of " + new java.util.TreeSet<>(EmbeddingPresets.names())
+                    + " (the models of `pharos embeddings enable`), got '" + spec.embeddings().model() + "'");
         }
         projects(spec.projects(), errors);
         role("writers", spec.writers(), errors);

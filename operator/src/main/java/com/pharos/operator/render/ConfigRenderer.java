@@ -40,7 +40,8 @@ import java.util.TreeSet;
  * object-store backend, {@code tokenEnv}, the node id and advertised URL, the work and cache dirs),
  * the autoscaling triggers mapped 1:1 onto {@code cluster.status.*}, then {@code spec.pharosConfig}
  * merged on top. The result is checked with {@link ClusterConfig#validate()} and serialized as the
- * role's {@code config.json}. Secrets never enter it: the token and the object-store keys are only
+ * role's {@code config.json}, next to the embedding provider of {@code spec.embeddings} on writers and
+ * readers (the block {@code pharos embeddings enable} writes, see {@link EmbeddingPresets}). Secrets never enter it: the token and the object-store keys are only
  * named ({@code tokenEnv}, {@code accessKeyEnv}, {@code secretKeyEnv}) and reach pods as env.
  *
  * <p>The node id and advertised URL differ per pod, but a ConfigMap is per role: they are rendered
@@ -180,6 +181,11 @@ public final class ConfigRenderer {
         }
         ObjectNode file = JsonNodeFactory.instance.objectNode();
         file.set("cluster", canonical);
+        if (role != Role.ROUTER) {
+            // what `pharos embeddings enable <model>` writes; the router embeds nothing
+            String model = cluster.getSpec().embeddings() == null ? null : cluster.getSpec().embeddings().model();
+            EmbeddingPresets.block(model).forEach(file::set);
+        }
         try {
             return new RoleConfig(role, merged, MAPPER.writeValueAsString(file) + "\n");
         } catch (JsonProcessingException e) {
