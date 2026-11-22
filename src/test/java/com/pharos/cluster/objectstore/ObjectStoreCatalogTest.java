@@ -4,6 +4,8 @@ import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.ShardEntry;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.ShardSource;
+import com.pharos.cluster.sharding.ProjectShards;
+import com.pharos.cluster.sharding.ShardSpec;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -154,5 +156,102 @@ class ObjectStoreCatalogTest {
         catalog.register(new ShardId("a"), Optional.of(ShardSource.git("ssh://git@example.org/r.git", "main")));
         catalog.register(new ShardId("b"), Optional.of(ShardSource.git("git@example.org:r.git", "main")));
         assertThat(catalog.entries()).hasSize(2);
+    }
+
+    // ── Phase 6: spec versions and the project ↔ shards mapping ─────────────────────────────
+
+    @Test
+    void phase5CatalogReadsAsTheProjectIdentity() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        assertThat(catalog.projectShards().projects()).isEmpty();
+        catalog.register(new ShardId("pharos"), Optional.of(ShardSource.path("/srv/pharos")));
+        catalog.register(new ShardId("lucene"));
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.projects()).containsExactly("lucene", "pharos");
+        assertThat(ps.shardsOf("pharos")).containsExactly(ShardId.ofProject("pharos"));
+        assertThat(ps.specOf("pharos")).isEqualTo(ShardSpec.PROJECT);
+        assertThat(new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8))
+                .as("nothing Phase 6 is written for [project]").doesNotContain("specs").doesNotContain("projects");
+    }
+
+    @Test
+    void specVersionsAreAppendedNeverEdited() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("pharos"));
+        assertThat(catalog.addSpec(Optional.empty(), ShardSpec.PROJECT)).isEqualTo(1);
+        ShardSpec ring4 = ShardSpec.parse("[project, ring(path, shards=4)]");
+        assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).isEqualTo(2);
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project,ring(path,shards=4,vnodes=128)]")))
+                .as("same as the newest of its scope: no new version").isEqualTo(2);
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
+        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=5)]"))).isEqualTo(3);
+        assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).as("going back is a new version").isEqualTo(4);
+        assertThat(catalog.projectShards().specs()).extracting(v -> v.version() + " " + v.project().orElse("-") + " " + v.spec())
+                .containsExactly("1 - [project]", "2 lucene [project, ring(path, shards=4)]",
+                        "3 lucene [project, ring(path, shards=5)]", "4 lucene [project, ring(path, shards=4)]");
+        catalog.setActiveVersion(1);
+        assertThat(catalog.projectShards().activeVersion()).hasValue(1);
+        assertThatThrownBy(() -> catalog.setActiveVersion(2)).hasMessageContaining("belongs to project 'lucene'");
+        assertThatThrownBy(() -> catalog.setActiveVersion(9)).hasMessageContaining("no spec version 9");
+        assertThatThrownBy(() -> catalog.addSpec(Optional.of("a~b=c"), ring4)).hasMessageContaining("not a valid");
+        assertThat(catalog.shards()).as("register's list untouched").containsExactly(new ShardId("pharos"));
+    }
+
+    @Test
+    void putProjectMapsShardsAndListsThem() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("lucene"), Optional.of(ShardSource.git("https://example.org/l.git", "main")));
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        List<ShardId> ring = List.of(new ShardId("lucene~ring=s01"), new ShardId("lucene~ring=s02"));
+        catalog.putProject("lucene", v, ring);
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        catalog.putProject("lucene", v, ring);
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("idempotent").isEqualTo(etag);
+
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.shardsOf("lucene")).containsExactlyElementsOf(ring);
+        assertThat(ps.projectOf(new ShardId("lucene~ring=s02"))).contains("lucene");
+        assertThat(ps.specVersionOf("lucene")).hasValue(v);
+        assertThat(catalog.shards()).containsExactly(new ShardId("lucene"), ring.get(0), ring.get(1));
+        assertThat(catalog.entries().get(0).source()).as("existing entries and sources are kept").isPresent();
+
+        // a reshard flip replaces the entry in one CAS
+        int v2 = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=3)]"));
+        List<ShardId> three = List.of(ring.get(0), ring.get(1), new ShardId("lucene~ring=s03"));
+        catalog.putProject("lucene", v2, three);
+        assertThat(catalog.projectShards().shardsOf("lucene")).containsExactlyElementsOf(three);
+        assertThat(catalog.projectShards().specVersionOf("lucene")).hasValue(v2);
+
+        assertThatThrownBy(() -> catalog.putProject("lucene", v2, List.of(new ShardId("lucene~ring=s09"))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("not a shard id of project");
+        assertThatThrownBy(() -> catalog.putProject("other", v2, List.of(new ShardId("other~ring=s01"))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("belongs to project 'lucene'");
+        assertThatThrownBy(() -> catalog.putProject("lucene", 42, three))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("no spec version 42");
+    }
+
+    @Test
+    void phase6FieldsSurviveOlderWritersRegister() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, module]"));
+        catalog.putProject("lucene", v, List.of(new ShardId("lucene~module=core")));
+        catalog.register(new ShardId("pharos")); // the Phase 5 write path
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.projects()).containsExactly("lucene", "pharos");
+        assertThat(ps.shardsOf("lucene")).containsExactly(new ShardId("lucene~module=core"));
+    }
+
+    @Test
+    void phase6WritesRetryUnderContention() throws Exception {
+        ContendedStore store = new ContendedStore(2);
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.addSpec(Optional.empty(), ShardSpec.PROJECT)).isEqualTo(1);
+        assertThat(store.conditionalPuts).isEqualTo(3);
+        assertThat(sleeps).hasSize(2);
     }
 }
