@@ -584,6 +584,21 @@ The web UI (`pharos web`, `./pharos web`) has a **Cluster** button next to *Modu
 
 The page follows `/cluster/events` and refetches the status on every event; when the stream is unavailable (a refused stream, more than 64 clients on the node, a proxy that drops it) it polls every 10 s and says so. On a single node (`role: all`) it shows one node holding every project.
 
+## Container image
+
+`docker/pharos/Dockerfile` builds the image the Kubernetes operator deploys (Temurin 25 JRE, the fat jar, python3 with `python-hcl2`, node, git; runs as uid 10001). Build from the repository root: `docker build -f docker/pharos/Dockerfile -t pharos:dev .`. Release tags publish `ghcr.io/<owner>/pharos:<version>`.
+
+Entrypoint contract:
+
+| Setting | Meaning |
+|---|---|
+| `PHAROS_ROLE` | `writer`, `reader` or `all` run `pharos web` (port 7070); `router` runs `pharos router` (port 7080). The node's cluster role comes from `cluster.role` in the config. |
+| `/etc/pharos/config.json` | The config, mounted from a ConfigMap and linked to `$PHAROS_HOME/config.json`. Override the path with `PHAROS_CONFIG`. |
+| `PHAROS_HOME` | State and model cache, `/data/pharos` (put a PVC on `/data`). |
+| `PHAROS_PORT`, `JAVA_OPTS` | Optional port and JVM options. |
+
+Secrets reach the process only as env vars named by the config (`cluster.tokenEnv`, the object-store key envs); the entrypoint never writes them. It ends in `exec java`, so SIGTERM reaches the JVM. There is no `HEALTHCHECK`; use Kubernetes probes on `/health`. `scripts/image-smoke.sh` builds the image, runs one node and searches once; it needs a Docker daemon.
+
 ## How it works
 
 1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers extract methods, classes, call references, field declarations, inheritance, annotations, and type references
