@@ -106,6 +106,16 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   writers (`POST /replication/readers`), so coordinators and `pharos router` work without a
   bucket. No writer takeover in this mode (`cluster.writer.workQueue` is forced off). `/health`
   reports `peers` (writers, conflicts, `peerFetch` files and bytes; on a writer `transfers`).
+  - In peer mode `cluster.token` is the membership credential. A writer admits a reader heartbeat
+    only when its `advertiseUrl` host resolves to the request's address or is in
+    `cluster.peers.allowHosts` (403 otherwise). The token travels in clear text on the reader tier
+    even with `cluster.tls` (which protects reader-to-writer pulls only): restrict the network.
+  - `/health` shows the discovery spec, writer URLs and peer URLs only with
+    `X-Pharos-Cluster-Token` (as `/cluster/status`); the public view names nodes only.
+  - With `cluster.tls.keystore` a writer also listens with plain HTTP on
+    `127.0.0.1:<cluster.tls.localPort>` (default web port + 1, no `/replication/*`), which
+    `./pharos` uses.
+  - `cluster.peers.maxLongPolls` defaults to 4096; size it to readers × shards per writer.
 
 ### Changed (upgrade note)
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A

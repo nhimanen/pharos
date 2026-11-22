@@ -469,20 +469,73 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
 
 ### Without a bucket: peer-pull (experimental)
 
-With `"backend": "peer-pull"` readers pull manifests and files straight from the writers' `pharos web` (`/replication/*`, which requires `cluster.token`). Readers find writers with `cluster.peers.discovery`:
+With `"backend": "peer-pull"` there is no bucket: each writer keeps its published generations in a local **peer store**, and its `pharos web` serves them on `/replication/*` (every route requires `cluster.token`). Readers find the writers through `cluster.peers.discovery`, pull manifests and files from them, and fetch whole files from other readers that already hold them.
 
-- `dns:<name>[:port]`: every A/AAAA record of the name is a writer. A Kubernetes headless service is one example. The name is re-resolved on every refresh (`refreshSeconds`, default 15). Give the fully qualified name (for example `pharos-writers.<namespace>.svc.cluster.local`): a name without a dot is tried in the `/etc/resolv.conf` search domains first, and a name no DNS query answers falls back to the JVM resolver, which caches answers (30 s by default). Readers connect to `https://<address>:<port>`, so **with TLS and `dns:` discovery each writer's certificate needs IP subject alternative names** for its addresses (pod IPs); otherwise use `seeds:` with host names that the certificates carry.
-- `seeds:<url>,<url>`: the seeds, plus the writers they list at `/replication/peers` (gossip). Every writer a reader polls receives the cluster token. So with `cluster.tls.truststore` set, every seed must be `https://` and only `https://` gossip entries are followed. **Without TLS, seeds mode trusts the allow-listed hosts.** A gossiped URL is polled only if its host is in `cluster.peers.allowHosts`, which defaults to the seeds' hosts. Other hosts are ignored, with a WARN once per host.
+#### Setup
 
-**Trust model.** In peer mode `cluster.token` is the membership credential: there are no bucket credentials, and any client holding the token can read every published file and heartbeat as a reader. The address check above stops a token holder from advertising somebody else's URL, but not from joining from its own address. Coordinator-to-reader traffic (`/internal/*`) and, without `cluster.tls`, reader-to-writer traffic are plain HTTP and carry the token, so **the token is visible to anyone on the network path**. Run a peer-mode cluster on a network only its nodes can reach: a Kubernetes `NetworkPolicy` that admits only the pharos pods (and the router) to the cluster ports, or a private network or VPC.
+Writer (one per group of shards; repeat with another `nodeId` and other projects for more writers):
 
-**Peer readers.** A `pharos web` reader with a `cluster.advertiseUrl` also serves the files of the generations it holds in full to other readers (`/replication/<shard>/files/<key>`, token required, at most `cluster.peers.maxTransfersPerReader` (default 4) at once; more get 503 with `Retry-After`). Its heartbeat lists those generations (`generationsHeld`), and a writer's `latest` answer names up to 4 readers holding that generation. A reader then tries at most 2 of them before the writer. Peers serve **whole files only** (a `Range` request gets 416), and every file a peer sends is checked against the manifest (exact length and checksum). Ranges, that is a lazy reader's cold blocks and file heads, always come from the writer, so while the writer is down a lazy reader's cold reads fail (its cached data keeps serving). On any mismatch or failure the peer is skipped for 2 minutes and the writer serves the file. The token goes only to a trusted peer: with `cluster.tls.truststore` set only `https://` peers (readers serve plain HTTP, so in a TLS cluster this needs a TLS-terminating proxy in front of each reader), and without TLS only hosts in `cluster.peers.allowHosts` or hosts of the discovered writers. A heartbeat alone never makes a host trusted: a writer admits a reader's heartbeat only when the host of its `advertiseUrl` resolves to the address the heartbeat came from, or is in the writer's `cluster.peers.allowHosts` (a reader behind NAT or a proxy); anything else gets 403 and one WARN per host on the writer. `/health` reports the counters under `peers.peerFetch` (files and bytes from peers and from the writer).
+```json
+{"indexDir": "/data/pharos/indexes",
+ "cluster": {
+  "role": "writer",
+  "backend": "peer-pull",
+  "nodeId": "writer-1",
+  "token": "<shared secret>",
+  "advertiseUrl": "http://writer-1.internal:7171",
+  "peers": {
+    "storeDir": "/data/pharos/peer-store",
+    "discovery": "seeds:http://writer-1.internal:7171,http://writer-2.internal:7171",
+    "allowHosts": ["writer-1.internal", "writer-2.internal", "reader-1.internal", "reader-2.internal"]
+  }}}
+```
 
-Readers long-poll each shard's `latest` (`cluster.peers.longPollSeconds`, default 30). Every publish reaches a peer-mode writer from another process (`pharos index` or `pharos publish` next to `pharos web`); the writer re-reads `LATEST` of the shards readers wait on every 0.5 s, so a new generation reaches waiting readers within about a second. `/health` on a peer-mode writer reports its transfer counters under `peers.transfers` (`maxTransfers`, `transfersInFlight`, `peakTransfersInFlight`, `transfersServed`, `transfersRefused`, `bytesServed`, `longPolls`).
+Reader:
+
+```json
+{"cluster": {
+  "role": "reader",
+  "backend": "peer-pull",
+  "nodeId": "reader-1",
+  "token": "<shared secret>",
+  "advertiseUrl": "http://reader-1.internal:7171",
+  "cacheDir": "/var/cache/pharos",
+  "peers": {
+    "discovery": "seeds:http://writer-1.internal:7171,http://writer-2.internal:7171",
+    "allowHosts": ["writer-1.internal", "writer-2.internal", "reader-1.internal", "reader-2.internal"]
+  }}}
+```
+
+- **Writers must run `pharos web`** (`java -jar pharos.jar web --port 7171`, long-lived, role writer). It is what serves `/replication/*`, reader membership and the status state. Index and publish next to it as on a hand-run writer: `pharos index <dir>` publishes at the end of the run, and `pharos publish <project>` retries a failed publish; the running `pharos web` hands each new generation to waiting readers within about a second.
+- **No takeover.** Peer mode has no leases: each writer owns the shards in its own registry, and `cluster.writer.workQueue` is forced off (setting it to `true` is a config error). When a writer is down, its shards keep serving the generations readers hold, but nothing publishes them until it is back. A Phase 4 work-queue cluster moved to peer mode loses writer failover.
+- **`cluster.peers.storeDir`** (default `~/.pharos/peer-store`) holds the published generations: the last `retentionGenerations` (3) of each shard plus those younger than `retentionMinutes` (60). Lucene files are hard-linked from the index dir, so **put `storeDir` on the same file system as `indexDir`**; otherwise every file is copied, disk use doubles, and the writer logs a WARN at startup. The writer's disk guard (`cluster.writer.disk`, `/health` `writerDisk`) watches the store too.
+- **Readers** need `discovery`, `token` and an `advertiseUrl` that coordinators and other readers can reach. `pharos router` reads reader membership from the writers too: run it with a reader's config.
+- **Discovery.**
+  - `dns:<name>[:port]`: every A/AAAA record of the name is a writer, re-resolved on every refresh (`refreshSeconds`, default 15). A Kubernetes headless service is the usual example. Give the fully qualified name (for example `pharos-writers.<namespace>.svc.cluster.local`): a name without a dot is tried in the `/etc/resolv.conf` search domains first, and a name no DNS query answers falls back to the JVM resolver, which caches answers (30 s by default). Readers connect to `http(s)://<address>:<port>`, so certificates must carry IP SANs (see TLS).
+  - `seeds:<url>,<url>`: the seeds, plus the writers they list at `/replication/peers` (gossip, followed transitively). Every writer a reader polls receives the cluster token, so gossip is limited: with `cluster.tls.truststore` every seed must be `https://` and only `https://` gossip entries are followed; without TLS a gossiped URL is polled only if its host is in `cluster.peers.allowHosts` (default: the seeds' hosts). Other hosts are ignored, with a WARN once per host.
+- **`cluster.peers.allowHosts`** (host names or IPs, matched as written, ignoring case) is used three ways: (1) the gossip rule above; (2) the hosts of peer readers a reader may fetch from without TLS (besides the discovered writers' hosts); (3) on writers, the reader hosts whose heartbeats may arrive from another address (NAT, proxies; see the trust model). **Peer fetch is therefore off unless reader hosts are listed**: with `dns:` discovery the default list is empty, so reader pods are never used as peers unless every reader host is in `allowHosts`, which is impractical with pod IPs. Every file then comes from the writer, which is correct, only slower for the writer.
+- **TLS** (`cluster.tls`, peer-pull only):
+  - On a writer, `keystore` (with `keystoreType`, `PKCS12` (default) or `JKS`, and `passwordEnv`, the name of the environment variable holding the password; the password never goes into `config.json`) makes `pharos web` listen with TLS only on its port. It also listens with plain HTTP on `127.0.0.1:<localPort>` (`cluster.tls.localPort`, default web port + 1), loopback only, serving everything except `/replication/*` (404): `./pharos` on the writer uses that port by itself. Keep that port free; scripts on the writer host can use it too.
+  - Readers may set only `truststore` (with `passwordEnv`): their calls to writers then use `https://`, and every seed must be `https://`. A reader keystore is a config error: readers, coordinators and `pharos router` speak plain HTTP to readers. A writer that sets `discovery` (it polls the other writers for `/cluster/status`) needs the `truststore` and `https://` seeds too, and so does `pharos router`'s config.
+  - Certificates: with `dns:` discovery readers connect to the writers' IP addresses, so each writer certificate needs **IP subject alternative names** for its addresses (pod IPs); otherwise use `seeds:` with fully qualified host names that the certificates carry.
+  - With a truststore, readers fetch from peers only over `https://`, and readers serve plain HTTP, so **peer fetch is off in a TLS cluster**: every file comes from the writers. Do not put a TLS-terminating proxy in front of readers to get it back: the reader would then have to advertise an `https://` URL, and coordinators and `pharos router` have no truststore, so their shard calls and `/health` polls to it would fail.
+- **Long-polls and `cluster.peers.maxLongPolls`.** Readers long-poll each shard's `latest` at the writer that owns it (`longPollSeconds`, default 30), so a writer holds one waiting request per reader per shard it owns: size `maxLongPolls` (default 4096) to at least **readers × shards per writer** (8 readers × 40 shards = 320). A waiting long-poll holds no thread, but holds a connection, so the writer's open-files limit (`ulimit -n`) must be above `maxLongPolls` plus transfers. Past the cap, a long-poll gets 503 with `Retry-After` and the reader retries every 2–2.5 s, so the writer answers a steady stream of refused requests, and shards that never get a slot learn of new publishes only at the next refresh (`refreshSeconds`, 15 s). `/health` on the writer shows `peers.transfers.longPolls` (waiting now); raise the cap when it sits at the cap.
+
+#### How it runs
+
+**Peer readers.** A `pharos web` reader with a `cluster.advertiseUrl` also serves the files of the generations it holds in full to other readers (`/replication/<shard>/files/<key>`, token required, at most `cluster.peers.maxTransfersPerReader` (default 4) at once; more get 503 with `Retry-After`). Its heartbeat lists those generations (`generationsHeld`), and a writer's `latest` answer names up to 4 readers holding that generation. A reader then tries at most 2 of them before the writer. Peers serve **whole files only** (a `Range` request gets 416), and every file a peer sends is checked against the manifest (exact length and checksum). Ranges, that is a lazy reader's cold blocks and file heads, always come from the writer, so while the writer is down a lazy reader's cold reads fail (its cached data keeps serving). On any mismatch or failure the peer is skipped for 2 minutes and the writer serves the file. The token goes only to a trusted peer (see `allowHosts` and TLS above). `/health` reports the counters under `peers.peerFetch` (files and bytes from peers and from the writer).
+
+Every publish reaches a peer-mode writer from another process (`pharos index` or `pharos publish` next to `pharos web`); the writer re-reads `LATEST` of the shards readers wait on every 0.5 s, so a new generation reaches waiting readers within about a second. `/health` on a peer-mode writer reports its transfer counters under `peers.transfers` (`maxTransfers`, `transfersInFlight`, `peakTransfersInFlight`, `transfersServed`, `transfersRefused`, `bytesServed`, `longPolls`).
 
 A writer missing for 3 refreshes is dropped, and the generations readers hold of its shards keep serving. When two writers claim one shard, the reader syncs from the one with the higher `LATEST`; on a tie, the lowest node id wins. A writer that misses a refresh keeps its claim until it is dropped. `/health` reports each such conflict under `peers.conflicts` as `shard X claimed by A and B`.
 
 **`/health` and addresses.** Like `/cluster/status`, a peer-mode reader's `/health` has a public view and a token view. Without `X-Pharos-Cluster-Token` (and through `pharos router`, which never forwards the token) `peers` names nodes only: no `discovery` spec, no writer `url` or `error`, no peer reader URLs (`peerFetch.suspectCount` instead of `peerFetch.suspects`), and `unavailable` reasons by node id. With the token (compared in constant time) it shows all of them. The status code and readiness are the same in both views.
+
+#### Trust model
+
+- **The cluster token is the membership credential.** There are no bucket credentials in peer mode: any client holding `cluster.token` can read every published file and join as a reader.
+- **A heartbeat alone never makes a host trusted.** A writer admits a reader's heartbeat only when the host of its `advertiseUrl` resolves to the address the heartbeat came from (a name is resolved and the IPs compared; one that does not resolve is refused), or is in the writer's `cluster.peers.allowHosts` (a reader behind NAT or a proxy). Anything else gets 403, the writer logs one WARN per host, and the reader logs one WARN per writer. So a token holder cannot redirect coordinators' shard calls (which carry the token and users' queries) or the router's traffic to somebody else's address, though it can still join from its own.
+- **The token is visible on the network.** Coordinator-to-reader traffic (`/internal/*`) and peer fetches are always plain HTTP, and reader-to-writer traffic is too without `cluster.tls`; all of them carry the token. `cluster.tls` protects only reader-to-writer pulls. Run a peer-mode cluster on a network only its nodes can reach: a Kubernetes `NetworkPolicy` that admits only the pharos pods (and the router) to the cluster ports, or a private network or VPC.
 
 ### Work-queue writers
 

@@ -440,7 +440,7 @@ class ClusterConfigTest {
         assertThat(c.getPeers().getMaxTransfersPerWriter()).isEqualTo(8);
         assertThat(c.getPeers().getMaxTransfersPerReader()).isEqualTo(4);
         assertThat(c.getPeers().getLongPollSeconds()).isEqualTo(30);
-        assertThat(c.getPeers().getMaxLongPolls()).isEqualTo(256);
+        assertThat(c.getPeers().getMaxLongPolls()).isEqualTo(4096);
         assertThat(c.getPeers().getStoreDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("peer-store"));
         assertThat(c.getTls()).isNull();
         assertThat(c.tlsServer()).isFalse();
@@ -460,6 +460,11 @@ class ClusterConfigTest {
         assertThat(tls.tlsServer()).isTrue();
         assertThat(tls.getTls().getKeystoreType()).isEqualTo("PKCS12");
         assertThat(new String(tls.getTls().password())).isEqualTo(System.getenv("PATH"));
+        assertThat(tls.getTls().localPortFor(7171)).as("I3: the loopback plain port, default web port + 1").isEqualTo(7172);
+        assertThat(parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\","
+                + "\"localPort\":9000}}}").getTls().localPortFor(7171)).isEqualTo(9000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\","
+                + "\"passwordEnv\":\"PATH\",\"localPort\":70000}}}")).hasMessageContaining("cluster.tls.localPort");
         ClusterConfig unset = parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"truststore\":\"/t.p12\","
                 + "\"passwordEnv\":\"PHAROS_TEST_SURELY_UNSET_VAR\"}}}");
         assertThat(unset.tlsServer()).as("a truststore alone is client-side only").isFalse();

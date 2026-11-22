@@ -594,7 +594,7 @@ public class ClusterConfig {
         /** Concurrent file transfers a reader serves to peer readers; more get 503 (its own queries come first). */
         private int maxTransfersPerReader = 4;
         private int longPollSeconds = 30;
-        private int maxLongPolls = 256;
+        private int maxLongPolls = 4096;
         private Path storeDir = IndexConfig.DEFAULT_BASE.resolve("peer-store");
         /**
          * Seeds mode without TLS: the hosts a gossiped writer URL may name (every polled writer gets the
