@@ -86,9 +86,19 @@ public final class GenerationGc {
      * @return the number of objects deleted; never throws
      */
     public int collect(ShardId shard, Instant now) {
+        return collect(shard, now, Set.of());
+    }
+
+    /**
+     * As {@link #collect(ShardId, Instant)}, also keeping the generations in {@code pinned} (with
+     * everything they reference): the generations a version of the shard's project names in the catalog
+     * (a staged reshard's, the active pins after a flip, the previous version's), which readers sync or
+     * serve whatever {@code LATEST} says.
+     */
+    public int collect(ShardId shard, Instant now, Set<Long> pinned) {
         int[] deleted = {0};
         try {
-            run(shard, now, deleted);
+            run(shard, now, pinned == null ? Set.of() : pinned, deleted);
         } catch (Abort e) {
             log.warn("GC of shard {} aborted after {} deletes: {}", shard, deleted[0], e.getMessage());
         } catch (RuntimeException e) {
@@ -97,7 +107,7 @@ public final class GenerationGc {
         return deleted[0];
     }
 
-    private void run(ShardId shard, Instant now, int[] deleted) throws Abort {
+    private void run(ShardId shard, Instant now, Set<Long> pinned, int[] deleted) throws Abort {
         String prefix = layout.shardPrefix(shard);
         String manifestsPrefix = prefix + "manifests/";
         Instant cutoff = now.minus(minAge);
@@ -160,7 +170,7 @@ public final class GenerationGc {
         for (Manifest m : manifests.values()) { // newest generation first
             boolean young = isYoung(m, cutoff);
             boolean keep;
-            if (m.key().equals(latestManifestKey)) {
+            if (m.key().equals(latestManifestKey) || pinned.contains(m.generation())) {
                 keep = true;
             } else if (m.generation() > latestGen) {
                 keep = young;
@@ -174,6 +184,11 @@ public final class GenerationGc {
         protectedKeys.add(latestManifestKey);
         protectedKeys.add(layout.latestKey(shard));
         for (ManifestFile f : latestManifest.parsed().files()) protectedKeys.add(f.key());
+        for (Manifest m : manifests.values()) {
+            if (!pinned.contains(m.generation())) continue;
+            protectedKeys.add(m.key());
+            for (ManifestFile f : m.parsed().files()) protectedKeys.add(f.key());
+        }
         Set<String> referenced = new HashSet<>(protectedKeys);
         for (Manifest m : kept) {
             referenced.add(m.key());
@@ -361,6 +376,36 @@ public final class GenerationGc {
         if (newest >= 0) keptGens.add(newest);
         collectWriterState("project " + project, statePrefix, objects, keptGens, cutoff, protectedKeys, deleted);
         if (deleted[0] > 0) log.info("GC of project {}: deleted {} objects", project, deleted[0]);
+    }
+
+    /**
+     * Deletes every object of {@code shard} ({@code shards/<shard>/}): a shard no version of its project
+     * names any more, past the retention window (a retired or abandoned reshard's). Manifests and
+     * {@code LATEST} go first, so a crash midway leaves only unreferenced data. Never throws.
+     *
+     * @return the number of objects deleted
+     */
+    public int purgeShard(ShardId shard) {
+        int deleted = 0;
+        try {
+            List<ObjectInfo> objects = new ArrayList<>(store.list(layout.shardPrefix(shard)));
+            String manifests = layout.shardPrefix(shard) + "manifests/";
+            String latest = layout.latestKey(shard);
+            objects.sort(Comparator.comparing((ObjectInfo o) -> !o.key().equals(latest))
+                    .thenComparing(o -> !o.key().startsWith(manifests)));
+            for (ObjectInfo o : objects) {
+                try {
+                    store.delete(o.key());
+                    deleted++;
+                } catch (IOException | RuntimeException e) {
+                    log.warn("Purging shard {}: could not delete {}: {}", shard, o.key(), e.toString());
+                }
+            }
+            if (deleted > 0) log.info("Purged shard {}: deleted {} objects", shard, deleted);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Purging shard {} failed after {} deletes: {}", shard, deleted, e.toString());
+        }
+        return deleted;
     }
 
     /** Rejects manifests that parse leniently but cannot be trusted to list their references. */

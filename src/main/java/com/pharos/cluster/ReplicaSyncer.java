@@ -98,7 +98,12 @@ import java.util.stream.Stream;
  * materialised (not yet served), and the set's generations are activated together once every shard
  * of the set (the ones this reader is pinned to) has one at the same index run
  * ({@code projectGeneration}). Until then the previous complete set keeps serving, so a query on this
- * reader never sees a file that moved between shards twice, or not at all. The project's graph
+ * reader never sees a file that moved between shards twice, or not at all. A version whose
+ * generations the catalog pins (a reshard's staged version, the flipped version until the project's next
+ * index run, the retired one) is synced at exactly those generations. Only the active version activates a
+ * shard it has: a staged version's rewritten generation of such a shard is materialised and reported in
+ * the heartbeat ({@link #preparedGenerations}), and served only once the flip makes it active. The
+ * project's graph
  * ({@code projectFiles}, content-named) is downloaded once per reader into
  * {@value #PROJECT_FILES_DIR} and hard-linked into each shard's generation dir; refs are not fetched.
  */
@@ -140,6 +145,8 @@ public class ReplicaSyncer implements Closeable {
     private final Map<ShardId, Long> servedRun = new ConcurrentHashMap<>();
     /** Generation materialised but not activated per shard (waiting for its set); adopted quietly. */
     private final Map<ShardId, Generation> prepared = new HashMap<>();
+    /** {@link #prepared} minus what is served, as of the last pass (read by heartbeats without the lock). */
+    private volatile Map<ShardId, Generation> preparedSnapshot = Map.of();
     /** The last "waiting for a complete set" state logged per project, so it is not repeated every pass. */
     private final Map<String, String> waitingLogged = new HashMap<>();
     /** Shards dropped by pinning: unregistered, directories removed one pass later (in-flight queries). */
@@ -248,19 +255,17 @@ public class ReplicaSyncer implements Closeable {
             }
             Set<ShardId> wantedSet = new HashSet<>(shards);
             Set<ShardId> inSets = new HashSet<>();
-            List<List<ShardId>> sets = new ArrayList<>();
-            List<String> setProjects = new ArrayList<>();
-            for (String project : map.projects()) { // split projects' active and staged sets (pinned part)
-                List<List<ShardId>> projectSets = new ArrayList<>();
-                if (map.isSplit(project)) projectSets.add(map.shardsOf(project));
-                map.stagedOf(project).filter(st -> !st.spec().isDefault()).ifPresent(st -> projectSets.add(st.shards()));
-                for (List<ShardId> set : projectSets) {
-                    List<ShardId> mine = set.stream().filter(wantedSet::contains).toList();
-                    if (mine.isEmpty()) continue;
-                    sets.add(mine);
-                    setProjects.add(project);
-                    inSets.addAll(mine);
+            List<SyncSet> sets = new ArrayList<>();
+            for (String project : map.projects()) { // split projects' active, staged and retired sets (pinned part)
+                Set<ShardId> active = new HashSet<>(map.shardsOf(project));
+                Map<ShardId, Long> pins = map.pinsOf(project);
+                if (map.isSplit(project) || !pins.isEmpty()) {
+                    addSet(sets, inSets, wantedSet, project, SetRole.ACTIVE, map.shardsOf(project), pins, active);
                 }
+                map.stagedOf(project).filter(st -> !st.spec().isDefault() && !st.abandoned()).ifPresent(st ->
+                        addSet(sets, inSets, wantedSet, project, SetRole.STAGED, st.shards(), st.generations(), active));
+                map.previousOf(project).filter(pr -> !pr.spec().isDefault()).ifPresent(pr ->
+                        addSet(sets, inSets, wantedSet, project, SetRole.PREVIOUS, pr.shards(), pr.generations(), active));
             }
             for (ShardId shard : shards) {
                 if (closed) return;
@@ -272,7 +277,9 @@ public class ReplicaSyncer implements Closeable {
                     logSyncFailure(shard, e);
                 }
             }
-            syncSets(sets, setProjects);
+            syncSets(sets);
+            prepared.keySet().retainAll(wantedSet);
+            snapshotPrepared();
             if (lazy != null) lazy.sweep();
             sweepProjectFiles();
             try {
@@ -458,65 +465,129 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
+    /** What a set of a split project is: its active version, a staged one, or the retired one. */
+    private enum SetRole { ACTIVE, STAGED, PREVIOUS }
+
+    /**
+     * The shards of one version of a split project this reader syncs (its pinned part), the generation of
+     * each when the catalog pins them (a reshard's staged version, the active one after a flip until the
+     * next index run, the previous one), and the project's active shards (which only the active set may
+     * activate).
+     */
+    private record SyncSet(String project, SetRole role, List<ShardId> shards, Map<ShardId, Long> pins,
+                           Set<ShardId> active) {
+        /** True when this set may activate a generation of {@code shard}. */
+        boolean activates(ShardId shard) {
+            return role == SetRole.ACTIVE || !active.contains(shard);
+        }
+    }
+
+    private static void addSet(List<SyncSet> sets, Set<ShardId> inSets, Set<ShardId> wanted, String project,
+                               SetRole role, List<ShardId> shards, Map<ShardId, Long> pins, Set<ShardId> active) {
+        List<ShardId> mine = shards.stream().filter(wanted::contains).toList();
+        if (mine.isEmpty()) return;
+        sets.add(new SyncSet(project, role, mine, pins, active));
+        inSets.addAll(mine);
+    }
+
     /**
      * Syncs the shards of split projects set by set (see the class comment): materialises every new
      * generation, then activates a set's new generations together when all of its shards are (or would
-     * be) served at one index run. A shard in two sets (the active and the staged version of a ring
-     * change) is activated when either set is complete.
+     * be) served at one index run, or, for a set whose generations the catalog pins (a reshard), at
+     * exactly those generations. Only the active set activates a shard of the project's active version:
+     * a staged version's generation of a shard that the active version also has (a ring change rewrote
+     * it) is materialised and reported ({@link #preparedGenerations}), never served before the flip, so
+     * a query of the active version never sees the new version's content. Shards only a staged (or the
+     * retired) version has are activated when their set is complete.
      */
-    private void syncSets(List<List<ShardId>> sets, List<String> projects) {
+    private void syncSets(List<SyncSet> sets) {
         if (sets.isEmpty()) return;
-        Map<ShardId, Prepared> ready = new HashMap<>();
-        Set<ShardId> failed = new HashSet<>();
-        for (List<ShardId> set : sets) {
-            for (ShardId shard : set) {
+        Map<String, Prepared> ready = new HashMap<>();   // shard@target -> prepared generation
+        Set<String> failed = new HashSet<>();
+        for (SyncSet set : sets) {
+            for (ShardId shard : set.shards()) {
                 if (closed) return;
-                if (ready.containsKey(shard) || failed.contains(shard)) continue;
+                Long pin = set.pins().get(shard);
+                if (set.role() == SetRole.PREVIOUS && set.active().contains(shard)) continue; // the active set's
+                String key = shard + "@" + (pin == null ? "latest" : pin);
+                if (ready.containsKey(key) || failed.contains(key)) continue;
                 try {
-                    Prepared p = prepare(shard);
-                    if (p != null) ready.put(shard, p);
+                    Prepared p = prepare(shard, pin == null ? null : new Generation(pin));
+                    ready.put(key, p);
                 } catch (IOException | RuntimeException e) {
-                    failed.add(shard);
+                    failed.add(key);
                     logSyncFailure(shard, e);
                 }
             }
         }
-        Set<ShardId> activate = new java.util.LinkedHashSet<>();
-        for (int i = 0; i < sets.size(); i++) {
-            List<ShardId> set = sets.get(i);
-            String project = projects.get(i);
+        Map<ShardId, Prepared> activate = new java.util.LinkedHashMap<>();
+        for (SyncSet set : sets) {
             Long run = null;
             boolean complete = true;
             boolean anyNew = false;
             List<String> state = new ArrayList<>();
-            for (ShardId shard : set) {
-                Prepared p = ready.get(shard);
+            for (ShardId shard : set.shards()) {
+                Long pin = set.pins().get(shard);
+                if (set.role() == SetRole.PREVIOUS && set.active().contains(shard)) continue;
+                Prepared p = ready.get(shard + "@" + (pin == null ? "latest" : pin));
                 anyNew |= p != null;
+                if (pin != null) {
+                    Long have = p != null ? Long.valueOf(p.gen().value())
+                            : Optional.ofNullable(served.get(shard)).map(Generation::value).orElse(null);
+                    state.add(shard + (p != null ? " new" : served.containsKey(shard) ? " served" : " none")
+                            + " generation " + have + " (pinned " + pin + ")");
+                    if (!pin.equals(have)) complete = false;
+                    continue;
+                }
                 Long r = p != null ? p.run() : servedRun.get(shard);
                 state.add(shard + (p != null ? " new" : served.containsKey(shard) ? " served" : " none") + " run " + r);
                 if (r == null || (run != null && !run.equals(r))) complete = false;
                 if (run == null) run = r;
             }
+            String logKey = set.project() + set.role() + set.shards();
             if (complete) {
-                for (ShardId shard : set) if (ready.containsKey(shard)) activate.add(shard);
-                waitingLogged.remove(project + set);
+                for (ShardId shard : set.shards()) {
+                    Long pin = set.pins().get(shard);
+                    Prepared p = ready.get(shard + "@" + (pin == null ? "latest" : pin));
+                    if (p != null && set.activates(shard)) activate.putIfAbsent(shard, p);
+                }
+                waitingLogged.remove(logKey);
             } else if (anyNew) {
                 String line = String.join(", ", state);
-                if (!line.equals(waitingLogged.put(project + set, line))) {
-                    log.info("Project {}: not activating new generations until every shard of the set is at one index"
-                            + " run; still serving the previous set ({})", project, line);
+                if (!line.equals(waitingLogged.put(logKey, line))) {
+                    log.info("Project {} ({} version): not activating new generations until every shard of the set is"
+                            + " ready; still serving the previous set ({})", set.project(),
+                            set.role().name().toLowerCase(java.util.Locale.ROOT), line);
                 }
             }
         }
-        for (ShardId shard : activate) {
+        for (Map.Entry<ShardId, Prepared> e : activate.entrySet()) {
             if (closed) return;
             try {
-                activate(shard, ready.get(shard));
-            } catch (IOException | RuntimeException e) {
+                activate(e.getKey(), e.getValue());
+            } catch (IOException | RuntimeException ex) {
                 // registration failed: this shard keeps its previous generation; the next pass retries
-                logSyncFailure(shard, e);
+                logSyncFailure(e.getKey(), ex);
             }
         }
+    }
+
+    /**
+     * Generations materialised for a staged version but not served (a reshard's rewritten shards before
+     * the flip), per shard: what the heartbeat reports so the writer knows this reader is ready for the
+     * flip.
+     */
+    public Map<ShardId, Generation> preparedGenerations() {
+        return preparedSnapshot;
+    }
+
+    /** Holding {@link #syncLock}: refreshes what {@link #preparedGenerations} returns. */
+    private void snapshotPrepared() {
+        Map<ShardId, Generation> out = new HashMap<>();
+        prepared.forEach((shard, gen) -> {
+            if (!gen.equals(served.get(shard))) out.put(shard, gen);
+        });
+        preparedSnapshot = Map.copyOf(out);
     }
 
     /**
@@ -525,15 +596,27 @@ public class ReplicaSyncer implements Closeable {
      * gate refuses).
      */
     private Prepared prepare(ShardId shard) throws IOException {
-        Optional<Generation> latest = source.latest(shard);
-        if (latest.isEmpty()) return null;
-        Generation gen = latest.get();
+        return prepare(shard, null);
+    }
+
+    /**
+     * @param pinned the generation the catalog pins for the shard's set (a reshard); null: {@code LATEST}'s
+     */
+    private Prepared prepare(ShardId shard, Generation pinned) throws IOException {
+        Generation gen;
+        if (pinned != null) {
+            gen = pinned;
+        } else {
+            Optional<Generation> latest = source.latest(shard);
+            if (latest.isEmpty()) return null;
+            gen = latest.get();
+        }
         Generation current = served.get(shard);
         if (current != null && gen.equals(current)) {
             retryRegistration(shard, current);
             return null;
         }
-        if (current != null && gen.compareTo(current) < 0) {
+        if (pinned == null && current != null && gen.compareTo(current) < 0) {
             log.warn("Shard {}: LATEST points at generation {}, below the served generation {} (bucket wiped"
                     + " or rolled back?); serving generation {} as a new lineage",
                     shard, gen.value(), current.value(), gen.value());

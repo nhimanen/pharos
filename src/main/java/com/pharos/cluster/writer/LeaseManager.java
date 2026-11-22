@@ -134,9 +134,24 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         this(store, layout, writer, ttl, ownWrite, clock, ttl == null ? null : ttl.dividedBy(6));
     }
 
+    /**
+     * Leases on other keys than the shard leases: {@code leaseKey} maps the id a caller acquires to its
+     * lease object (the per-project reshard lease, {@link ObjectStoreLayout#reshardLeaseKey}, keyed by
+     * {@code ShardId.ofProject(project)}).
+     */
+    public LeaseManager(ObjectStore store, ObjectStoreLayout layout, String writer, Duration ttl,
+                        BucketNow ownWrite, Clock clock, java.util.function.Function<ShardId, String> leaseKey) {
+        this(store, layout, writer, ttl, ownWrite, clock, ttl == null ? null : ttl.dividedBy(6));
+        this.leaseKey = Objects.requireNonNull(leaseKey, "leaseKey");
+    }
+
+    /** The lease object of an id: the shard lease unless another mapping was given. */
+    private java.util.function.Function<ShardId, String> leaseKey;
+
     /** Visible for tests: an explicit deadline per store call. */
     LeaseManager(ObjectStore store, ObjectStoreLayout layout, String writer, Duration ttl,
                  BucketNow ownWrite, Clock clock, Duration ioTimeout) {
+        this.leaseKey = layout::leaseKey;
         this.store = Objects.requireNonNull(store, "store");
         this.layout = Objects.requireNonNull(layout, "layout");
         this.writer = Objects.requireNonNull(writer, "writer");
@@ -206,7 +221,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         synchronized (lockFor(shard)) {
             Held mine = current(shard);
             if (mine != null && !mine.lost()) return Optional.of(mine.lease());
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             Optional<StoredObject> cur = call("get " + key, () -> store.get(key));
             Optional<String> etag;
             if (cur.isEmpty()) {
@@ -264,7 +279,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
                 h = held.get(shard);
                 if (h == null || h.lost() || closed) return false;
             }
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             String etagNow = h.lease().etag();
             Optional<String> etag;
             try {
@@ -294,7 +309,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
                 h = held.remove(shard);
             }
             if (h == null || h.lost()) return;
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             try {
                 if (call("putIfMatch " + key, () -> store.putIfMatch(key, body(true), h.lease().etag())).isPresent()) {
                     log.info("Released the lease of shard {}", shard);
@@ -333,7 +348,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             Held h = current(shard);
             if (h == null) throw new PublishConflictException("writer " + writer + " holds no lease on shard " + shard);
             if (h.lost()) throw new PublishConflictException("writer " + writer + " lost the lease on shard " + shard);
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             try {
                 Optional<StoredObject> cur = call("get " + key, () -> store.get(key));
                 if (cur.isEmpty() || !h.lease().etag().equals(cur.get().etag())) {

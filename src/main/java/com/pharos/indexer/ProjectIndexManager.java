@@ -727,6 +727,235 @@ public class ProjectIndexManager {
         }
     }
 
+    // ------------------------------------------------------------------------- resharding (Task 4)
+
+    /**
+     * What a reshard build changed in the local index: the shards of the new version that gained or lost
+     * files (or are new), those it left exactly as they were, the shards of the old version it dropped,
+     * how many files moved, and how many the parsers parsed (the moved ones).
+     */
+    public record ReshardBuild(List<ShardId> affected, List<ShardId> unaffected, List<ShardId> removed,
+                               int movedFiles, int parsedFiles) {
+        public ReshardBuild {
+            affected = List.copyOf(affected);
+            unaffected = List.copyOf(unaffected);
+            removed = List.copyOf(removed);
+        }
+    }
+
+    /**
+     * The shards of {@code project} under {@code spec}, from the files a full run of {@code projectRoot}
+     * would index: every key value the files have, and for a ring every ring shard of each key group
+     * (empty ones included, since a ring's shards are its names), sorted by id.
+     */
+    public List<ShardId> shardsFor(Path projectRoot, String project, com.pharos.cluster.sharding.ShardSpec spec)
+            throws IOException {
+        if (spec.isDefault()) return List.of(ShardId.ofProject(project));
+        ShardPlan any = new ShardPlan(project, spec, List.of(ShardId.ofProject(project)));
+        FileShardRouter keys = new FileShardRouter(any, projectRoot, f -> parserFor(f) instanceof GenericFileParser);
+        java.util.TreeMap<String, ShardId> out = new java.util.TreeMap<>();
+        var ring = spec.ring();
+        for (Path f : sourceFiles(projectRoot)) {
+            ShardId id = spec.assign(keys.keysOf(f));
+            out.put(id.value(), id);
+            if (ring.isPresent()) {
+                for (String name : ring.get().names()) {
+                    java.util.LinkedHashMap<String, String> kv = new java.util.LinkedHashMap<>(id.keyValues());
+                    kv.put(ring.get().key(), name);
+                    ShardId r = ShardId.keyed(project, kv);
+                    out.put(r.value(), r);
+                }
+            }
+        }
+        if (out.isEmpty() && ring.isPresent() && spec.fields().size() == 2) {
+            for (String name : ring.get().names()) {
+                ShardId r = ShardId.keyed(project, new java.util.LinkedHashMap<>(java.util.Map.of(ring.get().key(), name)));
+                out.put(r.value(), r);
+            }
+        }
+        if (out.isEmpty()) throw new IOException("project " + project + " has no indexable files under " + projectRoot);
+        return List.copyOf(out.values());
+    }
+
+    /** The files a full run of {@code projectRoot} indexes (the same walk, skip rules and size limit). */
+    private List<Path> sourceFiles(Path projectRoot) throws IOException {
+        List<Path> out = new ArrayList<>();
+        OversizedFiles oversized = new OversizedFiles();
+        Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                if (SKIP_DIRS.contains(name) || name.startsWith(".")) return FileVisitResult.SKIP_SUBTREE;
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                String name = file.getFileName().toString();
+                for (CodeParser p : parsers) {
+                    if (p.supportedExtensions().stream().anyMatch(name::endsWith)) {
+                        if (!oversized.skip(file, attrs.size(), p)) out.add(file);
+                        break;
+                    }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return out;
+    }
+
+    /**
+     * Rebuilds the local index of {@code projectName}, now in the layout of {@code from} (the active
+     * version, as published), into the layout of {@code to} (a reshard's new version), re-indexing only
+     * the files whose shard changes (ruling: a ring change is incremental):
+     * <ul>
+     *   <li>each indexed file's shard under {@code from} is the shard whose index holds it; under
+     *       {@code to}, the spec's; a file moves when the two differ;</li>
+     *   <li>the moved files are parsed again (nothing else is) and written to their new shards with the
+     *       full run's documents (chunks, in-degrees and callers from the project's call graph, which a
+     *       reshard does not change); embeddings come from the persistent cache, so unchanged text is
+     *       never embedded again;</li>
+     *   <li>shards of {@code to} that gain or lose files, and new ones, are written (the others are not
+     *       touched: their commits stay byte-identical); the moved files' documents leave their old
+     *       shard in the same commit; shards {@code to} drops (and a {@code [project]} {@code lucene/}) are
+     *       removed after the commit.</li>
+     * </ul>
+     * Crash-safe like an index run: the commit marker, then the shard commits, the file state, and the
+     * layout last; nothing is published. The call graph is the project's and stays as it is.
+     *
+     * @throws IOException when the local index is not {@code from}'s, a file it holds is gone from the
+     *         source (the source changed since the published run: index it first), or the spec puts a
+     *         file in a shard {@code to} does not list
+     */
+    public ReshardBuild reshard(Path projectRoot, String projectName, ShardPlan from, ShardPlan to,
+                                boolean generateEmbeddings, ProgressListener progress, IndexAbort abort)
+            throws IOException {
+        ProjectNames.validate(projectName, config.getIndexDir());
+        if (!to.project().equals(projectName) || !from.project().equals(projectName)) {
+            throw new IllegalArgumentException("shard plans of " + from.project() + "/" + to.project() + " for " + projectName);
+        }
+        if (!to.isSplit()) {
+            throw new IllegalArgumentException("a reshard to [project] is not supported; use a single-shard ring,"
+                    + " [project, ring(path, shards=1)]");
+        }
+        String reason = fullRunReason(projectName, from);
+        if (reason != null || !luceneIndexer.indexExists(projectName)) {
+            throw new IOException("the local index of " + projectName + " is not the active version's ("
+                    + (reason != null ? reason : "no index") + "); index it first");
+        }
+        Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
+        abort.checkpoint();
+        progress.onProgress("Scanning", 0, 0);
+
+        // Where every indexed file is now: the shard whose index holds its documents.
+        List<ShardId> fromIds = from.clusterShards();
+        Map<String, ShardId> holder = new LinkedHashMap<>();
+        for (ShardId s : fromIds) {
+            Path dir = from.isSplit() ? LocalShardLayout.luceneDir(projectIndexDir, s) : projectIndexDir.resolve("lucene");
+            for (String path : liveFilePaths(dir)) holder.put(path, s);
+        }
+        FileShardRouter router = new FileShardRouter(to, projectRoot, f -> parserFor(f) instanceof GenericFileParser);
+        Map<String, ShardId> moved = new LinkedHashMap<>();
+        Set<ShardId> affected = new LinkedHashSet<>();
+        for (Map.Entry<String, ShardId> e : holder.entrySet()) {
+            if (!Files.isRegularFile(Path.of(e.getKey()))) {
+                throw new IOException("file " + e.getKey() + " of project " + projectName + " is gone from the source;"
+                        + " the source changed since the published run, which must be indexed first");
+            }
+            ShardId target;
+            try {
+                target = router.shardOf(e.getKey());
+            } catch (IllegalArgumentException ex) {
+                throw new IOException(ex.getMessage(), ex);
+            }
+            if (target.equals(e.getValue())) continue;
+            moved.put(e.getKey(), target);
+            affected.add(target);
+            if (to.shards().contains(e.getValue())) affected.add(e.getValue());
+        }
+        for (ShardId s : to.shards()) if (!fromIds.contains(s)) affected.add(s);
+        List<ShardId> affectedList = to.shards().stream().filter(affected::contains).toList();
+        List<ShardId> unaffected = to.shards().stream().filter(sh -> !affected.contains(sh)).toList();
+        List<ShardId> removed = fromIds.stream().filter(sh -> !to.shards().contains(sh)).toList();
+        log.info("Reshard of '{}' from {} to {}: {} of {} files move; shards written {}, kept {}, dropped {}",
+                projectName, from.spec(), to.spec(), moved.size(), holder.size(), affectedList, unaffected, removed);
+
+        // Parse only the moved files, grouped by parser.
+        Map<CodeParser, List<Path>> byParser = new LinkedHashMap<>();
+        for (String path : moved.keySet()) {
+            Path f = Path.of(path);
+            CodeParser parser = parserFor(f);
+            if (parser != null) byParser.computeIfAbsent(parser, k -> new ArrayList<>()).add(f);
+        }
+        List<ParsedProject> perLang = new ArrayList<>();
+        int parsed = 0;
+        for (Map.Entry<CodeParser, List<Path>> e : byParser.entrySet()) {
+            abort.checkpoint();
+            perLang.add(e.getKey().parseFiles(e.getValue(), projectRoot, projectName));
+            parsed += e.getValue().size();
+        }
+        ParsedProject subset = merge(projectName, projectRoot, perLang);
+        GraphIndexData graphData;
+        try (CallGraph graph = CallGraph.openExisting(CallGraph.writerGraphDir(projectIndexDir))) {
+            graphData = GraphIndexData.build(graph, subset);
+        } catch (RuntimeException e) {
+            log.warn("Reshard of '{}': the call graph could not be read ({}); moved methods get no in-degree", projectName,
+                    e.toString());
+            graphData = GraphIndexData.failed(e);
+        }
+
+        FileStateTracker stateTracker = stateTracker(projectIndexDir, generateEmbeddings);
+        List<EmbedRuntime> runtimes = buildRuntimes(projectIndexDir, generateEmbeddings, "embed-reshard");
+        Map<ShardId, IndexWriter> writers = ShardedWriter.openAll(affectedList,
+                sh -> luceneIndexer.openShardWriter(projectName, sh, !fromIds.contains(sh)));
+        try (ShardedWriter writer = ShardedWriter.split(writers, router)) {
+            try {
+                for (String path : moved.keySet()) writer.deleteFile(path);
+                indexProject(writer, subset, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir,
+                        runtimes, abort);
+                abort.enterCommit();
+                markCommitting(projectIndexDir, to);
+                writer.commit();
+            } catch (IndexAbortedException aborted) {
+                writer.rollback();
+                throw aborted;
+            }
+        }
+        stateTracker.save();
+        LocalShardLayout.write(projectIndexDir, to, keysOnModule(to) ? moduleDirs(projectRoot) : List.of());
+        luceneIndexer.dropOtherLayouts(projectName, to.shards());
+        Files.deleteIfExists(projectIndexDir.resolve(LocalShardLayout.COMMITTING));
+        progress.onProgress("Done", moved.size(), moved.size());
+        return new ReshardBuild(affectedList, unaffected, removed, moved.size(), parsed);
+    }
+
+    /** The {@code filePath} of every live document of the Lucene index in {@code luceneDir}. */
+    private static Set<String> liveFilePaths(Path luceneDir) throws IOException {
+        Set<String> out = new LinkedHashSet<>();
+        if (!Files.isDirectory(luceneDir)) return out;
+        try (org.apache.lucene.store.Directory d = org.apache.lucene.store.FSDirectory.open(luceneDir);
+             org.apache.lucene.index.DirectoryReader r = org.apache.lucene.index.DirectoryReader.open(d)) {
+            for (org.apache.lucene.index.LeafReaderContext leaf : r.leaves()) {
+                org.apache.lucene.index.Terms terms = leaf.reader().terms(DocumentMapper.F_FILE_PATH);
+                if (terms == null) continue;
+                org.apache.lucene.util.Bits live = leaf.reader().getLiveDocs();
+                org.apache.lucene.index.TermsEnum te = terms.iterator();
+                org.apache.lucene.index.PostingsEnum pe = null;
+                for (org.apache.lucene.util.BytesRef t = te.next(); t != null; t = te.next()) {
+                    pe = te.postings(pe, org.apache.lucene.index.PostingsEnum.NONE);
+                    for (int doc = pe.nextDoc(); doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+                         doc = pe.nextDoc()) {
+                        if (live == null || live.get(doc)) {
+                            out.add(t.utf8ToString());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
     /**
      * One run's shard routing: the plan, its file router (null for {@code [project]}) and the build-module
      * dirs found at the start of the run (recorded in the layout for a spec keyed on {@code module}).

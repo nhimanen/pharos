@@ -431,7 +431,9 @@ public class SearchEngine {
         if (fanout != null && fanout.fansOut()) {
             try (DistributedSearch.Query q = fanout) {
                 warnDegraded(q.localShards(), warnings);
-                return searchFannedOut(req, hints, expand, trace, warnings, q);
+                SearchResponse resp = searchFannedOut(req, hints, expand, trace, warnings, q);
+                for (String note : q.lateNotes()) trace.note(note);
+                return resp;
             }
         }
         if (fanout != null) fanout.close(); // routed, nothing pinned: released all the same

@@ -130,6 +130,16 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   heartbeat; a coordinator never sends a filtered query to a reader without it.
 - `cluster.reader.shards` accepts shard ids of split projects and project wildcards (`lucene~*`:
   every shard of the project).
+- Live resharding (object-store clusters): `pharos reshard <project> --spec "[project, ring(path,
+  shards=4)]"` requests a new spec version; `--status` shows the project's versions and the job's
+  progress, `--cancel` abandons it. The writer holding the project builds the new shards from its
+  index (a ring change re-indexes only the files that change shard; shards that neither gain nor
+  lose files keep their generations; embeddings come from the cache), readers keep serving the
+  current version and prepare the new one, and one catalog CAS flips routing once they have it
+  (or after `cluster.writer.reshardSyncTimeoutSeconds`, default 600). A query reads one version:
+  right after the flip it reads the previous one until its readers serve the new one. The retired
+  version is removed after `retentionMinutes`. An index run never adds shards: a new module under
+  `[project, module]` needs `pharos reshard` with the same spec.
 
 ### Changed (upgrade note)
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A

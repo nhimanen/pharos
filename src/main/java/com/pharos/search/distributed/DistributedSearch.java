@@ -119,7 +119,10 @@ import java.util.function.LongSupplier;
  * shards of a split project are kept on <b>one index run</b> ({@code projectGeneration}): before any of
  * its results are used, every shard is pinned and a shard answering from another run than the newest
  * one seen is moved to a replica serving that run (a local one is re-pinned), else left out with a
- * warning; a moved file is therefore never seen twice. Graph lookups of a split project ask one of its
+ * warning; a moved file is therefore never seen twice. Right after a reshard the catalog pins the
+ * generation of each shard of the new version (and of the retired one, which the router falls back to
+ * while the readers have not activated the new one): those shards are read at exactly those
+ * generations instead. Graph lookups of a split project ask one of its
  * shards: they all serve the same project graph.
  */
 public final class DistributedSearch implements Closeable {
@@ -200,13 +203,24 @@ public final class DistributedSearch implements Closeable {
         boolean unscoped = projects == null || projects.isEmpty();
         ShardRouter.RoutePlan plan = router.plan(projects, filter);
         List<ShardState> shards = new ArrayList<>(plan.shards().size());
+        List<ShardState> alternates = new ArrayList<>();
         for (ShardRouter.PlannedShard p : plan.shards()) { // ordinals follow the requested order
+            if (p.alternate()) continue;
             ShardState st = new ShardState(shards.size(), p.route(), router.servesLocally(p.shard()), p.project(), p.split());
             st.statsOnly = p.statsOnly();
+            st.expectedGeneration = p.generation();
             shards.add(st);
         }
+        for (ShardRouter.PlannedShard p : plan.shards()) { // the other version of a project just resharded
+            if (!p.alternate()) continue;
+            ShardState st = new ShardState(shards.size() + alternates.size(), p.route(), router.servesLocally(p.shard()),
+                    p.project(), p.split());
+            st.statsOnly = p.statsOnly();
+            st.expectedGeneration = p.generation();
+            alternates.add(st);
+        }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
-        Query q = new Query(shards, start + queryTimeout.toNanos(), explicitSingle, plan);
+        Query q = new Query(shards, alternates, start + queryTimeout.toNanos(), explicitSingle, plan);
         // a split project whose shards a filter all pruned still runs here (empty, with its warning)
         for (String p : unscoped ? plan.catalog().projects() : new LinkedHashSet<>(projects)) {
             if (plan.catalog().isSplit(p)) q.hasSplitProject = true;
@@ -215,7 +229,7 @@ public final class DistributedSearch implements Closeable {
         if (age > CATALOG_AGE_WARNING_SECONDS) q.warn("routing with a catalog " + age + " s old");
         for (String w : plan.warnings()) q.warn(w);
         java.util.Set<String> noFilters = new java.util.TreeSet<>();
-        for (ShardRouter.PlannedShard p : plan.shards()) noFilters.addAll(p.route().noFilters());
+        for (ShardRouter.PlannedShard p : plan.shards()) if (!p.alternate()) noFilters.addAll(p.route().noFilters());
         if (!noFilters.isEmpty()) {
             q.warn("key filters: reader(s) " + String.join(", ", noFilters)
                     + " run a pharos without key filter support and do not answer this query");
@@ -243,6 +257,7 @@ public final class DistributedSearch implements Closeable {
         final boolean split;              // that project is split: its shards stay on one index run
         boolean statsOnly;                // pruned by the key filter: answers term statistics only (P6-R13)
         Long projectGeneration;           // split shards: the index run of the pinned generation
+        Long expectedGeneration;          // split shards of a pinned version (a reshard's): the generation to read
         LocalShardService.Pin pin;        // local shards, pinned on first use, released on close
         ReaderHeartbeat reader;           // remote shards: the reader that answered last
         Long generation;                  // remote shards: pinned by the first answer
@@ -293,7 +308,12 @@ public final class DistributedSearch implements Closeable {
     /** The fan-out of one query; its shard calls run in parallel. Close it when the query is done. */
     public final class Query implements AutoCloseable {
 
-        private final List<ShardState> shards;
+        /** The query's shards; replaced once by {@link #reconcileRuns} when it reads a project's alternate version. */
+        private volatile List<ShardState> shards;
+        /** The other version of each project resharded just now ({@link ShardRouter.PlannedShard#alternate}). */
+        private final List<ShardState> alternates;
+        /** Trace notes that arise while the query runs (a switch to a project's other version). */
+        private final List<String> lateNotes = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final long deadlineNanos;
         private final List<String> warnings = new ArrayList<>();
         private final Map<String, float[]> vectors = new HashMap<>();
@@ -318,8 +338,10 @@ public final class DistributedSearch implements Closeable {
         /** Every split project's shards were pinned to one index run ({@link #reconcileRuns}). */
         private boolean reconciled;
 
-        Query(List<ShardState> shards, long deadlineNanos, boolean explicitSingle, ShardRouter.RoutePlan plan) {
-            this.shards = shards;
+        Query(List<ShardState> shards, List<ShardState> alternates, long deadlineNanos, boolean explicitSingle,
+              ShardRouter.RoutePlan plan) {
+            this.shards = List.copyOf(shards);
+            this.alternates = List.copyOf(alternates);
             this.deadlineNanos = deadlineNanos;
             this.explicitSingle = explicitSingle;
             this.plan = plan;
@@ -347,6 +369,11 @@ public final class DistributedSearch implements Closeable {
         /** What the router pruned, and why a filter could not prune where it could not (the query trace). */
         public List<String> routingNotes() {
             return plan.notes();
+        }
+
+        /** Notes of what the query decided while it ran (it read a just-resharded project's other version). */
+        public List<String> lateNotes() {
+            return List.copyOf(lateNotes);
         }
 
         /** The shards of the query in order (their names). */
@@ -624,7 +651,12 @@ public final class DistributedSearch implements Closeable {
                     for (ShardState s : shards) if (s.split) split.add(s);
                     if (split.isEmpty()) return;
                     List<ShardState> targets = new ArrayList<>();
-                    for (ShardState s : available()) if (s.split) targets.add(s);
+                    List<ShardState> pinned = new ArrayList<>();
+                    for (ShardState s : available()) {
+                        if (s.split && s.expectedGeneration != null) pinned.add(s);
+                        else if (s.split) targets.add(s);
+                    }
+                    if (!pinned.isEmpty()) alignPinnedProjects(pinned);
                     Map<ShardState, Long> runs = fanOut(targets, this::pinRun, (s, t) -> false, false);
                     runs.forEach((s, run) -> s.projectGeneration = run);
                     Map<String, List<ShardState>> byProject = new LinkedHashMap<>();
@@ -638,6 +670,173 @@ public final class DistributedSearch implements Closeable {
                     }
                 }
             }
+        }
+
+        /**
+         * The shards of a version whose generations the catalog pins (a reshard's: the flipped version
+         * until the project's next index run, or the retired one a query falls back to): each must be read
+         * at exactly its generation. A shard pinned to another one is pinned again (a local reader that
+         * activated the version meanwhile) or moved to a live reader serving it. When a shard of a project
+         * can't be, and the plan carries the project's other version (the router chose by heartbeats, which
+         * lag), the query reads that version instead if all of its shards can be; else the shard is left out
+         * with a warning. A query therefore reads one version of the project, every shard at the generation
+         * the version is made of: a moved file is never seen twice, nor dropped silently.
+         */
+        private void alignPinnedProjects(List<ShardState> pinned) {
+            Map<String, List<ShardState>> byProject = new LinkedHashMap<>();
+            for (ShardState s : pinned) byProject.computeIfAbsent(s.project, k -> new ArrayList<>()).add(s);
+            for (Map.Entry<String, List<ShardState>> e : byProject.entrySet()) {
+                Map<ShardState, String> failed = alignGenerations(e.getValue());
+                if (failed.isEmpty()) continue;
+                List<ShardState> alt = new ArrayList<>();
+                for (ShardState s : alternates) if (s.project.equals(e.getKey())) alt.add(s);
+                if (!alt.isEmpty() && servedAsPinned(alt)) {
+                    switchTo(e.getKey(), alt);
+                    continue;
+                }
+                failed.forEach(this::markUnavailable);
+            }
+        }
+
+        /** True when every shard of {@code version} (another version of a project) is served as it pins. */
+        private boolean servedAsPinned(List<ShardState> version) {
+            List<ShardState> pinned = new ArrayList<>();
+            for (ShardState s : version) {
+                if (!s.local && s.route.candidates().isEmpty()) return false;
+                if (s.split && s.expectedGeneration != null) pinned.add(s);
+            }
+            return alignGenerations(pinned).isEmpty();
+        }
+
+        /** The query reads {@code version} of {@code project} instead of the version it was planned with. */
+        private void switchTo(String project, List<ShardState> version) {
+            List<ShardState> dropped = new ArrayList<>();
+            synchronized (this) {
+                List<ShardState> next = new ArrayList<>();
+                boolean placed = false;
+                for (ShardState s : shards) {
+                    if (!s.project.equals(project)) {
+                        next.add(s);
+                        continue;
+                    }
+                    dropped.add(s);
+                    if (!placed) {
+                        next.addAll(version);
+                        placed = true;
+                    }
+                }
+                if (!placed) next.addAll(version);
+                shards = List.copyOf(next);
+            }
+            for (ShardState s : dropped) {
+                synchronized (s) {
+                    if (s.pin != null) {
+                        try {
+                            s.pin.close();
+                        } catch (IOException ex) {
+                            log.warn("Releasing the reader of shard {} failed: {}", s.name(), ex.toString());
+                        }
+                        s.pin = null;
+                    }
+                }
+            }
+            java.util.Set<ShardId> active = new java.util.HashSet<>(plan.catalog().shardsOf(project));
+            java.util.Set<ShardId> read = new java.util.HashSet<>();
+            for (ShardState s : version) read.add(s.route.shard());
+            String note = "project " + project + ": " + (read.equals(active)
+                    ? "the readers serve its new spec version (just resharded); this query reads it"
+                    : "the readers do not serve its new spec version (just resharded) yet; this query reads the"
+                      + " previous version");
+            lateNotes.add(note);
+            log.debug("Query: {}", note);
+        }
+
+        /**
+         * Pins every shard of {@code pinned} at its expected generation (see {@link #alignPinnedProjects});
+         * returns the ones that could not be, with why. Marks nothing unavailable.
+         */
+        private Map<ShardState, String> alignGenerations(List<ShardState> pinned) {
+            Map<ShardState, String> failed = new LinkedHashMap<>();
+            Map<ShardState, Long> gens = fanOut(pinned, this::pinGeneration, (s, t) -> {
+                failed.put(s, reason(t));
+                return true;
+            }, false);
+            for (ShardState s : pinned) {
+                if (failed.containsKey(s) || s.unavailable != null) continue;
+                Long have = gens.get(s);
+                if (have == null) {
+                    failed.put(s, "no answer");
+                    continue;
+                }
+                if (have.longValue() == s.expectedGeneration) continue;
+                long want = s.expectedGeneration;
+                if (s.local) {
+                    synchronized (s) {
+                        try {
+                            if (s.pin != null) s.pin.close();
+                            s.pin = null;
+                            have = pin(s).generation();
+                        } catch (IOException | RuntimeException e) {
+                            have = null;
+                        }
+                    }
+                    if (have != null && have == want) continue;
+                }
+                if (moveRemoteGeneration(s, want)) continue;
+                failed.put(s, "no live reader serves it at generation " + want + ", which the version of project "
+                        + s.project + " this query reads is made of (found generation " + have + ")");
+            }
+            return failed;
+        }
+
+        /** Pins {@code s} and returns its pinned generation. */
+        private Long pinGeneration(ShardState s) throws IOException {
+            if (s.local) return pin(s).generation();
+            TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()));
+            return r.generation();
+        }
+
+        /**
+         * Asks the live readers of {@code s} (in route order) for its generation {@code generation}; pins
+         * the shard to the first that serves it (served remotely from then on). False when none does.
+         */
+        private boolean moveRemoteGeneration(ShardState s, long generation) {
+            ReaderHeartbeat current;
+            synchronized (s) {
+                current = s.reader;
+            }
+            for (ReaderHeartbeat r : s.route.candidates()) {
+                if (current != null && r.node().equals(current.node())) continue;
+                long left = remainingNanos();
+                if (left <= 0) return false;
+                try {
+                    TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
+                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()), left / 2);
+                    if (resp.generation() != generation) continue;
+                    synchronized (s) {
+                        s.reader = r;
+                        s.generation = resp.generation();
+                        s.projectGeneration = resp.projectGeneration();
+                        if (s.local) {
+                            s.local = false;
+                            if (s.pin != null) {
+                                try {
+                                    s.pin.close();
+                                } catch (IOException e) {
+                                    log.warn("Releasing the reader of shard {} failed: {}", s.name(), e.toString());
+                                }
+                                s.pin = null;
+                            }
+                        }
+                    }
+                    return true;
+                } catch (RuntimeException e) {
+                    log.debug("Query: reader {} could not serve shard {} at generation {}: {}", r.node(), s.name(),
+                            generation, e.toString());
+                }
+            }
+            return false;
         }
 
         /** Pins {@code s} and returns the index run of its pinned generation (0 when it states none). */

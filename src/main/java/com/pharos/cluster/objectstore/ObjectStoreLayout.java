@@ -115,4 +115,14 @@ public final class ObjectStoreLayout {
     public String projectWriterStatePrefix(String project) {
         return projectPrefix(project) + "writer-state/";
     }
+
+    /** The per-project reshard lease ({@code projects/<project>/reshard-lease}): one reshard job at a time. */
+    public String reshardLeaseKey(String project) {
+        return projectPrefix(project) + "reshard-lease";
+    }
+
+    /** The state of a project's reshard job ({@code projects/<project>/reshard/job.json}), for status and resume. */
+    public String reshardJobKey(String project) {
+        return projectPrefix(project) + "reshard/job.json";
+    }
 }

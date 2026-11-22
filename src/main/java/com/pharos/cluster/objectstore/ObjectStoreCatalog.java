@@ -204,6 +204,348 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         });
     }
 
+    // ------------------------------------------------------------------------- resharding (Task 4)
+
+    /**
+     * Requests a reshard of {@code project} to {@code spec} ({@code pharos reshard}): appends a new spec
+     * version (always: a reshard is a new version even when the text equals an older one, for example to
+     * add the shard of a new module under the same spec) and records {@code projects[].reshard}. A project
+     * on the implicit {@code [project]} gets its entry. Idempotent: an open request for the same spec
+     * returns its version and writes nothing.
+     *
+     * @throws IllegalStateException when another reshard of the project is open (requested or staged and
+     *         not cancelled) for another spec: one reshard of a project at a time
+     */
+    public int requestReshard(String project, ShardSpec spec, java.time.Instant now) throws IOException {
+        if (!ShardId.isProjectName(project)) {
+            throw new IllegalArgumentException("'" + project + "' is not a valid cluster project name");
+        }
+        int[] version = new int[1];
+        update("request a reshard of project " + project, root -> {
+            ObjectNode entry = projectEntry(root, project, true);
+            String target = spec.toString();
+            JsonNode rq = entry.get("reshard");
+            if (rq != null && rq.isObject()) {
+                VersionedSpec open = specVersion(root, rq.path("spec").asInt(-1));
+                if (open.spec().toString().equals(target)) {
+                    version[0] = open.version();
+                    return false;
+                }
+                throw new IllegalStateException("a reshard of project " + project + " to " + open.spec()
+                        + " (spec version " + open.version() + ") is in progress; cancel it first (pharos reshard "
+                        + project + " --cancel)");
+            }
+            JsonNode st = entry.get("staged");
+            if (st != null && st.isObject() && !st.hasNonNull("abandonedAt")) {
+                throw new IllegalStateException("project " + project + " has a staged spec version "
+                        + st.path("spec").asInt() + " that was not cancelled; cancel it first (pharos reshard "
+                        + project + " --cancel)");
+            }
+            ArrayNode specs = array(root, "specs");
+            int max = 0;
+            for (JsonNode s : specs) max = Math.max(max, s.path("version").asInt(0));
+            version[0] = max + 1;
+            ObjectNode v = specs.addObject();
+            v.put("version", version[0]);
+            v.put("project", project);
+            v.put("spec", target);
+            ObjectNode req = entry.putObject("reshard");
+            req.put("spec", version[0]);
+            req.put("requestedAt", now.toString());
+            return true;
+        });
+        return version[0];
+    }
+
+    /**
+     * Cancels the open reshard of {@code project}: drops the request and marks a staged version that was
+     * not flipped {@code abandonedAt} (its shards are GC'd after the retention window). Returns false when
+     * there was nothing to cancel.
+     */
+    public boolean cancelReshard(String project, java.time.Instant now) throws IOException {
+        boolean[] cancelled = {false};
+        update("cancel the reshard of project " + project, root -> {
+            ObjectNode entry = projectEntry(root, project, false);
+            if (entry == null) return false;
+            boolean changed = entry.remove("reshard") != null;
+            JsonNode st = entry.get("staged");
+            if (st instanceof ObjectNode o && !o.hasNonNull("abandonedAt")) {
+                o.put("abandonedAt", now.toString());
+                changed = true;
+            }
+            cancelled[0] = changed;
+            return changed;
+        });
+        return cancelled[0];
+    }
+
+    /**
+     * Writes {@code project}'s staged version: spec {@code version} with {@code shards}, staged from the
+     * active spec version {@code from} (empty: the implicit {@code [project]}). The request must still
+     * name {@code version}. Idempotent for the same version and shards; a staged version of another spec
+     * (cancelled) moves to {@code abandoned}.
+     *
+     * @throws PublishConflictException when the request changed or the active version is no longer
+     *         {@code from}
+     */
+    public void stageReshard(String project, int version, java.util.OptionalInt from, List<ShardId> shards,
+                             java.time.Instant now) throws IOException {
+        update("stage spec version " + version + " of project " + project, root -> {
+            ObjectNode entry = requireRequest(root, project, version);
+            checkFrom(entry, project, from);
+            ProjectShards.checkProject(project, specVersion(root, version), shards);
+            ArrayNode ids = idArray(shards);
+            JsonNode st = entry.get("staged");
+            if (st instanceof ObjectNode o && o.path("spec").asInt(-1) == version && ids.equals(o.get("shards"))
+                    && !o.hasNonNull("abandonedAt") && listsAll(root, shards)) {
+                return false;
+            }
+            if (st instanceof ObjectNode o) abandon(entry, o.path("spec"), o.path("shards"), now);
+            ObjectNode staged = entry.putObject("staged");
+            staged.put("spec", version);
+            staged.set("shards", ids);
+            if (from.isPresent()) staged.put("from", from.getAsInt());
+            list(root, shards);
+            return true;
+        });
+    }
+
+    /**
+     * Records the generation of every staged shard ({@code staged.generations}): the version is complete
+     * and readers may sync it. In the same CAS, pins the active version at {@code activeGenerations} (what
+     * it serves now): from here on a query reads the active version at exactly those generations, so a
+     * coordinator still routing it after the flip (an older catalog read) can never read a shard the flip
+     * rewrote at its new generation. Idempotent.
+     */
+    public void pinStaged(String project, int version, java.util.Map<ShardId, Long> generations,
+                          java.util.Map<ShardId, Long> activeGenerations) throws IOException {
+        update("pin staged spec version " + version + " of project " + project, root -> {
+            ObjectNode entry = requireRequest(root, project, version);
+            ObjectNode st = staged(entry, project, version);
+            ObjectNode gens = generationsNode(generations);
+            List<ShardId> shards = new ArrayList<>();
+            for (JsonNode s : st.path("shards")) shards.add(new ShardId(s.asText()));
+            if (!generations.keySet().equals(new java.util.HashSet<>(shards))) {
+                throw new IllegalArgumentException("generations " + generations.keySet() + " are not the staged shards "
+                        + shards);
+            }
+            List<ShardId> active = new ArrayList<>();
+            for (JsonNode s : entry.path("shards")) active.add(new ShardId(s.asText()));
+            if (!activeGenerations.keySet().equals(new java.util.HashSet<>(active))) {
+                throw new IllegalArgumentException("generations " + activeGenerations.keySet()
+                        + " are not the active shards " + active);
+            }
+            ObjectNode activeGens = generationsNode(activeGenerations);
+            if (gens.equals(st.get("generations")) && activeGens.equals(entry.get("generations"))) return false;
+            st.set("generations", gens);
+            entry.set("generations", activeGens);
+            return true;
+        });
+    }
+
+    /**
+     * The reshard flip, one CAS: {@code project}'s entry becomes its staged version (spec, shards, and its
+     * generations as the active pins); the version it replaces becomes {@code previous} with
+     * {@code previousGenerations} and {@code retiredAt = now} (an older {@code previous} moves to
+     * {@code abandoned}); the staged entry and the request are removed.
+     *
+     * @throws PublishConflictException when the staged version is not {@code version}, is not pinned, or
+     *         the active version changed since it was staged
+     */
+    public void flipReshard(String project, int version, java.util.Map<ShardId, Long> previousGenerations,
+                            java.time.Instant now) throws IOException {
+        update("flip project " + project + " to spec version " + version, root -> {
+            ObjectNode entry = projectEntry(root, project, false);
+            if (entry == null) throw new PublishConflictException("project " + project + " has no catalog entry");
+            if (entry.path("spec").asInt(-1) == version && !entry.has("staged")) return false; // flipped already
+            ObjectNode st = staged(entry, project, version);
+            if (!st.hasNonNull("generations")) {
+                throw new PublishConflictException("staged spec version " + version + " of project " + project
+                        + " is not complete (no generations)");
+            }
+            java.util.OptionalInt from = st.hasNonNull("from") ? java.util.OptionalInt.of(st.get("from").asInt())
+                    : java.util.OptionalInt.empty();
+            checkFrom(entry, project, from);
+            ObjectNode prev = JSON.createObjectNode();
+            if (entry.hasNonNull("spec")) prev.put("spec", entry.get("spec").asInt());
+            prev.set("shards", entry.path("shards").deepCopy());
+            prev.set("generations", generationsNode(previousGenerations));
+            prev.put("retiredAt", now.toString());
+            JsonNode older = entry.get("previous");
+            if (older != null && older.isObject()) abandon(entry, older.path("spec"), older.path("shards"), now);
+            entry.put("spec", version);
+            entry.set("shards", st.get("shards").deepCopy());
+            entry.set("generations", st.get("generations").deepCopy());
+            entry.set("previous", prev);
+            entry.remove("staged");
+            entry.remove("reshard");
+            return true;
+        });
+    }
+
+    /**
+     * Drops the active pins of {@code project} once an index run published all of {@code shards} (its
+     * active shards): readers then follow {@code LATEST} again. No-op when there are none, or when the
+     * project's shards are no longer {@code shards}.
+     */
+    public void clearPins(String project, List<ShardId> shards) throws IOException {
+        update("clear the pins of project " + project, root -> {
+            ObjectNode entry = projectEntry(root, project, false);
+            if (entry == null || !entry.has("generations") || !idArray(shards).equals(entry.get("shards"))) return false;
+            entry.remove("generations");
+            return true;
+        });
+    }
+
+    /**
+     * After the retention window: drops {@code project}'s previous version (retired at {@code retiredAt})
+     * and unlists its shards that no version names any more. Returns the shards unlisted.
+     */
+    public List<ShardId> dropPrevious(String project, java.time.Instant retiredAt) throws IOException {
+        List<ShardId> gone = new ArrayList<>();
+        update("drop the previous version of project " + project, root -> {
+            gone.clear();
+            ObjectNode entry = projectEntry(root, project, false);
+            JsonNode prev = entry == null ? null : entry.get("previous");
+            if (prev == null || !prev.isObject() || !retiredAt.toString().equals(prev.path("retiredAt").asText())) {
+                return false;
+            }
+            entry.remove("previous");
+            gone.addAll(unlistUnreferenced(root, prev.path("shards")));
+            return true;
+        });
+        return List.copyOf(gone);
+    }
+
+    /**
+     * After the retention window: drops an abandoned version of {@code project} (its {@code since}), and
+     * a cancelled staged version ({@code abandonedAt} = {@code since}), unlisting the shards no version
+     * names any more. Returns the shards unlisted.
+     */
+    public List<ShardId> dropAbandoned(String project, java.time.Instant since) throws IOException {
+        List<ShardId> gone = new ArrayList<>();
+        update("drop an abandoned version of project " + project, root -> {
+            gone.clear();
+            ObjectNode entry = projectEntry(root, project, false);
+            if (entry == null) return false;
+            List<JsonNode> dropped = new ArrayList<>();
+            JsonNode st = entry.get("staged");
+            if (st instanceof ObjectNode o && since.toString().equals(o.path("abandonedAt").asText(null))) {
+                dropped.add(o.path("shards"));
+                entry.remove("staged");
+            }
+            JsonNode list = entry.get("abandoned");
+            if (list instanceof ArrayNode arr) {
+                for (int i = arr.size() - 1; i >= 0; i--) {
+                    if (since.toString().equals(arr.get(i).path("since").asText(null))) {
+                        dropped.add(arr.get(i).path("shards"));
+                        arr.remove(i);
+                    }
+                }
+                if (arr.isEmpty()) entry.remove("abandoned");
+            }
+            if (dropped.isEmpty()) return false;
+            for (JsonNode ids : dropped) gone.addAll(unlistUnreferenced(root, ids));
+            return true;
+        });
+        return List.copyOf(gone);
+    }
+
+    /** The entry of {@code project}; with {@code create}, an implicit {@code [project]} project gets one. */
+    private static ObjectNode projectEntry(ObjectNode root, String project, boolean create) {
+        ArrayNode projects = array(root, "projects");
+        for (JsonNode p : projects) {
+            if (project.equals(p.path("name").asText(null)) && p instanceof ObjectNode o) return o;
+        }
+        if (!create) return null;
+        ObjectNode entry = projects.addObject();
+        entry.put("name", project);
+        entry.putArray("shards").add(ShardId.ofProject(project).value());
+        list(root, List.of(ShardId.ofProject(project)));
+        return entry;
+    }
+
+    private ObjectNode requireRequest(ObjectNode root, String project, int version) throws PublishConflictException {
+        ObjectNode entry = projectEntry(root, project, false);
+        if (entry == null || entry.path("reshard").path("spec").asInt(-1) != version) {
+            throw new PublishConflictException("project " + project + " has no open reshard request to spec version "
+                    + version + " (cancelled or superseded)");
+        }
+        return entry;
+    }
+
+    private static void checkFrom(ObjectNode entry, String project, java.util.OptionalInt from)
+            throws PublishConflictException {
+        java.util.OptionalInt active = entry.hasNonNull("spec") ? java.util.OptionalInt.of(entry.get("spec").asInt())
+                : java.util.OptionalInt.empty();
+        if (!active.equals(from)) {
+            throw new PublishConflictException("project " + project + " is at spec version " + active
+                    + ", not " + from + ", since its reshard was staged");
+        }
+    }
+
+    private static ObjectNode staged(ObjectNode entry, String project, int version) throws PublishConflictException {
+        JsonNode st = entry.get("staged");
+        if (!(st instanceof ObjectNode o) || o.path("spec").asInt(-1) != version || o.hasNonNull("abandonedAt")) {
+            throw new PublishConflictException("project " + project + " has no staged spec version " + version);
+        }
+        return o;
+    }
+
+    private static void abandon(ObjectNode entry, JsonNode spec, JsonNode shards, java.time.Instant now) {
+        ObjectNode a = array(entry, "abandoned").addObject();
+        if (spec != null && spec.canConvertToInt()) a.put("spec", spec.asInt());
+        a.set("shards", shards == null ? JSON.createArrayNode() : shards.deepCopy());
+        a.put("since", now.toString());
+    }
+
+    private static ArrayNode idArray(List<ShardId> shards) {
+        ArrayNode ids = JSON.createArrayNode();
+        shards.forEach(id -> ids.add(id.value()));
+        return ids;
+    }
+
+    private static ObjectNode generationsNode(java.util.Map<ShardId, Long> generations) {
+        ObjectNode out = JSON.createObjectNode();
+        new java.util.TreeMap<>(java.util.Map.copyOf(generations).entrySet().stream()
+                .collect(java.util.stream.Collectors.toMap(e -> e.getKey().value(), java.util.Map.Entry::getValue)))
+                .forEach(out::put);
+        return out;
+    }
+
+    private static void list(ObjectNode root, List<ShardId> shards) {
+        ArrayNode list = shardsArray(root);
+        for (ShardId id : shards) {
+            if (!listsAll(root, List.of(id))) list.addObject().put("id", id.value());
+        }
+    }
+
+    /**
+     * Removes from {@code shards[]} those of {@code candidates} that no project entry names any more (its
+     * shards, staged, previous or abandoned versions). Returns the removed ids.
+     */
+    private static List<ShardId> unlistUnreferenced(ObjectNode root, JsonNode candidates) {
+        java.util.Set<String> named = new java.util.HashSet<>();
+        for (JsonNode p : array(root, "projects")) {
+            for (JsonNode s : p.path("shards")) named.add(s.asText());
+            for (JsonNode s : p.path("staged").path("shards")) named.add(s.asText());
+            for (JsonNode s : p.path("previous").path("shards")) named.add(s.asText());
+            for (JsonNode a : p.path("abandoned")) for (JsonNode s : a.path("shards")) named.add(s.asText());
+        }
+        java.util.Set<String> drop = new java.util.HashSet<>();
+        for (JsonNode c : candidates) if (!named.contains(c.asText())) drop.add(c.asText());
+        List<ShardId> out = new ArrayList<>();
+        ArrayNode list = shardsArray(root);
+        for (int i = list.size() - 1; i >= 0; i--) {
+            String id = list.get(i).path("id").asText();
+            if (drop.contains(id)) {
+                list.remove(i);
+                if (ShardId.isValid(id)) out.add(new ShardId(id));
+            }
+        }
+        return out;
+    }
+
     private static boolean listsAll(ObjectNode root, List<ShardId> ids) {
         java.util.Set<String> listed = new java.util.HashSet<>();
         for (JsonNode s : shardsArray(root)) listed.add(s.path("id").asText());

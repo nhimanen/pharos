@@ -79,6 +79,8 @@ public final class ClusterRuntime implements Closeable {
     private volatile com.pharos.indexer.ProjectIndexManager indexManager;
     /** The work queue of a writer with {@code cluster.writer.workQueue: true} while it runs. Guarded by this. */
     private com.pharos.cluster.writer.WorkLoop workLoop;
+    /** The live readers a writer's reshard flip waits for (an observer of the bucket's heartbeats). */
+    private com.pharos.cluster.membership.ReaderRegistry reshardReaders;
     /** Removes the writer's signal-time stop step. Guarded by this. */
     private AutoCloseable writerStopStep;
     /** {@code <workDir>/.work-loop.lock} while this process runs the work loop. */
@@ -470,9 +472,20 @@ public final class ClusterRuntime implements Closeable {
                 : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
         com.pharos.cluster.routing.CachedCatalog cat = coordinatorCatalog;
         Long catalogAge = cat == null || cat.ageSeconds() < 0 ? null : cat.ageSeconds();
+        Map<String, Long> generations = new java.util.TreeMap<>();
+        Map<String, Long> prepared = new java.util.TreeMap<>();
+        ReplicaSyncer sy;
+        synchronized (this) { sy = syncer; }
+        if (sy != null) {
+            sy.served().forEach((id, g) -> { if (names.contains(id.value())) generations.put(id.value(), g.value()); });
+            sy.preparedGenerations().forEach((id, g) -> {
+                if (pin.isEmpty() || pin.matches(id.value(), this::projectOfShard)) prepared.put(id.value(), g.value());
+            });
+        }
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
-                catalogAge, Boolean.TRUE); // applies key filters on /internal search (P6-R12)
+                catalogAge, Boolean.TRUE, // applies key filters on /internal search (P6-R12)
+                generations, prepared);
     }
 
     // Holding the monitor of this.
@@ -580,6 +593,18 @@ public final class ClusterRuntime implements Closeable {
                             Duration.ofSeconds(w.getLsRemoteTimeoutSeconds())),
                     java.time.Clock.systemUTC(), disk);
             os.workQueueGuard().ifPresent(g -> g.attach(loop));
+            if (os.publisher() instanceof com.pharos.cluster.objectstore.ObjectStorePublisher publisher) {
+                // resharding (Phase 6 Task 4): the flip waits for the readers this observer lists
+                com.pharos.cluster.membership.ReaderRegistry readersSeen =
+                        com.pharos.cluster.membership.ReaderRegistry.observer(os.store(), os.layout(), c);
+                readersSeen.start();
+                reshardReaders = readersSeen;
+                loop.enableResharding(publisher, new com.pharos.cluster.objectstore.GenerationGc(os.store(), os.layout(),
+                                c.getRetentionGenerations(), Duration.ofMinutes(c.getRetentionMinutes())),
+                        readersSeen::live, new com.pharos.cluster.sharding.ReshardJob.Settings(
+                                Duration.ofSeconds(w.getReshardSyncTimeoutSeconds()),
+                                Duration.ofMinutes(c.getRetentionMinutes()), CATALOG_CACHE.multipliedBy(3)));
+            }
             workLoop = loop;
         }
         loop.start();
@@ -655,10 +680,14 @@ public final class ClusterRuntime implements Closeable {
     /** Graceful stop of the work loop within {@code cluster.drainSeconds}; idempotent. */
     private void stopWriting() {
         com.pharos.cluster.writer.WorkLoop loop;
+        com.pharos.cluster.membership.ReaderRegistry readersSeen;
         synchronized (this) {
             loop = workLoop;
+            readersSeen = reshardReaders;
+            reshardReaders = null;
         }
         if (loop != null) loop.stop(Duration.ofSeconds(config.getCluster().getDrainSeconds()));
+        if (readersSeen != null) readersSeen.close();
     }
 
     /** Frees the work-loop lock once the loop has stopped (on {@link #close}). */

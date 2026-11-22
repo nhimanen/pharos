@@ -551,6 +551,18 @@ A `role: writer` node runs the **work queue** by default (`cluster.writer.workQu
 - **Synonyms.** Each publish merges the writer's mined rules for that shard into the cluster's `catalog/synonyms.txt` (a conditional read-modify-write that replaces only that shard's section and keeps every other shard's), so all readers serve the same file whichever writer published last. Hand-written rules come from the publishing writer's `synonyms.txt`: keep them the same on every writer.
 - A writer serves no search: `pharos web` on a writer does not load the search models (its index runs load the embedding models they use). Writers heartbeat into `catalog/writers/<node>.json` every `heartbeatSeconds` (which must stay below `leaseTtlSeconds`) with their leases, backlog and current job; `/cluster/status` and the Cluster page show them.
 
+### Resharding a project
+
+A project is split into shards by its **shard spec** (`cluster.sharding`; object-store clusters only): `[project]` (the default, one shard), `[project, module]`, `[project, ring(path, shards=8)]`, `[language]` and so on. Changing it live is one command:
+
+```bash
+pharos reshard lucene --spec "[project, ring(path, shards=4)]"   # request (a new spec version)
+pharos reshard lucene --status                                   # versions and progress
+pharos reshard lucene --cancel                                   # abandon an open reshard
+```
+
+The writer holding the project runs it under a per-project lease (`projects/<p>/reshard-lease`): it writes the new version as *staged*, builds it from its local index (a ring change re-indexes only the files whose shard changes, counted at the parser; embeddings come from the cache, so nothing unchanged is embedded again) and publishes the shards that changed without moving their `LATEST`; shards that neither gain nor lose files keep their generations, byte-identical. Readers keep serving the current version and prepare the new one; once every live reader has it (or after `cluster.writer.reshardSyncTimeoutSeconds`, default 600), one catalog CAS flips routing. Each query reads one version: right after the flip it reads the previous one until its readers serve the new one, so a file that moved shards is never seen twice or missed. The retired version is deleted after `retentionMinutes`. An interrupted reshard resumes on the next writer that holds the project; a cancelled one is removed after the retention window. Index runs never add shards: a new module under `[project, module]` fails the project's runs with "reshard the project to add it" until `pharos reshard <project> --spec "<the same spec>"` adds its shard. Resharding back to `[project]` is not supported; `[project, ring(path, shards=1)]` serves a project from one shard.
+
 ### Cluster page
 
 The web UI (`pharos web`, `./pharos web`) has a **Cluster** button next to *Module Graph*; `http://<node>:7171/#cluster` opens it directly. It is drawn only from `GET /cluster/status` (the public view, without reader addresses) on the node you opened, so any node shows the same cluster:

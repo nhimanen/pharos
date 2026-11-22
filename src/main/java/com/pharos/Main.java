@@ -216,6 +216,8 @@ public class Main {
                 return (K) new PublishCommand(config, registry, clusterRuntime);
             if (cls == RouterCommand.class)
                 return (K) new RouterCommand(config);
+            if (cls == ReshardCommand.class)
+                return (K) new ReshardCommand(config);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

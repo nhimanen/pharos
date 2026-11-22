@@ -247,7 +247,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
 
             // 8. Best-effort writer-state backup (before GC, so GC sees this generation's state), then GC.
             backupWriterState(shard, gen, snapshot.shardDir());
-            runGc(shard);
+            if (!mapping.pinsOf(snapshot.project()).isEmpty()) clearPinsQuietly(snapshot.project(), List.of(shard));
+            runGc(shard, mapping.pinnedGenerations(shard));
 
             log.info("Published shard {} generation {}: {} files uploaded, {} reused, {} bytes uploaded",
                     shard, gen.value(), uploaded, reused, bytesUploaded);
@@ -497,7 +498,16 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 log.warn("Writer-state backup of project {} run {} failed (publish succeeded): {}",
                         project, projectGen, e.toString());
             }
-            for (ShardId shard : plan.shards()) runGc(shard);
+            // A reshard's pins are superseded: every shard is at this run now, which readers activate as a set.
+            if (!mapping.pinsOf(project).isEmpty()) {
+                try {
+                    catalog.clearPins(project, plan.shards());
+                } catch (IOException | RuntimeException e) {
+                    log.warn("Clearing the reshard pins of project {} failed (publish succeeded; retried by the next"
+                            + " run): {}", project, e.toString());
+                }
+            }
+            for (ShardId shard : plan.shards()) runGc(shard, mapping.pinnedGenerations(shard));
             if (gc != null) gc.collectProject(project, plan.shards(), storeNow(layout.latestKey(plan.shards().getFirst())));
 
             log.info("Published project {} run {} as {} shard generations: {} files uploaded, {} reused, {} bytes"
@@ -509,6 +519,213 @@ public final class ObjectStorePublisher implements IndexPublisher {
             throw new PublishException("publishing project " + project + " failed: " + e.getMessage(), e);
         } finally {
             if (tempDir != null) deleteRecursively(tempDir);
+        }
+    }
+
+    // ------------------------------------------------------------------------- resharding (Task 4)
+
+    /**
+     * What every shard a reshard publishes shares with the version it reshards: the index run
+     * ({@code projectGeneration}), the project files (graph, refs), the project meta (source revision)
+     * and the model fingerprint. The content is the same run's, only split differently, so a reader sees
+     * one run across the new version's shards, and the writer's next run continues from it.
+     */
+    public record ReshardReference(long projectGeneration, List<ManifestFile> projectFiles, ProjectMeta meta,
+                                   String modelFingerprint) {
+        public ReshardReference {
+            projectFiles = List.copyOf(projectFiles);
+        }
+    }
+
+    /**
+     * The reference of a reshard of {@code project} away from {@code from} (the shards of the active
+     * version): a split version's run, project files and meta from its first shard's {@code LATEST}
+     * manifest; a {@code [project]} version's meta from its manifest, with the project graph and refs of
+     * {@code projectDir} uploaded once under {@code projects/<project>/} as run 1 (or one above any run an
+     * earlier, abandoned reshard of {@code to} left).
+     *
+     * @throws PublishException when a shard of {@code from} has never been published
+     */
+    public ReshardReference reshardReference(String project, List<ShardId> from, List<ShardId> to, Path projectDir)
+            throws IOException {
+        ShardManifest first = null;
+        for (ShardId shard : from) {
+            Optional<Latest> latest = readLatest(shard);
+            if (latest.isEmpty()) {
+                throw new PublishException("shard " + shard + " of project " + project + " was never published;"
+                        + " a reshard splits a published version");
+            }
+            ShardManifest m = readManifest(shard, latest.get());
+            if (first == null) first = m;
+        }
+        if (first == null) throw new PublishException("project " + project + " has no shards to reshard");
+        if (first.isProjectShard()) {
+            return new ReshardReference(first.projectGeneration(), first.projectFileList(), first.projectMeta(),
+                    first.modelFingerprint());
+        }
+        long run = 1;
+        for (ShardId shard : to) {
+            Optional<Latest> latest = readLatest(shard);
+            if (latest.isEmpty()) continue;
+            ShardManifest m = readManifest(shard, latest.get());
+            if (m.projectGeneration() != null) run = Math.max(run, m.projectGeneration() + 1);
+        }
+        Path tempDir = Files.createTempDirectory("pharos-reshard-");
+        try {
+            List<ManifestFile> projectFiles = new ArrayList<>();
+            Path arcade = CallGraph.projectGraphDir(projectDir);
+            if (Files.isDirectory(arcade)) {
+                Path graphFile = tempDir.resolve(GraphViews.COMPACT_FILE);
+                try (CallGraph graph = CallGraph.openExisting(arcade)) {
+                    CompactGraphWriter.export(graph, graphFile);
+                }
+                String crc = crc32Hex(graphFile);
+                projectFiles.add(upload(ManifestFile.GRAPH, GraphViews.COMPACT_FILE,
+                        layout.projectGraphKey(project, run, crc), graphFile, crc));
+            }
+            Path refs = projectDir.resolve(REFS_FILE);
+            if (Files.isRegularFile(refs)) {
+                Path refsGz = tempDir.resolve(REFS_FILE + ".gz");
+                CRC32 refsCrc = new CRC32();
+                try (OutputStream out = new GZIPOutputStream(
+                        new CheckedOutputStream(Files.newOutputStream(refsGz), refsCrc))) {
+                    Files.copy(refs, out);
+                }
+                String crc = Long.toHexString(refsCrc.getValue());
+                projectFiles.add(upload(ManifestFile.REFS, REFS_FILE + ".gz",
+                        layout.projectRefsKey(project, run, crc), refsGz, crc));
+            }
+            return new ReshardReference(run, projectFiles, first.projectMeta(), first.modelFingerprint());
+        } finally {
+            deleteRecursively(tempDir);
+        }
+    }
+
+    /**
+     * Publishes one shard of a reshard's new version as a new generation <b>without moving its
+     * {@code LATEST}</b>: readers sync it only through the catalog's staged generations, and serve it
+     * only once the flip routes to it; until then {@code LATEST} keeps naming what the active version
+     * serves. Uploads the shard's Lucene files of {@code projectDir} not already in its {@code LATEST}
+     * manifest, then writes manifest gen-N (N one above both {@code LATEST} and any manifest the shard
+     * has) create-only, after {@code check}.
+     *
+     * <p>When {@code reuse} names a generation of this shard whose manifest exists and lists exactly the
+     * local commit's Lucene files (a run of the same job that was interrupted after publishing it),
+     * that generation is returned and nothing is written.
+     *
+     * @return the shard's generation in the new version
+     */
+    public Generation stageShard(ShardId shard, Path projectDir, ReshardReference ref, Optional<Generation> reuse,
+                                 LeaseGuard check) throws IOException {
+        Path luceneDir = LocalShardLayout.luceneDir(projectDir, shard);
+        Optional<Latest> latest = readLatest(shard);
+        Set<String> previousKeys = latest.isPresent() ? keysOf(readManifest(shard, latest.get())) : Set.of();
+        if (reuse.isPresent()) {
+            Optional<StoredObject> m = store.get(layout.manifestKey(shard, reuse.get()));
+            if (m.isPresent()) {
+                Set<String> published = new HashSet<>();
+                for (ManifestFile f : ShardManifest.read(m.get().data()).files()) {
+                    if (ManifestFile.LUCENE.equals(f.role())) published.add(f.key());
+                }
+                if (published.equals(localLuceneKeys(shard, luceneDir))) {
+                    log.info("Reshard: shard {} generation {} was published by an earlier attempt; reusing it", shard,
+                            reuse.get().value());
+                    return reuse.get();
+                }
+            }
+        }
+        ShardLucene sl = uploadLucene(shard, luceneDir, previousKeys);
+        long highest = latest.map(l -> l.generation().value()).orElse(0L);
+        String manifests = layout.shardPrefix(shard) + "manifests/";
+        for (ObjectInfo o : store.list(manifests)) {
+            java.util.regex.Matcher mm = java.util.regex.Pattern.compile("gen-(\\d{1,18})\\.json")
+                    .matcher(o.key().substring(manifests.length()));
+            if (mm.matches()) highest = Math.max(highest, Long.parseLong(mm.group(1)));
+        }
+        long projectBytes = ref.projectFiles().stream().mapToLong(ManifestFile::length).sum();
+        long sizeBytes = sl.files().stream().mapToLong(ManifestFile::length).sum() + projectBytes;
+        IndexFormat.Stamp stamp = formatStamp(projectDir);
+        for (int attempt = 0; attempt < 5; attempt++) {
+            Generation gen = new Generation(highest + 1 + attempt);
+            ShardManifest manifest = new ShardManifest(ShardManifest.FORMAT_VERSION, shard.value(), gen.value(),
+                    latest.map(l -> l.generation().value()).orElse(null), Instant.now(), nodeId, sl.docCount(),
+                    sizeBytes, ref.modelFingerprint(), sl.files(), ShardManifest.stripRefs(ref.meta()), stamp,
+                    ref.projectGeneration(), ref.projectFiles());
+            check.assertHeld(shard);
+            if (store.putIfAbsent(layout.manifestKey(shard, gen), manifest.toJson()).isPresent()) {
+                log.info("Reshard: staged shard {} generation {} ({} Lucene files uploaded, {} reused)", shard,
+                        gen.value(), sl.uploaded(), sl.reused());
+                return gen;
+            }
+        }
+        throw new PublishConflictException("could not write a new manifest for shard " + shard
+                + ": manifests kept appearing (another writer publishing it?)");
+    }
+
+    /**
+     * True when the local commit of {@code shard} in {@code projectDir} has exactly the Lucene files of its
+     * generation {@code gen}: the shard is unchanged since it was published (a reshard left it alone).
+     */
+    public boolean publishedAs(ShardId shard, Generation gen, Path projectDir) throws IOException {
+        Optional<StoredObject> m = store.get(layout.manifestKey(shard, gen));
+        if (m.isEmpty()) return false;
+        Set<String> published = new HashSet<>();
+        for (ManifestFile f : ShardManifest.read(m.get().data()).files()) {
+            if (ManifestFile.LUCENE.equals(f.role())) published.add(f.key());
+        }
+        Path luceneDir = LocalShardLayout.luceneDir(projectDir, shard);
+        return Files.isDirectory(luceneDir) && published.equals(localLuceneKeys(shard, luceneDir));
+    }
+
+    /** The content-addressed keys of the local commit's Lucene files of {@code shard}. */
+    private Set<String> localLuceneKeys(ShardId shard, Path luceneDir) throws IOException {
+        Set<String> out = new HashSet<>();
+        try (Directory dir = FSDirectory.open(luceneDir)) {
+            SegmentInfos commit = SegmentInfos.readLatestCommit(dir);
+            for (String name : commit.files(true)) out.add(layout.luceneKey(shard, name, checksumHex(dir, name)));
+        }
+        return out;
+    }
+
+    /**
+     * After a reshard flip: moves each shard's {@code LATEST} to the generation the flipped version pins,
+     * where it is below it (or absent), so the writers' next runs and restores continue from the version
+     * readers now serve. A shard whose {@code LATEST} is at or past its pin is left alone (an index run
+     * published since). Idempotent; {@code check} runs before each CAS.
+     *
+     * @return the number of {@code LATEST} objects moved
+     */
+    public int finishFlip(Map<ShardId, Long> pins, LeaseGuard check) throws IOException {
+        int moved = 0;
+        List<Map.Entry<ShardId, Long>> ordered = new ArrayList<>(pins.entrySet());
+        ordered.sort(Map.Entry.comparingByKey(Comparator.comparing(ShardId::value)));
+        for (Map.Entry<ShardId, Long> e : ordered) {
+            ShardId shard = e.getKey();
+            Generation pin = new Generation(e.getValue());
+            Optional<Latest> latest = readLatest(shard);
+            if (latest.isPresent() && latest.get().generation().value() >= pin.value()) continue;
+            if (store.get(layout.manifestKey(shard, pin)).isEmpty()) {
+                throw new PublishException("shard " + shard + " has no manifest for its pinned generation " + pin.value());
+            }
+            check.assertHeld(shard);
+            byte[] body = ("{\"generation\": " + pin.value() + ", \"manifest\": \""
+                    + ObjectStoreLayout.manifestName(pin) + "\"}").getBytes(StandardCharsets.UTF_8);
+            Optional<String> done = latest.isPresent()
+                    ? store.putIfMatch(layout.latestKey(shard), body, latest.get().etag())
+                    : store.putIfAbsent(layout.latestKey(shard), body);
+            if (done.isEmpty()) throw new PublishConflictException("LATEST of shard " + shard + " moved during the flip");
+            moved++;
+        }
+        return moved;
+    }
+
+    /** Drops a project's pins after a publish superseded them; a failure is retried by the next publish. */
+    private void clearPinsQuietly(String project, List<ShardId> shards) {
+        try {
+            catalog.clearPins(project, shards);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Clearing the pins of project {} failed (publish succeeded; retried by the next run): {}", project,
+                    e.toString());
         }
     }
 
@@ -620,7 +837,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
         }
     }
 
-    private void runGc(ShardId shard) {
+    private void runGc(ShardId shard, Set<Long> pinned) {
         if (gc == null) return;
         try {
             String latestKey = layout.latestKey(shard);
@@ -632,7 +849,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 log.warn("Generation GC for shard {} skipped: LATEST not listed", shard);
                 return;
             }
-            gc.collect(shard, latestModified);
+            gc.collect(shard, latestModified, pinned);
         } catch (IOException | RuntimeException e) {
             log.warn("Generation GC for shard {} failed (publish succeeded): {}", shard, e.toString());
         }

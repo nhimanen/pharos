@@ -476,6 +476,12 @@ public class ClusterConfig {
         private int lsRemoteTimeoutSeconds = 30;
         /** Work-queue mode: the disk guard ({@code cluster.writer.disk}). */
         private DiskConfig disk = new DiskConfig();
+        /**
+         * Work-queue mode: a reshard ({@code pharos reshard}) flips once every live reader has the new
+         * version's generations, or after this many seconds (readers without it then fall back to the
+         * previous version until they activate the new one).
+         */
+        private int reshardSyncTimeoutSeconds = 600;
 
         static final int MIN_LEASE_TTL_SECONDS = 5;
 
@@ -500,6 +506,10 @@ public class ClusterConfig {
             if (lsRemoteTimeoutSeconds < 1) {
                 throw new IllegalStateException("cluster.writer.lsRemoteTimeoutSeconds must be at least 1, got "
                         + lsRemoteTimeoutSeconds);
+            }
+            if (reshardSyncTimeoutSeconds < 0) {
+                throw new IllegalStateException("cluster.writer.reshardSyncTimeoutSeconds must not be negative, got "
+                        + reshardSyncTimeoutSeconds);
             }
             if (disk == null) disk = new DiskConfig();
             disk.validate();
@@ -530,6 +540,8 @@ public class ClusterConfig {
         public void setLsRemoteTimeoutSeconds(int v) { this.lsRemoteTimeoutSeconds = v; }
         public DiskConfig getDisk() { return disk; }
         public void setDisk(DiskConfig disk) { this.disk = disk == null ? new DiskConfig() : disk; }
+        public int getReshardSyncTimeoutSeconds() { return reshardSyncTimeoutSeconds; }
+        public void setReshardSyncTimeoutSeconds(int v) { this.reshardSyncTimeoutSeconds = v; }
 
         /** {@code leaseTtlSeconds}. */
         public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }

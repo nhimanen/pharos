@@ -95,8 +95,21 @@ public final class ShardRouter {
         this.local = local;
     }
 
-    /** One shard of a plan: its route, the project it serves, and whether that project is split. */
-    public record PlannedShard(Route route, String project, boolean split, boolean statsOnly) {
+    /**
+     * One shard of a plan: its route, the project it serves, whether that project is split, and the
+     * generation the query must read it at when the catalog pins its version (a reshard's, see
+     * {@link ProjectShards#pinsOf}); null: the project's shards are aligned on one index run instead.
+     */
+    public record PlannedShard(Route route, String project, boolean split, boolean statsOnly, Long generation,
+                               boolean alternate) {
+        public PlannedShard(Route route, String project, boolean split, boolean statsOnly, Long generation) {
+            this(route, project, split, statsOnly, generation, false);
+        }
+
+        public PlannedShard(Route route, String project, boolean split, boolean statsOnly) {
+            this(route, project, split, statsOnly, null);
+        }
+
         public PlannedShard(Route route, String project, boolean split) {
             this(route, project, split, false);
         }
@@ -117,10 +130,10 @@ public final class ShardRouter {
             warnings = List.copyOf(warnings);
         }
 
-        /** The routes of the shards the query searches (not the stats-only ones). */
+        /** The routes of the shards the query searches (not the stats-only or alternate ones). */
         public List<Route> routes() {
             List<Route> out = new ArrayList<>(shards.size());
-            for (PlannedShard s : shards) if (!s.statsOnly()) out.add(s.route());
+            for (PlannedShard s : shards) if (!s.statsOnly() && !s.alternate()) out.add(s.route());
             return out;
         }
     }
@@ -179,46 +192,125 @@ public final class ShardRouter {
         for (String project : names) {
             List<ShardId> shards = mapping.shardsOf(project);
             boolean split = mapping.isSplit(project);
+            com.pharos.cluster.sharding.ShardSpec spec = mapping.specOf(project);
+            Map<ShardId, Long> pins = mapping.pinsOf(project);
+            var previous = mapping.previousOf(project);
+            if (!pins.isEmpty() && previous.isPresent()) {
+                // Right after a reshard flip the readers activate the new version one sync pass after
+                // another. The query reads one version: the new one when the live readers serve it at its
+                // pinned generations, else the retired one while they still serve that. The other version
+                // goes along as the alternate the coordinator switches to when the chosen one turns out not
+                // to be served at its generations (heartbeats lag the readers by up to a beat).
+                var prev = previous.get();
+                boolean pinnedSplit = !prev.spec().isDefault();
+                Map<ShardId, Long> prevPins = pinnedSplit ? prev.generations() : Map.of();
+                boolean readPrevious = !servable(shards, pins, readers) && servable(prev.shards(), prev.generations(), readers);
+                if (readPrevious) {
+                    notes.add("project " + project + ": the live readers do not serve spec version "
+                            + mapping.specVersionOf(project).orElse(0) + " (just resharded) yet; this query reads the"
+                            + " previous version, " + prev.spec());
+                    planProject(project, prev.shards(), pinnedSplit, prev.spec(), prevPins, false, f, needsFilters,
+                            readers, loads, out, notes, warnings);
+                    planProject(project, shards, split, spec, pins, true, f, needsFilters, readers, loads, out,
+                            new ArrayList<>(), new ArrayList<>());
+                } else {
+                    planProject(project, shards, split, spec, pins, false, f, needsFilters, readers, loads, out, notes,
+                            warnings);
+                    planProject(project, prev.shards(), pinnedSplit, prev.spec(), prevPins, true, f, needsFilters,
+                            readers, loads, out, new ArrayList<>(), new ArrayList<>());
+                }
+                continue;
+            }
             if (shards.isEmpty()) shards = List.of(ShardId.ofProject(project)); // unknown: its [project] shard
-            java.util.Set<ShardId> searched = new java.util.HashSet<>(shards);
-            if (split) {
-                ShardFilter.Pruned pruned = f.prune(project, mapping.specOf(project), shards);
-                notes.addAll(pruned.notes());
-                if (pruned.kept().isEmpty()) { // neither round: nothing of the project can match
-                    warnings.add("project " + project + ": the key filter matches none of its " + shards.size()
-                            + " shards under spec " + mapping.specOf(project) + "; no results from it");
-                    shards = List.of();
-                } else if (pruned.kept().size() < shards.size()) {
-                    // P6-R13: the statistics stay the whole project's (as one node filtering scores), so
-                    // every shard answers the term-statistics round; only the kept ones are searched
-                    notes.add("project " + project + ": stats: " + shards.size() + " shards, search: "
-                            + pruned.kept().size() + " of " + shards.size());
-                }
-                searched = new java.util.HashSet<>(pruned.kept());
-            }
-            String turnKey = split ? project : null;
-            long turn = -1;
-            for (ShardId shard : shards) {
-                String key = turnKey != null ? turnKey : shard.value();
-                if (turnKey == null || turn < 0) {
-                    turn = rotation.computeIfAbsent(key, k -> new AtomicLong()).getAndIncrement();
-                }
-                List<String> degraded = new ArrayList<>();
-                List<String> noFilters = new ArrayList<>();
-                List<ReaderHeartbeat> usable = readers;
-                boolean statsOnly = !searched.contains(shard);
-                if (needsFilters && !statsOnly) { // a reader that would ignore the filter must not search for it
-                    usable = new ArrayList<>();
-                    for (ReaderHeartbeat r : readers) {
-                        if (r.supportsFilters()) usable.add(r);
-                        else if (r.shards() != null && r.shards().contains(shard.value())) noFilters.add(r.node());
-                    }
-                }
-                out.add(new PlannedShard(new Route(shard, candidates(shard, usable, degraded, loads, turn), degraded,
-                        noFilters), project, split, statsOnly));
-            }
+            planProject(project, shards, split, spec, pins, false, f, needsFilters, readers, loads, out, notes, warnings);
         }
         return new RoutePlan(mapping, out, notes, warnings);
+    }
+
+    /** Plans the shards of one version of {@code project} (see {@link #plan}). */
+    private void planProject(String project, List<ShardId> shards, boolean split,
+                             com.pharos.cluster.sharding.ShardSpec spec, Map<ShardId, Long> pins, boolean alternate,
+                             ShardFilter f, boolean needsFilters, List<ReaderHeartbeat> readers,
+                             Map<String, Integer> loads, List<PlannedShard> out, List<String> notes,
+                             List<String> warnings) {
+        java.util.Set<ShardId> searched = new java.util.HashSet<>(shards);
+        if (split) {
+            ShardFilter.Pruned pruned = f.prune(project, spec, shards);
+            notes.addAll(pruned.notes());
+            if (pruned.kept().isEmpty()) { // neither round: nothing of the project can match
+                warnings.add("project " + project + ": the key filter matches none of its " + shards.size()
+                        + " shards under spec " + spec + "; no results from it");
+                shards = List.of();
+            } else if (pruned.kept().size() < shards.size()) {
+                // P6-R13: the statistics stay the whole project's (as one node filtering scores), so
+                // every shard answers the term-statistics round; only the kept ones are searched
+                notes.add("project " + project + ": stats: " + shards.size() + " shards, search: "
+                        + pruned.kept().size() + " of " + shards.size());
+            }
+            searched = new java.util.HashSet<>(pruned.kept());
+        }
+        String turnKey = split ? project : null;
+        long turn = -1;
+        for (ShardId shard : shards) {
+            String key = turnKey != null ? turnKey : shard.value();
+            if (turnKey == null || turn < 0) {
+                turn = rotation.computeIfAbsent(key, k -> new AtomicLong()).getAndIncrement();
+            }
+            List<String> degraded = new ArrayList<>();
+            List<String> noFilters = new ArrayList<>();
+            List<ReaderHeartbeat> usable = readers;
+            boolean statsOnly = !searched.contains(shard);
+            if (needsFilters && !statsOnly) { // a reader that would ignore the filter must not search for it
+                usable = new ArrayList<>();
+                for (ReaderHeartbeat r : readers) {
+                    if (r.supportsFilters()) usable.add(r);
+                    else if (r.shards() != null && r.shards().contains(shard.value())) noFilters.add(r.node());
+                }
+            }
+            Long gen = pins.get(shard);
+            List<ReaderHeartbeat> cands = candidates(shard, usable, degraded, loads, turn);
+            if (gen != null) cands = servingFirst(shard, gen, cands);
+            out.add(new PlannedShard(new Route(shard, cands, degraded, noFilters), project, split, statsOnly, gen,
+                    alternate));
+        }
+    }
+
+    /**
+     * True when every shard of {@code shards} has a live, non-draining reader serving it at its generation
+     * in {@code generations} (a reader whose heartbeat states no generations, an older one, counts as
+     * serving it).
+     */
+    private static boolean servable(List<ShardId> shards, Map<ShardId, Long> generations, List<ReaderHeartbeat> readers) {
+        for (ShardId shard : shards) {
+            Long gen = generations.get(shard);
+            boolean any = false;
+            for (ReaderHeartbeat r : readers) {
+                if (r.draining() || r.shards() == null || !r.shards().contains(shard.value())) continue;
+                if (gen == null || !r.statesGenerations() || r.generationOf(shard.value()).orElse(-1) == gen) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) return false;
+        }
+        return true;
+    }
+
+    /**
+     * {@code candidates} with the readers known to serve {@code shard} at {@code generation} first, then
+     * those that don't say, then those serving another generation (they may activate it meanwhile); the
+     * order within each group is kept.
+     */
+    private static List<ReaderHeartbeat> servingFirst(ShardId shard, long generation, List<ReaderHeartbeat> candidates) {
+        List<ReaderHeartbeat> serving = new ArrayList<>(), unknown = new ArrayList<>(), other = new ArrayList<>();
+        for (ReaderHeartbeat r : candidates) {
+            if (!r.statesGenerations()) unknown.add(r);
+            else if (r.generationOf(shard.value()).orElse(-1) == generation) serving.add(r);
+            else other.add(r);
+        }
+        serving.addAll(unknown);
+        serving.addAll(other);
+        return serving;
     }
 
     /**

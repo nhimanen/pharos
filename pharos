@@ -1023,6 +1023,25 @@ def cmd_router(args):
         sys.exit(130)
 
 
+def cmd_reshard(args):
+    """Request, follow or cancel a live reshard of a cluster project (`pharos reshard`).
+
+    Spawns its own JVM like publish; it needs the cluster config (cluster.backend "object-store").
+    Exit codes: 0 done, 1 refused (another reshard open, unknown project, nothing to cancel),
+    2 bad usage or config, 3 the bucket failed.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "reshard", args.project]
+    if args.spec is not None:
+        cmd += ["--spec", args.spec]
+    if args.status:
+        cmd.append("--status")
+    if args.cancel:
+        cmd.append("--cancel")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
 def cmd_backfill_embedding_cache(args):
     """Seed the embedding cache from the existing Lucene index without calling ONNX."""
     if not JAR.exists():
@@ -1370,6 +1389,7 @@ COMMANDS
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   publish                   Publish a project's local index to the cluster object store (writer nodes)
   router                    Route queries over the cluster's healthy readers (runs in the foreground)
+  reshard                   Split a cluster project by a new shard spec, live (--spec, --status, --cancel)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
 
@@ -1907,6 +1927,35 @@ EXAMPLES
     )
     p_router.add_argument("--port", type=int, default=7080, help="HTTP port to listen on (default: 7080)")
     p_router.set_defaults(func=cmd_router)
+
+    # reshard
+    p_reshard = sub.add_parser(
+        "reshard",
+        help="Split a cluster project by a new shard spec, live (object-store clusters)",
+        description="""\
+Request a live reshard of a cluster project: a new spec version in the catalog. The writer
+holding the project builds the new shards from its index (only files that change shard are
+re-indexed, embeddings come from the cache), readers keep serving the current version, and
+one catalog CAS flips routing once the readers have the new shards. The retired version is
+removed after cluster.retentionMinutes. Object-store clusters only.
+
+EXIT CODES
+  0 done, 1 refused (another reshard of the project is open, unknown project, nothing to
+  cancel), 2 bad usage or config, 3 the bucket failed
+
+EXAMPLES
+  pharos reshard lucene --spec "[project, ring(path, shards=4)]"
+  pharos reshard lucene --status
+  pharos reshard lucene --cancel
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_reshard.add_argument("project", help="Project name (as in the cluster catalog)")
+    g_reshard = p_reshard.add_mutually_exclusive_group(required=True)
+    g_reshard.add_argument("--spec", help='The new shard spec, e.g. "[project, ring(path, shards=4)]"')
+    g_reshard.add_argument("--status", action="store_true", help="Show the spec versions and the reshard's progress")
+    g_reshard.add_argument("--cancel", action="store_true", help="Abandon the open reshard")
+    p_reshard.set_defaults(func=cmd_reshard)
 
     # daemon
     p_daemon = sub.add_parser(
