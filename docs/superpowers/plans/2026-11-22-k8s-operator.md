@@ -135,6 +135,7 @@
   - Exit 0 means pass.
   - It needs a Docker daemon. If none is local, run it on a host that has one and record which. The local machine has no Docker daemon running.
 - [ ] Run the smoke script.
+- [ ] Extend `.github/workflows/release.yml` so a release tag publishes `ghcr.io/<owner>/pharos:<version>`, and, once Task 4 exists, `pharos-operator:<version>`. Leave the existing jar and asset steps unchanged.
 - [ ] Commit `docker: pharos image`.
 
 ### Task 4: Operator skeleton, the CRD and spec validation
