@@ -37,9 +37,11 @@ spec:
             # The pharos image repository; each PharosCluster's spec.version is the tag.
             - name: PHAROS_IMAGE
               value: ghcr.io/OWNER/pharos
-            # minio mode only; pinned releases by default (uncomment to override):
-            # - { name: MINIO_IMAGE, value: "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z" }
-            # - { name: MC_IMAGE, value: "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z" }
+            # minio mode only; pinned releases by default (uncomment to override, e.g. with a mirror).
+            # MinIO itself no longer publishes images (quay.io/minio and docker.io/minio refuse pulls);
+            # the defaults are community builds of the same sources:
+            # - { name: MINIO_IMAGE, value: "docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z" }
+            # - { name: MC_IMAGE, value: "docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z" }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { memory: 512Mi }

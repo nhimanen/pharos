@@ -9,12 +9,15 @@ import java.util.Map;
  *   <li>{@code MINIO_IMAGE} and {@code MC_IMAGE}: the MinIO server and client images of minio mode,
  *       pinned to a release tag by default.</li>
  * </ul>
+ * MinIO no longer publishes images: {@code quay.io/minio/*} and {@code docker.io/minio/*} refuse anonymous
+ * pulls since late 2025. The defaults are the community builds of the same AGPL sources published as
+ * {@code docker.io/pgsty/minio} and {@code docker.io/pgsty/mc}; set the env vars to use a mirror of your own.
  */
 public record OperatorSettings(String pharosImage, String minioImage, String mcImage) {
 
     public static final String DEFAULT_PHAROS_IMAGE = "pharos";
-    public static final String DEFAULT_MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z";
-    public static final String DEFAULT_MC_IMAGE = "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z";
+    public static final String DEFAULT_MINIO_IMAGE = "docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z";
+    public static final String DEFAULT_MC_IMAGE = "docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z";
 
     public static OperatorSettings defaults() {
         return new OperatorSettings(DEFAULT_PHAROS_IMAGE, DEFAULT_MINIO_IMAGE, DEFAULT_MC_IMAGE);
