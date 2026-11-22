@@ -605,6 +605,18 @@ Pods must set `securityContext` `runAsUser: 10001` and `fsGroup: 10001` when a P
 
 Secrets reach the process only as env vars named by the config (`cluster.tokenEnv`, the object-store key envs); the entrypoint never writes them. It ends in `exec java`, so SIGTERM reaches the JVM. There is no `HEALTHCHECK`; use Kubernetes probes on `/health`. `scripts/image-smoke.sh` builds the image, runs one node and searches once; it needs a Docker daemon.
 
+### Kubernetes operator: MinIO images and keeping the bucket
+
+With `storage.minio`, the operator deploys MinIO and creates the bucket with `mc`. MinIO no longer publishes images: `quay.io/minio/*` and `docker.io/minio/*` cannot be pulled anymore. The defaults are therefore a community build of the upstream MinIO sources (AGPL), pinned to release tags: `docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z` and `docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z`. To use your own build or a mirror, set the env vars on the operator Deployment (`deploy/operator.yaml`); there is no field in the `PharosCluster` spec for it:
+
+```yaml
+env:
+  - { name: MINIO_IMAGE, value: "registry.example.com/mirror/minio:RELEASE.2026-08-04T00-00-00Z" }
+  - { name: MC_IMAGE, value: "registry.example.com/mirror/mc:RELEASE.2026-11-12T00-00-00Z" }
+```
+
+A changed image applies to the MinIO StatefulSet at the next reconcile. The bucket Job picks it up the next time it is created. Deleting a `PharosCluster` keeps its data: the MinIO PVC and its credentials Secret have no owner reference, so a cluster applied again under the same name adopts them. Writer and reader volume claims also outlive their StatefulSets. A full teardown deletes them by label: `kubectl delete pvc,secret -l pharos.dev/cluster=<name>`.
+
 ## How it works
 
 1. **Parse** — JavaParser (with full symbol resolution), Python AST, Node.js AST, and regex-based parsers extract methods, classes, call references, field declarations, inheritance, annotations, and type references
