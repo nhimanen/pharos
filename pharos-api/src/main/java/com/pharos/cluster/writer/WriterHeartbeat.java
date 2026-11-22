@@ -11,7 +11,7 @@ import java.util.TreeMap;
 /**
  * One work-queue writer's announcement in {@code catalog/writers/<node>.json}, rewritten every
  * {@code cluster.heartbeatSeconds} and on every lease change. Its age (by the bucket's clock, see
- * {@link WriterRegistry}) is its liveness; the age itself is not stored.
+ * {@code WriterRegistry}) is its liveness; the age itself is not stored.
  *
  * <ul>
  *   <li>{@code leases}: the shards whose lease this writer holds, sorted (pinned ones included);</li>
@@ -24,7 +24,7 @@ import java.util.TreeMap;
  *       {@code progress} 0..1 within the phase, {@code startedAt} epoch millis), or null;</li>
  *   <li>{@code startedAt}: the process start (epoch millis, informational: a node clock);</li>
  *   <li>{@code stopping}: a graceful stop is under way; the balancer no longer counts this writer;</li>
- *   <li>{@code disk}: the disk guard's view ({@link DiskGuard}): free and total bytes of the most
+ *   <li>{@code disk}: the disk guard's view ({@code DiskGuard}): free and total bytes of the most
  *       constrained watched file store, and whether this writer is low on disk. A low writer
  *       acquires nothing and the balancer no longer counts it. Absent when no guard runs (a heartbeat
  *       written before Task 4b reads as "not low").</li>

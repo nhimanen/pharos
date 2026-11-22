@@ -169,6 +169,12 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   a signal no longer frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies
   to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
 
+### Build
+- Multi-module Maven build: the root `pom.xml` is now the parent of `app` (pharos itself, sources
+  still in `src/`), `pharos-api` (`ClusterConfig` and the `/cluster/status` records, Jackson only) and
+  `operator`. `mvn clean package` at the root still produces `target/pharos-<version>.jar`; a release
+  bumps every pom (`mvn versions:set`).
+
 ### Changed
 - Multi-node fan-out fixes from the Phase 3 gate: a query naming a project the coordinator does
   not hold boosts it as a single node does (the project list comes from the shard catalog), and

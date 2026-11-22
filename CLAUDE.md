@@ -17,6 +17,18 @@ mvn clean compile           # Compile only
 
 **Java 25+ required.** The shade plugin produces a single executable JAR.
 
+**Maven layout.** The root `pom.xml` is the aggregator and parent (`pharos-parent`); run every command above
+from the root. Modules:
+- `app/pom.xml` — the pharos application (artifactId `pharos`). Its sources stay in the root `src/` and it
+  builds into the root `target/`, so the jar is still `target/pharos-<version>.jar`; its tests run with the
+  repository root as working directory.
+- `pharos-api/` — what the operator shares with pharos: `ClusterConfig` (+ `PharosHome`, `DiscoverySpec`,
+  `BackendKind`, `NodeRole`, `ShardId`) and the status records (`ClusterStatus`, `StatusState`,
+  `StatusEvent`, `WriterHeartbeat`), same packages as before. Jackson only — `ApiModuleHasNoHeavyDepsTest`
+  fails if Lucene, DJL/ONNX or Javalin reach its dependency tree. Code that needs them stays in `src/`
+  (move a constant into the api class rather than referencing e.g. `LuceneIndexer` from it).
+- `operator/` — the Kubernetes operator; depends on `pharos-api`, never on the fat jar.
+
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency
 (Python/JS extractors otherwise only use stdlib). Without it, `TerraformCodeParser`
@@ -126,7 +138,8 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 
 ## Releasing (maintainers only)
 
-1. Bump the version in `pom.xml` (`X.Y.Z`).
+1. Bump the version in every pom (`X.Y.Z`): `mvn versions:set -DnewVersion=X.Y.Z -DgenerateBackupPoms=false`
+   (root `pom.xml` plus the `<parent>` version in `app/`, `pharos-api/`, `operator/`).
 2. In `CHANGELOG.md`, move `Unreleased` into a new `## [X.Y.Z] - date` section. It must start with an `**Index format:**` line (`N (unchanged)` or `N → M (...)`; `scripts/release-notes.sh X.Y.Z` fails without it). If the format changed, add a section to `UPGRADING.md`.
 3. Run `bash scripts/test-setup.sh` and `mvn -B clean package`.
 4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` workflow checks the tag against the pom version, builds, and publishes the GitHub release (jar, `.sha256`, skill bundle, `pharos`, `setup.sh`).

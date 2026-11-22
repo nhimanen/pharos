@@ -342,7 +342,7 @@ class ProposalsTest {
         // the delta is part of the shared state and of the events, like the action
         StatusState st = run(idle, null, 0, 1800, 10);
         assertThat(st.rules().values()).singleElement().satisfies(r -> assertThat(r.delta()).isEqualTo(-2));
-        List<StatusEvent> events = StatusEvent.diff(StatusState.EMPTY, st,
+        List<StatusEvent> events = Proposals.events(StatusState.EMPTY, st,
                 Proposals.candidates(idle.apply(T0.plusSeconds(1800)), st, CFG));
         assertThat(events).singleElement().satisfies(e -> assertThat(e.proposal().delta()).isEqualTo(-2));
 
@@ -353,7 +353,7 @@ class ProposalsTest {
                 r.falseSince(), r.active(), r.reason(), r.action(), null)));
         StatusState old = new StatusState(StatusState.VERSION, st.asOf(), stripped, st.pendingSince(), st.layout());
         var cands = Proposals.candidates(idle.apply(T0.plusSeconds(1800)), old, CFG);
-        assertThat(StatusEvent.diff(old, st, cands)).isEmpty();
+        assertThat(Proposals.events(old, st, cands)).isEmpty();
         assertThat(proposals(idle, old, 1800).get(0).delta()).isEqualTo(-2);
     }
 

@@ -177,7 +177,7 @@ public final class PeerBackend implements ReplicationBackend {
             }
         }
         if (cfg.getPeers().getDiscovery() != null
-                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof PeerDiscovery.Seeds s) {
+                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof DiscoverySpec.Seeds s) {
             s.urls().forEach(u -> out.add(u.toString()));
         }
         return java.util.List.copyOf(out);

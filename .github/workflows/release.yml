@@ -34,7 +34,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          POM_VERSION="$(mvn -B help:evaluate -Dexpression=project.version -q -DforceStdout)"
+          POM_VERSION="$(mvn -B -N help:evaluate -Dexpression=project.version -q -DforceStdout)"
           if [ "v$POM_VERSION" != "$TAG" ]; then
             echo "::error::tag $TAG does not match pom.xml version $POM_VERSION"
             exit 1

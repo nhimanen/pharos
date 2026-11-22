@@ -24,7 +24,7 @@ import java.util.TreeMap;
  *   <li>{@code layout}: the scale summary last recorded, for the {@code layout} event.</li>
  * </ul>
  * All instants are epoch seconds of bucket time. {@code asOf} is the snapshot time of the last
- * write: a node whose snapshot is older never overwrites the state (see {@link Proposals#advance}).
+ * write: a node whose snapshot is older never overwrites the state (see {@code Proposals.advance}).
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonPropertyOrder({"version", "asOf", "rules", "pendingSince", "layout"})
@@ -48,9 +48,9 @@ public record StatusState(int version, long asOf, SortedMap<String, Rule> rules,
 
     /**
      * One rule's hysteresis. {@code reason}, {@code action} and {@code delta} (the signed node count
-     * of a scaling proposal, see {@link Proposals}) are set only while {@code active}. A node older
+     * of a scaling proposal, see {@code Proposals}) are set only while {@code active}. A node older
      * than {@code delta} drops it when it rewrites the state; it is back on the next write by a newer
-     * node, and meanwhile {@link Proposals#proposal} fills it from the current candidate.
+     * node, and meanwhile {@code Proposals.proposal} fills it from the current candidate.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     @JsonPropertyOrder({"kind", "target", "since", "falseSince", "active", "reason", "action", "delta"})

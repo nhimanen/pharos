@@ -27,7 +27,7 @@ public class ClusterConfig {
      * query or fan-out timeout; the effective value is never below {@code pollIntervalSeconds}.
      */
     private int retireGraceSeconds = 120;
-    private Path cacheDir = IndexConfig.DEFAULT_BASE.resolve("cluster-cache");
+    private Path cacheDir = PharosHome.DEFAULT_BASE.resolve("cluster-cache");
     private int retentionGenerations = 3;
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
@@ -76,8 +76,12 @@ public class ClusterConfig {
     static final int MAX_DRAIN_SECONDS = 3600;
 
     public static final int DEFAULT_QUERY_TIMEOUT_MILLIS = 20_000;
-    /** A pinned local reader is retired this long after a swap: a query must finish well before. */
-    static final long RETIRE_DELAY_MILLIS = com.pharos.indexer.LuceneIndexer.RETIRE_DELAY.toMillis();
+    /**
+     * A pinned local reader is retired this long after a swap: a query must finish well before.
+     * {@code LuceneIndexer.RETIRE_DELAY} is this value; it lives here so the config needs no Lucene.
+     */
+    public static final java.time.Duration RETIRE_DELAY = java.time.Duration.ofSeconds(60);
+    static final long RETIRE_DELAY_MILLIS = RETIRE_DELAY.toMillis();
 
     /** How {@code tokenEnv} is read; package-private so tests can supply values (e.g. a trailing newline). */
     static java.util.function.UnaryOperator<String> envReader = System::getenv;
@@ -214,8 +218,8 @@ public class ClusterConfig {
                     + " (dns:<name>[:port] or seeds:<url>,<url>)");
         }
         if (tls != null && tls.getTruststore() != null && peers.getDiscovery() != null
-                && com.pharos.cluster.peer.PeerDiscovery.parse(peers.getDiscovery())
-                        instanceof com.pharos.cluster.peer.PeerDiscovery.Seeds seeds
+                && com.pharos.cluster.peer.DiscoverySpec.parse(peers.getDiscovery())
+                        instanceof com.pharos.cluster.peer.DiscoverySpec.Seeds seeds
                 && seeds.urls().stream().anyMatch(u -> !"https".equals(u.getScheme()))) {
             // P5-R8: the cluster token must not travel in clear text to a seed when TLS is configured
             throw new IllegalStateException("cluster.peers.discovery: every seed must be https:// when"
@@ -481,7 +485,7 @@ public class ClusterConfig {
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class WriterConfig {
-        private Path workDir = IndexConfig.DEFAULT_BASE.resolve("work");
+        private Path workDir = PharosHome.DEFAULT_BASE.resolve("work");
         /** How often a writer polls a shard's source (git ls-remote, directory state) for changes. */
         private int pollSeconds = 60;
         /**
@@ -646,7 +650,7 @@ public class ClusterConfig {
         private int maxTransfersPerReader = 4;
         private int longPollSeconds = 30;
         private int maxLongPolls = 4096;
-        private Path storeDir = IndexConfig.DEFAULT_BASE.resolve("peer-store");
+        private Path storeDir = PharosHome.DEFAULT_BASE.resolve("peer-store");
         /**
          * Seeds mode without TLS: the hosts a gossiped writer URL may name (every polled writer gets the
          * cluster token); null means the seeds' hosts (P5-R8).
@@ -681,7 +685,7 @@ public class ClusterConfig {
             }
             if (discovery != null) {
                 try {
-                    com.pharos.cluster.peer.PeerDiscovery.parse(discovery);
+                    com.pharos.cluster.peer.DiscoverySpec.parse(discovery);
                 } catch (IllegalArgumentException e) {
                     throw new IllegalStateException(e.getMessage());
                 }

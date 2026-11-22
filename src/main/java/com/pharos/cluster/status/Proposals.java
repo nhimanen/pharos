@@ -15,6 +15,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -364,6 +365,37 @@ public final class Proposals {
         }
         out.sort(java.util.Comparator.comparing(com.pharos.cluster.status.ClusterStatus.Proposal::kind)
                 .thenComparing(com.pharos.cluster.status.ClusterStatus.Proposal::target));
+        return out;
+    }
+
+    /**
+     * The events between two states (layout first, then proposals by id), proposals carrying the
+     * metrics of {@code cands}. Equal states give none; the first layout ever recorded is no change.
+     */
+    public static List<StatusEvent> events(StatusState before, StatusState after, Map<String, Candidate> cands) {
+        StatusState a = before == null ? StatusState.EMPTY : before;
+        StatusState b = after == null ? StatusState.EMPTY : after;
+        List<StatusEvent> out = new ArrayList<>();
+        if (a.layout() != null && b.layout() != null && !Objects.equals(a.layout(), b.layout())) { // not the first record
+            out.add(new StatusEvent(StatusEvent.LAYOUT, null, b.layout()));
+        }
+        TreeSet<String> ids = new TreeSet<>(a.rules().keySet());
+        ids.addAll(b.rules().keySet());
+        for (String id : ids) {
+            StatusState.Rule was = a.rules().get(id);
+            StatusState.Rule is = b.rules().get(id);
+            boolean wasOn = was != null && was.active();
+            boolean isOn = is != null && is.active();
+            if (!wasOn && isOn) {
+                out.add(new StatusEvent(StatusEvent.APPEARED, proposal(id, is, cands), null));
+            } else if (wasOn && !isOn) {
+                out.add(new StatusEvent(StatusEvent.CLEARED, proposal(id, was, cands), null));
+            } else if (wasOn && (!Objects.equals(was.reason(), is.reason()) || !Objects.equals(was.action(), is.action()))) {
+                // the delta follows the action's count, so it needs no comparison of its own (and a rule an
+                // older node rewrote without it is no change)
+                out.add(new StatusEvent(StatusEvent.CHANGED, proposal(id, is, cands), null));
+            }
+        }
         return out;
     }
 }

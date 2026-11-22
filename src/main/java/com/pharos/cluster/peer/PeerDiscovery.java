@@ -1,6 +1,8 @@
 package com.pharos.cluster.peer;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.pharos.cluster.peer.DiscoverySpec.Dns;
+import com.pharos.cluster.peer.DiscoverySpec.Seeds;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -8,11 +10,9 @@ import java.io.IOException;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Hashtable;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -42,20 +42,11 @@ import java.util.concurrent.CompletableFuture;
 public final class PeerDiscovery {
 
     private static final Logger log = LoggerFactory.getLogger(PeerDiscovery.class);
-    public static final int DEFAULT_PORT = 7070;
+    public static final int DEFAULT_PORT = DiscoverySpec.DEFAULT_PORT;
     /** Learned (gossiped) URLs no reachable writer listed for this many refreshes are forgotten. */
     static final int FORGET_AFTER = 3;
     /** The most URLs one gossip round follows. */
     static final int MAX_PEERS = 256;
-
-    /** A parsed {@code cluster.peers.discovery}. */
-    public sealed interface Spec permits Dns, Seeds {
-        String text();
-    }
-
-    public record Dns(String host, int port, String text) implements Spec {}
-
-    public record Seeds(List<URI> urls, String text) implements Spec {}
 
     /** Looks a host name up; every address is a writer. */
     @FunctionalInterface
@@ -159,77 +150,17 @@ public final class PeerDiscovery {
         }
     }
 
-    /**
-     * @throws IllegalArgumentException naming what is wrong (never the whole value: it is config)
-     */
-    public static Spec parse(String text) {
-        if (text == null || text.isBlank()) {
-            throw new IllegalArgumentException("cluster.peers.discovery is empty (expected dns:<name>[:port] or"
-                    + " seeds:<url>,<url>)");
-        }
-        String t = text.strip();
-        String lower = t.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("dns:")) {
-            String rest = t.substring(4).strip();
-            String host = rest;
-            int port = DEFAULT_PORT;
-            int colon = rest.lastIndexOf(':');
-            if (colon >= 0) {
-                host = rest.substring(0, colon);
-                try {
-                    port = Integer.parseInt(rest.substring(colon + 1));
-                } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("cluster.peers.discovery: invalid port in '" + t + "'");
-                }
-                if (port < 1 || port > 65535) {
-                    throw new IllegalArgumentException("cluster.peers.discovery: port out of range in '" + t + "'");
-                }
-            }
-            if (host.isEmpty() || !host.matches("[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\\.?")) {
-                throw new IllegalArgumentException("cluster.peers.discovery: invalid DNS name in '" + t + "'");
-            }
-            return new Dns(host, port, t);
-        }
-        if (lower.startsWith("seeds:")) {
-            List<URI> urls = new ArrayList<>();
-            for (String s : t.substring(6).split(",")) {
-                if (s.isBlank()) continue;
-                try {
-                    urls.add(baseUrl(s.strip()));
-                } catch (IllegalArgumentException e) {
-                    throw new IllegalArgumentException("cluster.peers.discovery: " + e.getMessage());
-                }
-            }
-            if (urls.isEmpty()) throw new IllegalArgumentException("cluster.peers.discovery: no seed URL in '" + t + "'");
-            return new Seeds(List.copyOf(new LinkedHashSet<>(urls)), t);
-        }
-        throw new IllegalArgumentException("cluster.peers.discovery must start with dns: or seeds:, got '" + t + "'");
+    /** {@link DiscoverySpec#parse}. */
+    public static DiscoverySpec parse(String text) {
+        return DiscoverySpec.parse(text);
     }
 
-    /** A writer's base URL: http(s), a host, no user info, no query; path and trailing slash dropped. */
+    /** {@link DiscoverySpec#baseUrl}. */
     static URI baseUrl(String s) {
-        URI u;
-        try {
-            u = new URI(s);
-        } catch (URISyntaxException e) {
-            throw new IllegalArgumentException("not a valid writer URL: '" + s + "'");
-        }
-        String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
-        if (u.getRawUserInfo() != null) { // never echo it: it may hold a password
-            throw new IllegalArgumentException("a writer URL must not carry user info (the cluster token authenticates)");
-        }
-        if (!(scheme.equals("http") || scheme.equals("https")) || u.getHost() == null || u.getRawUserInfo() != null
-                || u.getRawQuery() != null) {
-            throw new IllegalArgumentException("a writer URL must be http(s)://host[:port], got '" + s + "'");
-        }
-        try {
-            return new URI(scheme, null, u.getHost(), u.getPort(), null, null, null);
-        } catch (URISyntaxException e) {
-            throw new IllegalArgumentException("not a valid writer URL: '" + s + "'");
-        }
+        return DiscoverySpec.baseUrl(s);
     }
 
-    private final Spec spec;
+    private final DiscoverySpec spec;
     private final String scheme;
     private final Resolver resolver;
     private final PeerHttp http;
@@ -246,13 +177,13 @@ public final class PeerDiscovery {
      * node that follows gossip must build it this way, so readers, writers and routers trust the same
      * writers (and so agree on the status-state holder).
      */
-    public static PeerDiscovery of(com.pharos.config.ClusterConfig c, Spec spec, PeerHttp http) {
+    public static PeerDiscovery of(com.pharos.config.ClusterConfig c, DiscoverySpec spec, PeerHttp http) {
         return new PeerDiscovery(spec, http.tls() ? "https" : "http", SYSTEM_RESOLVER, http,
                 c.getPeers().getAllowHosts());
     }
 
-    /** {@link #PeerDiscovery(Spec, String, Resolver, PeerHttp, java.util.Collection)} allowing the seed hosts. */
-    public PeerDiscovery(Spec spec, String scheme, Resolver resolver, PeerHttp http) {
+    /** {@link #PeerDiscovery(DiscoverySpec, String, Resolver, PeerHttp, java.util.Collection)} allowing the seed hosts. */
+    public PeerDiscovery(DiscoverySpec spec, String scheme, Resolver resolver, PeerHttp http) {
         this(spec, scheme, resolver, http, null);
     }
 
@@ -264,7 +195,7 @@ public final class PeerDiscovery {
      *                   null means the seeds' hosts. With TLS (scheme {@code https}) every https URL is
      *                   accepted (the truststore authenticates the writer) and no other (P5-R8).
      */
-    public PeerDiscovery(Spec spec, String scheme, Resolver resolver, PeerHttp http,
+    public PeerDiscovery(DiscoverySpec spec, String scheme, Resolver resolver, PeerHttp http,
                          java.util.Collection<String> allowHosts) {
         this.spec = Objects.requireNonNull(spec, "spec");
         this.scheme = Objects.requireNonNull(scheme, "scheme");
@@ -329,7 +260,7 @@ public final class PeerDiscovery {
         return false;
     }
 
-    public Spec spec() { return spec; }
+    public DiscoverySpec spec() { return spec; }
 
     /**
      * The candidate writers of this refresh, sorted.

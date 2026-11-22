@@ -25,8 +25,7 @@ public class IndexConfig {
 
     private static final Logger log = LoggerFactory.getLogger(IndexConfig.class);
     /** Pharos state directory; override with {@code -Dpharos.home=...} (tests do, via surefire). */
-    public static final Path DEFAULT_BASE = Path.of(System.getProperty("pharos.home",
-            Path.of(System.getProperty("user.home"), ".pharos").toString()));
+    public static final Path DEFAULT_BASE = PharosHome.DEFAULT_BASE;
 
     private Path indexDir;
     private Path synonymsFile;
