@@ -29,17 +29,23 @@ import java.util.TreeSet;
  *   <tr><td>{@value #ADD_READERS}</td><td>{@code readers}</td><td>warm p95 (the highest of the
  *       readers that report one) or QPS per reader above target</td><td>5 min</td></tr>
  *   <tr><td>{@value #REMOVE_READERS}</td><td>{@code readers}</td><td>more than one reader, QPS per
- *       reader below 20% of target, warm p95 within target</td><td>30 min</td></tr>
- *   <tr><td>{@value #ADD_WRITERS}</td><td>{@code writers}</td><td>a shard's oldest unpublished
- *       change older than the backlog target, and fewer live writers than workable shards</td><td>0</td></tr>
+ *       reader below {@code removeReadersLoad} (20%) of target, warm p95 within target</td><td>30 min</td></tr>
+ *   <tr><td>{@value #ADD_WRITERS}</td><td>{@code writers}</td><td>at least {@code writers.backlogShards}
+ *       (1) shards whose oldest unpublished change is older than {@code writers.oldestPendingSeconds}
+ *       (300 s), and fewer live writers than workable shards</td><td>0</td></tr>
  *   <tr><td>{@value #REMOVE_WRITERS}</td><td>{@code writers}</td><td>more than one live writer,
- *       none indexing, nothing pending</td><td>30 min</td></tr>
+ *       none indexing, nothing pending</td><td>{@code writers.idleSeconds} (30 min)</td></tr>
  *   <tr><td>{@value #RESHARD}</td><td>the shard</td><td>its size above 50% of the smallest reader
  *       cache cap</td><td>0</td></tr>
  *   <tr><td>{@value #WRITER_DISK}</td><td>the writer</td><td>the writer reports low disk</td><td>0</td></tr>
  * </table>
  * Readers in state {@code draining} are not counted. Live writers are the work-queue writers that
  * are not stopping.
+ *
+ * <p><b>Delta</b>: each scaling proposal (add/remove readers/writers) carries a signed
+ * {@code delta}, {@code +N} to start N nodes and {@code -N} to stop N, the same N its
+ * {@code action} text names; {@value #RESHARD} and {@value #WRITER_DISK} carry none. An operator
+ * steps by it (clamped to its own limits).
  *
  * <p><b>Hysteresis</b> ({@link #advance}): a rule's {@code since} is the snapshot time its condition
  * was first seen holding; once {@code asOf - since} reaches the rule's window the proposal is in
@@ -62,9 +68,12 @@ public final class Proposals {
 
     private Proposals() {}
 
-    /** One rule evaluated on a snapshot: whether its condition holds, and its texts and metrics. */
+    /**
+     * One rule evaluated on a snapshot: whether its condition holds, its texts and metrics, and the
+     * signed node count its action names ({@code delta}; null for reshard and writer-disk).
+     */
     public record Candidate(String id, String kind, String target, boolean holds, String reason, String action,
-                            Map<String, Object> metrics) {}
+                            Integer delta, Map<String, Object> metrics) {}
 
     /** The stable proposal id: lower-case hex SHA-1 of {@code kind + target}. */
     public static String id(String kind, String target) {
@@ -145,19 +154,30 @@ public final class Proposals {
             m.put("freeBytes", w.heartbeat().disk().freeBytes());
             m.put("totalBytes", w.heartbeat().disk().totalBytes());
             put(out, WRITER_DISK, node, true, "writer " + node + " low on disk",
-                    "add writer capacity / free disk on " + node, m);
+                    "add writer capacity / free disk on " + node, null, m);
         }
         return out;
     }
 
     private static void put(Map<String, Candidate> out, String kind, String target, boolean holds, String reason,
-                            String action, Map<String, Object> metrics) {
+                            String action, Integer delta, Map<String, Object> metrics) {
         String id = id(kind, target);
-        out.put(id, new Candidate(id, kind, target, holds, reason, action, new TreeMap<>(metrics)));
+        out.put(id, new Candidate(id, kind, target, holds, reason, action, delta, new TreeMap<>(metrics)));
+    }
+
+    /** {@code n} with its noun, plural unless 1: "1 reader", "3 readers". */
+    private static String count(int n, String noun) {
+        return n + " " + noun + (n == 1 ? "" : "s");
     }
 
     private static double round2(double v) {
         return Math.round(v * 100) / 100.0;
+    }
+
+    /** A share as a percentage: 0.2 → "20%", 0.125 → "12.5%". */
+    private static String percent(double share) {
+        double p = Math.round(share * 1000) / 10.0;
+        return (p == Math.rint(p) ? String.valueOf((long) p) : String.valueOf(p)) + "%";
     }
 
     private static String minutes(long seconds) {
@@ -194,16 +214,15 @@ public final class Proposals {
         String why = qpsHigh && p95High ? "QPS per reader and warm p95 above target"
                 : qpsHigh ? "QPS per reader above target" : "warm p95 above target";
         put(out, ADD_READERS, READERS, qpsHigh || p95High,
-                why + " for " + minutes(cfg.addReadersSeconds()), "Start " + add + " reader" + (add == 1 ? "" : "s"), m);
+                why + " for " + minutes(cfg.addReadersSeconds()), "Start " + count(add, "reader"), add, m);
 
         int needed = Math.max(1, (int) Math.ceil(total / (cfg.qpsPerReader() * 0.5)));
         int remove = n - needed;
-        boolean low = n > 1 && remove >= 1 && perReader < StatusSettings.REMOVE_READERS_LOAD * cfg.qpsPerReader()
-                && !p95High;
+        boolean low = n > 1 && remove >= 1 && perReader < cfg.removeReadersLoad() * cfg.qpsPerReader() && !p95High;
+        int stop = Math.max(1, remove);
         put(out, REMOVE_READERS, READERS, low,
-                "readers below " + Math.round(StatusSettings.REMOVE_READERS_LOAD * 100) + "% load for "
-                        + minutes(cfg.removeReadersSeconds()),
-                "Drain and stop " + Math.max(1, remove) + " reader" + (Math.max(1, remove) == 1 ? "" : "s"), m);
+                "readers below " + percent(cfg.removeReadersLoad()) + " load for " + minutes(cfg.removeReadersSeconds()),
+                "Drain and stop " + count(stop, "reader"), -stop, m);
     }
 
     private static void writerRules(StatusSnapshot s, StatusState state, StatusSettings cfg,
@@ -227,7 +246,7 @@ public final class Proposals {
             pending++;
             long age = Math.max(0, now - since);
             oldest = oldest == null ? age : Math.max(oldest, age);
-            if (age > cfg.backlogSeconds()) pendingOver++;
+            if (age > cfg.oldestPendingSeconds()) pendingOver++;
         }
         boolean anyWriterKnown = !s.writers().isEmpty() || workable > 0;
         if (!anyWriterKnown) return;
@@ -238,17 +257,18 @@ public final class Proposals {
         m.put("shardsPending", pending);
         m.put("shardsPendingOverTarget", pendingOver);
         m.put("oldestPendingAgeSeconds", oldest);
-        m.put("targetBacklogSeconds", cfg.backlogSeconds());
+        m.put("targetOldestPendingSeconds", cfg.oldestPendingSeconds());
+        m.put("targetBacklogShards", cfg.backlogShards());
 
         int add = Math.max(1, Math.min(workable - writers, pendingOver));
-        put(out, ADD_WRITERS, WRITERS, pendingOver > 0 && writers < workable,
+        put(out, ADD_WRITERS, WRITERS, pendingOver >= cfg.backlogShards() && writers < workable,
                 "indexing backlog above target and fewer writers than shards",
-                "Start " + add + " writer" + (add == 1 ? "" : "s") + "; leases rebalance", m);
+                "Start " + count(add, "writer") + "; leases rebalance", add, m);
 
         boolean idle = writers > 1 && pending == 0 && live.stream().allMatch(h -> h.indexing() == null);
         int remove = Math.max(1, writers - 1);
         put(out, REMOVE_WRITERS, WRITERS, idle, "writers idle for " + minutes(cfg.removeWritersSeconds()),
-                "Stop " + remove + " writer" + (remove == 1 ? "" : "s") + "; leases move", m);
+                "Stop " + count(remove, "writer") + "; leases move", -remove, m);
     }
 
     private static void reshardRules(StatusSnapshot s, Map<String, Candidate> out) {
@@ -270,7 +290,7 @@ public final class Proposals {
             m.put("shareOfCache", round2(share));
             put(out, RESHARD, sh.shard(), share > StatusSettings.RESHARD_CACHE_SHARE,
                     "shard above " + Math.round(StatusSettings.RESHARD_CACHE_SHARE * 100) + "% of a reader's cache cap",
-                    "New shard spec, e.g. [project, hash(path) % " + parts + "]", m);
+                    "New shard spec, e.g. [project, hash(path) % " + parts + "]", null, m);
         }
     }
 
@@ -298,12 +318,12 @@ public final class Proposals {
                 long since = r == null ? now : r.since();
                 boolean active = now - since >= cfg.window(c.kind());
                 rules.put(id, new StatusState.Rule(c.kind(), c.target(), since, null, active,
-                        active ? c.reason() : null, active ? c.action() : null));
+                        active ? c.reason() : null, active ? c.action() : null, active ? c.delta() : null));
             } else if (r != null) {
                 long falseSince = r.falseSince() == null ? now : r.falseSince();
                 if (now - falseSince >= cfg.clearGraceSeconds()) continue; // cleared
                 rules.put(id, new StatusState.Rule(r.kind(), r.target(), r.since(), falseSince, r.active(), r.reason(),
-                        r.action()));
+                        r.action(), r.delta()));
             }
         }
 
@@ -318,6 +338,21 @@ public final class Proposals {
         return next.sameContent(base) ? base : next;
     }
 
+    /**
+     * The proposal of rule {@code id} as {@code /cluster/status} and the events show it: the texts
+     * and delta the state recorded, the metrics of the current candidate. A rule an older node
+     * wrote has no delta: the candidate's is used when its action matches the recorded one, so
+     * the delta always agrees with the action text.
+     */
+    static com.pharos.cluster.status.ClusterStatus.Proposal proposal(String id, StatusState.Rule r,
+                                                                     Map<String, Candidate> cands) {
+        Candidate c = cands == null ? null : cands.get(id);
+        Integer delta = r.delta();
+        if (delta == null && c != null && java.util.Objects.equals(c.action(), r.action())) delta = c.delta();
+        return new com.pharos.cluster.status.ClusterStatus.Proposal(id, r.kind(), r.target(), r.reason(),
+                c == null ? new TreeMap<>() : c.metrics(), r.action(), delta, Instant.ofEpochSecond(r.since()).toString());
+    }
+
     /** The proposals in force in {@code state}, with the metrics of {@code cands}, sorted by kind and target. */
     static List<com.pharos.cluster.status.ClusterStatus.Proposal> inForce(StatusState state,
                                                                           Map<String, Candidate> cands) {
@@ -325,9 +360,7 @@ public final class Proposals {
         for (Map.Entry<String, StatusState.Rule> e : state.rules().entrySet()) {
             StatusState.Rule r = e.getValue();
             if (!r.active()) continue;
-            Candidate c = cands.get(e.getKey());
-            out.add(new com.pharos.cluster.status.ClusterStatus.Proposal(e.getKey(), r.kind(), r.target(), r.reason(),
-                    c == null ? new TreeMap<>() : c.metrics(), r.action(), Instant.ofEpochSecond(r.since()).toString()));
+            out.add(proposal(e.getKey(), r, cands));
         }
         out.sort(java.util.Comparator.comparing(com.pharos.cluster.status.ClusterStatus.Proposal::kind)
                 .thenComparing(com.pharos.cluster.status.ClusterStatus.Proposal::target));

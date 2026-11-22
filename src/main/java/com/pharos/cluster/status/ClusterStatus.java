@@ -107,9 +107,11 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
 
     /**
      * A proposal in force. {@code id} = hex SHA-1 of {@code kind + target}; {@code since} is when its
-     * condition started to hold (bucket time, ISO-8601); {@code metrics} are the snapshot's numbers.
+     * condition started to hold (bucket time, ISO-8601); {@code metrics} are the snapshot's numbers;
+     * {@code delta} is the signed node count of a scaling proposal ({@code +N} start, {@code -N}
+     * stop, the N its {@code action} names), absent on {@code reshard} and {@code writer-disk}.
      */
-    @JsonPropertyOrder({"id", "kind", "target", "reason", "metrics", "action", "since"})
+    @JsonPropertyOrder({"id", "kind", "target", "reason", "metrics", "action", "delta", "since"})
     public record Proposal(String id, String kind, String target, String reason, Map<String, Object> metrics,
-                           String action, String since) {}
+                           String action, @JsonInclude(JsonInclude.Include.NON_NULL) Integer delta, String since) {}
 }

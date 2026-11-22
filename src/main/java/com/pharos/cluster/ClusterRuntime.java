@@ -781,7 +781,7 @@ public final class ClusterRuntime implements Closeable {
      * (never matches without one); the token itself does not leave the config.
      */
     public java.util.function.Predicate<String> clusterTokenMatcher() {
-        return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken());
+        return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().effectiveToken());
     }
 
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
@@ -817,7 +817,7 @@ public final class ClusterRuntime implements Closeable {
         if (peerFiles == null) {
             LazyGenerations l = lazy;
             peerFiles = new com.pharos.cluster.peer.PeerFileSource(readerCache, l == null ? null : l::blockCache,
-                    com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken()),
+                    com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().effectiveToken()),
                     config.getCluster().getPeers().getMaxTransfersPerReader(), System::nanoTime);
         }
         return Optional.of(peerFiles);
@@ -868,7 +868,7 @@ public final class ClusterRuntime implements Closeable {
      * the endpoints answer 503 and coordinators fail over.
      */
     public com.pharos.cluster.internal.InternalApi internalApi() {
-        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().getToken()) : null;
+        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().effectiveToken()) : null;
     }
 
     /**
@@ -906,7 +906,7 @@ public final class ClusterRuntime implements Closeable {
         com.pharos.search.distributed.LocalShardService service =
                 engine.shardService(this::servesShard, modelFingerprint(engine.embedder().modelId()));
         var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
-        var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
+        var client = new com.pharos.cluster.internal.ShardClient(health, c.effectiveToken(),
                 Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));
         var catalog = new com.pharos.cluster.routing.CachedCatalog(backend.catalog(), CATALOG_CACHE,
                 Duration.ofSeconds(c.getMaxCatalogAgeSeconds()), System::nanoTime,
@@ -942,7 +942,7 @@ public final class ClusterRuntime implements Closeable {
         if (previous != null) previous.close();
         engine.setDistributed(ds);
         engine.setLocalDegradation(this::degradation);
-        return new com.pharos.cluster.internal.InternalApi(c.getToken()).service(service);
+        return new com.pharos.cluster.internal.InternalApi(c.effectiveToken()).service(service);
     }
 
     /**

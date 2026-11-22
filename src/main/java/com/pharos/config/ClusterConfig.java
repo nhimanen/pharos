@@ -46,6 +46,12 @@ public class ClusterConfig {
     /** Shared secret of the cluster's internal endpoints; required on readers. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String token;
+    /**
+     * The name of an environment variable holding the token, instead of {@code token} (mutually
+     * exclusive with it): the token then never sits in config.json (Kubernetes passes it from a Secret).
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String tokenEnv;
     private int heartbeatSeconds = 10;
     private int readerTtlSeconds = 30;
     /** Timeout of one internal shard call (term statistics, shard search, snippets, callees). */
@@ -96,6 +102,20 @@ public class ClusterConfig {
 
     /** @throws IllegalStateException when the combination of settings is unusable */
     public void validate() {
+        if (tokenEnv != null) {
+            if (token != null) {
+                // never echo either value: one is the secret, the other names where it lives
+                throw new IllegalStateException("cluster.token and cluster.tokenEnv are mutually exclusive: set one");
+            }
+            if (tokenEnv.isBlank()) {
+                throw new IllegalStateException("cluster.tokenEnv must name an environment variable");
+            }
+            String v = System.getenv(tokenEnv.trim());
+            if (v == null || v.isBlank()) {
+                throw new IllegalStateException("cluster.tokenEnv names " + tokenEnv.trim()
+                        + ", which is not set (or empty) in this process's environment");
+            }
+        }
         if (role != NodeRole.ALL && backend == BackendKind.LOCAL) {
             throw new IllegalStateException("cluster.role '" + role.json()
                     + "' requires cluster.backend 'object-store' or 'peer-pull'");
@@ -172,9 +192,9 @@ public class ClusterConfig {
                 throw new IllegalStateException("cluster.writer.workQueue cannot be true with cluster.backend 'peer-pull'"
                         + " (peer mode has no leases or takeover; remove the setting)");
             }
-            if (token == null || token.isBlank()) {
+            if (effectiveToken() == null || effectiveToken().isBlank()) {
                 throw new IllegalStateException("cluster.token is required with cluster.backend 'peer-pull'"
-                        + " (every /replication/* route requires it)");
+                        + " (every /replication/* route requires it; or set cluster.tokenEnv)");
             }
         }
         if (peers == null) peers = new PeersConfig();
@@ -227,8 +247,9 @@ public class ClusterConfig {
             } catch (java.net.URISyntaxException e) {
                 throw new IllegalStateException("cluster.advertiseUrl is not a valid URL: '" + advertiseUrl + "'");
             }
-            if (token == null || token.isBlank()) {
-                throw new IllegalStateException("cluster.token is required on a reader (shared secret of the cluster)");
+            if (effectiveToken() == null || effectiveToken().isBlank()) {
+                throw new IllegalStateException("cluster.token is required on a reader (shared secret of the cluster;"
+                        + " or set cluster.tokenEnv)");
             }
         }
         if (reader == null) reader = new ReaderConfig();
@@ -258,7 +279,8 @@ public class ClusterConfig {
     @Override
     public String toString() {
         return "ClusterConfig[role=" + role + ", backend=" + backend + ", nodeId=" + nodeId
-                + ", advertiseUrl=" + advertiseUrl + ", token=" + (token == null ? "unset" : "***") + "]";
+                + ", advertiseUrl=" + advertiseUrl + ", token=" + (token == null ? "unset" : "***")
+                + (tokenEnv == null ? "" : ", tokenEnv=" + tokenEnv) + "]";
     }
 
     public NodeRole getRole() { return role; }
@@ -306,9 +328,26 @@ public class ClusterConfig {
     public void setDrainSeconds(int v) { this.drainSeconds = v; }
     public String getAdvertiseUrl() { return advertiseUrl; }
     public void setAdvertiseUrl(String v) { this.advertiseUrl = v; }
-    /** Serialised for config persistence ({@code IndexConfig.save}); every output surface redacts it. */
+    /**
+     * The configured {@code cluster.token} only, serialised for config persistence
+     * ({@code IndexConfig.save}); every output surface redacts it. Runtime code uses
+     * {@link #effectiveToken()}, which also reads {@code tokenEnv}.
+     */
     public String getToken() { return token; }
     public void setToken(String v) { this.token = v; }
+    public String getTokenEnv() { return tokenEnv; }
+    public void setTokenEnv(String v) { this.tokenEnv = v; }
+
+    /**
+     * The cluster token in effect: {@code token}, else the value of the environment variable
+     * {@code tokenEnv} names, else null. Read on every call and never stored, so it is never
+     * written back to config.json.
+     */
+    public String effectiveToken() {
+        if (token != null) return token;
+        if (tokenEnv == null || tokenEnv.isBlank()) return null;
+        return System.getenv(tokenEnv.trim());
+    }
     public int getHeartbeatSeconds() { return heartbeatSeconds; }
     public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }
     public int getFanoutTimeoutMillis() { return fanoutTimeoutMillis; }
@@ -784,6 +823,15 @@ public class ClusterConfig {
      *       raised (add readers 300, remove readers 1800, add writers 0, remove writers 1800, reshard 0,
      *       writer disk 0), and {@code windows.clearGraceSeconds} (default 60) how long it must be
      *       false before a raised proposal clears (or a pending condition resets);</li>
+     *   <li>{@code removeReadersLoad} (default 0.2): remove-readers needs QPS per reader below this
+     *       share of {@code targets.qpsPerReader} (exclusive range 0..1);</li>
+     *   <li>{@code writers.backlogShards} (default 1) and {@code writers.oldestPendingSeconds}
+     *       (default 300): add-writers needs at least that many shards whose oldest unpublished
+     *       change is older than that ({@code targets.backlog} drives only the {@code shard-lagging}
+     *       health finding);</li>
+     *   <li>{@code writers.idleSeconds} (default: {@code windows.removeWritersSeconds}, 1800): how
+     *       long the writers must be idle before remove-writers; it wins over
+     *       {@code windows.removeWritersSeconds} when both are set;</li>
      *   <li>{@code eventsKeepAliveSeconds} (default 15): the SSE keep-alive comment interval of
      *       {@code /cluster/events} (the router cuts a stream idle for twice that);</li>
      *   <li>{@code webhookUrl} (optional): receives every event as a JSON POST.</li>
@@ -793,6 +841,8 @@ public class ClusterConfig {
     public static class StatusConfig {
         private Targets targets = new Targets();
         private Windows windows = new Windows();
+        private double removeReadersLoad = 0.2;
+        private StatusWriters writers = new StatusWriters();
         private int eventsKeepAliveSeconds = 15;
         @JsonInclude(JsonInclude.Include.NON_NULL)
         private String webhookUrl;
@@ -802,8 +852,14 @@ public class ClusterConfig {
         public void validate() {
             if (targets == null) targets = new Targets();
             if (windows == null) windows = new Windows();
+            if (writers == null) writers = new StatusWriters();
             targets.validate();
             windows.validate();
+            writers.validate();
+            if (!(removeReadersLoad > 0 && removeReadersLoad < 1)) {
+                throw new IllegalStateException("cluster.status.removeReadersLoad must be above 0 and below 1"
+                        + " (a share of targets.qpsPerReader), got " + removeReadersLoad);
+            }
             if (eventsKeepAliveSeconds < 1 || eventsKeepAliveSeconds > MAX_KEEP_ALIVE_SECONDS) {
                 throw new IllegalStateException("cluster.status.eventsKeepAliveSeconds must be between 1 and "
                         + MAX_KEEP_ALIVE_SECONDS + ", got " + eventsKeepAliveSeconds);
@@ -827,6 +883,15 @@ public class ClusterConfig {
         public void setTargets(Targets t) { this.targets = t == null ? new Targets() : t; }
         public Windows getWindows() { return windows; }
         public void setWindows(Windows w) { this.windows = w == null ? new Windows() : w; }
+        public double getRemoveReadersLoad() { return removeReadersLoad; }
+        public void setRemoveReadersLoad(double v) { this.removeReadersLoad = v; }
+        public StatusWriters getWriters() { return writers; }
+        public void setWriters(StatusWriters w) { this.writers = w == null ? new StatusWriters() : w; }
+        /** The remove-writers window: {@code writers.idleSeconds} when set, else {@code windows.removeWritersSeconds}. */
+        public long effectiveRemoveWritersSeconds() {
+            Long idle = writers == null ? null : writers.getIdleSeconds();
+            return idle != null ? idle : windows.getRemoveWritersSeconds();
+        }
         public int getEventsKeepAliveSeconds() { return eventsKeepAliveSeconds; }
         public void setEventsKeepAliveSeconds(int v) { this.eventsKeepAliveSeconds = v; }
         public String getWebhookUrl() { return webhookUrl; }
@@ -859,6 +924,38 @@ public class ClusterConfig {
         public void setQpsPerReader(double v) { this.qpsPerReader = v; }
         public long getBacklog() { return backlog; }
         public void setBacklog(long v) { this.backlog = v; }
+    }
+
+    /** {@code cluster.status.writers}: the writer scaling triggers (see {@link StatusConfig}). */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class StatusWriters {
+        private int backlogShards = 1;
+        private long oldestPendingSeconds = 300;
+        /** Null: {@code windows.removeWritersSeconds} applies. */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Long idleSeconds;
+
+        void validate() {
+            if (backlogShards < 1) {
+                throw new IllegalStateException("cluster.status.writers.backlogShards must be at least 1, got "
+                        + backlogShards);
+            }
+            if (oldestPendingSeconds < 0) {
+                throw new IllegalStateException("cluster.status.writers.oldestPendingSeconds must not be negative, got "
+                        + oldestPendingSeconds);
+            }
+            if (idleSeconds != null && idleSeconds < 0) {
+                throw new IllegalStateException("cluster.status.writers.idleSeconds must not be negative, got "
+                        + idleSeconds);
+            }
+        }
+
+        public int getBacklogShards() { return backlogShards; }
+        public void setBacklogShards(int v) { this.backlogShards = v; }
+        public long getOldestPendingSeconds() { return oldestPendingSeconds; }
+        public void setOldestPendingSeconds(long v) { this.oldestPendingSeconds = v; }
+        public Long getIdleSeconds() { return idleSeconds; }
+        public void setIdleSeconds(Long v) { this.idleSeconds = v; }
     }
 
     /** {@code cluster.status.windows}: rule durations in seconds (shortened by the Phase 4 gate). */

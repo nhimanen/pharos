@@ -14,7 +14,7 @@ import java.util.TreeSet;
 
 /**
  * One {@code /cluster/events} (and webhook) event: {@code {type: appeared|changed|cleared, proposal}}
- * when a proposal comes into force, changes its reason or action, or clears, and
+ * when a proposal comes into force, changes its reason, action or delta, or clears, and
  * {@code {type: layout, summary}} when the scale (shard, writer or reader count) changes.
  */
 @JsonPropertyOrder({"type", "proposal", "summary"})
@@ -56,7 +56,8 @@ public record StatusEvent(String type, ClusterStatus.Proposal proposal, StatusSt
                 out.add(new StatusEvent(APPEARED, proposal(id, is, cands), null));
             } else if (wasOn && !isOn) {
                 out.add(new StatusEvent(CLEARED, proposal(id, was, cands), null));
-            } else if (wasOn && (!Objects.equals(was.reason(), is.reason()) || !Objects.equals(was.action(), is.action()))) {
+            } else if (wasOn && (!Objects.equals(was.reason(), is.reason()) || !Objects.equals(was.action(), is.action())
+                    || !Objects.equals(was.delta(), is.delta()))) {
                 out.add(new StatusEvent(CHANGED, proposal(id, is, cands), null));
             }
         }
@@ -64,8 +65,6 @@ public record StatusEvent(String type, ClusterStatus.Proposal proposal, StatusSt
     }
 
     private static ClusterStatus.Proposal proposal(String id, StatusState.Rule r, Map<String, Proposals.Candidate> cands) {
-        Proposals.Candidate c = cands == null ? null : cands.get(id);
-        return new ClusterStatus.Proposal(id, r.kind(), r.target(), r.reason(),
-                c == null ? new TreeMap<>() : c.metrics(), r.action(), Instant.ofEpochSecond(r.since()).toString());
+        return Proposals.proposal(id, r, cands);
     }
 }

@@ -16,8 +16,8 @@ import java.util.TreeMap;
  * <ul>
  *   <li>{@code rules}: per proposal id, since when its condition holds ({@code since}), since when
  *       it no longer does ({@code falseSince}, while the clear grace runs), and, once the rule's
- *       window has passed, the proposal in force ({@code active} with its {@code reason} and
- *       {@code action});</li>
+ *       window has passed, the proposal in force ({@code active} with its {@code reason},
+ *       {@code action} and {@code delta});</li>
  *   <li>{@code pendingSince}: per shard, the bucket time its oldest unpublished change was first
  *       seen. It is kept while no live writer reports the shard, so the backlog age survives a
  *       takeover;</li>
@@ -47,13 +47,16 @@ public record StatusState(int version, long asOf, SortedMap<String, Rule> rules,
     }
 
     /**
-     * One rule's hysteresis. {@code reason} and {@code action} are set only while {@code active}.
+     * One rule's hysteresis. {@code reason}, {@code action} and {@code delta} (the signed node count
+     * of a scaling proposal, see {@link Proposals}) are set only while {@code active}. A node older
+     * than {@code delta} drops it when it rewrites the state; it is back on the next write by a newer
+     * node, and meanwhile {@link Proposals#proposal} fills it from the current candidate.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    @JsonPropertyOrder({"kind", "target", "since", "falseSince", "active", "reason", "action"})
+    @JsonPropertyOrder({"kind", "target", "since", "falseSince", "active", "reason", "action", "delta"})
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Rule(String kind, String target, long since, Long falseSince, boolean active, String reason,
-                       String action) {}
+                       String action, Integer delta) {}
 
     /** The scale of the cluster: shard, live writer and live reader counts. */
     @JsonIgnoreProperties(ignoreUnknown = true)
