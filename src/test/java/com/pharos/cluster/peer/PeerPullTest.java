@@ -522,6 +522,28 @@ class PeerPullTest {
         assertThat(peers.get("writers")).asList().singleElement().asString().contains("writer-a");
     }
 
+    /**
+     * The reader holds a long-poll on its writer between passes, so a new generation arrives at once,
+     * not at the next refresh. (A sentinel {@code notBefore} of {@code Long.MIN_VALUE} made
+     * {@code now - notBefore} overflow, so no poll was ever issued and only refreshes synced.)
+     */
+    @Test
+    void longPollBringsTheNextGenerationLongBeforeTheRefresh() throws Exception {
+        Writer w = new Writer("writer-a").start();
+        w.index(JAVA, false);
+        Reader r = reader("reader-1", "seeds:" + w.url(), c -> c.getPeers().setRefreshSeconds(3600));
+        r.runtime().startServing();
+        await("the reader's long-poll held by the writer", () -> w.endpoint.longPolls().inFlight() >= 1,
+                Duration.ofSeconds(10));
+        long t0 = System.nanoTime();
+        long g2 = w.addMethod("quadrupleTheValue");
+        await("generation " + g2 + " served", () -> r.runtime().served().get(JAVA_SHARD).value() == g2,
+                Duration.ofSeconds(10));
+        assertThat(Duration.ofNanos(System.nanoTime() - t0)).isLessThan(Duration.ofSeconds(10));
+        await("the long-poll re-issued for the new generation", () -> w.endpoint.longPolls().inFlight() >= 1,
+                Duration.ofSeconds(10));
+    }
+
     @Test
     void writerJoinsAndLeaves() throws Exception {
         Writer a = new Writer("writer-a").start();
@@ -995,6 +1017,9 @@ class PeerPullTest {
         assertThat(first.files().transfersServed()).isEqualTo(writerTransfers);
         assertThat(stat(second, "filesFromPeers")).isEqualTo(writerTransfers);
         assertThat(stat(second, "rejected")).isZero();
+        assertThat(stat(second, "bytesFromWriter")).as("whole files, all from the peer").isZero();
+        assertThat(stat(second, "bytesFromPeers")).as("the peer's bytes").isEqualTo(stat(first.reader(), "bytesFromWriter"))
+                .isEqualTo(w.endpoint.stats().get("bytesServed")).isPositive();
         for (String q : List.of("Calculator", "add two numbers", "getName")) {
             assertThat(ids(second.engine(), JAVA, q)).as(q).isEqualTo(ids(first.reader().engine(), JAVA, q));
         }

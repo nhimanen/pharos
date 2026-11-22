@@ -14,10 +14,10 @@ import java.util.concurrent.CompletableFuture;
  * peer publisher right after a generation is committed. A waiter is a future, so a long-poll holds
  * no thread while it waits (the web server suspends the request).
  *
- * <p>Only publishes in this process signal. A generation published by another process on the same
- * store (a {@code pharos index} run beside {@code pharos web}) is seen when the waiter times out,
- * since the endpoint then answers with {@code LATEST} read from disk; the reader's next long-poll
- * returns at once.
+ * <p>Publishes in this process signal directly. A generation published by another process on the
+ * same store (a {@code pharos index} or {@code pharos publish} run beside {@code pharos web}, which is
+ * how every publish reaches a peer-mode writer) is signalled by the endpoint's watch of
+ * {@code LATEST} for the shards with waiters ({@link ReplicationEndpoint}).
  */
 public final class GenerationSignal {
 
@@ -55,6 +55,11 @@ public final class GenerationSignal {
             }
         }
         for (Waiter w : wake) w.future().complete(null); // outside the lock: completion runs the response
+    }
+
+    /** The shards with at least one waiter. */
+    public synchronized java.util.Set<ShardId> waitingShards() {
+        return java.util.Set.copyOf(waiters.keySet());
     }
 
     /** Waiters currently registered (all shards). */

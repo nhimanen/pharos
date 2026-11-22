@@ -242,6 +242,39 @@ class ReplicationEndpointTest {
         assertThat(get(app, "/..%2Fetc/latest").statusCode()).isIn(400, 404);
     }
 
+    /**
+     * Every publish to a peer-mode writer comes from another process ({@code pharos index}, {@code pharos
+     * publish}): the web daemon's long-polls must learn of it from the store, not wait out their timeout.
+     */
+    @Test
+    void publishByAnotherProcessWakesTheLongPoll() throws Exception {
+        open(config);
+        indexFull();
+        PeerBackend web = new PeerBackend(config); // the `pharos web` process: its own GenerationSignal
+        try {
+            ReplicationEndpoint served = web.endpoint();
+            Javalin app = serve(served);
+            CompletableFuture<HttpResponse<byte[]>> waiting = http.sendAsync(
+                    get(base(app) + "/" + PROJECT + "/latest?wait=30&after=1", TOKEN).build(),
+                    HttpResponse.BodyHandlers.ofByteArray());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (web.peerStore().signal().waiting() == 0 && System.nanoTime() < deadline) Thread.sleep(20);
+            assertThat(web.peerStore().signal().waiting()).isEqualTo(1);
+
+            changeAndReindex(1); // published by the `pharos index` process: signals only its own backend
+            long t0 = System.nanoTime();
+            HttpResponse<byte[]> woken = waiting.get(5, TimeUnit.SECONDS);
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0))
+                    .isLessThanOrEqualTo(ReplicationEndpoint.WATCH_MILLIS * 4);
+            assertThat(json(woken).get("generation").asLong()).isEqualTo(2);
+            assertThat(web.peerStore().signal().waiting()).isZero();
+            served.close();
+            assertThat(served.stats()).containsEntry("longPolls", 0);
+        } finally {
+            web.close();
+        }
+    }
+
     @Test
     void longPollsAboveTheBoundGet503() throws Exception {
         open(config);
@@ -363,6 +396,10 @@ class ReplicationEndpointTest {
         // Sequential transfers each give their slot back.
         for (int i = 0; i < 3; i++) assertThat(get(app, fileUrl(key)).statusCode()).isEqualTo(200);
         assertThat(endpoint.transfers().inFlight()).isZero();
+        long size = largestLucene(manifest(app, 1)).get("length").asLong();
+        assertThat(endpoint.stats()).containsEntry("maxTransfers", 1).containsEntry("transfersInFlight", 0)
+                .containsEntry("peakTransfersInFlight", 1).containsEntry("transfersServed", 3L)
+                .containsEntry("transfersRefused", 0L).containsEntry("bytesServed", 3 * size);
 
         try (TransferLimiter.Permit busy = endpoint.transfers().tryAcquire().orElseThrow()) {
             HttpResponse<byte[]> r = send(get(base(app) + fileUrl(key), TOKEN).header("Range", "bytes=0-9"));
@@ -373,6 +410,9 @@ class ReplicationEndpointTest {
             assertThat(get(app, "/" + PROJECT + "/manifests/gen-1.json").statusCode()).isEqualTo(200);
         }
         assertThat(send(get(base(app) + fileUrl(key), TOKEN).header("Range", "bytes=0-9")).statusCode()).isEqualTo(206);
+        assertThat(endpoint.stats()).as("the 503 is counted; a range adds its own bytes only")
+                .containsEntry("transfersRefused", 1L).containsEntry("transfersServed", 4L)
+                .containsEntry("bytesServed", 3 * size + 10).containsEntry("peakTransfersInFlight", 1);
     }
 
     @Test

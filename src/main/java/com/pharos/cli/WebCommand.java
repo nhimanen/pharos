@@ -94,6 +94,7 @@ public class WebCommand implements Callable<Integer> {
                 clusterRuntime.replicationEndpoint().ifPresent(e -> {
                     webServer.setReplicationEndpoint(e);
                     webServer.setWriterDisk(clusterRuntime::writerDisk); // index dir, store dir, checkouts
+                    webServer.setPeers(() -> java.util.Map.of("transfers", e.stats())); // /health peers.transfers
                     clusterRuntime.registerReplicationDrain(); // on a signal: in-flight ranges finish first
                     System.out.println("Serving /replication/* (cluster.backend: peer-pull)");
                 });

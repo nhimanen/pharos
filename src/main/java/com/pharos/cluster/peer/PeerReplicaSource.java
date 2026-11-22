@@ -155,6 +155,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             write(in, target, -1, file.key());
         }
         fromWriter.incrementAndGet();
+        bytesFromWriter.addAndGet(file.length());
     }
 
     @Override
@@ -170,6 +171,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             write(in, target, length, file.key());
         }
         fromWriter.incrementAndGet();
+        bytesFromWriter.addAndGet(length);
     }
 
     @Override
@@ -177,6 +179,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
         com.pharos.cluster.objectstore.ObjectStore.checkRange(offset, length);
         if (length == 0) return InputStream.nullInputStream();
         fromWriter.incrementAndGet();
+        bytesFromWriter.addAndGet(length);
         return open(file, offset, length);
     }
 
@@ -197,6 +200,9 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     private final Map<URI, Long> suspects = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong filesFromPeers = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong fromWriter = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong bytesFromPeers = new java.util.concurrent.atomic.AtomicLong();
+    /** Bytes asked of the writer (a whole file's manifest length, or a range's length). */
+    private final java.util.concurrent.atomic.AtomicLong bytesFromWriter = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong peerRejects = new java.util.concurrent.atomic.AtomicLong();
     /** This reader's own advertised base URL (never fetched from); null when it advertises none. */
     private volatile URI self;
@@ -234,13 +240,15 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
 
     /**
      * Counters of peer fetching for {@code /health}: whole files served by peers, transfers that
-     * went to the writer, peer transfers rejected (bytes not matching the manifest, or a failure),
-     * and the peers currently suspect.
+     * went to the writer, the bytes of each, peer transfers rejected (bytes not matching the
+     * manifest, or a failure), and the peers currently suspect.
      */
     public Map<String, Object> peerFetchStats() {
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("filesFromPeers", filesFromPeers.get());
         out.put("fromWriter", fromWriter.get());
+        out.put("bytesFromPeers", bytesFromPeers.get());
+        out.put("bytesFromWriter", bytesFromWriter.get());
         out.put("rejected", peerRejects.get());
         long now = clock.getAsLong();
         out.put("suspects", suspects.entrySet().stream().filter(e -> now - e.getValue() < 0)
@@ -387,6 +395,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
             return false;
         }
         filesFromPeers.incrementAndGet();
+        bytesFromPeers.addAndGet(f.length());
         return true;
     }
 
@@ -555,8 +564,8 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
                     }
                     if (w.isEmpty()) continue;
                     if (p == null) {
-                        long nb = notBefore.getOrDefault(shard, Long.MIN_VALUE);
-                        if (now - nb < 0) {
+                        Long nb = notBefore.get(shard); // no sentinel: now - Long.MIN_VALUE overflows
+                        if (nb != null && now - nb < 0) {
                             wakeAt = Math.min(wakeAt, nb);
                             continue;
                         }

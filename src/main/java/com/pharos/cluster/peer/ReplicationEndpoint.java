@@ -194,6 +194,47 @@ public final class ReplicationEndpoint {
     /** Wakes every waiting long-poll (each answers with the current generation). */
     public void close() {
         peer.signal().close(); // the answer executor needs no shutdown: virtual threads, none idle
+        java.util.concurrent.ScheduledExecutorService w;
+        synchronized (this) {
+            w = watch;
+            watch = null;
+            watchClosed = true;
+        }
+        if (w != null) w.shutdownNow();
+    }
+
+    /**
+     * How often {@code LATEST} of the shards with waiting long-polls is re-read. Every publish to a
+     * peer-mode writer comes from another process ({@code pharos index} or {@code pharos publish}; the
+     * web daemon does not index), and only in-process publishes signal, so without this watch a
+     * long-poll would learn of a new generation only when its wait ran out.
+     */
+    static final long WATCH_MILLIS = 500;
+
+    // Guarded by this; started by the first long-poll that waits.
+    private java.util.concurrent.ScheduledExecutorService watch;
+    private boolean watchClosed;
+
+    private synchronized void startWatch() {
+        if (watch != null || watchClosed) return;
+        watch = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pharos-replication-watch");
+            t.setDaemon(true);
+            return t;
+        });
+        watch.scheduleWithFixedDelay(this::watchLatest, WATCH_MILLIS, WATCH_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    /** Signals the shards whose {@code LATEST} on disk is newer than some waiter's {@code after}. */
+    void watchLatest() {
+        for (ShardId shard : peer.signal().waitingShards()) {
+            try {
+                Optional<Generation> gen = peer.source().latest(shard);
+                if (gen.isPresent()) peer.signal().published(shard, gen.get());
+            } catch (IOException | RuntimeException e) {
+                log.debug("watching LATEST of shard {} failed: {}", shard, e.toString());
+            }
+        }
     }
 
     static final long LAST_CHUNK_GRACE_MILLIS = 200;
@@ -309,6 +350,7 @@ public final class ReplicationEndpoint {
         }
         CompletableFuture<Void> signalled = null;
         try {
+            startWatch();
             signalled = peer.signal().awaitNewer(shard, after);
             // A publish between the read above and registering would otherwise be missed until the timeout.
             OptionalLong again = currentGeneration(shard);
@@ -398,9 +440,11 @@ public final class ReplicationEndpoint {
         }
         Optional<TransferLimiter.Permit> permit = transfers.tryAcquire();
         if (permit.isEmpty()) {
+            transfersRefused.incrementAndGet();
             busy(ctx, "too many transfers on this writer (max " + transfers.max() + ")");
             return;
         }
+        peakTransfers.accumulateAndGet(transfers.inFlight(), Math::max);
         try (TransferLimiter.Permit held = permit.get()) {
             Path path = peer.store().pathOf(key);
             FileChannel ch;
@@ -413,7 +457,7 @@ public final class ReplicationEndpoint {
             // Open: GC may unlink the file now, the bytes stay readable until the channel closes.
             try (ch) {
                 transfersServed.incrementAndGet();
-                serve(ctx, ch.size(), ch::read, ctx.header("Range"), held);
+                bytesServed.addAndGet(serve(ctx, ch.size(), ch::read, ctx.header("Range"), held));
             }
         }
     }
@@ -423,6 +467,29 @@ public final class ReplicationEndpoint {
 
     /** The file transfers ({@code /files/<key>}) this writer has started serving. */
     public long transfersServed() { return transfersServed.get(); }
+
+    private final java.util.concurrent.atomic.AtomicLong transfersRefused = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong bytesServed = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicInteger peakTransfers = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Counters for {@code /health} ({@code peers} on a peer-pull writer): {@code maxTransfers}
+     * ({@code cluster.peers.maxTransfersPerWriter}), {@code transfersInFlight} and its highest value
+     * so far ({@code peakTransfersInFlight}), {@code transfersServed}, {@code transfersRefused} (503 at
+     * the cap), {@code bytesServed} (file bytes written), and {@code longPolls}, the {@code latest}
+     * long-polls held now.
+     */
+    public Map<String, Object> stats() {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("maxTransfers", transfers.max());
+        out.put("transfersInFlight", transfers.inFlight());
+        out.put("peakTransfersInFlight", peakTransfers.get());
+        out.put("transfersServed", transfersServed.get());
+        out.put("transfersRefused", transfersRefused.get());
+        out.put("bytesServed", bytesServed.get());
+        out.put("longPolls", longPolls.inFlight());
+        return out;
+    }
 
     /**
      * A manifest file key of {@code shard} that {@code /files/<key>} may serve: under the shard's
@@ -450,8 +517,10 @@ public final class ReplicationEndpoint {
      * Writes the requested bytes. {@code slot} is given back right before the last chunk is written:
      * the response completes inside that write, and a reader that issues its next range as soon as it
      * has this one must find the slot free (not a spurious 503).
+     *
+     * @return the bytes written (fewer than asked when the reader went away)
      */
-    static void serve(Context ctx, long size, Positional ch, String range, TransferLimiter.Permit slot)
+    static long serve(Context ctx, long size, Positional ch, String range, TransferLimiter.Permit slot)
             throws IOException {
         long start = 0;
         long end = size - 1; // inclusive
@@ -462,7 +531,7 @@ public final class ReplicationEndpoint {
                 ctx.header("Content-Range", "bytes */" + size);
                 ctx.status(416).contentType("application/json").result("{\"error\":\"range not satisfiable (one"
                         + " bytes=start-end range within " + size + " bytes)\"}");
-                return;
+                return 0;
             }
             start = r[0];
             end = r[1];
@@ -493,6 +562,7 @@ public final class ReplicationEndpoint {
         } catch (IOException e) { // the reader went away mid-transfer; it retries the range
             log.debug("transfer aborted after {} of {} bytes: {}", length - remaining, length, e.toString());
         }
+        return length - remaining;
     }
 
     /**

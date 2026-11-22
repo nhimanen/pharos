@@ -89,8 +89,9 @@ public class WebServer {
 
     /**
      * A peer-pull reader's writer view reported by {@code /health} as {@code peers} (writers,
-     * {@code shard X claimed by A and B} conflicts, unavailable shards). Informational: it changes
-     * neither the status nor readiness.
+     * {@code shard X claimed by A and B} conflicts, unavailable shards), or a peer-pull writer's
+     * transfer counters ({@code peers.transfers}). Informational: it changes neither the status nor
+     * readiness.
      */
     public void setPeers(java.util.function.Supplier<Map<String, Object>> peers) {
         this.peers = java.util.Objects.requireNonNull(peers, "peers");
