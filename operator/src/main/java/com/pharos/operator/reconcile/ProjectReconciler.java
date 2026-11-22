@@ -36,8 +36,10 @@ import java.util.TreeSet;
  * <p>Jobs are create-only and named after what they do, so the Jobs themselves record progress:
  * <ul>
  *   <li><b>Registration.</b> A project in the spec gets {@code <name>-register-<k8sName>-<specHash>};
- *       a new url, ref or embed is a new hash and so a new Job. Two registrations of one project
- *       never run at once (the catalog would end with whichever wrote last): an unfinished Job of an
+ *       a new url, ref or embed is a new hash and so a new Job. A succeeded Job of the current source
+ *       counts only while no other registration Job of the project is newer (a source reverted
+ *       A → B → A would otherwise leave the catalog on B): else it is deleted and runs again.
+ *       Two registrations of one project never run at once (the catalog would end with whichever wrote last): an unfinished Job of an
  *       older source is deleted, with its pods, before the new one is created. Once the current Job
  *       succeeded, finished Jobs of older sources are deleted.</li>
  *   <li><b>Removal.</b> A project that left the spec (still listed in the status, or with
@@ -88,6 +90,19 @@ public final class ProjectReconciler {
         boolean registration() { return Labels.REGISTER.equals(job.getMetadata().getLabels().get(Labels.COMPONENT)); }
 
         boolean deleting() { return job.getMetadata().getDeletionTimestamp() != null; }
+
+        /** When the Job was created, or null when unknown. */
+        Instant created() {
+            String t = job.getMetadata().getCreationTimestamp();
+            return t == null ? null : Instant.parse(t);
+        }
+
+        /** Created after {@code other} (false when either time is unknown). */
+        boolean newerThan(ProjectJob other) {
+            Instant a = created();
+            Instant b = other.created();
+            return a != null && b != null && a.isAfter(b);
+        }
 
         Optional<JobCondition> condition(String type) {
             if (job.getStatus() == null || job.getStatus().getConditions() == null) return Optional.empty();
@@ -275,8 +290,13 @@ public final class ProjectReconciler {
             }
             Integer retries = previous == null ? null : previous.retries();
             boolean registered = registered(previous);
+            final ProjectJob mine = job;
+            boolean superseded = mine != null && regs.stream().anyMatch(j -> j != mine && j.newerThan(mine));
             if (job == null) {
                 if (!olderActive) create(ProjectJobRenderer.registration(cluster, p, settings));
+            } else if (job.succeeded() && superseded) {
+                // A -> B -> A: B's Job ran after this one, so the catalog may hold B; run this one again
+                delete(job, DeletionPropagation.BACKGROUND);
             } else if (job.succeeded()) {
                 registered = true;
                 retries = null;

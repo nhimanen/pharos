@@ -46,6 +46,12 @@ chmod -R a+rX "$tmp"
 echo "image-smoke: building $image"
 docker build -f "$root/docker/pharos/Dockerfile" -t "$image" "$root"
 
+# writers clone ssh sources: git needs an ssh client in the image
+if ! docker run --rm --entrypoint sh "$image" -c 'command -v ssh && command -v git' >/dev/null; then
+    echo "image-smoke: the image has no ssh client (or git); ssh git sources cannot be cloned" >&2
+    exit 1
+fi
+
 docker volume create "$vol" >/dev/null
 # A fresh named volume takes the ownership of /data from the image (uid 10001).
 echo "image-smoke: indexing"

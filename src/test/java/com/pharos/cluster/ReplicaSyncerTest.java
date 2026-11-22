@@ -835,6 +835,30 @@ class ReplicaSyncerTest {
     }
 
     @Test
+    void absentCatalogKeepsServingButAnEmptyOneDropsEverything() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        // no catalog object at all (a store being reset, a wrong prefix): may be transient, drop nothing
+        ReplicaSyncer absent = new ReplicaSyncer(new ObjectStoreCatalog(new InMemoryObjectStore(), layout),
+                new ObjectStoreReplicaSource(store, layout), cache, readerRegistry, cacheDir, readerSynonyms,
+                Duration.ofSeconds(10), lazy);
+        try {
+            absent.syncOnce();
+        } finally {
+            absent.close();
+        }
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+        assertThat(cache.active(PROJECT)).isPresent();
+
+        // the catalog exists and lists no shard (its last project was removed): authoritative
+        assertThat(new ObjectStoreCatalog(store, layout).unregister(new ShardId(PROJECT))).isTrue();
+        assertThat(new ObjectStoreCatalog(store, layout).authoritativeShards()).contains(List.of());
+        syncer.syncOnce();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
+    }
+
+    @Test
     void emptyCatalogReadDoesNotDropServedShards() throws Exception {
         publishFull();
         syncer.syncOnce();

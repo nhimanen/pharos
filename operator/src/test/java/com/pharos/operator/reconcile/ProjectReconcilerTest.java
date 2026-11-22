@@ -488,6 +488,44 @@ class ProjectReconcilerTest {
         assertThat(plan.projects()).containsExactly(new ProjectStatus("lucene", true, null, null, null, 1));
     }
 
+    private static Job created(Job j, Instant at) {
+        return new JobBuilder(j).editMetadata().withCreationTimestamp(at.toString()).endMetadata().build();
+    }
+
+    /** main -> v2 -> main: main's old succeeded Job ran before v2's, so it must run again. */
+    @Test
+    void aSourceRevertedToAnEarlierOneRegistersItAgain() {
+        PharosCluster c = planCluster(List.of(lucene("main")), List.of(new ProjectStatus("lucene", true)));
+        Job mainJob = created(state(ProjectJobRenderer.registration(c, lucene("main"), SETTINGS), "Complete", null), T0);
+        Job v2Job = created(state(ProjectJobRenderer.registration(c, lucene("v2"), SETTINGS), "Complete", null),
+                T0.plusSeconds(600));
+
+        var plan = ProjectReconciler.plan(c, SETTINGS, List.of(mainJob, v2Job), true, T0.plusSeconds(1200));
+        assertThat(plan.create()).isEmpty();
+        assertThat(plan.delete()).as("the catalog may hold v2: main's Job runs again")
+                .containsExactly(new ProjectReconciler.Deletion(registerJob("main"), DeletionPropagation.BACKGROUND));
+
+        // the next reconcile re-creates main's Job; once it succeeded (now the newest), v2's is cleaned up
+        plan = ProjectReconciler.plan(c, SETTINGS, List.of(v2Job), true, T0.plusSeconds(1201));
+        assertThat(names(plan.create())).containsExactly(registerJob("main"));
+        Job again = created(state(ProjectJobRenderer.registration(c, lucene("main"), SETTINGS), "Complete", null),
+                T0.plusSeconds(1201));
+        plan = ProjectReconciler.plan(c, SETTINGS, List.of(again, v2Job), true, T0.plusSeconds(1300));
+        assertThat(plan.create()).isEmpty();
+        assertThat(plan.delete()).containsExactly(new ProjectReconciler.Deletion(registerJob("v2"),
+                DeletionPropagation.BACKGROUND));
+        assertThat(plan.projects()).containsExactly(new ProjectStatus("lucene", true));
+
+        // a v2 Job still running when the spec goes back to main: both go, then main runs again
+        Job v2Running = created(state(ProjectJobRenderer.registration(c, lucene("v2"), SETTINGS), null, null),
+                T0.plusSeconds(600));
+        plan = ProjectReconciler.plan(c, SETTINGS, List.of(mainJob, v2Running), true, T0.plusSeconds(700));
+        assertThat(plan.create()).isEmpty();
+        assertThat(plan.delete()).containsExactlyInAnyOrder(
+                new ProjectReconciler.Deletion(registerJob("v2"), DeletionPropagation.FOREGROUND),
+                new ProjectReconciler.Deletion(registerJob("main"), DeletionPropagation.BACKGROUND));
+    }
+
     @Test
     void retryBackoffDoublesUpToFifteenMinutes() {
         assertThat(ProjectReconciler.backoffSeconds(null)).isEqualTo(60);

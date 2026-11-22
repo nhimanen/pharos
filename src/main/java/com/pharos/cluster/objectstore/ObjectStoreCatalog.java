@@ -70,6 +70,16 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         return List.copyOf(out);
     }
 
+    /**
+     * Empty only when {@code catalog/shards.json} does not exist; a catalog that exists and lists no
+     * shard is authoritative (its last project was removed), so readers stop serving everything.
+     */
+    @Override
+    public Optional<List<ShardId>> authoritativeShards() throws IOException {
+        if (store.get(layout.catalogKey()).isEmpty()) return Optional.empty();
+        return Optional.of(shards());
+    }
+
     /** The listed shards with their sources; the same entries, in the same order, as {@link #shards()}. */
     public List<ShardEntry> entries() throws IOException {
         Optional<StoredObject> current = store.get(layout.catalogKey());

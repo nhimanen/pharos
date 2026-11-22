@@ -16,9 +16,10 @@ RUN mvn -B -q -pl app -am -DskipTests package \
     && rm -f /build/target/original-*.jar
 
 FROM eclipse-temurin:25-jre
-# python3 + python-hcl2 (Terraform), node (JS), git (writers clone projects)
+# python3 + python-hcl2 (Terraform), node (JS), git and openssh-client (writers clone projects,
+# also over ssh: --no-install-recommends would leave git without ssh)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip nodejs git ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-pip nodejs git openssh-client ca-certificates \
     && pip3 install --no-cache-dir --break-system-packages python-hcl2 \
     && apt-get purge -y python3-pip \
     && apt-get autoremove -y \
