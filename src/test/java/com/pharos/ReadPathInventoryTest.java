@@ -50,7 +50,8 @@ class ReadPathInventoryTest {
         assertThat(files("CallGraph.openExisting(")).containsExactlyInAnyOrder(
                 "graph/GraphViews.java",                          // the read path
                 "graph/CrossProjectLinker.java",                  // writer: link (reads project graphs)
-                "cluster/objectstore/ObjectStorePublisher.java"); // writer: compact graph snapshot
+                "cluster/objectstore/ObjectStorePublisher.java",  // writer: compact graph snapshot
+                "indexer/ProjectIndexManager.java");              // writer: reshard build (in-degrees, callers)
     }
 
     @Test
@@ -72,7 +73,9 @@ class ReadPathInventoryTest {
 
     @Test
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
-        assertThat(files("DirectoryReader.open(")).containsExactly("indexer/LuceneIndexer.java");
+        assertThat(files("DirectoryReader.open(")).containsExactlyInAnyOrder(
+                "indexer/LuceneIndexer.java",
+                "indexer/ProjectIndexManager.java"); // writer: reshard build lists each local shard's files
         // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
         // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
         assertThat(files("FSDirectory::open")).isEmpty();
