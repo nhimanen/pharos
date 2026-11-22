@@ -265,6 +265,8 @@ public final class WorkLoop implements Closeable {
     private final ObjectStoreLayout layout;
     /** Runs the projects' reshards; null until {@link #enableResharding}. */
     private volatile com.pharos.cluster.sharding.ReshardJob reshard;
+    /** The catalog mapping of the last tick. */
+    private volatile ProjectShards lastMap = ProjectShards.identity(List.of());
     private final long startedAt;
 
     /** The held work units (see the class javadoc), keyed by {@code ShardId.ofProject(project)}. */
@@ -388,8 +390,13 @@ public final class WorkLoop implements Closeable {
             if (!members.lastWriteOk()) return; // can't tell "peers are gone" from "the bucket is unreachable"
             leases.renewAll();
             com.pharos.cluster.sharding.ReshardJob job = reshard;
-            if (job != null) job.leases().renewAll();
             forgetLost();
+            if (job != null) {
+                // a reshard lease lives only as long as its project's work unit here
+                Set<ShardId> held = heldSet();
+                for (Lease l : job.leases().held()) if (!held.contains(l.shard())) job.releaseLease(l.shard());
+                job.leases().renewAll();
+            }
             ObjectStoreCatalog.View view;
             try {
                 view = catalog.view();
@@ -397,6 +404,7 @@ public final class WorkLoop implements Closeable {
                 log.warn("Reading the shard catalog failed (retrying next poll): {}", e.toString());
                 return;
             }
+            lastMap = view.projects();
             Map<ShardId, ShardSource> sources = resolveSources(view.entries(), view.projects());
             if (diskLow()) {
                 if (!announcedLow) {
@@ -422,7 +430,9 @@ public final class WorkLoop implements Closeable {
                 if (stopping) return;
                 if (!unitHeld(shard)) continue;
                 if (noRun.contains(shard)) continue;
-                if (job != null && job.builtLocally(shard.value(), view.projects())) {
+                if (job != null && (job.builtLocally(shard.value(), view.projects()) || reshardPinned(shard))) {
+                    // an index run now would publish the active version under the staged one's feet: the flip
+                    // (or a cancel) comes first
                     log.debug("Project {}: its reshard is built and waits for the flip; no index run now", shard);
                     continue;
                 }
@@ -616,6 +626,8 @@ public final class WorkLoop implements Closeable {
             if (st != null && !leased.containsAll(st.leaseShards)) {
                 shards.remove(s);
                 for (Lease l : leases.held()) if (st.leaseShards.contains(l.shard())) leases.release(l);
+                com.pharos.cluster.sharding.ReshardJob job = reshard;
+                if (job != null) job.releaseLease(s);
                 log.warn("Writer {} no longer holds the lease of shard {}; stopped working on it", settings.node(), s);
             }
         }
@@ -1126,7 +1138,7 @@ public final class WorkLoop implements Closeable {
                 try {
                     if (stopping) run.abort.request("stopping");
                     com.pharos.cluster.sharding.ReshardJob.Step step = job.step(project, planOf(st, unit), st.source,
-                            root, embeds(unit), run.abort);
+                            root, embeds(unit), run.abort, leases);
                     if (step == com.pharos.cluster.sharding.ReshardJob.Step.FLIPPED) {
                         st.publishedGeneration = null; // re-read: LATEST moved to the new version's generations
                         st.publishedGens = null;
@@ -1408,7 +1420,7 @@ public final class WorkLoop implements Closeable {
     /** Right after a publish of {@code shard}: release it when this writer holds more than its share. */
     private void maybeRelease(ShardId shard, int share) {
         ShardState st = shards.get(shard);
-        if (st == null) return;
+        if (st == null || reshardPinned(shard)) return;
         if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
             log.info("Releasing shard {} after its publish: writer {} holds {} lease(s), its share is {}", shard,
                     settings.node(), heldSet().size(), share);
@@ -1423,6 +1435,7 @@ public final class WorkLoop implements Closeable {
             ShardState st = shards.get(shard);
             // only when the last poll confirmed LATEST covers the source (M5)
             if (st == null || st.pendingSince != null || !st.prepared || !st.lastPollOk) continue;
+            if (reshardPinned(shard)) continue; // its holder flips it first
             if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
                 log.info("Releasing idle shard {}: writer {} holds {} lease(s), its share is {}", shard,
                         settings.node(), heldSet().size(), share);
@@ -1472,6 +1485,18 @@ public final class WorkLoop implements Closeable {
         ShardState st = shards.remove(shard);
         List<ShardId> own = st != null ? st.leaseShards : List.of(shard);
         for (Lease l : leases.held()) if (own.contains(l.shard())) leases.release(l);
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        if (job != null) job.releaseLease(shard);
+    }
+
+    /**
+     * True when the project's reshard is published and pinned but not flipped: its unit is not released
+     * at a clean point (its holder flips it), and no index run of it starts.
+     */
+    private boolean reshardPinned(ShardId unit) {
+        ProjectShards map = lastMap;
+        return map.reshardRequestOf(unit.value()).isPresent()
+                && map.stagedOf(unit.value()).filter(st -> !st.abandoned() && st.pinned()).isPresent();
     }
 
     /** Renews every lease of the unit (right after its publish). */

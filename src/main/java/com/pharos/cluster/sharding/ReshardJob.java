@@ -202,6 +202,16 @@ public final class ReshardJob {
      * when resuming) is checked out at {@code root}.
      */
     public Step step(String project, ShardPlan active, ShardSource source, Path root, boolean embed, IndexAbort abort) {
+        return step(project, active, source, root, embed, abort, LeaseGuard.IMPLICIT);
+    }
+
+    /**
+     * As above; {@code unitGuard} checks the shard leases of the project's work unit: every write of the
+     * job asserts both the reshard lease and every shard lease of the active version, so a writer that
+     * lost the project (its unit released or taken over) writes nothing more.
+     */
+    public Step step(String project, ShardPlan active, ShardSource source, Path root, boolean embed, IndexAbort abort,
+                     LeaseGuard unitGuard) {
         ShardId unit = ShardId.ofProject(project);
         ProjectShards map;
         try {
@@ -229,7 +239,10 @@ public final class ReshardJob {
                 return Step.REFUSED;
             }
         }
-        LeaseGuard guard = shard -> leases.assertHeld(unit);
+        LeaseGuard guard = shard -> {
+            leases.assertHeld(unit);
+            for (ShardId s : active.clusterShards()) unitGuard.assertHeld(s);
+        };
         Job job = readJob(project).filter(j -> j.spec == req.specVersion()).orElseGet(() -> new Job(req.specVersion()));
         try {
             if (req.spec().isDefault()) {
@@ -244,6 +257,7 @@ public final class ReshardJob {
                 to = new ShardPlan(project, req.spec(), staged.get().shards());
             } else {
                 List<ShardId> shards = indexer.shardsFor(root, project, req.spec());
+                guard.assertHeld(unit);
                 catalog.stageReshard(project, req.specVersion(), from, shards, clock.instant());
                 to = new ShardPlan(project, req.spec(), shards);
                 log.info("Reshard of project {}: staged spec version {} ({}) with {} shards", project,
@@ -260,7 +274,8 @@ public final class ReshardJob {
                 pins = staged.get().generations();
             } else {
                 pins = buildAndPublish(project, active, to, root, embed, abort, guard, job);
-                catalog.pinStaged(project, req.specVersion(), pins, activeGenerations(project, active, map));
+                guard.assertHeld(unit);
+                catalog.pinStaged(project, req.specVersion(), pins, job.basedOn);
                 job.phase = "published";
                 job.generations = pins;
                 job.pinnedAt = clock.instant();
@@ -290,7 +305,24 @@ public final class ReshardJob {
                 log.warn("Reshard of project {}: flipping after {} s although {}; queries read the previous version"
                         + " on readers without the new one", project, settings.syncTimeout().toSeconds(), waiting);
             }
-            flip(project, active, to, req.specVersion(), pins, map, guard);
+            try {
+                flip(project, active, to, req.specVersion(), pins, map, guard, job);
+            } catch (Stale e) {
+                // an index run published the active version since the staged one was built from it: withdraw
+                // the staged generations and build it again from the new active version
+                log.warn("Reshard of project {}: {}; building spec version {} again", project, e.getMessage(),
+                        req.specVersion());
+                catalog.unpinStaged(project, req.specVersion());
+                dropStaleBuild(project, to);
+                job.generations = new LinkedHashMap<>();
+                job.basedOn = null;
+                job.pinnedAt = null;
+                job.phase = "rebuilding";
+                job.error = e.getMessage();
+                writeJob(project, job);
+                releaseLease(unit);
+                return Step.FAILED;
+            }
             job.phase = "flipped";
             job.waitingFor = null;
             job.flippedAt = clock.instant();
@@ -326,6 +358,14 @@ public final class ReshardJob {
                                                IndexAbort abort, LeaseGuard guard, Job job) throws IOException {
         Path projectDir = lucene.getProjectIndexDir(project);
         boolean built = lucene.localLayout(project).filter(l -> l.matches(to)).isPresent();
+        Map<ShardId, Long> current = activeGenerations(project, active, catalog.projectShards());
+        if (built && !current.equals(job.basedOn)) {
+            // built from another state of the active version (or from one this record does not know)
+            dropStaleBuild(project, to);
+            throw new IOException("the local build of spec version " + job.spec + " is not of the active version's"
+                    + " current generations; the project is restored and built again");
+        }
+        job.basedOn = current;
         if (!built) {
             ProjectIndexManager.ReshardBuild b = indexer.reshard(root, project, active, to, embed,
                     ProgressListener.SILENT, abort);
@@ -373,10 +413,9 @@ public final class ReshardJob {
         return gens;
     }
 
-    /** What the active version serves: its pins when it has some, else each shard's {@code LATEST}. */
+    /** What the active version is published as: each of its shards' {@code LATEST}. */
     private Map<ShardId, Long> activeGenerations(String project, ShardPlan active, ProjectShards map) throws IOException {
-        Map<ShardId, Long> out = new LinkedHashMap<>(map.pinsOf(project));
-        if (!out.isEmpty()) return out;
+        Map<ShardId, Long> out = new LinkedHashMap<>();
         for (ShardId s : active.clusterShards()) {
             Optional<Generation> g = replicas.latest(s);
             if (g.isEmpty()) throw new PublishConflictException("shard " + s + " of the active version has no LATEST");
@@ -385,11 +424,48 @@ public final class ReshardJob {
         return out;
     }
 
-    /** The flip CAS, then each rewritten shard's {@code LATEST} to its pinned generation. */
+    /** The active version changed since the staged version was built from it. */
+    private static final class Stale extends Exception {
+        Stale(String message) { super(message, null, false, false); }
+    }
+
+    /**
+     * Drops this writer's local build of {@code to} (made from an active version that has changed): the
+     * work loop restores the project's published state and the job builds again.
+     */
+    private void dropStaleBuild(String project, ShardPlan to) throws IOException {
+        if (lucene.localLayout(project).filter(l -> l.matches(to)).isPresent()) indexer.removeProject(project);
+    }
+
+    /**
+     * The flip CAS, then each rewritten shard's {@code LATEST} to its pinned generation. The active version
+     * must still be what the staged one was built from: every shard's {@code LATEST} and the catalog's pins
+     * equal the generations recorded when it was pinned (the CAS checks the pins again).
+     */
     private void flip(String project, ShardPlan active, ShardPlan to, int version, Map<ShardId, Long> pins,
-                      ProjectShards map, LeaseGuard guard) throws IOException {
-        Map<ShardId, Long> previous = activeGenerations(project, active, map);
-        catalog.flipReshard(project, version, previous, clock.instant());
+                      ProjectShards map, LeaseGuard guard, Job job) throws IOException, Stale {
+        Map<ShardId, Long> previous = catalog.projectShards().pinsOf(project); // read now: the pins may be this step's
+        if (job.basedOn != null && !job.basedOn.equals(previous)) {
+            throw new Stale("its pins " + previous + " are not the generations the staged version was built from "
+                    + job.basedOn);
+        }
+        if (previous.isEmpty()) throw new Stale("the active version is no longer pinned (an index run published it)");
+        for (ShardId s : active.clusterShards()) {
+            Optional<Generation> g = replicas.latest(s);
+            if (g.isEmpty() || !Long.valueOf(g.get().value()).equals(previous.get(s))) {
+                throw new Stale("shard " + s + " is at generation " + g.map(Generation::value).orElse(null)
+                        + ", not " + previous.get(s));
+            }
+        }
+        guard.assertHeld(ShardId.ofProject(project));
+        try {
+            catalog.flipReshard(project, version, previous, clock.instant());
+        } catch (PublishConflictException e) {
+            if (e.getMessage() != null && e.getMessage().contains("changed since spec version")) {
+                throw new Stale(e.getMessage());
+            }
+            throw e;
+        }
         log.info("Reshard of project {}: flipped to spec version {} ({}); the previous version is kept for {} min",
                 project, version, to.spec(), settings.retention().toMinutes());
         publisher.finishFlip(pins, guard);
@@ -456,7 +532,8 @@ public final class ReshardJob {
         }
     }
 
-    private void releaseLease(ShardId unit) {
+    /** Releases this writer's reshard lease of {@code unit} (the work loop no longer holds the unit). */
+    public void releaseLease(ShardId unit) {
         for (Lease l : leases.held()) if (l.shard().equals(unit)) leases.release(l);
     }
 
@@ -470,6 +547,8 @@ public final class ReshardJob {
         String writer;
         List<ShardId> shards = List.of();
         Map<ShardId, Long> generations = new LinkedHashMap<>();
+        /** The active version's generations the staged one was built from (pinned with it). */
+        Map<ShardId, Long> basedOn;
         List<ShardId> affected = List.of();
         List<ShardId> unaffected = List.of();
         List<ShardId> removed = List.of();
@@ -497,6 +576,11 @@ public final class ReshardJob {
             Map<ShardId, Long> gens = new LinkedHashMap<>();
             n.path("generations").fields().forEachRemaining(e -> gens.put(new ShardId(e.getKey()), e.getValue().asLong()));
             j.generations = gens;
+            if (n.hasNonNull("basedOn")) {
+                Map<ShardId, Long> based = new LinkedHashMap<>();
+                n.get("basedOn").fields().forEachRemaining(e -> based.put(new ShardId(e.getKey()), e.getValue().asLong()));
+                j.basedOn = based;
+            }
             j.affected = ids(n.path("affected"));
             j.unaffected = ids(n.path("unaffected"));
             j.removed = ids(n.path("removed"));
@@ -529,6 +613,10 @@ public final class ReshardJob {
         j.shards.forEach(s -> shards.add(s.value()));
         ObjectNode gens = n.putObject("generations");
         j.generations.forEach((s, g) -> gens.put(s.value(), g));
+        if (j.basedOn != null) {
+            ObjectNode based = n.putObject("basedOn");
+            j.basedOn.forEach((s, g) -> based.put(s.value(), g));
+        }
         var a = n.putArray("affected");
         j.affected.forEach(s -> a.add(s.value()));
         var u = n.putArray("unaffected");

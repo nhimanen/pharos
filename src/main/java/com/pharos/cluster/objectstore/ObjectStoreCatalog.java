@@ -336,9 +336,27 @@ public final class ObjectStoreCatalog implements ShardCatalog {
                         + " are not the active shards " + active);
             }
             ObjectNode activeGens = generationsNode(activeGenerations);
-            if (gens.equals(st.get("generations")) && activeGens.equals(entry.get("generations"))) return false;
+            if (sameGenerations(gens, st.get("generations")) && sameGenerations(activeGens, entry.get("generations"))) {
+                return false;
+            }
             st.set("generations", gens);
             entry.set("generations", activeGens);
+            return true;
+        });
+    }
+
+    /**
+     * Withdraws the generations of {@code project}'s staged version {@code version} (it was built from an
+     * active version that has changed since): readers stop preparing it, and the job builds it again.
+     */
+    public void unpinStaged(String project, int version) throws IOException {
+        update("unpin staged spec version " + version + " of project " + project, root -> {
+            ObjectNode entry = projectEntry(root, project, false);
+            JsonNode st = entry == null ? null : entry.get("staged");
+            if (!(st instanceof ObjectNode o) || o.path("spec").asInt(-1) != version || !o.has("generations")) {
+                return false;
+            }
+            o.remove("generations");
             return true;
         });
     }
@@ -366,6 +384,14 @@ public final class ObjectStoreCatalog implements ShardCatalog {
             java.util.OptionalInt from = st.hasNonNull("from") ? java.util.OptionalInt.of(st.get("from").asInt())
                     : java.util.OptionalInt.empty();
             checkFrom(entry, project, from);
+            // the active version must still be exactly what the staged one was built from (pinStaged pinned
+            // it): an index run that published meanwhile dropped or moved the pins, and the staged version
+            // would serve its moved files twice
+            if (!sameGenerations(generationsNode(previousGenerations), entry.get("generations"))) {
+                throw new PublishConflictException("project " + project + " changed since spec version " + version
+                        + " was staged (its active generations are " + entry.get("generations") + ", the staged version"
+                        + " was built from " + generationsNode(previousGenerations) + "); it is built again");
+            }
             ObjectNode prev = JSON.createObjectNode();
             if (entry.hasNonNull("spec")) prev.put("spec", entry.get("spec").asInt());
             prev.set("shards", entry.path("shards").deepCopy());
@@ -497,6 +523,18 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         if (spec != null && spec.canConvertToInt()) a.put("spec", spec.asInt());
         a.set("shards", shards == null ? JSON.createArrayNode() : shards.deepCopy());
         a.put("since", now.toString());
+    }
+
+    /** Two {@code {"<shard>": generation}} objects name the same generations (number types aside). */
+    private static boolean sameGenerations(JsonNode a, JsonNode b) {
+        if (a == null || b == null || !a.isObject() || !b.isObject() || a.size() != b.size()) return false;
+        var it = a.fields();
+        while (it.hasNext()) {
+            var e = it.next();
+            JsonNode o = b.get(e.getKey());
+            if (o == null || !o.canConvertToLong() || o.asLong() != e.getValue().asLong()) return false;
+        }
+        return true;
     }
 
     private static ArrayNode idArray(List<ShardId> shards) {

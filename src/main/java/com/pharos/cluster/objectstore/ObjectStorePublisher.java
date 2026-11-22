@@ -186,7 +186,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
             }
             // 1. Previous generation P and the ETag the final CAS is conditioned on.
             Optional<Latest> previous = readLatest(shard);
-            Generation gen = previous.map(p -> p.generation().next()).orElse(Generation.FIRST);
+            Generation gen = nextGeneration(previous, mapping.pinnedGenerations(shard));
             Set<String> previousKeys = previous.isPresent()
                     ? keysOf(readManifest(shard, previous.get())) : Set.of();
 
@@ -480,7 +480,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
             Generation firstGen = null;
             for (ShardId shard : plan.shards()) {
                 Optional<Latest> p = previous.get(shard);
-                Generation gen = p.map(l -> l.generation().next()).orElse(Generation.FIRST);
+                Generation gen = nextGeneration(p, mapping.pinnedGenerations(shard));
                 if (firstGen == null) firstGen = gen;
                 ShardLucene sl = lucene.get(shard);
                 long sizeBytes = sl.files().stream().mapToLong(ManifestFile::length).sum() + projectBytes;
@@ -727,6 +727,17 @@ public final class ObjectStorePublisher implements IndexPublisher {
             log.warn("Clearing the pins of project {} failed (publish succeeded; retried by the next run): {}", project,
                     e.toString());
         }
+    }
+
+    /**
+     * The generation an index run commits: one above {@code LATEST}, skipping every number a version of
+     * the project names in the catalog (a reshard's staged generations, the pins, the previous version's).
+     * A staged manifest is never taken for an orphan and overwritten: it is not one.
+     */
+    static Generation nextGeneration(Optional<Latest> latest, Set<Long> named) {
+        long g = latest.map(l -> l.generation().value()).orElse(0L) + 1;
+        while (named.contains(g)) g++;
+        return new Generation(g);
     }
 
     /** The store's last-modified time of {@code key} (the store clock); null when not listed. */
