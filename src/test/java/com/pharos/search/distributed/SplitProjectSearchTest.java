@@ -270,15 +270,26 @@ class SplitProjectSearchTest {
         SearchResponse filtered = search(c, "widget helper", MOD, ShardFilter.module("core"));
         assertThat(filtered.results()).isNotEmpty()
                 .allSatisfy(x -> assertThat(x.filePath()).contains("/core/"));
-        Set<String> touched = r.drainCalls().stream().map(TestReaderNode.Call::shard).collect(Collectors.toSet());
-        assertThat(touched).containsExactly(MOD_CORE.value());
+        List<TestReaderNode.Call> calls = r.drainCalls();
+        // P6-R13: the search round touches only the matching shard; the statistics round asks them all
+        assertThat(shardsCalled(calls, "/internal/shard-search")).containsExactly(MOD_CORE.value());
+        assertThat(calls).filteredOn(x -> !x.path().endsWith("/internal/term-stats"))
+                .allSatisfy(x -> assertThat(x.shard()).as(x.path()).isEqualTo(MOD_CORE.value()));
+        assertThat(shardsCalled(calls, "/internal/term-stats"))
+                .containsExactlyInAnyOrderElementsOf(MOD_SHARDS.stream().map(ShardId::value).toList());
         assertThat(filtered.trace().notes()).containsExactly(
-                "project " + MOD + ": module 'core' selects 1 of 3 shards (" + MOD_CORE.value() + ")");
+                "project " + MOD + ": module 'core' selects 1 of 3 shards (" + MOD_CORE.value() + ")",
+                "project " + MOD + ": stats: 3 shards, search: 1 of 3");
 
         SearchResponse all = search(c, "widget helper", MOD, ShardFilter.NONE);
-        assertThat(r.drainCalls().stream().map(TestReaderNode.Call::shard).collect(Collectors.toSet()))
+        assertThat(shardsCalled(r.drainCalls(), "/internal/shard-search"))
                 .containsExactlyInAnyOrderElementsOf(MOD_SHARDS.stream().map(ShardId::value).toList());
         assertThat(all.results().size()).isGreaterThan(filtered.results().size());
+    }
+
+    static Set<String> shardsCalled(List<TestReaderNode.Call> calls, String path) {
+        return calls.stream().filter(x -> x.path().endsWith(path)).map(TestReaderNode.Call::shard)
+                .collect(Collectors.toSet());
     }
 
     /** Review Focus 4: a path filter can't prune a ring: every shard of the project is asked, and the trace says why. */
@@ -299,14 +310,16 @@ class SplitProjectSearchTest {
     static final String MOD_WHOLE = "modwhole";
 
     /**
-     * P6-R12: key filters are non-scoring. With every shard searched (a [project] project, or a split
-     * project whose spec can't prune by the filter), a filtered query scores each document exactly as the
-     * unfiltered query does; it only drops the documents that don't match. (modproj has no calls: the
+     * P6-R12 and P6-R13: key filters are non-scoring. A filtered query scores each document exactly
+     * (bitwise) as the unfiltered query does, and only drops the documents that don't match: for a
+     * [project] project, for a split project whose spec can't prune by the filter, and for a split project
+     * the filter prunes (every shard still answers the statistics round). (modproj has no calls: the
      * graph boost, relative to each list's largest in-degree, can't differ between the two lists.)
      */
     @Test
     void keyFiltersSelectDocumentsWithoutChangingScores() throws Exception {
         for (String[] pq : new String[][]{{MOD_WHOLE, "module", "core"}, {MOD, "language", "java"},
+                {MOD, "module", "core"}, {MOD, "module", "web"},
                 {MOD_WHOLE, "pathPrefix", "web/src"}, {MOD_WHOLE, "kind", "code"}}) {
             ShardFilter f = switch (pq[1]) {
                 case "module" -> ShardFilter.module(pq[2]);
@@ -327,7 +340,7 @@ class SplitProjectSearchTest {
                     assertThat(bits(x.score())).as(n.id + " " + x.id()).isEqualTo(bits(scores.get(x.id())));
                 }
                 switch (pq[1]) {
-                    case "module" -> assertThat(filtered).allSatisfy(x -> assertThat(x.filePath()).contains("/core/"));
+                    case "module" -> assertThat(filtered).allSatisfy(x -> assertThat(x.filePath()).contains("/" + pq[2] + "/"));
                     case "pathPrefix" -> assertThat(filtered).allSatisfy(x -> assertThat(x.filePath()).contains("/web/src/"));
                     default -> { }
                 }
@@ -346,7 +359,9 @@ class SplitProjectSearchTest {
     /** P6-R12: a filter that selects no shard of a split project says so in the response's warnings. */
     @Test
     void aFilterMatchingNoShardWarns() throws Exception {
+        r.drainCalls();
         SearchResponse resp = search(c, "widget", MOD, ShardFilter.module("nowhere"));
+        assertThat(r.drainCalls()).as("neither round runs").isEmpty();
         assertThat(resp.results()).isEmpty();
         assertThat(resp.warnings()).anySatisfy(w -> assertThat(w).contains("project " + MOD,
                 "the key filter matches none of its 3 shards"));

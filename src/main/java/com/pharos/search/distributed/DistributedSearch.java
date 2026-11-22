@@ -201,7 +201,9 @@ public final class DistributedSearch implements Closeable {
         ShardRouter.RoutePlan plan = router.plan(projects, filter);
         List<ShardState> shards = new ArrayList<>(plan.shards().size());
         for (ShardRouter.PlannedShard p : plan.shards()) { // ordinals follow the requested order
-            shards.add(new ShardState(shards.size(), p.route(), router.servesLocally(p.shard()), p.project(), p.split()));
+            ShardState st = new ShardState(shards.size(), p.route(), router.servesLocally(p.shard()), p.project(), p.split());
+            st.statsOnly = p.statsOnly();
+            shards.add(st);
         }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
         Query q = new Query(shards, start + queryTimeout.toNanos(), explicitSingle, plan);
@@ -239,6 +241,7 @@ public final class DistributedSearch implements Closeable {
         volatile boolean local;
         final String project;             // the project this shard serves (catalog mapping of the query)
         final boolean split;              // that project is split: its shards stay on one index run
+        boolean statsOnly;                // pruned by the key filter: answers term statistics only (P6-R13)
         Long projectGeneration;           // split shards: the index run of the pinned generation
         LocalShardService.Pin pin;        // local shards, pinned on first use, released on close
         ReaderHeartbeat reader;           // remote shards: the reader that answered last
@@ -362,7 +365,7 @@ public final class DistributedSearch implements Closeable {
             List<String> w = warnings(); // marks the shards no live reader serves first
             synchronized (this) {
                 if (shards.isEmpty()) return;
-                for (ShardState s : shards) if (s.local || s.unavailable == null) return;
+                for (ShardState s : shards) if (!s.statsOnly && (s.local || s.unavailable == null)) return;
             }
             throw new com.pharos.cluster.routing.NoShardAnsweredException(w);
         }
@@ -370,14 +373,14 @@ public final class DistributedSearch implements Closeable {
         /** The shards this reader holds, in query order. */
         public List<String> localShards() {
             List<String> out = new ArrayList<>();
-            for (ShardState s : shards) if (s.local) out.add(s.name());
+            for (ShardState s : shards) if (s.local && !s.statsOnly) out.add(s.name());
             return out;
         }
 
         /** The shards no live reader serves (not held here either), in query order. */
         public List<String> unservedShards() {
             List<String> out = new ArrayList<>();
-            for (ShardState s : shards) if (!s.local && s.route.candidates().isEmpty()) out.add(s.name());
+            for (ShardState s : shards) if (!s.statsOnly && !s.local && s.route.candidates().isEmpty()) out.add(s.name());
             return out;
         }
 
@@ -409,9 +412,18 @@ public final class DistributedSearch implements Closeable {
         private synchronized void markUnavailable(ShardState s, String reason) {
             if (s.unavailable != null) return;
             s.unavailable = reason == null ? "unknown error" : reason;
-            String w = "shard " + s.name() + " unavailable: " + s.unavailable + "; results exclude it";
+            String w = "shard " + s.name() + " unavailable: " + s.unavailable + (s.statsOnly
+                    ? "; the query's statistics exclude it (it is not searched: the key filter pruned it)"
+                    : "; results exclude it");
             warnings.add(w);
             log.warn("Query fan-out: {}", w);
+        }
+
+        /** The available shards the query searches: not the stats-only ones (P6-R13). */
+        private List<ShardState> searchable() {
+            List<ShardState> out = new ArrayList<>();
+            for (ShardState s : available()) if (!s.statsOnly) out.add(s);
+            return out;
         }
 
         private synchronized List<ShardState> available() {
@@ -742,7 +754,7 @@ public final class DistributedSearch implements Closeable {
         private List<ShardState> graphFileTargets() {
             List<ShardState> out = new ArrayList<>();
             Set<String> splitSeen = new java.util.HashSet<>();
-            for (ShardState s : available()) {
+            for (ShardState s : searchable()) {
                 if (s.split && !splitSeen.add(s.project)) continue;
                 out.add(s);
             }
@@ -850,7 +862,7 @@ public final class DistributedSearch implements Closeable {
             GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             List<ShardState> targets = new ArrayList<>();
             boolean unified = "unified".equals(retriever);
-            for (ShardState s : available()) {
+            for (ShardState s : searchable()) {
                 synchronized (this) {
                     // unified keeps a shard whose project lacks the model's vectors (its documents score
                     // by the rescorer's BM25 fallback, as on a single node)
@@ -1172,7 +1184,7 @@ public final class DistributedSearch implements Closeable {
                                                         String to, int limit, GlobalStats stats) {
             boolean graphFile = "neighbors".equals(op) || "usages".equals(op) || "path".equals(op);
             reconcileRuns(); // before choosing the one shard of each split project
-            return fanOut(graphFile ? graphFileTargets() : available(),
+            return fanOut(graphFile ? graphFileTargets() : searchable(),
                     s -> graph(s, op, fqns, direction, kind, to, limit, stats));
         }
 

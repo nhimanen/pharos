@@ -79,8 +79,13 @@ class SpecRoutingTest {
         return new ShardRouter(() -> live, catalog, health, s -> false);
     }
 
+    /** The shards the plan searches (not the stats-only ones a filter pruned). */
     private static List<String> shardNames(ShardRouter.RoutePlan plan) {
-        return plan.shards().stream().map(s -> s.shard().value()).toList();
+        return plan.shards().stream().filter(s -> !s.statsOnly()).map(s -> s.shard().value()).toList();
+    }
+
+    private static List<String> statsOnly(ShardRouter.RoutePlan plan) {
+        return plan.shards().stream().filter(ShardRouter.PlannedShard::statsOnly).map(s -> s.shard().value()).toList();
     }
 
     @Test
@@ -131,10 +136,16 @@ class SpecRoutingTest {
         mapping.set(catalog(""));
         ShardRouter.RoutePlan plan = router().plan(List.of("mod", "app"), ShardFilter.module("core"));
         assertThat(shardNames(plan)).containsExactly("mod~module=core", "app");
-        assertThat(plan.notes()).containsExactly("project mod: module 'core' selects 1 of 3 shards (mod~module=core)");
+        assertThat(statsOnly(plan)).as("P6-R13: the pruned shards answer the statistics round")
+                .containsExactly("mod~module=web", "mod~module=_");
+        assertThat(plan.notes()).containsExactly("project mod: module 'core' selects 1 of 3 shards (mod~module=core)",
+                "project mod: stats: 3 shards, search: 1 of 3");
+        assertThat(plan.routes()).extracting(rt -> rt.shard().value()).containsExactly("mod~module=core", "app");
         // a module key value is compared in its id-safe form
         assertThat(shardNames(router().plan(List.of("mod"), ShardFilter.module("Core")))).containsExactly("mod~module=core");
-        assertThat(shardNames(router().plan(List.of("mod"), ShardFilter.module("none")))).isEmpty();
+        ShardRouter.RoutePlan none = router().plan(List.of("mod"), ShardFilter.module("none"));
+        assertThat(none.shards()).as("pruned to zero: neither round").isEmpty();
+        assertThat(none.warnings()).singleElement().asString().contains("matches none of its 3 shards");
     }
 
     @Test
@@ -186,11 +197,12 @@ class SpecRoutingTest {
                 5, 0, 0L, null, null, null, null, Boolean.TRUE);
         live = List.of(old, current);
         ShardRouter.RoutePlan filtered = router().plan(List.of("mod", "app"), ShardFilter.module("core"));
-        assertThat(filtered.shards()).extracting(s -> s.shard().value()).containsExactly("mod~module=core", "app");
-        assertThat(filtered.shards().get(0).route().candidates()).extracting(ReaderHeartbeat::node).containsExactly("new");
-        assertThat(filtered.shards().get(0).route().noFilters()).containsExactly("old");
-        assertThat(filtered.shards().get(1).route().candidates()).as("app's only reader lacks filters").isEmpty();
-        assertThat(filtered.shards().get(1).route().noFilters()).containsExactly("old");
+        List<ShardRouter.PlannedShard> searched = filtered.shards().stream().filter(x -> !x.statsOnly()).toList();
+        assertThat(searched).extracting(s -> s.shard().value()).containsExactly("mod~module=core", "app");
+        assertThat(searched.get(0).route().candidates()).extracting(ReaderHeartbeat::node).containsExactly("new");
+        assertThat(searched.get(0).route().noFilters()).containsExactly("old");
+        assertThat(searched.get(1).route().candidates()).as("app's only reader lacks filters").isEmpty();
+        assertThat(searched.get(1).route().noFilters()).containsExactly("old");
         ShardRouter.RoutePlan plain = router().plan(List.of("app"), ShardFilter.NONE);
         assertThat(plain.shards().get(0).route().candidates()).extracting(ReaderHeartbeat::node).containsExactly("old");
 

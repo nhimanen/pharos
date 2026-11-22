@@ -96,7 +96,11 @@ public final class ShardRouter {
     }
 
     /** One shard of a plan: its route, the project it serves, and whether that project is split. */
-    public record PlannedShard(Route route, String project, boolean split) {
+    public record PlannedShard(Route route, String project, boolean split, boolean statsOnly) {
+        public PlannedShard(Route route, String project, boolean split) {
+            this(route, project, split, false);
+        }
+
         public ShardId shard() { return route.shard(); }
     }
 
@@ -113,9 +117,10 @@ public final class ShardRouter {
             warnings = List.copyOf(warnings);
         }
 
+        /** The routes of the shards the query searches (not the stats-only ones). */
         public List<Route> routes() {
             List<Route> out = new ArrayList<>(shards.size());
-            for (PlannedShard s : shards) out.add(s.route());
+            for (PlannedShard s : shards) if (!s.statsOnly()) out.add(s.route());
             return out;
         }
     }
@@ -175,14 +180,21 @@ public final class ShardRouter {
             List<ShardId> shards = mapping.shardsOf(project);
             boolean split = mapping.isSplit(project);
             if (shards.isEmpty()) shards = List.of(ShardId.ofProject(project)); // unknown: its [project] shard
+            java.util.Set<ShardId> searched = new java.util.HashSet<>(shards);
             if (split) {
                 ShardFilter.Pruned pruned = f.prune(project, mapping.specOf(project), shards);
-                if (pruned.kept().isEmpty()) {
+                notes.addAll(pruned.notes());
+                if (pruned.kept().isEmpty()) { // neither round: nothing of the project can match
                     warnings.add("project " + project + ": the key filter matches none of its " + shards.size()
                             + " shards under spec " + mapping.specOf(project) + "; no results from it");
+                    shards = List.of();
+                } else if (pruned.kept().size() < shards.size()) {
+                    // P6-R13: the statistics stay the whole project's (as one node filtering scores), so
+                    // every shard answers the term-statistics round; only the kept ones are searched
+                    notes.add("project " + project + ": stats: " + shards.size() + " shards, search: "
+                            + pruned.kept().size() + " of " + shards.size());
                 }
-                shards = pruned.kept();
-                notes.addAll(pruned.notes());
+                searched = new java.util.HashSet<>(pruned.kept());
             }
             String turnKey = split ? project : null;
             long turn = -1;
@@ -194,7 +206,8 @@ public final class ShardRouter {
                 List<String> degraded = new ArrayList<>();
                 List<String> noFilters = new ArrayList<>();
                 List<ReaderHeartbeat> usable = readers;
-                if (needsFilters) { // a reader that would ignore the filter must not answer the query
+                boolean statsOnly = !searched.contains(shard);
+                if (needsFilters && !statsOnly) { // a reader that would ignore the filter must not search for it
                     usable = new ArrayList<>();
                     for (ReaderHeartbeat r : readers) {
                         if (r.supportsFilters()) usable.add(r);
@@ -202,7 +215,7 @@ public final class ShardRouter {
                     }
                 }
                 out.add(new PlannedShard(new Route(shard, candidates(shard, usable, degraded, loads, turn), degraded,
-                        noFilters), project, split));
+                        noFilters), project, split, statsOnly));
             }
         }
         return new RoutePlan(mapping, out, notes, warnings);
