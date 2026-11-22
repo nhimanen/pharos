@@ -355,6 +355,8 @@ spec:
                     type: "string"
                   to:
                     type: "string"
+                  writersFirst:
+                    type: "boolean"
                 type: "object"
               writers:
                 properties:

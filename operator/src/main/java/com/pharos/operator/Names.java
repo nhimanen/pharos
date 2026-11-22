@@ -72,6 +72,18 @@ public final class Names {
         return prefix + (plain ? version : k8sName(version, room));
     }
 
+    /**
+     * The post-check Job of a downgrade to {@code version}, run once the writers run it and before the
+     * readers move: {@code <name>-preflight-<version>-post}, fitted like {@link #preflightJob}.
+     */
+    public static String preflightPostJob(String cluster, String version) {
+        String prefix = cluster + "-preflight-";
+        String suffix = "-post";
+        int room = MAX_NAME - prefix.length() - suffix.length();
+        boolean plain = version.matches("[a-z0-9]([a-z0-9.-]*[a-z0-9])?") && version.length() <= room;
+        return prefix + (plain ? version : k8sName(version, room)) + suffix;
+    }
+
     /** A project's git credentials volume on the writers: {@code git-<k8sName>}. */
     public static String gitCredentialsVolume(String project) {
         return "git-" + k8sName(project, MAX_NAME - 4);

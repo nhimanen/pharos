@@ -53,7 +53,9 @@ from the root. Modules:
   Job `<name>-preflight-<version>` (`PreflightJobRenderer`: the new image, `pharos upgrade-indexes --check`,
   exit 3 = a shard refused → `UpgradeBlocked`, nothing applied), then rolls readers, writers, router, each
   only once the previous role is rolled out and every pod heartbeats in `/cluster/status` (started after
-  the `pharos.dev/version-since` annotation, applied with the image). Project Jobs use the writers' version.
+  the `pharos.dev/version-since` annotation, applied with the image). A downgrade (OP-R6) rolls writers
+  first, then re-checks the bucket (`<name>-preflight-<version>-post`) before readers and router move.
+  Project Jobs use the writers' version.
   Phase and conditions (StorageReady, ReadersReady, WritersReady, ProjectsPublished, UpgradeBlocked) come
   from `status/PhaseEvaluator` (pure), merged by the reconciler into its one status patch.
 

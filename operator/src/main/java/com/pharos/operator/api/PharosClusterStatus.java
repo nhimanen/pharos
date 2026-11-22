@@ -59,12 +59,19 @@ public record PharosClusterStatus(
     /**
      * A version change in progress ({@code spec.version} differs from what a workload runs):
      * {@code from} the version being replaced, {@code to} the spec's, {@code step} one of
-     * {@code Preflight}, {@code Readers}, {@code Writers}, {@code Router}; {@code preflightRetries}: how
-     * often a failed pre-flight Job was re-created (drives its backoff). Null when every workload runs
-     * {@code spec.version}.
+     * {@code Preflight}, {@code Readers}, {@code Writers}, {@code PostCheck}, {@code Router};
+     * {@code preflightRetries}: how often a failed check Job was re-created (drives its backoff);
+     * {@code writersFirst}: a downgrade, rolled writers, post-check, readers, router (ruling OP-R6).
+     * Null when every workload runs {@code spec.version}.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record UpgradeStatus(String from, String to, String step, Integer preflightRetries) {}
+    public record UpgradeStatus(String from, String to, String step, Integer preflightRetries, Boolean writersFirst) {
+
+        /** An upgrade (readers first). */
+        public UpgradeStatus(String from, String to, String step, Integer preflightRetries) {
+            this(from, to, step, preflightRetries, false);
+        }
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Replicas(Integer desired, Integer ready) {}

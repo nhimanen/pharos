@@ -31,8 +31,20 @@ public final class PreflightJobRenderer {
 
     /** The pre-flight Job of an upgrade of {@code cluster} to {@code version}. */
     public static Job render(PharosCluster cluster, OperatorSettings settings, String version) {
-        Job job = ProjectJobRenderer.job(cluster, settings, version,
-                Names.preflightJob(cluster.getMetadata().getName(), version), Labels.PREFLIGHT,
+        return render(cluster, settings, version, Names.preflightJob(cluster.getMetadata().getName(), version));
+    }
+
+    /**
+     * The post-check Job of a downgrade to {@code version} (ruling OP-R6): the same check, run once the
+     * writers run {@code version} and before the readers move, so a format published by the writers of
+     * the version being left is caught.
+     */
+    public static Job renderPostCheck(PharosCluster cluster, OperatorSettings settings, String version) {
+        return render(cluster, settings, version, Names.preflightPostJob(cluster.getMetadata().getName(), version));
+    }
+
+    private static Job render(PharosCluster cluster, OperatorSettings settings, String version, String name) {
+        Job job = ProjectJobRenderer.job(cluster, settings, version, name, Labels.PREFLIGHT,
                 Map.of(Labels.VERSION_ANNOTATION, version), List.of("upgrade-indexes", "--check"));
         job.getSpec().setPodFailurePolicy(new PodFailurePolicyBuilder()
                 .addNewRule().withAction("FailJob")

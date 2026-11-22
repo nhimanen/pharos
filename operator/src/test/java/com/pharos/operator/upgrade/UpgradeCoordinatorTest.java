@@ -230,4 +230,109 @@ class UpgradeCoordinatorTest {
         assertThat(VersionSince.parse("garbage")).isNull();
         assertThat(VersionSince.parse("1.7.0@yesterday")).isNull();
     }
+
+    /**
+     * Ruling OP-R6: a revert mid-roll (readers and writers on 1.7.0, the router still rolling) is a
+     * downgrade. Writers go first, so no 1.7.0 writer is left to publish a format 1.6.0 readers refuse;
+     * the bucket is checked again before the readers move, and a refusal keeps them on 1.7.0.
+     */
+    @Test
+    void midRollRevertRollsWritersFirstAndChecksTheBucketAgain() {
+        Instant t = T0;
+        Workload readers = new Workload("1.7.0", true, 2, "1.7.0@2026-11-22T08:00:00Z");
+        Workload writers = new Workload("1.7.0", true, 2, "1.7.0@2026-11-22T09:00:00Z");
+        Workload router = new Workload("1.7.0", false, 2, "1.7.0@2026-11-22T09:30:00Z");
+        UpgradeStatus wasHeadingTo170 = new UpgradeStatus("1.6.0", "1.7.0", "Router", null);
+        ClusterStatus old = heartbeats(T0.minusSeconds(7200), READER_PODS, WRITER_PODS);
+
+        // 1. the pre-flight check of 1.6.0 first; nothing moves
+        Plan p1 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers, router, Preflight.ABSENT,
+                List.of("demo-preflight-1.7.0"), true, old, wasHeadingTo170, t));
+        assertThat(p1.createPreflight()).isTrue();
+        assertThat(p1.deleteJobs()).containsExactly("demo-preflight-1.7.0");
+        assertThat(p1.versions()).isEqualTo(new DesiredState.Versions("1.7.0", "1.7.0", "1.7.0", writers.since(),
+                readers.since(), router.since()));
+        assertThat(p1.upgrade()).isEqualTo(new UpgradeStatus("1.7.0", "1.6.0", "Preflight", null, true));
+        assertThat(p1.message()).startsWith("Downgrade 1.7.0 -> 1.6.0");
+
+        // 2. it passes: the WRITERS move first; readers and router stay
+        Preflight passed = preflight(PreflightState.SUCCEEDED);
+        Plan p2 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers, router, passed, Preflight.ABSENT,
+                List.of(), true, old, p1.upgrade(), t));
+        String writersSince = new VersionSince("1.6.0", t).value();
+        assertThat(p2.versions()).isEqualTo(new DesiredState.Versions("1.6.0", "1.7.0", "1.7.0", writersSince,
+                readers.since(), router.since()));
+        assertThat(p2.upgrade().step()).isEqualTo("Writers");
+        assertThat(p2.createPostCheck()).isFalse();
+
+        // 3. the writers run 1.6.0 everywhere: the post-check runs, the readers still wait
+        Instant later = t.plusSeconds(300);
+        Workload writers160 = new Workload("1.6.0", true, 2, writersSince);
+        ClusterStatus newWriters = heartbeats(later, READER_PODS, WRITER_PODS);
+        Plan p3 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers160, router, passed,
+                Preflight.ABSENT, List.of(), true, newWriters, p2.upgrade(), later));
+        assertThat(p3.createPostCheck()).isTrue();
+        assertThat(p3.createPreflight()).isFalse();
+        assertThat(p3.upgrade()).isEqualTo(new UpgradeStatus("1.7.0", "1.6.0", "PostCheck", null, true));
+        assertThat(p3.versions().readers()).isEqualTo("1.7.0");
+        assertThat(p3.versions().router()).isEqualTo("1.7.0");
+        assertThat(p3.blocked()).isFalse();
+        assertThat(p3.message()).contains("demo-preflight-1.6.0-post").contains("before the readers move");
+
+        // 4. it refuses (the 1.7.0 writers published a format 1.6.0 cannot read): blocked, readers stay on 1.7.0
+        Preflight refused = new Preflight(PreflightState.REFUSED, later.plusSeconds(10), "PodFailurePolicy");
+        Plan p4 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers160, router, passed, refused,
+                List.of(), true, newWriters, p3.upgrade(), later.plusSeconds(20)));
+        assertThat(p4.blocked()).isTrue();
+        assertThat(p4.reason()).isEqualTo(UpgradeCoordinator.REASON_PREFLIGHT_REFUSED);
+        assertThat(p4.message()).contains("cannot read").contains("The readers stay on 1.7.0")
+                .contains("Roll forward (set spec.version back to 1.7.0)").contains("re-index");
+        assertThat(p4.versions()).isEqualTo(new DesiredState.Versions("1.6.0", "1.7.0", "1.7.0", writersSince,
+                readers.since(), router.since()));
+        assertThat(p4.recheck()).isEqualTo(Duration.ofSeconds(50));
+        Plan p4retry = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers160, router, passed, refused,
+                List.of(), true, newWriters, p4.upgrade(), later.plusSeconds(80)));
+        assertThat(p4retry.deleteJobs()).containsExactly("demo-preflight-1.6.0-post");
+        assertThat(p4retry.upgrade().preflightRetries()).isEqualTo(1);
+        assertThat(p4retry.versions().readers()).isEqualTo("1.7.0");
+
+        // 5. a passing post-check moves the readers, then the router
+        Plan p5 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers, writers160, router, passed, passed,
+                List.of(), true, newWriters, p4retry.upgrade(), later.plusSeconds(400)));
+        assertThat(p5.versions().readers()).isEqualTo("1.6.0");
+        assertThat(p5.versions().router()).isEqualTo("1.7.0");
+        assertThat(p5.upgrade().step()).isEqualTo("Readers");
+        Instant end = later.plusSeconds(800);
+        Workload readers160 = new Workload("1.6.0", true, 2, new VersionSince("1.6.0", later.plusSeconds(400)).value());
+        Plan p6 = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers160, writers160, router, passed, passed,
+                List.of(), true, heartbeats(end, READER_PODS, WRITER_PODS), p5.upgrade(), end));
+        assertThat(p6.versions().router()).isEqualTo("1.6.0");
+        assertThat(p6.upgrade().step()).isEqualTo("Router");
+
+        // done: both check Jobs go
+        Plan done = UpgradeCoordinator.plan(new Input("demo", "1.6.0", readers160, writers160,
+                new Workload("1.6.0", true, 2, null), passed, passed, List.of(), true, null, p6.upgrade(), end));
+        assertThat(done.upgrade()).isNull();
+        assertThat(done.deleteJobs()).containsExactly("demo-preflight-1.6.0", "demo-preflight-1.6.0-post");
+    }
+
+    @Test
+    void forwardUpgradesKeepReadersFirstAndOneCheck() {
+        assertThat(UpgradeCoordinator.writersFirst("1.6.0", "1.7.0", null)).isFalse();
+        assertThat(UpgradeCoordinator.writersFirst("1.7.0", "1.6.0", null)).isTrue();
+        assertThat(UpgradeCoordinator.writersFirst("1.10.0", "1.9.3", null)).isTrue();
+        assertThat(UpgradeCoordinator.writersFirst("1.7.0-rc1", "1.7.0", null)).isFalse();
+        // tags that are no releases: a downgrade only when reverting the upgrade in progress; then kept
+        assertThat(UpgradeCoordinator.writersFirst("main", "stable", null)).isFalse();
+        assertThat(UpgradeCoordinator.writersFirst("main", "stable",
+                new UpgradeStatus("stable", "main", "Router", null))).isTrue();
+        assertThat(UpgradeCoordinator.writersFirst("main", "stable",
+                new UpgradeStatus("main", "stable", "Writers", null, true))).isTrue();
+        // a forward roll never creates the post-check
+        Plan p = UpgradeCoordinator.plan(input(new Workload("1.7.0", true, 2, null), on("1.6.0"), on("1.6.0"),
+                preflight(PreflightState.SUCCEEDED), heartbeats(T0, READER_PODS, WRITER_PODS), null, T0));
+        assertThat(p.createPostCheck()).isFalse();
+        assertThat(p.versions().writers()).isEqualTo("1.7.0");
+        assertThat(p.upgrade().writersFirst()).isFalse();
+    }
 }

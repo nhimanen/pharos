@@ -45,7 +45,7 @@ import java.util.Objects;
 public final class UpgradeCoordinator {
 
     /** The steps of an upgrade ({@code status.upgrade.step}). */
-    public enum Step { Preflight, Readers, Writers, Router }
+    public enum Step { Preflight, Readers, Writers, PostCheck, Router }
 
     /** {@code UpgradeBlocked} reasons. */
     public static final String REASON_UP_TO_DATE = "UpToDate";
@@ -93,18 +93,33 @@ public final class UpgradeCoordinator {
      * or null; {@code previous}: {@code status.upgrade} of the last reconcile, or null.
      */
     public record Input(String cluster, String target, Workload readers, Workload writers, Workload router,
-                        Preflight preflight, List<String> otherPreflightJobs, boolean storageReady,
-                        ClusterStatus status, UpgradeStatus previous, Instant now) {}
+                        Preflight preflight, Preflight postCheck, List<String> otherPreflightJobs,
+                        boolean storageReady, ClusterStatus status, UpgradeStatus previous, Instant now) {
+
+        /** Without a post-check Job (none exists). */
+        public Input(String cluster, String target, Workload readers, Workload writers, Workload router,
+                     Preflight preflight, List<String> otherPreflightJobs, boolean storageReady, ClusterStatus status,
+                     UpgradeStatus previous, Instant now) {
+            this(cluster, target, readers, writers, router, preflight, Preflight.ABSENT, otherPreflightJobs,
+                    storageReady, status, previous, now);
+        }
+    }
 
     /**
      * What to apply. {@code versions}: each workload's version and annotation; {@code createPreflight}:
-     * create the spec's version's pre-flight Job; {@code deleteJobs}: pre-flight Jobs to delete;
+     * create the spec's version's pre-flight Job; {@code createPostCheck}: create its post-check Job (a
+     * downgrade, once the writers run the target); {@code deleteJobs}: pre-flight Jobs to delete;
      * {@code upgrade}: the new {@code status.upgrade} (null: none in progress); {@code blocked},
      * {@code reason} and {@code message}: the {@code UpgradeBlocked} condition; {@code recheck}: when to
      * look again (a retry's backoff), or null.
      */
     public record Plan(DesiredState.Versions versions, boolean createPreflight, List<String> deleteJobs,
-                       UpgradeStatus upgrade, boolean blocked, String reason, String message, Duration recheck) {}
+                       UpgradeStatus upgrade, boolean blocked, String reason, String message, Duration recheck,
+                       boolean createPostCheck) {}
+
+    /** A check Job's verdict for this reconcile. */
+    private record Check(boolean passed, boolean create, boolean blocked, String reason, String message,
+                         Duration recheck, Integer retries) {}
 
     public static Plan plan(Input in) {
         String target = in.target();
@@ -113,112 +128,188 @@ public final class UpgradeCoordinator {
         for (Workload w : List.of(in.writers(), in.readers(), in.router())) if (w.exists()) present.add(w);
         String from = present.stream().map(Workload::version).filter(v -> !v.isEmpty() && !v.equals(target))
                 .findFirst().orElse(null);
+        String job = Names.preflightJob(in.cluster(), target);
+        String postJob = Names.preflightPostJob(in.cluster(), target);
+        delete.addAll(in.otherPreflightJobs()); // a version changed again mid-upgrade: only the spec's counts
         if (from == null) { // every existing workload runs the spec's version (or nothing exists yet)
-            delete.addAll(in.otherPreflightJobs());
-            if (in.preflight().state() != PreflightState.ABSENT && in.preflight().state() != PreflightState.DELETING) {
-                delete.add(Names.preflightJob(in.cluster(), target));
-            }
+            if (live(in.preflight())) delete.add(job);
+            if (live(in.postCheck())) delete.add(postJob);
             return new Plan(new DesiredState.Versions(target, target, target, in.writers().since(),
                     in.readers().since(), in.router().since()), false, List.copyOf(delete), null, false,
-                    REASON_UP_TO_DATE, "Every workload runs " + target + ".", null);
+                    REASON_UP_TO_DATE, "Every workload runs " + target + ".", null, false);
         }
-        delete.addAll(in.otherPreflightJobs()); // a version changed again mid-upgrade: only the spec's counts
-        String job = Names.preflightJob(in.cluster(), target);
         Integer retries = in.previous() != null && target.equals(in.previous().to())
                 ? in.previous().preflightRetries() : null;
-        String upgrade = "Upgrade " + from + " -> " + target + ": ";
+        boolean writersFirst = writersFirst(from, target, in.previous());
+        String upgrade = (writersFirst ? "Downgrade " : "Upgrade ") + from + " -> " + target + ": ";
+        Workload readers = in.readers();
+        Workload writers = in.writers();
+        Workload router = in.router();
 
-        // the pre-flight check
-        Preflight pf = in.preflight();
-        boolean create = false;
-        boolean blocked = false;
-        String reason;
-        String message;
-        Duration recheck = null;
+        Check pre = check(in, in.preflight(), job, false, upgrade, from, retries, delete);
+        if (!pre.passed()) {
+            // nothing moves: every workload keeps the version it runs (one that does not exist yet: from's)
+            return new Plan(new DesiredState.Versions(keep(writers, from), keep(readers, from), keep(router, from),
+                    writers.since(), readers.since(), router.since()), pre.create(), List.copyOf(delete),
+                    new UpgradeStatus(from, target, Step.Preflight.name(), pre.retries(), writersFirst), pre.blocked(),
+                    pre.reason(), pre.message(), pre.recheck(), false);
+        }
+
+        List<String> waiting = new ArrayList<>();
+        String readersV = keep(readers, from);
+        String writersV = keep(writers, from);
+        String routerV = keep(router, from);
+        Step step;
+        Check post = null;
+        if (!writersFirst) {
+            // an upgrade: readers, then writers, then the router (readers read N and N-1 before writers write N)
+            readersV = target;
+            step = Step.Readers;
+            if (rolled(in, readers, Names.readers(in.cluster()), true, waiting)) {
+                writersV = target;
+                step = Step.Writers;
+                if (rolled(in, writers, Names.writers(in.cluster()), false, waiting)) {
+                    routerV = target;
+                    step = Step.Router;
+                }
+            }
+        } else {
+            // a downgrade: writers first, so no writer of the newer version is left to publish a format the
+            // target's readers refuse; then the bucket is checked again before the readers move
+            writersV = target;
+            step = Step.Writers;
+            if (rolled(in, writers, Names.writers(in.cluster()), false, waiting)) {
+                step = Step.PostCheck;
+                Integer postRetries = in.previous() != null && target.equals(in.previous().to())
+                        && Step.PostCheck.name().equals(in.previous().step()) ? in.previous().preflightRetries() : null;
+                post = check(in, in.postCheck(), postJob, true, upgrade, from, postRetries, delete);
+                if (post.passed()) {
+                    readersV = target;
+                    step = Step.Readers;
+                    if (rolled(in, readers, Names.readers(in.cluster()), true, waiting)) {
+                        routerV = target;
+                        step = Step.Router;
+                    }
+                }
+            }
+        }
+        DesiredState.Versions versions = new DesiredState.Versions(writersV, readersV, routerV,
+                since(writers, writersV, in.now()), since(readers, readersV, in.now()), since(router, routerV, in.now()));
+        if (step == Step.PostCheck) {
+            return new Plan(versions, false, List.copyOf(delete),
+                    new UpgradeStatus(from, target, step.name(), post.retries(), true), post.blocked(), post.reason(),
+                    post.message(), post.recheck(), post.create());
+        }
+        String message = upgrade + (writersFirst ? "the checks passed; rolling " : "the pre-flight check passed; rolling ")
+                + switch (step) {
+                    case Readers -> writersFirst ? "the readers (the writers run " + target + ")" : "the readers";
+                    case Writers -> writersFirst ? "the writers first (a downgrade)"
+                            : "the writers (the readers run " + target + ")";
+                    default -> "the router (readers and writers run " + target + ")";
+                } + (waiting.isEmpty() ? "." : "; waiting for " + String.join(", ", waiting) + ".");
+        return new Plan(versions, false, List.copyOf(delete),
+                new UpgradeStatus(from, target, step.name(), null, writersFirst), false, REASON_UPGRADING, message,
+                null, false);
+    }
+
+    private static boolean live(Preflight p) {
+        return p.state() != PreflightState.ABSENT && p.state() != PreflightState.DELETING;
+    }
+
+    /**
+     * Whether this version change rolls writers first (ruling OP-R6): a downgrade, where writers of the
+     * version being left may still publish an index format the target's readers refuse. Kept from
+     * {@code status.upgrade} for the same target; otherwise release tags are compared ({@code target}
+     * older than {@code from}); tags that are no releases count as a downgrade when the upgrade in
+     * progress was heading to {@code from} (a mid-roll revert).
+     */
+    static boolean writersFirst(String from, String target, UpgradeStatus previous) {
+        if (previous != null && target.equals(previous.to()) && previous.writersFirst() != null) {
+            return previous.writersFirst();
+        }
+        int c = compareReleases(target, from);
+        if (c != Integer.MIN_VALUE) return c < 0;
+        return previous != null && from.equals(previous.to());
+    }
+
+    private static final java.util.regex.Pattern RELEASE = java.util.regex.Pattern.compile("v?(\\d{1,9})\\.(\\d{1,9})\\.(\\d{1,9})(.*)");
+
+    /** Sign of {@code a - b} by major.minor.patch, or {@code Integer.MIN_VALUE} when either is no release tag. */
+    static int compareReleases(String a, String b) {
+        var ma = RELEASE.matcher(a);
+        var mb = RELEASE.matcher(b);
+        if (!ma.matches() || !mb.matches()) return Integer.MIN_VALUE;
+        for (int i = 1; i <= 3; i++) {
+            int c = Long.compare(Long.parseLong(ma.group(i)), Long.parseLong(mb.group(i)));
+            if (c != 0) return c;
+        }
+        return 0;
+    }
+
+    /**
+     * The verdict of a check Job: the pre-flight ({@code post} false) or, in a downgrade, the post-check
+     * after the writers moved. A failed one blocks, and is deleted (re-created next time) after its
+     * backoff, counted in {@code retries}.
+     */
+    private static Check check(Input in, Preflight pf, String job, boolean post, String upgrade, String from,
+                               Integer retries, List<String> delete) {
+        String target = in.target();
+        String stays = post ? " The readers stay on " + from + "." : " No workload is changed.";
         switch (pf.state()) {
             case SUCCEEDED -> {
-                retries = null;
-                reason = REASON_UPGRADING;
-                message = null; // set by the roll below
+                return new Check(true, false, false, REASON_UPGRADING, null, null, null);
             }
-            case ABSENT -> {
-                if (!in.storageReady()) {
-                    reason = REASON_WAITING_FOR_STORAGE;
-                    message = upgrade + "waiting for the storage before the pre-flight check; nothing is rolled yet.";
-                } else {
-                    create = true;
-                    reason = retries == null ? REASON_PREFLIGHT_RUNNING : REASON_PREFLIGHT_RETRYING;
-                    message = preflightRunning(upgrade, job, target, retries);
+            case ABSENT, RUNNING, DELETING -> {
+                boolean create = pf.state() == PreflightState.ABSENT && in.storageReady();
+                if (pf.state() == PreflightState.ABSENT && !in.storageReady()) {
+                    return new Check(false, false, retries != null, REASON_WAITING_FOR_STORAGE, upgrade
+                            + "waiting for the storage before the " + (post ? "post-check" : "pre-flight check") + ";"
+                            + stays, null, retries);
                 }
-                blocked = retries != null;
-            }
-            case RUNNING, DELETING -> {
-                reason = retries == null ? REASON_PREFLIGHT_RUNNING : REASON_PREFLIGHT_RETRYING;
-                message = preflightRunning(upgrade, job, target, retries);
-                blocked = retries != null;
+                String message = upgrade + (post
+                        ? "the writers run " + target + "; the post-check Job " + job + " checks the bucket's indexes"
+                          + " with " + target + (retries == null ? "" : " again (retries so far: " + retries + ")")
+                          + " before the readers move."
+                        : preflightRunning(job, target, retries));
+                return new Check(false, create, retries != null,
+                        retries == null ? REASON_PREFLIGHT_RUNNING : REASON_PREFLIGHT_RETRYING, message, null, retries);
             }
             case REFUSED, FAILED -> {
-                blocked = true;
                 long backoff = backoffSeconds(retries);
                 Instant due = (pf.failedAt() == null ? in.now() : pf.failedAt()).plusSeconds(backoff);
                 boolean refused = pf.state() == PreflightState.REFUSED;
-                reason = refused ? REASON_PREFLIGHT_REFUSED : REASON_PREFLIGHT_FAILED;
-                message = upgrade + (refused
-                        ? "the pre-flight Job " + job + " found shards that pharos " + target + " would refuse (index"
-                          + " format older than N-1, or newer; see its log). No workload is changed. Re-index them on "
-                          + from + " (UPGRADING.md), or set spec.version back to " + from + "."
-                        : "the pre-flight Job " + job + " failed" + (pf.failure() == null ? "" : " (" + pf.failure() + ")")
+                String what = post ? "post-check" : "pre-flight";
+                String message = upgrade + (refused
+                        ? (post
+                          ? "the post-check Job " + job + " found that the bucket holds index formats pharos " + target
+                            + " cannot read (published by the " + from + " writers before they stopped; see its"
+                            + " log)." + stays + " Roll forward (set spec.version back to " + from + "), or re-index"
+                            + " those shards on " + target + "."
+                          : "the pre-flight Job " + job + " found shards that pharos " + target + " would refuse (index"
+                            + " format older than N-1, or newer; see its log)." + stays + " Re-index them on " + from
+                            + " (UPGRADING.md), or set spec.version back to " + from + ".")
+                        : "the " + what + " Job " + job + " failed" + (pf.failure() == null ? "" : " (" + pf.failure() + ")")
                           + " before it could check the bucket's indexes (see its log: the bucket unreachable, or an"
-                          + " image without 'pharos upgrade-indexes --check'). No workload is changed.")
+                          + " image without 'pharos upgrade-indexes --check')." + stays)
                         + " The check runs again after " + backoff + " s"
                         + (retries == null ? "" : " (retries so far: " + retries + ")") + ".";
+                Duration recheck = null;
+                Integer next = retries;
                 if (in.now().isBefore(due)) {
                     recheck = Duration.between(in.now(), due);
                 } else {
                     delete.add(job); // re-created on the next reconcile
-                    retries = retries == null ? 1 : retries + 1;
+                    next = retries == null ? 1 : retries + 1;
                 }
+                return new Check(false, false, true, refused ? REASON_PREFLIGHT_REFUSED : REASON_PREFLIGHT_FAILED,
+                        message, recheck, next);
             }
             default -> throw new IllegalStateException(pf.state().name());
         }
-
-        Workload readers = in.readers();
-        Workload writers = in.writers();
-        Workload router = in.router();
-        if (pf.state() != PreflightState.SUCCEEDED) {
-            // nothing moves: every workload keeps the version it runs (one that does not exist yet: from's)
-            return new Plan(new DesiredState.Versions(keep(writers, from), keep(readers, from), keep(router, from),
-                    writers.since(), readers.since(), router.since()), create, List.copyOf(delete),
-                    new UpgradeStatus(from, target, Step.Preflight.name(), retries), blocked, reason, message, recheck);
-        }
-
-        // the roll: readers, then writers, then the router
-        List<String> waiting = new ArrayList<>();
-        String readersV = target;
-        String writersV = keep(writers, from);
-        String routerV = keep(router, from);
-        Step step = Step.Readers;
-        if (rolled(in, readers, Names.readers(in.cluster()), true, waiting)) {
-            writersV = target;
-            step = Step.Writers;
-            if (rolled(in, writers, Names.writers(in.cluster()), false, waiting)) {
-                routerV = target;
-                step = Step.Router;
-            }
-        }
-        message = upgrade + "the pre-flight check passed; rolling " + switch (step) {
-            case Readers -> "the readers";
-            case Writers -> "the writers (the readers run " + target + ")";
-            default -> "the router (readers and writers run " + target + ")";
-        } + (waiting.isEmpty() ? "." : "; waiting for " + String.join(", ", waiting) + ".");
-        return new Plan(new DesiredState.Versions(writersV, readersV, routerV,
-                since(writers, writersV, in.now()), since(readers, readersV, in.now()), since(router, routerV, in.now())),
-                false, List.copyOf(delete), new UpgradeStatus(from, target, step.name(), null), false, REASON_UPGRADING,
-                message, null);
     }
 
-    private static String preflightRunning(String upgrade, String job, String target, Integer retries) {
-        return upgrade + "the pre-flight Job " + job + " checks the bucket's indexes with " + target
+    private static String preflightRunning(String job, String target, Integer retries) {
+        return "the pre-flight Job " + job + " checks the bucket's indexes with " + target
                 + (retries == null ? "" : " again (retries so far: " + retries + ")")
                 + "; nothing is rolled until it passes.";
     }

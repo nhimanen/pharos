@@ -574,7 +574,9 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
         String name = resource.getMetadata().getName();
         String target = resource.getSpec().version();
         String targetJob = Names.preflightJob(name, target);
+        String postJob = Names.preflightPostJob(name, target);
         UpgradeCoordinator.Preflight preflight = UpgradeCoordinator.Preflight.ABSENT;
+        UpgradeCoordinator.Preflight postCheck = UpgradeCoordinator.Preflight.ABSENT;
         List<String> others = new ArrayList<>();
         for (Job j : jobs) {
             Map<String, String> labels = j.getMetadata().getLabels();
@@ -583,27 +585,33 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
                 continue;
             }
             ProjectReconciler.ProjectJob pj = new ProjectReconciler.ProjectJob(j);
-            if (!targetJob.equals(pj.name())) {
-                if (!pj.deleting()) others.add(pj.name());
-                continue;
-            }
-            if (pj.deleting()) {
-                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.DELETING, null, null);
-            } else if (pj.succeeded()) {
-                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.SUCCEEDED, null, null);
-            } else if (pj.failed()) {
-                boolean refused = PreflightJobRenderer.REASON_REFUSED.equals(pj.failure());
-                preflight = new UpgradeCoordinator.Preflight(refused ? UpgradeCoordinator.PreflightState.REFUSED
-                        : UpgradeCoordinator.PreflightState.FAILED, pj.failedAt(), pj.failure());
-            } else {
-                preflight = new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.RUNNING, null, null);
+            if (targetJob.equals(pj.name())) {
+                preflight = checkState(pj);
+            } else if (postJob.equals(pj.name())) {
+                postCheck = checkState(pj);
+            } else if (!pj.deleting()) {
+                others.add(pj.name());
             }
         }
         java.util.Collections.sort(others);
         PharosClusterStatus previous = resource.getStatus();
         return new UpgradeCoordinator.Input(name, target, observed.readersWorkload(), observed.writersWorkload(),
-                observed.routerWorkload(), preflight, List.copyOf(others), storageReady, status,
+                observed.routerWorkload(), preflight, postCheck, List.copyOf(others), storageReady, status,
                 previous == null ? null : previous.upgrade(), now);
+    }
+
+    /** A check Job's state; failed with reason {@code PodFailurePolicy} (exit 3) is a refusal. */
+    private static UpgradeCoordinator.Preflight checkState(ProjectReconciler.ProjectJob pj) {
+        if (pj.deleting()) {
+            return new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.DELETING, null, null);
+        } else if (pj.succeeded()) {
+            return new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.SUCCEEDED, null, null);
+        } else if (pj.failed()) {
+            boolean refused = PreflightJobRenderer.REASON_REFUSED.equals(pj.failure());
+            return new UpgradeCoordinator.Preflight(refused ? UpgradeCoordinator.PreflightState.REFUSED
+                    : UpgradeCoordinator.PreflightState.FAILED, pj.failedAt(), pj.failure());
+        }
+        return new UpgradeCoordinator.Preflight(UpgradeCoordinator.PreflightState.RUNNING, null, null);
     }
 
     /**
@@ -618,8 +626,9 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
             context.getClient().batch().v1().jobs().inNamespace(ns).withName(job)
                     .withPropagationPolicy(DeletionPropagation.BACKGROUND).delete();
         }
-        if (plan.createPreflight()) {
-            Job job = PreflightJobRenderer.render(resource, settings, resource.getSpec().version());
+        if (plan.createPreflight() || plan.createPostCheck()) {
+            Job job = plan.createPreflight() ? PreflightJobRenderer.render(resource, settings, resource.getSpec().version())
+                    : PreflightJobRenderer.renderPostCheck(resource, settings, resource.getSpec().version());
             job.addOwnerReference(resource);
             LOG.info("PharosCluster {}/{}: creating pre-flight Job {} ({})", ns, name, job.getMetadata().getName(),
                     plan.message());

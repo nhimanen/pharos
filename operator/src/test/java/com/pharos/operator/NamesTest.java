@@ -63,6 +63,11 @@ class NamesTest {
                     .matches("[a-z0-9]([-a-z0-9.]*[a-z0-9])?");
         }
         assertThat(Names.preflightJob(cluster, "x".repeat(128))).isNotEqualTo(Names.preflightJob(cluster, "x".repeat(127)));
+        assertThat(Names.preflightPostJob("demo", "1.6.0")).isEqualTo("demo-preflight-1.6.0-post");
+        for (String v : java.util.List.of("1.7.0", "1.10.10-rc.10", "x".repeat(128), "A_".repeat(60))) {
+            assertThat(Names.preflightPostJob(cluster, v)).hasSizeLessThanOrEqualTo(Names.MAX_NAME).endsWith("-post")
+                    .matches("[a-z0-9]([-a-z0-9.]*[a-z0-9])?").isNotEqualTo(Names.preflightJob(cluster, v));
+        }
     }
 
     @Test
