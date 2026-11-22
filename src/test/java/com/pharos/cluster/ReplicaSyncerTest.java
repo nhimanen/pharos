@@ -824,12 +824,17 @@ class ReplicaSyncerTest {
         syncer.setRetireGrace(Duration.ofSeconds(60));
         publishFull();
         Path stray = Files.createDirectories(cacheDir.resolve("stray-shard").resolve("gen-3"));
+        // a keyed shard's dir is its URL-safe encoded id (P6-R3); a raw or non-canonical name is not a shard dir
+        Path keyed = Files.createDirectories(cacheDir.resolve("lucene~ring%3Ds01").resolve("gen-2"));
+        Path raw = Files.createDirectories(cacheDir.resolve("lucene~ring=s01"));
         Path hidden = Files.createDirectories(cacheDir.resolve(".blocks"));
         syncer.syncOnce();
         assertThat(stray).isDirectory();
         now.addAndGet(61_000);
         syncer.syncOnce();
         assertThat(stray).doesNotExist();
+        assertThat(keyed).doesNotExist();
+        assertThat(raw).isDirectory();
         assertThat(hidden).isDirectory();
         assertThat(genDir(1)).isDirectory();
     }

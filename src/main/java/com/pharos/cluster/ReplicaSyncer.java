@@ -283,7 +283,7 @@ public class ReplicaSyncer implements Closeable {
             if (keep.contains(shard)) continue;
             if (now - e.getValue() < graceMillis) continue;
             try {
-                deleteRecursively(cacheDir.resolve(shard.value()));
+                deleteRecursively(cacheDir.resolve(shard.pathSegment()));
                 retired.remove(shard);
             } catch (IOException | RuntimeException ex) {
                 log.warn("Shard {}: removing its cache dir failed (retried next pass): {}", shard, ex.toString());
@@ -314,12 +314,8 @@ public class ReplicaSyncer implements Closeable {
         try (Stream<Path> s = Files.list(cacheDir)) {
             for (Path p : s.toList()) {
                 if (!Files.isDirectory(p)) continue;
-                ShardId id;
-                try {
-                    id = new ShardId(p.getFileName().toString());
-                } catch (IllegalArgumentException notAShard) {
-                    continue; // .blocks, .blocks-private, ...
-                }
+                ShardId id = ShardId.fromPathSegment(p.getFileName().toString()).orElse(null);
+                if (id == null) continue; // .blocks, .blocks-private, ...
                 if (keep.contains(id) || served.containsKey(id) || retired.containsKey(id)
                         || registry.find(id.value()).isPresent()) continue;
                 retired.put(id, now);
@@ -416,7 +412,7 @@ public class ReplicaSyncer implements Closeable {
         checkFiles(manifest);
         byte[] manifestJson = manifest.toJson();
 
-        Path shardRoot = cacheDir.resolve(shard.value());
+        Path shardRoot = cacheDir.resolve(shard.pathSegment());
         Files.createDirectories(shardRoot);
         deletePartials(shardRoot);
         Path genDir = shardRoot.resolve("gen-" + gen.value());
@@ -687,7 +683,7 @@ public class ReplicaSyncer implements Closeable {
 
     private void retryRegistration(ShardId shard, Generation current) throws IOException {
         if (current.equals(registered.get(shard))) return;
-        Path genDir = cacheDir.resolve(shard.value()).resolve("gen-" + current.value());
+        Path genDir = cacheDir.resolve(shard.pathSegment()).resolve("gen-" + current.value());
         ShardManifest m = ShardManifest.read(Files.readAllBytes(genDir.resolve(MANIFEST_FILE)));
         register(shard, current, m.projectMeta(), genDir);
     }

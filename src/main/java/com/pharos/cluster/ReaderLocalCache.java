@@ -10,7 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Reader cache: each shard is served from its active generation directory
- * ({@code <cacheDir>/<shard>/gen-N}), switched by {@link #activate}. {@code LuceneIndexer} notices
+ * ({@code <cacheDir>/<shard>/gen-N}, the shard id URL-safe encoded: {@link ShardId#pathSegment()}), switched by {@link #activate}. {@code LuceneIndexer} notices
  * the changed path on its next {@code openReader} and swaps readers. Activating another generation
  * evicts the previous one's cached compact graph ({@link GraphViews#evict}).
  */
@@ -43,7 +43,7 @@ public class ReaderLocalCache implements LocalCache {
     @Override
     public Path shardDir(String project) {
         Path dir = active.get(project);
-        return dir != null ? dir : cacheDir.resolve(project).resolve("none");
+        return dir != null ? dir : cacheDir.resolve(ShardId.pathSegmentOf(project)).resolve("none");
     }
 
     public Optional<Path> active(String project) {

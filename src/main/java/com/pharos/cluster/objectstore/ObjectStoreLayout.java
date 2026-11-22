@@ -36,7 +36,11 @@ public final class ObjectStoreLayout {
 
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
-    public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }
+    /**
+     * {@code shards/<shard>/}, the id URL-safe encoded ({@link ShardId#pathSegment()}): a project id
+     * gives the Phase 1–5 key byte for byte. Every per-shard key below builds on it.
+     */
+    public String shardPrefix(ShardId shard) { return root + "shards/" + shard.pathSegment() + "/"; }
 
     public String latestKey(ShardId shard) { return shardPrefix(shard) + "LATEST"; }
 

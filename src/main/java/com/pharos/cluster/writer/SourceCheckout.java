@@ -70,7 +70,7 @@ public final class SourceCheckout {
 
     /** Where a git shard's clone lives. */
     public Path cloneDir(ShardId shard) {
-        return workDir.resolve(shard.value());
+        return workDir.resolve(shard.pathSegment());
     }
 
     /**
@@ -128,7 +128,7 @@ public final class SourceCheckout {
         Files.createDirectories(workDir);
         if (!Files.exists(dir)) {
             log.info("Cloning source of shard {}", shard);
-            git(workDir, "clone", "--no-checkout", "--quiet", "--", src.location(), shard.value());
+            git(workDir, "clone", "--no-checkout", "--quiet", "--", src.location(), shard.pathSegment());
         } else if (!Files.isDirectory(dir.resolve(".git"))) {
             throw new IOException("work directory " + dir + " exists but is not a git clone; remove it to let"
                     + " the writer clone shard " + shard + " again");

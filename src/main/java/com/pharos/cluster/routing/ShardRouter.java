@@ -92,7 +92,7 @@ public final class ShardRouter {
         } else {
             for (String p : projects) {
                 try {
-                    names.add(new ShardId(p).value());
+                    names.add(ShardId.ofProject(p).value());
                 } catch (IllegalArgumentException e) {
                     throw new InvalidProjectException(e.getMessage(), e);
                 }

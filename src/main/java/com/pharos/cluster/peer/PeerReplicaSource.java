@@ -683,11 +683,7 @@ public final class PeerReplicaSource implements ReplicaSource, LongPollingSource
     static ShardId shardOf(String key) throws IOException {
         String[] seg = key == null ? new String[0] : key.split("/", 3);
         if (seg.length < 3 || !seg[0].equals("shards")) throw new IOException("not a peer-store file key: " + key);
-        try {
-            return new ShardId(seg[1]);
-        } catch (IllegalArgumentException e) {
-            throw new IOException("not a peer-store file key: " + key);
-        }
+        return ShardId.fromPathSegment(seg[1]).orElseThrow(() -> new IOException("not a peer-store file key: " + key));
     }
 
     private static String filePath(ShardId shard, String key) {

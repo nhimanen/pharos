@@ -1237,17 +1237,19 @@ public final class ClusterRuntime implements Closeable {
             if (name == null || meta.getIndexPath() == null) continue;
             List<String> onlyPinned = config.getCluster().getReader().getShards();
             if (!onlyPinned.isEmpty() && !onlyPinned.contains(name)) continue;
+            ShardId shardId;
             try {
-                new ShardId(name);
+                shardId = new ShardId(name);
             } catch (IllegalArgumentException e) {
                 continue;
             }
+            Path shardRoot = root.resolve(shardId.pathSegment());
             Path dir = Path.of(meta.getIndexPath()).toAbsolutePath().normalize();
-            if (!root.resolve(name).equals(dir.getParent()) || !completeGeneration(dir)) {
+            if (!shardRoot.equals(dir.getParent()) || !completeGeneration(dir)) {
                 continue;
             }
             if (!IndexFormat.servable(IndexFormat.status(dir))) {
-                Optional<Path> fallback = newestServableGeneration(root.resolve(name));
+                Optional<Path> fallback = newestServableGeneration(shardRoot);
                 if (reportedUnservable.add(dir)) {
                     log.warn("Shard {}: registered generation {} has index format {} ({}); this reader (pharos {})"
                             + " reads index formats {}-{}. {}", name, dir.getFileName(),

@@ -179,7 +179,7 @@ public final class DistributedSearch implements Closeable {
             for (Route r : routes) byName.put(r.shard().value(), r);
             List<Route> ordered = new ArrayList<>(routes.size());
             for (String p : new LinkedHashSet<>(projects)) {
-                Route r = byName.remove(new ShardId(p).value());
+                Route r = byName.remove(ShardId.ofProject(p).value());
                 if (r != null) ordered.add(r);
             }
             routes = ordered;
