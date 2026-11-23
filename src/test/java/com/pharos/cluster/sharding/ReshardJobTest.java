@@ -942,6 +942,60 @@ public class ReshardJobTest {
     }
 
     /**
+     * Integration carry I5: after a reshard every shard carries a copy of the source; registering a new
+     * source (pharos index without a path, the operator's Job when the CR's url or ref changes) must reach
+     * the writer, not be shadowed by those copies.
+     */
+    @Test
+    void aSourceRegisteredAfterAReshardIsTheOneTheWriterUses() throws IOException {
+        List<String> files = filesFor(RING2, RING3, 2);
+        writeFiles(files);
+        catalog.register(new ShardId(P), Optional.of(ShardSource.path(src.toString())));
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        Reader r = new Reader("r1");
+        r.sync();
+        catalog.requestReshard(P, RING2, clock.instant());
+        a.loop.tick();
+        r.sync();
+        a.loop.tick();
+        assertThat(catalog.projectShards().shardsOf(P)).as("flipped").isEqualTo(ring(2));
+        for (ShardId s : ring(2)) {
+            assertThat(catalog.entries().stream().filter(e -> e.id().equals(s)).findFirst().orElseThrow().source())
+                    .as("the reshard copied the source to " + s).contains(ShardSource.path(src.toString()));
+        }
+
+        // the project moves to another checkout (a new url/ref in the CR); one file differs there
+        Path moved = tmp.resolve("sources-v2").resolve(P);
+        try (var walk = Files.walk(src)) {
+            for (Path f : walk.toList()) {
+                Path to = moved.resolve(src.relativize(f).toString());
+                if (Files.isDirectory(f)) Files.createDirectories(to);
+                else Files.copy(f, to);
+            }
+        }
+        Path changed = moved.resolve(files.getFirst());
+        Files.writeString(changed, Files.readString(changed).replace("Part 0 of", "Part zero of"));
+        // only the entry named after the project, as a registration by a release before this fix writes it
+        // (recordSource also rewrites the shards' copies; ObjectStoreCatalogTest covers that): the writer
+        // prefers that entry over the copies
+        catalog.register(ShardId.ofProject(P), Optional.of(ShardSource.path(moved.toString())));
+
+        for (int i = 0; i < 3; i++) {
+            clock.advance(10);
+            a.loop.tick();
+        }
+        String root = moved.toAbsolutePath().normalize().toString();
+        for (ShardId s : ring(2)) {
+            assertThat(replicas.manifest(s, replicas.latest(s).orElseThrow()).projectMeta().getRootPath())
+                    .as("the writer indexes the new source for " + s).isEqualTo(root);
+        }
+        r.sync();
+        src = moved; // every file once, all of them under the new checkout (none left under the old one)
+        assertEveryFileOnce(r, files, "after the source moved");
+    }
+
+    /**
      * Final review I3: a cancelled pinned reshard leaves the reader with prepared generation dirs of the shards
      * it rewrote (their ids stay active). Within one pass the reader drops them, deletes their dirs and stops
      * reporting them; the active generations and the retained previous ones (P6-R19 grace) stay untouched.

@@ -181,6 +181,36 @@ class ObjectStoreCatalogTest {
         assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("no write").isEqualTo(etag);
     }
 
+    /**
+     * Integration carry I5: a source registered for a split project lands on its entry and on every shard of
+     * it that carries one, in one write; another project's shards are untouched.
+     */
+    @Test
+    void recordSourceUpdatesEveryShardOfASplitProject() throws Exception {
+        CountingStore store = new CountingStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        ShardSource v1 = ShardSource.git("https://example.org/l.git", "main");
+        ShardSource v2 = ShardSource.git("https://example.org/l.git", "v2");
+        ShardId s01 = new ShardId("lucene~ring=s01");
+        ShardId s02 = new ShardId("lucene~ring=s02");
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        catalog.putProject("lucene", v, List.of(s01, s02));
+        catalog.register(s01, Optional.of(v1)); // as a reshard records it
+        catalog.register(s02, Optional.of(v1));
+        catalog.register(new ShardId("lucene.x~ring=s01"), Optional.of(v1)); // another project, same prefix
+
+        int before = store.conditionalWrites;
+        assertThat(catalog.recordSource("lucene", v2)).containsExactlyInAnyOrder(s01, s02, ShardId.ofProject("lucene"));
+        assertThat(store.conditionalWrites - before).as("one CAS").isEqualTo(1);
+        assertThat(catalog.entries()).containsExactlyInAnyOrder(
+                new ShardEntry(s01, Optional.of(v2)), new ShardEntry(s02, Optional.of(v2)),
+                new ShardEntry(new ShardId("lucene.x~ring=s01"), Optional.of(v1)),
+                new ShardEntry(ShardId.ofProject("lucene"), Optional.of(v2)));
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.recordSource("lucene", v2)).as("unchanged").isEmpty();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
+    }
+
     @Test
     void removeProjectRemovesAnUnsplitProject() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();

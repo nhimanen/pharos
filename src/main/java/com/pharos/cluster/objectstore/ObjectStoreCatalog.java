@@ -780,6 +780,49 @@ public final class ObjectStoreCatalog implements ShardCatalog {
     }
 
     /**
+     * Records {@code source} as {@code project}'s source in one CAS ({@code pharos index}/{@code publish}
+     * with a source, the operator's registration Job; integration carry I5): on the entry named after the
+     * project (added when absent, as {@link #register(ShardId, Optional)}) and on every listed shard of the
+     * project that carries a source (a reshard records it on each of its shards), so a new url or ref
+     * reaches a split project too. Nothing is written when nothing changes.
+     *
+     * @return the shard ids whose source was set or replaced
+     */
+    public List<ShardId> recordSource(String project, ShardSource source) throws IOException {
+        if (!ShardId.isProjectName(project)) {
+            throw new IllegalArgumentException("'" + project + "' is not a valid cluster project name");
+        }
+        java.util.Objects.requireNonNull(source, "source");
+        List<ShardId> changed = new ArrayList<>();
+        update("record the source of project " + project, root -> {
+            changed.clear();
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            JsonNode entry = projectEntry(root, project, false);
+            if (entry != null) collectShardIds(entry, ids);
+            ArrayNode shards = shardsArray(root);
+            boolean unitListed = false;
+            for (JsonNode s : shards) {
+                String id = s.path("id").asText();
+                boolean unit = project.equals(id);
+                unitListed |= unit;
+                boolean ofProject = unit || ((ids.contains(id) || isKeyedIdOf(project, id)) && s.has("source"));
+                if (!ofProject || !(s instanceof ObjectNode o)) continue;
+                if (ShardSource.fromJson(o.get("source")).equals(Optional.of(source))) continue;
+                source.writeTo(o.putObject("source"));
+                changed.add(new ShardId(id));
+            }
+            if (!unitListed) {
+                ObjectNode e = shards.addObject();
+                e.put("id", project);
+                source.writeTo(e.putObject("source"));
+                changed.add(ShardId.ofProject(project));
+            }
+            return !changed.isEmpty();
+        });
+        return List.copyOf(changed);
+    }
+
+    /**
      * Removes a whole project from the catalog in one CAS ({@code pharos remove-index --from-catalog}, the
      * operator's removal Job; integration carry I4): its {@code projects[]} entry (active, staged, previous
      * and abandoned versions, pins and an open reshard request with it) and every {@code shards[]} entry of

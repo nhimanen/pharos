@@ -1,7 +1,6 @@
 package com.pharos.cli;
 
 import com.pharos.cluster.ClusterRuntime;
-import com.pharos.cluster.ShardId;
 import com.pharos.cluster.ShardSource;
 import com.pharos.cluster.objectstore.ObjectStoreCatalog;
 import picocli.CommandLine.Option;
@@ -58,10 +57,13 @@ public class SourceOptions {
                 : ShardSource.path(sourcePath.toAbsolutePath().normalize().toString()));
     }
 
-    /** Records {@code source} for {@code project} in the catalog. */
+    /**
+     * Records {@code source} for {@code project} in the catalog: on its entry and on every shard of a split
+     * project that carries one (integration carry I5), in one write.
+     */
     static void record(ClusterRuntime runtime, String project, ShardSource source) throws IOException {
         ObjectStoreCatalog catalog = runtime.sourceCatalog().orElseThrow();
-        catalog.register(ShardId.ofProject(project), Optional.of(source));
+        catalog.recordSource(project, source);
         System.out.println("recorded source " + source + " for " + project);
     }
 }

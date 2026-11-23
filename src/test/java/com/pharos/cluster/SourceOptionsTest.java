@@ -151,6 +151,32 @@ class SourceOptionsTest {
         }
     }
 
+    /** Integration carry I5: the registration Job's new ref reaches every shard of a split project. */
+    @Test
+    void registrationUpdatesEveryShardOfASplitProject() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            c.writerConfig.getCluster().getWriter().setWorkQueue(true);
+            var catalog = c.writerRuntime.sourceCatalog().orElseThrow();
+            ShardSource main = ShardSource.git("https://example.org/a.git", "main");
+            ShardId s01 = new ShardId("a~ring=s01");
+            ShardId s02 = new ShardId("a~ring=s02");
+            int v = catalog.addSpec(Optional.of("a"), com.pharos.cluster.sharding.ShardSpec.parse(
+                    "[project, ring(path, shards=2)]"));
+            catalog.putProject("a", v, java.util.List.of(s01, s02));
+            catalog.register(s01, Optional.of(main)); // the copies a reshard records
+            catalog.register(s02, Optional.of(main));
+
+            assertThat(new CommandLine(new IndexCommand(c.writerManager,
+                    new com.pharos.graph.CrossProjectLinker(c.writerConfig, c.writerRegistry), c.writerRegistry,
+                    c.writerConfig, c.writerRuntime)).execute("--project", "a", "--source-git",
+                    "https://example.org/a.git", "--ref", "v2")).isZero();
+            ShardSource v2 = ShardSource.git("https://example.org/a.git", "v2");
+            assertThat(catalog.entries()).containsExactlyInAnyOrder(new ShardEntry(s01, Optional.of(v2)),
+                    new ShardEntry(s02, Optional.of(v2)), new ShardEntry(ShardId.ofProject("a"), Optional.of(v2)));
+        }
+    }
+
     /** Integration carry I4: the removal Job on a split project removes every shard of it at once. */
     @Test
     void removeFromCatalogRemovesEveryShardOfASplitProject() throws Exception {

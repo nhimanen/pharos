@@ -497,13 +497,14 @@ public final class WorkLoop implements Closeable {
         for (String project : mapping.projects()) {
             ShardId unit = ShardId.ofProject(project);
             ShardPlan plan = ShardPlan.of(mapping, project);
-            Optional<ShardSource> source = Optional.empty();
+            // the entry named after the project first: registration (pharos index/publish with a source, the
+            // operator's Job) always writes it, so a new url or ref wins over a split project's shards, whose
+            // copies a reshard wrote (integration carry I5); a split project's shards may also carry none yet
+            Optional<ShardSource> source = sourceOf.getOrDefault(unit, Optional.empty());
             for (ShardId s : plan.clusterShards()) {
-                source = sourceOf.getOrDefault(s, Optional.empty());
                 if (source.isPresent()) break;
+                source = sourceOf.getOrDefault(s, Optional.empty());
             }
-            // a split project's shards may carry no source yet: the entry named after the project has it
-            if (source.isEmpty() && plan.isSplit()) source = sourceOf.getOrDefault(unit, Optional.empty());
             if (source.isPresent()) {
                 out.put(unit, source.get());
                 unitPlans.put(unit, plan);
