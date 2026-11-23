@@ -649,9 +649,13 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
     }
 
     /**
-     * The projects with what {@code /cluster/status} reports for their shard: {@code generation},
-     * {@code docCount} and {@code pending} (a change not yet published). Without a status, the values
-     * of the previous status stand; a project without a shard yet has none.
+     * The projects with what {@code /cluster/status} reports for them: {@code generation} (null until
+     * published), {@code docCount} and {@code pending} (a change not yet published). These come from the
+     * status's {@code projects[]} (ruling P6-R15: a split project is one entry over its active shards,
+     * never a staged or retired one, so a project mid-reshard stays published with its summed docCount).
+     * A status without {@code projects[]} (a pharos before Phase 6, e.g. during a rolling upgrade) is read
+     * per shard, by its {@code project} key. Without a status, the values of the previous status stand; a
+     * project without a shard yet has none.
      */
     static List<PharosClusterStatus.ProjectStatus> withClusterStatus(List<PharosClusterStatus.ProjectStatus> projects,
                                                                      ClusterStatus status,
@@ -661,8 +665,12 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
         if (previous != null && previous.projects() != null) {
             for (var p : previous.projects()) if (p != null && p.name() != null) before.put(p.name(), p);
         }
+        Map<String, ClusterStatus.Project> fromProjects = new HashMap<>();
+        if (status != null && status.projects() != null) {
+            for (ClusterStatus.Project p : status.projects()) if (p != null && p.project() != null) fromProjects.put(p.project(), p);
+        }
         Map<String, ClusterStatus.Shard> shards = new HashMap<>();
-        if (status != null && status.layout() != null && status.layout().shards() != null) {
+        if (fromProjects.isEmpty() && status != null && status.layout() != null && status.layout().shards() != null) {
             for (ClusterStatus.Shard s : status.layout().shards()) {
                 if (s == null) continue;
                 String project = s.keys() != null && s.keys().get("project") != null ? s.keys().get("project") : s.shard();
@@ -674,7 +682,14 @@ public class PharosClusterReconciler implements Reconciler<PharosCluster> {
             Long generation = null;
             Long docCount = null;
             Boolean pending = null;
-            if (status != null) {
+            if (status != null && !fromProjects.isEmpty()) {
+                ClusterStatus.Project cp = fromProjects.get(p.name());
+                if (cp != null) {
+                    generation = cp.published() ? cp.generation() : null;
+                    docCount = cp.docCount();
+                    pending = cp.pending();
+                }
+            } else if (status != null) {
                 ClusterStatus.Shard s = shards.get(p.name());
                 if (s != null) {
                     generation = s.generation();

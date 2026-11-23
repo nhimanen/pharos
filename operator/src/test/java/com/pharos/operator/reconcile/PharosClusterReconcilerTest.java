@@ -196,4 +196,50 @@ class PharosClusterReconcilerTest {
         assertThat(PharosClusterReconciler.applyError(new RuntimeException("x".repeat(1000))))
                 .hasSize(PharosClusterReconciler.MAX_ERROR_TEXT + 3);
     }
+
+    /**
+     * Ruling P6-R15 (integration carry): project status comes from {@code /cluster/status projects[]}, not from
+     * the shards by their project key. Mid-reshard a split project's staged shard (no generation yet) carries
+     * the same project key; the project is still published, at its lowest active generation, with the docs
+     * of all its active shards.
+     */
+    @Test
+    void projectStatusReadsProjectsOfTheClusterStatus() {
+        var s01 = new com.pharos.cluster.status.ClusterStatus.Shard("lucene~ring=s01", 2,
+                java.util.Map.of("project", "lucene", "ring", "s01"), 100L, 1000L, 7L, 5L, "w0", null, List.of("r0"),
+                null, "current", "lucene", "active", true, null);
+        var s02 = new com.pharos.cluster.status.ClusterStatus.Shard("lucene~ring=s02", 2,
+                java.util.Map.of("project", "lucene", "ring", "s02"), 200L, 2000L, 5L, 5L, "w0", null, List.of("r0"),
+                null, "current", "lucene", "active", true, null);
+        var s03 = new com.pharos.cluster.status.ClusterStatus.Shard("lucene~ring=s03", 3,
+                java.util.Map.of("project", "lucene", "ring", "s03"), null, null, null, null, null, null, List.of(),
+                null, "staged", "lucene", "staged", true, null);
+        var lucene = new com.pharos.cluster.status.ClusterStatus.Project("lucene", 2, "[project, ring(path, shards=2)]",
+                List.of("lucene~ring=s01", "lucene~ring=s02"), 300L, 3000L,
+                new com.pharos.cluster.status.ClusterStatus.StagedVersion(3, "[project, ring(path, shards=3)]",
+                        List.of("lucene~ring=s01", "lucene~ring=s02", "lucene~ring=s03"), "building"),
+                null, null, true, 5L, false);
+        // one active shard published, the other not yet: not published, so no generation
+        var beta = new com.pharos.cluster.status.ClusterStatus.Project("beta", 4, "[project, module]",
+                List.of("beta~module=a", "beta~module=b"), 10L, 100L, null, null, null, false, 4L, true);
+        var status = new com.pharos.cluster.status.ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                new com.pharos.cluster.status.ClusterStatus.Layout(null, List.of(s01, s02, s03), List.of(), List.of()),
+                null, List.of(), List.of(), List.of(lucene, beta), List.of());
+        var projects = List.of(new PharosClusterStatus.ProjectStatus("lucene", true),
+                new PharosClusterStatus.ProjectStatus("beta", true), new PharosClusterStatus.ProjectStatus("gamma", true));
+
+        assertThat(PharosClusterReconciler.withClusterStatus(projects, status, null)).containsExactly(
+                new PharosClusterStatus.ProjectStatus("lucene", true, 5L, 300L, false, null),
+                new PharosClusterStatus.ProjectStatus("beta", true, null, 10L, true, null),
+                new PharosClusterStatus.ProjectStatus("gamma", true, null, null, null, null));
+
+        // a status without projects[] (a pharos before Phase 6): per shard, by its project key
+        var legacy = new com.pharos.cluster.status.ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                new com.pharos.cluster.status.ClusterStatus.Layout(null, List.of(new com.pharos.cluster.status.ClusterStatus
+                        .Shard("lucene", 1, java.util.Map.of("project", "lucene"), 42L, 1L, 9L, 1L, "w0", null, List.of(),
+                        null, "current")), List.of(), List.of()),
+                null, List.of(), List.of());
+        assertThat(PharosClusterReconciler.withClusterStatus(projects.subList(0, 1), legacy, null)).containsExactly(
+                new PharosClusterStatus.ProjectStatus("lucene", true, 9L, 42L, false, null));
+    }
 }
