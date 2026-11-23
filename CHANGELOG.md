@@ -213,7 +213,22 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   usable for the grace: a coordinator whose reader has not synced new synonyms yet analyses the
   query with the previous ones, and a reader answers a coordinator still on them.
 - `?trace=true` search answers carry `searchMeta.rawScores`: each retrieval stage's raw
-  (pre-graph-boost) score per result id.
+  (pre-graph-boost) score per result id, and `searchMeta.statistics`: the shards, generations and
+  field totals a fanned-out query's statistics round read.
+- Multi-node: a shard's first request names the spec version of its project the coordinator
+  planned; a reader whose catalog has moved on answers with the generation that version names
+  (the previous one, retained) or refuses, so a coordinator whose catalog predates a reshard never
+  silently misses the files that moved. The shards a reshard writes get a new index run number.
+- Multi-node: a replica's generation mismatch no longer hides the first reader's "no vectors for
+  the model" answer (a vector or hybrid query right after a flip left every shard of a project
+  without vectors out).
+
+### Fixed
+- A Python module and a non-code file of the same path stem (e.g. `releaseWizard.py` and
+  `releaseWizard.yaml`) share one document id; both documents got the body of whichever file was
+  indexed first, so the non-code file's text was lost and, in a cluster, a reshard changed BM25
+  statistics. Each document now has its own file's body (`CHUNKING_VERSION` 5: the next
+  incremental run re-embeds, mostly from the cache).
 - A reshard rewrites each affected shard whole: the moved files' documents are expunged (their
   deletes merged away) before the commit, so BM25 statistics count every document once. Those
   shards, HNSW vector graphs included, get new segment files, are re-uploaded in full and
