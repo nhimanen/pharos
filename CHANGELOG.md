@@ -3,9 +3,25 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.7.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)
+
+Multi-node Phase 2: on-demand warming. Readers no longer need a full copy of every generation: by default
+they keep only the small Lucene files locally and read the rest in blocks, with ranged GETs, through a
+size-capped block cache. **Single-node installs are unaffected** apart from the body fix below: the next index run
+re-processes every file once and re-embeds only the documents whose text changed.
+
+### Fixed
+- Two files yielding the same qualified name (for example a Python module and a YAML or Markdown file with the
+  same path stem, such as `releaseWizard.py` and `releaseWizard.yaml`) got each other's synthesized document
+  body: it was cached by qualified name, so both documents carried the text of whichever file was indexed
+  first, and which one won depended on file order. The cache is now keyed by file and qualified name.
+  `CHUNKING_VERSION` 4 → 5: the next `pharos index` re-processes every tracked file once; embedding texts that
+  did not change come from the embedding cache, so only the affected documents are re-embedded.
+- On a lazy reader, `pharos embeddings status` reported "no" (and a `pharos index --full` hint) for every
+  project, because it probed the generation dir, where most Lucene files are not local. It now reports
+  "unknown (lazy reader; …)", and `index-status` no longer logs a WARN for the same probe.
 
 ### Added (multi-node Phase 2: on-demand warming)
 - Reader modes (`cluster.reader.mode`): `lazy` (default) downloads only the manifest, the graph
@@ -26,6 +42,18 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 - A lazy reader held on an older generation by a refused newer one downloads the rest of it in
   the background, so the bucket's GC can't strand it; switching a reader from lazy to full deletes
   the unused block cache.
+
+### Changed
+- **Readers upgraded from 1.6.0 switch to `lazy` mode** unless `cluster.reader.mode` is set; set
+  `"mode": "full"` to keep 1.6.0's full download per generation (recommended for readers that may lag beyond
+  the writer's retention, see README "Retention and lagging lazy readers").
+
+### Maintainers
+- Gate scripts (`scripts/cluster-gate.sh`, `scripts/cluster-gate-phase2.sh`): ports are configurable with
+  `GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`, `GATE_WRITER_PORT` / `GATE_READER_PORT` (Phase 1) and
+  `GATE_LAZY_PORT` / `GATE_FULL_PORT` (Phase 2); defaults are unchanged (9000, 9001, 7300, 7301, 7302). The
+  free-port probe and curl connects are bounded by `GATE_PORT_PROBE_TIMEOUT` (default 2 s) for hosts where
+  an unused port hangs instead of refusing.
 
 ## [1.6.0] - 2026-11-23
 
