@@ -235,7 +235,11 @@ public final class DistributedSearch implements Closeable {
         }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
         Query q = new Query(shards, alternates, start + queryTimeout.toNanos(), explicitSingle, plan);
-        q.openSignature = signature(plan);
+        try {
+            q.openSignature = signature(plan);
+        } catch (RuntimeException e) { // only a re-plan's wait reads it: never fail a query for it
+            q.openSignature = "unknown: " + e;
+        }
         // a split project whose shards a filter all pruned still runs here (empty, with its warning)
         for (String p : unscoped ? plan.catalog().projects() : new LinkedHashSet<>(projects)) {
             if (plan.catalog().isSplit(p)) q.hasSplitProject = true;
@@ -292,14 +296,14 @@ public final class DistributedSearch implements Closeable {
     private String signature(ShardRouter.RoutePlan plan) {
         StringBuilder sb = new StringBuilder();
         for (ShardRouter.PlannedShard p : plan.shards()) {
-            sb.append(p.shard().value()).append('@').append(p.generation()).append(p.alternate() ? "~alt" : "");
+            sb.append(p.shard().value()).append('@').append(p.generation()).append(p.alternate() ? " alternate" : "");
             for (ReaderHeartbeat r : p.route().candidates()) {
                 sb.append(' ').append(r.node()).append(':')
                         .append(r.generations() == null ? null : r.generations().get(p.shard().value()));
             }
             sb.append(';');
         }
-        return sb.append('|').append(local.synonymsHash()).toString();
+        return sb.append('|').append(local == null ? "none" : local.synonymsHash()).toString();
     }
 
     @Override
