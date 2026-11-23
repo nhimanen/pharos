@@ -135,3 +135,56 @@ PASS; 4a PASS 79 / 79; 4b PASS; 5 PASS.
 5. **No minPinned wait for the pins clear** (choice in P6-R19 5); if (1) is ever disabled (grace 0) the takeover window
    of run 4 can come back for one catalog period.
 6. Server: `~/builds/phase6-gate/run5` (3 GB) left for inspection with runs 1–4 (12 GB). Nothing of mine runs there.
+
+## Round 5 (rulings P6-R21, P6-R22; gate run 6: PASSED)
+
+### Commits (from 0f66087)
+e015478 (P6-R22 b), 5b779ab (P6-R21 version-addressed reads), 16dc756 (diagnostics), 9b14ba0 (P6-R21 run numbers),
+51db64c (P6-R22 a root cause), 58e72e2 (CHANGELOG), plus this report commit.
+
+### P6-R21
+- **New run number** (9b14ba0): `reshardReference` gives the staged shards a run one above every run of the project's
+  shards (from ∪ to); project files, revision and meta stay the split run's. The reshard's writer-state backup is filed
+  under the new run (a takeover's restore takes the newest backup at or below the newest run: found).
+  - Readers: a pinned version (always pinned until the next run) is activated by pins, so the mixed runs inside N+1
+    (unchanged shards keep N's run) need nothing; the next run publishes every shard at one run.
+  - Writer: `WorkLoop.refreshPublished` judged "one run" by run number, which would make every flipped project pending
+    (an extra run); it now compares the shards' project files (content), and revision.
+  - GC: `collectProject` keeps project files referenced by any kept manifest and writer state per run: unchanged.
+  - Test: `ReshardJobTest.rewrittenShardsGetANewRunNumber` (mutation: same run → fails).
+- **Never read unpinned at the wrong version** (5b779ab). Interpretation: the dangerous unpinned read is a coordinator
+  that does not know the previous version exists (its catalog predates the pin); a run number alone cannot help it
+  (all its old shards are rewritten, so it aligns on N+1's run and still misses moved files). So a split shard's first
+  request carries the planned spec version (`TermStatsRequest.specVersion`, `PlannedShard.specVersion`), and a reader
+  whose catalog has another active version pins the generation that version names (`ProjectShards.generationOfVersion`:
+  previous or staged pins) from its retained generation, or refuses 409 (`GenerationUnavailableException`): never a
+  silent miss. Coordinator-local shards resolve the same way (`LocalShardService.pinVersion`).
+  - Test: `ReshardQueryTest.aCoordinatorWhoseCatalogPredatesThePinReadsEveryFileOnce` (stale router on a catalog frozen
+    before the request; mutation: resolver off → "moved method once" 0).
+
+### P6-R22 — see the gate doc's Round 5 section
+- (a) Root cause: not the statistics round; two files sharing one document id got one cached synthesized body (order
+  dependent). Fixed in 51db64c (`CHANGELOG` Fixed; `CHUNKING_VERSION` 5). Drift now 0, clause unchanged at 1e-4.
+- (b) `ShardClient.callPreferring` let a fallback replica's generation mismatch hide the pinned reader's model mismatch.
+  Fixed in e015478.
+
+### Suites
+Local 1 855 run, 0 failures, 0 errors, 5 skipped; build server 1 856 run, 0 failures, 0 errors, 15 skipped (58e72e2).
+
+### Gate run 6: every criterion PASSES
+2a 19.7 %; 2b vacuous; 2c 0 / 4 883; 2d keyword 99/99 bitwise (drift 0), hybrid τ 1.0000, vector overlap 0.9970 /
+0 raw diffs; 2e 0 misses / 4 786 hits; 3a 1 of 4; 3b 5 of 5; 4a 82 / 82; 4b w2 resumed, flipped after 179.1 s; 5 clean.
+
+### Bugs found (round 5)
+- The same-id body crossing (indexer, single node too): a Python module and a non-code file of one path stem lost or
+  swapped their bodies. Fixed with a test.
+- The fallback-replica mismatch masking (ShardClient). Fixed with a test.
+
+### Concerns (round 5)
+1. Document ids still collide for such file pairs (both documents keep the id `…releaseWizard`): lookups by id
+   (`get_class`, graph ops) see two documents. Making them unique changes document ids → an `INDEX_FORMAT` bump; not done.
+2. Version-addressed reads depend on the reader's own catalog view; a reader whose catalog lags the coordinator's
+   (it does not know the planned newer version) answers its current generation, as before (pinned versions carry
+   generations anyway).
+3. `searchMeta.statistics` is a diagnostic string; it could be dropped or structured later.
+4. Server: `~/builds/phase6-gate` holds run4, run5, run6 (about 9 GB). Nothing of mine runs there.
