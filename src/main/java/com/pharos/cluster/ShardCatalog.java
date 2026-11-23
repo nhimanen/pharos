@@ -22,14 +22,31 @@ public interface ShardCatalog {
     }
 
     /**
-     * The shards when the catalog says so authoritatively, or empty when it cannot: readers drop
-     * shards that are not listed only on a present listing. By default an empty list is not
-     * authoritative (it may be a transient read); a catalog that can tell an absent catalog from one
-     * listing no shard overrides this.
+     * One catalog read: the project mapping ({@link #projectShards}) and whether its listing is
+     * authoritative, i.e. whether readers may drop the shards it does not list. Not authoritative: no
+     * catalog object at all (may be transient), or entries this build cannot parse (a newer release's id
+     * shape after a downgrade: keep serving rather than drop shards it cannot even name). A catalog that
+     * exists and lists no shard is authoritative (its last project was removed).
+     */
+    record MappingRead(ProjectShards map, boolean authoritative) {}
+
+    /**
+     * The mapping and its authority from one read (integration carry I3b, the operator's empty-catalog
+     * rule inside Phase 6's mapping). By default a listing is authoritative when it lists a shard (an empty
+     * list may be a transient read); a catalog that can tell an absent catalog from one listing no shard
+     * overrides this.
+     */
+    default MappingRead mappingRead() throws IOException {
+        ProjectShards map = projectShards();
+        return new MappingRead(map, !map.listed().isEmpty());
+    }
+
+    /**
+     * The shards when the catalog says so authoritatively ({@link #mappingRead}), or empty when it cannot.
      */
     default Optional<List<ShardId>> authoritativeShards() throws IOException {
-        List<ShardId> s = shards();
-        return s.isEmpty() ? Optional.empty() : Optional.of(s);
+        MappingRead read = mappingRead();
+        return read.authoritative() ? Optional.of(read.map().listed()) : Optional.empty();
     }
 
     /**

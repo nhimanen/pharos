@@ -75,24 +75,27 @@ public final class ObjectStoreCatalog implements ShardCatalog {
     }
 
     /**
-     * Empty when {@code catalog/shards.json} does not exist, or when it lists an entry this build cannot
-     * parse (a newer release's id: after a downgrade, readers keep what they serve rather than drop
-     * shards they cannot even name). A catalog whose {@code shards[]} is really empty is authoritative
-     * (its last project was removed), so readers stop serving everything.
+     * Not authoritative when {@code catalog/shards.json} does not exist, or when it lists an entry this
+     * build cannot parse (a newer release's id: after a downgrade, readers keep what they serve rather than
+     * drop shards they cannot even name). A catalog whose {@code shards[]} is really empty is authoritative
+     * (its last project was removed), so readers stop serving everything. Mapping and authority come from
+     * the same read.
      */
     @Override
-    public Optional<List<ShardId>> authoritativeShards() throws IOException {
+    public MappingRead mappingRead() throws IOException {
         Optional<StoredObject> current = store.get(layout.catalogKey());
-        if (current.isEmpty()) return Optional.empty();
-        List<ShardId> out = new ArrayList<>();
+        if (current.isEmpty()) return new MappingRead(ProjectShards.identity(List.of()), false);
+        ObjectNode root = parse(current.get().data());
         List<String> invalid = new ArrayList<>();
-        parseIds(current.get().data(), out, invalid);
+        for (JsonNode s : shardsArray(root)) {
+            String id = s.path("id").asText();
+            if (!ShardId.isValid(id)) invalid.add(id);
+        }
         if (!invalid.isEmpty()) {
             log.warn("Catalog {} lists {} entr{} this build cannot read ({}); not treating it as authoritative",
                     layout.catalogKey(), invalid.size(), invalid.size() == 1 ? "y" : "ies", invalid);
-            return Optional.empty();
         }
-        return Optional.of(List.copyOf(out));
+        return new MappingRead(ProjectShards.fromCatalog(root, validIds(root), this::warn), invalid.isEmpty());
     }
 
     /** The raw ids of entries {@link #shards()} skips. */

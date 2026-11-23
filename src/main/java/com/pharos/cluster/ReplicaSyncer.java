@@ -246,14 +246,19 @@ public class ReplicaSyncer implements Closeable {
     public void syncOnce() throws IOException {
         synchronized (syncLock) {
             com.pharos.cluster.sharding.ProjectShards map;
+            boolean authoritative;
             try {
-                map = catalog.projectShards();
+                ShardCatalog.MappingRead read = catalog.mappingRead();
+                map = read.map();
+                authoritative = read.authoritative();
             } catch (RuntimeException e) {
                 throw new IOException("unreadable shard catalog: " + e.getMessage(), e);
             }
             mapping = map;
             List<ShardId> shards = map.syncShards();
-            boolean catalogEmpty = map.listed().isEmpty();
+            // not authoritative: missing, a transient empty read, or entries this build cannot parse (a newer
+            // release's ids); the readable ones still sync, nothing is dropped (integration carry I3b)
+            boolean catalogEmpty = !authoritative;
             ReaderPin pin = pinned;
             if (!pin.isEmpty()) shards = shards.stream().filter(sh -> pin.matches(sh, map::projectOf)).toList();
             wanted = List.copyOf(shards);

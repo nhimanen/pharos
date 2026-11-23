@@ -369,10 +369,10 @@ class UpgradeIndexesCommandTest {
         com.pharos.cluster.ShardCatalog catalog = new com.pharos.cluster.ShardCatalog() {
             @Override public List<com.pharos.cluster.ShardId> shards() { return List.of(); }
 
-            @Override public List<String> unparseableEntries() { return List.of("proj~k=v"); }
+            @Override public List<String> unparseableEntries() { return List.of("proj~k:v"); }
         };
         assertThat(UpgradeIndexesCommand.checkShards(catalog, null)).isEqualTo(3);
-        assertThat(out.toString()).contains("proj~k=v").contains("cannot read").contains("1 refused");
+        assertThat(out.toString()).contains("proj~k:v").contains("cannot read").contains("1 refused");
     }
 
     @Test

@@ -39,22 +39,35 @@ class ObjectStoreCatalogTest {
         }
     }
 
-    /** Final review I2: a newer release's keyed id (Phase 6) after a downgrade. */
+    /**
+     * Operator final review I2, kept for future id shapes (integration item 7): an id this build cannot
+     * parse (here a separator no release uses yet) after a downgrade. Phase 6's keyed ids are parsed now
+     * and keep the catalog authoritative.
+     */
     @Test
     void anUnparseableEntryMakesTheCatalogNotAuthoritative() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
         ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
-        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"proj~k=v\"}]}".getBytes(StandardCharsets.UTF_8));
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"proj~k:v\"}]}".getBytes(StandardCharsets.UTF_8));
         assertThat(catalog.shards()).isEmpty();
-        assertThat(catalog.unparseableEntries()).containsExactly("proj~k=v");
+        assertThat(catalog.unparseableEntries()).containsExactly("proj~k:v");
         assertThat(catalog.authoritativeShards()).isEmpty(); // readers keep what they serve
+        assertThat(catalog.mappingRead().authoritative()).isFalse();
 
-        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~k=v\"}]}"
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~k:v\"}]}"
                 .getBytes(StandardCharsets.UTF_8));
         assertThat(catalog.authoritativeShards()).isEmpty();
+        assertThat(catalog.mappingRead().map().listed()).containsExactly(new ShardId("good")); // still synced
+
+        // a split project's keyed ids (Phase 6) are this build's own: authoritative
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~ring=s01\"}]}"
+                .getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.unparseableEntries()).isEmpty();
+        assertThat(catalog.authoritativeShards()).contains(List.of(new ShardId("good"), new ShardId("proj~ring=s01")));
 
         store.put(layout.catalogKey(), "{\"shards\":[]}".getBytes(StandardCharsets.UTF_8));
         assertThat(catalog.unparseableEntries()).isEmpty();
+        assertThat(catalog.mappingRead().authoritative()).isTrue();
         assertThat(catalog.authoritativeShards()).contains(List.of()); // really empty: authoritative
     }
 

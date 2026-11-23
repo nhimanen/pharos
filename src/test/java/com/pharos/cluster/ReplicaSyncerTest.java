@@ -445,7 +445,8 @@ class ReplicaSyncerTest {
         syncer.syncOnce();
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
 
-        store.put(layout.catalogKey(), "{\"shards\": [ {\"id\": \"proj~k=v\"} ]}".getBytes(StandardCharsets.UTF_8));
+        // an id shape this build cannot parse (Phase 6's keyed ids it can; item 7 keeps the rule for later shapes)
+        store.put(layout.catalogKey(), "{\"shards\": [ {\"id\": \"proj~k:v\"} ]}".getBytes(StandardCharsets.UTF_8));
         syncer.syncOnce();
 
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
