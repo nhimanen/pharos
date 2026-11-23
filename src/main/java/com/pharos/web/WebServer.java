@@ -612,6 +612,8 @@ public class WebServer {
                             stage.put("name", s.name()); stage.put("ms", s.durationMs()); return stage;
                         }).collect(Collectors.toList()));
                         if (!resp.trace().notes().isEmpty()) meta.put("routing", resp.trace().notes());
+                        // P6-R20: each stage's raw (pre-graph-boost) score per result id
+                        if (!resp.trace().rawScores().isEmpty()) meta.put("rawScores", resp.trace().rawScores());
                         var cls = resp.trace().getClassification();
                         if (cls != null) {
                             meta.put("classIntent",  cls.intent());

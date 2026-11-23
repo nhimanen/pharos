@@ -545,7 +545,13 @@ public class SearchEngine {
         Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
-        List<SearchResult> primary = pipeline.execute(reader, req, trace);
+        List<SearchResult> primary;
+        com.pharos.search.distributed.CandidateShaper.RAW_SCORES.set(trace); // P6-R20: raw scores in the trace
+        try {
+            primary = pipeline.execute(reader, req, trace);
+        } finally {
+            com.pharos.search.distributed.CandidateShaper.RAW_SCORES.remove();
+        }
 
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
@@ -622,7 +628,13 @@ public class SearchEngine {
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         // Mergers and rerankers read result fields only: they get no reader here.
-        List<SearchResult> primary = pipeline.execute(null, req, trace, fanout.runner());
+        List<SearchResult> primary;
+        com.pharos.search.distributed.CandidateShaper.RAW_SCORES.set(trace); // P6-R20: raw scores in the trace
+        try {
+            primary = pipeline.execute(null, req, trace, fanout.runner());
+        } finally {
+            com.pharos.search.distributed.CandidateShaper.RAW_SCORES.remove();
+        }
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
 

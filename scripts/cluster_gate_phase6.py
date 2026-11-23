@@ -20,7 +20,9 @@ shard's LATEST every 0.5 s.
              generation unchanged; 0 embedding provider calls (cache misses) during the pharos reshard.
   after      the same ranking on R1 after the three reshards. Pass: the Phase 3 rules (keyword top-10
              identical >= 98%; hybrid mean tau >= 0.95 and top-1 >= 95%); vector by ruling P6-R17 (recall:
-             per-query top-10 overlap >= 90%, mean >= 98%, shared documents' scores bitwise identical).
+             per-query top-10 overlap >= 90%, mean >= 98%, shared documents' raw (pre-graph-boost) scores
+             bitwise identical, ruling P6-R20: the trace's rawScores); keyword pages that are identical may
+             differ in score by at most 1e-4 relative (P6-R20).
   pruning    a module-filtered pharos query touches only that module's shard (trace: routing note and the
              fan-out shard count); a path prefix on ring-sharded lucene fans out to all its shards (traced).
   interrupt  `pharos reshard lucene --spec "[project, ring(path, shards=6)]"`; the writer running it is
@@ -70,6 +72,7 @@ SPEC_MODULE = "[project, module]"
 MOVE_MAX = 0.25
 VECTOR_MIN_OVERLAP = 0.90   # ruling P6-R17
 VECTOR_MEAN_OVERLAP = 0.98
+KEYWORD_MAX_REL_DRIFT = 1e-4  # ruling P6-R20: residual score drift accepted on identical keyword pages
 T0 = time.time()
 RESULTS = {}
 
@@ -468,12 +471,55 @@ def phase_setup():
     return True
 
 
+def fetch_traced(base, q, pipeline, timeout=120):
+    """p3.fetch with ?trace=true: each result gains "raw", its raw (pre-graph-boost) score per stage type
+    (ruling P6-R20, searchMeta.rawScores)."""
+    params = {"q": q, "pipeline": pipeline, "limit": p3.LIMIT, "trace": "true"}
+    url = f"{base}/api/search?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body, status = r.read(), r.status
+    except urllib.error.HTTPError as e:
+        body, status = e.read(), e.code
+    except Exception as e:  # connection refused, reset, timeout
+        return -1, [], [f"client error: {e!r}"]
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return (status if status != 200 else -2), [], [body[:200].decode(errors="replace")]
+    if isinstance(data, list):
+        return status, data, []
+    results = data.get("results", [])
+    raw = (data.get("searchMeta") or {}).get("rawScores") or {}
+    for res in results:
+        res["raw"] = {t: m[res.get("id")] for t, m in raw.items() if res.get("id") in m}
+    if "results" not in data and status == 200:
+        status = -2
+    return status, results, list(data.get("warnings") or [])
+
+
+def run_queries_traced(base, sp):
+    """p3.run_queries over fetch_traced: {key: results}, warnings {text: count}, failures."""
+    res, warns, fails, per = {}, {}, [], {}
+    for pl, scope, q in sp:
+        status, results, w = fetch_traced(base, q, pl)
+        k = p3.key(pl, scope, q)
+        if status != 200:
+            fails.append(f"{k}: status {status} {w}")
+        res[k] = results
+        per[k] = sorted(w)
+        for x in w:
+            warns[x[:160]] = warns.get(x[:160], 0) + 1
+    p3.LAST_WARNINGS[base] = per
+    return res, warns, fails
+
+
 def ranking_pass(label):
     _, qs = p3.gate_queries()
     sp = [(pl, None, q) for pl in PIPELINES for q in qs]
     base = NODES["r1"].base
-    p3.run_queries(base, sp)  # warm-up
-    res, warns, fails = p3.run_queries(base, sp)
+    run_queries_traced(base, sp)  # warm-up
+    res, warns, fails = run_queries_traced(base, sp)
     (gate() / f"ranking-{label}.json").write_text(json.dumps(res))
     (gate() / f"ranking-{label}-warnings.json").write_text(json.dumps(p3.LAST_WARNINGS[base]))
     log(f"ranking {label}: {len(sp)} answers, failures {len(fails)}, warnings {warns}")
@@ -628,12 +674,19 @@ def save_part(name, data):
 def vector_recall_verdict(ref, got, st):
     """Ruling P6-R17: after a resplit the shards' HNSW graphs differ, so vector parity is judged by recall:
     per-query top-10 overlap >= VECTOR_MIN_OVERLAP, mean overlap >= VECTOR_MEAN_OVERLAP, and the documents both
-    lists share have bitwise-identical scores. Overlap = |shared| / max(|ref|, |got|)."""
+    lists share have bitwise-identical raw (pre-graph-boost) scores (ruling P6-R20: the page-normalised graph
+    boost moves the final scores whenever recall brings in a document of another in-degree). Overlap =
+    |shared| / max(|ref|, |got|)."""
     overlaps, worst, score_diffs = [], [], []
+    missing_raw = 0
     for q, a in ref.items():
         b = got.get(q, [])
-        sa = {r.get("id"): p2bits(r.get("score")) for r in a}
-        sb = {r.get("id"): p2bits(r.get("score")) for r in b}
+        def raw(r):
+            v = (r.get("raw") or {}).get("vector")
+            return p2bits(v if v is not None else r.get("score"))
+        missing_raw += sum(1 for r in a + b if (r.get("raw") or {}).get("vector") is None)
+        sa = {r.get("id"): raw(r) for r in a}
+        sb = {r.get("id"): raw(r) for r in b}
         shared = set(sa) & set(sb)
         ov = len(shared) / max(1, len(sa), len(sb))
         overlaps.append(ov)
@@ -644,9 +697,28 @@ def vector_recall_verdict(ref, got, st):
                 score_diffs.append((q, i, sa[i], sb[i]))
     mean = sum(overlaps) / max(1, len(overlaps))
     ok = not worst and mean >= VECTOR_MEAN_OVERLAP and not score_diffs
-    st.update({"recall_mean_overlap": mean, "recall_below_min": worst, "recall_shared_score_diffs": score_diffs[:20]})
+    st.update({"recall_mean_overlap": mean, "recall_below_min": worst, "recall_shared_score_diffs": score_diffs[:20],
+               "results_without_raw_score": missing_raw})
     return ok, (f"P6-R17 recall: mean overlap {mean:.4f} (>= {VECTOR_MEAN_OVERLAP}), queries below {VECTOR_MIN_OVERLAP}:"
-                f" {len(worst)}, shared docs with other score bits: {len(score_diffs)}")
+                f" {len(worst)}, shared docs with other raw-score bits: {len(score_diffs)}"
+                f" (results without a raw score: {missing_raw})")
+
+
+def keyword_drift(ref, got, st):
+    """Ruling P6-R20: on keyword pages with identical ids, the largest relative score difference."""
+    worst, over = 0.0, []
+    for q, a in ref.items():
+        b = got.get(q, [])
+        if [r.get("id") for r in a] != [r.get("id") for r in b]:
+            continue
+        for x, y in zip(a, b):
+            sx, sy = float(x.get("score") or 0), float(y.get("score") or 0)
+            rel = abs(sx - sy) / max(abs(sx), abs(sy), 1e-30)
+            worst = max(worst, rel)
+            if rel > KEYWORD_MAX_REL_DRIFT:
+                over.append((q, x.get("id"), sx, sy))
+    st.update({"keyword_max_rel_drift": worst, "keyword_drift_over_bar": over[:20]})
+    return not over, f"identical pages: max relative score drift {worst:.2e} (<= {KEYWORD_MAX_REL_DRIFT:.0e})"
 
 
 def p2bits(score):
@@ -663,6 +735,9 @@ def compare(ref_label, got_label, key):
         good, rule = p3.verdict(st)
         if pl == "vector":
             good, rule = vector_recall_verdict(p3.by_pipeline(ref, pl), p3.by_pipeline(got, pl), st)
+        if pl == "keyword":
+            drift_ok, drift_rule = keyword_drift(p3.by_pipeline(ref, pl), p3.by_pipeline(got, pl), st)
+            good, rule = good and drift_ok, rule + "; " + drift_rule
         log(f"   {key} {pl:8s} n={st['queries']} {rule}; ids identical {st['top10_identical']}, score-bitwise"
             f" {st['score_bitwise_identical']}, top-1 {st['top1_identical_pct']:.1f}%, tau {st['mean_tau']:.4f}"
             f" -> {'PASS' if good else 'FAIL'}")
