@@ -3,7 +3,7 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [1.5.0] - 2026-11-17
+## [1.5.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)
 
