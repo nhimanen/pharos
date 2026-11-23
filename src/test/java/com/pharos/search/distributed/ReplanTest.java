@@ -142,6 +142,49 @@ class ReplanTest {
         }
     }
 
+    /**
+     * The re-plan itself loses every shard (here: both readers die before it runs). The first attempt's
+     * answer, partial with its warning, is returned, not the re-plan's failure.
+     */
+    @Test
+    void aReplanThatLosesEveryShardKeepsTheFirstPartialAnswer() throws Exception {
+        Path tmp = Files.createTempDirectory("replan-keep");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "swap";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        List<ShardId> shards = List.of(new ShardId(project + "~ring=s01"), new ShardId(project + "~ring=s02"));
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 12; i++) {
+            SplitProjectSearchTest.writeClass(src, "src/main/java/com/example/p" + i + "/Kestrel" + i + ".java",
+                    "com.example.p" + i, "Kestrel" + i, "kestrel calculator " + i);
+        }
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, null)) {
+            fx.indexSplit(src, project, ring2, shards, false);
+            fx.indexBoth();
+            try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null);
+                 TestReaderNode r = new TestReaderNode(tmp.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER, null);
+                 TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(PY), EMBEDDER, null)) {
+                for (ShardId s : shards) k.awaitShard(s.value(), 1);
+                k.awaitShard(JAVA, 1);
+                nextRun(fx, src, project, ring2, shards, 1);
+                swapOnceAfterStats(x);
+                DistributedSearch.beforeReplan = () -> { // nothing answers the re-plan
+                    x.kill();
+                    r.kill();
+                };
+                SearchResponse resp = k.engine.searchWithTrace(new SearchRequest("Calculator kestrel", SearchType.KEYWORD,
+                        null, List.of(JAVA, project), 20, "text", null, null, 0), false);
+                assertThat(resp.results()).as("the first attempt's sample-app results")
+                        .isNotEmpty().allSatisfy(res -> assertThat(res.project()).isEqualTo(JAVA));
+                assertThat(resp.warnings()).as("its warning").anyMatch(w -> w.contains("generation changed"));
+                assertThat(resp.trace().notes()).anyMatch(n -> n.startsWith("the re-plan failed"));
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
     /** Publishes the project's next index run (a changed file), which reader x has not activated yet. */
     private static void nextRun(ClusterFixture fx, Path src, String project, ShardSpec spec, List<ShardId> shards,
                                 int n) throws Exception {

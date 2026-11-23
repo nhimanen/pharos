@@ -458,20 +458,24 @@ public class SearchEngine {
                 // other synonyms. Plan the query once more on the state the readers have moved to; if that
                 // still loses shards, its answer (partial, with the warnings) is returned, as before.
                 trace.note("re-planned once (" + retryCause + ")");
-                DistributedSearch.Query again;
-                try {
-                    again = ds.reopen(fanout, requestedProjects(req), shardFilter);
-                } catch (CatalogUnavailableException e) {
-                    if (noAnswer != null) throw noAnswer;
-                    return resp;
-                }
-                try (DistributedSearch.Query q = again) {
+                try (DistributedSearch.Query q = ds.reopen(fanout, requestedProjects(req), shardFilter)) {
                     if (q.fansOut()) {
                         List<String> retryWarnings = new ArrayList<>(before);
                         warnDegraded(q.localShards(), retryWarnings);
-                        resp = searchFannedOut(req, hints, expand, trace, retryWarnings, q);
+                        SearchResponse second = searchFannedOut(req, hints, expand, trace, retryWarnings, q);
                         for (String note : q.lateNotes()) trace.note(note);
+                        resp = second;
                         noAnswer = null;
+                    }
+                } catch (RuntimeException | IOException e) {
+                    // the re-plan failed (no shard answered it, the catalog, ...): the first answer stands,
+                    // partial with its warnings; with none, the first attempt's own failure is reported
+                    log.debug("Query '{}': the re-plan failed ({}); keeping the first answer", req.query(), e.toString());
+                    trace.note("the re-plan failed (" + e.getMessage() + "); the first answer stands");
+                    if (resp == null) {
+                        if (noAnswer != null) throw noAnswer;
+                        if (e instanceof IOException io) throw io;
+                        throw (RuntimeException) e;
                     }
                 }
             }
