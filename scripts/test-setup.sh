@@ -46,8 +46,8 @@ make_variant v9.9.7 9.9.7 "$JAR" "$WORK/badskill.tar.gz"
 
 # Each case gets a fresh HOME. The previous case's HOME is deleted first: every install holds a
 # copy of the ~200 MB jar, and keeping them all can fill a small /tmp before the last cases run.
-new_home() {
-  rm -rf "$WORK"/home.*
+new_home() {  # --keep: keep earlier homes (a case that compares two installs)
+  [ "${1:-}" = --keep ] || rm -rf "$WORK"/home.*
   mktemp -d "$WORK/home.XXXXXX"
 }
 
@@ -343,4 +343,24 @@ t_release_on_reader_points_upgrades_at_the_writer
 t_bad_release_tag_rejected
 t_checksum_naming_other_file_fails
 t_release_notes_extracts_and_validates
+t_semantic_hint_only_when_embeddings_off() {
+  local off on; off="$(new_home)"; on="$(new_home --keep)"
+  run_setup "$off" --release latest
+  mkdir -p "$on/.pharos"
+  printf '%s\n' '{"embeddingProviders":[{"type":"djl","modelId":"jina-v2-code","url":"hf://jinaai/jina-embeddings-v2-base-code","dimensions":768}]}' \
+    > "$on/.pharos/config.json"
+  run_setup "$on" --release latest
+  [ "$(rc "$off")" = 0 ] && [ "$(rc "$on")" = 0 ] \
+    && grep -q 'Semantic search is off' "$off/out.txt" \
+    && ! grep -q 'Semantic search is off' "$on/out.txt"
+  check semantic_hint_only_when_embeddings_off $? "off: $(tail -2 "$off/out.txt") | on: $(tail -2 "$on/out.txt")"
+}
+t_semantic_hint_only_when_embeddings_off
+
+t_python_cli_embeddings() {
+  python3 -I "$REPO/scripts/test_pharos_cli.py" >"$WORK/pycli.log" 2>&1
+  check python_cli_embeddings $? "$(tail -5 "$WORK/pycli.log")"
+}
+t_python_cli_embeddings
+
 exit "$FAILED"

@@ -6,7 +6,7 @@ package com.pharos.search;
  * more of the queried projects.
  *
  * <p>Surfaces as a clear error rather than empty results, so callers can
- * suggest running {@code pharos embed --model=<id> <project>} (or a re-index)
+ * suggest {@code pharos embed --model=<id> <project>} or, for a project without vectors, {@code pharos index --full <root path>}
  * instead of silently returning nothing.
  */
 public class VectorModelUnavailableException extends RuntimeException {

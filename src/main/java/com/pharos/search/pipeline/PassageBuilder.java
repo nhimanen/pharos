@@ -18,6 +18,16 @@ final class PassageBuilder {
     static String build(SearchResult r) {
         StringBuilder sb = new StringBuilder();
 
+        // Identifier line: the cross-encoder otherwise never sees the class name or camelCase method
+        // name, so exact-name targets score ~0 (class docs get just the class name).
+        StringBuilder id = new StringBuilder();
+        if (r.className() != null && !r.className().isBlank()) id.append(r.className());
+        if (r.methodName() != null && !r.methodName().isBlank()) {
+            if (id.length() > 0) id.append('.');
+            id.append(r.methodName());
+        }
+        if (id.length() > 0) sb.append(id).append('\n');
+
         boolean hasJavadoc = r.javadoc() != null && !r.javadoc().isBlank();
 
         if (hasJavadoc) {

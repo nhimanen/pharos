@@ -6,7 +6,7 @@
 
     <groupId>com.pharos</groupId>
     <artifactId>pharos</artifactId>
-    <version>1.4.1</version>
+    <version>1.7.0</version>
     <packaging>jar</packaging>
     <name>pharos</name>
     <description>Pharos — code-aware search tool with BM25 + vector search and call graph analysis</description>
@@ -19,7 +19,7 @@
         <lucene.version>10.4.0</lucene.version>
         <javaparser.version>3.26.2</javaparser.version>
         <picocli.version>4.7.6</picocli.version>
-        <djl.version>0.28.0</djl.version>
+        <djl.version>0.40.0</djl.version>
         <onnxruntime.version>1.19.2</onnxruntime.version>
         <jackson.version>2.17.2</jackson.version>
         <slf4j.version>2.0.13</slf4j.version>

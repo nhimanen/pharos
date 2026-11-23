@@ -102,7 +102,8 @@ done
 
 # The JVM resolves user.home from the passwd entry, not $HOME; pin it so the registry and
 # index dirs seen by the jar are the ones under $HOME/.pharos.
-PHAROS_JVM_HOME_ARGS=("-Duser.home=$HOME" "-Dpharos.home=$HOME/.pharos")
+# OPT_OUT_TRACKING: DJL telemetry would otherwise probe the EC2 metadata endpoint.
+PHAROS_JVM_HOME_ARGS=("-Duser.home=$HOME" "-Dpharos.home=$HOME/.pharos" "-DOPT_OUT_TRACKING=true")
 
 # ── Daemon helpers ────────────────────────────────────────────────────────────
 
@@ -132,6 +133,7 @@ _restart_daemon() {
     "--add-modules" "jdk.incubator.vector"
     "-XX:+HeapDumpOnOutOfMemoryError"
     "-XX:HeapDumpPath=$PHAROS_DUMPS"
+    "-DOPT_OUT_TRACKING=true"
   )
   if [ -n "${PHAROS_HEAP:-}" ]; then
     JVM_ARGS=("-Xmx${PHAROS_HEAP}" "${JVM_ARGS[@]}")
@@ -473,4 +475,12 @@ echo "Done. $(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" --
 echo "  JAR:    $PHAROS_BIN/pharos.jar"
 echo "  Client: $PHAROS_BIN/pharos-cli.py"
 echo "  Path:   $LOCAL_BIN/pharos"
+# Hint only when embeddings are not configured (first line of `embeddings status`).
+EMB_STATE="$(java "${PHAROS_JVM_HOME_ARGS[@]}" -jar "$PHAROS_BIN/pharos.jar" embeddings status 2>/dev/null | head -1 || true)"
+case "$EMB_STATE" in
+  "Semantic search: off"*)
+    echo ""
+    echo "Semantic search is off; enable with \`pharos embeddings enable\`."
+    ;;
+esac
 exit "$UP_RC"

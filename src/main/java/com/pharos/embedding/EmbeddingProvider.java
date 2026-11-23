@@ -44,6 +44,37 @@ public interface EmbeddingProvider {
      */
     float[] embed(String text);
 
+    /** Prepends {@code prefix} to non-blank text; null/blank text and empty prefixes pass through. */
+    static String withPrefix(String prefix, String text) {
+        if (prefix == null || prefix.isEmpty() || text == null || text.isBlank()) return text;
+        return prefix + text;
+    }
+
+    /** Applies {@link #withPrefix} to every element. */
+    static List<String> withPrefix(String prefix, List<String> texts) {
+        if (prefix == null || prefix.isEmpty() || texts == null) return texts;
+        List<String> out = new ArrayList<>(texts.size());
+        for (String t : texts) out.add(withPrefix(prefix, t));
+        return out;
+    }
+
+    /**
+     * Embed a search query. Providers that use a query prefix apply it here; callers
+     * never add prefixes. Defaults to {@link #embed}.
+     */
+    default float[] embedQuery(String query) {
+        return embed(query);
+    }
+
+    /**
+     * Embed one document/chunk. Providers that use a document prefix apply it here.
+     * Defaults to {@link #embed}. {@link #embedBatch} and {@link #embedChunked} are
+     * document-side too.
+     */
+    default float[] embedDocument(String document) {
+        return embed(document);
+    }
+
     /**
      * Embed multiple texts in one call, returning one vector per input.
      *
@@ -123,7 +154,8 @@ public interface EmbeddingProvider {
             case "djl":
                 return new DjlEmbeddingProvider(
                         cfg.getModelId(), cfg.getUrl(),
-                        cfg.getDimensions(), cfg.getMaxTokens());
+                        cfg.getDimensions(), cfg.getMaxTokens(),
+                        cfg.getPooling(), cfg.getQueryPrefix(), cfg.getDocumentPrefix());
             case "openai":
                 return new OpenAiHttpEmbeddingProvider(cfg);
             default:
@@ -157,6 +189,10 @@ public interface EmbeddingProvider {
         for (int i = 0; i < candidates.size(); i++) {
             EmbeddingProviderConfig candidate = candidates.get(i);
             try {
+                if (i > 0) {
+                    candidate.inheritRuntimeSettings(cfg);
+                    candidate.validate();
+                }
                 EmbeddingProvider provider = createOne(candidate);
                 if (i == 0) {
                     log.debug("Embedding provider '{}' resolved via primary runtime ({} @ {}).",
@@ -190,7 +226,7 @@ public interface EmbeddingProvider {
         List<EmbeddingProviderConfig> cfgs = config.getEmbeddingProviders();
         if (cfgs == null || cfgs.isEmpty()) {
             log.info("No embedding providers configured — vector search disabled. " +
-                    "Add an entry to 'embeddingProviders' in ~/.pharos/config.json to enable.");
+                    "Run `pharos embeddings enable` to turn on semantic search.");
             return List.of();
         }
         // Lazy: the model is loaded the first time something embeds (or asks isAvailable()),
