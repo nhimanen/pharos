@@ -108,8 +108,9 @@ class AdaptiveOversampleTest {
         }
 
         @Test
-        void hybridReranked_returnsZero() throws Exception {
-            assertEquals(0, oversample(SearchRequest.SearchType.HYBRID_RERANKED, "some query"));
+        void hybridReranked_matchesHybridOversample() throws Exception {
+            assertEquals(3, oversample(SearchRequest.SearchType.HYBRID_RERANKED, "some query"));
+            assertEquals(1, oversample(SearchRequest.SearchType.HYBRID_RERANKED, "ConnectionPool"));
         }
 
         @Test

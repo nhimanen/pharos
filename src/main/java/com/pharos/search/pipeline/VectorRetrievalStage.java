@@ -21,7 +21,7 @@ public final class VectorRetrievalStage implements RetrievalStage {
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                        SearchTrace trace) throws IOException {
         long t = System.currentTimeMillis();
-        List<SearchResult> results = strategy.search(reader, req);
+        List<SearchResult> results = strategy.search(reader, req, trace);
         if (trace != null) trace.record("vector search (incl. embed)", t);
         return results;
     }

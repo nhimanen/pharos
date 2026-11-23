@@ -51,6 +51,23 @@ class EmbeddingCacheUpgradeTest {
         assertThat(IndexVersions.legacyFingerprints(noUrl)).isEmpty();
     }
 
+    @Test
+    void legacyFingerprints_emptyWhenPoolingOrPrefixDiffersFromPreUpgradeBehaviour() {
+        // Pre-upgrade pharos only ever embedded with mean pooling and no prefix: its url:dims
+        // fingerprint must not vouch for vectors under other settings.
+        EmbeddingProviderConfig cls = legacyProvider("hf://jinaai/jina-embeddings-v2-base-code", 768);
+        cls.setPooling(com.pharos.config.Pooling.CLS);
+        assertThat(IndexVersions.legacyFingerprints(cls)).isEmpty();
+
+        EmbeddingProviderConfig qp = legacyProvider("hf://jinaai/jina-embeddings-v2-base-code", 768);
+        qp.setQueryPrefix("query: ");
+        assertThat(IndexVersions.legacyFingerprints(qp)).isEmpty();
+
+        EmbeddingProviderConfig dp = legacyProvider("hf://jinaai/jina-embeddings-v2-base-code", 768);
+        dp.setDocumentPrefix("passage: ");
+        assertThat(IndexVersions.legacyFingerprints(dp)).isEmpty();
+    }
+
     // ── PersistentEmbeddingCache ─────────────────────────────────────────────
 
     @Test

@@ -289,6 +289,7 @@ public class SearchEngine {
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         List<SearchResult> primary = pipeline.execute(reader, req, trace);
+        warnings.addAll(trace.warnings());
 
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
@@ -316,7 +317,7 @@ public class SearchEngine {
                         if (i == null) {
                             try {
                                 i = embedder.isAvailable()
-                                        ? vectorStrategy.buildVectorResolver(reader, embedder.embed(snippetQuery))
+                                        ? vectorStrategy.buildVectorResolver(reader, embedder.embedQuery(snippetQuery))
                                         : SnippetResolver.none();
                             } catch (RuntimeException e) {
                                 // keyword snippets still work; don't re-embed and fail for every result
@@ -981,7 +982,7 @@ public class SearchEngine {
     private static int adaptiveOversample(SearchRequest.SearchType resolvedType, String query) {
         return switch (resolvedType) {
             case KEYWORD -> 1;
-            case HYBRID  -> queryHasCamelCase(query) ? 1 : 3;
+            case HYBRID, HYBRID_RERANKED -> queryHasCamelCase(query) ? 1 : 3;
             default      -> 0; // VECTOR, UNIFIED, HYBRID_* — handle internally
         };
     }
@@ -1094,11 +1095,16 @@ public class SearchEngine {
                 String available = embeddedModels.isEmpty()
                         ? "<legacy / none recorded>"
                         : String.join(", ", embeddedModels);
+                // `pharos embed` only adds a model next to existing vectors; a project with none
+                // (keyword-only, e.g. right after `pharos embeddings enable`) needs a full index.
+                String fullIndex = com.pharos.indexer.ReindexHint.fullIndexCommand(p, meta.getRootPath());
+                String fix = embeddedModels.isEmpty()
+                        ? fullIndex
+                        : "pharos embed --model=" + modelId + " " + p + " (or " + fullIndex + ")";
                 throw new VectorModelUnavailableException(String.format(
                         "Project '%s' has no vectors for search embedding model '%s'. " +
-                        "Available model(s): %s. " +
-                        "Run: pharos embed --model=%s %s",
-                        p, modelId, available, modelId, p));
+                        "Available model(s): %s. Run: %s",
+                        p, modelId, available, fix));
             }
         }
     }
