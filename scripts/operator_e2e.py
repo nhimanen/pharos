@@ -27,6 +27,11 @@ Phases (E2E_PHASES, comma-separated, default all, in this order):
   preflight   spec.version changes with a tampered bucket: format 999 -> PreflightRefused (Job failed
               by its podFailurePolicy), an unreadable manifest -> PreflightFailed; no workload changes
   upgrade     the bucket restored, a version change rolls readers, writers, router in that order
+  reshard     `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` in a writer pod: the
+              writer builds and flips it; /cluster/status lists alpha as one published project on two
+              ring shards with the same docCount, the operator's ProjectsPublished stays True throughout
+              and its status carries that docCount, and every query's top-10 matches a fresh
+              single-node reference indexed at the current commits
   secrets     no token or MinIO key in any non-Secret object (-o yaml), Event, or the operator's logs
   reapply     kubectl delete of the PharosCluster keeps the MinIO PVC and credentials Secret (no owner
               reference); the same cluster applied again adopts them and answers every query as before
@@ -72,7 +77,7 @@ V_REFUSED, V_FAILED, V_UPGRADE = (os.environ.get("E2E_VERSION_REFUSED", "1.4.2-e
 MC_IMAGE = os.environ.get("E2E_MC_IMAGE", "docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z")
 OUT = Path(os.environ.get("E2E_OUT", "e2e-out"))
 PHASES_ALL = ["fixture", "cluster", "ready", "infra", "reference", "load", "scaledown", "takeover",
-              "writerdown", "generations", "preflight", "upgrade", "secrets", "reapply", "teardown"]
+              "writerdown", "generations", "preflight", "upgrade", "reshard", "secrets", "reapply", "teardown"]
 
 # E2E_EMBEDDINGS=<model> (operator-e2e.sh --with-embeddings): the vector run. One writer and one reader
 # that download the model on first start; beta is embedded, alpha stays --no-embed.
@@ -878,14 +883,15 @@ def phase_infra():
         check(f"sts {comp}: applied by server-side apply (field managers {managers})", bool(managers))
 
 
-def phase_reference():
+def reference_node(name="e2e-ref"):
+    """A single-node pharos pod (and NodePort Service) indexing the repos' current commits; its base URL."""
     image = f"{IMAGE_REPO}:{VERSION}"
     clone = " && ".join(f"git clone -q {GIT_URL}/{n}.git /data/src/{n}" for n, _ in PROJECTS)
     index = " && ".join(f"pharos-entrypoint index /data/src/{n} --project {n}"
                         + ("" if EMBEDDINGS and e else " --no-embed") for n, e in PROJECTS)
-    ref = pod("e2e-ref", image, ["sh", "-c", f"export HOME=/tmp; mkdir -p /data/src && {clone} && {index} "
-                                             "&& exec pharos-entrypoint"],
-              labels={"app": "e2e-ref"},
+    ref = pod(name, image, ["sh", "-c", f"export HOME=/tmp; mkdir -p /data/src && {clone} && {index} "
+                                        "&& exec pharos-entrypoint"],
+              labels={"app": name},
               env=[{"name": "PHAROS_ROLE", "value": "all"}, {"name": "PHAROS_HOME", "value": "/data/pharos"},
                    {"name": "PHAROS_CONFIG", "value": "/etc/ref/config.json" if EMBEDDINGS else "/data/none.json"}],
               volumes=[{"name": "data", "emptyDir": {}}, {"name": "tmp", "emptyDir": {}}]
@@ -905,10 +911,14 @@ def phase_reference():
         {"requests": {"cpu": "500m", "memory": "1536Mi"}, "limits": {"memory": "4Gi"}} if EMBEDDINGS
         else {"requests": {"cpu": "200m", "memory": "512Mi"}, "limits": {"memory": "900Mi"}})
     apply(ref)
-    apply({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "e2e-ref", "namespace": NS},
-           "spec": {"type": "NodePort", "selector": {"app": "e2e-ref"}, "ports": [{"port": 7070, "targetPort": 7070}]}})
-    wait_for("the reference node", lambda: "e2e-ref" in ready_names(), 1800 if EMBEDDINGS else 600, 5)
-    ST.ref_base = f"http://{minikube_ip()}:{node_port('e2e-ref')}"
+    apply({"apiVersion": "v1", "kind": "Service", "metadata": {"name": name, "namespace": NS},
+           "spec": {"type": "NodePort", "selector": {"app": name}, "ports": [{"port": 7070, "targetPort": 7070}]}})
+    wait_for(f"the reference node {name}", lambda: name in ready_names(), 1800 if EMBEDDINGS else 600, 5)
+    return f"http://{minikube_ip()}:{node_port(name)}"
+
+
+def phase_reference():
+    ST.ref_base = reference_node()
     same = differ = empty = 0
     for q, project in QUERIES:
         r = search(ST.ref_base, q, project)
@@ -1294,6 +1304,81 @@ def phase_upgrade():
           f"{differ} differ of {len(answers)}")
 
 
+RESHARD_PROJECT = "alpha"
+RESHARD_SPEC = "[project, ring(path, shards=2)]"
+
+
+def status_project(status, project):
+    return next((p for p in status.get("projects") or [] if p.get("project") == project), None)
+
+
+def phase_reshard():
+    """Integration step: a live reshard under the operator (P6-R15: the operator reads projects[])."""
+    p = RESHARD_PROJECT
+    before = status_project(cluster_status(), p)
+    check(f"reshard: {p} starts unsplit and published", before and before.get("specVersion") is None
+          and before.get("published") and len(before.get("shards") or []) == 1, json.dumps(before)[:300])
+    writer = ready_pods("writer")[0]
+    out = pod_exec(writer, f"JAVA_OPTS=-Xmx256m pharos-entrypoint reshard {p} --spec '{RESHARD_SPEC}'",
+                   container="pharos", timeout=240)
+    log(out.strip().splitlines()[-1] if out.strip() else "(no output)")
+    check(f"reshard: requested in writer pod {writer}", f"requested: project {p}" in out, out.strip()[-300:])
+
+    seen = {"phases": [], "unpublished": []}
+
+    def flipped():
+        c = cluster()
+        cond = condition(c, "ProjectsPublished")
+        if cond.get("status") != "True":
+            seen["unpublished"].append(cond.get("message", ""))
+        st = cluster_status()
+        cur = status_project(st, p)
+        if not cur:
+            return None
+        phase = (cur.get("reshard") or {}).get("phase")
+        if phase and (not seen["phases"] or seen["phases"][-1] != phase):
+            seen["phases"].append(phase)
+            log(f"reshard {p}: {phase} ({json.dumps(cur.get('reshard'))[:200]})")
+        done = (cur.get("specVersion") is not None and (cur.get("spec") or "").startswith("[project, ring(path, shards=2")
+                and cur.get("published") and not cur.get("staged") and len(cur.get("shards") or []) == 2
+                and (cur.get("reshard") is None or (cur.get("reshard") or {}).get("phase") == "flipped"))
+        return cur if done else None
+    try:
+        after = wait_for(f"{p} flipped to {RESHARD_SPEC}", flipped, 900, 5)
+    except Abort:
+        log("reshard at timeout: " + json.dumps(status_project(cluster_status(), p))[:2000])
+        raise
+    check(f"reshard: /cluster/status lists {p} once, published, on 2 ring shards with the same docCount",
+          after["published"] and after.get("docCount") == before.get("docCount")
+          and all("~ring=" in sh for sh in after["shards"]),
+          f"shards {after['shards']}, docCount {before.get('docCount')} -> {after.get('docCount')}, phases {seen['phases']}")
+
+    def operator_sees():
+        c = cluster()
+        mine = next((x for x in (c.get("status") or {}).get("projects") or [] if x.get("name") == p), None)
+        cond = condition(c, "ProjectsPublished")
+        return (c, mine) if mine and mine.get("generation") is not None and mine.get("docCount") == after.get("docCount") \
+            and cond.get("status") == "True" else None
+    c, mine = wait_for("the operator's status of the split project", operator_sees, 300, 5)
+    check(f"reshard: the operator reports {p} published with the summed docCount (projects[], P6-R15)", True,
+          f"generation {mine.get('generation')}, docCount {mine.get('docCount')}")
+    check("reshard: ProjectsPublished stayed True during the reshard", not seen["unpublished"],
+          f"{seen['unpublished'][:3]}")
+
+    ref = reference_node("e2e-ref2")
+    differ = 0
+    for q, project in QUERIES:
+        r = search(ref, q, project)
+        got = search(router_base(), q, project)
+        if r != got:
+            differ += 1
+            log(f"MISMATCH after reshard [{project}] {q!r}\n   reference: {r}\n   cluster:   {got}")
+    check("reshard: top-10 of every query identical to a single-node reference at the current commits",
+          differ == 0, f"{differ} differ of {len(QUERIES)}")
+    kubectl("delete", "pod", "e2e-ref2", "--wait=false", check_rc=False)
+    kubectl("delete", "service", "e2e-ref2", "--wait=false", check_rc=False)
+
+
 def load_secrets():
     for secret, keys in ((f"{NAME}-token", ["token"]), (f"{NAME}-minio", ["accessKey", "secretKey"])):
         s = get_or_none("secret", secret)
@@ -1398,9 +1483,9 @@ def phase_teardown():
     kubectl("delete", "pharoscluster", NAME, "--wait=true", "--timeout=180s", check_rc=False, timeout=200)
     kubectl("delete", "pod,service,configmap", "-l", "app.kubernetes.io/part-of=pharos-e2e", "--wait=false",
             check_rc=False)
-    kubectl("delete", "pod", "e2e-git", "e2e-mc", "e2e-probe", "e2e-ref", "--wait=false", "--ignore-not-found",
+    kubectl("delete", "pod", "e2e-git", "e2e-mc", "e2e-probe", "e2e-ref", "e2e-ref2", "--wait=false", "--ignore-not-found",
             check_rc=False)
-    kubectl("delete", "service", "e2e-git", "e2e-ref", "--ignore-not-found", check_rc=False)
+    kubectl("delete", "service", "e2e-git", "e2e-ref", "e2e-ref2", "--ignore-not-found", check_rc=False)
     kubectl("delete", "configmap", "e2e-fixture-files", "e2e-fixture-scripts", "e2e-ref-config", "--ignore-not-found",
             check_rc=False)
 
