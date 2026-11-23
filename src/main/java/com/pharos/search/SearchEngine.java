@@ -127,6 +127,32 @@ public class SearchEngine {
      */
     private final java.util.function.Supplier<PipelineFactory.Result> builtPipelines;
 
+    /** Where the search-time models stand; see {@link #warmUpInBackground()}. */
+    public enum ModelState {
+        /** No embedding model is configured: keyword search only, nothing to load. */
+        NONE,
+        /** Configured and not loaded yet (or the warm-up has not run). */
+        LOADING,
+        READY,
+        /** The configured model could not be loaded: vector search is unavailable. */
+        FAILED
+    }
+
+    /**
+     * How a warm-up settled.
+     *
+     * @param failure why the model is unavailable (FAILED), else null
+     * @param millis  time from the start of the warm-up
+     */
+    public record ModelWarmup(ModelState state, String failure, long millis) {}
+
+    /** True when an embedding model is configured (a bare no-op provider means none is). */
+    private final boolean modelConfigured;
+    private final java.util.concurrent.CompletableFuture<ModelWarmup> warmup =
+            new java.util.concurrent.CompletableFuture<>();
+    private volatile ModelState modelState;
+    private volatile String modelFailure;
+
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry) {
         this(luceneIndexer, embedder, registry, new NoOpCrossEncoder(), new FstQueryClassifier());
@@ -144,6 +170,8 @@ public class SearchEngine {
         this.registry      = registry;
         this.embedder      = embedder;
         this.queryRouter   = queryRouter;
+        this.modelConfigured = !(embedder instanceof com.pharos.embedding.NoOpEmbeddingProvider);
+        this.modelState = modelConfigured ? ModelState.LOADING : ModelState.NONE;
 
         KeywordSearchStrategy kw  = new KeywordSearchStrategy();
         this.keywordStrategy = kw;
@@ -214,6 +242,9 @@ public class SearchEngine {
         }
 
         List<String> warnings = new ArrayList<>();
+        if (modelState == ModelState.FAILED && requiresVectors(req.type())) {
+            warnings.add("vector search unavailable: " + modelFailure + "; vector results are missing");
+        }
         List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) {
             if (warnings.isEmpty()) {
@@ -828,21 +859,82 @@ public class SearchEngine {
      * first search does not wait for the multi-second model load. One-shot CLI commands don't
      * call this and never load models they don't use. A search arriving mid-warm-up waits for
      * the same one-time load rather than starting a second one.
+     *
+     * <p>{@link #modelWarmup()} completes when it settles. A configured model that does not load
+     * is logged at ERROR and settles as {@link ModelState#FAILED}: the node still becomes ready,
+     * and vector searches carry a warning instead of silently returning nothing.
      */
     public Thread warmUpInBackground() {
         Thread t = new Thread(() -> {
             long t0 = System.nanoTime();
+            ModelWarmup result;
             try {
                 builtPipelines.get();                       // isAvailable() → loads embedder + cross-encoder
-                if (embedder.isAvailable()) embedder.embed("warm up");   // first ONNX run initialises the session
-                log.info("Search models ready ({} ms)", (System.nanoTime() - t0) / 1_000_000);
+                if (!modelConfigured) {
+                    result = new ModelWarmup(ModelState.NONE, null, elapsedMs(t0));
+                } else if (!embedder.isAvailable()) {
+                    result = new ModelWarmup(ModelState.FAILED, "embedding model '" + embedder.modelId()
+                            + "' failed to load", elapsedMs(t0));
+                } else {
+                    embedder.embed("warm up");              // first ONNX run initialises the session
+                    result = new ModelWarmup(ModelState.READY, null, elapsedMs(t0));
+                }
             } catch (Throwable e) {
-                log.warn("Model warm-up failed: {}", e.toString());
+                result = new ModelWarmup(modelConfigured ? ModelState.FAILED : ModelState.NONE,
+                        modelConfigured ? "embedding model '" + embedder.modelId() + "' failed to load: " + e
+                                : null, elapsedMs(t0));
+                if (!modelConfigured) log.warn("Model warm-up failed: {}", e.toString());
             }
+            settle(result);
         }, "pharos-model-warmup");
         t.setDaemon(true);
         t.start();
         return t;
+    }
+
+    private void settle(ModelWarmup result) {
+        modelFailure = result.failure();
+        modelState = result.state();
+        if (result.state() == ModelState.FAILED) {
+            log.error("SEARCH MODEL UNAVAILABLE after {} ms: {}. Vector and hybrid search answer without vectors"
+                    + " (each such search carries a warning); keyword search is unaffected.",
+                    result.millis(), result.failure());
+        } else {
+            log.info("Search models ready ({} ms)", result.millis());
+        }
+        warmup.complete(result);
+    }
+
+    private static long elapsedMs(long t0) {
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    /** Completes when {@link #warmUpInBackground()} has settled; never completes if it never runs. */
+    public java.util.concurrent.CompletableFuture<ModelWarmup> modelWarmup() {
+        return warmup;
+    }
+
+    /**
+     * {@link #modelWarmup()}, or after {@code max} a {@link ModelState#FAILED} result naming the
+     * timeout (logged at ERROR), so a hanging load can never hold a node's readiness forever. The
+     * load itself keeps running and the engine's {@link #modelState()} follows it.
+     */
+    public java.util.concurrent.CompletableFuture<ModelWarmup> modelsSettled(java.time.Duration max) {
+        java.util.concurrent.CompletableFuture<ModelWarmup> out = new java.util.concurrent.CompletableFuture<>();
+        warmup.whenComplete((r, e) -> out.complete(r));
+        java.util.concurrent.CompletableFuture.delayedExecutor(max.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                .execute(() -> {
+                    if (out.complete(new ModelWarmup(ModelState.FAILED, "model warm-up timed out after "
+                            + max.toMillis() / 1000.0 + " s", max.toMillis()))) {
+                        log.error("SEARCH MODEL WARM-UP TIMED OUT after {} s: becoming ready anyway; searches that"
+                                + " need the model wait for it until it loads", max.toMillis() / 1000.0);
+                    }
+                });
+        return out;
+    }
+
+    public ModelState modelState() {
+        return modelState;
     }
 
     /** Thread-safe, compute-once supplier. */

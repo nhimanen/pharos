@@ -229,6 +229,21 @@ class EmbeddingsCommandTest {
     }
 
     @Test
+    void statusOnALazyReaderGenerationSaysUnknownInsteadOfProbingLocalFiles() throws Exception {
+        run("enable");
+        out.reset();
+        ProjectMeta m = VectorIndexFixture.register(registry, home, "lazyshard", "vec.granite-r2");
+        // A lazy reader generation dir: the marker says most Lucene files live on the bucket.
+        Files.createFile(Path.of(m.getIndexPath()).resolve(com.pharos.cluster.warm.LazyGenerations.MARKER));
+        assertThat(run("status")).isZero();
+        String o = out.toString();
+        assertThat(o).containsPattern("lazyshard\\s+unknown \\(lazy reader");
+        assertThat(o).doesNotContain("pharos index --full --single --project lazyshard");
+        assertThat(com.pharos.indexer.LegacyVectorFields.hasLiveVectors(
+                Path.of(m.getIndexPath()).resolve("lucene"), "vec.granite-r2")).isFalse();
+    }
+
+    @Test
     void enableJinaOnEquivalentJinaSetupIsAlreadyConfigured() throws Exception {
         String[] equivalent = {
                 // old single-key config (the user's own form)

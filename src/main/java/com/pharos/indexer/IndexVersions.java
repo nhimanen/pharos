@@ -52,9 +52,11 @@ public final class IndexVersions {
      *       to the sibling equation clause(s) instead of stopping at the signature line</li>
      *   <li>3 — added Terraform (.tf) parsing via TerraformCodeParser</li>
      *   <li>4 — added Go (.go) parsing via GoCodeParser</li>
+     *   <li>5 — a class document's synthesized body is its own file's when two files yield one qualified name
+     *       (a Python module and a non-code file of the same path stem); it was whichever file came first</li>
      * </ul>
      */
-    public static final int CHUNKING_VERSION = 4;
+    public static final int CHUNKING_VERSION = 5;
 
     /**
      * Fingerprint for a single embedding provider — includes everything that

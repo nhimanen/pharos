@@ -26,6 +26,10 @@
     <logger name="com.pharos.cluster" level="INFO" additivity="false">
         <appender-ref ref="CLUSTER"/>
     </logger>
+    <!-- Phase 2 gate: "Search models ready (N ms)" times the background model warm-up. -->
+    <logger name="com.pharos.search.SearchEngine" level="INFO" additivity="false">
+        <appender-ref ref="CLUSTER"/>
+    </logger>
     <logger name="com.github.javaparser" level="ERROR"/>
     <logger name="org.jgrapht" level="WARN"/>
     <logger name="ai.djl" level="WARN"/>

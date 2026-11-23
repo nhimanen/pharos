@@ -1,5 +1,6 @@
 package com.pharos.cluster.objectstore;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -24,6 +25,7 @@ public class InMemoryObjectStore implements ObjectStore {
 
     private final Map<String, Entry> map = new ConcurrentHashMap<>();
     private final Set<String> failSubstrings = ConcurrentHashMap.newKeySet();
+    private final Set<String> midBodyFailSubstrings = ConcurrentHashMap.newKeySet();
     private final Clock clock;
 
     public InMemoryObjectStore() { this(Clock.systemUTC()); }
@@ -33,8 +35,11 @@ public class InMemoryObjectStore implements ObjectStore {
     /** Makes any later {@code download} whose key contains {@code keySubstring} throw IOException. */
     public void failOn(String keySubstring) { failSubstrings.add(keySubstring); }
 
+    /** Makes any later {@code downloadRange} whose key contains {@code keySubstring} fail after writing part of the body. */
+    public void failMidBodyOn(String keySubstring) { midBodyFailSubstrings.add(keySubstring); }
+
     /** Removes all failure hooks. */
-    public void clearFailures() { failSubstrings.clear(); }
+    public void clearFailures() { failSubstrings.clear(); midBodyFailSubstrings.clear(); }
 
     private Entry newEntry(byte[] data) {
         return new Entry(data.clone(), "\"" + UUID.randomUUID() + "\"", clock.instant());
@@ -62,6 +67,43 @@ public class InMemoryObjectStore implements ObjectStore {
         } finally {
             Files.deleteIfExists(tmp);
         }
+    }
+
+    @Override
+    public void downloadRange(String key, long offset, long length, Path target) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
+        Entry e = map.get(key);
+        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (end > e.data().length) {
+            throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
+        }
+        Path abs = target.toAbsolutePath();
+        Files.createDirectories(abs.getParent());
+        Path tmp = Files.createTempFile(abs.getParent(), abs.getFileName().toString(), ".part");
+        try {
+            byte[] slice = java.util.Arrays.copyOfRange(e.data(), (int) offset, (int) end);
+            for (String s : midBodyFailSubstrings) {
+                if (key.contains(s)) {
+                    Files.write(tmp, java.util.Arrays.copyOf(slice, slice.length / 2));
+                    throw new IOException("injected mid-body failure for key: " + key);
+                }
+            }
+            Files.write(tmp, slice);
+            Files.move(tmp, abs, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Override
+    public java.io.InputStream openRange(String key, long offset, long length) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
+        Entry e = map.get(key);
+        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (end > e.data().length) {
+            throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
+        }
+        return new java.io.ByteArrayInputStream(e.data(), (int) offset, (int) length);
     }
 
     @Override

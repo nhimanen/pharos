@@ -3,6 +3,7 @@ package com.pharos.cli;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.pharos.PharosVersion;
+import com.pharos.cluster.ClusterRuntime;
 import com.pharos.cluster.NodeRole;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -20,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
@@ -40,6 +42,7 @@ public class IndexStatusCommand implements Callable<Integer> {
     private final ProjectRegistry registry;
     private final NodeRole role;
     private final boolean embeddingsConfigured;
+    private final Supplier<Map<String, Object>> readerCache;
 
     /** For callers that do not know the config: reports {@code needsReembed} as if embeddings were on. */
     public IndexStatusCommand(ProjectRegistry registry) {
@@ -51,7 +54,15 @@ public class IndexStatusCommand implements Callable<Integer> {
      *             (setup.sh) do not advise {@code upgrade-indexes} on a reader, which refuses it
      */
     public IndexStatusCommand(ProjectRegistry registry, NodeRole role) {
-        this(registry, role, true);
+        this(registry, role, true, null);
+    }
+
+    /**
+     * @param readerCache this process's block cache stats ({@code ClusterRuntime#readerCacheStats}),
+     *                    reported as {@code readerCache}; null, or returning null, on anything but a lazy reader
+     */
+    public IndexStatusCommand(ProjectRegistry registry, NodeRole role, Supplier<Map<String, Object>> readerCache) {
+        this(registry, role, true, readerCache);
     }
 
     /**
@@ -59,13 +70,19 @@ public class IndexStatusCommand implements Callable<Integer> {
      *                             re-embeds, so {@code needsReembed} is always false
      */
     public IndexStatusCommand(ProjectRegistry registry, boolean embeddingsConfigured) {
-        this(registry, NodeRole.ALL, embeddingsConfigured);
+        this(registry, NodeRole.ALL, embeddingsConfigured, null);
     }
 
     public IndexStatusCommand(ProjectRegistry registry, NodeRole role, boolean embeddingsConfigured) {
+        this(registry, role, embeddingsConfigured, null);
+    }
+
+    public IndexStatusCommand(ProjectRegistry registry, NodeRole role, boolean embeddingsConfigured,
+                              Supplier<Map<String, Object>> readerCache) {
         this.registry = registry;
         this.role = role;
         this.embeddingsConfigured = embeddingsConfigured;
+        this.readerCache = readerCache;
     }
 
     @Override
@@ -92,12 +109,14 @@ public class IndexStatusCommand implements Callable<Integer> {
             rows.add(r);
         }
 
+        Map<String, Object> cache = readerCache == null ? null : readerCache.get();
         if (json) {
             Map<String, Object> top = new LinkedHashMap<>();
             top.put("requiredFormat", IndexVersions.INDEX_FORMAT);
             top.put("minReadableFormat", IndexFormat.MIN_READABLE_FORMAT);
             top.put("pharosVersion", PharosVersion.get());
             top.put("role", role.json());
+            if (cache != null) top.put("readerCache", cache);
             top.put("projects", rows);
             System.out.println(new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
                     .writeValueAsString(top));
@@ -106,6 +125,7 @@ public class IndexStatusCommand implements Callable<Integer> {
 
         System.out.printf("pharos %s  (index format %d; reads %d-%d)%n", PharosVersion.get(),
                 IndexVersions.INDEX_FORMAT, IndexFormat.MIN_READABLE_FORMAT, IndexVersions.INDEX_FORMAT);
+        if (cache != null) System.out.println(ClusterRuntime.readerCacheLine(cache));
         if (rows.isEmpty()) {
             System.out.println("No projects indexed.");
             return 0;

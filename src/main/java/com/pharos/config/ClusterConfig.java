@@ -25,6 +25,7 @@ public class ClusterConfig {
     private int retentionGenerations = 3;
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
+    private ReaderConfig reader = new ReaderConfig();
 
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
@@ -72,7 +73,10 @@ public class ClusterConfig {
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
         }
+        if (reader == null) reader = new ReaderConfig();
+        reader.validate();
         if (backend == BackendKind.OBJECT_STORE) {
+            objectStore.validate();
             String prefix = objectStore.getPrefix();
             if (prefix != null && !prefix.isEmpty()) {
                 if (prefix.startsWith("/")) {
@@ -104,6 +108,94 @@ public class ClusterConfig {
     public void setRetentionMinutes(int v) { this.retentionMinutes = v; }
     public ObjectStoreConfig getObjectStore() { return objectStore; }
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
+    public ReaderConfig getReader() { return reader; }
+    public void setReader(ReaderConfig reader) { this.reader = reader; }
+
+    /**
+     * {@code cluster.reader}: how a reader node serves a generation. {@code lazy} (the default) keeps
+     * only the small Lucene files on disk and reads the rest in blocks through a size-capped local
+     * cache; {@code full} copies every file, as before Phase 2. Only reader nodes use it.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class ReaderConfig {
+        public static final String LAZY = "lazy";
+        public static final String FULL = "full";
+        static final long MIN_BLOCK = 64L * 1024;
+        static final long MAX_BLOCK = 64L * 1024 * 1024;
+
+        private String mode = LAZY;
+        private long cacheMaxBytes = 8L << 30;
+        private long blockSizeBytes = 8L << 20;
+        private long eagerMaxBytes = 1L << 20;
+        private java.util.List<String> prefetchExtensions = java.util.List.of("tip", "tmd", "tim", "vex", "vem");
+        private int prefetchTimeoutSeconds = 30;
+        private int maxConcurrentFetches = 16;
+        /** Cap of a private block cache (a second process on the cache dir); 0 derives it. */
+        private long privateCacheMaxBytes = 0;
+
+        /** @throws IllegalStateException naming the offending field */
+        public void validate() {
+            if (!LAZY.equals(mode) && !FULL.equals(mode)) {
+                throw new IllegalStateException("cluster.reader.mode must be 'lazy' or 'full', got '" + mode + "'");
+            }
+            if (blockSizeBytes < MIN_BLOCK || blockSizeBytes > MAX_BLOCK || Long.bitCount(blockSizeBytes) != 1) {
+                throw new IllegalStateException("cluster.reader.blockSizeBytes must be a power of two between "
+                        + MIN_BLOCK + " (64 KiB) and " + MAX_BLOCK + " (64 MiB), got " + blockSizeBytes);
+            }
+            if (cacheMaxBytes / 4 < blockSizeBytes) {
+                throw new IllegalStateException("cluster.reader.cacheMaxBytes must be at least 4 x"
+                        + " cluster.reader.blockSizeBytes (" + 4 * blockSizeBytes + "), got " + cacheMaxBytes);
+            }
+            if (eagerMaxBytes < 0) {
+                throw new IllegalStateException("cluster.reader.eagerMaxBytes must not be negative, got " + eagerMaxBytes);
+            }
+            if (prefetchExtensions == null || prefetchExtensions.stream().anyMatch(e -> e == null || e.isBlank())) {
+                throw new IllegalStateException("cluster.reader.prefetchExtensions must be a list of file extensions"
+                        + " (e.g. [\"tip\", \"tim\"]), got " + prefetchExtensions);
+            }
+            if (prefetchTimeoutSeconds < 0) {
+                throw new IllegalStateException("cluster.reader.prefetchTimeoutSeconds must not be negative, got "
+                        + prefetchTimeoutSeconds);
+            }
+            if (privateCacheMaxBytes < 0 || (privateCacheMaxBytes > 0 && privateCacheMaxBytes / 4 < blockSizeBytes)) {
+                throw new IllegalStateException("cluster.reader.privateCacheMaxBytes must be 0 (derived) or at least"
+                        + " 4 x cluster.reader.blockSizeBytes (" + 4 * blockSizeBytes + "), got " + privateCacheMaxBytes);
+            }
+            if (maxConcurrentFetches < 1) {
+                throw new IllegalStateException("cluster.reader.maxConcurrentFetches must be at least 1, got "
+                        + maxConcurrentFetches);
+            }
+        }
+
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        public boolean isLazy() { return LAZY.equals(mode); }
+
+        public String getMode() { return mode; }
+        public void setMode(String mode) { this.mode = mode; }
+        public long getCacheMaxBytes() { return cacheMaxBytes; }
+        public void setCacheMaxBytes(long v) { this.cacheMaxBytes = v; }
+        public long getBlockSizeBytes() { return blockSizeBytes; }
+        public void setBlockSizeBytes(long v) { this.blockSizeBytes = v; }
+        public long getEagerMaxBytes() { return eagerMaxBytes; }
+        public void setEagerMaxBytes(long v) { this.eagerMaxBytes = v; }
+        public java.util.List<String> getPrefetchExtensions() { return prefetchExtensions; }
+        public void setPrefetchExtensions(java.util.List<String> v) { this.prefetchExtensions = v; }
+        public int getPrefetchTimeoutSeconds() { return prefetchTimeoutSeconds; }
+        public void setPrefetchTimeoutSeconds(int v) { this.prefetchTimeoutSeconds = v; }
+        public int getMaxConcurrentFetches() { return maxConcurrentFetches; }
+        public long getPrivateCacheMaxBytes() { return privateCacheMaxBytes; }
+        public void setPrivateCacheMaxBytes(long v) { this.privateCacheMaxBytes = v; }
+
+        /**
+         * The cap of a private block cache: {@code privateCacheMaxBytes}, or when 0
+         * {@code min(cacheMaxBytes, max(4 blocks, cacheMaxBytes / 8))}.
+         */
+        public long effectivePrivateCacheMaxBytes() {
+            if (privateCacheMaxBytes > 0) return privateCacheMaxBytes;
+            return Math.min(cacheMaxBytes, Math.max(4 * blockSizeBytes, cacheMaxBytes / 8));
+        }
+        public void setMaxConcurrentFetches(int v) { this.maxConcurrentFetches = v; }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ObjectStoreConfig {
@@ -114,6 +206,35 @@ public class ClusterConfig {
         private boolean pathStyle = true;
         private String accessKeyEnv;
         private String secretKeyEnv;
+        /**
+         * Bound of one attempt of a reader's ranged read (and the HTTP client's connect and idle-read
+         * timeouts); a whole call, retries included, gets {@value #READ_ATTEMPTS} times this.
+         */
+        private int readTimeoutSeconds = 10;
+
+        static final int READ_ATTEMPTS = 3;
+        static final int MAX_READ_TIMEOUT_SECONDS = 3600;
+
+        /** @throws IllegalStateException naming the offending field */
+        void validate() {
+            if (readTimeoutSeconds < 1 || readTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.readTimeoutSeconds must be between 1 and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + readTimeoutSeconds);
+            }
+        }
+
+        public int getReadTimeoutSeconds() { return readTimeoutSeconds; }
+        public void setReadTimeoutSeconds(int v) { this.readTimeoutSeconds = v; }
+
+        /** One attempt of a ranged read: {@code readTimeoutSeconds}. */
+        public java.time.Duration readAttemptTimeout() {
+            return java.time.Duration.ofSeconds(readTimeoutSeconds);
+        }
+
+        /** A whole ranged read, retries included (and a block-cache waiter): 3 × {@code readTimeoutSeconds}. */
+        public java.time.Duration readTotalTimeout() {
+            return java.time.Duration.ofSeconds((long) READ_ATTEMPTS * readTimeoutSeconds);
+        }
 
         public String getEndpoint() { return endpoint; }
         public void setEndpoint(String endpoint) { this.endpoint = endpoint; }

@@ -7,6 +7,7 @@ import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ShardId;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
@@ -79,6 +80,16 @@ public final class ObjectStoreReplicaSource implements ReplicaSource {
     @Override
     public void download(ManifestFile file, Path target) throws IOException {
         store.download(file.key(), target);
+    }
+
+    @Override
+    public void downloadRange(ManifestFile file, long offset, long length, Path target) throws IOException {
+        store.downloadRange(file.key(), offset, length, target);
+    }
+
+    @Override
+    public InputStream openRange(ManifestFile file, long offset, long length) throws IOException {
+        return store.openRange(file.key(), offset, length);
     }
 
     @Override

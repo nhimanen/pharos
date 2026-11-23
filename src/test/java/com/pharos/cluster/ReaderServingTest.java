@@ -161,6 +161,68 @@ class ReaderServingTest {
         assertThat(ids(cluster.readerEngine, "Calculator")).isNotEmpty();
     }
 
+    /**
+     * A reader is ready, and logs "serving N shard(s)", only once its first sync is served AND its
+     * search models have loaded: the router and load balancers send traffic on that signal.
+     */
+    @Test
+    void readyWaitsForTheModelsAsWellAsTheFirstSync() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        java.util.concurrent.CompletableFuture<Void> models = new java.util.concurrent.CompletableFuture<>();
+        var log = captureRuntimeLog();
+        try {
+            cluster.readerRuntime.beginServing(models);
+            cluster.readerRuntime.awaitFirstSync();
+            assertThat(cluster.readerRuntime.ready()).as("first sync done, models still loading").isFalse();
+            assertThat(servingLines(log)).isEmpty();
+            models.complete(null);
+            assertThat(cluster.readerRuntime.ready()).isTrue();
+            assertThat(servingLines(log)).singleElement().asString().contains("serving 1 shard(s)");
+        } finally {
+            detach(log);
+        }
+    }
+
+    /** Models that settle first (loaded, failed or timed out): ready as soon as the first sync is served. */
+    @Test
+    void modelsSettledBeforeTheSyncDoNotDelayReadiness() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.beginServing(java.util.concurrent.CompletableFuture.failedFuture(
+                new IllegalStateException("model failed to load")));
+        cluster.readerRuntime.awaitFirstSync();
+        assertThat(cluster.readerRuntime.ready()).as("a failed model load never blocks readiness").isTrue();
+    }
+
+    @Test
+    void followerAlsoWaitsForTheModels() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        Reader second = secondReader(store);
+        java.util.concurrent.CompletableFuture<Void> models = new java.util.concurrent.CompletableFuture<>();
+        second.runtime().beginServing(models);
+        assertThat(second.runtime().ownsSync()).isFalse();
+        assertThat(second.runtime().ready()).isFalse();
+        models.complete(null);
+        assertThat(second.runtime().ready()).isTrue();
+    }
+
+    private static List<String> servingLines(ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> a) {
+        return a.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains(" serving ")).toList();
+    }
+
+    private static void detach(ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> a) {
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class);
+        logger.detachAppender(a);
+        logger.setLevel(null);
+    }
+
     @Test
     void nonReaderIsAlwaysReady() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
@@ -181,7 +243,9 @@ class ReaderServingTest {
     private static ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> captureRuntimeLog() {
         var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
         appender.start();
-        ((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class)).addAppender(appender);
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ClusterRuntime.class);
+        logger.addAppender(appender);
+        if (!logger.isInfoEnabled()) logger.setLevel(ch.qos.logback.classic.Level.INFO);
         return appender;
     }
 

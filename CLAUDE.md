@@ -136,6 +136,15 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 - The shade plugin **must** include `ServicesResourceTransformer` for Lucene codec SPI discovery. Removing it breaks runtime with `ServiceConfigurationError`.
 - Lucene `DirectoryReader` caching: readers are kept open across searches. When re-indexing, `LuceneIndexer` must reopen readers — verify this path when modifying indexing code.
 
+## Unsupported diagnostics switches
+
+System properties under `pharos.diag.` are for maintainers' measurements only: undocumented for
+users, unsupported, and free to change or vanish between releases. They are JVM-global.
+
+- `-Dpharos.diag.luceneDirectory=niofs` — `LuceneDirectoryFactory.DEFAULT` opens `NIOFSDirectory`
+  instead of Lucene's mmap default (the Phase 2 gate's bitwise comparison of a lazy reader against
+  a full copy). A test that sets it must restore it and must not run in parallel with others.
+
 ## Key Method FQN Format
 
 Methods are identified as: `com.example.MyClass#methodName(ParamType1,ParamType2)`

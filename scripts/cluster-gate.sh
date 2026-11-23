@@ -14,7 +14,20 @@
 #   PHAROS_HEAP       JVM heap for pharos processes (default 8g)
 #   PHAROS_INDEX_HEAP heap for the writer index runs (default $PHAROS_HEAP)
 #   PHAROS_WEB_HEAP   heap for each web daemon (default $PHAROS_HEAP)
+#   GATE_MINIO_PORT          MinIO S3 port (default 9000)
+#   GATE_MINIO_CONSOLE_PORT  MinIO console port (default 9001)
+#   GATE_WRITER_PORT         writer web port (default 7300)
+#   GATE_READER_PORT         reader web port (default 7301)
+#   GATE_PORT_PROBE_TIMEOUT  seconds to wait on each port probe and curl connect (default 2). On some
+#                            hosts (WSL behind a firewall) an unused port hangs instead of refusing;
+#                            a probe that times out counts as free.
 set -euo pipefail
+
+MINIO_PORT="${GATE_MINIO_PORT:-9000}"
+MINIO_CONSOLE_PORT="${GATE_MINIO_CONSOLE_PORT:-9001}"
+WRITER_PORT="${GATE_WRITER_PORT:-7300}"
+READER_PORT="${GATE_READER_PORT:-7301}"
+PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
 
 MINIO_BIN="${MINIO_BIN:-$HOME/.cache/pharos-gate/minio}"
 if [[ ! -x "$MINIO_BIN" ]]; then
@@ -45,8 +58,8 @@ PY
 )" || exit 2
 [[ -d "$LUCENE_SRC" ]] || { echo "cluster-gate: lucene rootPath not a directory: $LUCENE_SRC" >&2; exit 2; }
 
-for port in 9000 7300 7301; do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+for port in "$MINIO_PORT" "$MINIO_CONSOLE_PORT" "$WRITER_PORT" "$READER_PORT"; do
+  if timeout "$PROBE_TIMEOUT" bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" 2>/dev/null; then
     echo "cluster-gate: port $port is already in use (another MinIO or a pharos daemon?); refusing to start" >&2
     exit 2
   fi
@@ -84,7 +97,7 @@ write_config() {  # $1 = role, $2 = node id, $3 = pharos home
     "pollIntervalSeconds": $POLL,
     "cacheDir": "$3/cluster-cache",
     "objectStore": {
-      "endpoint": "http://127.0.0.1:9000",
+      "endpoint": "http://127.0.0.1:$MINIO_PORT",
       "region": "us-east-1",
       "bucket": "pharos-gate",
       "prefix": "pharos",
@@ -122,18 +135,18 @@ jvm() {  # $1 = heap, $2 = home dir (user.home); rest = pharos args. Always call
 }
 wait_http() {  # $1 = url, $2 = timeout seconds
   local end=$((SECONDS + $2))
-  until curl -fs -o /dev/null "$1"; do
+  until curl -fs --connect-timeout "$PROBE_TIMEOUT" --max-time 10 -o /dev/null "$1"; do
     (( SECONDS < end )) || { echo "cluster-gate: timeout waiting for $1" >&2; return 1; }
     sleep 1
   done
 }
 
 echo "== gate dir: $GATE (index heap $INDEX_HEAP, web heap $WEB_HEAP each)"
-echo "== starting MinIO on 127.0.0.1:9000"
-"$MINIO_BIN" server "$MINIO_DATA" --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
+echo "== starting MinIO on 127.0.0.1:$MINIO_PORT"
+"$MINIO_BIN" server "$MINIO_DATA" --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE_PORT" \
   > "$GATE/minio.log" 2>&1 &
 PIDS+=($!)
-wait_http http://127.0.0.1:9000/minio/health/live 60
+wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 60
 
 echo "== copying pharos sources to $PHAROS_SRC"
 mkdir -p "$PHAROS_SRC"
@@ -147,17 +160,17 @@ tail -n 5 "$GATE/writer-index-pharos.log"
   || { echo "cluster-gate: indexing lucene failed; see $GATE/writer-index-lucene.log" >&2; tail -n 20 "$GATE/writer-index-lucene.log" >&2; exit 1; }
 tail -n 5 "$GATE/writer-index-lucene.log"
 
-echo "== starting writer web :7300 and reader web :7301"
-( jvm "$WEB_HEAP" "$W_HOME" web --port 7300 --no-open ) > "$GATE/writer-web.log" 2>&1 &
+echo "== starting writer web :$WRITER_PORT and reader web :$READER_PORT"
+( jvm "$WEB_HEAP" "$W_HOME" web --port "$WRITER_PORT" --no-open ) > "$GATE/writer-web.log" 2>&1 &
 PIDS+=($!)
-( jvm "$WEB_HEAP" "$R_HOME" web --port 7301 --no-open ) > "$GATE/reader-web.log" 2>&1 &
+( jvm "$WEB_HEAP" "$R_HOME" web --port "$READER_PORT" --no-open ) > "$GATE/reader-web.log" 2>&1 &
 PIDS+=($!)
-wait_http http://127.0.0.1:7300/health 120
-wait_http http://127.0.0.1:7301/health 120
+wait_http "http://127.0.0.1:$WRITER_PORT/health" 120
+wait_http "http://127.0.0.1:$READER_PORT/health" 120
 
 echo "== waiting for the reader to materialise both projects"
 end=$((SECONDS + 900))
-until curl -fs http://127.0.0.1:7301/api/projects | python3 -I -c '
+until curl -fs --connect-timeout "$PROBE_TIMEOUT" --max-time 30 "http://127.0.0.1:$READER_PORT/api/projects" | python3 -I -c '
 import json, sys
 names = {p.get("name") for p in json.load(sys.stdin)}
 sys.exit(0 if {"pharos", "lucene"} <= names else 1)'; do
@@ -165,7 +178,7 @@ sys.exit(0 if {"pharos", "lucene"} <= names else 1)'; do
   sleep 2
 done
 # The reader binds its port before its first sync; wait until /health reports ready.
-until curl -fs http://127.0.0.1:7301/health | python3 -I -c '
+until curl -fs --connect-timeout "$PROBE_TIMEOUT" --max-time 10 "http://127.0.0.1:$READER_PORT/health" | python3 -I -c '
 import json, sys
 sys.exit(0 if json.load(sys.stdin).get("ready") else 1)'; do
   (( SECONDS < end )) || { echo "cluster-gate: reader never reported ready" >&2; exit 1; }
@@ -181,7 +194,7 @@ export GATE_POLL_INTERVAL="$POLL"
 export GATE_READER_CACHE="$R_PH/cluster-cache"
 
 rc=0
-python3 -I "$REPO/scripts/cluster_gate.py" --writer http://127.0.0.1:7300 --reader http://127.0.0.1:7301 || rc=$?
+python3 -I "$REPO/scripts/cluster_gate.py" --writer "http://127.0.0.1:$WRITER_PORT" --reader "http://127.0.0.1:$READER_PORT" || rc=$?
 
 echo "== reader cache size:"; du -sh "$R_PH/cluster-cache" || true
 echo "== MinIO bucket size:"; du -sh "$MINIO_DATA/pharos-gate" || true

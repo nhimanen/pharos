@@ -50,6 +50,9 @@ public class WebServer {
     private final ObjectMapper mapper;
     /** False while a reader's first sync is running; see {@link #setReadiness}. */
     private volatile java.util.function.BooleanSupplier readiness = () -> true;
+    private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
+    /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
+    private volatile java.util.function.Supplier<String> degradation = () -> null;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -72,23 +75,60 @@ public class WebServer {
     }
 
     /**
-     * Readiness reported by {@code /health} ({@code {"status":"syncing","ready":false}} until it
-     * turns true) and warned about on searches answered before it does.
+     * Readiness reported by {@code /health} (HTTP 503 {@code {"status":"warming","ready":false}}
+     * until it turns true) and warned about on searches answered before it does.
      */
     public void setReadiness(java.util.function.BooleanSupplier readiness) {
         this.readiness = java.util.Objects.requireNonNull(readiness, "readiness");
     }
 
-    /** Health payload: HTTP 200 either way (liveness); {@code ready} tells whether the first sync is done. */
-    Map<String, Object> health() {
-        boolean ready = readiness.getAsBoolean();
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("status", ready ? "ok" : "syncing");
-        out.put("ready", ready);
-        return out;
+    /** Reader cache stats reported by {@code /health} as {@code readerCache}; null result: omitted. */
+    public void setReaderCacheStats(java.util.function.Supplier<Map<String, Object>> stats) {
+        this.readerCacheStats = java.util.Objects.requireNonNull(stats, "stats");
     }
 
-    static final String SYNCING_WARNING = "reader is still running its first sync; results may be incomplete";
+    /**
+     * Degradation reported by {@code /health}: while it returns a reason (non-null), a ready node
+     * answers HTTP 503 {@code {"status":"degraded","reason":…}}, so routers drain it (a lazy reader
+     * whose served generation was garbage-collected on the bucket).
+     */
+    public void setDegradation(java.util.function.Supplier<String> reason) {
+        this.degradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /** One {@code /health} answer: the HTTP status and the payload, from one read of each signal. */
+    record HealthAnswer(int status, Map<String, Object> body) {}
+
+    /**
+     * {@code /health}: 200 {@code ok} when ready; 503 {@code warming} while a reader's first sync or
+     * model load runs, and 503 {@code degraded} (with a {@code reason}) while a ready reader can't
+     * serve a shard. The 503 keeps load balancers and the router from sending traffic. A client that
+     * only wants liveness treats any answer as "running". Readiness and degradation are read once.
+     */
+    HealthAnswer healthAnswer() {
+        boolean ready = readiness.getAsBoolean();
+        String degraded = ready ? degradation.get() : null;
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", !ready ? "warming" : degraded != null ? "degraded" : "ok");
+        out.put("ready", ready);
+        if (degraded != null) out.put("reason", degraded);
+        Map<String, Object> cache = readerCacheStats.get();
+        if (cache != null) out.put("readerCache", cache);
+        return new HealthAnswer(ready && degraded == null ? 200 : 503, out);
+    }
+
+    /** The {@code /health} payload; see {@link #healthAnswer}. */
+    Map<String, Object> health() {
+        return healthAnswer().body();
+    }
+
+    static final String SYNCING_WARNING =
+            "reader is still warming up (first sync or model load); results may be incomplete";
+
+    /** {@code /health}'s HTTP status (see {@link #healthAnswer}). */
+    int healthStatus() {
+        return healthAnswer().status();
+    }
 
     /** Module endpoints need the module graph, which reader nodes do not have yet: 501. */
     private boolean refuseOnReader(io.javalin.http.Context ctx) {
@@ -610,7 +650,10 @@ public class WebServer {
         });
 
         // Health check (used by daemon client to detect readiness)
-        app.get("/health", ctx -> ctx.json(health()));
+        app.get("/health", ctx -> {
+            HealthAnswer h = healthAnswer(); // status and body from the same reads
+            ctx.status(h.status()).json(h.body());
+        });
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);

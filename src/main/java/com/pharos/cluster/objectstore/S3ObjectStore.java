@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -21,6 +22,7 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -33,10 +35,21 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given. */
+/**
+ * {@link ObjectStore} backed by an S3-compatible service (AWS S3, MinIO, ...). Keys are used as given.
+ *
+ * <p>Timeouts: the HTTP client connects and waits for each read of a response within
+ * {@code cluster.objectStore.readTimeoutSeconds}; a ranged read ({@link #openRange}, which a reader's
+ * block fetches use) also bounds each attempt by that and the whole call, retries included, by
+ * {@link ClusterConfig.ObjectStoreConfig#readTotalTimeout}. An unreachable bucket then fails a query's
+ * miss in seconds instead of stalling it for the SDK's minutes of socket timeouts and retries.
+ */
 public class S3ObjectStore implements ObjectStore {
 
     private final S3Client s3;
+    /** Per-request bounds of a ranged read: one attempt, and the whole call with retries. */
+    private final java.time.Duration readAttemptTimeout;
+    private final java.time.Duration readTotalTimeout;
     private final String bucket;
     /** For messages: the configured endpoint, or the AWS default. */
     private final String endpoint;
@@ -49,6 +62,8 @@ public class S3ObjectStore implements ObjectStore {
     S3ObjectStore(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         this.bucket = cfg.getBucket();
         this.endpoint = describeEndpoint(cfg);
+        this.readAttemptTimeout = cfg.readAttemptTimeout();
+        this.readTotalTimeout = cfg.readTotalTimeout();
         try {
             this.s3 = buildClient(cfg, credentials);
         } catch (RuntimeException e) {
@@ -65,7 +80,10 @@ public class S3ObjectStore implements ObjectStore {
 
     private static S3Client buildClient(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         var builder = S3Client.builder()
-                .httpClient(UrlConnectionHttpClient.create())
+                .httpClient(UrlConnectionHttpClient.builder()
+                        .connectionTimeout(cfg.readAttemptTimeout())
+                        .socketTimeout(cfg.readAttemptTimeout()) // idle time between reads, not a whole body
+                        .build())
                 .region(Region.of(cfg.getRegion()))
                 .credentialsProvider(credentials)
                 .serviceConfiguration(S3Configuration.builder()
@@ -140,6 +158,214 @@ public class S3ObjectStore implements ObjectStore {
             throw wrap("download", key, e);
         } finally {
             Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Override
+    public void downloadRange(String key, long offset, long length, Path target) throws IOException {
+        ObjectStore.checkRange(offset, length);
+        Path abs = target.toAbsolutePath();
+        Path dir = abs.getParent();
+        Files.createDirectories(dir);
+        Path tmp = Files.createTempFile(dir, abs.getFileName().toString(), ".part");
+        try {
+            try (InputStream in = openRange(key, offset, length)) {
+                long copied = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+                if (copied != length) {
+                    throw new IOException("short range body for '" + key + "': expected " + length
+                            + " bytes, got " + copied);
+                }
+            }
+            Files.move(tmp, abs, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Override
+    public InputStream openRange(String key, long offset, long length) throws IOException {
+        long end = ObjectStore.checkRange(offset, length);
+        try {
+            if (length == 0) {
+                // No ranged GET can express zero bytes; a HEAD gives the same missing-key / past-end answers.
+                long size;
+                try {
+                    size = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key)
+                                    .overrideConfiguration(this::readTimeouts).build())
+                            .contentLength();
+                } catch (S3Exception e) {
+                    if (isMissingOnHead(e)) throw missing(key);
+                    throw e;
+                }
+                if (offset > size) {
+                    throw new EOFException("range " + offset + "+0 is past the end (size " + size + ") of " + key);
+                }
+                return InputStream.nullInputStream();
+            }
+            GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
+                    .range("bytes=" + offset + "-" + (end - 1))
+                    .overrideConfiguration(this::readTimeouts).build();
+            ResponseInputStream<GetObjectResponse> in = s3.getObject(req);
+            try {
+                String contentRange = in.response().contentRange();
+                checkContentRange(contentRange, offset, key);
+                Long total = totalSize(contentRange);
+                if (total != null && end > total) {
+                    throw new EOFException("range " + offset + "+" + length + " exceeds size " + total + " of " + key);
+                }
+            } catch (IOException | RuntimeException e) {
+                in.abort();
+                closeQuietly(in);
+                throw e;
+            }
+            return new RangeStream(in, in::abort, length, (op, e) -> wrap(op, key, e));
+        } catch (NoSuchKeyException e) {
+            throw missing(key);
+        } catch (S3Exception e) {
+            if (isMissingKey(e)) throw missing(key);
+            if (e.statusCode() == 416) {
+                throw new EOFException("range " + offset + "+" + length + " is past the end of " + key);
+            }
+            throw wrap("open range", key, e);
+        } catch (SdkException e) {
+            throw wrap("open range", key, e);
+        }
+    }
+
+    /** A ranged read's bounds: {@code readTimeoutSeconds} per attempt, three times that per call. */
+    private void readTimeouts(software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration.Builder o) {
+        o.apiCallAttemptTimeout(readAttemptTimeout).apiCallTimeout(readTotalTimeout);
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException | RuntimeException ignored) {
+            // already failing
+        }
+    }
+
+    /**
+     * A ranged GET body that reports SDK failures while streaming as {@link IOException}s naming the
+     * key. It aborts the HTTP connection (never drains it) when a read fails, and when it is closed
+     * before all {@code length} bytes were read: draining a large unread rest would stall the closing
+     * thread, and a broken connection must not go back to the pool.
+     */
+    static final class RangeStream extends java.io.FilterInputStream {
+        @FunctionalInterface
+        interface Wrapper {
+            IOException wrap(String op, SdkException e);
+        }
+
+        private final Runnable abort;
+        private final Wrapper wrapper;
+        private long remaining;
+        private boolean aborted;
+        private boolean closed;
+
+        RangeStream(InputStream in, Runnable abort, long length, Wrapper wrapper) {
+            super(in);
+            this.abort = abort;
+            this.remaining = length;
+            this.wrapper = wrapper;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            try {
+                int n = in.read(b, off, len);
+                if (n > 0) remaining -= n;
+                return n;
+            } catch (SdkException e) {
+                abortOnce();
+                throw wrapper.wrap("read range", e);
+            } catch (IOException | RuntimeException e) {
+                abortOnce();
+                throw e;
+            }
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            try {
+                long skipped = in.skip(n);
+                if (skipped > 0) remaining -= skipped;
+                return skipped;
+            } catch (SdkException e) {
+                abortOnce();
+                throw wrapper.wrap("read range", e);
+            } catch (IOException | RuntimeException e) {
+                abortOnce();
+                throw e;
+            }
+        }
+
+        /** Aborts the connection the first time only (a failed read, or a close with bytes left). */
+        private void abortOnce() {
+            if (aborted) return;
+            aborted = true;
+            try {
+                abort.run();
+            } catch (RuntimeException ignored) {
+                // closing the stream releases what is left
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            try {
+                if (remaining > 0) abortOnce();
+                in.close();
+            } catch (SdkException e) {
+                throw wrapper.wrap("close range", e);
+            }
+        }
+    }
+
+    /**
+     * Rejects a response whose body does not start at {@code offset}: a {@code Content-Range} with
+     * another start, or none at all for a non-zero offset (a 200 that ignored the Range header and
+     * sent the object from byte 0).
+     */
+    static void checkContentRange(String contentRange, long offset, String key) throws IOException {
+        if (contentRange == null) {
+            if (offset == 0) return;
+            throw new IOException("server ignored the Range header for '" + key + "' (no Content-Range,"
+                    + " expected a body starting at " + offset + ")");
+        }
+        String v = contentRange.trim();
+        int dash = v.indexOf('-');
+        long start;
+        try {
+            if (!v.startsWith("bytes ") || dash < 0) throw new NumberFormatException(v);
+            start = Long.parseLong(v.substring("bytes ".length(), dash).trim());
+        } catch (NumberFormatException e) {
+            throw new IOException("unparseable Content-Range '" + contentRange + "' for '" + key + "'");
+        }
+        if (start != offset) {
+            throw new IOException("Content-Range '" + contentRange + "' for '" + key + "' starts at " + start
+                    + ", expected " + offset);
+        }
+    }
+
+    /** Total object size from a {@code Content-Range: bytes a-b/total} value; null when unknown. */
+    private static Long totalSize(String contentRange) {
+        if (contentRange == null) return null;
+        int slash = contentRange.lastIndexOf('/');
+        if (slash < 0) return null;
+        try {
+            return Long.parseLong(contentRange.substring(slash + 1).trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 
@@ -233,6 +459,14 @@ public class S3ObjectStore implements ObjectStore {
 
     private static NoSuchFileException missing(String key) {
         return new NoSuchFileException(key, null, "object not found: " + key);
+    }
+
+    /**
+     * A HEAD response has no body, so S3 can't say NoSuchKey: any 404 counts as a missing object
+     * (a missing bucket included — the next non-HEAD call reports that precisely).
+     */
+    static boolean isMissingOnHead(S3Exception e) {
+        return e.statusCode() == 404 || isMissingKey(e);
     }
 
     /** True only for a missing object (NoSuchKey); a 404 for NoSuchBucket etc. is a real error. */

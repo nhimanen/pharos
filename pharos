@@ -100,13 +100,26 @@ def _jvm_flags() -> list:
 
 # ── Daemon management ─────────────────────────────────────────────────────────
 
-def _is_daemon_running() -> bool:
-    """Return True if the daemon is responding on its health endpoint."""
+def _health_status():
+    """HTTP status of the daemon's /health (200 ready, 503 warming or degraded), or None when nothing answers."""
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
-            return resp.status == 200
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
     except Exception:
-        return False
+        return None
+
+
+def _is_daemon_running() -> bool:
+    """Return True if the daemon is responding on its health endpoint (ready or still warming:
+    a reader answers 503 until its first sync and its search models are done)."""
+    return _health_status() in (200, 503)
+
+
+def _daemon_ready() -> bool:
+    """True once the daemon reports ready (HTTP 200)."""
+    return _health_status() == 200
 
 
 DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate at daemon start once the log exceeds this
@@ -181,12 +194,19 @@ def _start_daemon():
     )
     DAEMON_PID_FILE.write_text(str(proc.pid))
 
-    # Wait up to 30s for the server to become ready
+    # Wait up to 30s for the server to become ready (a reader may still be warming after that:
+    # its requests are answered, with a warning, so go ahead once it responds at all)
     deadline = time.monotonic() + 30
+    status = None
     while time.monotonic() < deadline:
-        if _is_daemon_running():
+        status = _health_status()
+        if status == 200:
             return
         time.sleep(0.3)
+    if status == 503:
+        print("pharos daemon is still warming up (first sync or model load); continuing.",
+              file=sys.stderr, flush=True)
+        return
 
     die(f"pharos daemon failed to start within 30s.\n"
         f"Check logs: {DAEMON_LOG_FILE}")
@@ -958,14 +978,76 @@ def cmd_version(args):
     sys.exit(0)
 
 
+def _gib(n):
+    """Bytes as B / KiB / MiB / GiB / TiB with one decimal (same as the jar's reader cache line)."""
+    v = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if v < 1024 or unit == "TiB":
+            return f"{int(n)} B" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+
+
+def reader_cache_line(rc):
+    """One-line text form of the `readerCache` object of index-status --json and /health."""
+    if rc.get("mode") == "full":
+        return "reader cache: full mode (no block cache)"
+    rate = f"{100 * rc['hitRate']:.1f}%" if rc["hits"] + rc["misses"] > 0 else "n/a"
+    return (f"reader cache: {_gib(rc['bytesOnDisk'])} / {_gib(rc['cacheMaxBytes'])}, "
+            f"hit rate {rate}, {rc['evictions']} evictions")
+
+
+def _daemon_reader_cache():
+    """The running daemon's `readerCache` (its hits are the real ones), or None. A warming
+    reader answers 503 with the same body."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
+            return json.loads(resp.read()).get("readerCache")
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()).get("readerCache")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def index_status_json(text):
+    """index-status --json from the jar, its `readerCache` replaced by the running daemon's (its
+    hits are the real ones; the one-shot JVM served no queries) with "source": "daemon"."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return text
+    daemon = _daemon_reader_cache() if "readerCache" in doc else None
+    if daemon:
+        doc["readerCache"] = dict(daemon, source="daemon")
+    return json.dumps(doc, indent=2)
+
+
 def cmd_index_status(args):
-    """Show per-project index format status (read-only; spawns the jar, no daemon)."""
+    """Show per-project index format status (read-only; spawns the jar, no daemon).
+
+    On a lazy reader the text output ends with a `reader cache:` line; when a daemon is
+    running its figures replace the one-shot JVM's (which has served no queries).
+    """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
     cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index-status"]
     if args.json:
         cmd.append("--json")
-    sys.exit(subprocess.run(cmd).returncode)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    if args.json:
+        print(index_status_json(r.stdout))
+        sys.exit(r.returncode)
+    lines = r.stdout.splitlines()
+    own = [l for l in lines if l.startswith("reader cache:")]
+    if own:
+        daemon = _daemon_reader_cache()
+        replacement = reader_cache_line(daemon) if daemon else own[0]
+        lines = [replacement if l.startswith("reader cache:") else l for l in lines]
+    if lines:
+        print("\n".join(lines))
+    sys.exit(r.returncode)
 
 
 def cmd_upgrade_indexes(args):

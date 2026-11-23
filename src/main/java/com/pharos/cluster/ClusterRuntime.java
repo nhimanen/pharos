@@ -1,8 +1,11 @@
 package com.pharos.cluster;
 
+import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
+import com.pharos.cluster.warm.LazyGenerations;
+import com.pharos.cluster.warm.WarmStats;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import com.pharos.indexer.LuceneIndexer;
@@ -16,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -38,8 +42,19 @@ import java.util.regex.Pattern;
  * syncer and follows the registry the holder maintains (re-activating every poll interval, and
  * taking over the lock once the holder is gone).
  *
- * <p>{@link #close} stops the syncer, releases the lock and closes the backend (object-store
- * clients); it is idempotent.
+ * <p>Readers in {@code cluster.reader.mode} {@code lazy} (the default) install a
+ * {@link LazyGenerations} as the {@link LuceneIndexer}'s directory factory before anything is
+ * activated: lazy generation dirs open as remote directories over the block cache, every other dir
+ * as before. A full-mode reader, and every other role, keeps the default factory and never builds a
+ * Phase 2 class. A full-mode reader does not activate lazy generation dirs found on disk (the syncer
+ * materialises them again), and its syncing process deletes the block cache lazy mode left in the
+ * cache dir when no process holds that cache's lock.
+ *
+ * <p>{@link #close} stops the syncer, releases the lock, closes the block cache and the backend
+ * (object-store clients); it is idempotent. Shutdown order: close it only once nothing searches
+ * any more ({@code Main} does so when the command returns). Once the block cache is closed, a read
+ * of a lazy generation fails with "block cache ... is closed"; on a signal the JVM shutdown hook may
+ * close it while a query is still running, and that query fails as the process exits.
  */
 public final class ClusterRuntime implements Closeable {
 
@@ -50,6 +65,8 @@ public final class ClusterRuntime implements Closeable {
     private final ReplicationBackend backend;
     private final ProjectRegistry registry;
     private final LuceneIndexer luceneIndexer;
+    /** Lazy mode on a reader; null otherwise. */
+    private final LazyGenerations lazy;
     private final CountDownLatch firstSync = new CountDownLatch(1);
     /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -61,6 +78,11 @@ public final class ClusterRuntime implements Closeable {
     private boolean serving;
     private volatile boolean ready;
     private boolean closed;
+    /** The search models' warm-up readiness also waits for; settled at once unless given. */
+    private java.util.concurrent.CompletionStage<?> models = java.util.concurrent.CompletableFuture.completedFuture(null);
+    // Guarded by this: the first sync is served; and the readiness line it logs once ready.
+    private boolean firstSyncServed;
+    private String servedLine;
 
     public ClusterRuntime(IndexConfig config, ReplicationBackend backend, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer) {
@@ -68,6 +90,15 @@ public final class ClusterRuntime implements Closeable {
         this.backend = Objects.requireNonNull(backend, "backend");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.luceneIndexer = Objects.requireNonNull(luceneIndexer, "luceneIndexer");
+        if (isReader() && config.getCluster().getReader().isLazy()) {
+            ClusterConfig.ObjectStoreConfig store = config.getCluster().getObjectStore();
+            lazy = new LazyGenerations(cacheDir(), config.getCluster().getReader(), backend.source(),
+                    store == null ? null : store.readTotalTimeout());
+            lazy.setActiveGenerations(this::activeGeneration);
+            luceneIndexer.setDirectoryFactory(lazy);
+        } else {
+            lazy = null;
+        }
         if (isReader() && backend.localCache() instanceof ReaderLocalCache) {
             try {
                 activateRegistered();
@@ -94,6 +125,80 @@ public final class ClusterRuntime implements Closeable {
      */
     public static void applySourceReadPolicy(IndexConfig config) {
         SourceReader.setEnabled(config.getCluster().getRole() != NodeRole.READER);
+    }
+
+    /** Lazy mode's directory factory and block cache; null unless this is a reader (a full-mode reader reports mode {@code full} and zeros). */
+    LazyGenerations lazyGenerations() {
+        return lazy;
+    }
+
+    /**
+     * The block cache of this process as operators see it ({@code readerCache} of
+     * {@code index-status --json} and {@code /health}); null unless this is a lazy reader.
+     * Fields: {@code mode, cacheMaxBytes, bytesOnDisk, hits, misses, hitRate (0..1), bytesFetched,
+     * evictions, leasesOpen}, plus {@code shared}: true when this process's cache is the cache dir's
+     * shared one, false when it runs a private one (or none has been created yet).
+     */
+    public Map<String, Object> readerCacheStats() {
+        if (!isReader()) return null;
+        WarmStats st = lazy == null ? new WarmStats(0, 0, 0, 0, 0, 0, 0, 0)
+                : lazy.stats().orElse(new WarmStats(0, 0, 0, 0, 0, 0, 0, 0));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("mode", lazy == null ? ClusterConfig.ReaderConfig.FULL : config.getCluster().getReader().getMode());
+        out.put("cacheMaxBytes", lazy == null ? 0L : lazy.cacheMaxBytes());
+        out.put("bytesOnDisk", st.bytesOnDisk());
+        out.put("hits", st.hits());
+        out.put("misses", st.misses());
+        out.put("hitRate", st.hitRate());
+        out.put("bytesFetched", st.bytesFetched());
+        out.put("evictions", st.evictions());
+        out.put("leasesOpen", st.leasesOpen());
+        out.put("shared", lazy != null && lazy.sharedCache());
+        out.put("source", "process");
+        return out;
+    }
+
+    /**
+     * The one-line text form of {@link #readerCacheStats}:
+     * {@code reader cache: 1.2 GiB / 8.0 GiB, hit rate 97.3%, 41 evictions}; {@code hit rate n/a}
+     * before the first lookup, and a full-mode reader has no block cache.
+     */
+    public static String readerCacheLine(Map<String, Object> rc) {
+        if (ClusterConfig.ReaderConfig.FULL.equals(rc.get("mode"))) return "reader cache: full mode (no block cache)";
+        boolean lookups = ((Number) rc.get("hits")).longValue() + ((Number) rc.get("misses")).longValue() > 0;
+        String rate = lookups ? String.format(java.util.Locale.ROOT, "%.1f%%",
+                100 * ((Number) rc.get("hitRate")).doubleValue()) : "n/a";
+        return String.format(java.util.Locale.ROOT, "reader cache: %s / %s, hit rate %s, %d evictions",
+                gib(((Number) rc.get("bytesOnDisk")).longValue()), gib(((Number) rc.get("cacheMaxBytes")).longValue()),
+                rate, ((Number) rc.get("evictions")).longValue());
+    }
+
+    private static String gib(long bytes) {
+        String[] units = {"B", "KiB", "MiB", "GiB", "TiB"};
+        double v = bytes;
+        int i = 0;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        return i == 0 ? bytes + " B" : String.format(java.util.Locale.ROOT, "%.1f %s", v, units[i]);
+    }
+
+    /**
+     * Why this reader can't answer every query (served by {@code /health} as 503 {@code degraded}),
+     * or null when it can: a lazy reader whose active generation was garbage-collected on the bucket.
+     */
+    public String degradation() {
+        return lazy == null ? null : lazy.degradation();
+    }
+
+    /** The generation number of the shard's active generation dir; empty when none is active. */
+    private java.util.OptionalLong activeGeneration(String shard) {
+        if (!(backend.localCache() instanceof ReaderLocalCache cache)) return java.util.OptionalLong.empty();
+        return cache.active(shard).map(p -> generationOf(p.getFileName().toString()))
+                .orElse(java.util.OptionalLong.empty());
+    }
+
+    private static java.util.OptionalLong generationOf(String dirName) {
+        if (!GEN_DIR.matcher(dirName).matches()) return java.util.OptionalLong.empty();
+        return java.util.OptionalLong.of(Long.parseLong(dirName.substring("gen-".length())));
     }
 
     public IndexPublisher publisher() {
@@ -133,9 +238,23 @@ public final class ClusterRuntime implements Closeable {
      * @throws IOException when the lock file cannot be created
      */
     public void beginServing() throws IOException {
+        beginServing(java.util.concurrent.CompletableFuture.completedFuture(null));
+    }
+
+    /**
+     * {@link #beginServing()}, with readiness also waiting for {@code modelsLoaded}: a reader is
+     * {@link #ready} (and logs "Reader … serving N shard(s)") only once its first sync is served
+     * AND the search models have settled. Load balancers and the router send traffic on that
+     * signal, so a reader never takes queries that would stall on a multi-second model load. The
+     * stage completing exceptionally counts as settled: a model that fails to load never blocks
+     * readiness (the caller bounds a hanging load with a timeout).
+     */
+    public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded) throws IOException {
+        java.util.Objects.requireNonNull(modelsLoaded, "modelsLoaded");
         synchronized (this) {
             if (!isReader() || serving) return;
             if (closed) throw new IllegalStateException("cluster runtime is closed");
+            models = modelsLoaded;
             ReaderLocalCache cache = readerCache();
             Optional<SyncLock> lock = SyncLock.tryAcquire(cacheDir());
             serving = true;
@@ -145,6 +264,26 @@ public final class ClusterRuntime implements Closeable {
                 becomeFollower();
             }
         }
+        modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
+    }
+
+    /** The first sync is served; ready now if the models have settled too. */
+    private void firstSyncServed(String line) {
+        synchronized (this) {
+            firstSyncServed = true;
+            servedLine = line;
+        }
+        maybeBecomeReady();
+    }
+
+    private void maybeBecomeReady() {
+        String line;
+        synchronized (this) {
+            if (ready || !firstSyncServed || !models.toCompletableFuture().isDone()) return;
+            ready = true;
+            line = servedLine;
+        }
+        log.info(line);
     }
 
     /** Blocks until the first sync pass of a serving reader has finished; returns at once otherwise. */
@@ -159,7 +298,10 @@ public final class ClusterRuntime implements Closeable {
         }
     }
 
-    /** False while a serving reader's first sync pass is still running; true otherwise. */
+    /**
+     * False while a serving reader's first sync pass is still running or its search models are
+     * still loading (see {@link #beginServing(java.util.concurrent.CompletionStage)}); true otherwise.
+     */
     public boolean ready() {
         return !isReader() || ready;
     }
@@ -172,9 +314,19 @@ public final class ClusterRuntime implements Closeable {
     // Holding the monitor of this.
     private void becomeOwner(SyncLock lock, ReaderLocalCache cache) {
         syncLock = lock;
+        if (lazy == null) {
+            LazyGenerations.deleteUnusedBlockCaches(cacheDir()); // left by lazy mode; full mode never reads it
+        } else {
+            try {
+                lazy.blockCache(); // the prefetching process takes the shared block cache, not a private one
+                lazy.adoptSharedCache(); // a follower taking over starts on a private one
+            } catch (IOException | RuntimeException e) {
+                log.warn("Opening the block cache in {} failed (retried on first use): {}", cacheDir(), e.toString());
+            }
+        }
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
-                Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()));
+                Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);
@@ -190,9 +342,14 @@ public final class ClusterRuntime implements Closeable {
                     config.getCluster().getPollIntervalSeconds(), e.toString());
         } finally {
             Map<ShardId, Generation> served = s.served();
-            log.info("Reader {} serving {} shard(s): {}", config.getCluster().effectiveNodeId(), served.size(), served);
             warm(served.keySet().stream().map(ShardId::value).toList());
-            ready = true;
+            String line = "Reader " + config.getCluster().effectiveNodeId() + " serving " + served.size()
+                    + " shard(s): " + served;
+            if (ready) {
+                log.info(line); // a follower that took over syncing: already ready
+            } else {
+                firstSyncServed(line);
+            }
             firstSync.countDown();
         }
         try {
@@ -206,8 +363,10 @@ public final class ClusterRuntime implements Closeable {
     private void becomeFollower() {
         log.info("Another process holds {}: not syncing here; serving the generations it registers in {}",
                 cacheDir().resolve(SyncLock.FILE), cacheDir().resolve("registry.json"));
-        warm(activateRegistered());
-        ready = true;
+        List<String> activated = activateRegistered();
+        warm(activated);
+        firstSyncServed("Reader " + config.getCluster().effectiveNodeId() + " serving " + activated.size()
+                + " shard(s): " + activated + " (following the sync lock holder)");
         firstSync.countDown();
         long interval = config.getCluster().getPollIntervalSeconds();
         follower = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -303,18 +462,20 @@ public final class ClusterRuntime implements Closeable {
         return changed;
     }
 
-    private static boolean completeGeneration(Path dir) {
+    /** A materialised generation dir this reader can serve (a lazy one only in lazy mode). */
+    private boolean completeGeneration(Path dir) {
         return GEN_DIR.matcher(dir.getFileName().toString()).matches()
                 && Files.isDirectory(dir.resolve(ReplicaSyncer.LUCENE_DIR))
-                && Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE));
+                && Files.isRegularFile(dir.resolve(ReplicaSyncer.MANIFEST_FILE))
+                && (lazy != null || !LazyGenerations.isLazy(dir));
     }
 
     /** The highest-numbered complete generation dir of a shard whose index format this build serves. */
-    private static Optional<Path> newestServableGeneration(Path shardRoot) {
+    private Optional<Path> newestServableGeneration(Path shardRoot) {
         if (!Files.isDirectory(shardRoot)) return Optional.empty();
         try (var s = Files.list(shardRoot)) {
             return s.map(p -> p.toAbsolutePath().normalize())
-                    .filter(ClusterRuntime::completeGeneration)
+                    .filter(this::completeGeneration)
                     .filter(p -> IndexFormat.servable(IndexFormat.status(p)))
                     .max(java.util.Comparator.comparingLong(
                             p -> Long.parseLong(p.getFileName().toString().substring("gen-".length()))));
@@ -387,6 +548,7 @@ public final class ClusterRuntime implements Closeable {
                 log.warn("Releasing the sync lock failed: {}", e.toString());
             }
         }
+        if (lazy != null) lazy.close();
         try {
             backend.close();
         } catch (IOException | RuntimeException e) {

@@ -111,4 +111,112 @@ class ClusterConfigTest {
         assertThat(back.getCluster().getRole()).isEqualTo(NodeRole.ALL);
         assertThat(back.getCluster().getBackend()).isEqualTo(BackendKind.LOCAL);
     }
+
+    // ── cluster.reader (Phase 2: lazy reader generations) ─────────────────────────────────
+
+    @Test
+    void readerDefaults() throws Exception {
+        ClusterConfig.ReaderConfig r = parse("{\"verbose\": true}").getReader();
+        assertThat(r.getMode()).isEqualTo("lazy");
+        assertThat(r.isLazy()).isTrue();
+        assertThat(r.getCacheMaxBytes()).isEqualTo(8L << 30);
+        assertThat(r.getBlockSizeBytes()).isEqualTo(8 << 20);
+        assertThat(r.getEagerMaxBytes()).isEqualTo(1L << 20);
+        assertThat(r.getPrefetchExtensions()).containsExactly("tip", "tmd", "tim", "vex", "vem");
+        assertThat(r.getPrefetchTimeoutSeconds()).isEqualTo(30);
+        assertThat(r.getMaxConcurrentFetches()).isEqualTo(16);
+    }
+
+    @Test
+    void parsesReaderSection() throws Exception {
+        ClusterConfig.ReaderConfig r = parse("""
+                {"cluster": {"reader": {"mode": "full", "cacheMaxBytes": 1073741824, "blockSizeBytes": 65536,
+                  "eagerMaxBytes": 0, "prefetchExtensions": ["tip"], "prefetchTimeoutSeconds": 5,
+                  "maxConcurrentFetches": 4}}}
+                """).getReader();
+        assertThat(r.getMode()).isEqualTo("full");
+        assertThat(r.isLazy()).isFalse();
+        assertThat(r.getCacheMaxBytes()).isEqualTo(1L << 30);
+        assertThat(r.getBlockSizeBytes()).isEqualTo(64 * 1024);
+        assertThat(r.getEagerMaxBytes()).isZero();
+        assertThat(r.getPrefetchExtensions()).containsExactly("tip");
+        assertThat(r.getPrefetchTimeoutSeconds()).isEqualTo(5);
+        assertThat(r.getMaxConcurrentFetches()).isEqualTo(4);
+    }
+
+    @Test
+    void blockSizeMustBeAPowerOfTwoInRange() {
+        for (long bad : new long[]{100_000, 32 * 1024, 128L << 20, 0, -65536}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":" + bad + "}}}"))
+                    .as("blockSizeBytes %d", bad)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.reader.blockSizeBytes");
+        }
+    }
+
+    @Test
+    void cacheMustHoldFourBlocks() throws Exception {
+        assertThatThrownBy(() -> parse(
+                "{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":4194303}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.cacheMaxBytes");
+        parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":4194304}}}");
+    }
+
+    @Test
+    void unknownReaderModeIsRejected() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"mode\":\"eager\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.mode")
+                .hasMessageContaining("eager");
+    }
+
+    @Test
+    void otherReaderLimitsNameTheirField() {
+        for (String[] c : new String[][]{
+                {"eagerMaxBytes", "-1"}, {"prefetchTimeoutSeconds", "-1"}, {"maxConcurrentFetches", "0"},
+                {"prefetchExtensions", "null"}}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"" + c[0] + "\":" + c[1] + "}}}"))
+                    .as(c[0])
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.reader." + c[0]);
+        }
+    }
+
+    @Test
+    void privateCacheCapDefaultsToAnEighthOfTheCacheWithinBounds() throws Exception {
+        ClusterConfig.ReaderConfig r = parse("{\"verbose\": true}").getReader();
+        assertThat(r.getPrivateCacheMaxBytes()).as("0 = derived").isZero();
+        assertThat(r.effectivePrivateCacheMaxBytes()).isEqualTo(1L << 30); // 8 GiB / 8
+        r = parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":8388608}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).as("at least four blocks").isEqualTo(4L << 20);
+        r = parse("{\"cluster\":{\"reader\":{\"blockSizeBytes\":1048576,\"cacheMaxBytes\":4194304}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).as("never above the cache cap").isEqualTo(4L << 20);
+        r = parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":33554432}}}").getReader();
+        assertThat(r.effectivePrivateCacheMaxBytes()).isEqualTo(32L << 20);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":1048576}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.privateCacheMaxBytes");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"privateCacheMaxBytes\":-1}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.reader.privateCacheMaxBytes");
+    }
+
+    @Test
+    void objectStoreReadTimeoutDefaultsAndIsValidated() throws Exception {
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"}}}");
+        assertThat(c.getObjectStore().getReadTimeoutSeconds()).isEqualTo(10);
+        assertThat(c.getObjectStore().readAttemptTimeout()).isEqualTo(java.time.Duration.ofSeconds(10));
+        assertThat(c.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
+        for (int bad : new int[]{0, -1, 3601}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                    + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":" + bad + "}}}"))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.objectStore.readTimeoutSeconds");
+        }
+        ClusterConfig five = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":5}}}");
+        assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
+    }
 }

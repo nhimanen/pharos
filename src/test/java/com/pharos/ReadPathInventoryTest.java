@@ -77,9 +77,14 @@ class ReadPathInventoryTest {
                 // resolved (index-status / embeddings status / upgrade-indexes hints, and the writer's
                 // legacy-vector re-index check); never on the search serving path
                 "indexer/LegacyVectorFields.java");
+        // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
+        // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
+        assertThat(files("FSDirectory::open")).isEmpty();
         assertThat(files("FSDirectory.open(")).containsExactlyInAnyOrder(
-                "indexer/LuceneIndexer.java",
+                "indexer/LuceneDirectoryFactory.java",            // the default factory
                 "cluster/ReplicaSyncer.java",                     // reader: verify before serving
-                "cluster/objectstore/ObjectStorePublisher.java"); // writer: read the commit to upload
+                "cluster/objectstore/ObjectStorePublisher.java",  // writer: read the commit to upload
+                "cluster/warm/LazyGenerations.java",              // reader factory: full-copy generations
+                "cluster/warm/RemoteDirectory.java");             // lazy generation: local eager files, checksums
     }
 }

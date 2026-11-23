@@ -16,7 +16,6 @@ import org.apache.lucene.analysis.synonym.SynonymMap;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +54,7 @@ public class LuceneIndexer implements Closeable {
     private final Duration retireDelay;
 
     private final LocalCache cache;
+    private volatile LuceneDirectoryFactory directoryFactory = LuceneDirectoryFactory.DEFAULT;
 
     public LuceneIndexer(IndexConfig config) {
         this(config, new LocalFsCache(config));
@@ -193,23 +193,35 @@ public class LuceneIndexer implements Closeable {
         return indexExists(getLucenePath(projectName));
     }
 
-    private static boolean indexExists(Path luceneDir) {
+    private boolean indexExists(Path luceneDir) {
         if (!Files.exists(luceneDir)) return false;
-        try (Directory dir = openDirectory(luceneDir)) {
-            return DirectoryReader.indexExists(dir);
+        try {
+            return directoryFactory.indexExists(luceneDir);
         } catch (IOException e) {
             return false;
         }
     }
 
     /**
-     * Lucene's platform default — {@code MMapDirectory} on 64-bit JVMs. Index files are read
-     * through the OS page cache instead of being copied into per-input heap buffers (as
-     * {@code NIOFSDirectory} did), which was a large share of search-time heap allocation.
-     * Mapped pages count as shared, reclaimable file-backed RSS, not anonymous memory.
+     * Opens {@code luceneDir} through the installed {@link LuceneDirectoryFactory}; by default
+     * {@link LuceneDirectoryFactory#DEFAULT}, Lucene's platform default ({@code MMapDirectory} on
+     * 64-bit JVMs). Mapped pages count as shared, reclaimable file-backed RSS, not anonymous memory.
      */
-    static Directory openDirectory(Path luceneDir) throws IOException {
-        return FSDirectory.open(luceneDir);
+    Directory openDirectory(Path luceneDir) throws IOException {
+        return directoryFactory.open(luceneDir);
+    }
+
+    /**
+     * Replaces the factory every directory is opened with from now on (readers already open keep
+     * theirs). Reader nodes in lazy mode install one that serves remote generations.
+     */
+    public void setDirectoryFactory(LuceneDirectoryFactory factory) {
+        this.directoryFactory = Objects.requireNonNull(factory, "factory");
+    }
+
+    /** The installed directory factory. */
+    public LuceneDirectoryFactory directoryFactory() {
+        return directoryFactory;
     }
 
     /** The configured index root (parent of every project dir). */
@@ -243,6 +255,18 @@ public class LuceneIndexer implements Closeable {
                       .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
             }
             log.info("Deleted index directory for '{}'", projectName);
+        }
+    }
+
+    /**
+     * Opens and immediately closes a reader on {@code dir}, so a lazy reader generation pays its
+     * open cost (codec headers, footers, segment metadata) before it is activated. The reader is
+     * never cached or used to serve queries; serving readers come only from {@link #openReader}.
+     * Kept here so that this class stays the only place that opens Lucene readers.
+     */
+    public static void warmOpen(Directory dir) throws IOException {
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+            reader.maxDoc();
         }
     }
 
