@@ -218,7 +218,11 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
 - Multi-node: a shard's first request names the spec version of its project the coordinator
   planned; a reader whose catalog has moved on answers with the generation that version names
   (the previous one, retained) or refuses, so a coordinator whose catalog predates a reshard never
-  silently misses the files that moved. The shards a reshard writes get a new index run number.
+  silently misses the files that moved. Every shard of a reshard's new version is at one new index
+  run number: a shard that neither gains nor loses files gets a metadata-only manifest at that run
+  (its Lucene files unchanged, nothing uploaded or downloaded again; readers hard-link them), so once
+  the next run clears the reshard's pins a query no longer leaves such a shard out, or reads the
+  rewritten shards' previous generations and misses a removed shard's files.
 - Multi-node: a replica's generation mismatch no longer hides the first reader's "no vectors for
   the model" answer (a vector or hybrid query right after a flip left every shard of a project
   without vectors out).

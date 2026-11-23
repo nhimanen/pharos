@@ -85,14 +85,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * {@link InMemoryObjectStore}; a fake clock drives the bucket and the writers, and the tests tick and sync
  * by hand. Embeddings come from a counting fake, parses are counted at the parser.
  */
-class ReshardJobTest {
+public class ReshardJobTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    static final String P = "lib";
+    public static final String P = "lib";
     static final ShardSpec RING2 = ShardSpec.parse("[project, ring(path, shards=2)]");
     static final ShardSpec RING3 = ShardSpec.parse("[project, ring(path, shards=3)]");
-    static final ShardSpec RING4 = ShardSpec.parse("[project, ring(path, shards=4)]");
-    static final ShardSpec RING5 = ShardSpec.parse("[project, ring(path, shards=5)]");
+    public static final ShardSpec RING4 = ShardSpec.parse("[project, ring(path, shards=4)]");
+    public static final ShardSpec RING5 = ShardSpec.parse("[project, ring(path, shards=5)]");
     static final ShardSpec RING6 = ShardSpec.parse("[project, ring(path, shards=6)]");
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Duration HEARTBEAT = Duration.ofSeconds(10);
@@ -300,6 +300,9 @@ class ReshardJobTest {
         }
     }
 
+    /** Every Lucene file key uploaded to the store. */
+    private final List<String> uploadedLucene = new CopyOnWriteArrayList<>();
+
     /** Runs before every {@code LATEST} CAS of the store (a commit point), with the key. */
     private volatile java.util.function.Consumer<String> latestCas;
 
@@ -307,6 +310,12 @@ class ReshardJobTest {
     void setUp() throws IOException {
         layout = new ObjectStoreLayout("pharos");
         store = new InMemoryObjectStore(clock) {
+            @Override
+            public String put(String key, Path source) throws IOException {
+                if (key.contains("/lucene/")) uploadedLucene.add(key);
+                return super.put(key, source);
+            }
+
             @Override
             public Optional<String> putIfAbsent(String key, byte[] data) {
                 for (String s : failManifestsOf) {
@@ -356,13 +365,13 @@ class ReshardJobTest {
 
     // ------------------------------------------------------------------------------- fixtures
 
-    static List<ShardId> ring(int n) {
+    public static List<ShardId> ring(int n) {
         List<ShardId> out = new ArrayList<>();
         for (int i = 1; i <= n; i++) out.add(new ShardId(P + "~ring=" + ShardSpec.ringName(i)));
         return out;
     }
 
-    static ShardId shardOf(ShardSpec spec, String rel) {
+    public static ShardId shardOf(ShardSpec spec, String rel) {
         return spec.assign(DocKeys.of(P, rel));
     }
 
@@ -370,7 +379,15 @@ class ReshardJobTest {
      * {@code n} source files where {@code from} → {@code to} moves at least one file, from at most two of
      * {@code from}'s shards, and every shard of {@code from} has files: some shards are left untouched.
      */
-    static List<String> filesFor(ShardSpec from, ShardSpec to, int fromShards) {
+    public static List<String> filesFor(ShardSpec from, ShardSpec to, int fromShards) {
+        return filesFor(from, to, fromShards, false);
+    }
+
+    /**
+     * As above; {@code untouchedTarget} also requires a shard both specs have that neither gains nor loses
+     * a file (a ring shrink's surviving shards that receive none of the removed shard's files).
+     */
+    public static List<String> filesFor(ShardSpec from, ShardSpec to, int fromShards, boolean untouchedTarget) {
         for (int n = 8; n < 60; n++) {
             List<String> files = new ArrayList<>();
             for (int i = 0; i < n; i++) files.add("src/main/java/com/example/p" + i + "/Part" + i + ".java");
@@ -382,6 +399,13 @@ class ReshardJobTest {
                     moved++;
                     sources.add(shardOf(from, f));
                 }
+            }
+            if (untouchedTarget) {
+                Set<ShardId> touched = new HashSet<>(sources);
+                for (String f : files) if (!shardOf(from, f).equals(shardOf(to, f))) touched.add(shardOf(to, f));
+                boolean any = false;
+                for (String f : files) any |= !touched.contains(shardOf(from, f)) && shardOf(from, f).equals(shardOf(to, f));
+                if (!any) continue;
             }
             if (moved >= 1 && sources.size() <= 2 && holders.size() == fromShards) return files;
         }
@@ -539,8 +563,9 @@ class ReshardJobTest {
 
     /**
      * 4 → 5 ring shards: only the files that move are parsed again; the shards that neither gain nor lose
-     * files keep their generations byte-identical, the new version references them, and the reader never
-     * downloads anything of them again.
+     * files keep their content: N's generation stays byte-identical, and N+1 references exactly its Lucene
+     * files from a metadata-only manifest at the new run (P6-R23); nothing of them is uploaded, and the
+     * reader never downloads anything of them again.
      */
     @Test
     void ringAddReindexesOnlyMovedFiles() throws IOException {
@@ -563,6 +588,7 @@ class ReshardJobTest {
         Map<ShardId, Long> untouchedDownloads = new HashMap<>();
         for (ShardId s : untouched) untouchedDownloads.put(s, r.downloadsOf(s));
         a.parser.parsed.clear();
+        uploadedLucene.clear();
 
         catalog.requestReshard(P, RING5, clock.instant());
         a.loop.tick();
@@ -581,13 +607,21 @@ class ReshardJobTest {
         assertThat(job.path("unaffected").size()).isEqualTo(untouched.size());
         Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
         for (ShardId s : untouched) {
-            assertThat(replicas.latest(s)).as(s + " keeps its generation").contains(before.get(s));
             assertThat(store.get(layout.manifestKey(s, before.get(s))).orElseThrow().data())
                     .as(s + " byte-identical").isEqualTo(manifests.get(s));
-            assertThat(pins.get(s)).as("the new version references " + s + " as it was").isEqualTo(before.get(s).value());
-            assertThat(r.syncer.served().get(s)).as("the reader serves " + s + " as before").isEqualTo(before.get(s));
+            ShardManifest old = ShardManifest.read(manifests.get(s));
+            ShardManifest now = replicas.manifest(s, new Generation(pins.get(s)));
+            assertThat(pins.get(s)).as(s + ": a metadata-only generation at the new run").isGreaterThan(before.get(s).value());
+            assertThat(now.files().stream().filter(f -> ManifestFile.LUCENE.equals(f.role())).toList())
+                    .as("the new version references " + s + "'s Lucene files as they were")
+                    .isEqualTo(old.files().stream().filter(f -> ManifestFile.LUCENE.equals(f.role())).toList());
+            assertThat(replicas.latest(s)).as(s + ": LATEST at the new version's pin").contains(new Generation(pins.get(s)));
+            assertThat(r.syncer.served().get(s)).as("the reader serves " + s + " at the pin")
+                    .isEqualTo(new Generation(pins.get(s)));
             assertThat(r.downloadsOf(s)).as("nothing of " + s + " downloaded again").isEqualTo(untouchedDownloads.get(s));
         }
+        assertThat(uploadedLucene).as("nothing of the untouched shards uploaded")
+                .noneMatch(k -> untouched.stream().anyMatch(s -> k.startsWith(layout.shardPrefix(s))));
         for (ShardId s : sources) {
             assertThat(replicas.latest(s).orElseThrow().value()).as(s + " rewritten").isGreaterThan(before.get(s).value());
         }
@@ -1216,12 +1250,17 @@ class ReshardJobTest {
         Set<ShardId> rewritten = movedFrom(files, RING4, RING5);
         for (ShardId s : ring(5)) {
             long run = replicas.manifest(s, new Generation(pins.get(s))).projectGeneration();
-            if (rewritten.contains(s) || !ring(4).contains(s)) {
-                assertThat(run).as(s + ": written by the reshard, a new run").isGreaterThan(runN);
-            } else {
-                assertThat(run).as(s + ": unchanged, N's run").isEqualTo(runN);
-            }
+            // P6-R23: an untouched shard too, by a metadata-only manifest, so all of N+1 shares one run
+            assertThat(run).as(s + (rewritten.contains(s) || !ring(4).contains(s) ? ": written by the reshard"
+                    : ": untouched") + ", the new run").isGreaterThan(runN);
         }
+        assertThat(ring(5).stream().map(s -> {
+            try {
+                return replicas.manifest(s, new Generation(pins.get(s))).projectGeneration();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }).distinct().count()).as("one run across N+1").isEqualTo(1);
         Map<ShardId, Generation> flipped = latestOf(ring(5));
         clock.advance(10);
         a.loop.tick();

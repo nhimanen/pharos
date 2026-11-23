@@ -58,11 +58,13 @@ import java.util.function.Supplier;
  *   <li><b>Build</b> ({@link ProjectIndexManager#reshard}): only files whose shard changes are parsed again
  *       and written to their new shards, embeddings from the restored persistent cache (nothing unchanged
  *       is embedded again); shards that neither gain nor lose files are not touched.</li>
- *   <li><b>Publish</b> the shards of N+1 that changed as new generations <b>without moving their
- *       {@code LATEST}</b> ({@link ObjectStorePublisher#stageShard}), sharing N's index run, project files
- *       and meta. A shard N+1 shares with N unchanged keeps its current generation, byte-identical, which
- *       N+1 references as it is. Then the staged version's generations are pinned in the catalog: readers
- *       materialise the rewritten shards (not serving them) and activate the new ones.</li>
+ *   <li><b>Publish</b> every shard of N+1 as a new generation <b>without moving its {@code LATEST}</b>
+ *       ({@link ObjectStorePublisher#stageShard}) at one new index run (P6-R21), sharing N's project files
+ *       and meta. A shard N+1 shares with N unchanged gets a metadata-only manifest at that run listing
+ *       exactly its current Lucene files (nothing uploaded, readers hard-link them; ruling P6-R23), so every
+ *       shard of N+1 is at one run. Then the staged version's generations are pinned in the catalog: readers
+ *       materialise the staged generations of shards N also has (not serving them) and activate the new
+ *       shards.</li>
  *   <li><b>Flip</b> once every live reader has the new version's generations (heartbeats: served or
  *       prepared), or after {@code syncTimeout}: one CAS makes N+1 active with its generations pinned and
  *       N the project's {@code previous} version ({@code retiredAt}); then each rewritten shard's
@@ -352,7 +354,7 @@ public final class ReshardJob {
 
     /**
      * Builds {@code to} locally (unless the local index already is {@code to}'s: a resumed job), publishes
-     * every shard of it that differs from what {@code LATEST} serves, and returns the generation of every
+     * every shard of it at the new run (an untouched one metadata-only, P6-R23), and returns the generation of every
      * shard of {@code to}.
      */
     private Map<ShardId, Long> buildAndPublish(String project, ShardPlan active, ShardPlan to, Path root, boolean embed,
@@ -394,17 +396,15 @@ public final class ReshardJob {
         for (ShardId s : to.shards()) {
             abort.checkpoint();
             Optional<Generation> latest = fromIds.contains(s) ? replicas.latest(s) : Optional.empty();
-            if (latest.isPresent() && publisher.publishedAs(s, latest.get(), projectDir)) {
-                gens.put(s, latest.get().value()); // untouched: N+1 references N's generation as it is
-                unaffected.add(s);
-                writeJob(project, job);
-                continue;
-            }
+            // Ruling P6-R23: an untouched shard still gets a generation at the new run, a metadata-only
+            // manifest listing exactly N's Lucene files (nothing uploaded; readers hard-link them), so every
+            // shard of N+1 is at one run and an unpinned query (after the next run clears the pins) aligns them
+            boolean untouched = latest.isPresent() && publisher.publishedAs(s, latest.get(), projectDir);
             Long earlier = job.generations.get(s);
             Generation g = publisher.stageShard(s, projectDir, ref,
                     earlier == null ? Optional.empty() : Optional.of(new Generation(earlier)), guard);
             gens.put(s, g.value());
-            affected.add(s);
+            (untouched ? unaffected : affected).add(s);
             job.generations = new LinkedHashMap<>(job.generations);
             job.generations.put(s, g.value());
             writeJob(project, job);

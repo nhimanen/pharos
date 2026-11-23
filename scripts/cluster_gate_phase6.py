@@ -272,6 +272,18 @@ class Bucket:
         except (OSError, ValueError):
             return None
 
+    def lucene_keys(self, shard, gen):
+        """The sorted Lucene file keys generation {gen} of {shard} (decoded id) lists; None when unreadable."""
+        if gen is None:
+            return None
+        try:
+            m = self.s3.get_json(f"shards/{urllib.parse.quote(shard, safe='')}/manifests/gen-{gen}.json")
+        except (OSError, ValueError):
+            return None
+        if not m:
+            return None
+        return sorted(f.get("key") for f in m.get("files", []) if f.get("role") == "lucene")
+
     def latest(self):
         """{shard dir name (encoded): generation} for every shard with a LATEST."""
         out = {}
@@ -652,7 +664,11 @@ def phase_reshard():
         kept = job.get("unaffected") or []
         unchanged = {s: (r5["latest_before"].get(s), r5["latest_after"].get(s)) for s in kept}
         move_ok = frac <= MOVE_MAX and (parsed is None or parsed <= mv["moved"])
-        kept_ok = all(a == b for a, b in unchanged.values())
+        # P6-R23: a kept shard gets a metadata-only generation at the new run; its content (Lucene files) is
+        # what must be unchanged
+        bk = Bucket()
+        kept_ok = all(bk.lucene_keys(s, a) is not None and bk.lucene_keys(s, a) == bk.lucene_keys(s, b)
+                      for s, (a, b) in unchanged.items())
         out["criterion_4to5"] = {"moved": mv["moved"], "indexed": mv["indexed"], "fraction": round(frac, 4),
                                  "parsed": parsed, "kept": kept, "kept_generations": unchanged,
                                  "rewritten": job.get("affected"), "pass_moved": move_ok, "pass_kept": kept_ok}
