@@ -941,6 +941,63 @@ public class ReshardJobTest {
         assertEveryFileOnce(r, files, "after the abandoned reshard");
     }
 
+    /**
+     * Final review I3: a cancelled pinned reshard leaves the reader with prepared generation dirs of the shards
+     * it rewrote (their ids stay active). Within one pass the reader drops them, deletes their dirs and stops
+     * reporting them; the active generations and the retained previous ones (P6-R19 grace) stay untouched.
+     */
+    @Test
+    void aCancelledReshardFreesThePreparedGenerationsOnReaders() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        // a run of the project: the reader activates it and retains the previous generations for the grace
+        Path f = src.resolve(files.getFirst());
+        Files.writeString(f, Files.readString(f).replace("Part 0 of", "Part zero of"));
+        Files.setLastModifiedTime(f, FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        a.loop.tick();
+        r.sync();
+        Map<ShardId, Path> retained = new HashMap<>();
+        for (ShardId s : ring(4)) {
+            r.cache.retained(s.value()).ifPresent(rt -> retained.put(s, rt.dir()));
+        }
+        assertThat(retained).as("previous generations retained").isNotEmpty();
+
+        heartbeats = List.of(r.heartbeat()); // the reader has not prepared: the job waits pinned
+        catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        assertThat(catalog.projectShards().stagedOf(P).orElseThrow().pinned()).isTrue();
+        r.syncer.syncOnce(); // prepares the rewritten shards (heartbeat not published: the job keeps waiting)
+        Map<ShardId, Generation> prepared = Map.copyOf(r.syncer.preparedGenerations());
+        assertThat(prepared).as("rewritten shards prepared").isNotEmpty();
+        Path cacheDir = tmp.resolve("r-" + r.node);
+        Map<ShardId, Path> active = new HashMap<>();
+        for (ShardId s : ring(4)) active.put(s, r.cache.active(s.value()).orElseThrow());
+        for (Map.Entry<ShardId, Generation> e : prepared.entrySet()) {
+            assertThat(cacheDir.resolve(e.getKey().pathSegment()).resolve("gen-" + e.getValue().value())).isDirectory();
+        }
+
+        assertThat(catalog.cancelReshard(P, clock.instant())).isTrue();
+        r.sync();
+        assertThat(r.syncer.preparedGenerations()).as("no longer reported").isEmpty();
+        assertThat(r.heartbeat().prepared()).isEmpty();
+        for (Map.Entry<ShardId, Generation> e : prepared.entrySet()) {
+            assertThat(cacheDir.resolve(e.getKey().pathSegment()).resolve("gen-" + e.getValue().value()))
+                    .as("prepared dir of " + e.getKey() + " freed").doesNotExist();
+        }
+        for (Map.Entry<ShardId, Path> e : active.entrySet()) {
+            assertThat(e.getValue()).as("active dir of " + e.getKey()).isDirectory();
+            assertThat(r.cache.active(e.getKey().value())).contains(e.getValue());
+        }
+        for (Map.Entry<ShardId, Path> e : retained.entrySet()) {
+            assertThat(e.getValue()).as("retained dir of " + e.getKey()).isDirectory();
+            assertThat(r.cache.retained(e.getKey().value()).map(ReaderLocalCache.Retained::dir)).contains(e.getValue());
+        }
+        assertEveryFileOnce(r, files, "after the cancel");
+    }
+
     /** A catalog frozen at one read: a coordinator whose cached catalog predates a change. */
     static com.pharos.cluster.ShardCatalog frozen(ProjectShards snapshot) {
         return new com.pharos.cluster.ShardCatalog() {

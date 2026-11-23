@@ -296,9 +296,12 @@ public class ReplicaSyncer implements Closeable {
                     logSyncFailure(shard, e);
                 }
             }
-            syncSets(sets);
+            Map<ShardId, Set<Long>> targets = new HashMap<>();
+            Set<ShardId> unknown = new HashSet<>();
+            syncSets(sets, targets, unknown);
             cache.expireRetained(); // P6-R19: previous generations past their grace are released
             prepared.keySet().retainAll(wantedSet);
+            dropStalePrepared(inSets, targets, unknown);
             snapshotPrepared();
             if (lazy != null) lazy.sweep();
             sweepProjectFiles();
@@ -519,7 +522,7 @@ public class ReplicaSyncer implements Closeable {
      * a query of the active version never sees the new version's content. Shards only a staged (or the
      * retired) version has are activated when their set is complete.
      */
-    private void syncSets(List<SyncSet> sets) {
+    private void syncSets(List<SyncSet> sets, Map<ShardId, Set<Long>> targets, Set<ShardId> unknown) {
         if (sets.isEmpty()) return;
         Map<String, Prepared> ready = new HashMap<>();   // shard@target -> prepared generation
         Set<String> failed = new HashSet<>();
@@ -537,6 +540,22 @@ public class ReplicaSyncer implements Closeable {
                     failed.add(key);
                     logSyncFailure(shard, e);
                 }
+            }
+        }
+        // what each set wants of its shards this pass (I3: a prepared generation no set wants is stale)
+        for (SyncSet set : sets) {
+            for (ShardId shard : set.shards()) {
+                if (set.role() == SetRole.PREVIOUS && set.active().contains(shard)) continue; // the active set's
+                Long pin = set.pins().get(shard);
+                if (pin != null) {
+                    targets.computeIfAbsent(shard, k -> new HashSet<>()).add(pin);
+                    continue;
+                }
+                String key = shard + "@latest";
+                Prepared p = ready.get(key);
+                if (p != null) targets.computeIfAbsent(shard, k -> new HashSet<>()).add(p.gen().value());
+                else if (failed.contains(key) || !ready.containsKey(key)) unknown.add(shard); // can't tell: keep
+                else targets.computeIfAbsent(shard, k -> new HashSet<>()); // LATEST is what it serves
             }
         }
         Map<ShardId, Prepared> activate = new java.util.LinkedHashMap<>();
@@ -587,6 +606,44 @@ public class ReplicaSyncer implements Closeable {
             } catch (IOException | RuntimeException ex) {
                 // registration failed: this shard keeps its previous generation; the next pass retries
                 logSyncFailure(e.getKey(), ex);
+            }
+        }
+    }
+
+    /**
+     * Final review I3: drops each prepared generation of a set's shard that no set of this pass wants (a
+     * cancelled or rebuilt reshard's staged generation of a shard the active version keeps), and deletes its
+     * dir unless it is the active or the retained one (P6-R19 grace) or the registry names it; heartbeats
+     * stop reporting it. A shard whose wanted generation this pass could not tell (a failed or empty
+     * {@code LATEST} read) keeps its prepared one.
+     */
+    private void dropStalePrepared(Set<ShardId> inSets, Map<ShardId, Set<Long>> targets, Set<ShardId> unknown) {
+        for (Map.Entry<ShardId, Generation> e : List.copyOf(prepared.entrySet())) {
+            ShardId shard = e.getKey();
+            Generation gen = e.getValue();
+            if (!inSets.contains(shard) || unknown.contains(shard)) continue;
+            if (targets.getOrDefault(shard, Set.of()).contains(gen.value())) continue;
+            prepared.remove(shard);
+            Path dir = cacheDir.resolve(shard.pathSegment()).resolve("gen-" + gen.value());
+            Path norm = dir.toAbsolutePath().normalize();
+            boolean inUse = cache.active(shard.value()).map(p -> p.toAbsolutePath().normalize().equals(norm)).orElse(false)
+                    || cache.retained(shard.value()).map(r -> r.dir().toAbsolutePath().normalize().equals(norm))
+                    .orElse(false)
+                    || registry.find(shard.value()).map(ProjectMeta::getIndexPath)
+                    .map(p -> Path.of(p).toAbsolutePath().normalize().equals(norm)).orElse(false);
+            if (inUse) {
+                log.info("Shard {}: generation {} is no longer staged; keeping its dir (still referenced)", shard,
+                        gen.value());
+                continue;
+            }
+            try {
+                GraphViews.evict(dir);
+                deleteRecursively(dir);
+                log.info("Shard {}: dropped prepared generation {} (its reshard was cancelled or rebuilt)", shard,
+                        gen.value());
+            } catch (IOException | RuntimeException ex) {
+                log.warn("Shard {}: deleting the dropped prepared generation dir {} failed: {}", shard, dir,
+                        ex.toString());
             }
         }
     }

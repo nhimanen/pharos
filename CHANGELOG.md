@@ -232,6 +232,9 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   without vectors out).
 
 ### Fixed
+- Multi-node: a reader frees the generations it prepared for a reshard that was cancelled or rebuilt
+  within one sync pass (their dirs are deleted unless active or retained for the grace, and
+  heartbeats stop reporting them); before, they stayed on disk until the shard's next activation.
 - A Python module and a non-code file of the same path stem (e.g. `releaseWizard.py` and
   `releaseWizard.yaml`) share one document id; both documents got the body of whichever file was
   indexed first, so the non-code file's text was lost and, in a cluster, a reshard changed BM25
