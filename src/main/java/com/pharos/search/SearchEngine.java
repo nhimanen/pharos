@@ -451,6 +451,7 @@ public class SearchEngine {
                     noAnswer = e; // every shard lost to a swap or synonyms: the re-plan below may answer
                 }
                 for (String note : q.lateNotes()) trace.note(note);
+                if (q.statsSummary() != null) trace.statistics(q.statsSummary());
                 retryCause = q.retryCause();
             }
             if (retryCause != null && ds.retries()) {
@@ -464,6 +465,7 @@ public class SearchEngine {
                         warnDegraded(q.localShards(), retryWarnings);
                         SearchResponse second = searchFannedOut(req, hints, expand, trace, retryWarnings, q);
                         for (String note : q.lateNotes()) trace.note(note);
+                        if (q.statsSummary() != null) trace.statistics(q.statsSummary());
                         resp = second;
                         noAnswer = null;
                     }

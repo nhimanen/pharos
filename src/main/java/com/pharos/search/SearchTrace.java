@@ -44,6 +44,13 @@ public class SearchTrace {
 
     public List<String> notes() { return List.copyOf(notes); }
 
+    private volatile String statistics;
+
+    /** What a fanned-out query's statistics round read (shards, generations, field totals); diagnostics. */
+    public void statistics(String summary) { this.statistics = summary; }
+
+    public String statistics() { return statistics; }
+
     /** Per stage type, each result's raw score before the graph boost and the other multipliers (P6-R20). */
     private final java.util.Map<String, java.util.Map<String, Float>> rawScores = new java.util.LinkedHashMap<>();
 

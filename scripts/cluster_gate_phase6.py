@@ -490,12 +490,17 @@ def fetch_traced(base, q, pipeline, timeout=120):
     if isinstance(data, list):
         return status, data, []
     results = data.get("results", [])
-    raw = (data.get("searchMeta") or {}).get("rawScores") or {}
+    meta = data.get("searchMeta") or {}
+    LAST_META[q, pipeline] = {"routing": meta.get("routing", []), "statistics": meta.get("statistics")}
+    raw = meta.get("rawScores") or {}
     for res in results:
         res["raw"] = {t: m[res.get("id")] for t, m in raw.items() if res.get("id") in m}
     if "results" not in data and status == 200:
         status = -2
     return status, results, list(data.get("warnings") or [])
+
+
+LAST_META = {}  # (query, pipeline) -> {"routing", "statistics"} of the last traced answer (P6-R22 diagnostics)
 
 
 def run_queries_traced(base, sp):
@@ -520,6 +525,8 @@ def ranking_pass(label):
     base = NODES["r1"].base
     run_queries_traced(base, sp)  # warm-up
     res, warns, fails = run_queries_traced(base, sp)
+    (gate() / f"ranking-{label}-meta.json").write_text(json.dumps(
+        {p3.key(pl, scope, q): LAST_META.get((q, pl)) for pl, scope, q in sp}))
     (gate() / f"ranking-{label}.json").write_text(json.dumps(res))
     (gate() / f"ranking-{label}-warnings.json").write_text(json.dumps(p3.LAST_WARNINGS[base]))
     log(f"ranking {label}: {len(sp)} answers, failures {len(fails)}, warnings {warns}")

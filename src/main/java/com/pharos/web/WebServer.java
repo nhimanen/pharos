@@ -614,6 +614,7 @@ public class WebServer {
                         if (!resp.trace().notes().isEmpty()) meta.put("routing", resp.trace().notes());
                         // P6-R20: each stage's raw (pre-graph-boost) score per result id
                         if (!resp.trace().rawScores().isEmpty()) meta.put("rawScores", resp.trace().rawScores());
+                        if (resp.trace().statistics() != null) meta.put("statistics", resp.trace().statistics());
                         var cls = resp.trace().getClassification();
                         if (cls != null) {
                             meta.put("classIntent",  cls.intent());
