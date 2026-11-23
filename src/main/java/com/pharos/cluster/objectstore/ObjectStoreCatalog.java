@@ -779,6 +779,81 @@ public final class ObjectStoreCatalog implements ShardCatalog {
                 + shard + " after " + MAX_ATTEMPTS + " attempts");
     }
 
+    /**
+     * Removes a whole project from the catalog in one CAS ({@code pharos remove-index --from-catalog}, the
+     * operator's removal Job; integration carry I4): its {@code projects[]} entry (active, staged, previous
+     * and abandoned versions, pins and an open reshard request with it) and every {@code shards[]} entry of
+     * the project: its {@code [project]} id, every shard any of its versions names, and any other keyed id
+     * of it ({@code <project>~...}, matched by rebuilding the id from its key values, never by parsing).
+     * Writers release it and readers stop serving all of it at once. Spec versions ({@code specs[]}) stay
+     * (history; version numbers are never reused), and so do generations and writer state in the store:
+     * registering the project again resumes from them. Idempotent.
+     *
+     * @return the shard ids removed; empty (and nothing written) when the catalog does not know the project
+     */
+    public List<ShardId> removeProject(String project) throws IOException {
+        if (!ShardId.isProjectName(project)) {
+            throw new IllegalArgumentException("'" + project + "' is not a valid cluster project name");
+        }
+        List<ShardId> removed = new ArrayList<>();
+        update("remove project " + project, root -> {
+            removed.clear();
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            ids.add(project);
+            boolean entryRemoved = false;
+            ArrayNode projects = array(root, "projects");
+            for (int i = projects.size() - 1; i >= 0; i--) {
+                if (project.equals(projects.get(i).path("name").asText(null))) {
+                    collectShardIds(projects.get(i), ids);
+                    projects.remove(i);
+                    entryRemoved = true;
+                }
+            }
+            if (projects.isEmpty()) root.remove("projects");
+            ArrayNode shards = shardsArray(root);
+            for (int i = shards.size() - 1; i >= 0; i--) {
+                String id = shards.get(i).path("id").asText();
+                if (ids.contains(id) || isKeyedIdOf(project, id)) {
+                    shards.remove(i);
+                    removed.add(0, new ShardId(id));
+                }
+            }
+            return entryRemoved || !removed.isEmpty();
+        });
+        return List.copyOf(removed);
+    }
+
+    /** Every text in a {@code shards} array anywhere under {@code node} (a project entry and its versions). */
+    private static void collectShardIds(JsonNode node, java.util.Set<String> out) {
+        if (node == null) return;
+        if (node.isObject()) {
+            var it = node.fields();
+            while (it.hasNext()) {
+                var e = it.next();
+                if ("shards".equals(e.getKey()) && e.getValue().isArray()) {
+                    for (JsonNode id : e.getValue()) if (id.isTextual()) out.add(id.asText());
+                } else {
+                    collectShardIds(e.getValue(), out);
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode n : node) collectShardIds(n, out);
+        }
+    }
+
+    /** True when {@code id} is a keyed shard id of {@code project}: the id rebuilt from its key values. */
+    private static boolean isKeyedIdOf(String project, String id) {
+        if (!ShardId.isValid(id)) return false;
+        ShardId shard = new ShardId(id);
+        var keys = shard.keyValues();
+        if (keys.isEmpty()) return false;
+        try {
+            return ShardId.keyed(project, keys).equals(shard);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
     /** Sleeps a random time in [d/2, d] with d = base * 2^(attempt-2). */
     private void backoff(int attempt) throws IOException {
         long d = BASE_BACKOFF_MS << (attempt - 2);

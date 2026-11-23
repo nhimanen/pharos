@@ -169,7 +169,8 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   --ref <ref> [--no-embed]` with no path only records the source in the shard catalog (also
   `./pharos index` without a path). It publishes nothing, so a work-queue writer runs it too and no
   writer needs to be running; the work queue then indexes the project. `pharos remove-index
-  --from-catalog <name>` drops a project's catalog entry: writers release it and readers stop
+  --from-catalog <name>` drops a project from the catalog in one write (a split project's every
+  shard, its staged and retired versions and an open reshard too): writers release it and readers stop
   serving it, the last project too (readers keep their shards only while the catalog object is
   missing, no longer when it lists no shard); its generations stay in the bucket, and registering
   it again resumes from them. The

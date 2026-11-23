@@ -151,6 +151,27 @@ class SourceOptionsTest {
         }
     }
 
+    /** Integration carry I4: the removal Job on a split project removes every shard of it at once. */
+    @Test
+    void removeFromCatalogRemovesEveryShardOfASplitProject() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        try (ClusterFixture c = new ClusterFixture(tmp, store, store, "test-bucket")) {
+            c.writerConfig.getCluster().getWriter().setWorkQueue(true);
+            var catalog = c.writerRuntime.sourceCatalog().orElseThrow();
+            catalog.register(ShardId.ofProject("a"), Optional.of(ShardSource.git("https://example.org/a.git", "main")));
+            catalog.register(ShardId.ofProject("b"), Optional.of(ShardSource.git("https://example.org/b.git", "main")));
+            int v = catalog.addSpec(Optional.of("a"), com.pharos.cluster.sharding.ShardSpec.parse(
+                    "[project, ring(path, shards=2)]"));
+            catalog.putProject("a", v, java.util.List.of(new ShardId("a~ring=s01"), new ShardId("a~ring=s02")));
+            assertThat(catalog.projectShards().isSplit("a")).isTrue();
+
+            assertThat(new CommandLine(new com.pharos.cli.RemoveIndexCommand(c.writerRegistry, c.writerManager,
+                    c.writerConfig, c.writerRuntime)).execute("a", "--from-catalog")).isZero();
+            assertThat(catalog.shards()).containsExactly(new ShardId("b"));
+            assertThat(catalog.projectShards().projects()).containsExactly("b");
+        }
+    }
+
     @Test
     void sourceForDiscoveredSubprojectIsRefused() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();

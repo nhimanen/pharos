@@ -17,8 +17,9 @@ import java.util.concurrent.Callable;
  *
  * <p>With {@code --all}, removes every indexed project in the registry.
  *
- * <p>With {@code --from-catalog}, removes only the project's entry from the cluster's shard catalog
- * (object-store backend): work-queue writers release it and readers stop serving it. It deletes no
+ * <p>With {@code --from-catalog}, removes only the project from the cluster's shard catalog
+ * (object-store backend), in one write: every shard of a split project, its staged and retired versions
+ * and an open reshard request with it. Work-queue writers release it and readers stop serving it. It deletes no
  * index data, locally or in the store, so a work-queue writer runs it too.
  */
 @Command(
@@ -37,7 +38,7 @@ public class RemoveIndexCommand implements Callable<Integer> {
     private boolean all;
 
     @Option(names = "--from-catalog",
-            description = "Cluster: only remove the project from the shard catalog, so work-queue writers stop"
+            description = "Cluster: only remove the project (every shard of a split project) from the shard catalog, so work-queue writers stop"
                     + " indexing it and readers stop serving it. Deletes no index data (locally or in the object"
                     + " store); registering the project again resumes from its last generation")
     private boolean fromCatalog;
@@ -107,16 +108,16 @@ public class RemoveIndexCommand implements Callable<Integer> {
                     + " this node has none.");
             return 2;
         }
-        com.pharos.cluster.ShardId shard;
-        try {
-            shard = com.pharos.cluster.ShardId.ofProject(projectName);
-        } catch (IllegalArgumentException e) {
-            System.err.println("Error: " + e.getMessage());
+        if (!com.pharos.cluster.ShardId.isProjectName(projectName)) {
+            System.err.println("Error: '" + projectName + "' is not a valid cluster project name");
             return 2;
         }
         try {
-            if (catalog.get().unregister(shard)) {
-                System.out.println("Removed project '" + projectName + "' from the cluster catalog.");
+            // the whole project in one catalog write: a split project's shards and its versions too (I4)
+            List<com.pharos.cluster.ShardId> removed = catalog.get().removeProject(projectName);
+            if (!removed.isEmpty()) {
+                System.out.println("Removed project '" + projectName + "' from the cluster catalog"
+                        + (removed.size() == 1 ? "." : " (" + removed.size() + " shards)."));
             } else {
                 System.out.println("Project '" + projectName + "' is not in the cluster catalog.");
             }

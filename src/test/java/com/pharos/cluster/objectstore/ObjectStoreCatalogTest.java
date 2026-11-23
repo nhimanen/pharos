@@ -132,6 +132,69 @@ class ObjectStoreCatalogTest {
         assertThat(sleeps).isEmpty();
     }
 
+    /** Counts conditional catalog writes. */
+    private static final class CountingStore extends InMemoryObjectStore {
+        int conditionalWrites;
+
+        @Override
+        public Optional<String> putIfMatch(String key, byte[] data, String etag) {
+            conditionalWrites++;
+            return super.putIfMatch(key, data, etag);
+        }
+    }
+
+    /**
+     * Integration carry I4: remove-index --from-catalog removes a whole split project in one CAS: its
+     * projects[] entry with the staged version and the open reshard, every shard any version names, and
+     * its pre-split [project] id. Another project (even one whose name shares the prefix) stays; specs stay.
+     */
+    @Test
+    void removeProjectRemovesASplitProjectInOneWrite() throws Exception {
+        CountingStore store = new CountingStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        ShardId s01 = new ShardId("lucene~ring=s01");
+        ShardId s02 = new ShardId("lucene~ring=s02");
+        ShardId s03 = new ShardId("lucene~ring=s03");
+        catalog.register(ShardId.ofProject("lucene"), Optional.of(ShardSource.git("https://example.org/l.git", "main")));
+        catalog.register(ShardId.ofProject("other"));
+        catalog.register(new ShardId("lucene.x~ring=s01")); // another project's keyed id, same prefix
+        int v1 = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        catalog.putProject("lucene", v1, List.of(s01, s02));
+        int v2 = catalog.requestReshard("lucene", ShardSpec.parse("[project, ring(path, shards=3)]"),
+                java.time.Instant.parse("2026-11-23T10:00:00Z"));
+        catalog.stageReshard("lucene", v2, java.util.OptionalInt.of(v1), List.of(s01, s02, s03),
+                java.time.Instant.parse("2026-11-23T10:00:00Z"));
+        assertThat(catalog.projectShards().stagedOf("lucene")).isPresent();
+
+        int before = store.conditionalWrites;
+        assertThat(catalog.removeProject("lucene")).containsExactlyInAnyOrder(ShardId.ofProject("lucene"), s01, s02, s03);
+        assertThat(store.conditionalWrites - before).as("one CAS").isEqualTo(1);
+        assertThat(catalog.shards()).containsExactly(ShardId.ofProject("other"), new ShardId("lucene.x~ring=s01"));
+        ProjectShards map = catalog.projectShards();
+        assertThat(map.projects()).doesNotContain("lucene");
+        assertThat(map.stagedOf("lucene")).isEmpty();
+        String json = new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8);
+        assertThat(json).doesNotContain("\"reshard\"").doesNotContain("\"staged\"").contains("\"specs\"");
+
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.removeProject("lucene")).as("already gone").isEmpty();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("no write").isEqualTo(etag);
+    }
+
+    @Test
+    void removeProjectRemovesAnUnsplitProject() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.removeProject("a")).as("no catalog yet").isEmpty();
+        catalog.register(ShardId.ofProject("a"), Optional.of(ShardSource.git("https://example.org/a.git", "main")));
+        catalog.register(ShardId.ofProject("b"));
+        assertThat(catalog.removeProject("a")).containsExactly(ShardId.ofProject("a"));
+        assertThat(catalog.shards()).containsExactly(ShardId.ofProject("b"));
+        assertThat(catalog.removeProject("b")).containsExactly(ShardId.ofProject("b"));
+        assertThat(catalog.authoritativeShards()).as("the last project: an empty, authoritative catalog")
+                .contains(List.of());
+    }
+
     @Test
     void registerRecordsAndUpdatesSourceIdempotently() throws Exception {
         InMemoryObjectStore store = new InMemoryObjectStore();
