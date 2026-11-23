@@ -1269,6 +1269,75 @@ public class ReshardJobTest {
         assertEveryFileOnce(r, files, "after the flip");
     }
 
+    /** A live heartbeat of a reader of a release without sharding (Phase 5: no {@code filters} capability). */
+    private static ReaderHeartbeat olderReader(String node) {
+        return new ReaderHeartbeat(node, "http://" + node, List.of(P), false, Map.of(), 0, 0, 0L, null, null, null,
+                null);
+    }
+
+    /**
+     * Final review I2: while a reader of a release without sharding is live (a rolling upgrade), {@code pharos
+     * reshard} and {@code requestReshard} refuse, and nothing is written; once it is gone the request goes through.
+     */
+    @Test
+    void aReshardIsRefusedWhileAReaderOfAnOlderReleaseIsLive() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        new Reader("r1").sync();
+        byte[] before = store.get(layout.catalogKey()).orElseThrow().data();
+        store.put(layout.readerKey("old-1"), JSON.writeValueAsBytes(olderReader("old-1")));
+
+        assertThat(cli(P, "--spec", RING5.toString())).as("pharos reshard refuses").isEqualTo(1);
+        assertThatThrownBy(() -> catalog.requestReshard(P, RING5, clock.instant(), List.of(olderReader("old-1"))))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("old-1")
+                .hasMessageContaining("finish upgrading");
+        assertThat(store.get(layout.catalogKey()).orElseThrow().data()).as("nothing written").isEqualTo(before);
+        assertThat(catalog.projectShards().reshardRequestOf(P)).isEmpty();
+
+        store.delete(layout.readerKey("old-1"));
+        assertThat(cli(P, "--spec", RING5.toString())).as("upgrade finished: accepted").isZero();
+        assertThat(catalog.projectShards().reshardRequestOf(P)).isPresent();
+    }
+
+    /**
+     * Final review I2: a requested reshard holds before staging while a reader of a release without sharding is
+     * live, and a staged one holds before its flip when such a reader appears mid-job, past the sync timeout too;
+     * each goes on once the reader is gone.
+     */
+    @Test
+    void aReshardHoldsWhileAReaderOfAnOlderReleaseIsLive() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        int n = catalog.projectShards().specVersionOf(P).orElseThrow();
+        catalog.requestReshard(P, RING5, clock.instant());
+        heartbeats = List.of(r.heartbeat(), olderReader("old-1"));
+        a.loop.tick();
+        assertThat(catalog.projectShards().stagedOf(P)).as("held before staging").isEmpty();
+        JsonNode job = JSON.readTree(store.get(layout.reshardJobKey(P)).orElseThrow().data());
+        assertThat(job.path("waitingFor").asText()).contains("old-1", "without sharding");
+
+        r.sync(); // the older reader is gone
+        a.loop.tick();
+        assertThat(catalog.projectShards().stagedOf(P).orElseThrow().pinned()).as("staged and pinned").isTrue();
+        r.sync(); // r prepares the new version
+        heartbeats = List.of(r.heartbeat(), olderReader("old-2")); // an older reader appears mid-job
+        clock.advance(SYNC_TIMEOUT.toSeconds() + 10);
+        a.loop.tick();
+        assertThat(catalog.projectShards().specVersionOf(P)).as("held before the flip, timeout or not").hasValue(n);
+        assertThat(catalog.projectShards().stagedOf(P)).isPresent();
+        assertEveryFileOnce(r, files, "held before the flip");
+
+        r.sync();
+        a.loop.tick();
+        assertThat(catalog.projectShards().specVersionOf(P).orElseThrow()).as("flipped once it is gone").isGreaterThan(n);
+        r.sync();
+        assertEveryFileOnce(r, files, "after the flip");
+    }
+
     private boolean latestEqualsPins() throws IOException {
         Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
         if (pins.isEmpty()) return false;

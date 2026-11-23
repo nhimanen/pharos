@@ -107,6 +107,35 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
         return Boolean.TRUE.equals(filters);
     }
 
+    /**
+     * True when the reader runs a release with sharding (Phase 6): it parses split shard ids
+     * ({@code p~ring=…}), prepares a reshard's staged shards and routes by spec versions. Phase 6 readers
+     * announce it with the {@code filters} capability (both came with Phase 6, P6-R12); an older reader's
+     * heartbeat has neither.
+     */
+    public boolean supportsSharding() {
+        return supportsFilters();
+    }
+
+    /**
+     * The nodes of {@code live} that run a release without sharding (final review I2): a reshard is refused,
+     * and an open one holds before staging and before its flip, while any is live, since such a node never
+     * prepares the new version and, as a coordinator, would route only the previous one until retention
+     * dropped it. Sorted; empty when every live reader supports sharding.
+     */
+    public static List<String> withoutSharding(java.util.Collection<ReaderHeartbeat> live) {
+        return live.stream().filter(r -> !r.supportsSharding()).map(ReaderHeartbeat::node).sorted().toList();
+    }
+
+    /** The words every {@link #withoutShardingMessage} contains. */
+    public static final String WITHOUT_SHARDING = "run a pharos release without sharding";
+
+    /** The refusal for {@link #withoutSharding} nodes: what is wrong and what to do. */
+    public static String withoutShardingMessage(List<String> nodes) {
+        return "live reader(s) " + String.join(", ", nodes) + " " + WITHOUT_SHARDING + " (a rolling"
+                + " upgrade in progress?); finish upgrading every node to this release before resharding";
+    }
+
     public ReaderHeartbeat {
         if (draining) state = DRAINING;
         else if (state == null || state.isBlank()) state = READY;

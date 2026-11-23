@@ -251,6 +251,22 @@ public final class ReshardJob {
                 throw new IllegalArgumentException("a reshard to [project] is not supported; use a single-shard ring,"
                         + " [project, ring(path, shards=1)]");
             }
+            // final review I2: hold (before staging, and before the flip, timeout or not) while a live reader
+            // runs a release without sharding: it would never prepare the new version and, as a coordinator,
+            // route only the previous one, so the project would go missing from its answers after retention
+            List<String> older = ReaderHeartbeat.withoutSharding(readers.get());
+            if (!older.isEmpty()) {
+                String why = ReaderHeartbeat.withoutShardingMessage(older);
+                if (!why.equals(job.waitingFor)) {
+                    job.waitingFor = why;
+                    writeJob(project, job);
+                    log.warn("Reshard of project {}: holding: {}", project, why);
+                }
+                return Step.WAITING;
+            }
+            if (job.waitingFor != null && job.waitingFor.contains(ReaderHeartbeat.WITHOUT_SHARDING)) {
+                job.waitingFor = null; // the rolling-upgrade hold is over
+            }
             OptionalInt from = map.specVersionOf(project);
             Optional<ProjectShards.Staged> staged = map.stagedOf(project)
                     .filter(s -> !s.abandoned() && s.specVersion() == req.specVersion());

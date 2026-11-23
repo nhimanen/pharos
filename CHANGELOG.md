@@ -223,6 +223,10 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   (its Lucene files unchanged, nothing uploaded or downloaded again; readers hard-link them), so once
   the next run clears the reshard's pins a query no longer leaves such a shard out, or reads the
   rewritten shards' previous generations and misses a removed shard's files.
+- Multi-node: `pharos reshard` is refused while a live reader runs an older release without
+  sharding (a rolling upgrade in progress), and an open reshard holds before staging and before its
+  flip until every live reader is upgraded: an older coordinator would otherwise route only the
+  previous version and lose the project from its answers once retention dropped it (UPGRADING.md).
 - Multi-node: a replica's generation mismatch no longer hides the first reader's "no vectors for
   the model" answer (a vector or hybrid query right after a flip left every shard of a project
   without vectors out).

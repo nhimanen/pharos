@@ -217,8 +217,25 @@ public final class ObjectStoreCatalog implements ShardCatalog {
      *         not cancelled) for another spec: one reshard of a project at a time
      */
     public int requestReshard(String project, ShardSpec spec, java.time.Instant now) throws IOException {
+        return requestReshard(project, spec, now, List.of());
+    }
+
+    /**
+     * As above, refused while {@code liveReaders} (the cluster's live heartbeats) include a reader of a
+     * release without sharding (final review I2: finish a rolling upgrade before resharding).
+     *
+     * @throws IllegalStateException also when such a reader is live; nothing is written
+     */
+    public int requestReshard(String project, ShardSpec spec, java.time.Instant now,
+                              java.util.Collection<com.pharos.cluster.membership.ReaderHeartbeat> liveReaders)
+            throws IOException {
         if (!ShardId.isProjectName(project)) {
             throw new IllegalArgumentException("'" + project + "' is not a valid cluster project name");
+        }
+        List<String> older = com.pharos.cluster.membership.ReaderHeartbeat.withoutSharding(liveReaders);
+        if (!older.isEmpty()) {
+            throw new IllegalStateException("cannot reshard project " + project + ": "
+                    + com.pharos.cluster.membership.ReaderHeartbeat.withoutShardingMessage(older));
         }
         int[] version = new int[1];
         update("request a reshard of project " + project, root -> {

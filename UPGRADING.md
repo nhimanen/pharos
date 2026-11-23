@@ -25,6 +25,13 @@ Nothing, unless you want the filters:
 format 2. Upgrade readers before relying on filters: a coordinator skips readers that do not
 advertise filter support (with a warning) for filtered queries.
 
+**Resharding:** finish the rolling upgrade before running `pharos reshard`. A node of an older
+release can't read split shard ids (`p~ring=…`) and never prepares a reshard's new version, so while
+a reader of an older release heartbeats, `pharos reshard` is refused (exit 1, naming the nodes) and
+an already open reshard holds before staging and before its flip (past
+`reshardSyncTimeoutSeconds` too); `pharos reshard <p> --status` shows why it waits. It goes on
+once every live reader runs this release.
+
 ## Invalid project names (e.g. ".")
 
 ### What happened

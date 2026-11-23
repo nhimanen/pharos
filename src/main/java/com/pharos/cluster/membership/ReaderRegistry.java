@@ -112,6 +112,14 @@ public final class ReaderRegistry implements MembershipSource {
         }
     }
 
+    /** Lists the live readers now (one refresh, on the caller's thread) and returns them ({@code pharos reshard}). */
+    public List<ReaderHeartbeat> refreshNow() {
+        synchronized (mu) {
+            if (!closed) refresh();
+        }
+        return live();
+    }
+
     /** The live readers as of the last refresh (this node's own entry included). */
     @Override
     public List<ReaderHeartbeat> live() {

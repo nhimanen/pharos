@@ -17,6 +17,7 @@ import picocli.CommandLine.Parameters;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.function.Function;
 
@@ -117,7 +118,10 @@ public class ReshardCommand implements Callable<Integer> {
             }
             int version;
             try {
-                version = catalog.requestReshard(project, target, Instant.now());
+                // final review I2: refused while a live reader runs a release without sharding
+                List<com.pharos.cluster.membership.ReaderHeartbeat> live =
+                        com.pharos.cluster.membership.ReaderRegistry.observer(store, layout, c).refreshNow();
+                version = catalog.requestReshard(project, target, Instant.now(), live);
             } catch (IllegalStateException e) {
                 System.err.println(e.getMessage());
                 return 1;
