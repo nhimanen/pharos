@@ -188,6 +188,19 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
 
 ### Changed
+- Keyword search ranks equal scores in a stable, build-independent order (document id, type and line
+  range) instead of by Lucene doc id, on a single node too: it reads the whole group of equal scores
+  at the page's cut (up to 10 000 hits), so two builds of the same source (a re-index, a resharded
+  project) return the same page, scores included. Results with equal scores may come back in another
+  order than before, and where another tied document is kept at the cut the page's graph-boosted
+  scores can change slightly.
+- Multi-node: a query that loses a shard because a reader switched the shard's generation during
+  the query (right after a reshard flip or a publish) or analyses with other synonyms (a synonyms
+  publish not yet everywhere) is planned again once: the coordinator waits up to 2 s (at most half
+  of the query's remaining budget) for its view to move on and runs the query again within the
+  original timeout, at most 16 such re-plans at once. Those queries can take up to that much longer
+  (the trace notes "re-planned once"); a re-plan that fails returns the first, partial answer with
+  its warnings, as before.
 - A reshard rewrites each affected shard whole: the moved files' documents are expunged (their
   deletes merged away) before the commit, so BM25 statistics count every document once. Those
   shards, HNSW vector graphs included, get new segment files, are re-uploaded in full and
