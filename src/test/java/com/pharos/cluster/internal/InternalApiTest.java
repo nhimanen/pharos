@@ -165,6 +165,28 @@ class InternalApiTest {
     private static final java.util.function.Function<ReaderHeartbeat, TermStatsRequest> STATS =
             hb -> new TermStatsRequest("java", List.of("body"), List.of());
 
+    /**
+     * Ruling P6-R22 (b), gate run 5's 8 hybrid failures: the pinned reader answers a vector request for a shard
+     * without vectors with a model mismatch; the client then tries another replica that still serves the
+     * shard's previous generation and refuses (generation mismatch). That later refusal must not hide the
+     * model mismatch (the coordinator leaves the shard out of the vector part only), as it did.
+     */
+    @Test
+    void aLaterReplicasGenerationMismatchNeverHidesTheModelMismatch() throws Exception {
+        FakeShardSearchService novectors = new FakeShardSearchService().serving("java", 4);
+        novectors.failure = new ModelMismatchException(ModelMismatchException.Reason.NO_VECTORS, "no vectors for model m");
+        FakeShardSearchService behind = new FakeShardSearchService().serving("java", 3);
+        Javalin a = serve(novectors);
+        Javalin b = serve(behind);
+        ReaderHeartbeat pinned = reader("pinned", a.port());
+        Route route = new Route(new ShardId("java"), List.of(pinned, reader("behind", b.port())));
+        assertThatThrownBy(() -> client(new ReaderHealth(30)).callPreferring(route, pinned, ShardClient.SHARD_SEARCH,
+                hb -> new ShardSearchRequest("java", 4L, "vector", null, new float[]{1f}, null), System.nanoTime() + 5_000_000_000L))
+                .isNotInstanceOf(GenerationMismatchException.class)
+                .hasCauseInstanceOf(ModelMismatchException.class);
+        assertThat(behind.calls).as("the fallback refused before its handler ran").hasValue(0);
+    }
+
     @Test
     void retriesOnceOnAnotherReplicaAfterConnectError() throws Exception {
         FakeShardSearchService good = new FakeShardSearchService().serving("java", 5);
