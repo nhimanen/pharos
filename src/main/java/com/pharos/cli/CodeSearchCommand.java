@@ -35,6 +35,7 @@ import picocli.CommandLine.*;
                 IndexStatusCommand.class,
                 UpgradeIndexesCommand.class,
                 PublishCommand.class,
+                EmbeddingsCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,

@@ -11,7 +11,8 @@ import java.util.Map;
 
 /**
  * Merges multiple candidate lists by scoring every deduplicated candidate with a
- * cross-encoder model and ranking by cross-encoder relevance.
+ * cross-encoder model and fusing the cross-encoder ranking with the
+ * first-stage order (best rank across lists) by equal-weight RRF (see {@link RrfFusion}).
  *
  * <p>Deduplication is by {@link SearchResult#id()}, first-occurrence wins (preserves
  * the searchType of whichever retriever found it first).
@@ -40,7 +41,13 @@ public final class CrossEncoderMerger implements MergeStage {
                 deduped.putIfAbsent(r.id(), r);
             }
         }
+        // First-stage order: each candidate's best rank in any list (ties: list order).
+        Map<String, Integer> bestRank = new LinkedHashMap<>();
+        for (List<SearchResult> list : candidates) {
+            for (int i = 0; i < list.size(); i++) bestRank.merge(list.get(i).id(), i, Math::min);
+        }
         List<SearchResult> pool = new ArrayList<>(deduped.values());
+        pool.sort(Comparator.comparingInt(r -> bestRank.get(r.id())));
 
         if (!encoder.isAvailable()) {
             if (trace != null) trace.record("cross-encoder merge (encoder unavailable)", t);
@@ -50,18 +57,7 @@ public final class CrossEncoderMerger implements MergeStage {
         List<String> passages = pool.stream().map(PassageBuilder::build).toList();
         float[] scores = encoder.score(query, passages);
 
-        List<SearchResult> scored = new ArrayList<>(pool.size());
-        for (int i = 0; i < pool.size(); i++) {
-            SearchResult r = pool.get(i);
-            scored.add(new SearchResult(
-                    r.id(), r.project(), r.packageName(), r.className(),
-                    r.qualifiedClassName(), r.methodName(), r.signature(),
-                    r.returnType(), r.body(), r.javadoc(), r.accessModifier(),
-                    r.filePath(), r.startLine(), r.endLine(),
-                    scores[i], "cross-encoder", r.docType()
-            ));
-        }
-        scored.sort(Comparator.comparingDouble(SearchResult::score).reversed());
+        List<SearchResult> scored = RrfFusion.fuse(pool, scores, "cross-encoder");
 
         if (trace != null) trace.record("cross-encoder merge", t);
         return scored.subList(0, Math.min(limit, scored.size()));

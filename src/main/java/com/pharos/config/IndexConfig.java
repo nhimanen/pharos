@@ -167,8 +167,48 @@ public class IndexConfig {
         return new IndexConfig();
     }
 
+    /** Model id of the recommended embedding model (written by {@code pharos embeddings enable}). */
+    public static final String RECOMMENDED_MODEL_ID = "granite-r2";
+    /** The jina preset's id: the one README documented for the jina provider block before 1.5.0. */
+    public static final String JINA_MODEL_ID = "jina-v2-code";
+
+    /**
+     * Pinned commit of {@code onnx-community/granite-embedding-english-r2-ONNX}; bump deliberately.
+     * Basis for the recommendation: docs/superpowers/gates/2026-11-16-embedding-ab.md.
+     */
+    static final String GRANITE_URL =
+            "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23";
+
+    /**
+     * Provider block for a known model: {@code granite-r2} (recommended: CLS pooling, 768 dims,
+     * pinned revision) or {@code jina-v2-code}. Null for anything else. Never applied implicitly:
+     * embeddings stay off until {@code pharos embeddings enable}.
+     */
+    public static EmbeddingProviderConfig presetProvider(String name) {
+        EmbeddingProviderConfig p = new EmbeddingProviderConfig();
+        p.setType("djl");
+        p.setDimensions(768);
+        p.setMaxTokens(512);
+        if (RECOMMENDED_MODEL_ID.equals(name)) {
+            p.setModelId(RECOMMENDED_MODEL_ID);
+            p.setUrl(GRANITE_URL);
+            p.setPooling(Pooling.CLS);
+        } else if (JINA_MODEL_ID.equals(name)) {
+            p.setModelId(JINA_MODEL_ID);
+            p.setUrl("hf://jinaai/jina-embeddings-v2-base-code");
+        } else {
+            return null;
+        }
+        return p;
+    }
+
     public static IndexConfig load() {
-        Path configFile = DEFAULT_BASE.resolve("config.json");
+        return loadFrom(DEFAULT_BASE);
+    }
+
+    /** Loads {@code <home>/config.json}; with none, returns the keyword-only defaults (writes nothing). */
+    public static IndexConfig loadFrom(Path home) {
+        Path configFile = home.resolve("config.json");
         if (!Files.exists(configFile)) {
             return defaults();
         }
@@ -258,6 +298,7 @@ public class IndexConfig {
             if (fb.getDimensions() <= 0) {
                 fb.setDimensions(parent.getDimensions());
             }
+            fb.inheritRuntimeSettings(parent);
             fb.validate();
             if (!fb.getModelId().equals(parent.getModelId())) {
                 throw new IllegalArgumentException(String.format(
