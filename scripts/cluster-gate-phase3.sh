@@ -15,9 +15,11 @@
 # With GATE_SEED_EMBED_CACHE=1 (default) the writer's pharos and mypal embedding caches are seeded from
 # COPIES of ~/.pharos/indexes/<project>/embed-cache.* (same model and vectors), which are only read.
 #
-# Run under a memory cap, e.g.
-#   GATE=/home/me/gate3-scratch/run1 systemd-run --user --scope -q -p MemoryMax=9G \
-#     bash scripts/cluster-gate-phase3.sh
+# On a shared host, run it under scripts/gate-watchdog.sh: one hard memory cap for every gate process
+# (a systemd user scope, or a cgroup-free fallback), and a watchdog that stops every recorded PID with
+# SIGTERM, then SIGKILL, when MemAvailable runs low, e.g.
+#   GATE=/home/me/gate3-scratch/run1 bash scripts/gate-watchdog.sh --state-dir /home/me/gate3-scratch/run1.wd \
+#     --mem-max 4G --min-available 3072 -- bash scripts/cluster-gate-phase3.sh
 #
 # Env:
 #   MINIO_BIN          minio server binary (default $HOME/.cache/pharos-gate/minio)
