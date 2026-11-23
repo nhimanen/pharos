@@ -194,6 +194,52 @@ class ReplicaSyncerTest {
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
     }
 
+    /**
+     * Ruling P6-R19: after activating generation 2 the reader keeps generation 1 answerable for the grace
+     * (its directory and a reader on it; the pruning never deletes it meanwhile). A newer activation or the
+     * end of the grace releases it: the reader is retired and the directory becomes an old generation the
+     * pruning may delete.
+     */
+    @Test
+    void thePreviousGenerationIsAnsweredForTheGraceThenReleased() throws Exception {
+        long[] now = {1_000_000L};
+        cache.setClock(() -> now[0]);
+        cache.setPreviousGenerationGrace(Duration.ofSeconds(30));
+        publishFull();
+        syncer.syncOnce();
+        try (LuceneIndexer indexer = new LuceneIndexer(IndexConfig.defaults(), cache)) {
+            int before = indexer.openReader(PROJECT).numDocs();
+            publishIncremental("retainedOne");
+            syncer.syncOnce();
+            assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(2)));
+            assertThat(indexer.openReader(PROJECT).numDocs()).as("the new generation is served").isGreaterThan(before);
+            assertThat(cache.retainedDir(PROJECT, 1)).contains(genDir(1));
+            var previous = indexer.openPinnedPreviousReader(PROJECT, 1).orElseThrow();
+            assertThat(previous.reader().numDocs()).as("generation 1 still answers").isEqualTo(before);
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 7)).as("an unknown generation").isEmpty();
+
+            now[0] += 29_000; // within the grace: a pass keeps it
+            syncer.syncOnce();
+            assertThat(genDir(1)).isDirectory();
+            assertThat(cache.retainedGenerations()).isEqualTo(Map.of(PROJECT, 1L));
+
+            publishIncremental("retainedTwo"); // a newer activation replaces it: 2 is retained, 1 released
+            syncer.syncOnce();
+            assertThat(cache.retainedGenerations()).isEqualTo(Map.of(PROJECT, 2L));
+            assertThat(cache.retainedDir(PROJECT, 1)).isEmpty();
+            assertThat(genDirNames()).as("generation 1 pruned once released").doesNotContain("gen-1");
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 2)).isPresent();
+            assertThat(indexer.previousGenerationReaders()).containsExactly(PROJECT);
+
+            now[0] += 31_000; // the grace is over
+            syncer.syncOnce();
+            assertThat(cache.retainedDir(PROJECT, 2)).isEmpty();
+            assertThat(cache.retainedGenerations()).isEmpty();
+            assertThat(indexer.previousGenerationReaders()).as("its reader retired").isEmpty();
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 2)).isEmpty();
+        }
+    }
+
     @Test
     void beforeFirstActivationShardDirIsNone() {
         assertThat(cache.shardDir(PROJECT)).isEqualTo(cacheDir.resolve(PROJECT).resolve("none"));

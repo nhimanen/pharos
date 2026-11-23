@@ -34,6 +34,10 @@ class ReplanTest {
     private static final String BUCKET = "test-bucket";
     private static final ParityCorpus.HashEmbeddings EMBEDDER = new ParityCorpus.HashEmbeddings();
 
+    /** A reader that keeps no previous generation (P6-R19 off): the re-plan is what mends a swap then. */
+    private static final java.util.function.Consumer<com.pharos.config.ClusterConfig> NO_RETENTION =
+            c -> c.getReader().setPreviousGenerationGraceSeconds(0);
+
     @AfterEach
     void clearHooks() {
         DistributedSearch.afterStatsRound = null;
@@ -69,7 +73,7 @@ class ReplanTest {
             fx.indexSplit(src, project, ring2, shards, false);
             fx.index(JAVA, false);
             try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
-                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null);
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null, NO_RETENTION);
                  TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(JAVA), EMBEDDER, null)) {
                 for (ShardId s : shards) k.awaitShard(s.value(), 1);
                 assertThat(search(k, project).warnings()).as("before").isEmpty();
@@ -90,6 +94,47 @@ class ReplanTest {
                 assertThat(on.results().stream().map(res -> res.className()).distinct().count())
                         .as("every Kestrel class, from both shards").isEqualTo(12);
                 assertThat(on.trace().notes()).anyMatch(n -> n.startsWith("re-planned once"));
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
+    /**
+     * Ruling P6-R19: the same swap on a reader that retains the previous generation. The query's search round
+     * asks for the generations its statistics round pinned, and the reader answers them from the retained
+     * ones: complete, no warning, and no re-plan needed (re-plans are off).
+     */
+    @Test
+    void aReaderSwappingAShardDuringTheQueryAnswersFromItsRetainedGeneration() throws Exception {
+        Path tmp = Files.createTempDirectory("replan-retained");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "swap";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        List<ShardId> shards = List.of(new ShardId(project + "~ring=s01"), new ShardId(project + "~ring=s02"));
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 12; i++) {
+            SplitProjectSearchTest.writeClass(src, "src/main/java/com/example/p" + i + "/Kestrel" + i + ".java",
+                    "com.example.p" + i, "Kestrel" + i, "kestrel hover " + i);
+        }
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, null)) {
+            fx.indexSplit(src, project, ring2, shards, false);
+            fx.index(JAVA, false);
+            try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null,
+                    c -> c.getReader().setPreviousGenerationGraceSeconds(300));
+                 TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(JAVA), EMBEDDER, null)) {
+                for (ShardId s : shards) k.awaitShard(s.value(), 1);
+                k.ds().retries = false;
+                for (int n = 1; n <= 2; n++) {
+                    nextRun(fx, src, project, ring2, shards, n);
+                    swapOnceAfterStats(x);
+                    SearchResponse r = search(k, project);
+                    assertThat(r.warnings()).as("run " + n + ": no shard left out").isEmpty();
+                    assertThat(r.results().stream().map(res -> res.className()).distinct().count())
+                            .as("run " + n + ": every Kestrel class, from both shards").isEqualTo(12);
+                    assertThat(r.trace().notes()).noneMatch(note -> note.startsWith("re-planned"));
+                }
             }
         } finally {
             SplitProjectSearchTest.deleteTree(tmp);
@@ -162,7 +207,7 @@ class ReplanTest {
             fx.indexSplit(src, project, ring2, shards, false);
             fx.indexBoth();
             try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
-                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null);
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null, NO_RETENTION);
                  TestReaderNode r = new TestReaderNode(tmp.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER, null);
                  TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(PY), EMBEDDER, null)) {
                 for (ShardId s : shards) k.awaitShard(s.value(), 1);

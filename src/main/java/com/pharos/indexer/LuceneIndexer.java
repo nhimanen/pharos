@@ -48,6 +48,11 @@ public class LuceneIndexer implements Closeable {
     private final IndexConfig config;
     /** Guarded by {@code this}. */
     private final Map<String, CachedReader> openReaders = new HashMap<>();
+    /**
+     * Ruling P6-R19: per shard, the reader of its retained previous generation ({@link LocalCache#retainedDir});
+     * released ({@link #releasePrevious}) when the cache ends the retention. Guarded by {@code this}.
+     */
+    private final Map<String, CachedReader> previousReaders = new HashMap<>();
     /** Readers swapped out by a path change, awaiting their delayed close; guarded by {@code this}. */
     private final Set<DirectoryReader> retired = new HashSet<>();
     /** Lazily created single daemon thread closing retired readers; guarded by {@code this}. */
@@ -70,6 +75,7 @@ public class LuceneIndexer implements Closeable {
         this.config = config;
         this.cache = cache;
         this.retireDelay = retireDelay;
+        if (cache instanceof com.pharos.cluster.ReaderLocalCache rc) rc.onRelease(this::releasePrevious);
     }
 
     /**
@@ -155,10 +161,59 @@ public class LuceneIndexer implements Closeable {
         DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
         openReaders.put(key, new CachedReader(luceneDir, reader));
         if (cached != null) {
-            log.info("Project '{}' moved to {}; retiring the reader on {}", projectName, luceneDir, cached.path());
-            retire(cached.reader());
+            Path oldDir = cached.path().getParent();
+            long oldGen = generationOf(oldDir);
+            if (oldGen >= 0 && cache.retainedDir(key, oldGen).filter(d -> d.equals(oldDir)).isPresent()) {
+                // P6-R19: the generation stays answerable for its grace; the reader with it
+                log.info("Project '{}' moved to {}; keeping the reader on {} for the previous generation's grace",
+                        projectName, luceneDir, cached.path());
+                CachedReader before = previousReaders.put(key, cached);
+                if (before != null && before.reader() != cached.reader()) retire(before.reader());
+            } else {
+                log.info("Project '{}' moved to {}; retiring the reader on {}", projectName, luceneDir, cached.path());
+                retire(cached.reader());
+            }
         }
         return reader;
+    }
+
+    /** {@code gen-N} → N, else -1. */
+    private static long generationOf(Path dir) {
+        if (dir == null || dir.getFileName() == null) return -1;
+        var m = java.util.regex.Pattern.compile("gen-(\\d{1,18})").matcher(dir.getFileName().toString());
+        return m.matches() ? Long.parseLong(m.group(1)) : -1;
+    }
+
+    /**
+     * Ruling P6-R19: the reader of {@code projectName}'s retained previous generation {@code generation}
+     * ({@link LocalCache#retainedDir}) with its lucene dir; empty when the node does not answer that
+     * generation (any more). The active generation is {@link #openPinnedReader}'s.
+     */
+    public synchronized Optional<PinnedReader> openPinnedPreviousReader(String projectName, long generation)
+            throws IOException {
+        Optional<Path> dir = cache.retainedDir(projectName, generation);
+        if (dir.isEmpty()) return Optional.empty();
+        Path luceneDir = dir.get().resolve("lucene");
+        CachedReader cached = previousReaders.get(projectName);
+        if (cached != null && cached.path().equals(luceneDir)) {
+            return Optional.of(new PinnedReader(luceneDir, cached.reader()));
+        }
+        if (!Files.exists(luceneDir) || !indexExists(luceneDir)) return Optional.empty();
+        DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
+        previousReaders.put(projectName, new CachedReader(luceneDir, reader));
+        if (cached != null) retire(cached.reader());
+        return Optional.of(new PinnedReader(luceneDir, reader));
+    }
+
+    /** The shards whose retained previous generation has an open reader here (P6-R19). */
+    public synchronized Set<String> previousGenerationReaders() {
+        return Set.copyOf(previousReaders.keySet());
+    }
+
+    /** Ends the retention of {@code projectName}'s previous generation: its reader is retired (closed later). */
+    public synchronized void releasePrevious(String projectName) {
+        CachedReader cached = previousReaders.remove(projectName);
+        if (cached != null) retire(cached.reader());
     }
 
     /**
@@ -378,6 +433,11 @@ public class LuceneIndexer implements Closeable {
         return cache.shardDir(projectName);
     }
 
+    /** Where this indexer finds the shard dirs it serves. */
+    public LocalCache localCache() {
+        return cache;
+    }
+
     /**
      * Deletes the Lucene index directory for a project and evicts any cached reader.
      * Called by force re-index to clear incompatible or corrupt index state.
@@ -504,6 +564,14 @@ public class LuceneIndexer implements Closeable {
             }
         }
         openReaders.clear();
+        for (CachedReader r : previousReaders.values()) {
+            try {
+                r.reader().close();
+            } catch (IOException e) {
+                log.warn("Error closing a previous generation's reader: {}", e.getMessage());
+            }
+        }
+        previousReaders.clear();
         for (DirectoryReader r : retired) {
             try {
                 r.close();

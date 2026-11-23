@@ -287,6 +287,26 @@ public class ClusterConfig {
     public ObjectStoreConfig getObjectStore() { return objectStore; }
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
+
+    /** The coordinators' shard catalog cache period, in seconds (equals {@code ClusterRuntime.CATALOG_CACHE}). */
+    public static final int CATALOG_CACHE_SECONDS = 5;
+    /** The least default {@link #previousGenerationGrace}. */
+    public static final int MIN_DEFAULT_PREVIOUS_GENERATION_GRACE_SECONDS = 30;
+
+    /**
+     * Ruling P6-R19: how long a reader keeps a shard's previous generation open and answerable after it
+     * activated a new one, and how long the bucket's GC keeps a generation after it stopped being
+     * {@code LATEST}: {@code cluster.reader.previousGenerationGraceSeconds}, else
+     * {@code max(30 s, 3 × catalog cache + 2 × heartbeatSeconds)}, the time every coordinator takes to
+     * re-read the catalog and see the readers' new heartbeats. Zero: no retention.
+     */
+    public java.time.Duration previousGenerationGrace() {
+        Integer set = reader == null ? null : reader.getPreviousGenerationGraceSeconds();
+        if (set != null) return java.time.Duration.ofSeconds(set);
+        return java.time.Duration.ofSeconds(Math.max(MIN_DEFAULT_PREVIOUS_GENERATION_GRACE_SECONDS,
+                3L * CATALOG_CACHE_SECONDS + 2L * heartbeatSeconds));
+    }
+
     public WriterConfig getWriter() { return writer; }
     public void setWriter(WriterConfig writer) {
         this.writer = writer == null ? new WriterConfig() : writer;
@@ -359,9 +379,20 @@ public class ClusterConfig {
          * wildcards ({@code lucene~*}, every shard of the project); empty means every shard.
          */
         private java.util.List<String> shards = java.util.List.of();
+        /**
+         * Ruling P6-R19: how long a reader keeps answering a shard's previous generation after it activated
+         * a new one (a coordinator may still route the previous one). Null: the default,
+         * {@link ClusterConfig#previousGenerationGrace}; 0 turns the retention off.
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Integer previousGenerationGraceSeconds;
 
         /** @throws IllegalStateException naming the offending field */
         public void validate() {
+            if (previousGenerationGraceSeconds != null && previousGenerationGraceSeconds < 0) {
+                throw new IllegalStateException("cluster.reader.previousGenerationGraceSeconds must not be negative"
+                        + " (0 turns the retention off; omit it for the default), got " + previousGenerationGraceSeconds);
+            }
             if (shards == null) shards = java.util.List.of();
             try {
                 com.pharos.cluster.ReaderPin.of(shards); // shard ids and project wildcards (P6-R5)
@@ -415,6 +446,8 @@ public class ClusterConfig {
         public void setPrefetchExtensions(java.util.List<String> v) { this.prefetchExtensions = v; }
         public int getPrefetchTimeoutSeconds() { return prefetchTimeoutSeconds; }
         public void setPrefetchTimeoutSeconds(int v) { this.prefetchTimeoutSeconds = v; }
+        public Integer getPreviousGenerationGraceSeconds() { return previousGenerationGraceSeconds; }
+        public void setPreviousGenerationGraceSeconds(Integer v) { this.previousGenerationGraceSeconds = v; }
         public java.util.List<String> getShards() { return shards; }
         public void setShards(java.util.List<String> v) { this.shards = v == null ? java.util.List.of() : java.util.List.copyOf(v); }
         public int getMaxConcurrentFetches() { return maxConcurrentFetches; }

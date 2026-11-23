@@ -113,7 +113,8 @@ public final class InternalApi {
                 throw new Rejected(503, "shard search not available");
             }
         });
-        app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard, null,
+        app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard,
+                TermStatsRequest::generation,
                 false, TermStatsResponse::generation, InternalApi::check, r -> service.termStats(r)));
         app.post("/internal/shard-search", ctx -> handle(ctx, ShardSearchRequest.class, ShardSearchRequest::shard,
                 ShardSearchRequest::generation, false, ShardSearchResponse::generation, InternalApi::check,
@@ -165,7 +166,7 @@ public final class InternalApi {
             error(ctx, 404, "shard not served here: " + shard);
             return;
         }
-        if (wanted != null && wanted != served.getAsLong()) {
+        if (wanted != null && wanted != served.getAsLong() && !service.servesGeneration(shard, wanted)) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", "generation mismatch",
                             "servedGeneration", served.getAsLong())));

@@ -99,7 +99,8 @@ class ReshardJobTest {
     private static final Duration MIN_HOLD = Duration.ofSeconds(120);
     private static final Duration RETENTION = Duration.ofMinutes(10);
     private static final Duration SYNC_TIMEOUT = Duration.ofSeconds(600);
-    private static final Duration ACTIVATION_HOLD = Duration.ofSeconds(15);
+    /** The readers' previous-generation grace (P6-R19). */
+    private static final Duration GRACE = Duration.ofSeconds(30);
 
     /** One clock for the bucket and every writer; only the test moves it. */
     static final class TestClock extends Clock {
@@ -226,11 +227,12 @@ class ReshardJobTest {
             this.node = node;
             Path cacheDir = tmp.resolve("r-" + node);
             cache = new ReaderLocalCache(cacheDir);
+            cache.setClock(clock::millis);
+            cache.setPreviousGenerationGrace(GRACE);
             source = new CountingSource(new ObjectStoreReplicaSource(store, layout));
             syncer = new ReplicaSyncer(catalog, source, cache, ProjectRegistry.at(tmp.resolve("r-" + node + ".json")),
                     cacheDir, null, Duration.ofSeconds(10));
             syncer.setClock(clock::millis);
-            syncer.setActivationHold(ACTIVATION_HOLD);
             readers.add(this);
         }
 
@@ -246,7 +248,7 @@ class ReshardJobTest {
             Map<String, Long> prepared = new TreeMap<>();
             syncer.preparedGenerations().forEach((s, g) -> prepared.put(s.value(), g.value()));
             return new ReaderHeartbeat(node, "http://" + node, List.copyOf(gens.keySet()), false, Map.of(), 0, 0, 0L,
-                    null, null, null, null, Boolean.TRUE, gens, prepared);
+                    null, null, null, null, Boolean.TRUE, gens, prepared, cache.retainedGenerations());
         }
 
         /**
@@ -271,11 +273,12 @@ class ReshardJobTest {
             for (ShardRouter.PlannedShard ps : read) {
                 Generation served = syncer.served().get(ps.shard());
                 assertThat(served).as("shard " + ps.shard() + " served").isNotNull();
-                if (ps.generation() != null) {
-                    assertThat(served.value()).as("shard " + ps.shard() + " at its pinned generation")
-                            .isEqualTo(ps.generation());
-                }
                 Path dir = cache.active(ps.shard().value()).orElseThrow();
+                if (ps.generation() != null && served.value() != ps.generation()) { // P6-R19: the retained one
+                    dir = cache.retainedDir(ps.shard().value(), ps.generation()).orElse(null);
+                    assertThat(dir).as("shard " + ps.shard() + " answered at its pinned generation " + ps.generation()
+                            + " (serves " + served.value() + ")").isNotNull();
+                }
                 for (String f : filesIn(dir.resolve("lucene"))) out.merge(f, 1, Integer::sum);
             }
             return out;
@@ -284,7 +287,9 @@ class ReshardJobTest {
         private boolean servedAsPinned(List<ShardRouter.PlannedShard> version) {
             for (ShardRouter.PlannedShard ps : version) {
                 Generation served = syncer.served().get(ps.shard());
-                if (served == null || (ps.generation() != null && served.value() != ps.generation())) return false;
+                if (served == null) return false;
+                if (ps.generation() != null && served.value() != ps.generation()
+                        && cache.retainedDir(ps.shard().value(), ps.generation()).isEmpty()) return false;
             }
             return true;
         }
@@ -608,7 +613,7 @@ class ReshardJobTest {
         r.sync();
         a.loop.tick();
         r.sync();
-        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        clock.advance(GRACE.toSeconds() + 1);
         r.sync();
 
         assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
@@ -972,7 +977,7 @@ class ReshardJobTest {
         }
         assertMarksNeverGoBackwards();
         assertThat(map.specVersionOf(P)).as("rebuilt from the new run and flipped").hasValue(v);
-        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        clock.advance(GRACE.toSeconds() + 1);
         r.sync();
         assertEveryFileOnce(r, files, "after the rebuilt flip");
         Path changed = src.resolve(files.getFirst()).toAbsolutePath().normalize();
@@ -1020,7 +1025,7 @@ class ReshardJobTest {
         clock.advance(10);
         b.loop.tick();
         assertThat(catalog.projectShards().specVersionOf(P)).hasValue(v);
-        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        clock.advance(GRACE.toSeconds() + 1);
         r.sync();
         assertEveryFileOnce(r, files, "after B's flip");
     }
@@ -1060,7 +1065,7 @@ class ReshardJobTest {
         }
         assertThat(catalog.projectShards().pinsOf(P)).as("the commit was indexed on the new version").isEmpty();
         r.sync();
-        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
+        clock.advance(GRACE.toSeconds() + 1);
         r.sync();
         assertEveryFileOnce(r, files, "after the flip and the commit");
         ShardId holder = shardOf(RING5, files.getFirst());
@@ -1077,9 +1082,10 @@ class ReshardJobTest {
     }
 
     /**
-     * Fix round 1, I2: right after the flip a reader keeps serving the rewritten shards at their previous
-     * generations for the activation hold, so a coordinator still routing the previous version (its catalog
-     * read predates the flip) reads it complete; once the hold is over the reader serves the new version.
+     * Ruling P6-R19 (it replaced fix round 1's I2 activation hold): right after the flip a reader activates
+     * the rewritten shards at their new generations at once and keeps the previous ones answerable for the
+     * grace, so a coordinator still routing the previous version (its catalog read predates the flip) reads it
+     * complete, and so does a fresh one; after the grace the previous generations are released.
      */
     @Test
     void aCoordinatorWithThePreFlipCatalogStillReadsEveryFile() throws IOException {
@@ -1096,21 +1102,25 @@ class ReshardJobTest {
         a.loop.tick();
         assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
 
-        r.sync(); // within the hold
+        r.sync(); // activates the new version; the previous generations are retained
         Set<ShardId> rewritten = movedFrom(files, RING4, RING5);
-        for (ShardId s : rewritten) {
-            assertThat(r.syncer.served().get(s)).as(s + " keeps its previous generation").isEqualTo(before.get(s));
-        }
-        assertEveryFileOnce(r, files, "stale coordinator, within the hold", frozen(preFlip));
-        assertEveryFileOnce(r, files, "fresh coordinator, within the hold");
-
-        clock.advance(ACTIVATION_HOLD.toSeconds() + 1);
-        r.sync();
         Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
         for (ShardId s : rewritten) {
-            assertThat(r.syncer.served().get(s).value()).as(s + " at the new version").isEqualTo(pins.get(s));
+            assertThat(r.syncer.served().get(s).value()).as(s + " at the new version at once").isEqualTo(pins.get(s));
+            assertThat(r.cache.retainedDir(s.value(), before.get(s).value())).as(s + " keeps its previous generation")
+                    .isPresent();
+            assertThat(r.heartbeat().retained()).as("the heartbeat names it").containsEntry(s.value(), before.get(s).value());
         }
-        assertEveryFileOnce(r, files, "fresh coordinator, after the hold");
+        assertEveryFileOnce(r, files, "stale coordinator, within the grace", frozen(preFlip));
+        assertEveryFileOnce(r, files, "fresh coordinator, within the grace");
+
+        clock.advance(GRACE.toSeconds() + 1);
+        r.sync();
+        for (ShardId s : rewritten) {
+            assertThat(r.cache.retainedDir(s.value(), before.get(s).value())).as(s + " released after the grace").isEmpty();
+        }
+        assertThat(r.heartbeat().retained()).isEmpty();
+        assertEveryFileOnce(r, files, "fresh coordinator, after the grace");
     }
 
     private com.pharos.cluster.status.StatusState statusState;

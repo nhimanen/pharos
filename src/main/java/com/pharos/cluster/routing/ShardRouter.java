@@ -286,7 +286,7 @@ public final class ShardRouter {
             boolean any = false;
             for (ReaderHeartbeat r : readers) {
                 if (r.draining() || r.shards() == null || !r.shards().contains(shard.value())) continue;
-                if (gen == null || !r.statesGenerations() || r.generationOf(shard.value()).orElse(-1) == gen) {
+                if (gen == null || !r.statesGenerations() || r.answersGeneration(shard.value(), gen)) {
                     any = true;
                     break;
                 }
@@ -305,7 +305,7 @@ public final class ShardRouter {
         List<ReaderHeartbeat> serving = new ArrayList<>(), unknown = new ArrayList<>(), other = new ArrayList<>();
         for (ReaderHeartbeat r : candidates) {
             if (!r.statesGenerations()) unknown.add(r);
-            else if (r.generationOf(shard.value()).orElse(-1) == generation) serving.add(r);
+            else if (r.answersGeneration(shard.value(), generation)) serving.add(r);
             else other.add(r);
         }
         serving.addAll(unknown);

@@ -106,6 +106,12 @@ import java.util.stream.Stream;
  * project's graph
  * ({@code projectFiles}, content-named) is downloaded once per reader into
  * {@value #PROJECT_FILES_DIR} and hard-linked into each shard's generation dir; refs are not fetched.
+ *
+ * <p><b>The previous generation (ruling P6-R19).</b> An activation leaves the replaced generation answerable for
+ * the cache's grace ({@link ReaderLocalCache#setPreviousGenerationGrace}): a coordinator that still routes it
+ * (planned before this reader switched, or pinned by a catalog read older than a flip) is answered from it.
+ * Pruning never deletes a retained generation's dir; each pass releases the ones whose grace is over. This
+ * replaced Task 4's activation hold after a flip: rewritten shards are activated at the flip at once.
  */
 public class ReplicaSyncer implements Closeable {
 
@@ -153,9 +159,6 @@ public class ReplicaSyncer implements Closeable {
     private final Map<ShardId, Long> retired = new HashMap<>();
     private java.util.function.LongSupplier clock = System::currentTimeMillis;
     private Duration retireGrace = Duration.ofSeconds(120);
-    private volatile Duration activationHold = Duration.ofSeconds(15);
-    /** When this reader first saw each flip (project@retiredAt): the activation hold starts there. */
-    private final Map<String, Long> flipSeen = new HashMap<>();
     private boolean swept;
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
@@ -197,19 +200,9 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
-    /** The wall clock (millis) retirement and the post-flip activation hold are timed with (tests). */
+    /** The wall clock (millis) retirement is timed with (tests); the cache's retention has its own. */
     public void setClock(java.util.function.LongSupplier clock) {
         this.clock = clock;
-    }
-
-    /**
-     * How long after this reader first sees a reshard flip a shard the flip rewrote keeps serving its
-     * previous generation: at least the time every coordinator takes to re-read the catalog, so none still
-     * routing the previous version finds the shard gone ({@code 3 × catalog cache}, as the flip's own
-     * minimum pinned age).
-     */
-    public void setActivationHold(Duration hold) {
-        this.activationHold = Objects.requireNonNull(hold, "hold");
     }
 
     /**
@@ -269,43 +262,24 @@ public class ReplicaSyncer implements Closeable {
             Set<ShardId> wantedSet = new HashSet<>(shards);
             Set<ShardId> inSets = new HashSet<>();
             List<SyncSet> sets = new ArrayList<>();
-            Set<String> flipsNow = new HashSet<>();
             for (String project : map.projects()) { // split projects' active, staged and retired sets (pinned part)
                 Set<ShardId> active = new HashSet<>(map.shardsOf(project));
                 Map<ShardId, Long> pins = map.pinsOf(project);
-                // Right after a flip, a shard both versions have but the flip rewrote keeps its previous
-                // generation for activationHold: a coordinator still routing the previous version (its catalog
-                // read predates the flip) finds it there; a fresh one reads the previous version meanwhile.
-                // (Only where this reader serves the previous generation: a reader that has none serves the
-                // new one at once.)
-                Set<ShardId> rewritten = new HashSet<>();
-                long holdUntil = Long.MIN_VALUE;
+                // Right after a flip a shard both versions have but the flip rewrote is activated at its new
+                // generation at once: its previous one stays answerable for the cache's grace (ruling P6-R19,
+                // which replaced Task 4's activation hold), so a coordinator still routing the previous version
+                // (its catalog read predates the flip) is answered from it.
                 var prev = map.previousOf(project);
-                if (!pins.isEmpty() && prev.isPresent()) {
-                    for (ShardId sh : prev.get().shards()) {
-                        Long was = prev.get().generations().get(sh);
-                        Generation have = served.get(sh);
-                        if (pins.containsKey(sh) && was != null && !was.equals(pins.get(sh))
-                                && have != null && have.value() == was) {
-                            rewritten.add(sh);
-                        }
-                    }
-                    // timed from this reader's first sight of the flip: no dependence on the writer's clock
-                    String flipKey = project + "@" + prev.get().retiredAt();
-                    flipsNow.add(flipKey);
-                    long seen = flipSeen.computeIfAbsent(flipKey, k -> clock.getAsLong());
-                    holdUntil = seen + activationHold.toMillis();
-                }
                 if (map.isSplit(project) || !pins.isEmpty()) {
                     addSet(sets, inSets, wantedSet, new SyncSet(project, SetRole.ACTIVE, map.shardsOf(project), pins,
-                            active, rewritten, holdUntil));
+                            active));
                 }
                 map.stagedOf(project).filter(st -> !st.spec().isDefault() && !st.abandoned()).ifPresent(st ->
                         addSet(sets, inSets, wantedSet, new SyncSet(project, SetRole.STAGED, st.shards(),
-                                st.generations(), active, Set.of(), Long.MIN_VALUE)));
+                                st.generations(), active)));
                 prev.filter(pr -> !pr.spec().isDefault()).ifPresent(pr ->
                         addSet(sets, inSets, wantedSet, new SyncSet(project, SetRole.PREVIOUS, pr.shards(),
-                                pr.generations(), active, Set.of(), Long.MIN_VALUE)));
+                                pr.generations(), active)));
             }
             for (ShardId shard : shards) {
                 if (closed) return;
@@ -318,7 +292,7 @@ public class ReplicaSyncer implements Closeable {
                 }
             }
             syncSets(sets);
-            flipSeen.keySet().retainAll(flipsNow);
+            cache.expireRetained(); // P6-R19: previous generations past their grace are released
             prepared.keySet().retainAll(wantedSet);
             snapshotPrepared();
             if (lazy != null) lazy.sweep();
@@ -516,7 +490,7 @@ public class ReplicaSyncer implements Closeable {
      * activate).
      */
     private record SyncSet(String project, SetRole role, List<ShardId> shards, Map<ShardId, Long> pins,
-                           Set<ShardId> active, Set<ShardId> rewritten, long holdUntilMillis) {
+                           Set<ShardId> active) {
         /** True when this set may activate a generation of {@code shard}. */
         boolean activates(ShardId shard) {
             return role == SetRole.ACTIVE || !active.contains(shard);
@@ -526,8 +500,7 @@ public class ReplicaSyncer implements Closeable {
     private static void addSet(List<SyncSet> sets, Set<ShardId> inSets, Set<ShardId> wanted, SyncSet set) {
         List<ShardId> mine = set.shards().stream().filter(wanted::contains).toList();
         if (mine.isEmpty()) return;
-        sets.add(new SyncSet(set.project(), set.role(), mine, set.pins(), set.active(), set.rewritten(),
-                set.holdUntilMillis()));
+        sets.add(new SyncSet(set.project(), set.role(), mine, set.pins(), set.active()));
         inSets.addAll(mine);
     }
 
@@ -586,12 +559,6 @@ public class ReplicaSyncer implements Closeable {
                 if (run == null) run = r;
             }
             String logKey = set.project() + set.role() + set.shards();
-            if (complete && anyNew && clock.getAsLong() < set.holdUntilMillis()
-                    && set.shards().stream().anyMatch(sh -> set.rewritten().contains(sh)
-                    && ready.get(sh + "@" + set.pins().get(sh)) != null)) {
-                complete = false; // activationHold after the flip (see syncOnce)
-                state.add("held until " + java.time.Instant.ofEpochMilli(set.holdUntilMillis()));
-            }
             if (complete) {
                 for (ShardId shard : set.shards()) {
                     Long pin = set.pins().get(shard);
@@ -1052,6 +1019,8 @@ public class ReplicaSyncer implements Closeable {
             registry.find(shard.value()).map(ProjectMeta::getIndexPath)
                     .ifPresent(p -> inUse.add(Path.of(p).toAbsolutePath().normalize()));
             cache.active(shard.value()).ifPresent(p -> inUse.add(p.toAbsolutePath().normalize()));
+            // P6-R19: the previous generation stays answerable for its grace
+            cache.retained(shard.value()).ifPresent(r -> inUse.add(r.dir().toAbsolutePath().normalize()));
             for (long g : gens) {
                 if (g == active.value() || g == previous) continue;
                 Path dir = shardRoot.resolve("gen-" + g);

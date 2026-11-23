@@ -92,7 +92,7 @@ public final class ClusterRuntime implements Closeable {
     /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
     private com.pharos.search.distributed.DistributedSearch distributed;
     /** How often the coordinator re-reads the shard catalog (in the background) for "every project" queries. */
-    static final Duration CATALOG_CACHE = Duration.ofSeconds(5);
+    static final Duration CATALOG_CACHE = Duration.ofSeconds(ClusterConfig.CATALOG_CACHE_SECONDS);
     private volatile com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
@@ -133,7 +133,9 @@ public final class ClusterRuntime implements Closeable {
             // shards held on disk stay listed until a live writer releases them (a writer down at start)
             peer.peerCatalog().ifPresent(c -> c.setHeld(this::registeredShards));
         }
-        if (isReader() && backend.localCache() instanceof ReaderLocalCache) {
+        if (isReader() && backend.localCache() instanceof ReaderLocalCache rc) {
+            // P6-R19: a shard's previous generation stays answerable for the grace after an activation
+            rc.setPreviousGenerationGrace(config.getCluster().previousGenerationGrace());
             try {
                 activateRegistered();
             } catch (RuntimeException e) {
@@ -474,6 +476,7 @@ public final class ClusterRuntime implements Closeable {
         Long catalogAge = cat == null || cat.ageSeconds() < 0 ? null : cat.ageSeconds();
         Map<String, Long> generations = new java.util.TreeMap<>();
         Map<String, Long> prepared = new java.util.TreeMap<>();
+        Map<String, Long> retained = new java.util.TreeMap<>();
         ReplicaSyncer sy;
         synchronized (this) { sy = syncer; }
         if (sy != null) {
@@ -482,10 +485,13 @@ public final class ClusterRuntime implements Closeable {
                 if (pin.isEmpty() || pin.matches(id.value(), this::projectOfShard)) prepared.put(id.value(), g.value());
             });
         }
+        if (backend.localCache() instanceof ReaderLocalCache rc) { // P6-R19: still answered after a switch
+            rc.retainedGenerations().forEach((shard, g) -> { if (names.contains(shard)) retained.put(shard, g); });
+        }
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
                 catalogAge, Boolean.TRUE, // applies key filters on /internal search (P6-R12)
-                generations, prepared);
+                generations, prepared, retained);
     }
 
     // Holding the monitor of this.
@@ -1156,7 +1162,6 @@ public final class ClusterRuntime implements Closeable {
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
-        s.setActivationHold(CATALOG_CACHE.multipliedBy(3)); // as the reshard flip's minimum pinned age
         s.pin(readerPin());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");

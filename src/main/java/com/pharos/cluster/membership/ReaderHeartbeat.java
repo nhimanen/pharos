@@ -19,7 +19,9 @@ import java.util.Map;
  * <p>{@code generations} names the generation served of each shard, {@code prepared} the generations
  * materialised for a reshard's staged version but not served yet (Phase 6 Task 4): the router pins a
  * query to readers serving the generations its version is made of, and a reshard flips once the readers
- * have prepared the new version. Both are omitted when empty (an older reader's heartbeat has neither).
+ * have prepared the new version. {@code retained} (ruling P6-R19) names the previous generation a reader still
+ * answers for its grace after activating a newer one: routing counts it as serving that generation. All three
+ * are omitted when empty (an older reader's heartbeat has none).
  *
  * <p>{@code warmP95Millis} is the p95 latency of the {@code /api/*} requests of the last minute
  * ({@link LoadCounter#warmP95Millis}); {@code catalogAgeSeconds} the age of the coordinator's cached
@@ -35,7 +37,8 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
                               @JsonInclude(JsonInclude.Include.NON_NULL) Long catalogAgeSeconds,
                               @JsonInclude(JsonInclude.Include.NON_NULL) Boolean filters,
                               @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> generations,
-                              @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> prepared) {
+                              @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> prepared,
+                              @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> retained) {
 
     public static final String WARMING = "warming";
     public static final String READY = "ready";
@@ -51,7 +54,16 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
                            String state, List<String> degradedShards, Long warmP95Millis, Long catalogAgeSeconds,
                            Boolean filters) {
         this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, state, degradedShards,
-                warmP95Millis, catalogAgeSeconds, filters, null, null);
+                warmP95Millis, catalogAgeSeconds, filters, null, null, null);
+    }
+
+    /** A heartbeat without retained previous generations (a reader before ruling P6-R19). */
+    public ReaderHeartbeat(String node, String advertiseUrl, List<String> shards, boolean draining,
+                           Map<String, Object> readerCache, int inFlight, double qps, long startedAt,
+                           String state, List<String> degradedShards, Long warmP95Millis, Long catalogAgeSeconds,
+                           Boolean filters, Map<String, Long> generations, Map<String, Long> prepared) {
+        this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, state, degradedShards,
+                warmP95Millis, catalogAgeSeconds, filters, generations, prepared, null);
     }
 
     /**
@@ -61,6 +73,17 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
     public java.util.OptionalLong generationOf(String shard) {
         Long g = generations.get(shard);
         return g == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(g);
+    }
+
+    /**
+     * True when this reader answers {@code shard} at {@code generation}: it serves it, or still retains it as
+     * the previous generation (P6-R19).
+     */
+    public boolean answersGeneration(String shard, long generation) {
+        Long g = generations.get(shard);
+        if (g != null && g == generation) return true;
+        Long r = retained.get(shard);
+        return r != null && r == generation;
     }
 
     /** True when the heartbeat states served generations (a Phase 6 Task 4 reader). */
@@ -90,6 +113,7 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
         degradedShards = degradedShards == null ? List.of() : List.copyOf(degradedShards);
         generations = generations == null ? Map.of() : Map.copyOf(generations);
         prepared = prepared == null ? Map.of() : Map.copyOf(prepared);
+        retained = retained == null ? Map.of() : Map.copyOf(retained);
     }
 
     /** A heartbeat without latency or catalog age (an older reader's). */
@@ -109,6 +133,6 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
     /** This heartbeat as a membership writes it: {@code draining} and the process start set. */
     public ReaderHeartbeat with(boolean draining, long startedAt) {
         return new ReaderHeartbeat(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt,
-                state, degradedShards, warmP95Millis, catalogAgeSeconds, filters, generations, prepared);
+                state, degradedShards, warmP95Millis, catalogAgeSeconds, filters, generations, prepared, retained);
     }
 }

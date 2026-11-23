@@ -616,7 +616,9 @@ public final class DistributedSearch implements Closeable {
             synchronized (s) {
                 if (s.pin == null) {
                     if (closed) throw new IllegalStateException("query closed");
-                    s.pin = local.pin(s.route.shard());
+                    // a pinned version's shard is read at its generation: the retained previous one when this
+                    // node activated another meanwhile (P6-R19)
+                    s.pin = local.pin(s.route.shard(), s.expectedGeneration);
                 }
                 return s.pin;
             }
@@ -657,7 +659,9 @@ public final class DistributedSearch implements Closeable {
             Long generation;
             synchronized (s) {
                 preferred = s.reader;
-                generation = s.generation;
+                // before the first answer, a pinned version's shard asks for its generation (P6-R19: a reader
+                // that activated another one meanwhile answers from the retained previous one)
+                generation = s.generation != null ? s.generation : s.expectedGeneration;
             }
             ShardClient.Answer<R> a;
             try {
@@ -963,7 +967,7 @@ public final class DistributedSearch implements Closeable {
         private Long pinGeneration(ShardState s) throws IOException {
             if (s.local) return pin(s).generation();
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(gen));
             return r.generation();
         }
 
@@ -982,7 +986,8 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return false;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()), left / 2);
+                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(generation),
+                            left / 2);
                     if (resp.generation() != generation) continue;
                     synchronized (s) {
                         s.reader = r;
@@ -1016,11 +1021,15 @@ public final class DistributedSearch implements Closeable {
                 return run == null ? 0L : run;
             }
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(gen));
             return r.projectGeneration() == null ? 0L : r.projectGeneration();
         }
 
-        /** Moves the shards of one split project onto the newest run any of them is pinned to. */
+        /**
+         * Moves the shards of one split project onto the newest run any of them is pinned to; when some can't
+         * be (their readers have not activated it yet), onto the run those are at instead, which the others'
+         * readers still answer from their retained previous generation (ruling P6-R19).
+         */
         private void alignRuns(String project, List<ShardState> projectShards) {
             for (int round = 0; round < 3; round++) {
                 long target = 0;
@@ -1028,6 +1037,7 @@ public final class DistributedSearch implements Closeable {
                     if (s.unavailable == null && s.projectGeneration != null) target = Math.max(target, s.projectGeneration);
                 }
                 boolean moved = false;
+                Map<ShardState, String> stuck = new LinkedHashMap<>();
                 for (ShardState s : projectShards) {
                     if (s.unavailable != null || s.projectGeneration == null || s.projectGeneration == target) continue;
                     long from = s.projectGeneration;
@@ -1044,11 +1054,117 @@ public final class DistributedSearch implements Closeable {
                         moved = true;
                         continue;
                     }
-                    markUnavailable(s, "no live reader serves it at index run " + target + " of project " + project
+                    stuck.put(s, "no live reader serves it at index run " + target + " of project " + project
                             + ", the run the query reads its other shards from (still at run " + from + ")");
                 }
-                if (!moved) return;
+                if (moved) continue;
+                if (!stuck.isEmpty() && !onOlderRun(project, projectShards, stuck.keySet())) {
+                    stuck.forEach(this::markUnavailable);
+                }
+                return;
             }
+        }
+
+        /**
+         * P6-R19: moves every other shard of the project back onto the one run the {@code stuck} shards are
+         * at, when each is answered at that run (its retained previous generation, here or on a live reader).
+         * All or nothing: false, and nothing moved, when one can't be.
+         */
+        private boolean onOlderRun(String project, List<ShardState> projectShards, java.util.Set<ShardState> stuck) {
+            Long older = null;
+            for (ShardState s : stuck) {
+                if (s.projectGeneration == null || (older != null && !older.equals(s.projectGeneration))) return false;
+                older = s.projectGeneration;
+            }
+            if (older == null) return false;
+            long run = older;
+            Map<ShardState, LocalShardService.Pin> localPins = new LinkedHashMap<>();
+            Map<ShardState, Map.Entry<ReaderHeartbeat, Long>> remotes = new LinkedHashMap<>();
+            boolean all = true;
+            for (ShardState s : projectShards) {
+                if (stuck.contains(s) || s.unavailable != null || s.projectGeneration == null
+                        || s.projectGeneration == run) continue;
+                if (s.local) {
+                    try {
+                        LocalShardService.Pin p = local.pinRun(s.route.shard(), run);
+                        if (p.projectGeneration() != null && p.projectGeneration() == run) {
+                            localPins.put(s, p);
+                            continue;
+                        }
+                        p.close();
+                    } catch (IOException | RuntimeException e) {
+                        log.debug("Query: shard {} has no retained generation at run {}: {}", s.name(), run, e.toString());
+                    }
+                }
+                Map.Entry<ReaderHeartbeat, Long> at = remoteAtRun(s, run);
+                if (at == null) {
+                    all = false;
+                    break;
+                }
+                remotes.put(s, at);
+            }
+            if (!all) {
+                for (LocalShardService.Pin p : localPins.values()) {
+                    try {
+                        p.close();
+                    } catch (IOException e) {
+                        log.warn("Releasing a reader of project {} failed: {}", project, e.toString());
+                    }
+                }
+                return false;
+            }
+            localPins.forEach((s, p) -> {
+                synchronized (s) {
+                    try {
+                        if (s.pin != null) s.pin.close();
+                    } catch (IOException e) {
+                        log.warn("Releasing the reader of shard {} failed: {}", s.name(), e.toString());
+                    }
+                    s.pin = p;
+                    s.projectGeneration = run;
+                }
+            });
+            remotes.forEach((s, at) -> {
+                synchronized (s) {
+                    s.reader = at.getKey();
+                    s.generation = at.getValue();
+                    s.projectGeneration = run;
+                    if (s.local) {
+                        s.local = false;
+                        try {
+                            if (s.pin != null) s.pin.close();
+                        } catch (IOException e) {
+                            log.warn("Releasing the reader of shard {} failed: {}", s.name(), e.toString());
+                        }
+                        s.pin = null;
+                    }
+                }
+            });
+            log.debug("Query: project {} read at run {}, which a reader of it has not left yet", project, run);
+            return true;
+        }
+
+        /** The reader (its current one first) answering {@code s} at index run {@code run}, with the generation. */
+        private Map.Entry<ReaderHeartbeat, Long> remoteAtRun(ShardState s, long run) {
+            List<ReaderHeartbeat> order = new ArrayList<>();
+            synchronized (s) {
+                if (s.reader != null) order.add(s.reader);
+            }
+            for (ReaderHeartbeat r : s.route.candidates()) if (order.stream().noneMatch(o -> o.node().equals(r.node()))) order.add(r);
+            for (ReaderHeartbeat r : order) {
+                long left = remainingNanos();
+                if (left <= 0) return null;
+                try {
+                    TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
+                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).atRun(run), left / 2);
+                    if (resp.projectGeneration() != null && resp.projectGeneration() == run) {
+                        return Map.entry(r, resp.generation());
+                    }
+                } catch (RuntimeException e) {
+                    log.debug("Query: reader {} does not answer shard {} at run {}: {}", r.node(), s.name(), run, e.toString());
+                }
+            }
+            return null;
         }
 
         /** Pins a local shard again (its reader activated another set); its new run. */
@@ -1082,7 +1198,8 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return null;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()), left / 2);
+                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).atRun(target),
+                            left / 2);
                     if (resp.projectGeneration() != null && resp.projectGeneration() == target) {
                         synchronized (s) {
                             s.reader = r;
@@ -1173,7 +1290,7 @@ public final class DistributedSearch implements Closeable {
             Map<ShardState, TermStatsResponse> answers = fanOut(available(), s -> s.local
                     ? new TermStatsResponse(pin(s).generation(), local.termStats(pin(s), fields, terms))
                     : remote(s, ShardClient.TERM_STATS, false,
-                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash)));
+                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash).at(gen)));
             return GlobalStats.merge(new ArrayList<>(answers.values()));
         }
 

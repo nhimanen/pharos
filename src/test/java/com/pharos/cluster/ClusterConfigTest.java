@@ -28,6 +28,23 @@ class ClusterConfigTest {
         assertThat(c.getRetentionGenerations()).isEqualTo(3);
     }
 
+    /** Ruling P6-R19: the previous-generation grace's default, an explicit value, 0, and a negative one. */
+    @Test
+    void previousGenerationGrace() throws Exception {
+        ClusterConfig c = parse("{\"verbose\": true}");
+        assertThat(c.previousGenerationGrace()).as("heartbeat 10 s: 3 x 5 s + 2 x 10 s")
+                .isEqualTo(java.time.Duration.ofSeconds(35));
+        c.setHeartbeatSeconds(5);
+        assertThat(c.previousGenerationGrace()).as("at least 30 s").isEqualTo(java.time.Duration.ofSeconds(30));
+        assertThat(ClusterRuntime.CATALOG_CACHE.toSeconds()).isEqualTo(ClusterConfig.CATALOG_CACHE_SECONDS);
+        c.getReader().setPreviousGenerationGraceSeconds(90);
+        assertThat(c.previousGenerationGrace()).isEqualTo(java.time.Duration.ofSeconds(90));
+        c.getReader().setPreviousGenerationGraceSeconds(0);
+        assertThat(c.previousGenerationGrace()).isZero();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"previousGenerationGraceSeconds\":-1}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("previousGenerationGraceSeconds");
+    }
+
     @Test
     void readerNeedsObjectStore() {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"local\"}}"))
