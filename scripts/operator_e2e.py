@@ -27,7 +27,8 @@ Phases (E2E_PHASES, comma-separated, default all, in this order):
   preflight   spec.version changes with a tampered bucket: format 999 -> PreflightRefused (Job failed
               by its podFailurePolicy), an unreadable manifest -> PreflightFailed; no workload changes
   upgrade     the bucket restored, a version change rolls readers, writers, router in that order
-  reshard     `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` in a writer pod: the
+  reshard     `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` as a one-off Job (writer
+              image and config, its own memory limit; no writer restarts or OOM kills allowed): the
               writer builds and flips it; /cluster/status lists alpha as one published project on two
               ring shards with the same docCount, the operator's ProjectsPublished stays True throughout
               and its status carries that docCount, and every query's top-10 matches a fresh
@@ -1312,17 +1313,81 @@ def status_project(status, project):
     return next((p for p in status.get("projects") or [] if p.get("project") == project), None)
 
 
+RESHARD_JOB = "e2e-reshard"
+
+
+def writer_restarts():
+    """Per writer pod: the pharos container's (restartCount, lastState.terminated.reason)."""
+    pods = kjson("get", "pods", "-l", f"pharos.dev/cluster={NAME},app.kubernetes.io/component=writer")
+    out = {}
+    for p in pods["items"]:
+        for cs in (p.get("status") or {}).get("containerStatuses") or []:
+            if cs.get("name") == "pharos":
+                term = ((cs.get("lastState") or {}).get("terminated") or {})
+                out[p["metadata"]["name"]] = (cs.get("restartCount", 0), term.get("reason"))
+    return out
+
+
+def run_reshard_job(project, spec, timeout=420):
+    """`pharos reshard <project> --spec <spec>` as a one-off Job shaped like the operator's register Job
+    (writer image, the writer ConfigMap filled in by the same init container, token and object-store keys
+    as env from Secrets, its own memory limit), never a second JVM inside a writer container. Its logs."""
+    tpl = sts("writers")["spec"]["template"]
+    pspec = tpl["spec"]
+    main = next(c for c in pspec["containers"] if c["name"] == "pharos")
+    volumes = {v["name"]: v for v in pspec.get("volumes") or []}
+    mounts, used = [], set()
+    for c in [main] + (pspec.get("initContainers") or []):
+        for m in c.get("volumeMounts") or []:
+            used.add(m["name"])
+    for m in main.get("volumeMounts") or []:
+        mounts.append({k: m[k] for k in ("name", "mountPath", "readOnly") if k in m})
+    # the writer's PVCs (volumeClaimTemplates) are not in the template's volumes: scratch dirs instead
+    job_volumes = [v for n, v in volumes.items() if n in used and "persistentVolumeClaim" not in v]
+    job_volumes += [{"name": n, "emptyDir": {}} for n in sorted(used)
+                    if n not in volumes or "persistentVolumeClaim" in volumes[n]]
+    container = {"name": "pharos", "image": main["image"], "imagePullPolicy": main.get("imagePullPolicy", "IfNotPresent"),
+                 "args": ["reshard", project, "--spec", spec], "env": main.get("env") or [],
+                 "volumeMounts": mounts, "securityContext": main.get("securityContext") or {},
+                 "resources": {"requests": {"cpu": "100m", "memory": "384Mi"}, "limits": {"memory": "512Mi"}}}
+    job = {"apiVersion": "batch/v1", "kind": "Job",
+           "metadata": {"name": RESHARD_JOB, "namespace": NS,
+                        "labels": {"app": RESHARD_JOB, "app.kubernetes.io/part-of": "pharos-e2e"}},
+           "spec": {"backoffLimit": 0, "activeDeadlineSeconds": timeout, "template": {
+               "metadata": {"labels": {"app": RESHARD_JOB, "app.kubernetes.io/part-of": "pharos-e2e"}},
+               "spec": {"restartPolicy": "Never", "automountServiceAccountToken": False,
+                        "securityContext": pspec.get("securityContext") or {},
+                        "initContainers": pspec.get("initContainers") or [],
+                        "containers": [container], "volumes": job_volumes}}}}
+    kubectl("delete", "job", RESHARD_JOB, "--ignore-not-found", "--wait=true", check_rc=False)
+    apply(job)
+    log(f"Job {RESHARD_JOB}: reshard {project} --spec {spec!r} ({main['image']})")
+
+    def finished():
+        st = (get_or_none("job", RESHARD_JOB) or {}).get("status") or {}
+        conds = {c["type"]: c["status"] for c in st.get("conditions") or []}
+        if conds.get("Complete") == "True":
+            return "complete"
+        if conds.get("Failed") == "True":
+            return "failed"
+        return None
+    state = wait_for(f"Job {RESHARD_JOB} to finish", finished, timeout + 60, 3)
+    logs = kubectl("logs", f"job/{RESHARD_JOB}", "-c", "pharos", check_rc=False)
+    if state != "complete":
+        log(f"Job {RESHARD_JOB} failed:\n{logs[-2000:]}")
+    return logs
+
+
 def phase_reshard():
     """Integration step: a live reshard under the operator (P6-R15: the operator reads projects[])."""
     p = RESHARD_PROJECT
     before = status_project(cluster_status(), p)
     check(f"reshard: {p} starts unsplit and published", before and before.get("specVersion") is None
           and before.get("published") and len(before.get("shards") or []) == 1, json.dumps(before)[:300])
-    writer = ready_pods("writer")[0]
-    out = pod_exec(writer, f"JAVA_OPTS=-Xmx256m pharos-entrypoint reshard {p} --spec '{RESHARD_SPEC}'",
-                   container="pharos", timeout=240)
+    restarts_before = writer_restarts()
+    out = run_reshard_job(p, RESHARD_SPEC)
     log(out.strip().splitlines()[-1] if out.strip() else "(no output)")
-    check(f"reshard: requested in writer pod {writer}", f"requested: project {p}" in out, out.strip()[-300:])
+    check(f"reshard: requested by the one-off Job {RESHARD_JOB}", f"requested: project {p}" in out, out.strip()[-300:])
 
     seen = {"phases": [], "unpublished": []}
 
@@ -1377,6 +1442,9 @@ def phase_reshard():
           differ == 0, f"{differ} differ of {len(QUERIES)}")
     kubectl("delete", "pod", "e2e-ref2", "--wait=false", check_rc=False)
     kubectl("delete", "service", "e2e-ref2", "--wait=false", check_rc=False)
+    restarts_after = writer_restarts()
+    check("reshard: no writer container restarted or was OOM-killed during the phase",
+          restarts_after == restarts_before, f"before {restarts_before}, after {restarts_after}")
 
 
 def load_secrets():
@@ -1486,6 +1554,7 @@ def phase_teardown():
     kubectl("delete", "pod", "e2e-git", "e2e-mc", "e2e-probe", "e2e-ref", "e2e-ref2", "--wait=false", "--ignore-not-found",
             check_rc=False)
     kubectl("delete", "service", "e2e-git", "e2e-ref", "e2e-ref2", "--ignore-not-found", check_rc=False)
+    kubectl("delete", "job", RESHARD_JOB, "--ignore-not-found", "--wait=false", check_rc=False)
     kubectl("delete", "configmap", "e2e-fixture-files", "e2e-fixture-scripts", "e2e-ref-config", "--ignore-not-found",
             check_rc=False)
 
