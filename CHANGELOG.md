@@ -3,6 +3,19 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.7.1] - 2026-11-23
+
+**Index format:** 1 (unchanged)
+
+The first published build of 1.7: the 1.7.0 tag never produced a release, because the release
+workflow failed on a flaky test fixture. 1.7.1 has the same code as 1.7.0; read 1.7.0's notes below
+for what changed since 1.6.0.
+
+### Fixed
+- `RemoteDirectoryTest`'s flat fixture is always rewritten without compound files. Lucene sometimes
+  flushed the sample index as a single compound segment, which left the fixture without a `.tim`
+  file and failed `openingAReaderWithEdgesFetchesNothing` (test only; no runtime change).
+
 ## [1.7.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)
