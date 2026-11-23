@@ -1539,6 +1539,11 @@ public class ProjectIndexManager {
 
         Map<String, List<ParsedMethod>> methodsByClass = project.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
+        // The synthesized bodies are cached by file and class: two files can yield the same qualified name (a
+        // Python module and a non-code file of the same path stem, e.g. releaseWizard.py and releaseWizard.yaml),
+        // and each document must get its own body, never the other file's (found by the Phase 6 gate: which body
+        // both got depended on file order, so a resharded project's statistics differed from the unsplit one's).
+        // Methods stay grouped by name: a type's methods may be declared in several files (Go).
         ConcurrentHashMap<String, String> synthesizedBodyCache = new ConcurrentHashMap<>();
 
         boolean doEmbed = generateEmbeddings && !runtimes.isEmpty();
@@ -1567,8 +1572,9 @@ public class ProjectIndexManager {
                         ParsedFile file = files.get(fi);
                         List<String> synthBodies = file.classes().stream()
                                 .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                                        cls.qualifiedClassName(),
-                                        k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
+                                        classKey(cls.filePath(), cls.qualifiedClassName()),
+                                        k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(
+                                                cls.qualifiedClassName(), List.of()))))
                                 .collect(Collectors.toList());
                         fileSynthBodies.add(synthBodies);
                         fileOffsets[fi] = totalSlots;
@@ -1618,8 +1624,9 @@ public class ProjectIndexManager {
                     ParsedFile file = files.get(fi);
                     List<String> synthBodies = file.classes().stream()
                             .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                                    cls.qualifiedClassName(),
-                                    k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
+                                    classKey(cls.filePath(), cls.qualifiedClassName()),
+                                    k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(
+                                            cls.qualifiedClassName(), List.of()))))
                             .collect(Collectors.toList());
                     fileSynthBodies.add(synthBodies);
                     fileMethodChunks.add(List.of()); // empty = no-embed fallback
@@ -2106,6 +2113,11 @@ public class ProjectIndexManager {
      * the raw file content so chunkers and BM25 see the actual text.
      * For code classes it is the concatenation of method signatures and javadocs.
      */
+    /** A class's key within one file (two files may declare the same qualified name). */
+    private static String classKey(String filePath, String qualifiedClassName) {
+        return filePath + "\u0000" + qualifiedClassName;
+    }
+
     private static String buildSynthesizedBody(ParsedClass cls, List<ParsedMethod> methods) {
         if ("document".equals(cls.kind())) {
             return DocumentMapper.readBodyFromFile(cls.filePath(), cls.startLine(), cls.endLine());
