@@ -64,7 +64,7 @@ public final class ObjectStoreBackend implements ReplicationBackend {
         } else {
             this.cache = new LocalFsCache(config);
             GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
-                    Duration.ofMinutes(cfg.getRetentionMinutes()));
+                    Duration.ofMinutes(cfg.getRetentionMinutes()), cfg.previousGenerationGrace());
             this.writerState = new ObjectStoreWriterStateStore(store, layout, source, cfg.effectiveNodeId());
             // Work-queue mode: only this process's work loop publishes, under the shard's lease (R3);
             // every other writer keeps the implicit lease of Phases 1-3.

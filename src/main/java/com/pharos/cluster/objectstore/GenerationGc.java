@@ -64,13 +64,26 @@ public final class GenerationGc {
     private final ObjectStoreLayout layout;
     private final int keepGenerations;
     private final Duration minAge;
+    private final Duration supersededGrace;
 
     public GenerationGc(ObjectStore store, ObjectStoreLayout layout, int keepGenerations, Duration minAge) {
+        this(store, layout, keepGenerations, minAge, Duration.ZERO);
+    }
+
+    /**
+     * @param supersededGrace ruling P6-R19: a generation that stopped being {@code LATEST} less than this long
+     *                        ago (the generation above it was published since) is kept: readers keep answering
+     *                        their previous generation for that long ({@code ClusterConfig#previousGenerationGrace}),
+     *                        and a lazy one reads its objects from the bucket
+     */
+    public GenerationGc(ObjectStore store, ObjectStoreLayout layout, int keepGenerations, Duration minAge,
+                        Duration supersededGrace) {
         if (keepGenerations < 1) throw new IllegalArgumentException("keepGenerations must be at least 1");
         this.store = Objects.requireNonNull(store, "store");
         this.layout = Objects.requireNonNull(layout, "layout");
         this.keepGenerations = keepGenerations;
         this.minAge = Objects.requireNonNull(minAge, "minAge");
+        this.supersededGrace = Objects.requireNonNull(supersededGrace, "supersededGrace");
     }
 
     private record Manifest(String key, long generation, Instant lastModified, ShardManifest parsed) {}
@@ -111,6 +124,7 @@ public final class GenerationGc {
         String prefix = layout.shardPrefix(shard);
         String manifestsPrefix = prefix + "manifests/";
         Instant cutoff = now.minus(minAge);
+        Instant supersededCutoff = now.minus(supersededGrace);
 
         // 1. LATEST: the generation readers see. Without it, we know nothing safe.
         long latestGen;
@@ -167,6 +181,7 @@ public final class GenerationGc {
         List<Manifest> kept = new ArrayList<>();
         List<Manifest> doomed = new ArrayList<>();
         int newestAtOrBelowLatest = 0;
+        Manifest above = null; // the next newer manifest at or below LATEST: the one that superseded m
         for (Manifest m : manifests.values()) { // newest generation first
             boolean young = isYoung(m, cutoff);
             boolean keep;
@@ -175,9 +190,14 @@ public final class GenerationGc {
             } else if (m.generation() > latestGen) {
                 keep = young;
             } else {
-                keep = newestAtOrBelowLatest < keepGenerations || young;
+                // P6-R19: still a reader's retained previous generation while its grace may last
+                boolean justSuperseded = !supersededGrace.isZero() && above != null && isYoung(above, supersededCutoff);
+                keep = newestAtOrBelowLatest < keepGenerations || young || justSuperseded;
             }
-            if (m.generation() <= latestGen) newestAtOrBelowLatest++;
+            if (m.generation() <= latestGen) {
+                newestAtOrBelowLatest++;
+                above = m;
+            }
             (keep ? kept : doomed).add(m);
         }
         Set<String> protectedKeys = new HashSet<>();

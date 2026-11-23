@@ -93,7 +93,7 @@ public final class PeerBackend implements ReplicationBackend {
         storeMismatch(cfg.getPeers().getStoreDir(), config.getIndexDir(), FILE_STORE).ifPresent(log::warn);
         this.cache = new LocalFsCache(config);
         GenerationGc gc = new GenerationGc(peer.store(), peer.layout(), cfg.getRetentionGenerations(),
-                Duration.ofMinutes(cfg.getRetentionMinutes()));
+                Duration.ofMinutes(cfg.getRetentionMinutes()), cfg.previousGenerationGrace());
         this.publisher = new SignallingPublisher(new ObjectStorePublisher(peer.store(), peer.layout(),
                 peer.catalog(), gc, cfg.effectiveNodeId(), config.getSynonymsFile(), LeaseGuard.IMPLICIT,
                 WriterStateStore.NONE), peer.signal());

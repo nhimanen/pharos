@@ -606,7 +606,8 @@ public final class ClusterRuntime implements Closeable {
                 readersSeen.start();
                 reshardReaders = readersSeen;
                 loop.enableResharding(publisher, new com.pharos.cluster.objectstore.GenerationGc(os.store(), os.layout(),
-                                c.getRetentionGenerations(), Duration.ofMinutes(c.getRetentionMinutes())),
+                                c.getRetentionGenerations(), Duration.ofMinutes(c.getRetentionMinutes()),
+                                c.previousGenerationGrace()),
                         readersSeen::live, new com.pharos.cluster.sharding.ReshardJob.Settings(
                                 Duration.ofSeconds(w.getReshardSyncTimeoutSeconds()),
                                 Duration.ofMinutes(c.getRetentionMinutes()), CATALOG_CACHE.multipliedBy(3)));
