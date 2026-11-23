@@ -297,4 +297,24 @@ t_release_with_upgrade_indexes_installs_then_upgrades
 t_bad_release_tag_rejected
 t_checksum_naming_other_file_fails
 t_release_notes_extracts_and_validates
+t_semantic_hint_only_when_embeddings_off() {
+  local off on; off="$(new_home)"; on="$(new_home)"
+  run_setup "$off" --release latest
+  mkdir -p "$on/.pharos"
+  printf '%s\n' '{"embeddingProviders":[{"type":"djl","modelId":"jina-v2-code","url":"hf://jinaai/jina-embeddings-v2-base-code","dimensions":768}]}' \
+    > "$on/.pharos/config.json"
+  run_setup "$on" --release latest
+  [ "$(rc "$off")" = 0 ] && [ "$(rc "$on")" = 0 ] \
+    && grep -q 'Semantic search is off' "$off/out.txt" \
+    && ! grep -q 'Semantic search is off' "$on/out.txt"
+  check semantic_hint_only_when_embeddings_off $? "off: $(tail -2 "$off/out.txt") | on: $(tail -2 "$on/out.txt")"
+}
+t_semantic_hint_only_when_embeddings_off
+
+t_python_cli_embeddings() {
+  python3 -I "$REPO/scripts/test_pharos_cli.py" >"$WORK/pycli.log" 2>&1
+  check python_cli_embeddings $? "$(tail -5 "$WORK/pycli.log")"
+}
+t_python_cli_embeddings
+
 exit "$FAILED"

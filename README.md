@@ -213,9 +213,40 @@ All MCP tools return structured JSON. Key tools:
 
 ## Embedding configuration
 
-Vector search is **disabled by default**. To enable it, add at least one provider to `embeddingProviders[]` in `~/.pharos/config.json`. The list is the new shape — legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
+Vector search is **off by default** for everyone, new installs included: nothing is downloaded or embedded until you opt in. The recommended model is **granite-embedding-english-r2**. Turn it on with:
 
-### Recommended: Jina v2 Code via DJL (local, no API key)
+```bash
+pharos embeddings enable                 # writes the granite-r2 provider to ~/.pharos/config.json
+pharos embeddings enable --model jina-v2-code   # or the jina provider
+pharos embeddings status                 # configured model, fingerprint, which projects have vectors
+pharos embeddings disable                # back to keyword-only
+```
+
+`enable` only edits `config.json` and prints the cost first (about a 600 MB model download on first use, and a CPU-heavy first embed); it never embeds by itself. Afterwards restart the daemon (`pharos daemon restart`) and re-index each project with `pharos index --full <root path>` — `index` takes the project's directory, not its name; `pharos embeddings status` prints the exact command for every project without vectors (`pharos index --full --single --project <name> <root path>`). `pharos embed` is not the opt-in path: it only adds a model next to vectors an index already has, and fails on a keyword-only index. `enable` refuses to replace a different, already configured provider unless you pass `--force`; asking for the model that is already configured (same URL, ignoring an `@<sha>` pin) reports "already configured". Existing jina users keep jina; to switch: `pharos embeddings enable --model granite-r2 --force`, then `pharos index --full <root path>` per project (caches do not carry over between models). Legacy single-key configs (`embeddingModelUrl` at the top level) are migrated on load and not written back.
+
+### Recommended: granite-embedding-english-r2 via DJL (local, no API key)
+
+What `pharos embeddings enable` writes:
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "granite-r2",
+      "type": "djl",
+      "url": "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+      "dimensions": 768,
+      "maxTokens": 512,
+      "pooling": "cls"
+    }
+  ],
+  "searchEmbeddingModel": "granite-r2"
+}
+```
+
+On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches it in `~/.djl.ai/pharos/` (the revision is part of the directory name). `hf://owner/name@<sha>` pins any HuggingFace model to a commit (7-40 hex chars); without `@<sha>` it follows `main`. In an A/B on 99 queries over the pharos and lucene projects, granite-r2 beat jina on the `auto` pipeline's main path (hybrid-rrf MRR@10 +0.056, 95% CI [+0.002, +0.112]) and on hybrid (+0.068, [+0.008, +0.129]); with the cross-encoder reranker it was a tie (-0.009). Details: `docs/superpowers/gates/2026-11-16-embedding-ab.md`. Trade-offs: peak RSS is higher (about 2.8 GB vs 2.3 GB) and CPU embedding is much slower (10.9 h vs about 30 min for the lucene project on one CPU, which is why a full re-embed is a deliberate step).
+
+### Jina v2 Code via DJL (existing installs keep this)
 
 ```json
 {
@@ -232,7 +263,7 @@ Vector search is **disabled by default**. To enable it, add at least one provide
 }
 ```
 
-On first index run, DJL downloads the ONNX model from HuggingFace Hub and caches it in `~/.djl.ai/pharos/`. Subsequent runs load from cache. This is the recommended setup for code search — 768-dim, 8 192-token context window.
+768-dim, 8 192-token context window, mean pooling (the default).
 
 ### Alternative: MiniLM via DJL model zoo
 
@@ -305,7 +336,7 @@ An `embeddingProviders` entry can list `fallbacks` — alternate runtimes for th
 {
   "embeddingProviders": [
     {
-      "modelId": "jina-code-v2",
+      "modelId": "jina-v2-code",
       "type": "openai",
       "url": "http://192.168.1.100:8083/v1",
       "model": "jinaai/jina-embeddings-v2-base-code",
@@ -316,7 +347,7 @@ An `embeddingProviders` entry can list `fallbacks` — alternate runtimes for th
     }
   ],
   "searchEmbeddingProvider": {
-    "modelId": "jina-code-v2",
+    "modelId": "jina-v2-code",
     "type": "djl",
     "url": "hf://jinaai/jina-embeddings-v2-base-code",
     "dimensions": 768
@@ -324,7 +355,7 @@ An `embeddingProviders` entry can list `fallbacks` — alternate runtimes for th
 }
 ```
 
-A `fallbacks` entry inherits the parent's `modelId`/`dimensions` when omitted; if given explicitly they must match the parent's — mismatched dimensions would corrupt the shared `vec.jina-code-v2` field, and a mismatched `modelId` would defeat the whole point. As with `searchEmbeddingProvider`, you're on the hook for verifying the fallback runtime produces vectors close enough to the primary's to be usable interchangeably in the same vector space.
+A `fallbacks` entry inherits the parent's `modelId`/`dimensions` when omitted; if given explicitly they must match the parent's — mismatched dimensions would corrupt the shared `vec.jina-v2-code` field, and a mismatched `modelId` would defeat the whole point. As with `searchEmbeddingProvider`, you're on the hook for verifying the fallback runtime produces vectors close enough to the primary's to be usable interchangeably in the same vector space.
 
 `pharos index` and `pharos embed` each spawn a fresh JVM per invocation, so index-time fallback resolution re-probes the primary's reachability on every run — no daemon restart needed to pick up a remote server coming back online. The Lucene field and embedding cache key are always derived from the parent config, so vectors written via the fallback one day and the primary the next land in the same `vec.<modelId>` field/cache namespace — no forced re-embed when the runtime flips.
 
@@ -336,7 +367,7 @@ Embedding vectors are cached on disk at `<index-dir>/<project>/embed-cache.bin`,
 pharos backfill-embedding-cache myproject              # seed cache from existing HNSW vectors (no ONNX)
 pharos backfill-embedding-cache --all                  # all projects
 
-pharos embed --model=qwen3-emb myproject               # add a model's vectors to an existing index
+pharos embed --model=qwen3-emb myproject               # add a 2nd model's vectors next to existing ones
 pharos embed --model=qwen3-emb --all                   # all projects
 pharos embed --model=qwen3-emb myproject --force       # overwrite existing vectors
 
@@ -346,7 +377,7 @@ pharos invalidate-embeddings myproject --scope all     # everything
 pharos invalidate-embeddings --all                     # docs in every project
 ```
 
-Use `embed` when adding a new model without re-parsing. Use `invalidate-embeddings` after changing chunking logic to force selective re-embedding on the next incremental index run.
+Use `embed` when adding a second model to an index that already has vectors, without re-parsing; it embeds single-chunk documents only (multi-chunk ones need `pharos index --full <root path>`). On a keyword-only index it fails: use `pharos index --full <root path>`. Use `invalidate-embeddings` after changing chunking logic to force selective re-embedding on the next incremental index run.
 
 ### Skipping embeddings
 

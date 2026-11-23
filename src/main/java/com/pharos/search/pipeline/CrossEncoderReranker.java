@@ -5,13 +5,12 @@ import com.pharos.search.SearchResult;
 import com.pharos.search.SearchTrace;
 import org.apache.lucene.index.IndexReader;
 
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 
 /**
  * Post-merge reranker: scores the already-merged list with a cross-encoder model
- * and re-sorts by cross-encoder relevance.
+ * and fuses its ranking with the incoming first-stage order via equal-weight
+ * RRF (k=60) rather than replacing the first-stage score (see {@link RrfFusion}).
  *
  * <p>When the encoder is unavailable ({@link CrossEncoder#isAvailable()} returns false),
  * the input list is returned unchanged — this makes {@code HYBRID_RERANKED} degrade
@@ -35,18 +34,7 @@ public final class CrossEncoderReranker implements RerankStage {
         List<String> passages = results.stream().map(PassageBuilder::build).toList();
         float[] scores = encoder.score(req.query(), passages);
 
-        List<SearchResult> reranked = new ArrayList<>(results.size());
-        for (int i = 0; i < results.size(); i++) {
-            SearchResult r = results.get(i);
-            reranked.add(new SearchResult(
-                    r.id(), r.project(), r.packageName(), r.className(),
-                    r.qualifiedClassName(), r.methodName(), r.signature(),
-                    r.returnType(), r.body(), r.javadoc(), r.accessModifier(),
-                    r.filePath(), r.startLine(), r.endLine(),
-                    scores[i], r.searchType(), r.docType()
-            ));
-        }
-        reranked.sort(Comparator.comparingDouble(SearchResult::score).reversed());
+        List<SearchResult> reranked = RrfFusion.fuse(results, scores, null);
 
         if (trace != null) trace.record("cross-encoder rerank", t);
         return reranked.subList(0, Math.min(limit, reranked.size()));

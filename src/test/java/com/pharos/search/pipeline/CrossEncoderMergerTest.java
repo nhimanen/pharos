@@ -98,4 +98,21 @@ class CrossEncoderMergerTest {
         List<SearchResult> merged = merger.merge(List.of(List.of(), List.of()), req("q", 10), null);
         assertThat(merged).isEmpty();
     }
+
+    @Test
+    void fusesBestFirstStageRankWithCrossEncoderInsteadOfReplacing() {
+        CrossEncoder fixed = new CrossEncoder() {
+            @Override public float[] score(String q, List<String> passages) {
+                // pool order a,b,c,d : CE dislikes a (first-stage rank 1 in list 1)
+                return new float[] {0.0001f, 0.3f, 0.6f, 0.9f};
+            }
+            @Override public boolean isAvailable() { return true; }
+        };
+        CrossEncoderMerger merger = new CrossEncoderMerger(fixed);
+        List<SearchResult> merged = merger.merge(List.of(
+                List.of(result("proj:a", 1f, "k"), result("proj:b", .9f, "k"),
+                        result("proj:c", .8f, "k"), result("proj:d", .7f, "k"))), req("q", 10), null);
+        assertThat(merged.stream().map(SearchResult::id).toList().indexOf("proj:a")).isLessThan(3);
+        assertThat(merged.get(0).score()).isLessThan(0.1f);
+    }
 }

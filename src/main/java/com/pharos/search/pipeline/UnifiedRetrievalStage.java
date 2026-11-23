@@ -120,7 +120,14 @@ public class UnifiedRetrievalStage implements RetrievalStage {
             return KeywordSearchStrategy.toResults(searcher, trimmed, "unified");
         }
 
-        float[] queryVec = embedder.embed(req.query());
+        float[] queryVec;
+        try {
+            queryVec = embedder.embedQuery(req.query());
+        } catch (com.pharos.embedding.EmbeddingException e) {
+            queryVec = null;   // already logged at WARN by the provider
+            trace.addWarning("vector embedding failed for model " + embedder.modelId()
+                    + "; results are keyword-only");
+        }
         if (queryVec == null) {
             trace.record("unified retrieval (embed failed)", t0);
             int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);

@@ -446,6 +446,22 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
+        // 1.4.0-1.4.1 stored the legacy model's vectors under vec.legacy, which search never reads.
+        // Only a full index embeds exactly like a fresh one (chunked text, chunk vectors), so it also
+        // reuses the existing embedding cache; an incremental run would miss it and downgrade chunks.
+        if (incremental && !force && generateEmbeddings && !embedders.isEmpty()
+                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
+            if (availableEmbedders().isEmpty()) {
+                // A full run without a usable model writes no vectors and the project would stay flagged.
+                log.warn("project {}: vectors need re-embedding but no embedding model is available", projectName);
+            } else {
+                String msg = "vectors stored under vec.legacy by pharos 1.4.0-1.4.1; "
+                        + "running a full re-index to re-embed (cached vectors are reused)";
+                log.warn("project {}: {}", projectName, msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -1261,7 +1277,7 @@ public class ProjectIndexManager {
      * <p>Threads count is from {@code rt.threads}; 1 collapses to a single
      * worker, equivalent to the previous serial pass.
      */
-    private void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
                                ProgressListener progress, String projectName) throws IOException {
         if (totalSlots == 0) return;
         int chunkSize = rt.chunkSize;
@@ -1348,6 +1364,17 @@ public class ProjectIndexManager {
                     throw new IOException("Embed task failed: " + cause.getMessage(), cause);
                 }
             }
+        } catch (IOException | RuntimeException abort) {
+            // Keep what was already embedded so the next run does not redo it.
+            pool.shutdownNow();
+            try {
+                pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (rt.cache != null) rt.cache.save();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                abort.addSuppressed(interrupted);
+            }
+            throw abort;
         } finally {
             pool.shutdown();
         }

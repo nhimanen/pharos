@@ -1,5 +1,64 @@
 # Upgrading
 
+## Upgrading to 1.5.0
+
+Index format: 1 (unchanged). No default changes: semantic search stays off unless you configured it, and
+existing jina installs keep jina.
+
+### Legacy-model vectors
+
+With the old single-model config (`embeddingModelUrl`) or a provider with model id `legacy`, 1.4.0-1.4.1
+stored vectors in a field vector search never read, so vector search returned nothing. `pharos index-status`
+flags such projects (`needsReembed`) and prints the command for each; it looks like this (`index` takes the
+project's root directory, and `--project` keeps the registered name):
+
+```bash
+pharos index --full --single --project <name> <root path>
+```
+
+It re-indexes the project and re-embeds it from the embedding cache, so it is fast. `pharos upgrade-indexes`
+lists these projects with the same command but does not migrate legacy vectors: use `pharos index`.
+
+### Switching to granite-r2
+
+Nothing changes on upgrade: no default model changed, no re-embed happens, and the index format is unchanged.
+Semantic search is off unless you configured it; existing jina installs keep jina. granite-embedding-english-r2
+is the *recommended* model when you do enable embeddings (see the A/B in the CHANGELOG).
+
+To enable it (or to switch a jina install):
+
+```bash
+pharos embeddings enable                 # fresh: writes the granite-r2 provider
+pharos embeddings enable --force         # replaces an existing jina provider
+pharos daemon restart
+pharos embeddings status                 # prints the index command for every project without vectors
+pharos index --full <root path>          # per project; embeds it (`index` takes the directory, not the name)
+```
+
+The block written to `~/.pharos/config.json` (you can also paste it by hand):
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "granite-r2",
+      "type": "djl",
+      "url": "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+      "dimensions": 768,
+      "maxTokens": 512,
+      "pooling": "cls"
+    }
+  ],
+  "searchEmbeddingModel": "granite-r2"
+}
+```
+
+`enable` only edits the config and never embeds. `pharos embed` is not the way to embed a keyword-only
+project: it adds a model next to existing vectors only, and fails on an index that has none. Embedding caches are per model and do not carry over, so the
+first embed covers everything: expect hours for a large project on CPU (10.9 h for the lucene source tree in the
+A/B, against about 30 min for jina from cache). Peak memory is about 2.8 GB (jina about 2.3 GB). To stay on jina
+change nothing; `pharos embeddings status` shows what is configured and which projects have vectors.
+
 ## Invalid project names (e.g. ".")
 
 ### What happened
