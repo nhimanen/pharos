@@ -1218,6 +1218,18 @@ public final class WorkLoop implements Closeable {
                                         + root);
                         continue;
                     }
+                    String localRevision = local.get().getSourceRevision();
+                    if (!built && st.publishedRevision != null && !st.publishedRevision.equals(localRevision)) {
+                        // the local index is not the published run: another writer published since this one last
+                        // indexed the project (a lease that came back, e.g. after a writer scale-down and up, with
+                        // the old index still on disk). Splitting it would publish the new version without what
+                        // that writer added; the run that catches up goes first (integration e2e, run 2)
+                        log.info("Reshard of project {}: the local index is at revision {}, the published run at {};"
+                                + " indexing it first", project, localRevision, st.publishedRevision);
+                        needFullRunFirst(st, "the local index (revision " + localRevision + ") is behind the published"
+                                + " run (revision " + st.publishedRevision + ")");
+                        continue;
+                    }
                     if (!built && !admitted(unit, estimate(unit, indexDir, root, true))) {
                         // ruling P6-R18: the build rewrites its affected shards whole (the expunge merges
                         // them), so their old and new segments coexist until the commit: about twice their

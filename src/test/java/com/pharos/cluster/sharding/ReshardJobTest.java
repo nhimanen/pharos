@@ -159,8 +159,12 @@ public class ReshardJobTest {
 
         /** @param handRun publishes under the implicit lease (a hand-run writer racing the work loop) */
         Writer(String node, Duration minPinned, boolean handRun) {
+            this(node, minPinned, handRun, tmp.resolve("w" + (++seq) + "-" + node));
+        }
+
+        /** @param home the node's state dir: an existing one is a restarted node that kept its disk */
+        Writer(String node, Duration minPinned, boolean handRun, Path home) {
             this.node = node;
-            Path home = tmp.resolve("w" + (++seq) + "-" + node);
             IndexConfig config = IndexConfig.defaults();
             config.setIndexDir(home.resolve("indexes"));
             ProjectRegistry registry = ProjectRegistry.at(home.resolve("registry.json"));
@@ -939,6 +943,63 @@ public class ReshardJobTest {
         assertThat(map.listed()).doesNotContain(s03);
         r.sync();
         assertEveryFileOnce(r, files, "after the abandoned reshard");
+    }
+
+    /**
+     * Integration e2e run 2: a writer gets a project back with its old local index still on disk (a writer
+     * scale-down and up keeps the PVC) after another writer published a newer run at the current source
+     * revision. The reshard must not split that stale index: the new version would lack what the other
+     * writer added until some later run. The writer catches up first, then splits the published run.
+     */
+    @Test
+    void aReshardOnAWriterWithAStaleLocalIndexCatchesUpFirst() throws IOException {
+        List<String> files = filesFor(RING2, RING3, 2);
+        writeFiles(files);
+        catalog.register(new ShardId(P), Optional.of(ShardSource.path(src.toString())));
+        Path homeA = tmp.resolve("node-a-disk");
+        Writer a = new Writer("node-a", Duration.ZERO, false, homeA);
+        a.loop.tick();
+        assertThat(replicas.latest(new ShardId(P))).contains(Generation.FIRST);
+        a.loop.stop(Duration.ofSeconds(5)); // scaled down: releases the project, keeps its disk
+        a.loop.close();
+        a.lucene.close();
+        writers.remove(a);
+
+        // another writer publishes a newer run with one more file
+        String added = "src/main/java/org/example/lib/Added.java";
+        Path f = src.resolve(added);
+        Files.createDirectories(f.getParent());
+        Files.writeString(f, "package org.example.lib;\n\n/** Added while node-a was away. */\npublic class Added {\n"
+                + "    public int added(int x) { return x; }\n}\n", StandardCharsets.UTF_8);
+        Writer b = new Writer("node-b");
+        for (int i = 0; i < 3 && replicas.latest(new ShardId(P)).orElseThrow().value() < 2; i++) {
+            clock.advance(10);
+            b.loop.tick();
+        }
+        assertThat(replicas.latest(new ShardId(P)).orElseThrow().value()).as("node-b published the newer run").isEqualTo(2);
+        b.loop.stop(Duration.ofSeconds(5));
+        b.loop.close();
+        b.lucene.close();
+        writers.remove(b);
+
+        // node-a comes back with its generation-1 index on disk; the source is at the published revision
+        Writer a2 = new Writer("node-a", Duration.ZERO, false, homeA);
+        Reader r = new Reader("r1");
+        catalog.requestReshard(P, RING2, clock.instant());
+        for (int i = 0; i < 6 && !catalog.projectShards().shardsOf(P).equals(ring(2)); i++) {
+            clock.advance(10);
+            a2.loop.tick();
+            r.sync();
+        }
+        assertThat(catalog.projectShards().shardsOf(P)).as("flipped").isEqualTo(ring(2));
+        r.sync();
+        List<String> all = new ArrayList<>(files);
+        all.add(added);
+        assertEveryFileOnce(r, all, "the new version holds the file node-b added");
+        long docs = 0;
+        for (ShardId s : ring(2)) docs += replicas.manifest(s, replicas.latest(s).orElseThrow()).docCount();
+        assertThat(docs).as("no document lost by the split")
+                .isEqualTo(replicas.manifest(new ShardId(P), new Generation(2)).docCount());
     }
 
     /**

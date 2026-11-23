@@ -140,6 +140,9 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   right after the flip it reads the previous one until its readers serve the new one. The retired
   version is removed after `retentionMinutes`. An index run never adds shards: a new module under
   `[project, module]` needs `pharos reshard` with the same spec.
+  A writer whose local index is behind the published run (it got the project back after another
+  writer published, e.g. a writer scale-down and up that kept its disk) catches up with a full
+  run before it splits the project, so the new version never lacks that writer's files.
 - Resharding is visible: `/cluster/status` gains `projects[]` (a split project is one entry over
   its shards, with its staged and retired spec versions and the reshard's phase — requested,
   building, pinned, flipped, abandoned — progress in shards and in files, and the reshard lease
