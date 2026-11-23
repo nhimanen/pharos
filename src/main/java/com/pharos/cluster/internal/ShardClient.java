@@ -280,7 +280,7 @@ public final class ShardClient implements AutoCloseable {
                 }
                 if (InternalApi.SYNONYMS_MISMATCH.equals(error)) {
                     throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
-                            + " (synonyms.txt differs from this coordinator's)");
+                            + " (synonyms.txt differs from this coordinator's)", synonymsHashOf(body));
                 }
                 throw new GenerationMismatchException(reader.node(), servedGeneration(body));
             }
@@ -334,6 +334,17 @@ public final class ShardClient implements AutoCloseable {
         try {
             return mapper.readTree(body).path("error").asText(null);
         } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** The {@code synonymsHash} of a synonyms-mismatch 409 (P6-R19); null when absent. */
+    private String synonymsHashOf(byte[] body) {
+        try {
+            JsonNode n = mapper.readTree(body);
+            JsonNode h = n == null ? null : n.get("synonymsHash");
+            return h != null && h.isTextual() ? h.asText() : null;
+        } catch (IOException | RuntimeException e) {
             return null;
         }
     }

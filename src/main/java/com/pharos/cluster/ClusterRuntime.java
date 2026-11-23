@@ -941,6 +941,8 @@ public final class ClusterRuntime implements Closeable {
         ClusterConfig c = config.getCluster();
         com.pharos.search.distributed.LocalShardService service =
                 engine.shardService(this::servesShard, modelFingerprint(engine.embedder().modelId()));
+        // P6-R19: synonyms a publish replaced stay usable for the grace (readers see the publish at different times)
+        service.keyword().setPreviousSynonymsGrace(c.previousGenerationGrace());
         var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
         var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
                 Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));

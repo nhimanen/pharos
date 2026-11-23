@@ -189,8 +189,11 @@ public final class InternalApi {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", KEY_FILTERS_UNSUPPORTED, "detail", e.getMessage())));
         } catch (SynonymsMismatchException e) {
-            ctx.status(409).contentType("application/json")
-                    .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));
+            Map<String, Object> out = new java.util.LinkedHashMap<>();
+            out.put("error", SYNONYMS_MISMATCH);
+            out.put("detail", e.getMessage());
+            if (e.servedHash() != null) out.put("synonymsHash", e.servedHash()); // P6-R19
+            ctx.status(409).contentType("application/json").result(mapper.writeValueAsBytes(out));
         } catch (Exception e) {
             log.warn("internal call on shard '{}' failed: {}", shard, e.toString());
             error(ctx, 500, "internal error");

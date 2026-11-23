@@ -188,6 +188,54 @@ class ReplanTest {
     }
 
     /**
+     * Ruling P6-R19: a synonyms publish reaches one node late. Both nodes start on the same synonyms; the
+     * publish reaches the coordinator first (the reader still has the old ones: the coordinator analyses the
+     * query with its previous synonyms instead), then, in the other order, the reader first (it answers the
+     * coordinator's old synonyms from its previous ones). Complete results either way, no warning, re-plans off.
+     */
+    @Test
+    void aLateSynonymsPublishOnOneNodeStillAnswersComplete() throws Exception {
+        Path tmp = Files.createTempDirectory("syn-late");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String before = "old, rule\n";
+        String published = "calculator, adder\n";
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            fx.indexBoth();
+            try (TestReaderNode c = new TestReaderNode(tmp.resolve("c"), store, BUCKET, "c", List.of(PY), EMBEDDER, before);
+                 TestReaderNode r = new TestReaderNode(tmp.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER,
+                         before)) {
+                c.awaitShard(JAVA, 1);
+                c.ds().retries = false;
+                assertComplete(search(c, null, "multiply Calculator"), "same synonyms");
+
+                publish(c.configBase.resolve("synonyms.txt"), published, 5000); // the coordinator first
+                SearchResponse coordinatorFirst = search(c, null, "multiply Calculator");
+                assertComplete(coordinatorFirst, "the reader is late");
+                assertThat(coordinatorFirst.trace().notes()).anyMatch(n -> n.contains("previous synonyms"));
+
+                publish(r.configBase.resolve("synonyms.txt"), published, 5000);
+                assertComplete(search(c, null, "multiply Calculator"), "both on the new synonyms");
+
+                publish(r.configBase.resolve("synonyms.txt"), before, 10_000); // now the reader first
+                assertComplete(search(c, null, "multiply Calculator"), "the coordinator is late");
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
+    private static void publish(Path synonyms, String text, long aheadMillis) throws Exception {
+        Files.writeString(synonyms, text);
+        Files.setLastModifiedTime(synonyms, FileTime.fromMillis(System.currentTimeMillis() + aheadMillis));
+    }
+
+    private static void assertComplete(SearchResponse r, String when) {
+        assertThat(r.warnings()).as(when + ": no warning").isEmpty();
+        assertThat(r.results()).as(when + ": the sample-app shard answered").anyMatch(x -> x.project().equals(JAVA));
+        assertThat(r.trace().notes()).as(when + ": no re-plan").noneMatch(n -> n.startsWith("re-planned"));
+    }
+
+    /**
      * The re-plan itself loses every shard (here: both readers die before it runs). The first attempt's
      * answer, partial with its warning, is returned, not the re-plan's failure.
      */

@@ -454,6 +454,20 @@ public final class DistributedSearch implements Closeable {
         private volatile String retryCause;
         /** Runs once when the query closes (a re-planned query returns its permit). */
         private volatile Runnable onClose;
+        /**
+         * The synonyms the query is analysed with: this node's, or (P6-R19) its previous ones when a reader
+         * of the query has not synced the new ones yet; null until first used.
+         */
+        private volatile KeywordSearchStrategy keyword;
+
+        private KeywordSearchStrategy keyword() {
+            KeywordSearchStrategy kw = keyword;
+            return kw != null ? kw : local.keyword();
+        }
+
+        private String synonymsHash() {
+            return keyword().synonymsHash();
+        }
 
         Query(List<ShardState> shards, List<ShardState> alternates, long deadlineNanos, boolean explicitSingle,
               ShardRouter.RoutePlan plan) {
@@ -967,7 +981,7 @@ public final class DistributedSearch implements Closeable {
         private Long pinGeneration(ShardState s) throws IOException {
             if (s.local) return pin(s).generation();
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(gen));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).at(gen));
             return r.generation();
         }
 
@@ -986,7 +1000,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return false;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(generation),
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).at(generation),
                             left / 2);
                     if (resp.generation() != generation) continue;
                     synchronized (s) {
@@ -1021,7 +1035,7 @@ public final class DistributedSearch implements Closeable {
                 return run == null ? 0L : run;
             }
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).at(gen));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).at(gen));
             return r.projectGeneration() == null ? 0L : r.projectGeneration();
         }
 
@@ -1156,7 +1170,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return null;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).atRun(run), left / 2);
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atRun(run), left / 2);
                     if (resp.projectGeneration() != null && resp.projectGeneration() == run) {
                         return Map.entry(r, resp.generation());
                     }
@@ -1198,7 +1212,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return null;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), local.synonymsHash()).atRun(target),
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atRun(target),
                             left / 2);
                     if (resp.projectGeneration() != null && resp.projectGeneration() == target) {
                         synchronized (s) {
@@ -1290,16 +1304,50 @@ public final class DistributedSearch implements Closeable {
             Map<ShardState, TermStatsResponse> answers = fanOut(available(), s -> s.local
                     ? new TermStatsResponse(pin(s).generation(), local.termStats(pin(s), fields, terms))
                     : remote(s, ShardClient.TERM_STATS, false,
-                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash).at(gen)));
+                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash).at(gen)),
+                    (s, t) -> {
+                        // P6-R19: a reader still on this node's previous synonyms; the query is analysed again
+                        // with those (see globalStats), so the shard is not left out
+                        if (previousSynonyms == null) return false;
+                        for (Throwable c = t; c != null; c = c.getCause()) {
+                            if (c instanceof SynonymsMismatchException sm && previousSynonyms.equals(sm.servedHash())) {
+                                behindOnSynonyms = true;
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
             return GlobalStats.merge(new ArrayList<>(answers.values()));
         }
 
+        /** This node's previous synonyms the current stats round may fall back to (P6-R19); else null. */
+        private volatile String previousSynonyms;
+        /** A reader of the stats round answered with {@link #previousSynonyms}. */
+        private volatile boolean behindOnSynonyms;
+        /** The previous synonyms the query falls back to after such a round. */
+        private volatile String fallbackSynonyms;
+
         /** Global statistics of the query's BM25 terms, gathered once per query. */
         private GlobalStats globalStats(SearchRequest req) {
-            KeywordSearchStrategy kw = local.keyword();
+            GlobalStats first = globalStatsOnce(req, true);
+            if (first != null) return first;
+            // P6-R19: a reader has not synced this node's new synonyms yet: the whole query is analysed with
+            // the previous ones, which every reader still answers (the new ones keep them for a grace)
+            KeywordSearchStrategy previous = local.keyword().forSynonyms(fallbackSynonyms);
+            if (previous != null) {
+                keyword = previous;
+                lateNotes.add("analysed with the previous synonyms: a reader has not synced the new ones yet");
+            }
+            return globalStatsOnce(req, false);
+        }
+
+        /** One statistics round; null when a reader is behind on synonyms and {@code mayFallBack}. */
+        private GlobalStats globalStatsOnce(SearchRequest req, boolean mayFallBack) {
+            KeywordSearchStrategy kw = keyword();
+            String hash = kw.synonymsHash();
             org.apache.lucene.search.Query q = kw.buildQuery(req);
             Set<Term> terms = q == null ? Set.of() : GlobalStats.queryTerms(q);
-            String key = terms.toString();
+            String key = hash + "|" + terms;
             synchronized (this) {
                 if (globalStats != null && key.equals(statsKey)) return globalStats;
             }
@@ -1317,7 +1365,15 @@ public final class DistributedSearch implements Closeable {
                         + " beyond " + cap + " are scored with each shard's own statistics");
                 terms = shipped;
             }
-            GlobalStats merged = gather(terms, local.synonymsHash());
+            String prev = mayFallBack && keyword == null ? local.keyword().previousSynonymsHash().orElse(null) : null;
+            previousSynonyms = prev;
+            behindOnSynonyms = false;
+            GlobalStats merged = gather(terms, hash);
+            previousSynonyms = null;
+            if (behindOnSynonyms) {
+                fallbackSynonyms = prev;
+                return null;
+            }
             if (capped) merged = merged.asPartial();
             java.util.function.Consumer<String> hook = afterStatsRound;
             if (hook != null) hook.accept(req.query());
@@ -1476,7 +1532,8 @@ public final class DistributedSearch implements Closeable {
                                                            java.util.function.Function<ShardState, List<ScoredId>> selected,
                                                            java.util.function.Function<ShardState, List<ScoredId>> selectedKnn,
                                                            boolean chunks) {
-            String hash = local.synonymsHash();
+            // pure vector retrieval analyses no text: no synonyms to agree on
+            String hash = retriever.startsWith("vector") ? null : synonymsHash();
             LocalShardService.Model model = local.model();
             String queryModelId = vec == null || model == null ? null : model.modelId();
             boolean unifiedRound = retriever.startsWith("unified");
@@ -1493,7 +1550,8 @@ public final class DistributedSearch implements Closeable {
                 String fingerprint = v == null || model == null ? null : model.fingerprint();
                 if (s.local) {
                     if (modelId != null) local.checkModel(s.route.shard(), modelId, dims, fingerprint);
-                    return local.search(pin(s), retriever, req, v, stats, selected.apply(s), selectedKnn.apply(s), chunks);
+                    return local.search(pin(s), retriever, req, v, stats, selected.apply(s), selectedKnn.apply(s), chunks,
+                            hash);
                 }
                 return remote(s, ShardClient.SHARD_SEARCH, true, // first-round doc ids bind the generation too
                         (hb, gen) -> new ShardSearchRequest(s.name(), gen, retriever, req, v, stats, hash, modelId,

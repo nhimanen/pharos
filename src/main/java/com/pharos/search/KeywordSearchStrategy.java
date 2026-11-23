@@ -193,17 +193,87 @@ public class KeywordSearchStrategy {
         reloadAnalyzer();
     }
 
+    /** A view analysing with {@code analyzer} (the synonyms of {@code hash}) for good: never reloads. */
+    private KeywordSearchStrategy(Analyzer analyzer, String hash, SearcherFactory searcherFactory) {
+        this.synonymFile = null;
+        this.searcherFactory = searcherFactory;
+        this.analyzer = analyzer;
+        this.synonymsHash = hash;
+    }
+
+    /** The synonyms a reload replaced, kept for {@link #setPreviousSynonymsGrace} (ruling P6-R19). */
+    private record Previous(String hash, Analyzer analyzer, long untilMillis) {}
+
+    private volatile Previous previous;
+    private volatile java.time.Duration previousSynonymsGrace = java.time.Duration.ZERO;
+    private volatile java.util.function.LongSupplier clock = System::currentTimeMillis;
+
+    /**
+     * Ruling P6-R19: how long the synonyms a reload replaced stay usable ({@link #forSynonyms}): a cluster
+     * node's coordinator or shard requests analysed with them are still answered meanwhile (a synonyms
+     * publish reaches the nodes at different moments). Zero (the default, a single node) keeps none.
+     */
+    public void setPreviousSynonymsGrace(java.time.Duration grace) {
+        this.previousSynonymsGrace = java.util.Objects.requireNonNull(grace, "grace");
+    }
+
+    /** The clock the previous synonyms' grace is timed with (tests). */
+    public void setClock(java.util.function.LongSupplier clock) {
+        this.clock = java.util.Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * This strategy when {@code hash} names the synonyms it analyses with; a view analysing with the previous
+     * synonyms when {@code hash} names those and their grace lasts (P6-R19); else null.
+     */
+    public KeywordSearchStrategy forSynonyms(String hash) {
+        if (hash == null || hash.equals(synonymsHash())) return this;
+        Previous p = previous;
+        if (p == null || !p.hash().equals(hash) || clock.getAsLong() >= p.untilMillis()) return null;
+        return new KeywordSearchStrategy(p.analyzer(), p.hash(), searcherFactory);
+    }
+
+    /** The hash of the previous synonyms while their grace lasts (P6-R19); empty otherwise. */
+    public java.util.Optional<String> previousSynonymsHash() {
+        synonymsHash(); // a reload due now replaces them first
+        Previous p = previous;
+        if (p == null || clock.getAsLong() >= p.untilMillis()) return java.util.Optional.empty();
+        return java.util.Optional.of(p.hash());
+    }
+
     /**
      * Rebuilds the query analyzer from the current synonyms.txt.
      * Called at construction and whenever the file's last-modified time advances.
      */
-    private void reloadAnalyzer() {
-        this.analyzer = LuceneIndexer.buildQueryAnalyzer(synonymFile.getParent());
+    private synchronized void reloadAnalyzer() {
+        if (synonymFile == null) return;
+        Analyzer before = this.analyzer;
+        String beforeHash = this.synonymsHash;
+        long stamp;
         try {
-            this.synonymFileLastModified = Files.exists(synonymFile)
-                    ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
+            stamp = Files.exists(synonymFile) ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
         } catch (IOException e) {
-            this.synonymFileLastModified = -1;
+            stamp = -1;
+        }
+        String hash = hashOf(synonymFile);
+        this.analyzer = LuceneIndexer.buildQueryAnalyzer(synonymFile.getParent());
+        this.synonymsHash = hash;
+        this.synonymsHashOf = stamp;
+        this.synonymFileLastModified = stamp;
+        java.time.Duration grace = previousSynonymsGrace;
+        if (before != null && beforeHash != null && !beforeHash.equals(hash) && !grace.isZero()) {
+            previous = new Previous(beforeHash, before, clock.getAsLong() + grace.toMillis());
+        }
+    }
+
+    private static String hashOf(Path file) {
+        try {
+            return Files.exists(file)
+                    ? java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(Files.readAllBytes(file)))
+                    : "none";
+        } catch (IOException | java.security.NoSuchAlgorithmException e) {
+            return "unreadable";
         }
     }
 
@@ -213,6 +283,7 @@ public class KeywordSearchStrategy {
      * the file-stat is a single syscall and is negligible compared to Lucene I/O.
      */
     private void reloadIfChanged() {
+        if (synonymFile == null) return; // a view of fixed synonyms
         try {
             long current = Files.exists(synonymFile)
                     ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
@@ -236,17 +307,11 @@ public class KeywordSearchStrategy {
      */
     public String synonymsHash() {
         reloadIfChanged();
+        if (synonymFile == null) return synonymsHash;
         long stamp = synonymFileLastModified;
         String h = synonymsHash;
         if (h != null && synonymsHashOf == stamp) return h;
-        try {
-            h = Files.exists(synonymFile)
-                    ? java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
-                            .digest(Files.readAllBytes(synonymFile)))
-                    : "none";
-        } catch (IOException | java.security.NoSuchAlgorithmException e) {
-            h = "unreadable";
-        }
+        h = hashOf(synonymFile);
         synonymsHash = h;
         synonymsHashOf = stamp;
         return h;

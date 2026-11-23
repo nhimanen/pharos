@@ -286,10 +286,20 @@ public final class LocalShardService implements ShardSearchService {
     }
 
     private void checkSynonyms(String hash) {
-        if (hash != null && !hash.equals(synonymsHash())) {
-            throw new SynonymsMismatchException("synonyms hash " + hash + " differs from this reader's "
-                    + synonymsHash());
+        keywordFor(hash);
+    }
+
+    /**
+     * The keyword strategy analysing with the synonyms of {@code hash}: this node's, or the previous ones it
+     * still keeps (P6-R19); null hash: this node's. Another hash is refused with this node's own.
+     */
+    public KeywordSearchStrategy keywordFor(String hash) {
+        KeywordSearchStrategy kw = keyword.forSynonyms(hash);
+        if (kw == null) {
+            String own = synonymsHash();
+            throw new SynonymsMismatchException("synonyms hash " + hash + " differs from this reader's " + own, own);
         }
+        return kw;
     }
 
     private static boolean other(Long wanted, Pin pin) {
@@ -329,7 +339,7 @@ public final class LocalShardService implements ShardSearchService {
         try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new ShardSearchResponse(pin.generation(), 1, List.of());
             return search(pin, request.retriever(), request.request(), request.queryVector(), request.globalStats(),
-                    request.selected(), request.selectedKnn(), request.chunkVectors());
+                    request.selected(), request.selectedKnn(), request.chunkVectors(), request.synonymsHash());
         }
     }
 
@@ -346,6 +356,15 @@ public final class LocalShardService implements ShardSearchService {
     public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
                                       GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
                                       boolean chunkVectors) throws IOException {
+        return search(pin, retriever, req, queryVector, stats, selected, selectedKnn, chunkVectors, null);
+    }
+
+    /** As above, analysing with the synonyms of {@code synonymsHash} (null: this node's; see {@link #keywordFor}). */
+    public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
+                                      GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
+                                      boolean chunkVectors, String synonymsHash) throws IOException {
+        KeywordSearchStrategy keyword = keywordFor(synonymsHash);
+        UnifiedRetrievalStage unified = this.unified.withKeyword(keyword);
         if (req != null && req.hasKeyFilter()) {
             com.pharos.search.KeyFiltersUnsupportedException.check(pin.project(), pin.shardDir());
         }

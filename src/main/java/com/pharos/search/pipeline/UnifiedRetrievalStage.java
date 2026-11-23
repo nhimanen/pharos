@@ -108,6 +108,12 @@ public class UnifiedRetrievalStage implements RetrievalStage {
         this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
 
+    /** This stage analysing its BM25 part with {@code keyword} (e.g. a previous synonyms view, P6-R19). */
+    public UnifiedRetrievalStage withKeyword(KeywordSearchStrategy keyword) {
+        if (keyword == keywordStrategy) return this;
+        return new UnifiedRetrievalStage(keyword, embedder, searcherFactory);
+    }
+
     @Override
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                         SearchTrace trace) throws IOException {
