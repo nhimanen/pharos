@@ -272,8 +272,76 @@ public class KeywordSearchStrategy {
         Query query = buildQuery(req);
         if (query == null) return List.of();
 
-        TopDocs hits = searcher.search(query, req.limit());
-        return rawCandidates(searcher, hits, TYPE);
+        int limit = req.limit();
+        if (limit <= 0) return List.of();
+        TopDocs hits = searcher.search(query, limit + 1);
+        ScoreDoc[] sd = hits.scoreDocs;
+        if (sd.length > limit && sd[limit - 1].score == sd[limit].score) {
+            // the cut falls inside a group of equal scores: read the whole group (up to MAX_TIE_WINDOW
+            // hits), so which of its documents stay is decided by the stable key, not by doc ids
+            float cut = sd[limit - 1].score;
+            int n = limit + 1;
+            while (sd.length == n && sd[n - 1].score == cut && n < MAX_TIE_WINDOW) {
+                n = Math.min(MAX_TIE_WINDOW, n * 4);
+                sd = searcher.search(query, n).scoreDocs;
+            }
+            sd = stableCut(searcher, sd, limit);
+        } else if (sd.length > limit) {
+            sd = java.util.Arrays.copyOf(sd, limit);
+        }
+        return stableTop(rawCandidates(searcher, new TopDocs(hits.totalHits, sd), TYPE), limit);
+    }
+
+    /** The most hits a retrieval reads to resolve a tie at the cut. */
+    static final int MAX_TIE_WINDOW = 10_000;
+
+    private static final java.util.Set<String> TIE_KEY_FIELDS = java.util.Set.of(DocumentMapper.F_ID,
+            DocumentMapper.F_DOC_TYPE, DocumentMapper.F_START_LINE, DocumentMapper.F_END_LINE);
+
+    /** The first {@code limit} hits by score, equal scores by {@link #tieKey}; reads only the key's fields. */
+    private static ScoreDoc[] stableCut(IndexSearcher searcher, ScoreDoc[] hits, int limit) throws IOException {
+        StoredFields stored = searcher.storedFields();
+        List<Map.Entry<ScoreDoc, String>> keyed = new ArrayList<>(hits.length);
+        for (ScoreDoc h : hits) {
+            Document d = stored.document(h.doc, TIE_KEY_FIELDS);
+            keyed.add(Map.entry(h, tieKey(d.get(DocumentMapper.F_ID), d.get(DocumentMapper.F_DOC_TYPE),
+                    getInt(d, DocumentMapper.F_START_LINE), getInt(d, DocumentMapper.F_END_LINE))));
+        }
+        keyed.sort(java.util.Comparator.<Map.Entry<ScoreDoc, String>>comparingDouble(e -> -e.getKey().score)
+                .thenComparing(Map.Entry::getValue));
+        ScoreDoc[] out = new ScoreDoc[Math.min(limit, keyed.size())];
+        for (int i = 0; i < out.length; i++) out[i] = keyed.get(i).getKey();
+        return out;
+    }
+
+    /**
+     * The order keyword candidates rank in: by raw score, and equal scores by {@link #tieKey}, so the
+     * ranking and the documents kept at the cut do not depend on Lucene doc ids. Doc ids depend on how
+     * an index was built (parallel writes, segments, how a project is split into shards); without this,
+     * two builds of the same source kept different documents of a tie at the cut, and since the graph
+     * boost is normalised by the page's highest in-degree ({@link
+     * com.pharos.search.distributed.CandidateShaper}), that changed every score on the page (found by the
+     * Phase 6 gate: a resharded project's keyword pages drifted by up to 0.2 % against the unsplit build).
+     */
+    public static final java.util.Comparator<RawCandidate> STABLE_ORDER =
+            java.util.Comparator.comparing(RawCandidate::rawScore, java.util.Comparator.reverseOrder())
+                    .thenComparing(KeywordSearchStrategy::tieKey);
+
+    /** A build-independent key of a candidate: its id, document type and line range. */
+    public static String tieKey(RawCandidate c) {
+        SearchResult r = c.result();
+        return tieKey(r.id(), c.docType(), r.startLine(), r.endLine());
+    }
+
+    private static String tieKey(String id, String docType, int startLine, int endLine) {
+        return id + '\u0000' + docType + '\u0000' + startLine + '\u0000' + endLine;
+    }
+
+    /** The first {@code limit} of {@code raw} in {@link #STABLE_ORDER}. */
+    static List<RawCandidate> stableTop(List<RawCandidate> raw, int limit) {
+        List<RawCandidate> sorted = new ArrayList<>(raw);
+        sorted.sort(STABLE_ORDER);
+        return sorted.size() > limit ? List.copyOf(sorted.subList(0, limit)) : sorted;
     }
 
     /** The intent {@link #search} shapes with: the router's classification, if any. */

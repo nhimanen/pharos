@@ -290,6 +290,15 @@ public final class DistributedSearch implements Closeable {
 
     /** Merges per-shard raw lists (in shard ordinal order) k-way and keeps the top {@code limit}. */
     static List<RawCandidate> mergeRaw(List<List<RawCandidate>> perShard, int limit) {
+        return mergeRaw(perShard, limit, false);
+    }
+
+    /**
+     * As {@link #mergeRaw(List, int)}; with {@code stableTies} equal scores are ordered by
+     * {@link KeywordSearchStrategy#tieKey} (the keyword ranking's order, which a single node uses too),
+     * instead of by shard ordinal.
+     */
+    static List<RawCandidate> mergeRaw(List<List<RawCandidate>> perShard, int limit, boolean stableTies) {
         int[] pos = new int[perShard.size()];
         List<RawCandidate> out = new ArrayList<>(Math.max(0, limit));
         while (out.size() < limit) {
@@ -302,6 +311,9 @@ public final class DistributedSearch implements Closeable {
                 if (best < 0 || s > bestScore) { // strict: a tie keeps the lower ordinal
                     best = i;
                     bestScore = s;
+                } else if (stableTies && s == bestScore && KeywordSearchStrategy.tieKey(l.get(pos[i]))
+                        .compareTo(KeywordSearchStrategy.tieKey(perShard.get(best).get(pos[best]))) < 0) {
+                    best = i;
                 }
             }
             if (best < 0) break;
@@ -1131,7 +1143,7 @@ public final class DistributedSearch implements Closeable {
                     answered = first.size();
                 }
             }
-            List<RawCandidate> merged = mergeRaw(lists, req.limit());
+            List<RawCandidate> merged = mergeRaw(lists, req.limit(), "keyword".equals(retriever));
             String shapeIntent = switch (retriever) {
                 case "keyword" -> KeywordSearchStrategy.shapingIntent(req);
                 case "vector" -> null;

@@ -172,10 +172,10 @@ class SplitProjectSearchTest {
      * scoped to the split project is bitwise (ids, scores, order) what a single node searching the same
      * shards locally returns (one MultiReader over them: the same documents and doc ids), with all three
      * shards remote and with all three held here. (b) Against the unsplit project, another index build of
-     * the same files: bitwise for every query whose rank-10 and rank-11 raw BM25 scores are not tied. A tie
-     * at the cut is broken by doc id, which differs between the builds (documents are written in parallel),
-     * so either may keep other documents of the tied group; for those queries the raw top 10 must have the
-     * same scores rank by rank and the same documents outside the tied group ({@link #compareRaw}).
+     * the same files, with other doc ids: bitwise and in the same order for every query, also those with a
+     * tie at the cut. Equal raw scores rank by a build-independent key ({@code KeywordSearchStrategy
+     * .STABLE_ORDER}); found by the Phase 6 gate: with ties broken by doc id the two builds kept other
+     * documents at the cut, and the page-relative graph boost then shifted every score on the page.
      */
     @Test
     void splitProjectScoresBitwiseAsTheUnsplitProject() throws Exception {
@@ -204,19 +204,17 @@ class SplitProjectSearchTest {
                     r.parts.lucene().openReader(WHOLE)), rawRequest(q, List.of(WHOLE), 10));
             List<RawCandidate> splitRaw = keyword.retrieveRaw(new org.apache.lucene.search.IndexSearcher(
                     r.parts.lucene().openMultiReader(shardNames)), rawRequest(q, shardNames, 10));
-            String rawDiff = compareRaw(splitRaw, wholeRaw, 10);
-            if (rawDiff == null) {
-                assertThat(compareBitwise(remote, whole)).as(q).isNull();
-            } else {
-                // A tie at the cut, broken by doc id, which differs between the builds: each build may keep
-                // other documents of the tied group. Everything else is the same raw ranking, and the page
-                // is that ranking shaped (bitwise the local reference above).
-                tied++;
-                assertThat(rawDiff).as(q).startsWith("tied at the cut");
-            }
+            assertThat(compareRaw(splitRaw, wholeRaw, 10)).as(q + " (raw)").isNull();
+            assertThat(splitRaw.stream().map(x -> fqn(x.result().id())).toList()).as(q + " (raw order)")
+                    .isEqualTo(wholeRaw.stream().map(x -> fqn(x.result().id())).toList());
+            assertThat(remote.stream().map(x -> fqn(x.id()) + "=" + bits(x.score())).toList()).as(q)
+                    .isEqualTo(whole.stream().map(x -> fqn(x.id()) + "=" + bits(x.score())).toList());
+            List<RawCandidate> eleven = keyword.retrieveRaw(new org.apache.lucene.search.IndexSearcher(
+                    r.parts.lucene().openReader(WHOLE)), rawRequest(q, List.of(WHOLE), 11));
+            if (eleven.size() == 11 && eleven.get(9).rawScore() == eleven.get(10).rawScore()) tied++;
         }
         assertThat(compared).isGreaterThan(5);
-        assertThat(tied).as("most queries have no tie at the cut").isLessThan(compared);
+        assertThat(tied).as("the corpus has queries with a tie at the cut").isPositive();
     }
 
     static SearchRequest rawRequest(String q, List<String> projects, int limit) {
