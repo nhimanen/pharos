@@ -185,6 +185,42 @@ class ReplanTest {
         }
     }
 
+    /**
+     * A re-plan shares the original query's budget: it waits at most half of what is left (2 s at most)
+     * and the re-planned query keeps the original deadline, so the whole query stays within its timeout
+     * even when nothing has changed by the re-plan (here a coordinator whose synonyms never catch up).
+     */
+    @Test
+    void aReplanNeverExceedsTheOriginalQueryTimeout() throws Exception {
+        Path tmp = Files.createTempDirectory("replan-budget");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        int timeoutMillis = 1500;
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            fx.indexBoth();
+            try (TestReaderNode c = new TestReaderNode(tmp.resolve("c"), store, BUCKET, "c", List.of(PY), EMBEDDER,
+                    "old, rule\n", cfg -> {
+                        cfg.setFanoutTimeoutMillis(1000);
+                        cfg.setQueryTimeoutMillis(timeoutMillis);
+                    });
+                 TestReaderNode r = new TestReaderNode(tmp.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER,
+                         "calculator, adder\n")) {
+                c.awaitShard(JAVA, 1);
+                search(c, null, "multiply Calculator"); // warm-up
+                for (int i = 0; i < 3; i++) {
+                    long t0 = System.nanoTime();
+                    SearchResponse resp = search(c, null, "multiply Calculator");
+                    long tookMillis = (System.nanoTime() - t0) / 1_000_000;
+                    assertThat(resp.trace().notes()).anyMatch(n -> n.startsWith("re-planned once"));
+                    assertThat(resp.warnings()).as("still refused: the partial answer").anyMatch(w -> w.contains("synonyms"));
+                    assertThat(tookMillis).as("within the query timeout of " + timeoutMillis + " ms (plus scheduling)")
+                            .isLessThan(timeoutMillis + 400);
+                }
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
     /** Publishes the project's next index run (a changed file), which reader x has not activated yet. */
     private static void nextRun(ClusterFixture fx, Path src, String project, ShardSpec spec, List<ShardId> shards,
                                 int n) throws Exception {

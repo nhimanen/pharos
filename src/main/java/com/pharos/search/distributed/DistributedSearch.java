@@ -160,6 +160,9 @@ public final class DistributedSearch implements Closeable {
     static volatile Runnable beforeReplan;
     /** The longest a re-plan waits for fresh heartbeats, catalog or synonyms (ruling P6-R16). */
     static final Duration REPLAN_WAIT = Duration.ofSeconds(2);
+    /** Re-planned queries running at once; beyond it a query keeps its first, partial answer. */
+    static final int MAX_CONCURRENT_REPLANS = 16;
+    private final java.util.concurrent.Semaphore replans = new java.util.concurrent.Semaphore(MAX_CONCURRENT_REPLANS);
 
     /**
      * @param queryTimeout      the budget of one query, every round included
@@ -213,6 +216,11 @@ public final class DistributedSearch implements Closeable {
      * {@link ShardFilter}); {@link Query#routingNotes} says what was pruned and what could not be.
      */
     public Query open(List<String> projects, ShardFilter filter) {
+        return open(projects, filter, System.nanoTime() + queryTimeout.toNanos());
+    }
+
+    /** As {@link #open(List, ShardFilter)}, the query ending at {@code deadlineNanos} (a re-plan keeps the original's). */
+    private Query open(List<String> projects, ShardFilter filter, long deadlineNanos) {
         long start = System.nanoTime();
         boolean unscoped = projects == null || projects.isEmpty();
         ShardRouter.RoutePlan plan = router.plan(projects, filter);
@@ -234,7 +242,7 @@ public final class DistributedSearch implements Closeable {
             alternates.add(st);
         }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
-        Query q = new Query(shards, alternates, start + queryTimeout.toNanos(), explicitSingle, plan);
+        Query q = new Query(shards, alternates, deadlineNanos, explicitSingle, plan);
         try {
             q.openSignature = signature(plan);
         } catch (RuntimeException e) { // only a re-plan's wait reads it: never fail a query for it
@@ -270,18 +278,40 @@ public final class DistributedSearch implements Closeable {
      * statistics.
      */
     public Query reopen(Query failed, List<String> projects, ShardFilter filter) {
-        Runnable hook = beforeReplan;
-        if (hook != null) hook.run();
-        long end = System.nanoTime() + REPLAN_WAIT.toNanos();
-        while (System.nanoTime() < end && stateSignature(projects, filter).equals(failed.openSignature)) {
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
+        if (!replans.tryAcquire()) {
+            throw new ReplanRefusedException(MAX_CONCURRENT_REPLANS + " queries are re-planning already");
         }
-        return open(projects, filter);
+        boolean handedOver = false;
+        try {
+            Runnable hook = beforeReplan;
+            if (hook != null) hook.run();
+            long left = failed.remainingNanos();
+            if (left <= 0) throw new ReplanRefusedException("the query's time budget is spent");
+            // the wait and the re-planned query share what is left of the original budget: wait at most
+            // half of it, so the second fan-out keeps time for its calls
+            long end = System.nanoTime() + Math.min(REPLAN_WAIT.toNanos(), left / 2);
+            while (System.nanoTime() < end && stateSignature(projects, filter).equals(failed.openSignature)) {
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            Query q = open(projects, filter, failed.deadlineNanos);
+            q.onClose = replans::release;
+            handedOver = true;
+            return q;
+        } finally {
+            if (!handedOver) replans.release();
+        }
+    }
+
+    /** A re-plan was not run (too many at once, or no time left): the query keeps its first answer. */
+    public static final class ReplanRefusedException extends RuntimeException {
+        ReplanRefusedException(String why) {
+            super("re-plan refused: " + why);
+        }
     }
 
     /** What a re-plan waits to change: each planned shard's pin and its readers' generations, and the synonyms. */
@@ -422,6 +452,8 @@ public final class DistributedSearch implements Closeable {
         private volatile String openSignature = "";
         /** Why the query lost a shard in a way a re-plan can mend (ruling P6-R16), else null. */
         private volatile String retryCause;
+        /** Runs once when the query closes (a re-planned query returns its permit). */
+        private volatile Runnable onClose;
 
         Query(List<ShardState> shards, List<ShardState> alternates, long deadlineNanos, boolean explicitSingle,
               ShardRouter.RoutePlan plan) {
@@ -597,6 +629,8 @@ public final class DistributedSearch implements Closeable {
                 if (closed) return;
                 closed = true;
             }
+            Runnable done = onClose;
+            if (done != null) done.run();
             for (Future<?> f : outstanding) f.cancel(true);
             for (ShardState s : shards) {
                 synchronized (s) {
