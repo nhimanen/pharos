@@ -299,6 +299,8 @@ public final class WorkLoop implements Closeable {
     private ScheduledExecutorService diskWatch;
     /** Change detection at a fixed rate, on its own thread: it runs while the loop thread indexes. */
     private ScheduledExecutorService detector;
+    /** Renews the reshard leases while their units are held (see {@link #renewReshardLeases}). */
+    private ScheduledExecutorService reshardRenewer;
     private volatile boolean stopping;
     private final ReentrantLock tickLock = new ReentrantLock();
     private final Object stopMu = new Object();
@@ -348,7 +350,7 @@ public final class WorkLoop implements Closeable {
             leases.start();
             // the reshard lease is renewed on its own thread too: a reshard build runs inside a tick, which
             // would otherwise not renew it for the whole build (any build longer than the TTL lost it)
-            if (reshard != null) reshard.leases().start();
+            if (reshard != null) startReshardRenewer();
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "pharos-writer-work-loop");
                 t.setDaemon(true);
@@ -1063,7 +1065,64 @@ public final class WorkLoop implements Closeable {
         this.reshard = new com.pharos.cluster.sharding.ReshardJob(settings.node(), store, layout, catalog, publisher,
                 replicas, writerState, indexer, lucene, reshardLeases, readers, gc, clock, reshardSettings);
         synchronized (stopMu) {
-            if (scheduler != null) reshardLeases.start(); // enabled after start(): renew from now on
+            if (scheduler != null) startReshardRenewer(); // enabled after start(): renew from now on
+        }
+    }
+
+    /** Holding stopMu: renews the reshard leases every TTL/3 on their own thread. */
+    private void startReshardRenewer() {
+        if (reshardRenewer != null || stopped) return;
+        reshardRenewer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pharos-writer-reshard-lease");
+            t.setDaemon(true);
+            return t;
+        });
+        long every = Math.max(1, settings.leaseTtl().dividedBy(3).toMillis());
+        reshardRenewer.scheduleWithFixedDelay(this::renewReshardLeasesQuietly, every, every, TimeUnit.MILLISECONDS);
+    }
+
+    private void renewReshardLeasesQuietly() {
+        try {
+            renewReshardLeases();
+        } catch (RuntimeException e) {
+            log.warn("Renewing the reshard leases failed (retried next interval): {}", e.toString());
+        }
+    }
+
+    /**
+     * Renews each reshard lease while this writer holds every shard lease of its project's work unit
+     * (a reshard runs only on the unit's holder). Once the unit is lost (a lease taken over or a failed
+     * renewal) the running build of that project is aborted and the reshard lease released at once, so
+     * the writer that holds the project now takes the reshard over without waiting out the TTL.
+     */
+    void renewReshardLeases() {
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        if (job == null) return;
+        for (Lease l : job.leases().held()) {
+            ShardId unit = l.shard();
+            if (unitHeld(unit)) {
+                job.leases().renew(l);
+                continue;
+            }
+            Run r = current;
+            if (r != null && r.shard.equals(unit)) {
+                r.abort.request("this writer lost the shard leases of project " + unit);
+            }
+            log.warn("Reshard of project {}: this writer no longer holds the project's shard leases; releasing its"
+                    + " reshard lease", unit);
+            job.releaseLease(unit);
+        }
+    }
+
+    /** Tests only: a run of {@code unit} is in progress; its abort. */
+    IndexAbort runningForTest(ShardId unit) {
+        tickLock.lock(); // after a tick in progress, which clears current when it ends
+        try {
+            Run r = new Run(unit, List.of(unit), clock.millis());
+            current = r;
+            return r.abort;
+        } finally {
+            tickLock.unlock();
         }
     }
 
@@ -1659,6 +1718,8 @@ public final class WorkLoop implements Closeable {
             diskWatch = null;
             if (detector != null) detector.shutdownNow(); // read-only source checks: nothing to drain
             detector = null;
+            if (reshardRenewer != null) reshardRenewer.shutdownNow(); // the leases are released below
+            reshardRenewer = null;
         }
         stopping = true;
         long start = System.nanoTime();
