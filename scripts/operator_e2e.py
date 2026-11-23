@@ -749,6 +749,9 @@ def phase_fixture():
     # probe: an unlabelled pod (no pharos.dev/cluster), for DNS and the NetworkPolicy's refusal
     apply(pod("e2e-probe", image, ["sleep", "86400"]))
     wait_for("the git server", lambda: "e2e-git" in ready_names(), 180, 2)
+    # the probe runs the check: it must be running too (with cached images the git server can be ready first)
+    wait_for("the probe pod", lambda: (get_or_none("pod", "e2e-probe") or {}).get("status", {}).get("phase")
+             == "Running", 180, 2)
     out = kubectl("exec", "e2e-probe", "--", "git", "ls-remote", f"{GIT_URL}/alpha.git", "main",
                   check_rc=False)
     check("fixture: git server answers ls-remote over HTTP", "refs/heads/main" in out, out.strip()[:60])
