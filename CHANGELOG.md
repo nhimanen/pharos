@@ -188,6 +188,12 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
 
 ### Changed
+- A reshard rewrites each affected shard whole: the moved files' documents are expunged (their
+  deletes merged away) before the commit, so BM25 statistics count every document once. Those
+  shards, HNSW vector graphs included, get new segment files, are re-uploaded in full and
+  re-downloaded in full by readers. The expunge can be aborted (a graceful stop, a lost lease) and
+  rolls back; the disk guard admits a reshard build only when about twice the project's Lucene
+  files fit (old and new segments coexist until the commit).
 - Multi-node fan-out fixes from the Phase 3 gate: a query naming a project the coordinator does
   not hold boosts it as a single node does (the project list comes from the shard catalog), and
   synonym expansions are scored with every expanded term's global statistics, terms absent on a

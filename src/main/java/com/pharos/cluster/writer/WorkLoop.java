@@ -1154,6 +1154,13 @@ public final class WorkLoop implements Closeable {
                                         + root);
                         continue;
                     }
+                    if (!built && !admitted(unit, estimate(unit, indexDir, root, true))) {
+                        // ruling P6-R18: the build rewrites its affected shards whole (the expunge merges
+                        // them), so their old and new segments coexist until the commit: about twice their
+                        // size at the peak. Estimated as a full run (2x the project's Lucene files), an
+                        // upper bound: a reshard rewrites at most all of its shards. Retried next poll.
+                        continue;
+                    }
                     if (!built && !atPublishedRevision(unit, st)) {
                         // the reshard splits the published run: what changed since is indexed (and published) first
                         log.info("Reshard of project {}: its source moved past the published revision; indexing it"

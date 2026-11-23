@@ -919,7 +919,7 @@ public class ProjectIndexManager {
                         runtimes, abort);
                 abort.checkpoint();
                 // the moved files' old documents must leave the term statistics too, not only the live docs
-                writer.expungeDeletes();
+                writer.expungeDeletes(abort);
                 abort.enterCommit();
                 markCommitting(projectIndexDir, to);
                 writer.commit();

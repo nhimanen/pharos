@@ -101,7 +101,7 @@ final class ShardedWriter implements Closeable {
      * merge drops them), so every moved file would be counted twice in the global BM25 statistics and
      * every score would shift (found by the Phase 6 gate: about 2 % after a 4 to 5 ring change).
      */
-    void expungeDeletes() throws IOException {
+    void expungeDeletes(IndexAbort abort) throws IOException {
         if (single != null) throw new IllegalStateException("only a split run expunges deletes");
         for (IndexWriter w : writers.values()) {
             if (w.getConfig().getMergePolicy() instanceof TieredMergePolicy t) t.setForceMergeDeletesPctAllowed(0.0);
@@ -110,9 +110,24 @@ final class ShardedWriter implements Closeable {
             try (org.apache.lucene.index.DirectoryReader applied = org.apache.lucene.index.DirectoryReader.open(w)) {
                 // opened only to apply the deletes
             }
-            w.forceMergeDeletes(true);
+            // ruling P6-R18: the merges run in the background and the abort is polled meanwhile; an abort
+            // throws, and the caller's rollback() stops the running merges and drops their output
+            w.forceMergeDeletes(false);
+            while (w.hasPendingMerges() || !w.getMergingSegments().isEmpty()) {
+                abort.checkpoint();
+                try {
+                    Thread.sleep(MERGE_POLL_MILLIS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while expunging deletes", e);
+                }
+            }
+            abort.checkpoint();
         }
     }
+
+    /** How often {@link #expungeDeletes} checks the abort while merges run. */
+    static final long MERGE_POLL_MILLIS = 50;
 
     /** Commits every writer, in plan order. */
     void commit() throws IOException {

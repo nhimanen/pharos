@@ -50,7 +50,7 @@ class ShardedWriterExpungeTest {
             // a moved file leaves its old shard: 12.5 % deleted, below the merge policy's natural
             // deletes threshold (20 %), so nothing but expungeDeletes merges them away
             writer.deleteFile("/src/F1.java");
-            writer.expungeDeletes();
+            writer.expungeDeletes(IndexAbort.none());
             writer.commit();
         }
         for (Map.Entry<ShardId, Directory> e : dirs.entrySet()) {
@@ -60,6 +60,68 @@ class ShardedWriterExpungeTest {
                 assertThat(MultiTerms.getTerms(r, DocumentMapper.F_FILE_PATH).getDocCount())
                         .as(e.getKey() + " term statistics count live documents only").isEqualTo(35);
             }
+        }
+    }
+
+    /**
+     * Ruling P6-R18: the expunge's merges run in the background while the abort is polled. An abort in the
+     * middle of a merge throws at once; rollback() then stops the merge, and the last commit stays as it
+     * was (the deletes and the merge are dropped).
+     */
+    @Test
+    void anAbortDuringTheExpungeRollsBackCleanly() throws Exception {
+        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        Directory d = new ByteBuffersDirectory();
+        try (IndexWriter w = new IndexWriter(d, new IndexWriterConfig(new StandardAnalyzer()))) {
+            for (int i = 0; i < 40; i++) {
+                Document doc = new Document();
+                doc.add(new StringField(DocumentMapper.F_FILE_PATH, "/src/F" + (i % 8) + ".java", Field.Store.YES));
+                w.addDocument(doc);
+            }
+            w.commit();
+        }
+        IndexWriterConfig c = new IndexWriterConfig(new StandardAnalyzer());
+        c.setCommitOnClose(false);
+        c.setMergeScheduler(new org.apache.lucene.index.ConcurrentMergeScheduler() {
+            @Override
+            protected void doMerge(MergeSource source, org.apache.lucene.index.MergePolicy.OneMerge merge)
+                    throws IOException {
+                started.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                super.doMerge(source, merge);
+            }
+        });
+        Map<ShardId, IndexWriter> writers = new LinkedHashMap<>();
+        writers.put(new ShardId("lib~ring=s01"), new IndexWriter(d, c));
+        IndexAbort abort = new IndexAbort();
+        ShardedWriter writer = ShardedWriter.split(writers, null);
+        writer.deleteFile("/src/F1.java");
+        java.util.concurrent.CompletableFuture<Throwable> expunge = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                writer.expungeDeletes(abort);
+                return null;
+            } catch (Throwable t) {
+                return t;
+            }
+        });
+        assertThat(started.await(20, java.util.concurrent.TimeUnit.SECONDS)).as("the expunge merge started").isTrue();
+        abort.request("test: stop the reshard");
+        Throwable thrown = expunge.get(20, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(thrown).as("the abort is seen while the merge runs").isInstanceOf(IndexAbortedException.class);
+        release.countDown();
+        writer.rollback();
+        writer.close();
+        try (DirectoryReader r = DirectoryReader.open(d)) {
+            assertThat(r.numDocs()).as("the last commit, unchanged").isEqualTo(40);
+            assertThat(r.numDeletedDocs()).isZero();
+        }
+        try (IndexWriter again = new IndexWriter(d, new IndexWriterConfig(new StandardAnalyzer()))) {
+            assertThat(again.getDocStats().numDocs).as("the write lock was released").isEqualTo(40);
         }
     }
 }
