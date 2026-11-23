@@ -70,9 +70,11 @@ public final class ObjectStoreBackend implements ReplicationBackend {
             // every other writer keeps the implicit lease of Phases 1-3.
             this.workQueueGuard = cfg.getRole() == NodeRole.WRITER && cfg.getWriter().isWorkQueue()
                     ? new com.pharos.cluster.writer.WorkQueueLeaseGuard() : null;
-            this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
+            ObjectStorePublisher publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
                     config.getSynonymsFile(), workQueueGuard != null ? workQueueGuard : LeaseGuard.IMPLICIT,
                     writerState);
+            publisher.setFlipSettle(cfg.previousGenerationGrace()); // P6-R19 (5)
+            this.publisher = publisher;
         }
     }
 

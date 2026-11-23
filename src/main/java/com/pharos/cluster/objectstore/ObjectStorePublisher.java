@@ -34,6 +34,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -125,6 +126,60 @@ public final class ObjectStorePublisher implements IndexPublisher {
         this.gc = gc;
         this.nodeId = nodeId;
         this.synonymsFile = synonymsFile;
+    }
+
+    /** See {@link #setFlipSettle}. */
+    private volatile Duration flipSettle = Duration.ZERO;
+    private volatile java.time.Clock clock = java.time.Clock.systemUTC();
+
+    /**
+     * Ruling P6-R19 (5): how long after a reshard flip the next run may clear the flipped version's pins
+     * before its commits rather than after them (the readers' previous-generation grace). Within it a reader
+     * may not have activated the flip yet, and an unpinned query could then read a rewritten shard's previous
+     * generation at the same index run as the new version's shards; so the pins stay until after the commits
+     * (readers activate the new run as a set and keep the pinned generations answerable).
+     */
+    public void setFlipSettle(Duration settle) {
+        this.flipSettle = Objects.requireNonNull(settle, "settle");
+    }
+
+    /** The clock the flip's settle time is judged with (tests). */
+    public void setClock(java.time.Clock clock) {
+        this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * Ruling P6-R19 (5): when the catalog pins {@code project} at exactly the generations {@code LATEST} names
+     * for {@code shards} (a flipped reshard's version after {@code finishFlip}), clears the pins before the
+     * run commits anything: nothing a reader serves changes, and a coordinator that still routes by them asks
+     * for generations readers serve until the commits and retain afterwards. Returns true when cleared; false
+     * leaves them to be cleared after the commits.
+     */
+    private boolean clearPinsBeforeCommit(String project, ProjectShards mapping, List<ShardId> shards,
+                                          Map<ShardId, Optional<Latest>> latest) {
+        Map<ShardId, Long> pins = mapping.pinsOf(project);
+        if (pins.isEmpty() || !pins.keySet().equals(new java.util.HashSet<>(shards))) return false;
+        for (ShardId shard : shards) {
+            Optional<Latest> l = latest.get(shard);
+            if (l == null || l.isEmpty() || l.get().generation().value() != pins.get(shard)) return false;
+        }
+        var prev = mapping.previousOf(project);
+        if (prev.isPresent() && prev.get().retiredAt() != null
+                && clock.instant().isBefore(prev.get().retiredAt().plus(flipSettle))) {
+            log.info("Project {}: the reshard flip of {} is younger than {} s; its pins are cleared after this run's"
+                    + " commits", project, prev.get().retiredAt(), flipSettle.toSeconds());
+            return false;
+        }
+        try {
+            catalog.clearPins(project, shards);
+            log.info("Project {}: cleared the pins of its flipped version before committing (they equal LATEST)",
+                    project);
+            return true;
+        } catch (IOException | RuntimeException e) {
+            log.warn("Clearing the pins of project {} before its commits failed (cleared after them): {}", project,
+                    e.toString());
+            return false;
+        }
     }
 
     /** Attempts of the synonyms CAS before the publish fails. */
@@ -234,8 +289,10 @@ public final class ObjectStorePublisher implements IndexPublisher {
             // 4. Synonyms are cluster-wide: replace only this shard's section (a CAS read-modify-write).
             publishSynonyms(shard.value());
 
-            // 5. Catalog before the commit point (idempotent).
+            // 5. Catalog before the commit point (idempotent); pins that equal LATEST are cleared first (P6-R19).
             catalog.register(shard);
+            boolean pinsCleared = clearPinsBeforeCommit(snapshot.project(), mapping, List.of(shard),
+                    Map.of(shard, previous));
 
             // 6. Manifest gen-N, create-only; an orphan left by a run that never committed N is replaced.
             long sizeBytes = files.stream().mapToLong(ManifestFile::length).sum();
@@ -247,7 +304,9 @@ public final class ObjectStorePublisher implements IndexPublisher {
 
             // 8. Best-effort writer-state backup (before GC, so GC sees this generation's state), then GC.
             backupWriterState(shard, gen, snapshot.shardDir());
-            if (!mapping.pinsOf(snapshot.project()).isEmpty()) clearPinsQuietly(snapshot.project(), List.of(shard));
+            if (!pinsCleared && !mapping.pinsOf(snapshot.project()).isEmpty()) {
+                clearPinsQuietly(snapshot.project(), List.of(shard));
+            }
             runGc(shard, mapping.pinnedGenerations(shard));
 
             log.info("Published shard {} generation {}: {} files uploaded, {} reused, {} bytes uploaded",
@@ -473,6 +532,9 @@ public final class ObjectStorePublisher implements IndexPublisher {
             // 5. Register every shard before the first commit (idempotent), so a catalog failure leaves no
             //    shard committed and nothing slow runs between the commits.
             for (ShardId shard : plan.shards()) catalog.register(shard);
+            //    A flipped version's pins that equal every shard's LATEST are cleared before the first commit
+            //    (P6-R19): coordinators then stop routing by them while readers still serve exactly them.
+            boolean pinsCleared = clearPinsBeforeCommit(project, mapping, plan.shards(), previous);
 
             // 6. Commit every shard: manifest, LATEST CAS (each under its lease check), back to back.
             ProjectMeta meta = ShardManifest.stripRefs(snapshot.meta());
@@ -499,7 +561,7 @@ public final class ObjectStorePublisher implements IndexPublisher {
                         project, projectGen, e.toString());
             }
             // A reshard's pins are superseded: every shard is at this run now, which readers activate as a set.
-            if (!mapping.pinsOf(project).isEmpty()) {
+            if (!pinsCleared && !mapping.pinsOf(project).isEmpty()) {
                 try {
                     catalog.clearPins(project, plan.shards());
                 } catch (IOException | RuntimeException e) {

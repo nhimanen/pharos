@@ -300,6 +300,9 @@ class ReshardJobTest {
         }
     }
 
+    /** Runs before every {@code LATEST} CAS of the store (a commit point), with the key. */
+    private volatile java.util.function.Consumer<String> latestCas;
+
     @BeforeEach
     void setUp() throws IOException {
         layout = new ObjectStoreLayout("pharos");
@@ -318,6 +321,8 @@ class ReshardJobTest {
 
             @Override
             public Optional<String> putIfMatch(String key, byte[] data, String etag) {
+                java.util.function.Consumer<String> hook = latestCas;
+                if (hook != null && key.endsWith("/LATEST")) hook.accept(key);
                 Optional<String> out = super.putIfMatch(key, data, etag);
                 if (out.isPresent() && key.equals(layout.catalogKey())) recordVersion(data);
                 return out;
@@ -1121,6 +1126,76 @@ class ReshardJobTest {
         }
         assertThat(r.heartbeat().retained()).isEmpty();
         assertEveryFileOnce(r, files, "fresh coordinator, after the grace");
+    }
+
+    /**
+     * Ruling P6-R19 (5), the gate's takeover failure: after a flip the active version stays pinned at
+     * generations equal to {@code LATEST}. The next run (here a takeover's) clears those pins before its first
+     * commit, so no coordinator routes by them past the commits; and a coordinator whose catalog still has them
+     * is answered from the readers' retained generations. Every file is read once at every point: before the
+     * reader syncs the run, after, with the pinned catalog and with the fresh one.
+     */
+    @Test
+    void theRunAfterAFlipClearsThePinsBeforeItsFirstCommit() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        r.sync();
+        a.loop.tick();
+        assertThat(catalog.projectShards().shardsOf(P)).isEqualTo(ring(5));
+        for (int i = 0; i < 4 && !latestEqualsPins(); i++) {
+            clock.advance(10);
+            a.loop.tick();
+        }
+        assertThat(latestEqualsPins()).as("finishFlip moved LATEST to the pins").isTrue();
+        r.sync();
+        ProjectShards pinned = catalog.projectShards(); // a coordinator's read while the pins equal LATEST
+        assertEveryFileOnce(r, files, "after the flip");
+
+        Path f = src.resolve(files.getFirst());
+        Files.writeString(f, Files.readString(f).replace("Part 0 of", "Part zero of"));
+        Files.setLastModifiedTime(f, FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        List<Map<ShardId, Long>> pinsAtCommits = new ArrayList<>();
+        Set<String> projectLatest = new HashSet<>();
+        for (ShardId sh : ring(5)) projectLatest.add(layout.latestKey(sh));
+        latestCas = key -> {
+            if (!projectLatest.contains(key)) return;
+            try {
+                pinsAtCommits.add(catalog.projectShards().pinsOf(P));
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        Writer b = new Writer("node-b");
+        clock.advance(TTL.toSeconds() + 5); // A is gone; B takes the project over and runs it
+        Map<ShardId, Generation> before = latestOf(ring(5));
+        for (int i = 0; i < 4 && latestOf(ring(5)).equals(before); i++) {
+            b.loop.tick();
+            clock.advance(10);
+        }
+        latestCas = null;
+        assertThat(latestOf(ring(5))).as("B published its run").isNotEqualTo(before);
+        assertThat(pinsAtCommits).as("B committed every shard").hasSizeGreaterThanOrEqualTo(ring(5).size());
+        assertThat(pinsAtCommits).as("the pins were cleared before the first commit").allMatch(Map::isEmpty);
+
+        assertEveryFileOnce(r, files, "B's run committed, reader not synced, fresh catalog");
+        assertEveryFileOnce(r, files, "B's run committed, reader not synced, pinned catalog", frozen(pinned));
+        r.sync();
+        assertEveryFileOnce(r, files, "reader synced, fresh catalog");
+        assertEveryFileOnce(r, files, "reader synced, pinned catalog (retained generations)", frozen(pinned));
+    }
+
+    private boolean latestEqualsPins() throws IOException {
+        Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
+        if (pins.isEmpty()) return false;
+        for (Map.Entry<ShardId, Long> e : pins.entrySet()) {
+            if (replicas.latest(e.getKey()).map(Generation::value).orElse(-1L) != e.getValue().longValue()) return false;
+        }
+        return true;
     }
 
     private com.pharos.cluster.status.StatusState statusState;
