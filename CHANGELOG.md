@@ -3,7 +3,16 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.8.0] - 2026-11-23
+
+**Index format:** 1 (unchanged)
+
+Multi-node Phase 3: multi-shard fan-out and the router. A reader no longer has to hold every project: a query
+that needs shards held elsewhere is coordinated by the reader that received it, and `pharos router` spreads
+requests over the healthy readers. Fan-out rankings equal a single node's (Phase 3 gate: keyword 99/99
+bitwise, hybrid τ 0.9996, vector 99/99; 3 600/3 600 requests answered while a reader joined and another
+drained). **Single-node installs are unaffected** apart from the multi-project vector change under Changed.
+Requires no re-index; cluster readers should read UPGRADING.md (config validation, health probes, stop timeouts).
 
 ### Added (multi-node Phase 3: fan-out and router)
 - `pharos router --port <p>` (`./pharos router`): a stateless router over the healthy readers. It polls each
@@ -69,7 +78,11 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   with a message naming both fields (see UPGRADING.md).
 
 ### Maintainers
-- Phase 3 gate driver: `scripts/cluster-gate-phase3.sh` and `scripts/cluster_gate_phase3.py`.
+- Phase 3 gate driver: `scripts/cluster-gate-phase3.sh` and `scripts/cluster_gate_phase3.py`. Ports are
+  configurable (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`, `GATE_R1_PORT`..`GATE_R4_PORT`,
+  `GATE_REF_PORT`, `GATE_ROUTER_PORT`; defaults 9000, 9001, 7301-7304, 7305, 7080), and so are the
+  sources, embed-cache seed and model source for hosts without a `~/.pharos` registry (`GATE_LUCENE_SRC`,
+  `GATE_EXTRA_PROJECT` / `GATE_EXTRA_SRC`, `GATE_SEED_FROM`, `GATE_MODELS_SRC`).
 
 ## [1.7.1] - 2026-11-23
 
@@ -83,7 +96,6 @@ for what changed since 1.6.0.
 - `RemoteDirectoryTest`'s flat fixture is always rewritten without compound files. Lucene sometimes
   flushed the sample index as a single compound segment, which left the fixture without a `.tim`
   file and failed `openingAReaderWithEdgesFetchesNothing` (test only; no runtime change).
-
 
 ## [1.7.0] - 2026-11-23
 
