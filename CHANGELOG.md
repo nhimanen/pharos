@@ -201,6 +201,19 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   original timeout, at most 16 such re-plans at once. Those queries can take up to that much longer
   (the trace notes "re-planned once"); a re-plan that fails returns the first, partial answer with
   its warnings, as before.
+- Multi-node: a reader keeps a shard's previous generation open and answerable for a grace after it
+  activates a new one (`cluster.reader.previousGenerationGraceSeconds`; default max(30 s,
+  3 × 5 s + 2 × `heartbeatSeconds`), 0 turns it off), so a coordinator still routing the previous
+  generation (a reshard flip, a split project's next run, a reader lagging another) is answered
+  instead of losing the shard. Requests carry their generation; heartbeats add `retained`; the
+  bucket GC keeps a generation superseded less than the grace ago. A reader's disk and memory hold
+  up to two generations of a changed shard during the grace. After a flip the rewritten shards are
+  activated at once (the 15 s activation hold is gone), and the next run of the project clears the
+  flipped version's pins before its first commit. Likewise the synonyms a publish replaced stay
+  usable for the grace: a coordinator whose reader has not synced new synonyms yet analyses the
+  query with the previous ones, and a reader answers a coordinator still on them.
+- `?trace=true` search answers carry `searchMeta.rawScores`: each retrieval stage's raw
+  (pre-graph-boost) score per result id.
 - A reshard rewrites each affected shard whole: the moved files' documents are expunged (their
   deletes merged away) before the commit, so BM25 statistics count every document once. Those
   shards, HNSW vector graphs included, get new segment files, are re-uploaded in full and
