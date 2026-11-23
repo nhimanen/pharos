@@ -438,12 +438,45 @@ public class SearchEngine {
             }
         }
         if (fanout != null && fanout.fansOut()) {
+            List<String> before = List.copyOf(warnings);
+            SearchResponse resp = null;
+            String retryCause;
+            com.pharos.cluster.routing.NoShardAnsweredException noAnswer = null;
             try (DistributedSearch.Query q = fanout) {
                 warnDegraded(q.localShards(), warnings);
-                SearchResponse resp = searchFannedOut(req, hints, expand, trace, warnings, q);
+                try {
+                    resp = searchFannedOut(req, hints, expand, trace, warnings, q);
+                } catch (com.pharos.cluster.routing.NoShardAnsweredException e) {
+                    if (q.retryCause() == null || !ds.retries()) throw e;
+                    noAnswer = e; // every shard lost to a swap or synonyms: the re-plan below may answer
+                }
                 for (String note : q.lateNotes()) trace.note(note);
-                return resp;
+                retryCause = q.retryCause();
             }
+            if (retryCause != null && ds.retries()) {
+                // Ruling P6-R16: a reader swapped a shard's generation during the query, or analyses with
+                // other synonyms. Plan the query once more on the state the readers have moved to; if that
+                // still loses shards, its answer (partial, with the warnings) is returned, as before.
+                trace.note("re-planned once (" + retryCause + ")");
+                DistributedSearch.Query again;
+                try {
+                    again = ds.reopen(fanout, requestedProjects(req), shardFilter);
+                } catch (CatalogUnavailableException e) {
+                    if (noAnswer != null) throw noAnswer;
+                    return resp;
+                }
+                try (DistributedSearch.Query q = again) {
+                    if (q.fansOut()) {
+                        List<String> retryWarnings = new ArrayList<>(before);
+                        warnDegraded(q.localShards(), retryWarnings);
+                        resp = searchFannedOut(req, hints, expand, trace, retryWarnings, q);
+                        for (String note : q.lateNotes()) trace.note(note);
+                        noAnswer = null;
+                    }
+                }
+            }
+            if (noAnswer != null) throw noAnswer;
+            return resp;
         }
         if (fanout != null) fanout.close(); // routed, nothing pinned: released all the same
         if (fanout != null && !fanout.unservedShards().isEmpty()) {
