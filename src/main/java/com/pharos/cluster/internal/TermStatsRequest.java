@@ -19,12 +19,13 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record TermStatsRequest(String shard, List<String> fields, List<Term> terms, String synonymsHash,
                                @JsonInclude(JsonInclude.Include.NON_NULL) Long generation,
-                               @JsonInclude(JsonInclude.Include.NON_NULL) Long run) {
+                               @JsonInclude(JsonInclude.Include.NON_NULL) Long run,
+                               @JsonInclude(JsonInclude.Include.NON_NULL) Integer specVersion) {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record Term(String field, String text) {}
 
     public TermStatsRequest(String shard, List<String> fields, List<Term> terms, String synonymsHash) {
-        this(shard, fields, terms, synonymsHash, null, null);
+        this(shard, fields, terms, synonymsHash, null, null, null);
     }
 
     public TermStatsRequest(String shard, List<String> fields, List<Term> terms) {
@@ -33,11 +34,21 @@ public record TermStatsRequest(String shard, List<String> fields, List<Term> ter
 
     /** This request for generation {@code generation} (null: whatever the reader serves). */
     public TermStatsRequest at(Long generation) {
-        return new TermStatsRequest(shard, fields, terms, synonymsHash, generation, run);
+        return new TermStatsRequest(shard, fields, terms, synonymsHash, generation, run, specVersion);
+    }
+
+    /**
+     * Ruling P6-R21: this request for the shard as spec version {@code v} of its project has it (the version the
+     * coordinator planned; null: none). A reader whose catalog has another active version answers with the
+     * generation version {@code v} names (the previous version's, from its retained generation), or refuses.
+     * Ignored once a generation is asked for.
+     */
+    public TermStatsRequest atVersion(Integer v) {
+        return new TermStatsRequest(shard, fields, terms, synonymsHash, generation, run, v);
     }
 
     /** This request for index run {@code run} (see the class comment). */
     public TermStatsRequest atRun(Long run) {
-        return new TermStatsRequest(shard, fields, terms, synonymsHash, generation, run);
+        return new TermStatsRequest(shard, fields, terms, synonymsHash, generation, run, specVersion);
     }
 }

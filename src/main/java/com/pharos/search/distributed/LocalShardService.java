@@ -209,6 +209,37 @@ public final class LocalShardService implements ShardSearchService {
         return previous;
     }
 
+    /** Ruling P6-R21: which generation an older spec version names for a shard (see {@link #pinVersion}). */
+    private volatile java.util.function.BiFunction<ShardId, Integer, java.util.Optional<Long>> versions =
+            (shard, v) -> java.util.Optional.empty();
+
+    /** Sets how a shard's generation of a spec version that is not its project's active one is found. */
+    public void setVersions(java.util.function.BiFunction<ShardId, Integer, java.util.Optional<Long>> versions) {
+        this.versions = java.util.Objects.requireNonNull(versions, "versions");
+    }
+
+    /**
+     * Ruling P6-R21: pins the shard as spec version {@code specVersion} of its project has it (the version a
+     * coordinator planned the query with). When this node's catalog has another active version and that one
+     * names a generation of the shard (the version before a flip), that generation is pinned (the retained
+     * previous one); if it is not answerable any more, {@link GenerationUnavailableException}. Otherwise the
+     * current generation.
+     */
+    public Pin pinVersion(ShardId shard, Integer specVersion) throws IOException {
+        if (specVersion == null) return pin(shard);
+        java.util.Optional<Long> g = versions.apply(shard, specVersion);
+        if (g.isEmpty()) return pin(shard);
+        Pin p = pin(shard, g.get());
+        if (p.generation() != g.get()) {
+            long served = p.generation();
+            p.close();
+            throw new com.pharos.cluster.internal.GenerationUnavailableException("shard " + shard + ": spec version "
+                    + specVersion + " of its project is generation " + g.get() + ", which this reader no longer"
+                    + " answers (it serves " + served + ")", served);
+        }
+        return p;
+    }
+
     /** The retained previous generation {@code generation} pinned, or null when not answerable. */
     private Pin pinPrevious(ShardId shard, long generation) throws IOException {
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -318,7 +349,7 @@ public final class LocalShardService implements ShardSearchService {
         List<String> fields = request.fields() == null ? List.of() : request.fields();
         ShardId shard = new ShardId(request.shard());
         try (Pin pin = request.generation() != null ? pin(shard, request.generation())
-                : request.run() != null ? pinRun(shard, request.run()) : pin(shard)) {
+                : request.run() != null ? pinRun(shard, request.run()) : pinVersion(shard, request.specVersion())) {
             return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms), pin.projectGeneration());
         }
     }

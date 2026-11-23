@@ -231,6 +231,7 @@ public final class DistributedSearch implements Closeable {
             ShardState st = new ShardState(shards.size(), p.route(), router.servesLocally(p.shard()), p.project(), p.split());
             st.statsOnly = p.statsOnly();
             st.expectedGeneration = p.generation();
+            st.specVersion = p.specVersion();
             shards.add(st);
         }
         for (ShardRouter.PlannedShard p : plan.shards()) { // the other version of a project just resharded
@@ -239,6 +240,7 @@ public final class DistributedSearch implements Closeable {
                     p.project(), p.split());
             st.statsOnly = p.statsOnly();
             st.expectedGeneration = p.generation();
+            st.specVersion = p.specVersion();
             alternates.add(st);
         }
         boolean explicitSingle = !unscoped && new LinkedHashSet<>(projects).size() == 1;
@@ -357,6 +359,7 @@ public final class DistributedSearch implements Closeable {
         boolean statsOnly;                // pruned by the key filter: answers term statistics only (P6-R13)
         Long projectGeneration;           // split shards: the index run of the pinned generation
         Long expectedGeneration;          // split shards of a pinned version (a reshard's): the generation to read
+        Integer specVersion;              // split shards: the spec version of the project the query planned (P6-R21)
         LocalShardService.Pin pin;        // local shards, pinned on first use, released on close
         ReaderHeartbeat reader;           // remote shards: the reader that answered last
         Long generation;                  // remote shards: pinned by the first answer
@@ -632,7 +635,8 @@ public final class DistributedSearch implements Closeable {
                     if (closed) throw new IllegalStateException("query closed");
                     // a pinned version's shard is read at its generation: the retained previous one when this
                     // node activated another meanwhile (P6-R19)
-                    s.pin = local.pin(s.route.shard(), s.expectedGeneration);
+                    s.pin = s.expectedGeneration != null ? local.pin(s.route.shard(), s.expectedGeneration)
+                            : local.pinVersion(s.route.shard(), s.specVersion); // P6-R21: as the planned version
                 }
                 return s.pin;
             }
@@ -981,7 +985,7 @@ public final class DistributedSearch implements Closeable {
         private Long pinGeneration(ShardState s) throws IOException {
             if (s.local) return pin(s).generation();
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).at(gen));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).atVersion(s.specVersion).at(gen));
             return r.generation();
         }
 
@@ -1000,7 +1004,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return false;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), null).at(generation),
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atVersion(s.specVersion).at(generation),
                             left / 2);
                     if (resp.generation() != generation) continue;
                     synchronized (s) {
@@ -1035,7 +1039,7 @@ public final class DistributedSearch implements Closeable {
                 return run == null ? 0L : run;
             }
             TermStatsResponse r = remote(s, ShardClient.TERM_STATS, false,
-                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).at(gen));
+                    (hb, gen) -> new TermStatsRequest(s.name(), List.of(), List.of(), null).atVersion(s.specVersion).at(gen));
             return r.projectGeneration() == null ? 0L : r.projectGeneration();
         }
 
@@ -1170,7 +1174,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return null;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atRun(run), left / 2);
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atVersion(s.specVersion).atRun(run), left / 2);
                     if (resp.projectGeneration() != null && resp.projectGeneration() == run) {
                         return Map.entry(r, resp.generation());
                     }
@@ -1212,7 +1216,7 @@ public final class DistributedSearch implements Closeable {
                 if (left <= 0) return null;
                 try {
                     TermStatsResponse resp = client.callOn(r, ShardClient.TERM_STATS,
-                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atRun(target),
+                            new TermStatsRequest(s.name(), List.of(), List.of(), null).atVersion(s.specVersion).atRun(target),
                             left / 2);
                     if (resp.projectGeneration() != null && resp.projectGeneration() == target) {
                         synchronized (s) {
@@ -1304,7 +1308,7 @@ public final class DistributedSearch implements Closeable {
             Map<ShardState, TermStatsResponse> answers = fanOut(available(), s -> s.local
                     ? new TermStatsResponse(pin(s).generation(), local.termStats(pin(s), fields, terms))
                     : remote(s, ShardClient.TERM_STATS, false,
-                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash).at(gen)),
+                            (hb, gen) -> new TermStatsRequest(s.name(), List.copyOf(fields), wire, synonymsHash).atVersion(s.specVersion).at(gen)),
                     (s, t) -> {
                         // P6-R19: a reader still on this node's previous synonyms; the query is analysed again
                         // with those (see globalStats), so the shard is not left out
@@ -1317,7 +1321,23 @@ public final class DistributedSearch implements Closeable {
                         }
                         return false;
                     });
-            return GlobalStats.merge(new ArrayList<>(answers.values()));
+            GlobalStats merged = GlobalStats.merge(new ArrayList<>(answers.values()));
+            StringBuilder sb = new StringBuilder("statistics of ").append(answers.size()).append(" shard(s):");
+            answers.forEach((s, r) -> sb.append(' ').append(s.name()).append('@').append(r.generation())
+                    .append(s.local ? "" : "(" + (s.reader == null ? "?" : s.reader.node()) + ")"));
+            merged.fields().entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> sb.append("; ")
+                    .append(e.getKey()).append(" docCount=").append(e.getValue().docCount()).append(" sumTtf=")
+                    .append(e.getValue().sumTotalTermFreq()));
+            statsSummary = sb.toString();
+            return merged;
+        }
+
+        /** What the last statistics round read (shards, generations, field totals): a trace diagnostic. */
+        private volatile String statsSummary;
+
+        /** The last statistics round's shards, generations and field totals (P6-R22 diagnostics); null if none. */
+        public String statsSummary() {
+            return statsSummary;
         }
 
         /** This node's previous synonyms the current stats round may fall back to (P6-R19); else null. */

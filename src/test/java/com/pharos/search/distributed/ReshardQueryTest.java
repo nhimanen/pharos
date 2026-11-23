@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 
 import static com.pharos.cluster.ClusterFixture.JAVA;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -211,6 +212,166 @@ class ReshardQueryTest {
                     stale.close();
                 }
                 for (int i = 0; i < 3; i++) assertNoReplan(assertOnce(k, project, "fresh routing, both switched"));
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
+    /**
+     * Ruling P6-R22 (a): an unscoped keyword query over a just-resharded project (pins + previous version) and
+     * another project scores every result with the same raw BM25 as before the reshard.
+     */
+    @Test
+    void anUnscopedQueryScoresAsBeforeWhileAPreviousVersionIsPinned() throws Exception {
+        Path tmp = Files.createTempDirectory("reshard-stats");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "mover";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        List<ShardId> two = List.of(new ShardId(project + "~ring=s01"), new ShardId(project + "~ring=s02"));
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 40; i++) SplitProjectSearchTest.writeClass(src, "src/main/java/com/example/p" + i + "/Calc" + i + ".java",
+                "com.example.p" + i, "Calc" + i, "calculator words " + (i % 7 == 0 ? "add" : "multiply") + " zebra " + i);
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, null)) {
+            fx.indexSource(src, project);
+            fx.index(JAVA, false);
+            try (TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k",
+                    List.of(project, ShardId.wildcardOf(project), JAVA), EMBEDDER, null)) {
+                k.awaitShard(project, 1);
+                k.awaitShard(JAVA, 1);
+                k.ds().retries = false;
+                Map<String, Float> before = rawKeyword(k, "calculator add");
+                ReshardJob job = fx.reshardJob(() -> k.parts.runtime().liveReaders().stream()
+                        .map(l -> l.heartbeat()).toList(), Clock.systemUTC(), Duration.ofMinutes(10));
+                ShardPlan active = new ShardPlan(project, ShardSpec.PROJECT, List.of());
+                fx.writerCatalog().requestReshard(project, ring2, java.time.Instant.now());
+                job.step(project, active, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                k.parts.runtime().syncNow();
+                ReshardJob.Step step = ReshardJob.Step.WAITING;
+                long deadline = System.nanoTime() + 30_000_000_000L;
+                while (step == ReshardJob.Step.WAITING && System.nanoTime() < deadline) {
+                    Thread.sleep(200);
+                    step = job.step(project, active, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                }
+                assertThat(step).isEqualTo(ReshardJob.Step.FLIPPED);
+                long seen = System.nanoTime() + 20_000_000_000L;
+                while (k.ds().catalogProjects().map(m -> m.previousOf(project).isEmpty()).orElse(true)
+                        && System.nanoTime() < seen) Thread.sleep(200);
+                SearchResponse window = k.engine.searchWithTrace(new com.pharos.search.SearchRequest("calculator add",
+                        com.pharos.search.SearchRequest.SearchType.KEYWORD, null, null, 20, "text", null, null, 0), false);
+                System.err.println("DEBUG window notes " + window.trace().notes());
+                assertThat(new java.util.TreeMap<>(window.trace().rawScores().get("keyword")))
+                        .as("flip window (previous version read)").isEqualTo(before);
+                k.parts.runtime().syncNow();
+                assertThat(rawKeyword(k, "calculator add")).as("new version read").isEqualTo(before);
+                // a second reshard: ring 2 -> 3, the previous version (ring 2) shares shard ids with the new one
+                ShardSpec ring3 = ShardSpec.parse("[project, ring(path, shards=3)]");
+                List<ShardId> three = List.of(two.get(0), two.get(1), new ShardId(project + "~ring=s03"));
+                ShardPlan active2 = new ShardPlan(project, ring2, two);
+                fx.writerCatalog().requestReshard(project, ring3, java.time.Instant.now());
+                job.step(project, active2, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                k.parts.runtime().syncNow();
+                step = ReshardJob.Step.WAITING;
+                deadline = System.nanoTime() + 30_000_000_000L;
+                while (step == ReshardJob.Step.WAITING && System.nanoTime() < deadline) {
+                    Thread.sleep(200);
+                    step = job.step(project, active2, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                }
+                assertThat(step).isEqualTo(ReshardJob.Step.FLIPPED);
+                seen = System.nanoTime() + 20_000_000_000L;
+                while (!k.ds().catalogProjects().map(m -> m.shardsOf(project).equals(three)).orElse(false)
+                        && System.nanoTime() < seen) Thread.sleep(200);
+                SearchResponse w2 = k.engine.searchWithTrace(new com.pharos.search.SearchRequest("calculator add",
+                        com.pharos.search.SearchRequest.SearchType.KEYWORD, null, null, 20, "text", null, null, 0), false);
+                System.err.println("DEBUG window2 notes " + w2.trace().notes() + " " + w2.warnings());
+                assertThat(new java.util.TreeMap<>(w2.trace().rawScores().get("keyword"))).as("second flip window").isEqualTo(before);
+                k.parts.runtime().syncNow();
+                assertThat(rawKeyword(k, "calculator add")).as("second flip, synced").isEqualTo(before);
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
+    private static Map<String, Float> rawKeyword(TestReaderNode k, String q) throws Exception {
+        SearchResponse r = k.engine.searchWithTrace(new com.pharos.search.SearchRequest(q,
+                com.pharos.search.SearchRequest.SearchType.KEYWORD, null, null, 20, "text", null, null, 0), false);
+        assertThat(r.warnings()).isEmpty();
+        return new java.util.TreeMap<>(r.trace().rawScores().get("keyword"));
+    }
+
+    /**
+     * Ruling P6-R21: a coordinator whose catalog predates the reshard's pin (it knows the project's version N
+     * only, unpinned) queries after the flip, when the reader serves the rewritten shards at version N+1. The
+     * request names version N, so the reader answers each shard with the generation N names (its retained
+     * previous one), and the moved file is found exactly once. Before, the reader answered N+1's rewritten
+     * shards, without the moved file (now in a shard the coordinator does not know), silently.
+     */
+    @Test
+    void aCoordinatorWhoseCatalogPredatesThePinReadsEveryFileOnce() throws Exception {
+        Path tmp = Files.createTempDirectory("reshard-prepin");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "mover";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        ShardSpec ring3 = ShardSpec.parse("[project, ring(path, shards=3)]");
+        List<ShardId> two = List.of(new ShardId(project + "~ring=s01"), new ShardId(project + "~ring=s02"));
+        ShardId s03 = new ShardId(project + "~ring=s03");
+        String moving = null;
+        for (int i = 0; i < 500 && moving == null; i++) {
+            String rel = "src/main/java/com/example/z" + i + "/Zebrafinch.java";
+            if (ring3.assign(DocKeys.of(project, rel)).equals(s03)) moving = rel;
+        }
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 8; i++) SplitProjectSearchTest.writeClass(src, "src/main/java/com/example/p/Plain" + i + ".java",
+                "com.example.p", "Plain" + i, "plain words " + i);
+        SplitProjectSearchTest.writeClass(src, moving, "com.example." + Path.of(moving).getParent().getFileName(),
+                "Zebrafinch", "zebrafinch song");
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, null)) {
+            fx.indexSplit(src, project, ring2, two, false);
+            fx.index(JAVA, false);
+            try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null,
+                    c -> c.getReader().setPreviousGenerationGraceSeconds(300));
+                 TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(JAVA), EMBEDDER, null)) {
+                k.awaitShard(two.get(0).value(), 1);
+                k.awaitShard(two.get(1).value(), 1);
+                assertOnce(k, project, "before");
+                com.pharos.cluster.sharding.ProjectShards prePin = fx.writerCatalog().projectShards();
+                assertThat(prePin.pinsOf(project)).isEmpty();
+
+                ReshardJob job = fx.reshardJob(() -> k.parts.runtime().liveReaders().stream()
+                        .map(l -> l.heartbeat()).toList(), Clock.systemUTC(), Duration.ofMinutes(10));
+                ShardPlan active = new ShardPlan(project, ring2, two);
+                fx.writerCatalog().requestReshard(project, ring3, java.time.Instant.now());
+                job.step(project, active, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                x.parts.runtime().syncNow();
+                ReshardJob.Step step = ReshardJob.Step.WAITING;
+                long deadline = System.nanoTime() + 30_000_000_000L;
+                while (step == ReshardJob.Step.WAITING && System.nanoTime() < deadline) {
+                    Thread.sleep(200);
+                    step = job.step(project, active, ShardSource.path(src.toString()), src, false, IndexAbort.none());
+                }
+                assertThat(step).isEqualTo(ReshardJob.Step.FLIPPED);
+                x.parts.runtime().syncNow(); // x serves the new version
+                assertThat(x.parts.runtime().served()).containsKey(s03);
+
+                var cfg = k.parts.config().getCluster();
+                var health = new com.pharos.cluster.membership.ReaderHealth(cfg.getReaderTtlSeconds());
+                var stale = new DistributedSearch(new com.pharos.cluster.routing.ShardRouter(
+                        k.parts.runtime().membership(), frozen(prePin), health, id -> false, n -> 0),
+                        new com.pharos.cluster.internal.ShardClient(health, cfg.getToken(),
+                                Duration.ofMillis(cfg.getConnectTimeoutMillis()), Duration.ofMillis(cfg.getFanoutTimeoutMillis())),
+                        k.engine.shardService(id -> k.parts.runtime().servesShard(id), null), EMBEDDER,
+                        k.engine.vectorStrategy(), Duration.ofSeconds(10), () -> 0L);
+                stale.retries = false;
+                DistributedSearch fresh = k.ds();
+                try {
+                    k.engine.setDistributed(stale);
+                    for (int i = 0; i < 4; i++) assertOnce(k, project, "catalog older than the pin, after the flip");
+                } finally {
+                    k.engine.setDistributed(fresh);
+                    stale.close();
+                }
             }
         } finally {
             SplitProjectSearchTest.deleteTree(tmp);

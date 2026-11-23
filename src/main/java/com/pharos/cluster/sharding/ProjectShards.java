@@ -516,6 +516,28 @@ public final class ProjectShards {
     public List<ShardId> listed() { return listed; }
 
     /** The staged spec version of {@code project} (a reshard in progress), if any. */
+    /**
+     * Ruling P6-R21: the generation spec version {@code specVersion} of {@code shard}'s project names for it
+     * when that is not the project's active version: the previous (retired) version's or a staged version's
+     * pinned generation. Empty when {@code specVersion} is the active version, or one this mapping does not know
+     * (a newer catalog's), or when the version does not pin the shard.
+     */
+    public Optional<Long> generationOfVersion(ShardId shard, int specVersion) {
+        Optional<String> project = projectOf(shard);
+        if (project.isEmpty()) return Optional.empty();
+        String p = project.get();
+        if (specVersionOf(p).equals(OptionalInt.of(specVersion))) return Optional.empty();
+        Optional<Previous> prev = previousOf(p);
+        if (prev.isPresent() && prev.get().specVersion().equals(OptionalInt.of(specVersion))) {
+            return Optional.ofNullable(prev.get().generations().get(shard));
+        }
+        Optional<Staged> st = stagedOf(p);
+        if (st.isPresent() && st.get().specVersion() == specVersion) {
+            return Optional.ofNullable(st.get().generations().get(shard));
+        }
+        return Optional.empty();
+    }
+
     public Optional<Staged> stagedOf(String project) {
         return Optional.ofNullable(staged.get(project));
     }

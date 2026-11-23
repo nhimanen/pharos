@@ -228,6 +228,11 @@ public class ReplicaSyncer implements Closeable {
         return mapping.projectOf(shard);
     }
 
+    /** The catalog's project ↔ shards mapping as of the last pass (P6-R21: which generation a version names). */
+    public com.pharos.cluster.sharding.ProjectShards mapping() {
+        return mapping;
+    }
+
     /** Generation currently served per shard. */
     public Map<ShardId, Generation> served() {
         return Map.copyOf(served);

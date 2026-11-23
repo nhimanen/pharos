@@ -181,6 +181,10 @@ public final class InternalApi {
                 return;
             }
             ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
+        } catch (GenerationUnavailableException e) { // P6-R21: the planned version's generation is gone here
+            ctx.status(409).contentType("application/json")
+                    .result(mapper.writeValueAsBytes(Map.of("error", "generation mismatch",
+                            "servedGeneration", e.servedGeneration(), "detail", e.getMessage())));
         } catch (ModelMismatchException e) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage(),

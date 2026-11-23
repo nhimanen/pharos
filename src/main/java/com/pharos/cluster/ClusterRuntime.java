@@ -943,6 +943,13 @@ public final class ClusterRuntime implements Closeable {
                 engine.shardService(this::servesShard, modelFingerprint(engine.embedder().modelId()));
         // P6-R19: synonyms a publish replaced stay usable for the grace (readers see the publish at different times)
         service.keyword().setPreviousSynonymsGrace(c.previousGenerationGrace());
+        // P6-R21: a coordinator planning an older spec version of a project (its catalog predates a flip) is
+        // answered with the generations that version names, by this reader's last catalog read
+        service.setVersions((shard, v) -> {
+            ReplicaSyncer sy;
+            synchronized (this) { sy = syncer; }
+            return sy == null ? java.util.Optional.empty() : sy.mapping().generationOfVersion(shard, v);
+        });
         var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
         var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
                 Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));

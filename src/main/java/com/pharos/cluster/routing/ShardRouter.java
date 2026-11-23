@@ -101,7 +101,13 @@ public final class ShardRouter {
      * {@link ProjectShards#pinsOf}); null: the project's shards are aligned on one index run instead.
      */
     public record PlannedShard(Route route, String project, boolean split, boolean statsOnly, Long generation,
-                               boolean alternate) {
+                               boolean alternate, Integer specVersion) {
+        /** Without a spec version (a {@code [project]} project, or tests). */
+        public PlannedShard(Route route, String project, boolean split, boolean statsOnly, Long generation,
+                            boolean alternate) {
+            this(route, project, split, statsOnly, generation, alternate, null);
+        }
+
         public PlannedShard(Route route, String project, boolean split, boolean statsOnly, Long generation) {
             this(route, project, split, statsOnly, generation, false);
         }
@@ -210,29 +216,37 @@ public final class ShardRouter {
                             + mapping.specVersionOf(project).orElse(0) + " (just resharded) yet; this query reads the"
                             + " previous version, " + prev.spec());
                     planProject(project, prev.shards(), pinnedSplit, prev.spec(), prevPins, false, f, needsFilters,
-                            readers, loads, out, notes, warnings);
+                            readers, loads, out, notes, warnings, versionOf(prev.specVersion()));
                     planProject(project, shards, split, spec, pins, true, f, needsFilters, readers, loads, out,
-                            new ArrayList<>(), new ArrayList<>());
+                            new ArrayList<>(), new ArrayList<>(), versionOf(mapping.specVersionOf(project)));
                 } else {
                     planProject(project, shards, split, spec, pins, false, f, needsFilters, readers, loads, out, notes,
-                            warnings);
+                            warnings, versionOf(mapping.specVersionOf(project)));
                     planProject(project, prev.shards(), pinnedSplit, prev.spec(), prevPins, true, f, needsFilters,
-                            readers, loads, out, new ArrayList<>(), new ArrayList<>());
+                            readers, loads, out, new ArrayList<>(), new ArrayList<>(), versionOf(prev.specVersion()));
                 }
                 continue;
             }
             if (shards.isEmpty()) shards = List.of(ShardId.ofProject(project)); // unknown: its [project] shard
-            planProject(project, shards, split, spec, pins, false, f, needsFilters, readers, loads, out, notes, warnings);
+            planProject(project, shards, split, spec, pins, false, f, needsFilters, readers, loads, out, notes, warnings,
+                    split ? versionOf(mapping.specVersionOf(project)) : null);
         }
         return new RoutePlan(mapping, out, notes, warnings);
     }
 
-    /** Plans the shards of one version of {@code project} (see {@link #plan}). */
+    private static Integer versionOf(java.util.OptionalInt v) {
+        return v.isPresent() ? v.getAsInt() : null;
+    }
+
+    /**
+     * Plans the shards of one version of {@code project} (see {@link #plan}); {@code specVersion} is that
+     * version's number (P6-R21: a reader answers a shard as the version the query planned), null for none.
+     */
     private void planProject(String project, List<ShardId> shards, boolean split,
                              com.pharos.cluster.sharding.ShardSpec spec, Map<ShardId, Long> pins, boolean alternate,
                              ShardFilter f, boolean needsFilters, List<ReaderHeartbeat> readers,
                              Map<String, Integer> loads, List<PlannedShard> out, List<String> notes,
-                             List<String> warnings) {
+                             List<String> warnings, Integer specVersion) {
         java.util.Set<ShardId> searched = new java.util.HashSet<>(shards);
         if (split) {
             ShardFilter.Pruned pruned = f.prune(project, spec, shards);
@@ -271,7 +285,7 @@ public final class ShardRouter {
             List<ReaderHeartbeat> cands = candidates(shard, usable, degraded, loads, turn);
             if (gen != null) cands = servingFirst(shard, gen, cands);
             out.add(new PlannedShard(new Route(shard, cands, degraded, noFilters), project, split, statsOnly, gen,
-                    alternate));
+                    alternate, split ? specVersion : null));
         }
     }
 
