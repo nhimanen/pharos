@@ -72,5 +72,18 @@ class ApiModuleHasNoHeavyDepsTest {
             assertThat(p.metrics()).isEqualTo(Map.of());
         });
         assertThat(s.layout().summary().writers()).isEqualTo(1);
+
+        // integration carry I6: the shard spec (ShardSpec, DocKeys, Murmur3) validates and routes here too
+        ClusterConfig c = new com.fasterxml.jackson.databind.ObjectMapper().readValue("""
+                {"role":"writer","backend":"object-store","objectStore":{"bucket":"b"},"token":"t",
+                 "sharding":{"default":"[project]","projects":{"lucene":"[project, ring(path, shards=4)]"}},
+                 "reader":{"previousGenerationGraceSeconds":45},"writer":{"reshardSyncTimeoutSeconds":300}}""",
+                ClusterConfig.class);
+        c.validate();
+        com.pharos.cluster.sharding.ShardSpec spec = c.getSharding().specFor("lucene");
+        assertThat(spec.assign(com.pharos.cluster.sharding.DocKeys.of("lucene", "core/src/Main.java")).value())
+                .startsWith("lucene~ring=s0");
+        assertThat(c.previousGenerationGrace()).isEqualTo(java.time.Duration.ofSeconds(45));
+        assertThat(c.getWriter().getReshardSyncTimeoutSeconds()).isEqualTo(300);
     }
 }

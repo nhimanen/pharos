@@ -225,4 +225,50 @@ class ConfigRendererTest {
         assertThat(render(withPharosConfig(Map.of("peers", F.objectNode()))).get(Role.WRITER).json())
                 .isEqualTo(render(TestClusters.minio()).get(Role.WRITER).json());
     }
+
+    /**
+     * Integration carry I6: Phase 6's keys pass through spec.pharosConfig: cluster.sharding.* (by default and
+     * per project, also a project name with a dot), cluster.reader.previousGenerationGraceSeconds and
+     * cluster.writer.reshardSyncTimeoutSeconds, and the config pharos reads back carries them.
+     */
+    @Test
+    void phase6KeysPassThroughPharosConfig() throws Exception {
+        Map<String, JsonNode> extra = new LinkedHashMap<>();
+        extra.put("sharding.default", F.textNode("[project, module]"));
+        extra.put("sharding", F.objectNode().set("projects", F.objectNode()
+                .put("lucene", "[project, ring(path, shards=4)]").put("my.lib", "[project, ring(path, shards=2)]")));
+        extra.put("reader.previousGenerationGraceSeconds", F.numberNode(45));
+        extra.put("writer.reshardSyncTimeoutSeconds", F.numberNode(300));
+        ConfigRenderer.Result r = render(withPharosConfig(extra));
+        assertThat(r.errors()).isEmpty();
+        for (Role role : Role.values()) {
+            ClusterConfig c = asPharosReadsIt(withPharosConfig(extra), role);
+            assertThat(c.getSharding().defaultSpec().toString()).as(role.id()).isEqualTo("[project, module]");
+            assertThat(c.getSharding().specFor("lucene").toString()).isEqualTo("[project, ring(path, shards=4, vnodes=512)]");
+            assertThat(c.getSharding().specFor("my.lib").toString()).isEqualTo("[project, ring(path, shards=2, vnodes=512)]");
+            assertThat(c.getReader().getPreviousGenerationGraceSeconds()).isEqualTo(45);
+            assertThat(c.previousGenerationGrace()).isEqualTo(java.time.Duration.ofSeconds(45));
+            assertThat(c.getWriter().getReshardSyncTimeoutSeconds()).isEqualTo(300);
+        }
+        // an invalid spec is pharos's own validation error
+        assertThat(render(withPharosConfig(Map.of("sharding.default", F.textNode("[project, hash(path) % 8]")))).errors())
+                .first().asString().startsWith("cluster config (writer): cluster.sharding.default: invalid shard spec");
+    }
+
+    /**
+     * Integration carry I6: the previous-generation grace defaults to max(30 s, 3 x catalog cache + 2 x
+     * heartbeatSeconds). The rendered config leaves it unset, so a pod computes the same default pharos's
+     * validation does, for the heartbeat the spec sets; never a value fixed at the operator's default heartbeat.
+     */
+    @Test
+    void previousGenerationGraceDefaultFollowsTheHeartbeat() throws Exception {
+        for (Role role : Role.values()) {
+            JsonNode file = new ObjectMapper().readTree(render(TestClusters.minio()).get(role).json());
+            assertThat(file.path("cluster").path("reader").has("previousGenerationGraceSeconds")).as(role.id()).isFalse();
+            ClusterConfig d = asPharosReadsIt(TestClusters.minio(), role);
+            assertThat(d.previousGenerationGrace()).isEqualTo(new ClusterConfig().previousGenerationGrace());
+            ClusterConfig slow = asPharosReadsIt(withPharosConfig(Map.of("heartbeatSeconds", F.numberNode(20))), role);
+            assertThat(slow.previousGenerationGrace()).as("3 x 5 s + 2 x 20 s").isEqualTo(java.time.Duration.ofSeconds(55));
+        }
+    }
 }

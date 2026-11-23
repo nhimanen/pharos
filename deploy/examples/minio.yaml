@@ -56,3 +56,8 @@ spec:
       - { cron: "0 8 * * 1-5", timezone: Europe/Helsinki, readers: { min: 4 } }
       - { cron: "0 18 * * 1-5", timezone: Europe/Helsinki, readers: { min: 2 } }
   pharosConfig: {}                    # extra keys merged into cluster.* (validated by ClusterConfig)
+  # e.g. split a large project into ring shards (or reshard it live: pharos reshard in a writer pod):
+  #   pharosConfig:
+  #     sharding: {projects: {lucene: "[project, ring(path, shards=4)]"}}
+  #     writer.reshardSyncTimeoutSeconds: 600
+  #     reader.previousGenerationGraceSeconds: 45   # unset: max(30, 15 + 2 x heartbeatSeconds)
