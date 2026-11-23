@@ -19,7 +19,8 @@ shard's LATEST every 0.5 s.
              Pass: the 4 -> 5 step parses <= 25% of lucene's indexed files and every shard it keeps has its
              generation unchanged; 0 embedding provider calls (cache misses) during the pharos reshard.
   after      the same ranking on R1 after the three reshards. Pass: the Phase 3 rules (keyword top-10
-             identical >= 98%; hybrid mean tau >= 0.95 and top-1 >= 95%; vector Phase 2 ulp rule).
+             identical >= 98%; hybrid mean tau >= 0.95 and top-1 >= 95%); vector by ruling P6-R17 (recall:
+             per-query top-10 overlap >= 90%, mean >= 98%, shared documents' scores bitwise identical).
   pruning    a module-filtered pharos query touches only that module's shard (trace: routing note and the
              fan-out shard count); a path prefix on ring-sharded lucene fans out to all its shards (traced).
   interrupt  `pharos reshard lucene --spec "[project, ring(path, shards=6)]"`; the writer running it is
@@ -67,6 +68,8 @@ SPEC_RING5 = "[project, ring(path, shards=5)]"
 SPEC_RING6 = "[project, ring(path, shards=6)]"
 SPEC_MODULE = "[project, module]"
 MOVE_MAX = 0.25
+VECTOR_MIN_OVERLAP = 0.90   # ruling P6-R17
+VECTOR_MEAN_OVERLAP = 0.98
 T0 = time.time()
 RESULTS = {}
 
@@ -622,6 +625,35 @@ def save_part(name, data):
     save()
 
 
+def vector_recall_verdict(ref, got, st):
+    """Ruling P6-R17: after a resplit the shards' HNSW graphs differ, so vector parity is judged by recall:
+    per-query top-10 overlap >= VECTOR_MIN_OVERLAP, mean overlap >= VECTOR_MEAN_OVERLAP, and the documents both
+    lists share have bitwise-identical scores. Overlap = |shared| / max(|ref|, |got|)."""
+    overlaps, worst, score_diffs = [], [], []
+    for q, a in ref.items():
+        b = got.get(q, [])
+        sa = {r.get("id"): p2bits(r.get("score")) for r in a}
+        sb = {r.get("id"): p2bits(r.get("score")) for r in b}
+        shared = set(sa) & set(sb)
+        ov = len(shared) / max(1, len(sa), len(sb))
+        overlaps.append(ov)
+        if ov < VECTOR_MIN_OVERLAP:
+            worst.append((q, round(ov, 2)))
+        for i in shared:
+            if sa[i] != sb[i]:
+                score_diffs.append((q, i, sa[i], sb[i]))
+    mean = sum(overlaps) / max(1, len(overlaps))
+    ok = not worst and mean >= VECTOR_MEAN_OVERLAP and not score_diffs
+    st.update({"recall_mean_overlap": mean, "recall_below_min": worst, "recall_shared_score_diffs": score_diffs[:20]})
+    return ok, (f"P6-R17 recall: mean overlap {mean:.4f} (>= {VECTOR_MEAN_OVERLAP}), queries below {VECTOR_MIN_OVERLAP}:"
+                f" {len(worst)}, shared docs with other score bits: {len(score_diffs)}")
+
+
+def p2bits(score):
+    import struct
+    return None if score is None else struct.unpack(">I", struct.pack(">f", float(score)))[0]
+
+
 def compare(ref_label, got_label, key):
     ref = json.loads((gate() / f"ranking-{ref_label}.json").read_text())
     got = json.loads((gate() / f"ranking-{got_label}.json").read_text())
@@ -629,6 +661,8 @@ def compare(ref_label, got_label, key):
     for pl in PIPELINES:
         st = p3.compare_rank(p3.by_pipeline(ref, pl), p3.by_pipeline(got, pl), pl)
         good, rule = p3.verdict(st)
+        if pl == "vector":
+            good, rule = vector_recall_verdict(p3.by_pipeline(ref, pl), p3.by_pipeline(got, pl), st)
         log(f"   {key} {pl:8s} n={st['queries']} {rule}; ids identical {st['top10_identical']}, score-bitwise"
             f" {st['score_bitwise_identical']}, top-1 {st['top1_identical_pct']:.1f}%, tau {st['mean_tau']:.4f}"
             f" -> {'PASS' if good else 'FAIL'}")
