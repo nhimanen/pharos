@@ -422,7 +422,8 @@ class SplitProjectSearchTest {
     /**
      * Two readers each pinned to one shard of a split project, the coordinator holding neither: a file
      * moves between the shards and only one reader has synced the new run. The query refuses to mix
-     * runs (the lagging shard is left out with a warning, never the moved file twice); once a reader
+     * runs: it reads the older run whole from the readers' retained generations (P6-R19), and without them
+     * leaves the lagging shard out with a warning, never the moved file twice; once a reader
      * serves the lagging shard at the new run, the query is moved to it and the file is there once.
      */
     @Test
@@ -470,9 +471,18 @@ class SplitProjectSearchTest {
                 fx.indexSplit(src, project, ring2, shards, true);
                 x.parts.runtime().syncNow();
 
+                // P6-R19: x still answers s01 at run 1 (its retained generation), so the query reads run 1 whole
                 SearchResponse mixed = searchKeyword(coord, "zebrafinch", project);
-                assertThat(mixed.results()).as("never twice: s01 at run 2 lacks it, s02 at run 1 is left out").isEmpty();
-                assertThat(mixed.warnings()).anySatisfy(w -> assertThat(w).contains("shard " + s02.value() + " unavailable",
+                assertThat(mixed.results().stream().filter(res -> res.id().contains("Zebrafinch#")).count())
+                        .as("never twice: read at run 1, where s01 has it").isEqualTo(1);
+                assertThat(mixed.warnings()).isEmpty();
+
+                // without the retained generation (x's grace over), s02 at run 1 is left out, never mixed
+                ((com.pharos.cluster.ReaderLocalCache) x.parts.lucene().localCache()).setClock(
+                        () -> System.currentTimeMillis() + 3_600_000L);
+                SearchResponse left = searchKeyword(coord, "zebrafinch", project);
+                assertThat(left.results()).as("never twice: s01 at run 2 lacks it, s02 at run 1 is left out").isEmpty();
+                assertThat(left.warnings()).anySatisfy(w -> assertThat(w).contains("shard " + s02.value() + " unavailable",
                         "index run 2 of project " + project));
 
                 // a reader holding the whole project at run 2: the query moves s02 to it
