@@ -608,6 +608,12 @@ public final class ObjectStorePublisher implements IndexPublisher {
      *
      * @throws PublishException when a shard of {@code from} has never been published
      */
+    private static List<ShardId> concat(List<ShardId> a, List<ShardId> b) {
+        List<ShardId> out = new ArrayList<>(a);
+        for (ShardId s : b) if (!out.contains(s)) out.add(s);
+        return out;
+    }
+
     public ReshardReference reshardReference(String project, List<ShardId> from, List<ShardId> to, Path projectDir)
             throws IOException {
         ShardManifest first = null;
@@ -622,7 +628,17 @@ public final class ObjectStorePublisher implements IndexPublisher {
         }
         if (first == null) throw new PublishException("project " + project + " has no shards to reshard");
         if (first.isProjectShard()) {
-            return new ReshardReference(first.projectGeneration(), first.projectFileList(), first.projectMeta(),
+            // P6-R21: the shards the reshard writes get a new index run, one above every run the project's
+            // shards (both versions) are at, so a rewritten shard of N+1 is never taken for N's at the same run;
+            // the content (project files, meta) stays N's
+            long newRun = first.projectGeneration() + 1;
+            for (ShardId shard : concat(from, to)) {
+                Optional<Latest> latest = readLatest(shard);
+                if (latest.isEmpty()) continue;
+                ShardManifest m = readManifest(shard, latest.get());
+                if (m.projectGeneration() != null) newRun = Math.max(newRun, m.projectGeneration() + 1);
+            }
+            return new ReshardReference(newRun, first.projectFileList(), first.projectMeta(),
                     first.modelFingerprint());
         }
         long run = 1;

@@ -1189,6 +1189,47 @@ class ReshardJobTest {
         assertEveryFileOnce(r, files, "reader synced, pinned catalog (retained generations)", frozen(pinned));
     }
 
+    /**
+     * Ruling P6-R21: the shards a reshard rewrites get a new index run number, above every run the project's
+     * shards are at, so version N+1's rewritten shard is never the same run as N's under the same id; the
+     * content (project files, revision) stays the run it split, so the writer does not see the project as
+     * pending (no extra run after the flip), and its next run numbers above both.
+     */
+    @Test
+    void rewrittenShardsGetANewRunNumber() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        Reader r = new Reader("r1");
+        r.sync();
+        Map<ShardId, Generation> before = latestOf(ring(4));
+        long runN = replicas.manifest(ring(4).getFirst(), before.get(ring(4).getFirst())).projectGeneration();
+        catalog.requestReshard(P, RING5, clock.instant());
+        a.loop.tick();
+        r.sync();
+        a.loop.tick();
+        for (int i = 0; i < 4 && !latestEqualsPins(); i++) {
+            clock.advance(10);
+            a.loop.tick();
+        }
+        Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
+        Set<ShardId> rewritten = movedFrom(files, RING4, RING5);
+        for (ShardId s : ring(5)) {
+            long run = replicas.manifest(s, new Generation(pins.get(s))).projectGeneration();
+            if (rewritten.contains(s) || !ring(4).contains(s)) {
+                assertThat(run).as(s + ": written by the reshard, a new run").isGreaterThan(runN);
+            } else {
+                assertThat(run).as(s + ": unchanged, N's run").isEqualTo(runN);
+            }
+        }
+        Map<ShardId, Generation> flipped = latestOf(ring(5));
+        clock.advance(10);
+        a.loop.tick();
+        assertThat(latestOf(ring(5))).as("no extra run after the flip").isEqualTo(flipped);
+        r.sync();
+        assertEveryFileOnce(r, files, "after the flip");
+    }
+
     private boolean latestEqualsPins() throws IOException {
         Map<ShardId, Long> pins = catalog.projectShards().pinsOf(P);
         if (pins.isEmpty()) return false;

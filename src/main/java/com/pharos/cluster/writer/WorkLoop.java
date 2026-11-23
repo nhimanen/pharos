@@ -796,15 +796,18 @@ public final class WorkLoop implements Closeable {
         String revision = null;
         boolean oneRun = true;
         int format = Integer.MAX_VALUE;
-        Long run = null;
+        List<String> projectFiles = null;
         for (int i = 0; i < gens.size(); i++) {
             ShardManifest manifest = replicas.manifest(st.leaseShards.get(i), gens.get(i));
             ProjectMeta meta = manifest.projectMeta();
             String r = meta == null ? null : meta.getSourceRevision();
+            // one run's content: the same project files (a reshard's rewritten shards carry a new run number,
+            // P6-R21, but the content, and so the project files, of the run they split)
+            List<String> files = manifest.projectFileList().stream().map(f -> f.key()).sorted().toList();
             if (i == 0) {
                 revision = r;
-                run = manifest.projectGeneration();
-            } else if (!Objects.equals(r, revision) || !Objects.equals(run, manifest.projectGeneration())) {
+                projectFiles = files;
+            } else if (!Objects.equals(r, revision) || !Objects.equals(projectFiles, files)) {
                 oneRun = false;
             }
             format = Math.min(format, manifest.indexFormatVersion());
