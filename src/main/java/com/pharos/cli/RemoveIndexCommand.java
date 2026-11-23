@@ -16,6 +16,10 @@ import java.util.concurrent.Callable;
  * module-graph entry, cross-project graph, and registry entry.
  *
  * <p>With {@code --all}, removes every indexed project in the registry.
+ *
+ * <p>With {@code --from-catalog}, removes only the project's entry from the cluster's shard catalog
+ * (object-store backend): work-queue writers release it and readers stop serving it. It deletes no
+ * index data, locally or in the store, so a work-queue writer runs it too.
  */
 @Command(
         name = "remove-index",
@@ -32,18 +36,33 @@ public class RemoveIndexCommand implements Callable<Integer> {
             description = "Remove every indexed project")
     private boolean all;
 
+    @Option(names = "--from-catalog",
+            description = "Cluster: only remove the project from the shard catalog, so work-queue writers stop"
+                    + " indexing it and readers stop serving it. Deletes no index data (locally or in the object"
+                    + " store); registering the project again resumes from its last generation")
+    private boolean fromCatalog;
+
     private final ProjectRegistry registry;
     private final ProjectIndexManager indexManager;
     private final IndexConfig config;
+    /** The cluster runtime ({@code --from-catalog}); null when not wired. */
+    private final com.pharos.cluster.ClusterRuntime runtime;
 
     public RemoveIndexCommand(ProjectRegistry registry, ProjectIndexManager indexManager, IndexConfig config) {
+        this(registry, indexManager, config, null);
+    }
+
+    public RemoveIndexCommand(ProjectRegistry registry, ProjectIndexManager indexManager, IndexConfig config,
+                              com.pharos.cluster.ClusterRuntime runtime) {
         this.registry = registry;
         this.indexManager = indexManager;
         this.config = config;
+        this.runtime = runtime;
     }
 
     @Override
     public Integer call() throws Exception {
+        if (fromCatalog) return removeFromCatalog();
         try {
             RoleGuard.requireIndexing(config);
             RoleGuard.requireNoWorkQueue(config, "pharos remove-index");
@@ -65,6 +84,45 @@ public class RemoveIndexCommand implements Callable<Integer> {
             return removeOne(projectName);
         } catch (IllegalArgumentException e) {
             System.err.println("Error: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    /** {@code --from-catalog}: 0 removed or not listed, 1 the store failed, 2 unusable options. */
+    private int removeFromCatalog() {
+        try {
+            RoleGuard.requireIndexing(config); // readers never change the catalog
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
+        if (all || projectName == null) {
+            System.err.println("--from-catalog removes one project: pass its name (not --all).");
+            return 2;
+        }
+        var catalog = runtime == null ? java.util.Optional.<com.pharos.cluster.objectstore.ObjectStoreCatalog>empty()
+                : runtime.sourceCatalog();
+        if (catalog.isEmpty()) {
+            System.err.println("--from-catalog needs a cluster object-store backend (cluster.backend 'object-store');"
+                    + " this node has none.");
+            return 2;
+        }
+        com.pharos.cluster.ShardId shard;
+        try {
+            shard = com.pharos.cluster.ShardId.ofProject(projectName);
+        } catch (IllegalArgumentException e) {
+            System.err.println("Error: " + e.getMessage());
+            return 2;
+        }
+        try {
+            if (catalog.get().unregister(shard)) {
+                System.out.println("Removed project '" + projectName + "' from the cluster catalog.");
+            } else {
+                System.out.println("Project '" + projectName + "' is not in the cluster catalog.");
+            }
+            return 0;
+        } catch (java.io.IOException e) {
+            System.err.println("Removing " + projectName + " from the cluster catalog failed: " + e.getMessage());
             return 1;
         }
     }

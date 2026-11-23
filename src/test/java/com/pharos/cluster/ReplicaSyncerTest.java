@@ -438,6 +438,19 @@ class ReplicaSyncerTest {
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
     }
 
+    /** Final review I2: after a downgrade from a release with keyed ids, the reader drops nothing. */
+    @Test
+    void catalogOfOnlyUnparseableIdsDropsNothing() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+
+        store.put(layout.catalogKey(), "{\"shards\": [ {\"id\": \"proj~k=v\"} ]}".getBytes(StandardCharsets.UTF_8));
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+    }
+
     @Test
     void corruptedGraphIsRejected() throws Exception {
         publishFull();
@@ -881,6 +894,30 @@ class ReplicaSyncerTest {
         assertThat(raw).isDirectory();
         assertThat(hidden).isDirectory();
         assertThat(genDir(1)).isDirectory();
+    }
+
+    @Test
+    void absentCatalogKeepsServingButAnEmptyOneDropsEverything() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        // no catalog object at all (a store being reset, a wrong prefix): may be transient, drop nothing
+        ReplicaSyncer absent = new ReplicaSyncer(new ObjectStoreCatalog(new InMemoryObjectStore(), layout),
+                new ObjectStoreReplicaSource(store, layout), cache, readerRegistry, cacheDir, readerSynonyms,
+                Duration.ofSeconds(10), lazy);
+        try {
+            absent.syncOnce();
+        } finally {
+            absent.close();
+        }
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+        assertThat(cache.active(PROJECT)).isPresent();
+
+        // the catalog exists and lists no shard (its last project was removed): authoritative
+        assertThat(new ObjectStoreCatalog(store, layout).unregister(new ShardId(PROJECT))).isTrue();
+        assertThat(new ObjectStoreCatalog(store, layout).authoritativeShards()).contains(List.of());
+        syncer.syncOnce();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
     }
 
     @Test

@@ -17,6 +17,48 @@ mvn clean compile           # Compile only
 
 **Java 25+ required.** The shade plugin produces a single executable JAR.
 
+**Maven layout.** The root `pom.xml` is the aggregator and parent (`pharos-parent`); run every command above
+from the root. Modules:
+- `app/pom.xml` — the pharos application (artifactId `pharos`). Its sources stay in the root `src/` and it
+  builds into the root `target/`, so the jar is still `target/pharos-<version>.jar`; its tests run with the
+  repository root as working directory.
+- `pharos-api/` — what the operator shares with pharos: `ClusterConfig` (+ `PharosHome`, `DiscoverySpec`,
+  `BackendKind`, `NodeRole`, `ShardId`) and the status records (`ClusterStatus`, `StatusState`,
+  `StatusEvent`, `WriterHeartbeat`), same packages as before. Jackson only — `ApiModuleHasNoHeavyDepsTest`
+  fails if Lucene, DJL/ONNX or Javalin reach its dependency tree. Code that needs them stays in `src/`
+  (move a constant into the api class rather than referencing e.g. `LuceneIndexer` from it).
+- `operator/` — the Kubernetes operator (plain JOSDK on the fabric8 client); depends on `pharos-api`, never
+  on the fat jar. The `PharosCluster` CRD is generated from `com.pharos.operator.api` into `operator/target/crd/`;
+  the committed copy is `deploy/crd/`, and `CrdGenerationTest` fails when they drift. After changing the api
+  classes: `mvn -pl operator -am test -Dtest=CrdGenerationTest -Dpharos.regenerateCrd=true`.
+  Spec defaults live only in `operator/.../Defaults.java` (validator, renderers and autoscaler share them);
+  every derived object name comes from `Names` (project names only via `Names.k8sName`). The renderers
+  (`render/`) build a `DesiredState` that JOSDK dependent resources apply with server-side apply.
+  `ReconcilerMockServerTest` runs a real `Operator` on fabric8's mock server, which has no SSA, so it
+  switches JOSDK to create/update; a second reconcile must leave every resourceVersion unchanged.
+  Project Jobs (registration `pharos index --project <p> --source-git … --ref …` without a path, removal
+  `pharos remove-index --from-catalog <p>`) are dynamic, so they are not dependents: `ProjectReconciler`
+  plans them from the Jobs in the informer (pure, unit-tested) and the reconciler creates/deletes them.
+  Writers mount each project's `git.credentialsSecret` at `/etc/pharos/git/<k8sName>`, named in
+  `cluster.writer.gitCredentials`, which `SourceCheckout` applies to that project's git calls only.
+  Replicas come from `scale/Autoscaler` (pure; fake clock in tests): pharos's proposals from
+  `/cluster/status`, read by `status/ClusterStatusClient` straight from the pods (readers' headless
+  Service, then writers'; never the router) on its own threads, behind the JOSDK event source
+  `ClusterStatusEventSource`. Its source of truth is each StatefulSet's `pharos.dev/last-scale`
+  annotation (`LastScale`, applied together with `replicas`, OP-R5), with `status.proposals` as the
+  informational copy, so cooldown and episodes survive a restart or a failed status patch; writer scale-down passes `ScaleDownGate` (removed ordinals' heartbeats and leases gone);
+  `ScheduleFloors` raises `min` (cron via `CronSchedule`, also the validator's parser). Tests use
+  `ClusterStatusEventSource.NEVER_ANSWERS` or a fake `Watch`.
+  Workload versions come from `upgrade/UpgradeCoordinator` (pure): a changed `spec.version` first runs
+  Job `<name>-preflight-<version>` (`PreflightJobRenderer`: the new image, `pharos upgrade-indexes --check`,
+  exit 3 = a shard refused → `UpgradeBlocked`, nothing applied), then rolls readers, writers, router, each
+  only once the previous role is rolled out and every pod heartbeats in `/cluster/status` (started after
+  the `pharos.dev/version-since` annotation, applied with the image). A downgrade (OP-R6) rolls writers
+  first, then re-checks the bucket (`<name>-preflight-<version>-post`) before readers and router move.
+  Project Jobs use the writers' version.
+  Phase and conditions (StorageReady, ReadersReady, WritersReady, ProjectsPublished, UpgradeBlocked) come
+  from `status/PhaseEvaluator` (pure), merged by the reconciler into its one status patch.
+
 **Terraform (.tf) indexing** requires `python3` plus the third-party `python-hcl2` package
 (`pip install python-hcl2`) — the first extractor script with a non-stdlib dependency
 (Python/JS extractors otherwise only use stdlib). Without it, `TerraformCodeParser`
@@ -126,7 +168,8 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 
 ## Releasing (maintainers only)
 
-1. Bump the version in `pom.xml` (`X.Y.Z`).
+1. Bump the version in every pom (`X.Y.Z`): `mvn versions:set -DnewVersion=X.Y.Z -DgenerateBackupPoms=false`
+   (root `pom.xml` plus the `<parent>` version in `app/`, `pharos-api/`, `operator/`).
 2. In `CHANGELOG.md`, move `Unreleased` into a new `## [X.Y.Z] - date` section. It must start with an `**Index format:**` line (`N (unchanged)` or `N → M (...)`; `scripts/release-notes.sh X.Y.Z` fails without it). If the format changed, add a section to `UPGRADING.md`.
 3. Run `bash scripts/test-setup.sh` and `mvn -B clean package`.
 4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` workflow checks the tag against the pom version, builds, and publishes the GitHub release (jar, `.sha256`, skill bundle, `pharos`, `setup.sh`).

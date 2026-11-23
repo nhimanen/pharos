@@ -258,9 +258,9 @@ public class ReplicaSyncer implements Closeable {
             if (!pin.isEmpty()) shards = shards.stream().filter(sh -> pin.matches(sh, map::projectOf)).toList();
             wanted = List.copyOf(shards);
             if (catalogEmpty && !served.isEmpty()) {
-                // an empty read may be transient (a catalog object being rewritten): drop nothing
-                log.warn("The shard catalog lists no shard; keeping the {} served shard(s)",
-                        served.size());
+                // no catalog, a non-authoritative empty read or unreadable entries: drop nothing
+                log.warn("The shard catalog is missing, lists no shard or has entries this build cannot read;"
+                        + " keeping the {} served shard(s)", served.size());
             } else {
                 dropUnwanted(shards);
             }

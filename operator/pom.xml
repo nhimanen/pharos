@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      The Kubernetes operator: plain Java Operator SDK (JOSDK) on the fabric8 client, no Quarkus.
+      It depends on pharos-api, never on the pharos fat jar. The PharosCluster CRD is generated from
+      com.pharos.operator.api by the fabric8 crd-generator into target/crd/; the committed copy lives in
+      deploy/crd/ and CrdGenerationTest fails when they drift. Refresh it with
+        mvn -pl operator -am test -Dtest=CrdGenerationTest -Dpharos.regenerateCrd=true
+    -->
+    <parent>
+        <groupId>com.pharos</groupId>
+        <artifactId>pharos-parent</artifactId>
+        <version>1.4.1</version>
+    </parent>
+
+    <artifactId>pharos-operator</artifactId>
+    <packaging>jar</packaging>
+    <name>pharos-operator</name>
+    <description>Kubernetes operator for a pharos cluster</description>
+
+    <properties>
+        <josdk.version>5.6.3</josdk.version>
+        <!-- The fabric8 client JOSDK ${josdk.version} is built against; the CRD generator must match it. -->
+        <fabric8.version>7.9.0</fabric8.version>
+        <!-- fabric8 needs a newer Jackson than the parent's; pharos-api only uses the stable core API. -->
+        <operator.jackson.version>2.21.4</operator.jackson.version>
+        <operator.jackson.annotations.version>2.21</operator.jackson.annotations.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Declared directly: entries inherited from the parent would win over an imported BOM. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${operator.jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>${operator.jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-annotations</artifactId>
+                <version>${operator.jackson.annotations.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${operator.jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.fabric8</groupId>
+                <artifactId>kubernetes-client-bom</artifactId>
+                <version>${fabric8.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.pharos</groupId>
+            <artifactId>pharos-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.javaoperatorsdk</groupId>
+            <artifactId>operator-framework</artifactId>
+            <version>${josdk.version}</version>
+            <exclusions>
+                <!-- JOSDK brings the JDK HTTP client; keep fabric8's default Vert.x one out (size, one SPI impl). -->
+                <exclusion>
+                    <groupId>io.fabric8</groupId>
+                    <artifactId>kubernetes-httpclient-vertx</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- CRD schema annotations (@Required, @Default, @PreserveUnknownFields); compile-time only. -->
+        <dependency>
+            <groupId>io.fabric8</groupId>
+            <artifactId>generator-annotations</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Reconcile tests against fabric8's in-memory API server (CRUD mode); version from the client BOM. -->
+        <dependency>
+            <groupId>io.fabric8</groupId>
+            <artifactId>kubernetes-server-mock</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>io.fabric8</groupId>
+                <artifactId>crd-generator-maven-plugin</artifactId>
+                <version>${fabric8.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/crd</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables combine.children="append">
+                        <pharos.crdGenerated>${project.build.directory}/crd</pharos.crdGenerated>
+                        <pharos.crdCommitted>${project.basedir}/../deploy/crd</pharos.crdCommitted>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <!-- fabric8 discovers its HTTP client and model types through SPI -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.pharos.operator.OperatorMain</mainClass>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

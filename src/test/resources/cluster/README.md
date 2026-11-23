@@ -43,9 +43,10 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
 - `health[]`: `{kind, target, message}`. The kinds are `lease-expired`, `no-readers`,
   `reader-degraded`, `reader-draining`, `reader-warming`, `shard-lagging`, `shard-unassigned`,
   `shard-unserved`, `writer-low-disk` and `writer-stopping`.
-- `proposals[]`: `{id (sha1 of kind+target), kind, target, reason, metrics, action, since}`.
+- `proposals[]`: `{id (sha1 of kind+target), kind, target, reason, metrics, action, delta, since}`.
   The kinds are `add-readers`, `remove-readers`, `add-writers`, `remove-writers`, `reshard` and
-  `writer-disk`. A `reshard` proposal targets a project and its action names the exact command, e.g.
+  `writer-disk`. `delta` is the signed node count of the four scaling kinds (`+N` start, `-N`
+  stop, the N the `action` names); it is absent on `reshard` and `writer-disk`. A `reshard` proposal targets a project and its action names the exact command, e.g.
   `pharos reshard alpha --spec "[project, ring(path, shards=2)]"` (ruling P6-R14: an unringed project gets
   a ring of `S = ceil(largestShardBytes / trigger)` shards, at least 2; a ringed one `max(N + 1, S)`;
   ruling P6-R15).
@@ -65,7 +66,8 @@ are in order. Ages are whole seconds of bucket time, measured to `asOf`.
 The golden cluster has no reshard (its `specs` is empty); `ClusterPageFixtures.resharding()` is the
 fixture with one, building and pinned.
 
-`/cluster/events` sends `{type: appeared|changed|cleared, proposal}`, `{type: layout, summary}` and
+`/cluster/events` sends `{type: appeared|changed|cleared, proposal}` (a change of reason or action, and so of
+delta, is `changed`), `{type: layout, summary}` and
 `{type: reshard, reshard: {project, specVersion, phase, shardsDone, shardsTotal, filesDone, filesTotal}}`
 at a reshard's phase transitions (`ended` once it is no longer shown) and at each quarter of its shards
 or files.

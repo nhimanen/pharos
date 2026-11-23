@@ -4,12 +4,25 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <!--
+      Aggregator and parent. The pharos application keeps its sources at the repository root
+      (src/) and builds into the root target/ (target/pharos-<version>.jar); its pom is app/pom.xml.
+      pharos-api holds what the operator shares with pharos (ClusterConfig, the status records)
+      without Lucene, ONNX or Javalin. All modules share this version: bump it with
+      mvn versions:set -DnewVersion=X.Y.Z -DgenerateBackupPoms=false
+    -->
     <groupId>com.pharos</groupId>
-    <artifactId>pharos</artifactId>
+    <artifactId>pharos-parent</artifactId>
     <version>1.4.1</version>
-    <packaging>jar</packaging>
-    <name>pharos</name>
-    <description>Pharos — code-aware search tool with BM25 + vector search and call graph analysis</description>
+    <packaging>pom</packaging>
+    <name>pharos-parent</name>
+    <description>Pharos build: the pharos application, its shared api module and the Kubernetes operator</description>
+
+    <modules>
+        <module>pharos-api</module>
+        <module>app</module>
+        <module>operator</module>
+    </modules>
 
     <properties>
         <java.version>25</java.version>
@@ -30,10 +43,17 @@
         <testcontainers.version>1.21.3</testcontainers.version>
         <!-- Exclude slow/integration/quality tests by default; override with -DexcludedGroups= to run all -->
         <excludedGroups>perf,integration,quality,validation</excludedGroups>
+        <!-- mvn test -Dtest=ClassName at the root: modules without that class are not a failure -->
+        <surefire.failIfNoSpecifiedTests>false</surefire.failIfNoSpecifiedTests>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>com.pharos</groupId>
+                <artifactId>pharos-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
             <dependency>
                 <groupId>ai.djl</groupId>
                 <artifactId>bom</artifactId>
@@ -48,259 +68,58 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-annotations</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>${junit.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
-    <dependencies>
-        <!-- ===== Apache Lucene ===== -->
-        <dependency>
-            <groupId>org.apache.lucene</groupId>
-            <artifactId>lucene-core</artifactId>
-            <version>${lucene.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.lucene</groupId>
-            <artifactId>lucene-analysis-common</artifactId>
-            <version>${lucene.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.lucene</groupId>
-            <artifactId>lucene-queryparser</artifactId>
-            <version>${lucene.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.lucene</groupId>
-            <artifactId>lucene-highlighter</artifactId>
-            <version>${lucene.version}</version>
-        </dependency>
-
-        <!-- ===== JavaParser with symbol solver ===== -->
-        <dependency>
-            <groupId>com.github.javaparser</groupId>
-            <artifactId>javaparser-symbol-solver-core</artifactId>
-            <version>${javaparser.version}</version>
-        </dependency>
-
-        <!-- ===== picocli CLI framework ===== -->
-        <dependency>
-            <groupId>info.picocli</groupId>
-            <artifactId>picocli</artifactId>
-            <version>${picocli.version}</version>
-        </dependency>
-
-        <!-- ===== ArcadeDB for call graph and module graph ===== -->
-        <dependency>
-            <groupId>com.arcadedb</groupId>
-            <artifactId>arcadedb-engine</artifactId>
-            <version>25.1.1</version>
-        </dependency>
-
-        <!-- ===== DJL + ONNX Runtime (optional vector embeddings) ===== -->
-        <dependency>
-            <groupId>ai.djl</groupId>
-            <artifactId>api</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>ai.djl.onnxruntime</groupId>
-            <artifactId>onnxruntime-engine</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.microsoft.onnxruntime</groupId>
-            <artifactId>onnxruntime</artifactId>
-            <version>${onnxruntime.version}</version>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>ai.djl.huggingface</groupId>
-            <artifactId>tokenizers</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- ===== Jackson for JSON ===== -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>${jackson.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
-            <version>${jackson.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.dataformat</groupId>
-            <artifactId>jackson-dataformat-yaml</artifactId>
-            <version>${jackson.version}</version>
-        </dependency>
-
-        <!-- ===== Logging ===== -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>${slf4j.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>${logback.version}</version>
-        </dependency>
-
-        <!-- ===== Javalin web server (for web UI) ===== -->
-        <dependency>
-            <groupId>io.javalin</groupId>
-            <artifactId>javalin</artifactId>
-            <version>6.3.0</version>
-        </dependency>
-
-        <!-- ===== S3-compatible object storage (cluster replication) ===== -->
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>s3</artifactId>
-            <exclusions>
-                <exclusion>
-                    <groupId>software.amazon.awssdk</groupId>
-                    <artifactId>netty-nio-client</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>software.amazon.awssdk</groupId>
-                    <artifactId>apache-client</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>software.amazon.awssdk</groupId>
-                    <artifactId>apache5-client</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>url-connection-client</artifactId>
-        </dependency>
-
-        <!-- ===== Testing ===== -->
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>minio</artifactId>
-            <version>${testcontainers.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>${testcontainers.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>${junit.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.assertj</groupId>
-            <artifactId>assertj-core</artifactId>
-            <version>${assertj.version}</version>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
     <build>
-        <resources>
-            <resource>
-                <directory>src/main/resources</directory>
-                <filtering>true</filtering>
-                <includes>
-                    <include>pharos-version.properties</include>
-                </includes>
-            </resource>
-            <resource>
-                <directory>src/main/resources</directory>
-                <filtering>false</filtering>
-                <excludes>
-                    <exclude>pharos-version.properties</exclude>
-                </excludes>
-            </resource>
-        </resources>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
-                <configuration>
-                    <release>${maven.compiler.release}</release>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>info.picocli</groupId>
-                            <artifactId>picocli-codegen</artifactId>
-                            <version>${picocli.version}</version>
-                        </path>
-                    </annotationProcessorPaths>
-                    <compilerArgs>
-                        <arg>-Aproject=${project.groupId}/${project.artifactId}</arg>
-                    </compilerArgs>
-                </configuration>
-            </plugin>
-
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.3.1</version>
-                <configuration>
-                    <!-- JavaParser reflects on JDK classes including jdk.incubator.vector
-                         when parsing corpora (e.g. Lucene) that use the Vector API. -->
-                    <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2 -Dpolyglot.engine.WarnInterpreterOnly=false</argLine>
-                    <excludedGroups>${excludedGroups}</excludedGroups>
-                    <!-- Keep tests out of the real ~/.pharos (synonyms, registry, config, module graph). -->
-                    <systemPropertyVariables>
-                        <pharos.home>${project.build.directory}/test-pharos-home</pharos.home>
-                    </systemPropertyVariables>
-                    <!-- Excluded due to ArcadeDB temp-dir contention when run in parallel
-                         with the full suite. Pass individually with -Dtest=ClassName. -->
-                    <excludes>
-                        <exclude>**/CrossProjectLinkerTest.java</exclude>
-                        <exclude>**/IndexCommandParallelTest.java</exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-
-            <!-- Fat JAR with ServicesResourceTransformer (required for Lucene ServiceLoader) -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <version>3.6.0</version>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                        <configuration>
-                            <createDependencyReducedPom>false</createDependencyReducedPom>
-                            <filters>
-                                <filter>
-                                    <artifact>*:*</artifact>
-                                    <excludes>
-                                        <exclude>META-INF/*.SF</exclude>
-                                        <exclude>META-INF/*.DSA</exclude>
-                                        <exclude>META-INF/*.RSA</exclude>
-                                        <exclude>module-info.class</exclude>
-                                    </excludes>
-                                </filter>
-                            </filters>
-                            <transformers>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.pharos.Main</mainClass>
-                                </transformer>
-                                <!-- CRITICAL: merges META-INF/services for Lucene codec ServiceLoader -->
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
-                                    <resource>META-INF/spring.handlers</resource>
-                                </transformer>
-                            </transformers>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                    <configuration>
+                        <release>${maven.compiler.release}</release>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.3.1</version>
+                    <configuration>
+                        <excludedGroups>${excludedGroups}</excludedGroups>
+                        <!-- Keep tests out of the real ~/.pharos (synonyms, registry, config, module graph). -->
+                        <systemPropertyVariables>
+                            <pharos.home>${project.build.directory}/test-pharos-home</pharos.home>
+                        </systemPropertyVariables>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>3.6.0</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
 </project>

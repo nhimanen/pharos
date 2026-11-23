@@ -155,7 +155,7 @@ public final class PeerBackend implements ReplicationBackend {
     public ReplicationEndpoint endpoint() {
         ClusterConfig cfg = config.getCluster();
         return new ReplicationEndpoint(peerStore(), cfg.effectiveNodeId(),
-                com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
+                com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.effectiveToken()),
                 cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg),
                 new PeerReaderRegistry(Duration.ofSeconds(cfg.getReaderTtlSeconds()), System::nanoTime),
                 new PeerStatusState(PeerStatusState.idleExpiry(cfg), System::nanoTime), System::currentTimeMillis,
@@ -177,7 +177,7 @@ public final class PeerBackend implements ReplicationBackend {
             }
         }
         if (cfg.getPeers().getDiscovery() != null
-                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof PeerDiscovery.Seeds s) {
+                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof DiscoverySpec.Seeds s) {
             s.urls().forEach(u -> out.add(u.toString()));
         }
         return java.util.List.copyOf(out);

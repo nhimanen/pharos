@@ -17,7 +17,7 @@ import java.util.regex.Pattern;
  * letters, digits, {@code '.'}, {@code '_'} and {@code '-'}. At most 128 characters, never {@code ".."}.
  *
  * <p><b>Never derive the project from the id string.</b> Which project a shard belongs to is recorded
- * in the catalog and answered by {@link com.pharos.cluster.sharding.ProjectShards}; a guard test fails
+ * in the catalog and answered by {@code com.pharos.cluster.sharding.ProjectShards}; a guard test fails
  * when code elsewhere splits ids on {@code '~'}.
  *
  * <p><b>Object keys and file paths</b> embed the id through {@link #pathSegment()}, one URL-safe
@@ -70,7 +70,7 @@ public record ShardId(String value) {
      * {@code module=core, ring=s03}); empty for a {@code [project]} id. The values are the id's
      * ({@code ShardSpec}'s id-safe form), so routing compares them with values made id-safe the same way.
      * This is <b>not</b> how to find the project of a shard: that is
-     * {@link com.pharos.cluster.sharding.ProjectShards#projectOf}.
+     * {@code com.pharos.cluster.sharding.ProjectShards#projectOf}.
      */
     public SequencedMap<String, String> keyValues() {
         java.util.LinkedHashMap<String, String> out = new java.util.LinkedHashMap<>();

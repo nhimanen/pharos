@@ -629,4 +629,100 @@ class ClusterConfigTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("cluster.sharding.default is [project, module], but cluster.backend 'peer-pull'");
     }
+
+    // ── cluster.tokenEnv and the scale thresholds (operator Task 1) ───────────────────────────
+
+    /** An env var no test machine sets. */
+    private static final String UNSET_ENV = "PHAROS_TEST_TOKEN_ENV_THAT_IS_NEVER_SET_7F3A";
+
+    @Test
+    void tokenFromEnv() throws Exception {
+        String home = System.getenv("PATH"); // set on every machine and CI runner (the value stands in for a token)
+        assertThat(home).isNotBlank();
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:7171\",\"tokenEnv\":\"PATH\"}}");
+        assertThat(c.getTokenEnv()).isEqualTo("PATH");
+        assertThat(c.effectiveToken()).as("read from the env var").isEqualTo(home);
+        assertThat(c.getToken()).as("the configured token stays unset").isNull();
+        assertThat(c.toString()).contains("tokenEnv=PATH").doesNotContain(home);
+        // the token read from env is never written back into config.json
+        String saved = mapper.writeValueAsString(mapper.readValue("{\"cluster\":{\"tokenEnv\":\"PATH\"}}",
+                IndexConfig.class));
+        assertThat(saved).contains("\"tokenEnv\":\"PATH\"").doesNotContain(home);
+
+        // a literal token still works as before
+        assertThat(parse("{\"cluster\":{\"token\":\"t\"}}").effectiveToken()).isEqualTo("t");
+        assertThat(parse("{}").effectiveToken()).isNull();
+
+        // an env var that is not set: refused, naming the variable (never a value)
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tokenEnv\":\"" + UNSET_ENV + "\"}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.tokenEnv").hasMessageContaining(UNSET_ENV);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tokenEnv\":\" \"}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.tokenEnv");
+    }
+
+    @Test
+    void tokenAndTokenEnvTogetherIsInvalid() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"token\":\"s3cret\",\"tokenEnv\":\"PATH\"}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.token").hasMessageContaining("cluster.tokenEnv")
+                .hasMessageContaining("mutually exclusive")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("s3cret"));
+    }
+
+    @Test
+    void statusScaleThresholds() throws Exception {
+        ClusterConfig d = parse("{}");
+        assertThat(d.getStatus().getRemoveReadersLoad()).isEqualTo(0.2);
+        assertThat(d.getStatus().getWriters().getBacklogShards()).isEqualTo(1);
+        assertThat(d.getStatus().getWriters().getOldestPendingSeconds()).isEqualTo(300);
+        assertThat(d.getStatus().getWriters().getIdleSeconds()).as("unset: windows.removeWritersSeconds applies").isNull();
+        var ds = com.pharos.cluster.status.StatusSettings.of(d.getStatus());
+        assertThat(ds.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(1800);
+
+        ClusterConfig c = parse("{\"cluster\":{\"status\":{\"removeReadersLoad\":0.35,"
+                + "\"writers\":{\"backlogShards\":2,\"oldestPendingSeconds\":120,\"idleSeconds\":900}}}}");
+        var st = com.pharos.cluster.status.StatusSettings.of(c.getStatus());
+        assertThat(st.removeReadersLoad()).isEqualTo(0.35);
+        assertThat(st.backlogShards()).isEqualTo(2);
+        assertThat(st.oldestPendingSeconds()).isEqualTo(120);
+        assertThat(st.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(900);
+        // the older windows.removeWritersSeconds still applies when writers.idleSeconds is not set
+        var legacy = com.pharos.cluster.status.StatusSettings.of(parse(
+                "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}").getStatus());
+        assertThat(legacy.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(60);
+
+        // writers.idleSeconds and windows.removeWritersSeconds set the same window: different values are refused
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60},"
+                + "\"writers\":{\"idleSeconds\":900}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.status.writers.idleSeconds")
+                .hasMessageContaining("cluster.status.windows.removeWritersSeconds");
+        var same = com.pharos.cluster.status.StatusSettings.of(parse("{\"cluster\":{\"status\":{\"windows\":"
+                + "{\"removeWritersSeconds\":900},\"writers\":{\"idleSeconds\":900}}}}").getStatus());
+        assertThat(same.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("equal: allowed").isEqualTo(900);
+        // the default (1800) is not a setting: idleSeconds alone, saved and reloaded, stays valid
+        String saved = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"writers\":{\"idleSeconds\":900}}}}", IndexConfig.class));
+        assertThat(saved).doesNotContain("removeWritersSeconds");
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(saved).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(900);
+        String savedLegacy = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}", IndexConfig.class));
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(savedLegacy).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("an explicit value round-trips")
+                .isEqualTo(60);
+
+        for (String bad : new String[]{"0", "1", "-0.1", "1.5"}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"removeReadersLoad\":" + bad + "}}}"))
+                    .as(bad).hasMessageContaining("cluster.status.removeReadersLoad");
+        }
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"backlogShards\":0}}}}"))
+                .hasMessageContaining("cluster.status.writers.backlogShards");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"oldestPendingSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.writers.oldestPendingSeconds");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"idleSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.writers.idleSeconds");
+    }
 }

@@ -1,0 +1,8 @@
+.git
+**/target
+log
+__pycache__
+eval
+docs
+hs_err_pid*.log
+.superpowers

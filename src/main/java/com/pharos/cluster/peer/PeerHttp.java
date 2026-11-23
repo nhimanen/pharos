@@ -77,7 +77,7 @@ public final class PeerHttp implements AutoCloseable {
 
     /** The client of a peer-pull reader built from {@code cluster.*}. */
     public static PeerHttp of(ClusterConfig c) {
-        return new PeerHttp(c.getToken(), sslContext(c.getTls()), Duration.ofMillis(c.getConnectTimeoutMillis()),
+        return new PeerHttp(c.effectiveToken(), sslContext(c.getTls()), Duration.ofMillis(c.getConnectTimeoutMillis()),
                 REQUEST_TIMEOUT);
     }
 

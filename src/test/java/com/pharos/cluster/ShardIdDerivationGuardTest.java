@@ -55,18 +55,22 @@ class ShardIdDerivationGuardTest {
 
     @Test
     void noCodeDerivesAProjectFromAShardId() throws IOException {
-        Path root = Path.of("src/main/java");
-        assertThat(root).isDirectory();
+        // the app, the pharos-api module (ShardId, ClusterConfig, the sharding spec) and the operator
+        List<Path> roots = List.of(Path.of("src/main/java"), Path.of("pharos-api/src/main/java"),
+                Path.of("operator/src/main/java"));
         List<String> offenders = new ArrayList<>();
-        try (Stream<Path> files = Files.walk(root)) {
-            for (Path f : files.filter(p -> p.toString().endsWith(".java")).toList()) {
-                String rel = root.relativize(f).toString().replace('\\', '/');
-                if (ALLOWED_FILES.contains(rel)) continue;
-                List<String> lines = Files.readAllLines(f);
-                for (int line : tildeLiteralLines(String.join("\n", lines))) {
-                    String text = lines.get(line - 1).strip();
-                    if (ALLOWED_LINES.getOrDefault(rel, Set.of()).contains(text)) continue;
-                    offenders.add(rel + ":" + line + ": " + text);
+        for (Path root : roots) {
+            assertThat(root).isDirectory();
+            try (Stream<Path> files = Files.walk(root)) {
+                for (Path f : files.filter(p -> p.toString().endsWith(".java")).toList()) {
+                    String rel = root.relativize(f).toString().replace('\\', '/');
+                    if (ALLOWED_FILES.contains(rel)) continue;
+                    List<String> lines = Files.readAllLines(f);
+                    for (int line : tildeLiteralLines(String.join("\n", lines))) {
+                        String text = lines.get(line - 1).strip();
+                        if (ALLOWED_LINES.getOrDefault(rel, Set.of()).contains(text)) continue;
+                        offenders.add(root + "/" + rel + ":" + line + ": " + text);
+                    }
                 }
             }
         }

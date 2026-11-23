@@ -4,6 +4,7 @@ import com.pharos.cluster.sharding.ProjectShards;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
 
 /** The cluster's list of published shards. */
 public interface ShardCatalog {
@@ -18,5 +19,24 @@ public interface ShardCatalog {
      */
     default ProjectShards projectShards() throws IOException {
         return ProjectShards.identity(shards());
+    }
+
+    /**
+     * The shards when the catalog says so authoritatively, or empty when it cannot: readers drop
+     * shards that are not listed only on a present listing. By default an empty list is not
+     * authoritative (it may be a transient read); a catalog that can tell an absent catalog from one
+     * listing no shard overrides this.
+     */
+    default Optional<List<ShardId>> authoritativeShards() throws IOException {
+        List<ShardId> s = shards();
+        return s.isEmpty() ? Optional.empty() : Optional.of(s);
+    }
+
+    /**
+     * The raw ids of catalog entries this build cannot parse as a shard id (e.g. a newer release's keyed
+     * ids), which {@link #shards()} skips. Empty by default.
+     */
+    default List<String> unparseableEntries() throws IOException {
+        return List.of();
     }
 }

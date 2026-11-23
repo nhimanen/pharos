@@ -153,7 +153,48 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   project gets one more shard, or more for its size). MCP `list_projects` on a reader lists a split
   project once, with its shards.
 
+- Scaling proposals for an operator: every scaling proposal on `/cluster/status`, in
+  `/cluster/events` and to the webhook carries a signed `delta` (`+N` start, `-N` stop, the N its
+  `action` names; none on `reshard` and `writer-disk`). New `cluster.status` keys for what were
+  constants: `removeReadersLoad` (0.2), `writers.backlogShards` (1),
+  `writers.oldestPendingSeconds` (300) and `writers.idleSeconds` (the remove-writers window;
+  unset, `windows.removeWritersSeconds` applies; both set to different values is a startup error).
+  README "Scaling proposals".
+- `cluster.tokenEnv`: read the cluster token from the named environment variable instead of
+  `cluster.token` (mutually exclusive with it; surrounding whitespace is stripped; an unset or
+  empty value, or one with inner whitespace or control characters, is a startup error).
+- `pharos config validate <file>` (and `./pharos config validate <file>`): runs a node's startup
+  validation on a config file; prints `ok` and exits 0, or prints the problem and exits 2.
+- Registering a cluster source without indexing: `pharos index --project <name> --source-git <url>
+  --ref <ref> [--no-embed]` with no path only records the source in the shard catalog (also
+  `./pharos index` without a path). It publishes nothing, so a work-queue writer runs it too and no
+  writer needs to be running; the work queue then indexes the project. `pharos remove-index
+  --from-catalog <name>` drops a project's catalog entry: writers release it and readers stop
+  serving it, the last project too (readers keep their shards only while the catalog object is
+  missing, no longer when it lists no shard); its generations stay in the bucket, and registering
+  it again resumes from them. The
+  Kubernetes operator runs both as Jobs.
+- Per-project git credentials on writers: `cluster.writer.gitCredentials` maps a project to a
+  directory holding `ssh-privatekey` (optional `known_hosts`; without it host keys are learned on
+  first contact into `<workDir>/.ssh-known-hosts`) and/or `username` and `password` (HTTPS). Only
+  that project's git calls use them, through `GIT_SSH_COMMAND` and a credential helper that reads
+  the files when git asks; the config holds paths only.
+- Container image: arguments run one pharos command instead of the server (`docker run pharos:<v>
+  index --project p --source-git <url> --ref main`).
+- `pharos upgrade-indexes --check` changes nothing and exits 3 when this release would refuse an
+  index: with an object-store backend it reads every catalog shard's `LATEST` manifest from the
+  bucket (on any role, work-queue writers included), otherwise the local
+  registry's projects. The Kubernetes operator runs it with the new image before an upgrade.
+  A catalog entry this release cannot parse (a newer release's shard id) counts as refused, and
+  readers no longer treat such a catalog as authoritative: they keep serving what they have instead
+  of dropping every shard.
+
 ### Changed (upgrade note)
+- `add-writers` is now raised when a shard's unpublished change is older than
+  `cluster.status.writers.oldestPendingSeconds` (default 300 s), no longer
+  `cluster.status.targets.backlog` (600 s), which now drives only the `shard-lagging` health
+  finding. The proposal's metric `targetBacklogSeconds` is replaced by `targetOldestPendingSeconds`
+  and `targetBacklogShards`. Set `writers.oldestPendingSeconds` to keep the old threshold.
 - `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
   writer config without the key now runs the work queue and refuses hand-run `pharos index` /
   `pharos publish` (exit 2); add `"writer": {"workQueue": false}` to keep indexing and publishing
@@ -186,6 +227,12 @@ stay searchable unfiltered, re-index to filter — see UPGRADING.md)
   exit; JVM shutdown hooks (ONNX Runtime's environment closer among them) start only after that, so
   a signal no longer frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies
   to `web`, `mcp-server`, `index`, `embed` and `upgrade-indexes`.
+
+### Build
+- Multi-module Maven build: the root `pom.xml` is now the parent of `app` (pharos itself, sources
+  still in `src/`), `pharos-api` (`ClusterConfig` and the `/cluster/status` records, Jackson only) and
+  `operator`. `mvn clean package` at the root still produces `target/pharos-<version>.jar`; a release
+  bumps every pom (`mvn versions:set`).
 
 ### Changed
 - Keyword search ranks equal scores in a stable, build-independent order (document id, type and line

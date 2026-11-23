@@ -34,6 +34,12 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
         specs = specs == null ? List.of() : List.copyOf(specs);
     }
 
+    /** A status without the Phase 6 project and spec views ({@code projects} and {@code specs} empty). */
+    public ClusterStatus(String mode, String asOf, Layout layout, BacklogSummary backlogSummary, List<Health> health,
+                         List<Proposal> proposals) {
+        this(mode, asOf, layout, backlogSummary, health, proposals, List.of(), List.of());
+    }
+
     /**
      * Deterministic JSON: map entries by key, records in their declared property order, no
      * pretty-printing, unknown fields ignored on read (a newer node's state stays readable).
@@ -88,7 +94,19 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
     public record Shard(String shard, int specVersion, Map<String, String> keys, Long docCount, Long sizeBytes,
                         Long generation, Long ageSeconds, String writer, Lease lease, List<String> readers,
                         Backlog backlog, String state, String project, String role, boolean staged,
-                        Long stagedGeneration) {}
+                        Long stagedGeneration) {
+
+        /**
+         * A shard as a status before Phase 6 described it: an active shard of the project its
+         * {@code project} key names, not staged.
+         */
+        public Shard(String shard, int specVersion, Map<String, String> keys, Long docCount, Long sizeBytes,
+                     Long generation, Long ageSeconds, String writer, Lease lease, List<String> readers,
+                     Backlog backlog, String state) {
+            this(shard, specVersion, keys, docCount, sizeBytes, generation, ageSeconds, writer, lease, readers, backlog,
+                    state, keys == null ? null : keys.get("project"), "active", false, null);
+        }
+    }
 
     /**
      * One catalog project: its active spec version ({@code null}: the implicit {@code [project]}), spec and
@@ -184,9 +202,11 @@ public record ClusterStatus(String mode, String asOf, Layout layout, BacklogSumm
 
     /**
      * A proposal in force. {@code id} = hex SHA-1 of {@code kind + target}; {@code since} is when its
-     * condition started to hold (bucket time, ISO-8601); {@code metrics} are the snapshot's numbers.
+     * condition started to hold (bucket time, ISO-8601); {@code metrics} are the snapshot's numbers;
+     * {@code delta} is the signed node count of a scaling proposal ({@code +N} start, {@code -N}
+     * stop, the N its {@code action} names), absent on {@code reshard} and {@code writer-disk}.
      */
-    @JsonPropertyOrder({"id", "kind", "target", "reason", "metrics", "action", "since"})
+    @JsonPropertyOrder({"id", "kind", "target", "reason", "metrics", "action", "delta", "since"})
     public record Proposal(String id, String kind, String target, String reason, Map<String, Object> metrics,
-                           String action, String since) {}
+                           String action, @JsonInclude(JsonInclude.Include.NON_NULL) Integer delta, String since) {}
 }

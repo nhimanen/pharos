@@ -37,6 +37,7 @@ import picocli.CommandLine.*;
                 PublishCommand.class,
                 RouterCommand.class,
                 ReshardCommand.class,
+                ConfigCommand.class,
                 CommandLine.HelpCommand.class
         },
         mixinStandardHelpOptions = true,

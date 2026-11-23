@@ -74,6 +74,48 @@ public final class ObjectStoreCatalog implements ShardCatalog {
         return List.copyOf(out);
     }
 
+    /**
+     * Empty when {@code catalog/shards.json} does not exist, or when it lists an entry this build cannot
+     * parse (a newer release's id: after a downgrade, readers keep what they serve rather than drop
+     * shards they cannot even name). A catalog whose {@code shards[]} is really empty is authoritative
+     * (its last project was removed), so readers stop serving everything.
+     */
+    @Override
+    public Optional<List<ShardId>> authoritativeShards() throws IOException {
+        Optional<StoredObject> current = store.get(layout.catalogKey());
+        if (current.isEmpty()) return Optional.empty();
+        List<ShardId> out = new ArrayList<>();
+        List<String> invalid = new ArrayList<>();
+        parseIds(current.get().data(), out, invalid);
+        if (!invalid.isEmpty()) {
+            log.warn("Catalog {} lists {} entr{} this build cannot read ({}); not treating it as authoritative",
+                    layout.catalogKey(), invalid.size(), invalid.size() == 1 ? "y" : "ies", invalid);
+            return Optional.empty();
+        }
+        return Optional.of(List.copyOf(out));
+    }
+
+    /** The raw ids of entries {@link #shards()} skips. */
+    @Override
+    public List<String> unparseableEntries() throws IOException {
+        Optional<StoredObject> current = store.get(layout.catalogKey());
+        if (current.isEmpty()) return List.of();
+        List<String> invalid = new ArrayList<>();
+        parseIds(current.get().data(), new ArrayList<>(), invalid);
+        return List.copyOf(invalid);
+    }
+
+    private void parseIds(byte[] data, List<ShardId> valid, List<String> invalid) throws IOException {
+        for (JsonNode s : shardsArray(parse(data))) {
+            String id = s.path("id").asText();
+            try {
+                valid.add(new ShardId(id));
+            } catch (IllegalArgumentException e) {
+                invalid.add(id);
+            }
+        }
+    }
+
     /** The listed shards with their sources; the same entries, in the same order, as {@link #shards()}. */
     public List<ShardEntry> entries() throws IOException {
         Optional<StoredObject> current = store.get(layout.catalogKey());
@@ -704,6 +746,36 @@ public final class ObjectStoreCatalog implements ShardCatalog {
                 + shard + " after " + MAX_ATTEMPTS + " attempts");
     }
 
+    /**
+     * Removes {@code shard}'s entry (with its source), so work-queue writers release it and readers stop
+     * serving it. Nothing else is touched: the shard's generations and writer state stay in the store,
+     * and registering it again resumes from them. CAS read-modify-write like {@link #register}. Idempotent.
+     *
+     * @return true when an entry was removed, false when the catalog did not list the shard
+     */
+    public boolean unregister(ShardId shard) throws IOException {
+        String key = layout.catalogKey();
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            if (attempt > 1) backoff(attempt);
+            Optional<StoredObject> current = store.get(key);
+            if (current.isEmpty()) return false;
+            ObjectNode root = parse(current.get().data());
+            ArrayNode shards = shardsArray(root);
+            boolean found = false;
+            for (int i = shards.size() - 1; i >= 0; i--) {
+                if (shard.value().equals(shards.get(i).path("id").asText())) {
+                    shards.remove(i);
+                    found = true;
+                }
+            }
+            if (!found) return false;
+            byte[] data = JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(root);
+            if (store.putIfMatch(key, data, current.get().etag()).isPresent()) return true;
+        }
+        throw new PublishConflictException("catalog " + key + " kept changing; could not unregister shard "
+                + shard + " after " + MAX_ATTEMPTS + " attempts");
+    }
+
     /** Sleeps a random time in [d/2, d] with d = base * 2^(attempt-2). */
     private void backoff(int attempt) throws IOException {
         long d = BASE_BACKOFF_MS << (attempt - 2);
@@ -712,7 +784,7 @@ public final class ObjectStoreCatalog implements ShardCatalog {
             sleeper.sleep(ms);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new InterruptedIOException("interrupted while registering in catalog " + layout.catalogKey());
+            throw new InterruptedIOException("interrupted while updating catalog " + layout.catalogKey());
         }
     }
 

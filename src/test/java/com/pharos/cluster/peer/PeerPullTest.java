@@ -1292,11 +1292,11 @@ class PeerPullTest {
     @Test
     void discoverySpecParsing() {
         assertThat(PeerDiscovery.parse("dns:writers.ns.svc.cluster.local")).isEqualTo(
-                new PeerDiscovery.Dns("writers.ns.svc.cluster.local", PeerDiscovery.DEFAULT_PORT,
+                new DiscoverySpec.Dns("writers.ns.svc.cluster.local", PeerDiscovery.DEFAULT_PORT,
                         "dns:writers.ns.svc.cluster.local"));
-        assertThat(PeerDiscovery.parse(" dns:w:9000 ")).isEqualTo(new PeerDiscovery.Dns("w", 9000, "dns:w:9000"));
-        PeerDiscovery.Spec seeds = PeerDiscovery.parse("seeds:http://a:7070/, https://b ,http://a:7070");
-        assertThat(((PeerDiscovery.Seeds) seeds).urls()).containsExactly(URI.create("http://a:7070"), URI.create("https://b"));
+        assertThat(PeerDiscovery.parse(" dns:w:9000 ")).isEqualTo(new DiscoverySpec.Dns("w", 9000, "dns:w:9000"));
+        DiscoverySpec seeds = PeerDiscovery.parse("seeds:http://a:7070/, https://b ,http://a:7070");
+        assertThat(((DiscoverySpec.Seeds) seeds).urls()).containsExactly(URI.create("http://a:7070"), URI.create("https://b"));
         assertThatThrownBy(() -> PeerDiscovery.parse("seeds:http://user:hunter2@a")).hasMessageNotContaining("hunter2");
     }
 }

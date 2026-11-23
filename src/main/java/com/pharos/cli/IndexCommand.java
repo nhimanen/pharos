@@ -33,7 +33,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 )
 public class IndexCommand implements Callable<Integer> {
 
-    @Parameters(index = "0", description = "Path to a project root or workspace containing multiple projects")
+    @Parameters(index = "0", arity = "0..1",
+            description = "Path to a project root or workspace containing multiple projects. Omit it, and give"
+                    + " --source-git (or --source-path) with --project, to only register the project's source in"
+                    + " the cluster catalog: work-queue writers then index it")
     private Path path;
 
     @Option(names = {"--project", "-p"},
@@ -112,6 +115,7 @@ public class IndexCommand implements Callable<Integer> {
             System.err.println(e.getMessage());
             return 2;
         }
+        if (path == null) return registerSource();
         Path root = path.toAbsolutePath();
         if (runtime != null && runtime.isWorkQueueWriter()) {
             // an index run publishes; on a work-queue writer only the work loop holding the lease does
@@ -166,6 +170,45 @@ public class IndexCommand implements Callable<Integer> {
         } catch (Exception e) {
             System.err.println("\nError indexing project: " + e.getMessage());
             if (Boolean.getBoolean("pharos.verbose")) e.printStackTrace();
+            return 1;
+        }
+    }
+
+    /**
+     * No path: records {@code --project}'s source in the cluster catalog without indexing anything here
+     * (exit 0, or 2 for unusable options, 1 when the store fails). It publishes nothing, so a work-queue
+     * writer runs it too, and no writer needs to be running: the work queue indexes the project from
+     * its source. Re-running it with another source replaces the recorded one.
+     */
+    private int registerSource() {
+        Optional<com.pharos.cluster.ShardSource> source;
+        try {
+            source = sourceOptions.source(runtime);
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
+        if (source.isEmpty()) {
+            System.err.println("Missing path. Give a project path to index, or --source-git <url> --ref <ref>"
+                    + " (or --source-path <dir>) with --project <name> to register a cluster source only.");
+            return 2;
+        }
+        if (projectName == null) {
+            System.err.println("Registering a source without a path needs --project <name>.");
+            return 2;
+        }
+        try {
+            ProjectNames.validate(projectName);
+            com.pharos.cluster.ShardId.ofProject(projectName);
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
+        try {
+            SourceOptions.record(runtime, projectName, source.get().withEmbed(!noEmbed));
+            return 0;
+        } catch (java.io.IOException e) {
+            System.err.println("Registering the source of " + projectName + " failed: " + e.getMessage());
             return 1;
         }
     }

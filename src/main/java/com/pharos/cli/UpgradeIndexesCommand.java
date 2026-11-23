@@ -30,6 +30,13 @@ import java.util.function.Function;
  * {@value #EXIT_INCOMPLETE} a project was skipped (unknown, missing index, root gone) or failed;
  * {@value #EXIT_NEEDS_YES} confirmation needed but no terminal (use --yes);
  * {@value #EXIT_READER} refused on this node: a reader, or a work-queue writer (its work loop upgrades).
+ *
+ * <p>{@code --check} changes nothing: it reports whether this build would serve every index. With an
+ * object-store backend it reads each catalog shard's {@code LATEST} manifest from the bucket (any
+ * role, work-queue writers included: the Kubernetes operator runs it with the new image before an
+ * upgrade); otherwise it checks the local registry. A shard or project whose index format this build
+ * refuses (older than N-1, or newer) exits {@value #EXIT_REFUSED}; one that cannot be read exits
+ * {@value #EXIT_INCOMPLETE}.
  */
 @Command(
         name = "upgrade-indexes",
@@ -41,6 +48,7 @@ import java.util.function.Function;
                 "0:nothing to upgrade, all upgraded, or aborted at the prompt",
                 "1:a project was skipped (unknown, missing index, root gone) or failed",
                 "2:confirmation needed but no terminal; re-run with --yes",
+                "3:--check: an index (or a bucket shard) has a format this pharos refuses (older than N-1, or newer)",
                 "5:refused on a reader node (readers receive upgrades by syncing) or on a work-queue writer (its work loop upgrades: restart it on the new release)"}
 )
 public class UpgradeIndexesCommand implements Callable<Integer> {
@@ -48,6 +56,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
     static final int EXIT_OK = 0;
     static final int EXIT_INCOMPLETE = 1;
     static final int EXIT_NEEDS_YES = 2;
+    static final int EXIT_REFUSED = 3;
     static final int EXIT_READER = 5;
 
     @Parameters(arity = "0..*", description = "Only these projects (default: all that need upgrading)")
@@ -62,16 +71,27 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
     @Option(names = "--no-embed", description = "Skip embedding generation (keyword-only re-index)")
     private boolean noEmbed;
 
+    @Option(names = "--check", description = "Change nothing: exit 3 when this pharos would refuse an index"
+            + " (cluster: any shard published in the bucket), 0 when it serves them all")
+    private boolean check;
+
     private final ProjectIndexManager indexManager;
     private final ProjectRegistry registry;
     private final IndexConfig config;
     private final Function<String, String> prompter;
     private final boolean interactive;
+    /** The cluster runtime ({@code --check} reads the bucket through it); null when not wired. */
+    private final com.pharos.cluster.ClusterRuntime runtime;
 
     public UpgradeIndexesCommand(ProjectIndexManager indexManager, ProjectRegistry registry,
                                  IndexConfig config) {
+        this(indexManager, registry, config, null);
+    }
+
+    public UpgradeIndexesCommand(ProjectIndexManager indexManager, ProjectRegistry registry,
+                                 IndexConfig config, com.pharos.cluster.ClusterRuntime runtime) {
         this(indexManager, registry, config, UpgradeIndexesCommand::consolePrompt,
-                interactiveConsole());
+                interactiveConsole(), runtime);
     }
 
     /** True only on a real terminal; since JDK 22 System.console() is non-null even when redirected. */
@@ -83,11 +103,18 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
     /** Test seam: injectable prompt source and interactivity. */
     UpgradeIndexesCommand(ProjectIndexManager indexManager, ProjectRegistry registry,
                           IndexConfig config, Function<String, String> prompter, boolean interactive) {
+        this(indexManager, registry, config, prompter, interactive, null);
+    }
+
+    UpgradeIndexesCommand(ProjectIndexManager indexManager, ProjectRegistry registry,
+                          IndexConfig config, Function<String, String> prompter, boolean interactive,
+                          com.pharos.cluster.ClusterRuntime runtime) {
         this.indexManager = indexManager;
         this.registry = registry;
         this.config = config;
         this.prompter = prompter;
         this.interactive = interactive;
+        this.runtime = runtime;
     }
 
     private String registryPath() {
@@ -101,6 +128,11 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        if (check) {
+            var bucket = runtime == null ? java.util.Optional.<com.pharos.cluster.ReplicationBackend>empty()
+                    : runtime.objectStoreBackend();
+            return bucket.isPresent() ? checkShards(bucket.get().catalog(), bucket.get().source()) : checkLocal();
+        }
         com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             RoleGuard.requireUpgrades(config);
@@ -211,5 +243,75 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         }
         System.out.printf("%nSummary: %d upgraded, %d skipped, %d failed%n", upgraded, skipped, failed);
         return skipped == 0 && failed == 0 ? 0 : 1;
+    }
+
+    /**
+     * {@code --check} against the bucket: the format of every catalog shard's {@code LATEST} manifest,
+     * as a reader of this build would judge it. A shard without a {@code LATEST} yet has nothing to
+     * refuse. Exits {@value #EXIT_REFUSED} when any is refused, {@value #EXIT_INCOMPLETE} when the
+     * catalog or a manifest cannot be read, else {@value #EXIT_OK}.
+     */
+    static int checkShards(com.pharos.cluster.ShardCatalog catalog, com.pharos.cluster.ReplicaSource source) {
+        List<com.pharos.cluster.ShardId> shards;
+        List<String> unparseable;
+        try {
+            shards = catalog.shards();
+            unparseable = catalog.unparseableEntries();
+        } catch (java.io.IOException e) {
+            System.err.println("Reading the shard catalog failed: " + e.getMessage());
+            return EXIT_INCOMPLETE;
+        }
+        int refused = 0;
+        int unreadable = 0;
+        // an id this build cannot parse (a newer release's keyed shard): its readers could not serve it
+        for (String id : unparseable) {
+            System.out.printf("  %-25s  catalog entry this pharos cannot read: refused%n", id);
+            refused++;
+        }
+        for (com.pharos.cluster.ShardId shard : shards) {
+            try {
+                var gen = source.latest(shard);
+                if (gen.isEmpty()) {
+                    System.out.printf("  %-25s  not published yet%n", shard.value());
+                    continue;
+                }
+                int format = source.manifest(shard, gen.get()).indexFormatVersion();
+                IndexFormat.Status status = IndexFormat.statusOf(format);
+                System.out.printf("  %-25s  generation %d, index format %d: %s%n", shard.value(), gen.get().value(),
+                        format, status.wireName());
+                if (!IndexFormat.servable(status)) refused++;
+            } catch (java.io.IOException e) {
+                System.err.printf("  %-25s  unreadable: %s%n", shard.value(), e.getMessage());
+                unreadable++;
+            }
+        }
+        return checkSummary(shards.size() + unparseable.size(), refused, unreadable, "shard");
+    }
+
+    /** {@code --check} without a bucket: the registry's projects, as this build would judge their indexes. */
+    private int checkLocal() {
+        int refused = 0;
+        int total = 0;
+        for (ProjectMeta p : registry.listAll()) {
+            if (!ProjectNames.isValid(p.getName())) continue;
+            IndexFormat.Status status = IndexFormat.status(IndexFormat.dir(p.getIndexPath()));
+            if (status == IndexFormat.Status.MISSING || status == IndexFormat.Status.INVALID) continue;
+            total++;
+            System.out.printf("  %-25s  %s%n", p.getName(), status.wireName());
+            if (!IndexFormat.servable(status)) refused++;
+        }
+        return checkSummary(total, refused, 0, "project");
+    }
+
+    private static int checkSummary(int total, int refused, int unreadable, String what) {
+        System.out.printf("Checked %d %s%s with pharos %s (index formats %d-%d): %d refused, %d unreadable.%n",
+                total, what, total == 1 ? "" : "s", com.pharos.PharosVersion.get(), IndexFormat.MIN_READABLE_FORMAT,
+                com.pharos.indexer.IndexVersions.INDEX_FORMAT, refused, unreadable);
+        if (refused > 0) {
+            System.out.println("This pharos would refuse " + refused + " " + what + (refused == 1 ? "" : "s")
+                    + ": re-index them on the current release first (see UPGRADING.md), or keep the current release.");
+            return EXIT_REFUSED;
+        }
+        return unreadable > 0 ? EXIT_INCOMPLETE : EXIT_OK;
     }
 }

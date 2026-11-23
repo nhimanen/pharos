@@ -1,0 +1,56 @@
+# The pharos operator. One replica (no leader election in v1); it watches PharosClusters in its
+# own namespace only (WATCH_NAMESPACE). Replace OWNER with the lowercased GitHub owner and VERSION
+# with the release (e.g. 1.6.0); for minikube, `minikube image load pharos-operator:<tag>` and set that image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharos-operator
+  namespace: pharos
+  labels:
+    app.kubernetes.io/name: pharos-operator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                    # never two operators reconciling the same clusters
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pharos-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pharos-operator
+    spec:
+      serviceAccountName: pharos-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: operator
+          image: ghcr.io/OWNER/pharos-operator:VERSION
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WATCH_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            # The pharos image repository; each PharosCluster's spec.version is the tag.
+            - name: PHAROS_IMAGE
+              value: ghcr.io/OWNER/pharos
+            # minio mode only; pinned releases by default (uncomment to override, e.g. with a mirror).
+            # MinIO itself no longer publishes images (quay.io/minio and docker.io/minio refuse pulls);
+            # the defaults are community builds of the same sources:
+            # - { name: MINIO_IMAGE, value: "docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z" }
+            # - { name: MC_IMAGE, value: "docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z" }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

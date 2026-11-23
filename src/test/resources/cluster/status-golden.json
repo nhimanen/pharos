@@ -214,7 +214,25 @@
       "warmP95Millis" : 640
     },
     "action" : "Start 1 reader",
+    "delta" : 1,
     "since" : "2026-11-21T10:00:00Z"
+  }, {
+    "id" : "cfee3b6736da69c26cc9cb0c98314f66992cd5d8",
+    "kind" : "add-writers",
+    "target" : "writers",
+    "reason" : "indexing backlog above target and fewer writers than shards",
+    "metrics" : {
+      "oldestPendingAgeSeconds" : 493,
+      "shardsPending" : 2,
+      "shardsPendingOverTarget" : 2,
+      "targetBacklogShards" : 1,
+      "targetOldestPendingSeconds" : 300,
+      "workableShards" : 3,
+      "writers" : 2
+    },
+    "action" : "Start 1 writer; leases rebalance",
+    "delta" : 1,
+    "since" : "2026-11-21T10:03:30Z"
   }, {
     "id" : "285a2b0ddbe37d749157b2eca82a826950c5248f",
     "kind" : "reshard",

@@ -54,7 +54,9 @@ and [CHANGELOG.md](CHANGELOG.md).
 
 `pharos upgrade-indexes` exit codes: **0** nothing to upgrade, all upgraded, or aborted at the prompt;
 **1** a project was skipped (unknown, missing index, root gone) or failed; **2** confirmation needed but
-no terminal (re-run with `--yes`); **5** refused on a cluster reader node (upgrade and re-publish on the
+no terminal (re-run with `--yes`); **3** (`--check`, which changes nothing) an index has a format this release
+refuses (older than N-1, or newer; with an object-store backend: any shard published in the bucket); **5**
+refused on a cluster reader node (upgrade and re-publish on the
 writer) or on a work-queue writer (it upgrades by itself: restart it on the new release, see
 "Work-queue writers"). `./setup.sh --upgrade-indexes` exits with the same code.
 
@@ -424,6 +426,8 @@ Reader node (same `objectStore` section; `cacheDir` is where generations are kep
 ```
 
 - Credentials come from the environment variables named by `accessKeyEnv` / `secretKeyEnv` (set both or neither; a named variable that is unset or empty is an error, not a silent fallback), or, when neither is configured, the AWS default credential chain. Use `"pathStyle": true` for MinIO.
+- **Token from the environment.** Instead of `cluster.token`, set `"tokenEnv": "PHAROS_CLUSTER_TOKEN"` to read the token from that environment variable (as Kubernetes passes a Secret), so it never sits in `config.json`. The two are mutually exclusive. Surrounding whitespace (such as the trailing newline of a Secret made with `--from-file`) is stripped; a named variable that is unset or empty, or whose value has whitespace or control characters inside it, is an error at startup.
+- **Check a config file:** `pharos config validate <file>` (`./pharos config validate <file>`) reads the file as `config.json` and runs the validation a node runs at startup (`tokenEnv` is read from the current environment). It prints `ok` and exits 0, or prints the problem to stderr and exits 2. It reads only that file, so it works when the node's own config is broken, and its messages never echo a value from the file.
 - `nodeId` defaults to the host name. `pollIntervalSeconds` must be positive, `retentionMinutes` non-negative, `retentionGenerations` at least 2, and `prefix` must not start with `/` or contain `.`/`..` segments.
 - `objectStore.readTimeoutSeconds` (default 10, 1–3600) bounds the store's connect time and each attempt of a reader's ranged read; a whole ranged read, retries included, gets three times that (30 s). A query whose block can't be fetched in that time fails with an error naming the shard and object key, instead of stalling while the bucket is unreachable. That wait starts when the query asks for the block, so it includes time queued behind other fetches (`maxConcurrentFetches` at once): under a burst of cold misses a block can time out although the bucket answers each fetch quickly. Raise `maxConcurrentFetches` or `readTimeoutSeconds` if timeouts appear only under load. Other calls (whole-object downloads, the writer's uploads, catalog reads) wait up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a response.
 - `retireGraceSeconds` (default 120) is how long a reader keeps a shard's directory after it stops serving it, so queries and shard calls already reading it finish. It must be at least `2 x pollIntervalSeconds` and at least the fan-out timeout (`fanoutTimeoutMillis`, default 5000; `connectTimeoutMillis`, default 1000, bounds the connect). Both rules are checked at startup and the message names the fields.
@@ -545,7 +549,8 @@ A `role: writer` node runs the **work queue** by default (`cluster.writer.workQu
 - **Upgrades.** On a work-queue cluster, upgrading is restarting the writers on the new release: a held shard is pending, and gets a full run, when its local index needs one (another index format, a broken graph pointer), its files were embedded under another `CHUNKING_VERSION` or model, or its published `LATEST` generation has an older index format. So every shard is re-indexed and re-published without a source change (embeddings from its cache). Don't run `upgrade-indexes` there (it is refused).
 - **One work loop per node.** `pharos web` takes `<workDir>/.work-loop.lock` before it starts the loop. A second pharos daemon with the same config on the same host (for example one `./pharos` starts on demand) logs a WARN, `another process is the writer for node <id> …`, runs no loop and serves everything else.
 
-- **Sources.** A shard is workable once its catalog entry names a source: index it once on a hand-run writer with `pharos index <dir> --single --project <name> --source-git <url> --ref <branch>` (or `--source-path <dir>`, a directory every writer can read; `pharos publish <project>` takes the same flags). `--no-embed` is recorded with the source (`"embed": false`), and work-queue writers then index that shard without embeddings too. A shard without a source stays with the writer that has its path (pinned).
+- **Sources.** A shard is workable once its catalog entry names a source: index it once on a hand-run writer with `pharos index <dir> --single --project <name> --source-git <url> --ref <branch>` (or `--source-path <dir>`, a directory every writer can read; `pharos publish <project>` takes the same flags), or only register the source, with no path: `pharos index --project <name> --source-git <url> --ref <branch>`. That indexes nothing and publishes nothing, so it runs on any writer config, a work-queue writer's included, with or without writers running; running it again with another url or ref replaces the source. `--no-embed` is recorded with the source (`"embed": false`), and work-queue writers then index that shard without embeddings too. A shard without a source stays with the writer that has its path (pinned). `pharos remove-index --from-catalog <name>` removes a project from the catalog: writers release it and readers stop serving it; its generations and writer state stay in the bucket, and registering it again resumes from them.
+- **Git credentials.** Writers run git with their own environment (credential helper, ssh agent, `GIT_ASKPASS`). For credentials per project, `cluster.writer.gitCredentials` maps a project to a directory (`{"mypal": "/etc/pharos/git/mypal"}`) holding the keys of a Kubernetes `ssh-auth` or `basic-auth` Secret: `ssh-privatekey` (and optionally `known_hosts`; without it a host key is accepted on first contact and pinned in `<workDir>/.ssh-known-hosts`), or `username` and `password` (a token works as the password). Only that project's clone, fetch and `ls-remote` use them; git reads the files when it needs them, and the config holds paths only. A URL must not carry credentials.
 - **Change detection.** Every `pollSeconds` (default 60, at a fixed rate, also while another shard is being indexed) a writer checks the sources of the shards it holds, read-only (`git ls-remote` of the source URL, or a digest of a path source's tree; `ls-remote` is killed after `lsRemoteTimeoutSeconds`, default 30, and an unreachable remote stalls only its own shard), and writes its heartbeat as soon as one has an unpublished change, so the backlog shows it within one poll. It indexes pending shards one at a time, oldest change first; a change pushed during a shard's own run stays pending after that run publishes.
 - **Leases.** One writer holds a shard's lease (`shards/<shard>/lease`, renewed every `leaseTtlSeconds` / 3, default TTL 30 s, expiry judged by the bucket's clock). When a writer dies its leases expire after the TTL, and another writer takes them on its next poll, restores the shard's writer state (embedding cache, file state) from the bucket and resumes from the last published generation, so unchanged code is not re-embedded. Writers share the shards (`ceil(shards / writers)` each) and release a surplus shard only after its publish or while it has nothing unpublished, never within `minHoldSeconds` (120) of taking it. A writer's checkout lives in `workDir/<shard>` (default `~/.pharos/work`): give every writer the same `workDir` path (as containers do), otherwise each takeover re-parses the shard in full (embeddings still come from the restored cache).
 - **Disk guard** (`cluster.writer.disk`): a writer whose free space is below `max(minFreeBytes, minFreePercent % of the disk)` (defaults 5 GiB and 0 %, so 5 GiB; raise `minFreeBytes`, or set a percentage, to keep more headroom) takes no new shard, refuses or aborts (at a safe point, never half committed) a run that would cross it, hands its pending shards to other writers and reports `low` in its heartbeat (`/cluster/status` health `writer-low-disk`) and in a WARN, once per low episode; it is back once free space exceeds the threshold plus `hysteresisBytes` (1 GiB).
@@ -566,6 +571,26 @@ The writer holding the project runs it under a per-project lease (`projects/<p>/
 
 A reshard shows in `/cluster/status` (`projects[].reshard`: phase `requested` → `building` → `pinned` → `flipped`, or `abandoned`; shards and moved files done of total; the writer holding the reshard lease; `specs[]` lists every spec version as active, staged, retired…), as `reshard` events on `/cluster/events` (at each phase and each quarter of the shards or files) and on the Cluster page. When a shard grows past half of a reader's cache, the `reshard` proposal names the command to run, e.g. `pharos reshard lucene --spec "[project, ring(path, shards=4)]"` (a ring of `ceil(largest shard size / that threshold)` shards, at least 2, since the ring splits each shard; a ringed project of N shards gets at least N + 1). Applying it stays manual.
 
+### Scaling proposals
+
+`GET /cluster/status` (and `/cluster/events`, and the optional `cluster.status.webhookUrl`) lists the scaling proposals in force. Pharos applies none of them; an operator or a person does. Each scaling proposal carries a signed `delta`, the node count its `action` names: `+N` to start N readers or writers, `-N` to stop N. `reshard` and `writer-disk` proposals carry no `delta`. The rules and their keys under `cluster.status`, with defaults:
+
+| Proposal | Raised when | Keys |
+|---|---|---|
+| `add-readers` | the highest warm p95 or the QPS per reader is above target for the window | `targets.warmP95Millis` (500), `targets.qpsPerReader` (50), `windows.addReadersSeconds` (300) |
+| `remove-readers` | more than one reader, QPS per reader below `removeReadersLoad` of the target, warm p95 within target | `removeReadersLoad` (0.2, above 0 and below 1), `windows.removeReadersSeconds` (1800) |
+| `add-writers` | at least `writers.backlogShards` shards have an unpublished change older than `writers.oldestPendingSeconds`, and there are fewer live writers than workable shards | `writers.backlogShards` (1), `writers.oldestPendingSeconds` (300), `windows.addWritersSeconds` (0) |
+| `remove-writers` | more than one live writer, none indexing and nothing pending, for `writers.idleSeconds` | `writers.idleSeconds` (unset: `windows.removeWritersSeconds`, 1800; both set to different values is an error) |
+| `reshard` | a shard is above half of the smallest reader cache cap | `windows.reshardSeconds` (0) |
+| `writer-disk` | a writer reports low disk | `windows.writerDiskSeconds` (0) |
+
+`targets.backlog` (600) sets when a pending shard is reported as `shard-lagging` in `health`. A proposal clears after its condition has been false for `windows.clearGraceSeconds` (60).
+
+```json
+"status": {"removeReadersLoad": 0.2,
+           "writers": {"backlogShards": 1, "oldestPendingSeconds": 300, "idleSeconds": 1800}}
+```
+
 ### Cluster page
 
 The web UI (`pharos web`, `./pharos web`) has a **Cluster** button next to *Module Graph*; `http://<node>:7171/#cluster` opens it directly. It is drawn only from `GET /cluster/status` (the public view, without reader addresses) on the node you opened, so any node shows the same cluster:
@@ -577,6 +602,36 @@ The web UI (`pharos web`, `./pharos web`) has a **Cluster** button next to *Modu
 - **Health**, **Nodes** (role, shards, docs, size, free disk, reader cache of cap, hit rate, QPS, warm p95, heartbeat age) and **Sharding** (the spec versions and their state, split projects with their staged and retired versions, and one shard table per spec version — active, staged, retired — with project, owner, generation and readers).
 
 The page follows `/cluster/events` and refetches the status on every event; when the stream is unavailable (a refused stream, more than 64 clients on the node, a proxy that drops it) it polls every 10 s and says so. On a single node (`role: all`) it shows one node holding every project.
+
+## Container image
+
+`docker/pharos/Dockerfile` builds the image the Kubernetes operator deploys (Temurin 25 JRE, the fat jar, python3 with `python-hcl2`, node, git; runs as uid 10001). Build from the repository root: `docker build -f docker/pharos/Dockerfile -t pharos:dev .`. Release tags publish `ghcr.io/<owner>/pharos:<version>`.
+
+Entrypoint contract:
+
+| Setting | Meaning |
+|---|---|
+| `PHAROS_ROLE` | `writer`, `reader` or `all` run `pharos web` (port 7070); `router` runs `pharos router` (port 7080). The node's cluster role comes from `cluster.role` in the config. |
+| `/etc/pharos/config.json` | The config, mounted from a ConfigMap and linked to `$PHAROS_HOME/config.json`. Override the path with `PHAROS_CONFIG`. |
+| `PHAROS_HOME` | State and model cache, `/data/pharos` (put a PVC on `/data`). |
+| `PHAROS_PORT`, `JAVA_OPTS` | Optional port and JVM options. |
+| arguments | One pharos command to run instead of the server, e.g. `index --project lucene --source-git <url> --ref main` (the operator's registration Job); the container exits with its code. |
+
+Pods must set `securityContext` `runAsUser: 10001` and `fsGroup: 10001` when a PVC is mounted on `/data` (the operator sets these). With `PHAROS_ROLE` writer, reader or router a missing config makes the container exit 78, and an invalid one fails `pharos config validate` before serving.
+
+Secrets reach the process only as env vars named by the config (`cluster.tokenEnv`, the object-store key envs); the entrypoint never writes them. It ends in `exec java`, so SIGTERM reaches the JVM. There is no `HEALTHCHECK`; use Kubernetes probes on `/health`. `scripts/image-smoke.sh` builds the image, runs one node and searches once; it needs a Docker daemon.
+
+### Kubernetes operator: MinIO images and keeping the bucket
+
+With `storage.minio`, the operator deploys MinIO and creates the bucket with `mc`. MinIO no longer publishes images: `quay.io/minio/*` and `docker.io/minio/*` cannot be pulled anymore. The defaults are therefore a community build of the upstream MinIO sources (AGPL), pinned to release tags: `docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z` and `docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z`. To use your own build or a mirror, set the env vars on the operator Deployment (`deploy/operator.yaml`); there is no field in the `PharosCluster` spec for it:
+
+```yaml
+env:
+  - { name: MINIO_IMAGE, value: "registry.example.com/mirror/minio:RELEASE.2026-08-04T00-00-00Z" }
+  - { name: MC_IMAGE, value: "registry.example.com/mirror/mc:RELEASE.2026-11-12T00-00-00Z" }
+```
+
+A changed image applies to the MinIO StatefulSet at the next reconcile. The bucket Job picks it up the next time it is created. Deleting a `PharosCluster` keeps its data: the MinIO PVC and its credentials Secret have no owner reference, so a cluster applied again under the same name adopts them. Writer and reader volume claims also outlive their StatefulSets. A full teardown deletes them by label: `kubectl delete pvc,secret -l pharos.dev/cluster=<name>`.
 
 ## How it works
 

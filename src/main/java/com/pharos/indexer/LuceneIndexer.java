@@ -40,7 +40,7 @@ public class LuceneIndexer implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(LuceneIndexer.class);
 
     /** How long a reader replaced by a shard-path change stays open for in-flight searches. */
-    public static final Duration RETIRE_DELAY = Duration.ofSeconds(60);
+    public static final Duration RETIRE_DELAY = com.pharos.config.ClusterConfig.RETIRE_DELAY;
 
     /** A cached reader and the lucene directory it was opened on. */
     private record CachedReader(Path path, DirectoryReader reader) {}
