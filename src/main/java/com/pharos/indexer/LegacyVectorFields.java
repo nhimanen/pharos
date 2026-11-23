@@ -61,12 +61,23 @@ public final class LegacyVectorFields {
     }
 
     /**
+     * True when {@code luceneDir} belongs to a lazy reader generation ({@code cluster.reader.mode lazy}):
+     * only its eager Lucene files are local and the rest is read from the bucket through the served
+     * reader, so a local open would fail (or, at best, report a misleading "no vectors"). The
+     * Path-based probes below skip such dirs and answer false; callers that print an answer should
+     * check this first and report "unknown on a lazy reader".
+     */
+    public static boolean isLazyGeneration(Path luceneDir) {
+        return luceneDir != null && com.pharos.cluster.warm.LazyGenerations.isLazy(luceneDir.getParent());
+    }
+
+    /**
      * Read-only: does the project's Lucene dir hold live vectors in {@code field}? False when there
      * is no index or it cannot be read. This, not the registry's {@code embeddedModels}, is the
      * evidence that a project can answer vector search for a model.
      */
     public static boolean hasLiveVectors(Path luceneDir, String field) {
-        if (luceneDir == null || !Files.isDirectory(luceneDir)) return false;
+        if (luceneDir == null || !Files.isDirectory(luceneDir) || isLazyGeneration(luceneDir)) return false;
         try (NIOFSDirectory dir = new NIOFSDirectory(luceneDir);
              DirectoryReader r = DirectoryReader.indexExists(dir) ? DirectoryReader.open(dir) : null) {
             return r != null && hasLiveVectors(r, field);
@@ -79,7 +90,8 @@ public final class LegacyVectorFields {
 
     /** Read-only check of a project's Lucene dir; false when there is no index. */
     public static boolean hasLiveMisnamedVectors(Path luceneDir) {
-        if (luceneDir == null || !Files.isDirectory(luceneDir)) return false;
+        // A lazy generation is a reader's: readers never re-embed, so false is the right answer there.
+        if (luceneDir == null || !Files.isDirectory(luceneDir) || isLazyGeneration(luceneDir)) return false;
         try (NIOFSDirectory dir = new NIOFSDirectory(luceneDir);
              DirectoryReader r = DirectoryReader.indexExists(dir) ? DirectoryReader.open(dir) : null) {
             return r != null && hasLiveMisnamedVectors(r);

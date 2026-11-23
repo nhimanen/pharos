@@ -252,6 +252,12 @@ public class EmbeddingsCommand implements Runnable {
                 // search-side legacy allowance: both said "yes" for keyword-only projects.
                 Path lucene = IndexFormat.dir(m.getIndexPath()) == null ? null
                         : IndexFormat.dir(m.getIndexPath()).resolve("lucene");
+                if (LegacyVectorFields.isLazyGeneration(lucene)) {
+                    // Most of a lazy reader's Lucene files live on the bucket: a local probe cannot tell.
+                    System.out.printf("  %-24s unknown (lazy reader; run `pharos embeddings status` on the writer)%n",
+                            m.getName());
+                    continue;
+                }
                 StringBuilder has = new StringBuilder();
                 for (EmbeddingProviderConfig p : cfg.getEmbeddingProviders()) {
                     if (LegacyVectorFields.hasLiveVectors(lucene, DocumentMapper.vectorFieldFor(p.getModelId()))) {
