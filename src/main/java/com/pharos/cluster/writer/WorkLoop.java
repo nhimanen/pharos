@@ -333,6 +333,7 @@ public final class WorkLoop implements Closeable {
         this.lucene = Objects.requireNonNull(lucene, "lucene");
         this.projects = Objects.requireNonNull(projects, "projects");
         this.checkout = Objects.requireNonNull(checkout, "checkout");
+        checkout.useProjects(s -> lastMap.projectOf(s)); // credentials by project, also for keyed shards (I3a)
         this.clock = Objects.requireNonNull(clock, "clock");
         this.balancer = new Balancer(settings.minHold());
         this.startedAt = clock.millis();

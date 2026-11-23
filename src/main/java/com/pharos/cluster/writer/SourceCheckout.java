@@ -30,8 +30,8 @@ import java.util.regex.Pattern;
  * kept under {@code <workDir>/<shard>} for a {@code git} source (cloned on first use, fetched before
  * every {@link #prepare}). Git runs as a subprocess with the writer's own environment, which is where
  * credentials come from (credential helper, ssh agent, {@code GIT_ASKPASS}); a prompt never blocks it.
- * A shard listed in {@code cluster.writer.gitCredentials} gets its own credentials directory on top
- * (see {@link #credentialEnv}): only that shard's git calls see it. Nothing here writes a URL or
+ * A project listed in {@code cluster.writer.gitCredentials} gets its own credentials directory on top
+ * (see {@link #credentialEnv}): only its shards' git calls see it. Nothing here writes a URL or
  * credential anywhere but the clone's own git config, and the credentials directory's files are read
  * by git only, never by pharos.
  */
@@ -47,8 +47,14 @@ public final class SourceCheckout {
     private final Duration gitTimeout;
     private final Duration lsRemoteTimeout;
     private final String gitExecutable;
-    /** Shard (project) name to its credentials directory ({@code cluster.writer.gitCredentials}). */
+    /** Project name to its credentials directory ({@code cluster.writer.gitCredentials}). */
     private final Map<String, Path> credentials;
+    /**
+     * The project of a keyed shard, for the credentials lookup ({@link #useProjects}). A plain id names its
+     * project (a {@code [project]} shard, or the work loop's unit of a split project); a keyed id
+     * ({@code p~ring=s01}) needs the catalog's mapping, never its id string (ruling P6-R8). None by default.
+     */
+    private volatile java.util.function.Function<ShardId, Optional<String>> projectOf = s -> Optional.empty();
     private final Map<ShardId, ShardSource> prepared = new ConcurrentHashMap<>();
 
     public SourceCheckout(Path workDir) {
@@ -62,7 +68,7 @@ public final class SourceCheckout {
 
     /**
      * @param lsRemoteTimeout how long a change check's {@code git ls-remote} may take
-     * @param credentials     shard (project) name to its git credentials directory
+     * @param credentials     project name to its git credentials directory
      */
     public SourceCheckout(Path workDir, Duration lsRemoteTimeout, Map<String, Path> credentials) {
         this(workDir, DEFAULT_GIT_TIMEOUT, lsRemoteTimeout, "git", credentials);
@@ -85,6 +91,14 @@ public final class SourceCheckout {
         this.workDir = Objects.requireNonNull(workDir, "workDir").toAbsolutePath().normalize();
         this.gitTimeout = gitTimeout;
         this.lsRemoteTimeout = Objects.requireNonNull(lsRemoteTimeout, "lsRemoteTimeout");
+    }
+
+    /**
+     * Resolves shards to projects through {@code projectOf} (the work loop passes its catalog mapping), so
+     * a split project's keyed shards get the project's {@code cluster.writer.gitCredentials} entry.
+     */
+    public void useProjects(java.util.function.Function<ShardId, Optional<String>> projectOf) {
+        this.projectOf = Objects.requireNonNull(projectOf, "projectOf");
     }
 
     /** Where a git shard's clone lives. */
@@ -209,10 +223,14 @@ public final class SourceCheckout {
     /**
      * The environment a shard's git calls get on top of the writer's: its credentials directory's
      * ({@link #credentialEnv}), or nothing when it has none, so one project's credentials are never
-     * offered to another project's remote.
+     * offered to another project's remote. The entry is the shard's project's (integration carry I3a):
+     * {@code gitCredentials} is keyed by project, and a split project's shards are not named after it.
      */
     Map<String, String> envFor(ShardId shard) {
-        Path dir = credentials.get(shard.value());
+        // a plain id is a project's name (the work loop's unit, also for a split project); a keyed one is
+        // looked up in the mapping
+        Optional<String> project = shard.keyValues().isEmpty() ? Optional.of(shard.value()) : projectOf.apply(shard);
+        Path dir = project.map(credentials::get).orElse(null);
         return dir == null ? Map.of() : credentialEnv(dir, workDir);
     }
 

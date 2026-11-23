@@ -290,4 +290,32 @@ class SourceCheckoutTest {
         assertThat(checkout.envFor(new ShardId("a")).get("GIT_SSH_COMMAND")).contains(a.toString());
         assertThat(checkout.envFor(new ShardId("b"))).isEmpty();
     }
+
+    /**
+     * Integration carry I3a: gitCredentials is keyed by project; a split project's shards carry keyed ids
+     * ({@code p~ring=s01}), so the lookup goes through the project mapping, not the id string.
+     */
+    @Test
+    void aKeyedShardGetsItsProjectsCredentials() throws Exception {
+        Path p = secretDir("p", java.util.Map.of("ssh-privatekey", "KEY"));
+        SourceCheckout checkout = new SourceCheckout(tmp.resolve("work"), Duration.ofSeconds(5),
+                java.util.Map.of("p", p));
+        ShardId keyed = ShardId.keyed("p", new java.util.LinkedHashMap<>(java.util.Map.of("ring", "s01")));
+        ShardId other = ShardId.keyed("q", new java.util.LinkedHashMap<>(java.util.Map.of("ring", "s01")));
+        assertThat(keyed.value()).isEqualTo("p~ring=s01");
+        assertThat(checkout.envFor(keyed)).as("no mapping: a keyed id names no project").isEmpty();
+
+        com.pharos.cluster.sharding.ProjectShards map = com.pharos.cluster.sharding.ProjectShards.fromCatalog(
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree("""
+                        {"shards":[{"id":"p~ring=s01"},{"id":"q~ring=s01"}],
+                         "specs":[{"version":1,"project":"p","spec":"[project, ring(path, shards=1)]"},
+                                  {"version":2,"project":"q","spec":"[project, ring(path, shards=1)]"}],
+                         "projects":[{"name":"p","spec":1,"shards":["p~ring=s01"]},
+                                     {"name":"q","spec":2,"shards":["q~ring=s01"]}]}"""),
+                java.util.List.of(keyed, other), m -> {});
+        checkout.useProjects(map::projectOf);
+        assertThat(checkout.envFor(keyed).get("GIT_SSH_COMMAND")).contains(p.toString());
+        assertThat(checkout.envFor(other)).as("another project's shard").isEmpty();
+        assertThat(checkout.envFor(ShardId.ofProject("p")).get("GIT_SSH_COMMAND")).contains(p.toString());
+    }
 }
