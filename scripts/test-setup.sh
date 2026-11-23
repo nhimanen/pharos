@@ -44,7 +44,12 @@ mkdir -p "$WORK/badskill/other" && echo x > "$WORK/badskill/other/f"
 tar -czf "$WORK/badskill.tar.gz" -C "$WORK/badskill" other
 make_variant v9.9.7 9.9.7 "$JAR" "$WORK/badskill.tar.gz"
 
-new_home() { mktemp -d "$WORK/home.XXXXXX"; }
+# Each case gets a fresh HOME. The previous case's HOME is deleted first: every install holds a
+# copy of the ~200 MB jar, and keeping them all can fill a small /tmp before the last cases run.
+new_home() {  # --keep: keep earlier homes (a case that compares two installs)
+  [ "${1:-}" = --keep ] || rm -rf "$WORK"/home.*
+  mktemp -d "$WORK/home.XXXXXX"
+}
 
 # register_project HOME NAME FORMAT|none  -> registry.json entry + index dir (stamp optional)
 register_project() {
@@ -225,6 +230,45 @@ t_release_with_upgrade_indexes_installs_then_upgrades() {
 }
 
 # A tag that isn't vX.Y.Z (given, or resolved from "latest") never reaches a path or URL.
+# reader_config HOME -> config.json for a reader node (role reader on an object store)
+reader_config() {
+  mkdir -p "$1/.pharos"
+  printf '%s\n' '{"cluster": {"role": "reader", "backend": "object-store", "objectStore": {"bucket": "b", "endpoint": "http://127.0.0.1:1", "region": "us-east-1"}}}' \
+    > "$1/.pharos/config.json"
+}
+
+# A reader refuses --upgrade-indexes (exit 5, its own code: 2 means "needs --yes") with the writer hint, starts no upgrade JVM and
+# leaves the index alone.
+t_upgrade_indexes_refused_on_reader() {
+  local h; h="$(new_home)"
+  run_setup "$h" --release "$TAG"
+  register_project "$h" oldish none
+  reader_config "$h"
+  JAVA_LOG="$h/java.log" PATH="$STUB_PATH" run_setup "$h" --upgrade-indexes --yes
+  [ "$(rc "$h")" = 5 ] \
+    && grep -q 'readers receive upgrades by syncing; upgrade the writer' "$h/out.txt" \
+    && ! grep -q 'upgrade-indexes' "$h/java.log" 2>/dev/null \
+    && ! grep -q Traceback "$h/out.txt" \
+    && [ ! -f "$h/.pharos/indexes/oldish/index-format.json" ]
+  check upgrade_indexes_refused_on_reader $? "rc=$(rc "$h"); $(tail -6 "$h/out.txt")"
+}
+
+# --release on a reader: the index-status warning points at the writer, not at --upgrade-indexes.
+t_release_on_reader_points_upgrades_at_the_writer() {
+  local h; h="$(new_home)"; preinstall "$h"
+  register_project "$h" oldish none
+  reader_config "$h"
+  # a reader's registry lives in its cluster cache dir (default ~/.pharos/cluster-cache)
+  mkdir -p "$h/.pharos/cluster-cache"
+  mv "$h/.pharos/registry.json" "$h/.pharos/cluster-cache/registry.json"
+  run_setup "$h" --release "$TAG"
+  [ "$(rc "$h")" = 0 ] && grep -q oldish "$h/out.txt" \
+    && grep -q 'reader node: upgrade and re-publish these projects on the writer' "$h/out.txt" \
+    && ! grep -q -- '--upgrade-indexes' "$h/out.txt" \
+    && ! grep -q 'pharos index --full oldish' "$h/out.txt"
+  check release_on_reader_points_upgrades_at_the_writer $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
+}
+
 t_bad_release_tag_rejected() {
   local ok=0 t h
   for t in "v1.4" "1.4.0" "v1.4.0/../../x" "v1.4.0;rm" "latest-ish"; do
@@ -294,11 +338,13 @@ t_bad_skill_bundle_leaves_install_untouched
 t_upgrade_indexes_without_yes_does_not_crash_on_empty_array
 t_upgrade_indexes_delegates_to_cli
 t_release_with_upgrade_indexes_installs_then_upgrades
+t_upgrade_indexes_refused_on_reader
+t_release_on_reader_points_upgrades_at_the_writer
 t_bad_release_tag_rejected
 t_checksum_naming_other_file_fails
 t_release_notes_extracts_and_validates
 t_semantic_hint_only_when_embeddings_off() {
-  local off on; off="$(new_home)"; on="$(new_home)"
+  local off on; off="$(new_home)"; on="$(new_home --keep)"
   run_setup "$off" --release latest
   mkdir -p "$on/.pharos"
   printf '%s\n' '{"embeddingProviders":[{"type":"djl","modelId":"jina-v2-code","url":"hf://jinaai/jina-embeddings-v2-base-code","dimensions":768}]}' \

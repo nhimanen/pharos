@@ -99,4 +99,44 @@ class IndexFormatTest {
         assertThat(IndexFormat.status(dir.resolve("nope"))).isEqualTo(IndexFormat.Status.MISSING);
         assertThatCode(() -> IndexFormat.check("p", dir.resolve("nope"))).doesNotThrowAnyException();
     }
+
+    // ── Reader generation dirs: the fix is on the reader or the writer, never a local re-index ──
+
+    private Path readerGeneration(int format) throws Exception {
+        Path gen = Files.createDirectories(dir.resolve("cache").resolve("p").resolve("gen-7"));
+        Files.writeString(gen.resolve("manifest.json"), "{}");
+        Files.writeString(gen.resolve("index-format.json"),
+                "{\"format\":" + format + ",\"pharosVersion\":\"9.9.9\",\"writtenAt\":\"2026-01-01T00:00:00Z\"}");
+        return gen;
+    }
+
+    @Test
+    void newerGenerationOnReaderSaysUpgradeThisReader() throws Exception {
+        Path gen = readerGeneration(IndexVersions.INDEX_FORMAT + 1);
+        assertThatThrownBy(() -> IndexFormat.check("p", gen))
+                .isInstanceOf(IncompatibleIndexException.class)
+                .hasMessageContaining("generation gen-7")
+                .hasMessageContaining("Upgrade pharos on this reader")
+                .hasMessageNotContaining("setup.sh --upgrade-indexes")
+                .hasMessageNotContaining("Re-index with this version");
+    }
+
+    @Test
+    void outdatedGenerationOnReaderSaysRepublishFromTheWriter() throws Exception {
+        Path gen = readerGeneration(IndexVersions.INDEX_FORMAT - 2);
+        assertThatThrownBy(() -> IndexFormat.check("p", gen))
+                .isInstanceOf(IncompatibleIndexException.class)
+                .hasMessageContaining("Re-publish it from an upgraded writer")
+                .hasMessageContaining("on the writer: pharos index --full p")
+                .hasMessageNotContaining("setup.sh --upgrade-indexes");
+    }
+
+    @Test
+    void writerDirNamedLikeAGenerationKeepsTheWriterHint() throws Exception {
+        Path gen = Files.createDirectories(dir.resolve("gen-7")); // no manifest.json: not a reader dir
+        Files.writeString(gen.resolve("index-format.json"),
+                "{\"format\":" + (IndexVersions.INDEX_FORMAT - 2) + ",\"pharosVersion\":\"0.9.0\"}");
+        assertThatThrownBy(() -> IndexFormat.check("p", gen))
+                .hasMessageContaining("./setup.sh --upgrade-indexes");
+    }
 }

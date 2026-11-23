@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Logging for scripts/cluster-gate.sh. The bundled logback.xml filters the console to WARN+,
+     but the freshness check parses the publisher's "Published shard ... generation N" and the
+     syncer's "materialised generation N ... in M ms" INFO lines. Same console format, with
+     com.pharos.cluster let through at INFO. -->
+<configuration>
+    <statusListener class="ch.qos.logback.core.status.NopStatusListener"/>
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+    </appender>
+    <appender name="CLUSTER" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="STDERR"/>
+    </root>
+    <logger name="com.pharos.cluster" level="INFO" additivity="false">
+        <appender-ref ref="CLUSTER"/>
+    </logger>
+    <logger name="com.github.javaparser" level="ERROR"/>
+    <logger name="org.jgrapht" level="WARN"/>
+    <logger name="ai.djl" level="WARN"/>
+</configuration>

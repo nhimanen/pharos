@@ -55,7 +55,7 @@ class InvalidNameCommandsTest {
         MultiModelEmbedder e = new MultiModelEmbedder(config, lucene, registry) {
             @Override public int embed(String p, String m, boolean f) { seen.add(p); return 0; }
         };
-        String out = capture(() -> new CommandLine(new EmbedCommand(e, registry))
+        String out = capture(() -> new CommandLine(new EmbedCommand(e, registry, config))
                 .execute("--all", "--model", "m"));
         assertThat(seen).containsExactly("good");
         assertThat(out).contains("Skipping invalid project name '.'");
@@ -64,7 +64,7 @@ class InvalidNameCommandsTest {
     @Test
     void backfillAllCommandSkipsInvalidNames() {
         String out = capture(() -> new CommandLine(new BackfillEmbeddingCacheCommand(
-                new EmbeddingCacheBackfiller(config, lucene, registry))).execute("--all"));
+                new EmbeddingCacheBackfiller(config, lucene, registry), config)).execute("--all"));
         assertThat(out).contains("Skipping invalid project name '.'").doesNotContain("Failed for '.'");
     }
 

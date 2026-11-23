@@ -1,15 +1,14 @@
 package com.pharos.cli;
 
 import com.pharos.indexer.IncompatibleIndexException;
-import com.pharos.indexer.IndexFormat;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
-import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.indexer.LuceneIndexer;
 import org.apache.lucene.index.DirectoryReader;
 import picocli.CommandLine.*;
 
-import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.Callable;
 
@@ -64,12 +63,9 @@ public class StatsCommand implements Callable<Integer> {
             }
 
             // Graph stats
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-                try (CallGraph graph = CallGraph.openExisting(CallGraph.projectGraphDir(Path.of(meta.getIndexPath())))) {
-                    System.out.printf("  Graph methods: %d%n", graph.methodCount());
-                    System.out.printf("  Graph calls:   %d%n", graph.callCount());
-                }
+            try (GraphView graph = GraphViews.open(meta)) { // checks the index format first
+                System.out.printf("  Graph methods: %d%n", graph.methodCount());
+                System.out.printf("  Graph calls:   %d%n", graph.callCount());
             } catch (IncompatibleIndexException e) {
                 System.out.printf("  Graph:         (index format incompatible: %s)%n", e.status().wireName());
             } catch (Exception e) {

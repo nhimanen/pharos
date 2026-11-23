@@ -1,6 +1,8 @@
 package com.pharos.indexer;
 
 import com.pharos.analysis.SynonymProvider;
+import com.pharos.cluster.LocalCache;
+import com.pharos.cluster.LocalFsCache;
 import com.pharos.config.IndexConfig;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
@@ -23,7 +25,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.ParseException;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Manages Lucene index directories — opening writers and readers per project,
@@ -33,11 +39,36 @@ public class LuceneIndexer implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(LuceneIndexer.class);
 
+    /** How long a reader replaced by a shard-path change stays open for in-flight searches. */
+    public static final Duration RETIRE_DELAY = Duration.ofSeconds(60);
+
+    /** A cached reader and the lucene directory it was opened on. */
+    private record CachedReader(Path path, DirectoryReader reader) {}
+
     private final IndexConfig config;
-    private final Map<String, DirectoryReader> openReaders = new HashMap<>();
+    /** Guarded by {@code this}. */
+    private final Map<String, CachedReader> openReaders = new HashMap<>();
+    /** Readers swapped out by a path change, awaiting their delayed close; guarded by {@code this}. */
+    private final Set<DirectoryReader> retired = new HashSet<>();
+    /** Lazily created single daemon thread closing retired readers; guarded by {@code this}. */
+    private ScheduledExecutorService retirer;
+    private final Duration retireDelay;
+
+    private final LocalCache cache;
 
     public LuceneIndexer(IndexConfig config) {
+        this(config, new LocalFsCache(config));
+    }
+
+    public LuceneIndexer(IndexConfig config, LocalCache cache) {
+        this(config, cache, RETIRE_DELAY);
+    }
+
+    /** Package-private: a shorter retire delay for tests. */
+    LuceneIndexer(IndexConfig config, LocalCache cache, Duration retireDelay) {
         this.config = config;
+        this.cache = cache;
+        this.retireDelay = retireDelay;
     }
 
     /**
@@ -80,27 +111,62 @@ public class LuceneIndexer implements Closeable {
         return new IndexWriter(dir, iwc);
     }
 
-    /** Open a DirectoryReader for a single project. Caches and refreshes automatically. */
-    public DirectoryReader openReader(String projectName) throws IOException {
+    /**
+     * Open a DirectoryReader for a single project. Caches and refreshes automatically.
+     *
+     * <p>When the project's lucene path changed since the cached reader was opened (a reader
+     * node activated a new generation directory), a fresh reader is opened on the new path and
+     * published first; the old one is retired and closed after {@link #RETIRE_DELAY}, so searches
+     * that obtained it just before the swap can finish.
+     */
+    public synchronized DirectoryReader openReader(String projectName) throws IOException {
         IndexFormat.check(projectName, getProjectIndexDir(projectName));
         Path luceneDir = getLucenePath(projectName);
-        if (!Files.exists(luceneDir) || !indexExists(projectName)) {
+        if (!Files.exists(luceneDir) || !indexExists(luceneDir)) {
             throw new IOException("No valid index found for project: " + projectName
                     + " (run 'pharos index' first)");
         }
-        DirectoryReader cached = openReaders.get(projectName);
-        if (cached != null) {
-            DirectoryReader refreshed = DirectoryReader.openIfChanged(cached);
+        CachedReader cached = openReaders.get(projectName);
+        if (cached != null && cached.path().equals(luceneDir)) {
+            DirectoryReader refreshed = DirectoryReader.openIfChanged(cached.reader());
             if (refreshed != null) {
-                cached.close();
-                openReaders.put(projectName, refreshed);
+                cached.reader().close();
+                openReaders.put(projectName, new CachedReader(luceneDir, refreshed));
                 return refreshed;
             }
-            return cached;
+            return cached.reader();
         }
         DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
-        openReaders.put(projectName, reader);
+        openReaders.put(projectName, new CachedReader(luceneDir, reader));
+        if (cached != null) {
+            log.info("Project '{}' moved to {}; retiring the reader on {}", projectName, luceneDir, cached.path());
+            retire(cached.reader());
+        }
         return reader;
+    }
+
+    /** Schedules {@code old} to be closed after the retire delay; caller holds {@code this}. */
+    private void retire(DirectoryReader old) {
+        retired.add(old);
+        if (retirer == null) {
+            retirer = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "pharos-reader-retire");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        retirer.schedule(() -> closeRetired(old), retireDelay.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    private void closeRetired(DirectoryReader old) {
+        synchronized (this) {
+            if (!retired.remove(old)) return; // already closed by close()
+        }
+        try {
+            old.close();
+        } catch (IOException e) {
+            log.warn("Error closing retired reader: {}", e.getMessage());
+        }
     }
 
     /**
@@ -124,7 +190,10 @@ public class LuceneIndexer implements Closeable {
 
     /** Returns true if a valid (committed) Lucene index exists for the given project. */
     public boolean indexExists(String projectName) {
-        Path luceneDir = getLucenePath(projectName);
+        return indexExists(getLucenePath(projectName));
+    }
+
+    private static boolean indexExists(Path luceneDir) {
         if (!Files.exists(luceneDir)) return false;
         try (Directory dir = openDirectory(luceneDir)) {
             return DirectoryReader.indexExists(dir);
@@ -149,23 +218,23 @@ public class LuceneIndexer implements Closeable {
     }
 
     public Path getLucenePath(String projectName) {
-        return config.getIndexDir().resolve(projectName).resolve("lucene");
+        return getProjectIndexDir(projectName).resolve("lucene");
     }
 
     public Path getProjectIndexDir(String projectName) {
-        return config.getIndexDir().resolve(projectName);
+        return cache.shardDir(projectName);
     }
 
     /**
      * Deletes the Lucene index directory for a project and evicts any cached reader.
      * Called by force re-index to clear incompatible or corrupt index state.
      */
-    public void deleteIndex(String projectName) throws IOException {
+    public synchronized void deleteIndex(String projectName) throws IOException {
         // Refuse before touching anything: a name like "." resolves to the index root itself.
         ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
-        DirectoryReader cached = openReaders.remove(projectName);
+        CachedReader cached = openReaders.remove(projectName);
         if (cached != null) {
-            try { cached.close(); } catch (IOException ignored) {}
+            try { cached.reader().close(); } catch (IOException ignored) {}
         }
         Path luceneDir = getLucenePath(projectName);
         if (Files.exists(luceneDir)) {
@@ -254,15 +323,28 @@ public class LuceneIndexer implements Closeable {
         return new PerFieldAnalyzerWrapper(new KeywordAnalyzer(), fieldAnalyzers);
     }
 
+    /** Closes cached readers and, immediately, any retired ones still awaiting their delay. */
     @Override
-    public void close() {
-        for (Map.Entry<String, DirectoryReader> entry : openReaders.entrySet()) {
+    public synchronized void close() {
+        for (Map.Entry<String, CachedReader> entry : openReaders.entrySet()) {
             try {
-                entry.getValue().close();
+                entry.getValue().reader().close();
             } catch (IOException e) {
                 log.warn("Error closing reader for {}: {}", entry.getKey(), e.getMessage());
             }
         }
         openReaders.clear();
+        for (DirectoryReader r : retired) {
+            try {
+                r.close();
+            } catch (IOException e) {
+                log.warn("Error closing retired reader: {}", e.getMessage());
+            }
+        }
+        retired.clear();
+        if (retirer != null) {
+            retirer.shutdownNow();
+            retirer = null;
+        }
     }
 }

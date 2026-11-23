@@ -1,5 +1,6 @@
 package com.pharos.cli;
 
+import com.pharos.cluster.RoleGuard;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -22,15 +23,32 @@ import java.util.function.Function;
 
 /**
  * Re-indexes (full) every project whose index is {@code upgrade-available}, {@code outdated}
- * or {@code newer}, so the whole set reaches the current index format.
+ * or {@code newer}, so the whole set reaches the current index format. Refused on reader nodes:
+ * they receive upgraded generations by syncing from the writer.
+ *
+ * <p>Exit codes: {@value #EXIT_OK} nothing to do, all upgraded, or aborted at the prompt;
+ * {@value #EXIT_INCOMPLETE} a project was skipped (unknown, missing index, root gone) or failed;
+ * {@value #EXIT_NEEDS_YES} confirmation needed but no terminal (use --yes);
+ * {@value #EXIT_READER} refused on a reader node.
  */
 @Command(
         name = "upgrade-indexes",
         description = "Re-index projects whose index format is not current (full re-index, embeddings included "
                 + "unless --no-embed)",
-        mixinStandardHelpOptions = true
+        mixinStandardHelpOptions = true,
+        exitCodeListHeading = "%nExit codes:%n",
+        exitCodeList = {
+                "0:nothing to upgrade, all upgraded, or aborted at the prompt",
+                "1:a project was skipped (unknown, missing index, root gone) or failed",
+                "2:confirmation needed but no terminal; re-run with --yes",
+                "5:refused on a reader node (readers receive upgrades by syncing; upgrade the writer)"}
 )
 public class UpgradeIndexesCommand implements Callable<Integer> {
+
+    static final int EXIT_OK = 0;
+    static final int EXIT_INCOMPLETE = 1;
+    static final int EXIT_NEEDS_YES = 2;
+    static final int EXIT_READER = 5;
 
     @Parameters(arity = "0..*", description = "Only these projects (default: all that need upgrading)")
     private List<String> names = new ArrayList<>();
@@ -83,6 +101,12 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        try {
+            RoleGuard.requireUpgrades(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return EXIT_READER;
+        }
         Set<String> wanted = new HashSet<>(names);
         List<ProjectMeta> todo = new ArrayList<>();
         List<ProjectMeta> missing = new ArrayList<>();

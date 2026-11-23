@@ -8,6 +8,9 @@ import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.graph.CrossProjectLinker;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraphBuilder;
+import com.pharos.cluster.Backends;
+import com.pharos.cluster.ClusterRuntime;
+import com.pharos.cluster.ReplicationBackend;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProjectIndexManager;
 import com.pharos.parser.CodeParser;
@@ -51,14 +54,21 @@ public class Main {
             return;
         }
 
-        // Core components
-        ProjectRegistry registry = new ProjectRegistry(config);
+        // Core components. Readers serve the registry their syncer fills from the object
+        // store, and never read source files (bodies come from the index).
+        ProjectRegistry registry = ClusterRuntime.registryFor(config);
+        ClusterRuntime.applySourceReadPolicy(config);
         // Build all configured embedding providers — indexing writes one vector
         // field per model; search picks one provider via config.searchEmbeddingModel.
         List<EmbeddingProvider> embedders = EmbeddingProvider.createAll(config);
         // Same instance as the matching indexing provider — not a second copy of the model.
         EmbeddingProvider searchEmbedder = EmbeddingProvider.searchProvider(config, embedders);
-        LuceneIndexer luceneIndexer = new LuceneIndexer(config);
+        ReplicationBackend backend = Backends.create(config);
+        LuceneIndexer luceneIndexer = new LuceneIndexer(config, backend.localCache());
+        // Owns the backend (object-store client) and, on readers, the syncer thread. Closed when
+        // the command returns and, for daemons stopped by a signal, by the shutdown hook.
+        ClusterRuntime clusterRuntime = new ClusterRuntime(config, backend, registry, luceneIndexer);
+        Runtime.getRuntime().addShutdownHook(new Thread(clusterRuntime::close, "pharos-cluster-shutdown"));
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
         // Tier-2 regex-based parsers — no external runtime needed
@@ -75,7 +85,7 @@ public class Main {
         parsers.addAll(regexParsers);
         parsers.add(new GenericFileParser(parseThreads, config.maxFileSizeBytes(true))); // must be last (catch-all)
         ProjectIndexManager indexManager = new ProjectIndexManager(
-                config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers);
+                config, luceneIndexer, registry, embedders, moduleGraphBuilder, parsers, clusterRuntime.publisher());
         CrossEncoder crossEncoder = buildCrossEncoder(config);
         SearchEngine searchEngine = new SearchEngine(luceneIndexer, searchEmbedder, registry, crossEncoder);
         ModuleBoundaryAnalyzer boundaryAnalyzer = new ModuleBoundaryAnalyzer(registry, searchEngine);
@@ -84,9 +94,14 @@ public class Main {
         // Build picocli CommandLine with injected dependencies via factory
         CommandLine cmd = new CommandLine(new CodeSearchCommand(),
                 new DependencyFactory(config, registry, luceneIndexer, indexManager, searchEngine,
-                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker, embedders));
+                        moduleGraphBuilder, boundaryAnalyzer, crossProjectLinker, embedders, clusterRuntime));
 
-        int exitCode = cmd.execute(args);
+        int exitCode;
+        try {
+            exitCode = cmd.execute(args); // daemons (web, mcp-server) serve inside this call
+        } finally {
+            clusterRuntime.close();
+        }
         // Let background model calls (e.g. a server's warm-up) finish before exit runs ORT's
         // shutdown hook, which frees the native environment under any call still running.
         com.pharos.embedding.NativeInferenceGuard.beginShutdown();
@@ -145,14 +160,17 @@ public class Main {
         private final CrossProjectLinker crossProjectLinker;
         /** The process's embedding providers — shared so no command loads a model twice. */
         private final List<EmbeddingProvider> embedders;
+        private final ClusterRuntime clusterRuntime;
 
         DependencyFactory(IndexConfig config, ProjectRegistry registry,
                           LuceneIndexer luceneIndexer, ProjectIndexManager indexManager,
                           SearchEngine searchEngine, ModuleGraphBuilder moduleGraphBuilder,
                           ModuleBoundaryAnalyzer boundaryAnalyzer,
                           CrossProjectLinker crossProjectLinker,
-                          List<EmbeddingProvider> embedders) {
+                          List<EmbeddingProvider> embedders,
+                          ClusterRuntime clusterRuntime) {
             this.embedders = embedders;
+            this.clusterRuntime = clusterRuntime;
             this.config = config;
             this.registry = registry;
             this.luceneIndexer = luceneIndexer;
@@ -194,7 +212,7 @@ public class Main {
                 return (K) new StatsCommand(registry, luceneIndexer);
             if (cls == McpServerCommand.class)
                 return (K) new McpServerCommand(searchEngine, registry,
-                        moduleGraphBuilder, boundaryAnalyzer);
+                        moduleGraphBuilder, boundaryAnalyzer, clusterRuntime, config.getCluster().getRole());
             if (cls == ModulesCommand.class)
                 return (K) new ModulesCommand(moduleGraphBuilder);
             if (cls == ModuleDepsCommand.class)
@@ -203,24 +221,28 @@ public class Main {
                 return (K) new ModulePathCommand(moduleGraphBuilder);
             if (cls == WebCommand.class)
                 return (K) new WebCommand(new WebServer(searchEngine, registry,
-                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer), searchEngine);
+                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, config.getCluster().getRole()),
+                        searchEngine, clusterRuntime);
             if (cls == RemoveIndexCommand.class)
-                return (K) new RemoveIndexCommand(registry, indexManager);
+                return (K) new RemoveIndexCommand(registry, indexManager, config);
             if (cls == BackfillEmbeddingCacheCommand.class)
                 return (K) new BackfillEmbeddingCacheCommand(
-                        new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry));
+                        new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry), config);
             if (cls == IndexStatusCommand.class)
-                return (K) new IndexStatusCommand(registry, !config.getEmbeddingProviders().isEmpty());
+                return (K) new IndexStatusCommand(registry, config.getCluster().getRole(),
+                        !config.getEmbeddingProviders().isEmpty());
             if (cls == UpgradeIndexesCommand.class)
                 return (K) new UpgradeIndexesCommand(indexManager, registry, config);
             if (cls == EmbeddingsCommand.class)
                 return (K) new EmbeddingsCommand(IndexConfig.DEFAULT_BASE, registry);
             if (cls == MineCommand.class)
-                return (K) new MineCommand(registry, luceneIndexer);
+                return (K) new MineCommand(registry, luceneIndexer, config);
             if (cls == EmbedCommand.class)
                 return (K) new EmbedCommand(
                         new com.pharos.indexer.MultiModelEmbedder(config, luceneIndexer, registry, embedders),
-                        registry);
+                        registry, config);
+            if (cls == PublishCommand.class)
+                return (K) new PublishCommand(config, registry, clusterRuntime);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

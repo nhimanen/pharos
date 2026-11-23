@@ -60,13 +60,13 @@ public class ProjectRegistry {
         this(IndexConfig.DEFAULT_BASE.resolve("registry.json"));
     }
 
-    /** Registry backed by an explicit file, e.g. an isolated location for tests. */
+    /** Registry backed by an explicit file (isolated from {@code ~/.pharos}); for tests and embedding. */
     public static ProjectRegistry at(Path registryFile) {
         return new ProjectRegistry(registryFile);
     }
 
-    /** Package-private: explicit registry path, used by tests that need an isolated location. */
-    ProjectRegistry(Path registryFile) {
+    /** Explicit registry path (see {@link #at}); protected so tests can inject failures. */
+    protected ProjectRegistry(Path registryFile) {
         this.registryFile = registryFile;
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())

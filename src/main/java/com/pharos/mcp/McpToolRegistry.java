@@ -4,7 +4,8 @@ import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
 import com.pharos.indexer.IncompatibleIndexException;
-import com.pharos.indexer.IndexFormat;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.graph.ModuleBoundaryAnalyzer;
 import com.pharos.graph.ModuleGraph;
 import com.pharos.graph.ModuleGraphBuilder;
@@ -17,10 +18,10 @@ import com.pharos.search.SearchResponse;
 import com.pharos.search.SearchResult;
 import com.pharos.search.Snippet;
 import com.pharos.search.SourceReader;
+import com.pharos.cluster.NodeRole;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -43,7 +44,14 @@ public class McpToolRegistry {
     private final ProjectRegistry registry;
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
+    /** Readers have no module graph yet (it is not replicated). */
+    private final boolean readerNode;
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /** Answer of module tools on reader nodes. */
+    public static final String NOT_ON_READERS = "not available on reader nodes yet";
+    private static final java.util.Set<String> MODULE_TOOLS = java.util.Set.of(
+            "list_modules", "get_module_deps", "find_module_path", "get_module_boundary");
 
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(McpToolRegistry.class);
 
@@ -58,10 +66,17 @@ public class McpToolRegistry {
     public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry,
                             ModuleGraphBuilder moduleGraphBuilder,
                             ModuleBoundaryAnalyzer boundaryAnalyzer) {
+        this(searchEngine, registry, moduleGraphBuilder, boundaryAnalyzer, NodeRole.ALL);
+    }
+
+    public McpToolRegistry(SearchEngine searchEngine, ProjectRegistry registry,
+                            ModuleGraphBuilder moduleGraphBuilder,
+                            ModuleBoundaryAnalyzer boundaryAnalyzer, NodeRole role) {
         this.searchEngine = searchEngine;
         this.registry = registry;
         this.moduleGraphBuilder = moduleGraphBuilder;
         this.boundaryAnalyzer = boundaryAnalyzer;
+        this.readerNode = role == NodeRole.READER;
     }
 
     public List<Map<String, Object>> getToolDefinitions() {
@@ -203,6 +218,9 @@ public class McpToolRegistry {
     }
 
     private String dispatch(String toolName, JsonNode args) throws Exception {
+        if (readerNode && MODULE_TOOLS.contains(toolName)) {
+            return toolName + " is " + NOT_ON_READERS + "; ask a writer node";
+        }
         return switch (toolName) {
             case "search_code"       -> callSearchCode(args);
             case "find_transitive_callers" -> callFindTransitiveCallers(args);
@@ -453,15 +471,8 @@ public class McpToolRegistry {
         String to = args.path("to_fqn").asText();
 
         for (ProjectMeta meta : registry.listAll()) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-            } catch (IncompatibleIndexException e) {
-                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
-                skipped.get().add(e.getMessage());
-                continue;
-            }
-            try (CallGraph g = CallGraph.openExisting(dbDir)) {
+            // GraphViews checks the index format before opening anything
+            try (GraphView g = GraphViews.open(meta)) {
                 List<String> path = g.shortestPath(from, to);
                 if (!path.isEmpty()) {
                     List<Map<String, Object>> steps = path.stream()
@@ -474,6 +485,9 @@ public class McpToolRegistry {
                     out.put("path", steps);
                     return mapper.writeValueAsString(out);
                 }
+            } catch (IncompatibleIndexException e) {
+                log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
+                skipped.get().add(e.getMessage());
             } catch (Exception ignored) {}
         }
         return "No call path found from `" + from + "` to `" + to + "`";
@@ -798,16 +812,12 @@ public class McpToolRegistry {
     private Set<String> getFromGraph(String fqn, boolean callers) {
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            // GraphViews checks the index format before opening anything
+            try (GraphView graph = GraphViews.open(meta)) {
+                result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (IncompatibleIndexException e) {
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
                 skipped.get().add(e.getMessage());
-                continue;
-            }
-            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
-                result.addAll(callers ? graph.callers(fqn) : graph.callees(fqn));
             } catch (Exception ignored) {}
         }
         return result;

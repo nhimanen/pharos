@@ -134,6 +134,16 @@ class IndexStatusCommandTest {
     }
 
     @Test
+    void jsonReportsTheNodeRole() throws Exception {
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute("--json")).isZero();
+        assertThat(new ObjectMapper().readTree(out.toString()).get("role").asText()).isEqualTo("all");
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry, com.pharos.cluster.NodeRole.READER))
+                .execute("--json")).isZero();
+        assertThat(new ObjectMapper().readTree(out.toString()).get("role").asText()).isEqualTo("reader");
+    }
+
+    @Test
     void needsReembedHintPrintsTheRootPathAndKeepsTheName() throws Exception {
         VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
         assertThat(new CommandLine(new IndexStatusCommand(registry, true)).execute()).isZero();

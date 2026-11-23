@@ -1,5 +1,7 @@
 package com.pharos.cli;
 
+import com.pharos.config.IndexConfig;
+import com.pharos.cluster.RoleGuard;
 import com.pharos.config.ProjectMeta;
 import com.pharos.indexer.ProjectNames;
 import com.pharos.config.ProjectRegistry;
@@ -46,14 +48,22 @@ public class EmbedCommand implements Callable<Integer> {
 
     private final MultiModelEmbedder embedder;
     private final ProjectRegistry registry;
+    private final IndexConfig config;
 
-    public EmbedCommand(MultiModelEmbedder embedder, ProjectRegistry registry) {
+    public EmbedCommand(MultiModelEmbedder embedder, ProjectRegistry registry, IndexConfig config) {
         this.embedder = embedder;
         this.registry = registry;
+        this.config = config;
     }
 
     @Override
     public Integer call() throws Exception {
+        try {
+            RoleGuard.requireIndexing(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
         if (all && projectName != null) {
             System.err.println("Specify either a project name or --all, not both.");
             return 2;

@@ -3,6 +3,8 @@ package com.pharos.search;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.search.SourceReader;
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.IndexFormat;
@@ -649,7 +651,7 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
                                           int maxBodyChars, List<String> warnings) throws IOException {
-        List<CallGraph> graphs = openAllGraphs(null, warnings);
+        List<GraphView> graphs = openAllGraphs(null, warnings);
         try {
             BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, direction, 50);
 
@@ -679,7 +681,7 @@ public class SearchEngine {
             return new CallChainResult(rootFqn, direction, depth,
                     nodes.size(), bfs.truncated(), nodes);
         } finally {
-            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+            for (GraphView g : graphs) { try { g.close(); } catch (Exception ignored) {} }
         }
     }
 
@@ -694,7 +696,7 @@ public class SearchEngine {
     ) {}
 
     /** Opens an ArcadeDB call graph for every indexed project. Caller must close all returned graphs. */
-    private List<CallGraph> openAllGraphs() {
+    private List<GraphView> openAllGraphs() {
         return openAllGraphs(null, new ArrayList<>());
     }
 
@@ -702,21 +704,21 @@ public class SearchEngine {
      * As {@link #openAllGraphs()}, optionally scoped to one project. Projects whose index format
      * is incompatible are skipped (logged) when searching all; a scoped one rethrows.
      */
-    private List<CallGraph> openAllGraphs(String onlyProject, List<String> warnings) {
-        List<CallGraph> graphs = new ArrayList<>();
+    private List<GraphView> openAllGraphs(String onlyProject, List<String> warnings) {
+        List<GraphView> graphs = new ArrayList<>();
         for (ProjectMeta meta : registry.listAll()) {
             if (onlyProject != null && !onlyProject.equals(meta.getName())) continue;
+            // GraphViews checks the index format, then opens existing graphs only: a project
+            // without one is skipped, nothing is created.
             try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+                graphs.add(GraphViews.open(meta));
             } catch (IncompatibleIndexException e) {
                 if (onlyProject != null) throw e;
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
                 warnings.add(e.getMessage());
-                continue;
+            } catch (Exception e) {
+                log.warn("Skipping unreadable graph of project {}: {}", meta.getName(), e.toString());
             }
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-            // openExisting: a project without a graph is skipped, and nothing is created.
-            try { graphs.add(CallGraph.openExisting(dbDir)); } catch (Exception ignored) {}
         }
         return graphs;
     }
@@ -727,7 +729,7 @@ public class SearchEngine {
      *
      * @param maxNodes hard cap on the total number of unique FQNs collected (including root)
      */
-    private static BfsResult bfsCallGraph(List<CallGraph> graphs, String rootFqn,
+    private static BfsResult bfsCallGraph(List<GraphView> graphs, String rootFqn,
                                            int depth, String direction, int maxNodes) {
         Map<String, Integer>      fqnDepth    = new LinkedHashMap<>();
         Map<String, List<String>> fqnChildren = new LinkedHashMap<>();
@@ -785,7 +787,7 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
                                                           int maxCallers, List<String> warnings) throws IOException {
-        List<CallGraph> graphs = openAllGraphs(null, warnings);
+        List<GraphView> graphs = openAllGraphs(null, warnings);
         try {
             // +1 to include root in the cap budget, then exclude it from results
             BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, "callers",
@@ -800,7 +802,7 @@ public class SearchEngine {
             return new TransitiveCallersResult(
                     rootFqn, depth, callers.size(), bfs.truncated(), callers);
         } finally {
-            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+            for (GraphView g : graphs) { try { g.close(); } catch (Exception ignored) {} }
         }
     }
 
@@ -898,10 +900,10 @@ public class SearchEngine {
         return query != null && query.chars().anyMatch(Character::isUpperCase);
     }
 
-    private static Set<String> neighborsFromGraphs(List<CallGraph> graphs,
+    private static Set<String> neighborsFromGraphs(List<GraphView> graphs,
                                                     String fqn, String direction) {
         Set<String> result = new LinkedHashSet<>();
-        for (CallGraph g : graphs) {
+        for (GraphView g : graphs) {
             try {
                 if (!"callees".equals(direction)) result.addAll(g.callers(fqn));
                 if (!"callers".equals(direction)) result.addAll(g.callees(fqn));
@@ -1115,9 +1117,9 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
-        List<CallGraph> graphs = openAllGraphs(project, warnings);
+        List<GraphView> graphs = openAllGraphs(project, warnings);
         try {
-            for (CallGraph g : graphs) {
+            for (GraphView g : graphs) {
                 if (all || "callers".equals(kind))
                     callers.addAll(g.callers(fqn));
                 if (all || "subclasses".equals(kind)) {
@@ -1136,7 +1138,7 @@ public class SearchEngine {
                 }
             }
         } finally {
-            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+            for (GraphView g : graphs) { try { g.close(); } catch (Exception ignored) {} }
         }
 
         return new UsageResult(fqn, callers, subclasses, superTypes,
@@ -1208,11 +1210,11 @@ public class SearchEngine {
 
         // Fields from knowledge graph
         List<CallGraph.FieldInfo> fields = new ArrayList<>();
-        List<CallGraph> kgGraphs = openAllGraphs(null, warnings);
+        List<GraphView> kgGraphs = openAllGraphs(null, warnings);
         try {
-            for (CallGraph g : kgGraphs) fields.addAll(g.getFieldsOf(classFqn));
+            for (GraphView g : kgGraphs) fields.addAll(g.getFieldsOf(classFqn));
         } finally {
-            for (CallGraph g : kgGraphs) { try { g.close(); } catch (Exception ignored) {} }
+            for (GraphView g : kgGraphs) { try { g.close(); } catch (Exception ignored) {} }
         }
 
         // Callers for each public method (cap at 10 per method)
@@ -1236,11 +1238,11 @@ public class SearchEngine {
      */
     public List<String> getSubclassHierarchy(String classFqn) {
         List<String> result = new ArrayList<>();
-        List<CallGraph> graphs = openAllGraphs();
+        List<GraphView> graphs = openAllGraphs();
         try {
-            for (CallGraph g : graphs) result.addAll(g.allSubclasses(classFqn));
+            for (GraphView g : graphs) result.addAll(g.allSubclasses(classFqn));
         } finally {
-            for (CallGraph g : graphs) { try { g.close(); } catch (Exception ignored) {} }
+            for (GraphView g : graphs) { try { g.close(); } catch (Exception ignored) {} }
         }
         return result;
     }

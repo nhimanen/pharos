@@ -3,6 +3,51 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.6.0] - 2026-11-23
+
+**Index format:** 1 (unchanged)
+
+The first multi-node release (Phases 0 and 1): one writer and any number of readers sharing an
+S3-compatible object store. **Without a `cluster` section in `config.json` nothing changes:** pharos stays the
+single-node tool (`role: all`, `backend: local`), and its search and graph output is byte-identical to 1.5.0
+(`SingleNodeGoldenTest`).
+
+### Added (multi-node: writer + readers over an object store)
+- `cluster` config section: `role` (`all` | `writer` | `reader`), `backend` (`local` | `object-store`), `nodeId`,
+  `pollIntervalSeconds`, `cacheDir`, retention (`retentionGenerations`, `retentionMinutes`) and `objectStore`
+  (`endpoint`, `region`, `bucket`, `prefix`, `pathStyle` for MinIO, `accessKeyEnv` / `secretKeyEnv`). Validated at
+  startup; a writer requires the `object-store` backend, and missing S3 credentials fail fast. See README,
+  "Multi-node (experimental)".
+- **Writer:** after each index run, the project is published as a new immutable generation (Lucene commit files,
+  a compact call-graph file, unresolved refs, and a manifest with the index format stamp), and `LATEST` is
+  flipped with a conditional put. Unchanged files are reused across generations. Old generations are
+  garbage-collected by count and age; GC validates manifests and re-checks data before deleting.
+- `pharos publish <project>` (Java CLI and `./pharos`, writer only) retries the upload without re-indexing. A
+  failed publish at the end of `pharos index` keeps the local index and exits **3**; `publish` refuses (exit
+  **4**) a broken `callgraph.current` pointer or an index format other than this build's.
+- **Reader:** polls `LATEST`, downloads whole generations into `cacheDir` (checksummed end to end, hard-linking
+  files it already has), and swaps them in; handles `LATEST` going back. Readers serve search and call-graph
+  queries from an immutable compact graph file (parity-tested against ArcadeDB) and class bodies/snippets from
+  the index, never from source files. Only one process per `cacheDir` syncs (`.sync.lock`).
+- A reader only materialises generations whose index format it can serve (its own or N-1); otherwise it keeps
+  the generation it has and logs a WARN naming the fix.
+- `pharos web` on a reader binds its port at once; until the first sync finishes `/health` reports
+  `{"status": "syncing", "ready": false}` and searches carry the notice in `X-Pharos-Warnings`.
+- `index-status --json` reports the node's `role`.
+
+### Changed
+- Readers refuse `index`, `link`, `embed`, `mine`, `remove-index`, `backfill-embedding-cache` and
+  `upgrade-indexes` (also `./setup.sh --upgrade-indexes`, which points readers at the writer).
+  `upgrade-indexes` on a reader exits with its own code **5**.
+- Internal: graph read paths go through a read-only `GraphView`; index publishing and local caching go through
+  the new `com.pharos.cluster` SPI (`LocalCache`, `IndexPublisher`, `ReplicationBackend`). No user-visible change
+  on single-node installs.
+
+### Not yet on readers
+- Module tools (MCP `list_modules`, `get_module_deps`, `find_module_path`, `get_module_boundary`, web UI module
+  views) answer "not available on reader nodes yet"; the cross-project graph is not replicated, so call paths
+  spanning projects are only found on the writer.
+
 ## [1.5.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)

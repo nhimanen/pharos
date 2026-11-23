@@ -2,6 +2,7 @@ package com.pharos.web;
 
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.IndexFormat;
+import com.pharos.cluster.NodeRole;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -44,11 +45,22 @@ public class WebServer {
     private final ModuleGraphBuilder moduleGraphBuilder;
     private final LuceneIndexer luceneIndexer;
     private final ModuleBoundaryAnalyzer boundaryAnalyzer;
+    /** Readers have no module graph yet (it is not replicated): module endpoints answer 501. */
+    private final boolean readerNode;
     private final ObjectMapper mapper;
+    /** False while a reader's first sync is running; see {@link #setReadiness}. */
+    private volatile java.util.function.BooleanSupplier readiness = () -> true;
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
                      ModuleBoundaryAnalyzer boundaryAnalyzer) {
+        this(searchEngine, registry, moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, NodeRole.ALL);
+    }
+
+    public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
+                     ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
+                     ModuleBoundaryAnalyzer boundaryAnalyzer, NodeRole role) {
+        this.readerNode = role == NodeRole.READER;
         this.searchEngine = searchEngine;
         this.registry = registry;
         this.moduleGraphBuilder = moduleGraphBuilder;
@@ -57,6 +69,32 @@ public class WebServer {
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
+
+    /**
+     * Readiness reported by {@code /health} ({@code {"status":"syncing","ready":false}} until it
+     * turns true) and warned about on searches answered before it does.
+     */
+    public void setReadiness(java.util.function.BooleanSupplier readiness) {
+        this.readiness = java.util.Objects.requireNonNull(readiness, "readiness");
+    }
+
+    /** Health payload: HTTP 200 either way (liveness); {@code ready} tells whether the first sync is done. */
+    Map<String, Object> health() {
+        boolean ready = readiness.getAsBoolean();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", ready ? "ok" : "syncing");
+        out.put("ready", ready);
+        return out;
+    }
+
+    static final String SYNCING_WARNING = "reader is still running its first sync; results may be incomplete";
+
+    /** Module endpoints need the module graph, which reader nodes do not have yet: 501. */
+    private boolean refuseOnReader(io.javalin.http.Context ctx) {
+        if (!readerNode) return false;
+        ctx.status(501).result(ctx.path() + " is not available on reader nodes yet");
+        return true;
     }
 
     public Javalin start(int port) {
@@ -134,7 +172,10 @@ public class WebServer {
         });
 
         // API: module dependency graph
-        app.get("/api/graph/modules", ctx -> ctx.json(buildModuleGraphData()));
+        app.get("/api/graph/modules", ctx -> {
+            if (refuseOnReader(ctx)) return;
+            ctx.json(buildModuleGraphData());
+        });
 
         // API: class dependency graph for a project
         app.get("/api/graph/classes/{project}", ctx -> {
@@ -182,6 +223,10 @@ public class WebServer {
             int snippetLines    = ctx.queryParamAsClass("snippetLines", Integer.class).getOrDefault(15);
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
                     project, null, limit, "text", docType, scope, oversample);
+            if (!readiness.getAsBoolean()) {
+                log.warn("Search '{}' answered before the first sync finished", q);
+                warningsHeader(ctx, List.of(SYNCING_WARNING)); // kept on a 409/500 answer too
+            }
             try {
                 SearchResponse resp = searchEngine.searchWithTrace(req, false);
                 List<SearchResult> decorated = searchEngine
@@ -417,7 +462,7 @@ public class WebServer {
             List<String> path = List.of();
             List<String> warnings = new ArrayList<>();
             for (ProjectMeta meta : registry.listAll()) {
-                try (CallGraph g = loadCallGraphCached(meta)) {
+                try (GraphView g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
                 } catch (IncompatibleIndexException e) {
@@ -434,6 +479,7 @@ public class WebServer {
 
         // API: list modules
         app.get("/api/modules", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String filter = ctx.queryParamAsClass("filter", String.class).getOrDefault("all");
             try (com.pharos.graph.ModuleGraph graph = moduleGraphBuilder.open()) {
                 List<Map<String, Object>> nodes = graph.allModules()
@@ -466,6 +512,7 @@ public class WebServer {
 
         // API: module dependencies
         app.get("/api/deps", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String moduleRef = ctx.queryParam("module");
             boolean transitive = Boolean.parseBoolean(ctx.queryParamAsClass("transitive", String.class).getOrDefault("false"));
             if (moduleRef == null) { ctx.status(400).result("module required"); return; }
@@ -490,6 +537,7 @@ public class WebServer {
 
         // API: module dependency path
         app.get("/api/mod-path", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String fromRef = ctx.queryParam("from");
             String toRef = ctx.queryParam("to");
             if (fromRef == null || toRef == null) { ctx.status(400).result("from and to required"); return; }
@@ -515,6 +563,7 @@ public class WebServer {
 
         // API: module boundary (entry/exit points)
         app.get("/api/boundary", ctx -> {
+            if (refuseOnReader(ctx)) return;
             String project = ctx.queryParam("project");
             if (project == null) { ctx.status(400).result("project required"); return; }
             int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(200);
@@ -561,7 +610,7 @@ public class WebServer {
         });
 
         // Health check (used by daemon client to detect readiness)
-        app.get("/health", ctx -> ctx.json(Map.of("status", "ok")));
+        app.get("/health", ctx -> ctx.json(health()));
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);
@@ -670,15 +719,13 @@ public class WebServer {
         }
     }
 
-    /** Open the ArcadeDB call graph for the given project. Caller must close. */
-    private CallGraph loadCallGraphCached(ProjectMeta meta) throws Exception {
-        IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
-        Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-        return CallGraph.openExisting(dbDir);
+    /** Open the read-only call graph for the given project. Caller must close. */
+    private GraphView loadCallGraphCached(ProjectMeta meta) throws Exception {
+        return GraphViews.open(meta); // checks the index format first (IncompatibleIndexException)
     }
 
     private Map<String, Object> buildClassGraphData(ProjectMeta meta) throws Exception {
-        try (CallGraph graph = loadCallGraphCached(meta)) {
+        try (GraphView graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
         // Map class FQN → filePath (use first method's path as representative)
@@ -745,7 +792,7 @@ public class WebServer {
     }
 
     private Map<String, Object> buildCallGraphData(ProjectMeta meta, int limit, String pkg, String className) throws Exception {
-        try (CallGraph graph = loadCallGraphCached(meta)) {
+        try (GraphView graph = loadCallGraphCached(meta)) {
         Set<String> knownPkgs = new HashSet<>(meta.getKnownPackages());
         Map<String, String> fqnToFile = buildFqnToFilePath(meta);
 

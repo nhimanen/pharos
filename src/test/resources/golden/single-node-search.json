@@ -1,0 +1,542 @@
+{
+  "classContext" : {
+    "com.example.model.User" : {
+      "body" : "public class User {\n\n    private final String name;\n    private final String email;\n\n    /**\n     * Creates a new User.\n     *\n     * @param name  the user's display name\n     * @param email the user's email address\n     */\n    public User(String name, String email) {\n        this.name = name;\n        this.email = email;\n    }\n\n    /**\n     * Returns the user's display name.\n     */\n    public String getName() {\n        return name;\n    }\n\n    /**\n     * Returns the user's email address.\n     */\n    public String getEmail() {\n        return email;\n    }\n\n    /**\n     * Checks whether this user has a valid email address (non-null and contains @).\n     */\n    public boolean hasValidEmail() {\n        return email != null && email.contains(\"@\");\n    }\n\n    @Override\n    public String toString() {\n        return \"User{name='\" + name + \"', email='\" + email + \"'}\";\n    }\n}",
+      "constructors" : [ "sample-app:com.example.model.User#<init>(String,String)" ],
+      "publicMethodCallers" : {
+        "com.example.model.User#getEmail()" : [ "com.example.service.GreetingService#formalGreet(User)" ],
+        "com.example.model.User#getName()" : [ "com.example.service.GreetingService#farewell(User)", "com.example.service.GreetingService#formalGreet(User)", "com.example.service.GreetingService#greet(User)" ]
+      },
+      "publicMethods" : [ "sample-app:com.example.model.User#getEmail()", "sample-app:com.example.model.User#getName()", "sample-app:com.example.model.User#hasValidEmail()", "sample-app:com.example.model.User#toString()" ]
+    },
+    "com.example.service.GreetingService" : {
+      "body" : "public class GreetingService {\n\n    /**\n     * Generates a greeting message for the given user.\n     *\n     * @param user the user to greet\n     * @return a personalized greeting string\n     */\n    public String greet(User user) {\n        return \"Hello, \" + user.getName() + \"!\";\n    }\n\n    /**\n     * Generates a farewell message for the given user.\n     *\n     * @param user the user to bid farewell\n     * @return a personalized farewell string\n     */\n    public String farewell(User user) {\n        return \"Goodbye, \" + user.getName() + \"!\";\n    }\n\n    /**\n     * Generates a formal greeting using the user's email domain.\n     */\n    public String formalGreet(User user) {\n        String email = user.getEmail();\n        String domain = email != null && email.contains(\"@\")\n                ? email.substring(email.indexOf('@') + 1)\n                : \"unknown\";\n        return \"Dear \" + user.getName() + \" from \" + domain + \",\";\n    }\n}",
+      "constructors" : [ ],
+      "publicMethodCallers" : { },
+      "publicMethods" : [ "sample-app:com.example.service.GreetingService#farewell(User)", "sample-app:com.example.service.GreetingService#formalGreet(User)", "sample-app:com.example.service.GreetingService#greet(User)" ]
+    }
+  },
+  "graph" : {
+    "callees|com.example.service.GreetingService#farewell(User)" : [ "com.example.model.User#getName()" ],
+    "callees|com.example.service.GreetingService#formalGreet(User)" : [ "com.example.model.User#getEmail()", "com.example.model.User#getName()", "java.lang.String#contains(CharSequence)", "java.lang.String#indexOf(int)", "java.lang.String#substring(int)" ],
+    "callees|com.example.service.GreetingService#greet(User)" : [ "com.example.model.User#getName()" ],
+    "callers|com.example.model.User#getEmail()" : [ "com.example.service.GreetingService#formalGreet(User)" ],
+    "callers|com.example.model.User#getName()" : [ "com.example.service.GreetingService#farewell(User)", "com.example.service.GreetingService#formalGreet(User)", "com.example.service.GreetingService#greet(User)" ],
+    "path|com.example.service.GreetingService#formalGreet(User)->com.example.model.User#getEmail()" : [ "com.example.service.GreetingService#formalGreet(User)", "com.example.model.User#getEmail()" ],
+    "path|com.example.service.GreetingService#greet(User)->com.example.model.User#getName()" : [ "com.example.service.GreetingService#greet(User)", "com.example.model.User#getName()" ]
+  },
+  "searches" : {
+    "auto|sample-app|Calculator" : [ {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "2.262316",
+      "snippetStartLine" : 7
+    }, {
+      "id" : "sample-app:com.example.Calculator#abs(int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 56
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.849287",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.Calculator#multiply(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 34
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 27
+    } ],
+    "auto|sample-app|Computes the absolute value of an integer" : [ {
+      "id" : "sample-app:com.example.Calculator#abs(int)",
+      "score" : "42.853901",
+      "snippetStartLine" : 56
+    }, {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "2.126856",
+      "snippetStartLine" : 7
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.910240",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.363111",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.224649",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.218865",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "0.190999",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.190271",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.184204",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "0.182046",
+      "snippetStartLine" : 26
+    } ],
+    "auto|sample-app|checks whether user has a valid email" : [ {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "0.024590",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.023077",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.022059",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.012097",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "0.011364",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.010870",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User#getEmail()",
+      "score" : "0.005952",
+      "snippetStartLine" : 32
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "0.005597",
+      "snippetStartLine" : 33
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.005357",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "0.002930",
+      "snippetStartLine" : 17
+    } ],
+    "auto|sample-app|division by zero is not allowed" : [ {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.024590",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "0.012097",
+      "snippetStartLine" : 7
+    } ],
+    "auto|sample-app|generate a greeting message for a user" : [ {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.024590",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.023810",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.022388",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.012097",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "0.011538",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.010870",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "0.005859",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "0.005515",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.005357",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "0.002841",
+      "snippetStartLine" : 33
+    } ],
+    "auto|sample-app|greeting service" : [ {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.024590",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.012097",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "0.005952",
+      "snippetStartLine" : 33
+    } ],
+    "auto|sample-app|methods that call getName" : [ {
+      "id" : "sample-app:com.example.model.User#getName()",
+      "score" : "7.674265",
+      "snippetStartLine" : 25
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.290227",
+      "snippetStartLine" : 6
+    } ],
+    "auto|sample-app|user display name and email address" : [ {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "0.024590",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.022727",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.012097",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "0.011194",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.model.User#getName()",
+      "score" : "0.005952",
+      "snippetStartLine" : 25
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "0.005515",
+      "snippetStartLine" : 33
+    }, {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "0.002930",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.002679",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.model.User#getEmail()",
+      "score" : "0.001442",
+      "snippetStartLine" : 32
+    }, {
+      "id" : "sample-app:com.example.model.User#toString()",
+      "score" : "0.000679",
+      "snippetStartLine" : 43
+    } ],
+    "auto|sample-python-app|abs_value" : [ {
+      "id" : "sample-python-app:calculator#abs_value()",
+      "score" : "5.967875",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-python-app:calculator",
+      "score" : "0.111935",
+      "snippetStartLine" : 1
+    } ],
+    "auto|sample-python-app|formal_greet" : [ {
+      "id" : "sample-python-app:service.greeting.GreetingService#formal_greet()",
+      "score" : "5.673273",
+      "snippetStartLine" : 19
+    }, {
+      "id" : "sample-python-app:service.greeting.GreetingService",
+      "score" : "0.143565",
+      "snippetStartLine" : 6
+    } ],
+    "auto|sample-python-app|has_valid_email" : [ {
+      "id" : "sample-python-app:model.user.User#has_valid_email()",
+      "score" : "6.986675",
+      "snippetStartLine" : 20
+    }, {
+      "id" : "sample-python-app:model.user.User",
+      "score" : "0.243570",
+      "snippetStartLine" : 4
+    } ],
+    "auto|sample-python-app|multiply" : [ {
+      "id" : "sample-python-app:calculator#multiply()",
+      "score" : "2.916910",
+      "snippetStartLine" : 14
+    }, {
+      "id" : "sample-python-app:calculator",
+      "score" : "0.111935",
+      "snippetStartLine" : 1
+    } ],
+    "keyword|sample-app|Calculator" : [ {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "2.262316",
+      "snippetStartLine" : 7
+    }, {
+      "id" : "sample-app:com.example.Calculator#abs(int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 56
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.849287",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.Calculator#multiply(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 34
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.849287",
+      "snippetStartLine" : 27
+    } ],
+    "keyword|sample-app|Computes the absolute value of an integer" : [ {
+      "id" : "sample-app:com.example.Calculator#abs(int)",
+      "score" : "42.853901",
+      "snippetStartLine" : 56
+    }, {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "2.126856",
+      "snippetStartLine" : 7
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "0.910240",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.363111",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.224649",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "0.218865",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "0.190999",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "0.190271",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.184204",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "0.182046",
+      "snippetStartLine" : 26
+    } ],
+    "keyword|sample-app|checks whether user has a valid email" : [ {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "42.050369",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "9.968753",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.model.User#getEmail()",
+      "score" : "4.937298",
+      "snippetStartLine" : 32
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "4.329584",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "2.033911",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "2.024384",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "1.922973",
+      "snippetStartLine" : 33
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "1.360990",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "1.330237",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "1.284979",
+      "snippetStartLine" : 46
+    } ],
+    "keyword|sample-app|division by zero is not allowed" : [ {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "13.549244",
+      "snippetStartLine" : 46
+    }, {
+      "id" : "sample-app:com.example.Calculator",
+      "score" : "0.408919",
+      "snippetStartLine" : 7
+    } ],
+    "keyword|sample-app|generate a greeting message for a user" : [ {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "11.881786",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "10.631414",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "3.639226",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "3.553227",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "2.777951",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "2.280803",
+      "snippetStartLine" : 33
+    }, {
+      "id" : "sample-app:com.example.Calculator#subtract(int,int)",
+      "score" : "1.808650",
+      "snippetStartLine" : 27
+    }, {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "1.800195",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.Calculator#add(int,int)",
+      "score" : "1.747145",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.Calculator#divide(double,double)",
+      "score" : "1.656630",
+      "snippetStartLine" : 46
+    } ],
+    "keyword|sample-app|greeting service" : [ {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "22.491236",
+      "snippetStartLine" : 8
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "0.847738",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "0.741624",
+      "snippetStartLine" : 33
+    } ],
+    "keyword|sample-app|methods that call getName" : [ {
+      "id" : "sample-app:com.example.model.User#getName()",
+      "score" : "7.674265",
+      "snippetStartLine" : 25
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "0.290227",
+      "snippetStartLine" : 6
+    } ],
+    "keyword|sample-app|user display name and email address" : [ {
+      "id" : "sample-app:com.example.model.User#<init>(String,String)",
+      "score" : "17.271278",
+      "snippetStartLine" : 17
+    }, {
+      "id" : "sample-app:com.example.model.User",
+      "score" : "14.201742",
+      "snippetStartLine" : 6
+    }, {
+      "id" : "sample-app:com.example.model.User#getName()",
+      "score" : "7.050020",
+      "snippetStartLine" : 25
+    }, {
+      "id" : "sample-app:com.example.model.User#hasValidEmail()",
+      "score" : "5.326330",
+      "snippetStartLine" : 39
+    }, {
+      "id" : "sample-app:com.example.model.User#getEmail()",
+      "score" : "5.143869",
+      "snippetStartLine" : 32
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#greet(User)",
+      "score" : "1.743139",
+      "snippetStartLine" : 16
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#farewell(User)",
+      "score" : "1.737020",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService#formalGreet(User)",
+      "score" : "1.668597",
+      "snippetStartLine" : 33
+    }, {
+      "id" : "sample-app:com.example.model.User#toString()",
+      "score" : "1.339113",
+      "snippetStartLine" : 43
+    }, {
+      "id" : "sample-app:com.example.service.GreetingService",
+      "score" : "0.827279",
+      "snippetStartLine" : 8
+    } ],
+    "keyword|sample-python-app|abs_value" : [ {
+      "id" : "sample-python-app:calculator#abs_value()",
+      "score" : "5.967875",
+      "snippetStartLine" : 26
+    }, {
+      "id" : "sample-python-app:calculator",
+      "score" : "0.111935",
+      "snippetStartLine" : 1
+    } ],
+    "keyword|sample-python-app|formal_greet" : [ {
+      "id" : "sample-python-app:service.greeting.GreetingService#formal_greet()",
+      "score" : "5.673273",
+      "snippetStartLine" : 19
+    }, {
+      "id" : "sample-python-app:service.greeting.GreetingService",
+      "score" : "0.143565",
+      "snippetStartLine" : 6
+    } ],
+    "keyword|sample-python-app|has_valid_email" : [ {
+      "id" : "sample-python-app:model.user.User#has_valid_email()",
+      "score" : "6.986675",
+      "snippetStartLine" : 20
+    }, {
+      "id" : "sample-python-app:model.user.User",
+      "score" : "0.243570",
+      "snippetStartLine" : 4
+    } ],
+    "keyword|sample-python-app|multiply" : [ {
+      "id" : "sample-python-app:calculator#multiply()",
+      "score" : "2.916910",
+      "snippetStartLine" : 14
+    }, {
+      "id" : "sample-python-app:calculator",
+      "score" : "0.111935",
+      "snippetStartLine" : 1
+    } ]
+  }
+}

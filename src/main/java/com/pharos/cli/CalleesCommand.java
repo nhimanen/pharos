@@ -1,16 +1,15 @@
 package com.pharos.cli;
 
 import com.pharos.indexer.IncompatibleIndexException;
-import com.pharos.indexer.IndexFormat;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
-import com.pharos.graph.CallGraph;
+import com.pharos.graph.GraphView;
+import com.pharos.graph.GraphViews;
 import com.pharos.search.SearchEngine;
 import com.pharos.search.SearchResult;
 import picocli.CommandLine.*;
 
-import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.Callable;
 
@@ -69,15 +68,12 @@ public class CalleesCommand implements Callable<Integer> {
 
         Set<String> allCallees = new LinkedHashSet<>();
         for (ProjectMeta meta : projects) {
-            Path dbDir = CallGraph.projectGraphDir(Path.of(meta.getIndexPath()));
-            try {
-                IndexFormat.check(meta.getName(), Path.of(meta.getIndexPath()));
+            // GraphViews checks the index format before opening anything
+            try (GraphView graph = GraphViews.open(meta)) {
+                allCallees.addAll(graph.callees(callerFqn));
             } catch (IncompatibleIndexException e) {
                 if (project != null) throw e;  // explicitly requested: surface it
-                continue;                       // all-project: skip the incompatible one
-            }
-            try (CallGraph graph = CallGraph.openExisting(dbDir)) {
-                allCallees.addAll(graph.callees(callerFqn));
+                // all-project: skip the incompatible one
             } catch (Exception e) {
                 // Graph not available for this project
             }

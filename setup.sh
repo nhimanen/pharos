@@ -27,7 +27,8 @@
 #   PHAROS_NO_DAEMON=1       do not start/restart the daemon (used by tests)
 #
 # Exit codes: 2 = upgrade warning declined / needs --yes, 3 = checksum mismatch;
-# with --upgrade-indexes, the exit status of upgrade-indexes.
+# with --upgrade-indexes, the exit status of upgrade-indexes (0 done, 1 skipped/failed,
+# 2 needs --yes, 5 refused on a cluster reader node).
 
 set -euo pipefail
 
@@ -171,10 +172,28 @@ _install_file() { # src dest [mode]
 # Runs through the installed Python client, so the JVM gets the same flags as every other
 # pharos command (heap sizing, --add-opens, vector module, native access, pharos.home).
 # The client passes the terminal through, so the confirmation prompt still works.
+# The configured cluster role ("all" when unset or unreadable); a reader refuses upgrade-indexes.
+_cluster_role() {
+  python3 - "$HOME/.pharos/config.json" 2>/dev/null <<'PY' || echo all
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("cluster") or {}).get("role") or "all")
+except Exception:
+    print("all")
+PY
+}
+
 _run_upgrade_indexes() { # -> exit status of upgrade-indexes
   if [ ! -f "$PHAROS_BIN/pharos.jar" ] || [ ! -f "$PHAROS_BIN/pharos-cli.py" ]; then
     echo "Error: pharos is not installed in $PHAROS_BIN; run setup first." >&2
     return 1
+  fi
+  # Same refusal as 'pharos upgrade-indexes' on a reader (exit 5), without starting a JVM.
+  if [ "$(_cluster_role)" = reader ]; then
+    echo "Error: this node has role reader; readers receive upgrades by syncing; upgrade the writer." >&2
+    echo "  (cluster.role in $HOME/.pharos/config.json; on the writer: ./setup.sh --upgrade-indexes," >&2
+    echo "   which re-indexes and re-publishes; this reader picks the new generations up on its next sync)" >&2
+    return 5
   fi
   local args=()
   [ "$ASSUME_YES" = true ] && args+=(--yes)
@@ -187,7 +206,8 @@ if [ "$UPGRADE_INDEXES" = true ] && [ -z "$RELEASE" ]; then
   _daemon_running && WAS_RUNNING=true
   UP_RC=0
   _run_upgrade_indexes || UP_RC=$?
-  if [ "$WAS_RUNNING" = true ]; then
+  # A reader's refusal changed nothing: leave its daemon alone.
+  if [ "$WAS_RUNNING" = true ] && [ "$(_cluster_role)" != reader ]; then
     _restart_daemon
   fi
   exit "$UP_RC"
@@ -309,7 +329,9 @@ _confirm_or_abort() {
   esac
 }
 
-if [ "$RESTART_ONLY" = false ] && [ -f "$HOME/.pharos/registry.json" ]; then
+# A reader keeps its registry in the cluster cache dir, not in registry.json: run the check
+# whenever there is a registry or a config (index-status reads the right registry per role).
+if [ "$RESTART_ONLY" = false ] && { [ -f "$HOME/.pharos/registry.json" ] || [ -f "$HOME/.pharos/config.json" ]; }; then
   [ -n "$TMP_DIR" ] || TMP_DIR="$(mktemp -d)"
   STATUS_ERR="$TMP_DIR/index-status.err"
   STATUS_JSON=""
@@ -325,6 +347,8 @@ if [ "$RESTART_ONLY" = false ] && [ -f "$HOME/.pharos/registry.json" ]; then
 import json, sys
 d = json.load(sys.stdin)
 rows = d.get("projects", [])
+# Readers do not re-index: the writer upgrades and re-publishes, readers sync.
+reader = d.get("role") == "reader"
 
 def human(b):
     v = float(b)
@@ -336,7 +360,7 @@ def human(b):
 def line(r, with_cmd):
     last = (r.get("lastIndexed") or "never")[:10]
     s = "  %-12s (%s, last indexed %s)" % (r["name"], human(r.get("indexBytes", 0)), last)
-    if with_cmd:
+    if with_cmd and not reader:
         if r.get("rootExists"):
             s += "   pharos index --full " + r["name"]
         else:
@@ -363,7 +387,10 @@ if invalid:
     out.append("These registry entries have an invalid project name; pharos ignores them and will not delete anything for them.")
     out.append("Remove each from ~/.pharos/registry.json by hand, then re-index with: pharos index --project <name> <path>")
     out += ["  '" + r["name"] + "'" + ("  (root: " + r["rootPath"] + ")" if r.get("rootPath") else "") for r in invalid]
-out.append("(re-index afterwards with: ./setup.sh --upgrade-indexes)")
+if reader:
+    out.append("(this is a reader node: upgrade and re-publish these projects on the writer; this reader picks the new generations up by syncing)")
+else:
+    out.append("(re-index afterwards with: ./setup.sh --upgrade-indexes)")
 print("\n".join(out))
 sys.exit(10 if blocked else 0)
 ' 2>"$STATUS_ERR")" || WARN_RC=$?
