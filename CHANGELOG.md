@@ -62,6 +62,11 @@ UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
   delete each have a deadline, so a stop ends within `cluster.drainSeconds` + 10 s and logs each call
   it gave up on. A lost lease aborts that shard's run, and a full run's parse checks the abort
   between files (it could only stop after the parser's last file).
+- Object-store calls are bounded (new `cluster.objectStore.callAttemptTimeoutSeconds`, default 20,
+  `callTimeoutSeconds`, default 60, and `uploadMinBytesPerSecond`, default 1 MiB/s): a heartbeat put
+  on the gate's saturated MinIO took about 4 minutes (three 30 s socket timeouts). Uploads get the
+  call bounds plus their size at the minimum rate, so large generation uploads are not cut; a
+  download's body stays bounded by the 30 s idle-read timeout.
 
 ### Maintainers
 - Phase 4 gate (`scripts/cluster-gate-phase4.sh`): ports (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`,

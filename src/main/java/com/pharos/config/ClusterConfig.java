@@ -506,9 +506,29 @@ public class ClusterConfig {
          * timeouts); a whole call, retries included, gets {@value #READ_ATTEMPTS} times this.
          */
         private int readTimeoutSeconds = 10;
+        /**
+         * Bound of one attempt of every other call (heartbeats, leases, catalog and manifest reads,
+         * listings, deletes, the response headers of a whole-object download, an upload's request
+         * before its body is counted). A healthy bucket answers these in well under a second; 20 s
+         * leaves a saturated one room before the SDK retries.
+         */
+        private int callAttemptTimeoutSeconds = DEFAULT_CALL_ATTEMPT_TIMEOUT_SECONDS;
+        /** Bound of such a call with its retries (3 attempts): one hung call no longer takes minutes. */
+        private int callTimeoutSeconds = DEFAULT_CALL_TIMEOUT_SECONDS;
+        /**
+         * The slowest upload rate a healthy bucket is assumed to sustain. An upload (a single
+         * PutObject: Lucene segment and embedding-cache files can be gigabytes) gets the call bounds
+         * plus its size at this rate, per attempt and for the whole call, so a large generation upload
+         * on a slow bucket is never cut while a hung one still ends.
+         */
+        private long uploadMinBytesPerSecond = DEFAULT_UPLOAD_MIN_BYTES_PER_SECOND;
 
         static final int READ_ATTEMPTS = 3;
         static final int MAX_READ_TIMEOUT_SECONDS = 3600;
+        public static final int DEFAULT_CALL_ATTEMPT_TIMEOUT_SECONDS = 20;
+        public static final int DEFAULT_CALL_TIMEOUT_SECONDS = 60;
+        public static final long DEFAULT_UPLOAD_MIN_BYTES_PER_SECOND = 1L << 20; // 1 MiB/s
+        static final long MIN_UPLOAD_MIN_BYTES_PER_SECOND = 1024;
 
         /** @throws IllegalStateException naming the offending field */
         void validate() {
@@ -516,6 +536,42 @@ public class ClusterConfig {
                 throw new IllegalStateException("cluster.objectStore.readTimeoutSeconds must be between 1 and "
                         + MAX_READ_TIMEOUT_SECONDS + ", got " + readTimeoutSeconds);
             }
+            if (callAttemptTimeoutSeconds < 1 || callAttemptTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.callAttemptTimeoutSeconds must be between 1 and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + callAttemptTimeoutSeconds);
+            }
+            if (callTimeoutSeconds < callAttemptTimeoutSeconds || callTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.callTimeoutSeconds must be between"
+                        + " callAttemptTimeoutSeconds (" + callAttemptTimeoutSeconds + ") and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + callTimeoutSeconds);
+            }
+            if (uploadMinBytesPerSecond < MIN_UPLOAD_MIN_BYTES_PER_SECOND) {
+                throw new IllegalStateException("cluster.objectStore.uploadMinBytesPerSecond must be at least "
+                        + MIN_UPLOAD_MIN_BYTES_PER_SECOND + ", got " + uploadMinBytesPerSecond);
+            }
+        }
+
+        public int getCallAttemptTimeoutSeconds() { return callAttemptTimeoutSeconds; }
+        public void setCallAttemptTimeoutSeconds(int v) { this.callAttemptTimeoutSeconds = v; }
+        public int getCallTimeoutSeconds() { return callTimeoutSeconds; }
+        public void setCallTimeoutSeconds(int v) { this.callTimeoutSeconds = v; }
+        public long getUploadMinBytesPerSecond() { return uploadMinBytesPerSecond; }
+        public void setUploadMinBytesPerSecond(long v) { this.uploadMinBytesPerSecond = v; }
+
+        /** One attempt of a control-plane call: {@code callAttemptTimeoutSeconds}. */
+        public java.time.Duration callAttemptTimeout() {
+            return java.time.Duration.ofSeconds(callAttemptTimeoutSeconds);
+        }
+
+        /** A control-plane call with its retries: {@code callTimeoutSeconds}. */
+        public java.time.Duration callTotalTimeout() {
+            return java.time.Duration.ofSeconds(callTimeoutSeconds);
+        }
+
+        /** The time {@code bytes} take at {@code uploadMinBytesPerSecond}, rounded up to a second. */
+        public java.time.Duration uploadAllowance(long bytes) {
+            long rate = Math.max(MIN_UPLOAD_MIN_BYTES_PER_SECOND, uploadMinBytesPerSecond);
+            return java.time.Duration.ofSeconds((Math.max(0, bytes) + rate - 1) / rate);
         }
 
         public int getReadTimeoutSeconds() { return readTimeoutSeconds; }
