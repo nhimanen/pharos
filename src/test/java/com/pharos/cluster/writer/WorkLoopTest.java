@@ -1193,6 +1193,49 @@ class WorkLoopTest {
     }
 
     /**
+     * Review I1: a renewal that fails without a definite answer (an I/O error or its deadline on a
+     * slow bucket) may leave the lease ours. Aborting would throw a full run away and the next run
+     * would be full again; on a bucket slow often enough the shard would never publish. Such a run
+     * goes on to its commit; its publish re-checks the lease, and once renewals work again the
+     * writer reclaims its untouched lease and publishes incrementally.
+     */
+    @Test
+    void ambiguousRenewalFailureDoesNotAbortTheRun() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Generation before = latest(s).orElseThrow();
+        change(s, "slow");
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.failPutIfMatchOn(layout.leaseKey(s)); // the renewal fails; the lease object stays ours
+        a.loop.leaseManager().renewAll();
+        assertThat(a.loop.leaseManager().isHeld(s)).as("seen lost").isFalse();
+        Thread.sleep(300);
+        assertThat(parser.aborted).as("not aborted on an ambiguous failure").isFalse();
+
+        store.release(); // renewals work again
+        parser.armed.set(false);
+        parser.finish = true;
+        runner.join(30_000);
+        assertThat(runner.isAlive()).isFalse();
+        assertThat(parser.aborted).isFalse();
+        assertThat(latest(s)).as("its publish failed the lease re-check").contains(before);
+
+        rounds(1, 10, a); // reclaims its untouched lease and publishes, incrementally
+        assertThat(a.held()).containsExactly(s);
+        assertThat(latest(s).orElseThrow().value()).isGreaterThan(before.value());
+        assertThat(warnings()).noneMatch(m -> m.contains("aborting the run"));
+    }
+
+    /**
      * A parser whose parse of the armed run takes up to 30 s, checking the run's abort every 10 ms
      * like {@link JavaCodeParser} does between files.
      */
@@ -1200,6 +1243,8 @@ class WorkLoopTest {
         final AtomicBoolean armed = new AtomicBoolean();
         final java.util.concurrent.CountDownLatch inParse = new java.util.concurrent.CountDownLatch(1);
         volatile boolean aborted;
+        /** Ends the armed parse normally (not aborted). */
+        volatile boolean finish;
 
         @Override
         public com.pharos.parser.model.ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
@@ -1207,7 +1252,7 @@ class WorkLoopTest {
             if (armed.get()) {
                 inParse.countDown();
                 long until = System.nanoTime() + 30_000_000_000L;
-                while (System.nanoTime() < until) {
+                while (System.nanoTime() < until && !finish) {
                     try {
                         abort.checkpoint();
                     } catch (com.pharos.indexer.IndexAbortedException e) {

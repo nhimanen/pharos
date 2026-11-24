@@ -60,8 +60,8 @@ UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
 - A writer's graceful stop is bounded when the bucket is slow or hangs (gate run 2: two writers
   needed SIGKILL 120 s after SIGTERM): the stopping heartbeat, the lease releases and the heartbeat
   delete each have a deadline, so a stop ends within `cluster.drainSeconds` + 10 s and logs each call
-  it gave up on. A lost lease aborts that shard's run, and a full run's parse checks the abort
-  between files (it could only stop after the parser's last file).
+  it gave up on. A lease taken by another writer aborts that shard's run (a renewal that merely
+  timed out does not), and a full run's parse checks the abort between files (it could only stop after the parser's last file).
 - Object-store calls are bounded (new `cluster.objectStore.callAttemptTimeoutSeconds`, default 20,
   `callTimeoutSeconds`, default 60, and `uploadMinBytesPerSecond`, default 1 MiB/s): a heartbeat put
   on the gate's saturated MinIO took about 4 minutes (three 30 s socket timeouts). Uploads get the

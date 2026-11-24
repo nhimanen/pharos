@@ -105,8 +105,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@code ls-remote} killed after {@code lsRemoteTimeoutSeconds}) stalls only its own shard.
  *
  * <p><b>Lost lease</b>: when the renewer (or the publish check) sees the lease of the shard being
- * run lost, the run is aborted at its next safe point ({@link #leaseLost}): its publish could only
- * fail the lease check.
+ * run definitely lost (taken over, or gone), the run is aborted at its next safe point
+ * ({@link #leaseLost}): its publish could only fail the lease check. A renewal that merely failed
+ * (an I/O error or its deadline) does not abort it.
  *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
@@ -319,19 +320,28 @@ public final class WorkLoop implements Closeable {
     }
 
     /**
-     * A held lease was seen lost (renewer thread, or the publish check): the run of that shard can
-     * no longer publish, so it is aborted at its next safe point instead of parsing, embedding and
-     * committing for nothing. A run past its commit finishes; its publish fails the lease check.
+     * A held lease was seen lost (renewer thread, or the publish check). A definite loss (another
+     * writer took it, or it is gone) aborts the run of that shard at its next safe point instead of
+     * parsing, embedding and committing for nothing. An ambiguous one (a renewal's I/O error or
+     * deadline on a slow bucket) does not: the lease is often still ours and reclaimed on the next
+     * tick, and aborting would make the next run full again; the run commits locally, its publish
+     * re-checks the lease, and the next (incremental) run publishes. A run past its commit finishes;
+     * its publish fails the lease check.
      */
-    private void leaseLost(ShardId shard) {
+    private void leaseLost(LeaseManager.Lost lost) {
         Run r = current;
-        if (r == null || !r.shard.equals(shard)) return;
-        if (r.abort.request("writer " + settings.node() + " lost the lease of shard " + shard)) {
-            log.warn("Shard {}: writer {} lost its lease; aborting the run at its next safe point (nothing is"
-                    + " committed, the new owner indexes it)", shard, settings.node());
+        if (r == null || !r.shard.equals(lost.shard())) return;
+        if (!lost.definite()) {
+            log.info("Shard {}: writer {} could not confirm its lease ({}); the run goes on, its publish re-checks"
+                    + " the lease", lost.shard(), settings.node(), lost.why());
+            return;
+        }
+        if (r.abort.request("writer " + settings.node() + " lost the lease of shard " + lost.shard())) {
+            log.warn("Shard {}: writer {} lost its lease ({}); aborting the run at its next safe point (nothing is"
+                    + " committed, the new owner indexes it)", lost.shard(), settings.node(), lost.why());
         } else {
             log.info("Shard {}: writer {} lost its lease after the run's commit; its publish fails the lease check",
-                    shard, settings.node());
+                    lost.shard(), settings.node());
         }
     }
 

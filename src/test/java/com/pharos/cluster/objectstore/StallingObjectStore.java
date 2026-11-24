@@ -38,9 +38,20 @@ public class StallingObjectStore extends InMemoryObjectStore {
     /** Lets every hanging call go on, and stops stalling. */
     public void release() {
         stalls.clear();
+        failingConditionalPuts.clear();
         CountDownLatch g = gate;
         gate = new CountDownLatch(1);
         g.countDown();
+    }
+
+    private final Set<String> failingConditionalPuts = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Conditional puts on keys containing {@code keySubstring} fail at once with an I/O error that
+     * leaves the object unchanged (a request the bucket never applied), until {@link #release}.
+     */
+    public void failPutIfMatchOn(String keySubstring) {
+        failingConditionalPuts.add(keySubstring);
     }
 
     /** Calls that hung so far. */
@@ -110,6 +121,11 @@ public class StallingObjectStore extends InMemoryObjectStore {
     @Override
     public Optional<String> putIfMatch(String key, byte[] data, String etag) {
         maybeStall(key);
+        for (String s : failingConditionalPuts) {
+            if (key.contains(s)) {
+                throw new java.io.UncheckedIOException(new IOException("injected putIfMatch failure for key: " + key));
+            }
+        }
         return super.putIfMatch(key, data, etag);
     }
 

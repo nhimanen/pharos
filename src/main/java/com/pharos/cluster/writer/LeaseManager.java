@@ -121,8 +121,8 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     });
     private ScheduledExecutorService renewer;
     private boolean closed;
-    /** Told about each lease seen lost (the work loop aborts the shard's run); never null. */
-    private volatile java.util.function.Consumer<ShardId> lostListener = s -> { };
+    /** Told about each lease seen lost (the work loop aborts the shard's run on a definite loss); never null. */
+    private volatile java.util.function.Consumer<Lost> lostListener = l -> { };
 
     /**
      * @param writer   this writer's node id, written into the lease
@@ -155,11 +155,21 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     public String writer() { return writer; }
 
     /**
-     * Calls {@code listener} with the shard each time a held lease is seen lost (a failed or
-     * conflicting renewal, a failed check), on the thread that saw it, after the state changed. It
-     * must not block on the store.
+     * A lease seen lost.
+     *
+     * @param definite true when another writer has it or it is gone (a conditional put refused, the
+     *                 lease object missing or carrying another ETag); false when the answer is
+     *                 unknown (an I/O error or a deadline on the bucket, an expiry by the bucket's
+     *                 clock), so the lease may well still be this writer's and be reclaimed at once
      */
-    public void onLost(java.util.function.Consumer<ShardId> listener) {
+    public record Lost(ShardId shard, String why, boolean definite) {}
+
+    /**
+     * Calls {@code listener} each time a held lease is seen lost (a failed or conflicting renewal, a
+     * failed check), on the thread that saw it, after the state changed. It must not block on the
+     * store.
+     */
+    public void onLost(java.util.function.Consumer<Lost> listener) {
         lostListener = Objects.requireNonNull(listener, "listener");
     }
 
@@ -281,11 +291,11 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             try {
                 etag = call("putIfMatch " + key, () -> store.putIfMatch(key, body(false), etagNow));
             } catch (IOException | RuntimeException e) {
-                markLost(shard, h, "renewal failed: " + e);
+                markLost(shard, h, "renewal failed: " + e, false);
                 return false;
             }
             if (etag.isEmpty()) {
-                markLost(shard, h, "it was taken by another writer");
+                markLost(shard, h, "it was taken by another writer", true);
                 return false;
             }
             recordWrite(shard, key, etag.get(), h);
@@ -382,14 +392,15 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             try {
                 Optional<StoredObject> cur = call("get " + key, () -> store.get(key));
                 if (cur.isEmpty() || !h.lease().etag().equals(cur.get().etag())) {
-                    markLost(shard, h, cur.isEmpty() ? "the lease object is gone" : "it was taken by another writer");
+                    markLost(shard, h, cur.isEmpty() ? "the lease object is gone" : "it was taken by another writer",
+                            true);
                     throw new PublishConflictException("writer " + writer + " lost the lease on shard " + shard);
                 }
                 Optional<ObjectInfo> info = call("stat " + key, () -> store.stat(key));
                 Optional<Instant> now = bucketNow();
                 if (info.isPresent() && info.get().lastModified() != null && now.isPresent()
                         && BucketClock.expired(info.get().lastModified(), now.get(), ttl)) {
-                    markLost(shard, h, "it expired by the bucket's clock");
+                    markLost(shard, h, "it expired by the bucket's clock", false);
                     throw new PublishConflictException("the lease of writer " + writer + " on shard " + shard
                             + " expired");
                 }
@@ -467,7 +478,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     }
 
     // Applies under mu, only if the shard's entry is still the one the caller started from.
-    private void markLost(ShardId shard, Held expected, String why) {
+    private void markLost(ShardId shard, Held expected, String why, boolean definite) {
         synchronized (mu) {
             Held h = held.get(shard);
             if (h == null || h != expected || h.lost()) return;
@@ -475,7 +486,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         }
         log.warn("Lease of shard {} lost ({}): writer {} stops publishing it", shard, why, writer);
         try {
-            lostListener.accept(shard);
+            lostListener.accept(new Lost(shard, why, definite));
         } catch (RuntimeException e) {
             log.warn("Handling the lost lease of shard {} failed: {}", shard, e.toString());
         }
