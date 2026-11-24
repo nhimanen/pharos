@@ -67,6 +67,20 @@ UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
   embedding model on any node (K2 then kills the `GATE_K2_SHARD` holder in `GATE_K2_PHASE`). Run it under
   `scripts/gate-watchdog.sh`. Defaults are unchanged.
 
+## [1.8.1] - 2026-11-24
+
+**Index format:** 1 (unchanged)
+
+The v1.8.0 tag produced no release: its release build failed in a test, so no 1.8.0 jar was published.
+1.8.1 is 1.8.0 plus the test fix below; there are no product changes. Upgrade from 1.7.x straight to 1.8.1
+and read the 1.8.0 notes below (and UPGRADING.md) for what changed.
+
+### Fixed
+- Build: `PipelineSplitParityTest` failed on GitHub runners with an AMD CPU without AVX-512. Lucene picks fused
+  or unfused multiply-add per CPU, so every vector score moved by one ulp against the fixture recorded on an
+  Intel machine. Surefire now pins `-Dlucene.useScalarFMA=true -Dlucene.useVectorFMA=true`, and the test
+  skips on hardware that cannot reproduce the recorded bits (no FMA, vectors narrower than 256 bits).
+
 ## [1.8.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)
