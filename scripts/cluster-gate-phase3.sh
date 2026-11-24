@@ -45,12 +45,14 @@
 #   GATE_R1_PORT .. GATE_R4_PORT / GATE_REF_PORT / GATE_ROUTER_PORT  (default 7301..7304 / 7305 / 7080)
 #   GATE_READER_CROSS_ENCODER  1 (default); 0: readers/router run without the cross-encoder (saves memory;
 #                      only for an elasticity-only run: hybrid-reranked rankings would differ)
+#   GATE_ELASTICITY_KEYWORD_ONLY  0 (default); 1: readers/router load no embedding model or cross-encoder and
+#                      the elasticity load is keyword only (elasticity-only runs on a tight memory cap)
 #   GATE_PORT_PROBE_TIMEOUT  seconds per port probe and curl connect (default 2; on hosts where an
 #                            unused port hangs instead of refusing, a timed-out probe counts as free)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,52p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
