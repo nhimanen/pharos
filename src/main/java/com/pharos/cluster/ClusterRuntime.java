@@ -293,8 +293,9 @@ public final class ClusterRuntime implements Closeable {
         }
         if (serve) {
             ClusterConfig c = config.getCluster();
-            long start = System.nanoTime(); // the announce counts toward drainSeconds
+            long start = System.nanoTime(); // drainSeconds caps everything, the announce included
             drain();
+            long announced = System.nanoTime(); // the notice runs from when draining is out
             long max = TimeUnit.SECONDS.toNanos(c.getDrainSeconds());
             long notice = Math.min(max, drainNotice(c.getHeartbeatSeconds()).toNanos());
             long quiet = FINAL_QUIET.toNanos();
@@ -312,7 +313,7 @@ public final class ClusterRuntime implements Closeable {
                     idleSince = now;
                 }
                 if (now - start >= max) break;
-                if (now - start >= notice && idleSince >= 0 && now - idleSince >= quiet) break;
+                if (now - announced >= notice && idleSince >= 0 && now - idleSince >= quiet) break;
                 try {
                     Thread.sleep(25);
                 } catch (InterruptedException e) {
