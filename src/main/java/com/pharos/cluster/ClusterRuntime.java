@@ -292,9 +292,9 @@ public final class ClusterRuntime implements Closeable {
             serve = isReader() && serving && advertised && !closed;
         }
         if (serve) {
-            drain();
             ClusterConfig c = config.getCluster();
-            long start = System.nanoTime();
+            long start = System.nanoTime(); // the announce counts toward drainSeconds
+            drain();
             long max = TimeUnit.SECONDS.toNanos(c.getDrainSeconds());
             long notice = Math.min(max, drainNotice(c.getHeartbeatSeconds()).toNanos());
             long quiet = FINAL_QUIET.toNanos();
@@ -351,7 +351,16 @@ public final class ClusterRuntime implements Closeable {
         stopCatalogTimer(); // queries still refresh on demand while the drain runs
         com.pharos.cluster.membership.ReaderRegistry r;
         synchronized (this) { r = readerRegistry; }
-        if (r != null) r.drain();
+        if (r != null) r.drain(drainAnnounceTimeout(config.getCluster().getDrainSeconds()));
+    }
+
+    /**
+     * How long the draining heartbeat may wait for the bucket: 5 s, at most {@code drainSeconds}
+     * (at least 1 s). A slow bucket then cannot hold the drain past {@code drainSeconds}; the
+     * heartbeat delete on close has its own 5 s deadline.
+     */
+    static Duration drainAnnounceTimeout(int drainSeconds) {
+        return Duration.ofSeconds(Math.max(1, Math.min(5, drainSeconds)));
     }
 
     com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {

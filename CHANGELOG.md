@@ -67,6 +67,10 @@ UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
   on the gate's saturated MinIO took about 4 minutes (three 30 s socket timeouts). Uploads get the
   call bounds plus their size at the minimum rate, so large generation uploads are not cut; a
   download's body stays bounded by the 30 s idle-read timeout.
+- A reader's SIGTERM drain is bounded on a slow bucket too (the same pattern, also in 1.8.1): the
+  draining heartbeat waits at most 5 s (and never past `drainSeconds`) for a tick stuck on the
+  bucket and for its put, the heartbeat delete on close at most 5 s, and each call given up on is
+  logged (`Stopping: gave up …`); the drain's `drainSeconds` now includes the announce.
 
 ### Maintainers
 - Phase 4 gate (`scripts/cluster-gate-phase4.sh`): ports (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`,

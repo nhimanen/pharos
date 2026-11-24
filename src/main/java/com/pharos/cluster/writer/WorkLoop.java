@@ -18,6 +18,7 @@ import com.pharos.indexer.IndexAbortedException;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProgressListener;
 import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.cluster.BoundedCall;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

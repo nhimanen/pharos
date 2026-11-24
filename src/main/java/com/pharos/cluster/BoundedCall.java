@@ -1,4 +1,4 @@
-package com.pharos.cluster.writer;
+package com.pharos.cluster;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -11,22 +11,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * A store call with a deadline, for the writer's shutdown path: the call runs on a daemon thread
+ * A store call with a deadline, for the shutdown paths of writers and readers: the call runs on a daemon thread
  * and the caller gives up when the deadline passes. An S3 request on a saturated bucket can take
  * minutes (a 30 s socket timeout, three attempts) and a blocking socket read ignores interrupts, so
  * a call past its deadline is abandoned, not stopped: its daemon thread ends with the call or the
  * JVM.
  */
-final class BoundedCall {
+public final class BoundedCall {
 
     /** A store call. */
     @FunctionalInterface
-    interface IoCall<T> {
+    public interface IoCall<T> {
         T call() throws IOException;
     }
 
     private static final ExecutorService POOL = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "pharos-writer-bounded-io");
+        Thread t = new Thread(r, "pharos-bounded-io");
         t.setDaemon(true);
         return t;
     });
@@ -38,7 +38,7 @@ final class BoundedCall {
      *
      * @throws IOException the call's own, or one saying it gave up after {@code timeout}
      */
-    static <T> T call(String what, Duration timeout, IoCall<T> call) throws IOException {
+    public static <T> T call(String what, Duration timeout, IoCall<T> call) throws IOException {
         long nanos = Math.max(0, timeout.toNanos());
         Future<T> f = POOL.submit(call::call);
         try {
@@ -59,16 +59,16 @@ final class BoundedCall {
         }
     }
 
-    static long millis(Duration d) {
+    public static long millis(Duration d) {
         return Math.max(0, d.toMillis());
     }
 
     /** What is left of a deadline on {@link System#nanoTime}; never negative. */
-    static Duration until(long deadlineNanos) {
+    public static Duration until(long deadlineNanos) {
         return Duration.ofNanos(Math.max(0, deadlineNanos - System.nanoTime()));
     }
 
-    static Duration min(Duration a, Duration b) {
+    public static Duration min(Duration a, Duration b) {
         return a.compareTo(b) <= 0 ? a : b;
     }
 }
