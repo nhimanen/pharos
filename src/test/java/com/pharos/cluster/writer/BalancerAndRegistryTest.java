@@ -73,6 +73,55 @@ class BalancerAndRegistryTest {
         a.close();
     }
 
+    @Test
+    void closeGivesUpOnAHungBucketAndALateBeatRemovesWhatItWrote() throws Exception {
+        WorkLoopTest.TestClock clock = new WorkLoopTest.TestClock();
+        com.pharos.cluster.objectstore.StallingObjectStore store = new com.pharos.cluster.objectstore.StallingObjectStore(clock);
+        ObjectStoreLayout layout = new ObjectStoreLayout("pharos");
+        WriterRegistry a = new WriterRegistry(store, layout, "a", Duration.ofSeconds(30), Duration.ofSeconds(10),
+                () -> hb("a"));
+        a.beat();
+        store.stallOn("catalog/writers/");
+        Thread beat = new Thread(a::beat);
+        beat.setDaemon(true);
+        beat.start();
+        assertThat(store.awaitStalled(1, 10)).isTrue();
+
+        long t0 = System.nanoTime();
+        assertThat(a.announce(Duration.ofMillis(300))).as("the lock is held by the hung beat").isFalse();
+        a.close(Duration.ofMillis(500));
+        assertThat((System.nanoTime() - t0) / 1_000_000).isLessThan(2_000);
+
+        store.release(); // the hung put lands after the close: the beat deletes it again
+        beat.join(10_000);
+        assertThat(beat.isAlive()).isFalse();
+        assertThat(store.get(layout.writerKey("a"))).isEmpty();
+    }
+
+    @Test
+    void releaseAllGivesUpOnAHungBucket() throws Exception {
+        WorkLoopTest.TestClock clock = new WorkLoopTest.TestClock();
+        com.pharos.cluster.objectstore.StallingObjectStore store = new com.pharos.cluster.objectstore.StallingObjectStore(clock);
+        ObjectStoreLayout layout = new ObjectStoreLayout("pharos");
+        LeaseManager m = new LeaseManager(store, layout, "a", Duration.ofSeconds(30), LeaseManager.BucketNow.NONE,
+                clock, Duration.ofSeconds(20));
+        ShardId x = new ShardId("x");
+        ShardId y = new ShardId("y");
+        m.tryAcquire(x).orElseThrow();
+        m.tryAcquire(y).orElseThrow();
+        store.stallOn("/shards/y/");
+
+        long t0 = System.nanoTime();
+        List<ShardId> late = m.releaseAll(Duration.ofMillis(500));
+        long took = (System.nanoTime() - t0) / 1_000_000;
+        m.close(Duration.ofMillis(100));
+
+        assertThat(took).isLessThan(2_000);
+        assertThat(late).containsExactly(y);
+        assertThat(store.get(layout.leaseKey(x)).orElseThrow().data()).asString().contains("\"released\":true");
+        store.release();
+    }
+
     private static WriterHeartbeat hb(String node) {
         return new WriterHeartbeat(node, true, List.of(), List.of(), Map.of(), null, 0L, false);
     }

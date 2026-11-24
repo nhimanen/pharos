@@ -20,6 +20,7 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
@@ -36,6 +37,12 @@ import java.util.function.Supplier;
  *
  * <p>A failed write or listing logs a WARN and keeps the previous live list; until our own write
  * succeeds again, {@link #lastWriteOk()} is false and the balancer makes no decision.
+ *
+ * <p><b>Shutdown is bounded.</b> A beat holds the registry's lock across its store calls, and on a
+ * saturated bucket one S3 call can take minutes. {@link #announce} and {@link #close(Duration)}
+ * therefore wait for that lock, and for their own store call, only until their deadline, and log
+ * that they gave up (the heartbeat then expires after the TTL). A beat that was in flight when the
+ * registry closed deletes the heartbeat it wrote, so a slow put cannot bring it back.
  */
 public final class WriterRegistry implements Closeable {
 
@@ -51,11 +58,13 @@ public final class WriterRegistry implements Closeable {
     private final Duration ttl;
     private final Duration every;
     private final Supplier<WriterHeartbeat> self;
-    private final Object mu = new Object();
+    /** Serialises the beats (held across their store calls); shutdown waits for it only so long. */
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Object mu = new Object(); // guards scheduler; never held across a store call
     private volatile List<LiveWriter> live = List.of();
     private volatile boolean lastWriteOk;
-    private boolean closed;                 // under mu
-    private ScheduledExecutorService scheduler;
+    private volatile boolean closed;
+    private ScheduledExecutorService scheduler; // under mu
 
     /**
      * @param ttl   liveness TTL of a heartbeat
@@ -87,21 +96,63 @@ public final class WriterRegistry implements Closeable {
 
     /** Writes our heartbeat, then refreshes the live list. Never throws. */
     public void beat() {
-        synchronized (mu) {
+        lock.lock();
+        try {
             if (closed) return;
             try {
                 store.put(key, MAPPER.writeValueAsBytes(self.get()));
                 lastWriteOk = true;
             } catch (IOException | RuntimeException e) {
                 lastWriteOk = false;
-                log.warn("Writing the writer heartbeat {} failed (retrying next beat): {}", key, e.toString());
+                if (!closed) log.warn("Writing the writer heartbeat {} failed (retrying next beat): {}", key, e.toString());
+                return;
+            }
+            if (closed) {
+                // closed while the put was in flight: its delete may have run first
+                deleteQuietly();
                 return;
             }
             refresh();
+        } finally {
+            lock.unlock();
         }
     }
 
-    // Holding mu, after a successful own write.
+    /**
+     * Shutdown: writes this writer's heartbeat once (it says {@code stopping}), so peers stop
+     * counting it. Waits for a beat in progress and for the write only until {@code timeout}, then
+     * gives up with a WARN. Never throws.
+     *
+     * @return true when the heartbeat was written
+     */
+    public boolean announce(Duration timeout) {
+        long deadline = System.nanoTime() + Math.max(0, timeout.toNanos());
+        try {
+            if (!lock.tryLock(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS)) {
+                log.warn("Stopping: gave up announcing it in the writer heartbeat {}: a heartbeat write has been in"
+                        + " progress for over {} ms (the bucket is slow); peers see it stop when the heartbeat goes"
+                        + " or expires", key, BoundedCall.millis(timeout));
+                return false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        try {
+            if (closed) return false;
+            byte[] body = MAPPER.writeValueAsBytes(self.get());
+            BoundedCall.call("put " + key, BoundedCall.until(deadline), () -> store.put(key, body));
+            lastWriteOk = true;
+            return true;
+        } catch (IOException | RuntimeException e) {
+            log.warn("Stopping: gave up announcing it in the writer heartbeat {}: {}", key, e.toString());
+            return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Holding the lock, after a successful own write.
     private void refresh() {
         try {
             List<ObjectInfo> infos = store.list(layout.writersPrefix()).stream()
@@ -148,9 +199,23 @@ public final class WriterRegistry implements Closeable {
         return store.stat(key).map(ObjectInfo::lastModified);
     }
 
-    /** Stops beating and deletes our heartbeat, so peers drop this writer at once. Idempotent. */
+    /** The deadline of {@link #close()}. */
+    static final Duration DEFAULT_CLOSE = Duration.ofSeconds(10);
+
+    /** {@link #close(Duration)} within {@link #DEFAULT_CLOSE}. */
     @Override
     public void close() {
+        close(DEFAULT_CLOSE);
+    }
+
+    /**
+     * Stops beating and deletes our heartbeat, so peers drop this writer at once. A beat stuck on
+     * the bucket is abandoned (its thread is a daemon; if its put lands later, it deletes what it
+     * wrote), and the delete gives up at {@code within} with a WARN: the heartbeat then expires after
+     * the TTL. Idempotent; returns within {@code within}.
+     */
+    public void close(Duration within) {
+        long deadline = System.nanoTime() + Math.max(0, within.toNanos());
         ScheduledExecutorService s;
         synchronized (mu) {
             if (closed) return;
@@ -158,21 +223,24 @@ public final class WriterRegistry implements Closeable {
             s = scheduler;
             scheduler = null;
         }
-        if (s != null) {
-            s.shutdownNow();
-            try {
-                s.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        synchronized (mu) {
-            try {
+        if (s != null) s.shutdownNow(); // a beat blocked in a socket read ignores the interrupt: not awaited
+        live = List.of();
+        try {
+            BoundedCall.call("delete " + key, BoundedCall.until(deadline), () -> {
                 store.delete(key);
-            } catch (IOException | RuntimeException e) {
-                log.warn("Removing the writer heartbeat {} failed (it expires after {}): {}", key, ttl, e.toString());
-            }
-            live = List.of();
+                return null;
+            });
+        } catch (IOException | RuntimeException e) {
+            log.warn("Stopping: gave up removing the writer heartbeat {} (it expires after {} s): {}", key,
+                    ttl.toSeconds(), e.toString());
+        }
+    }
+
+    private void deleteQuietly() {
+        try {
+            store.delete(key);
+        } catch (IOException | RuntimeException e) {
+            log.debug("Removing the writer heartbeat {} after a late beat failed: {}", key, e.toString());
         }
     }
 }

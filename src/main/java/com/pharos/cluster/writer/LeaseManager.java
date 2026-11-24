@@ -307,6 +307,40 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         }
     }
 
+    /**
+     * Shutdown: releases every held lease in parallel (each by {@link #release}, its store call
+     * bounded by the per-call deadline) and waits for them only until {@code within}. A release
+     * still running then is abandoned with a WARN: that lease expires after the TTL. Call it before
+     * {@link #close}. Never throws; returns within {@code within}.
+     *
+     * @return the shards whose release did not finish in time
+     */
+    public List<ShardId> releaseAll(Duration within) {
+        List<Lease> leases = held();
+        if (leases.isEmpty()) return List.of();
+        List<Callable<Void>> tasks = leases.stream().<Callable<Void>>map(l -> () -> {
+            release(l);
+            return null;
+        }).toList();
+        List<ShardId> late = new java.util.ArrayList<>();
+        try {
+            List<Future<Void>> done = io.invokeAll(tasks, Math.max(0, within.toNanos()), TimeUnit.NANOSECONDS);
+            for (int i = 0; i < done.size(); i++) {
+                if (done.get(i).isCancelled()) late.add(leases.get(i).shard());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            leases.forEach(l -> late.add(l.shard()));
+        } catch (RejectedExecutionException e) {
+            leases.forEach(l -> late.add(l.shard())); // closed meanwhile
+        }
+        if (!late.isEmpty()) {
+            log.warn("Stopping: gave up releasing the lease of shard(s) {} after {} ms (the bucket is slow); they"
+                    + " expire after {} s", late, Math.max(0, within.toMillis()), ttl.toSeconds());
+        }
+        return late;
+    }
+
     /** True while this manager holds the shard's lease and has not seen it lost. Never waits on the store. */
     public boolean isHeld(ShardId shard) {
         synchronized (mu) {
@@ -362,6 +396,11 @@ public final class LeaseManager implements LeaseGuard, Closeable {
      */
     @Override
     public void close() {
+        close(Duration.ofSeconds(5));
+    }
+
+    /** {@link #close()}, waiting at most {@code wait} for a renewal round in progress. */
+    public void close(Duration wait) {
         ScheduledExecutorService s;
         synchronized (mu) {
             if (closed) return;
@@ -372,7 +411,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         if (s != null) {
             s.shutdownNow();
             try {
-                s.awaitTermination(5, TimeUnit.SECONDS);
+                s.awaitTermination(Math.max(0, wait.toNanos()), TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

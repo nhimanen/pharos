@@ -717,7 +717,7 @@ public class ProjectIndexManager {
         int parserIdx = 0;
         for (Map.Entry<CodeParser, List<Path>> entry : filesByParser.entrySet()) {
             abort.checkpoint();
-            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName));
+            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName, abort));
             progress.onProgress("Parsing", ++parserIdx, parsers.size());
         }
         ParsedProject project = merge(projectName, projectRoot, perLang);

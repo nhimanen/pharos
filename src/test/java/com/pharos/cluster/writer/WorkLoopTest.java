@@ -96,7 +96,7 @@ class WorkLoopTest {
 
     @TempDir Path tmp;
     private final TestClock clock = new TestClock();
-    private InMemoryObjectStore store;
+    private com.pharos.cluster.objectstore.StallingObjectStore store;
     private ObjectStoreLayout layout;
     private ObjectStoreCatalog catalog;
     private ObjectStoreReplicaSource replicas;
@@ -128,6 +128,12 @@ class WorkLoopTest {
 
         /** @param checkouts the checkout for the writer's work dir */
         Writer(String node, DiskGuard.Probe probe, java.util.function.Function<Path, SourceCheckout> checkouts) {
+            this(node, probe, checkouts, new JavaCodeParser());
+        }
+
+        /** @param parser the code parser of its index runs */
+        Writer(String node, DiskGuard.Probe probe, java.util.function.Function<Path, SourceCheckout> checkouts,
+               com.pharos.parser.CodeParser parser) {
             this.node = node;
             Path home = tmp.resolve("w" + (++writerSeq) + "-" + node);
             IndexConfig config = IndexConfig.defaults();
@@ -144,7 +150,7 @@ class WorkLoopTest {
                 }
             };
             manager = new ProjectIndexManager(config, lucene, registry, List.of(embedder), noopModules,
-                    List.of(new JavaCodeParser()), publisher);
+                    List.of(parser), publisher);
             localOnly = new ProjectIndexManager(config, lucene, registry, List.of(embedder), noopModules,
                     List.of(new JavaCodeParser()));
             disk = probe == null ? null : new DiskGuard(home.resolve("indexes"), List.of(home.resolve("work")),
@@ -175,14 +181,32 @@ class WorkLoopTest {
 
     @BeforeEach
     void setUp() {
-        store = new InMemoryObjectStore(clock);
+        store = new com.pharos.cluster.objectstore.StallingObjectStore(clock);
         layout = new ObjectStoreLayout("pharos");
         catalog = new ObjectStoreCatalog(store, layout);
         replicas = new ObjectStoreReplicaSource(store, layout);
+        logs = new ch.qos.logback.core.read.ListAppender<>();
+        logs.start();
+        writerLogger().addAppender(logs);
+    }
+
+    private ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logs;
+
+    private static ch.qos.logback.classic.Logger writerLogger() {
+        return (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger("com.pharos.cluster.writer");
+    }
+
+    private List<String> warnings() {
+        synchronized (logs.list) {
+            return logs.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        }
     }
 
     @AfterEach
     void tearDown() {
+        store.release();
+        writerLogger().detachAppender(logs);
         for (Writer w : writers) {
             w.loop.close();
             w.lucene.close();
@@ -1060,6 +1084,113 @@ class WorkLoopTest {
         Writer b = new Writer("node-b");
         b.loop.tick();
         assertThat(latest(s)).contains(new Generation(2));
+    }
+
+    // ------------------------------------------------------------------ stop on a hung bucket
+
+    /** Runs {@code stop(budget)} on its own thread; returns its duration, or -1 if it is still running. */
+    private long timedStop(Writer w, Duration budget, long waitMillis) throws InterruptedException {
+        long t0 = System.nanoTime();
+        Thread stopper = new Thread(() -> w.loop.stop(budget), "test-stop-" + w.node);
+        stopper.setDaemon(true);
+        stopper.start();
+        stopper.join(waitMillis);
+        return stopper.isAlive() ? -1 : (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    /**
+     * Gate run 2 for 1.9.0, w5: an idle writer on a saturated MinIO did not exit within 120 s of
+     * SIGTERM. Its heartbeat thread sat in an S3 put (minutes: 30 s socket timeout, 3 attempts)
+     * holding the registry's lock, and stop() began with a synchronous heartbeat of its own on that
+     * lock, then deleted the heartbeat on it again, with no deadline.
+     */
+    @Test
+    void idleWriterStopsWithinBudgetPlusCleanupWhileTheBucketHangs() throws Exception {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.shutdownCleanup(Duration.ofSeconds(2));
+        a.loop.tick(); // holds the shard, published, idle
+        assertThat(a.held()).containsExactly(s);
+
+        store.stallOn("pharos/"); // every bucket call hangs from now on
+        clock.advance(10);
+        Thread beat = new Thread(a.loop::tick, "test-tick"); // like the heartbeat thread, stuck mid-beat
+        beat.setDaemon(true);
+        beat.start();
+        assertThat(store.awaitStalled(1, 10)).isTrue();
+
+        long took = timedStop(a, Duration.ofSeconds(2), 15_000);
+
+        assertThat(took).as("stop returned (ms)").isNotNegative().isLessThan(2_000 + 2_000 + 1_500);
+        assertThat(warnings()).anyMatch(m -> m.contains("gave up") && m.contains("heartbeat"));
+        assertThat(warnings()).anyMatch(m -> m.contains("gave up") && m.contains("lease"));
+    }
+
+    /**
+     * Gate run 2 for 1.9.0, w6: a writer in the parse phase of a long full run, on a hung bucket,
+     * gets SIGTERM. The stop ends within its budget plus the cleanup bound, and the run is aborted
+     * inside the parse (not after the parser's last file).
+     */
+    @Test
+    void writerMidParseStopsWithinBudgetPlusCleanupWhileTheBucketHangs() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.shutdownCleanup(Duration.ofSeconds(2));
+        a.loop.tick();
+        Optional<Generation> before = latest(s);
+        change(s, "slow");
+        // a FULL run, as w6's (takeover at another checkout path): its parse is one parseFiles call
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.stallOn("pharos/");
+        long took = timedStop(a, Duration.ofSeconds(2), 15_000);
+
+        assertThat(took).as("stop returned (ms)").isNotNegative().isLessThan(2_000 + 2_000 + 1_500);
+        runner.join(5_000);
+        assertThat(parser.aborted).as("the run was aborted inside its parse").isTrue();
+        store.release();
+        assertThat(latest(s)).isEqualTo(before);
+    }
+
+    /**
+     * A parser whose parse of the armed run takes up to 30 s, checking the run's abort every 10 ms
+     * like {@link JavaCodeParser} does between files.
+     */
+    static final class SlowParser extends JavaCodeParser {
+        final AtomicBoolean armed = new AtomicBoolean();
+        final java.util.concurrent.CountDownLatch inParse = new java.util.concurrent.CountDownLatch(1);
+        volatile boolean aborted;
+
+        @Override
+        public com.pharos.parser.model.ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
+                                                                com.pharos.indexer.IndexAbort abort) throws IOException {
+            if (armed.get()) {
+                inParse.countDown();
+                long until = System.nanoTime() + 30_000_000_000L;
+                while (System.nanoTime() < until) {
+                    try {
+                        abort.checkpoint();
+                    } catch (com.pharos.indexer.IndexAbortedException e) {
+                        aborted = true;
+                        throw e;
+                    }
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.InterruptedIOException("interrupted");
+                    }
+                }
+            }
+            return super.parseFiles(files, projectRoot, projectName, abort);
+        }
     }
 
     // --------------------------------------------------------------------------- disk guard

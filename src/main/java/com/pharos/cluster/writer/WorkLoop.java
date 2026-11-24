@@ -106,7 +106,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
  * its commit finishes, publish included); then every lease is released (before the lease manager is
- * closed, after which a release can no longer write) and the heartbeat is deleted.
+ * closed, after which a release can no longer write) and the heartbeat is deleted. The stop returns
+ * within the budget plus {@link #DEFAULT_SHUTDOWN_CLEANUP} whatever the bucket does: every store
+ * call on the way (the stopping heartbeat, the releases, the heartbeat delete) has a deadline, and
+ * one that passes it is given up with a WARN (its lease or heartbeat then expires after the TTL).
  */
 public final class WorkLoop implements Closeable {
 
@@ -266,6 +269,15 @@ public final class WorkLoop implements Closeable {
     private final Object stopMu = new Object();
     private boolean stopped;                 // under stopMu
     private ScheduledExecutorService scheduler;
+
+    /**
+     * How long a stop may spend on the bucket after its budget: releasing the leases, closing the
+     * lease manager and deleting the heartbeat. A stop ends within {@code cluster.drainSeconds} plus
+     * this (20 + 10 s by default), well inside the operator's pod grace of drainSeconds + 30 s, which
+     * also covers the model-call drain and the JVM exit after it.
+     */
+    public static final Duration DEFAULT_SHUTDOWN_CLEANUP = Duration.ofSeconds(10);
+    private volatile Duration shutdownCleanup = DEFAULT_SHUTDOWN_CLEANUP;
 
     /**
      * @param clock this writer's clock: {@code minHold}, backlog ages and run start times. Lease and
@@ -1270,10 +1282,13 @@ public final class WorkLoop implements Closeable {
     // ------------------------------------------------------------------------------- stop
 
     /**
-     * Graceful stop within {@code budget} ({@code cluster.drainSeconds}): no new run starts; a run in
-     * progress may finish until the budget minus a reserve (a quarter, at least 1 s), then is aborted
-     * at a safe point (a run past its commit finishes its publish); then all leases are released
-     * (before the lease manager closes) and the heartbeat is deleted. Idempotent.
+     * Graceful stop within {@code budget} ({@code cluster.drainSeconds}) plus the cleanup bound
+     * ({@link #DEFAULT_SHUTDOWN_CLEANUP}): no new run starts; the stopping heartbeat is written
+     * (given up after the lease manager's per-call deadline, at most the budget); a run in progress
+     * may finish until the budget minus a reserve (a quarter, at least 1 s), then is aborted at a safe
+     * point (a run past its commit finishes its publish); then all leases are released (before the
+     * lease manager closes) and the heartbeat is deleted, each given up at the cleanup bound. A tick
+     * that is only waiting on the bucket (no run, no restore) is not waited for. Idempotent.
      */
     public void stop(Duration budget) {
         ScheduledExecutorService s;
@@ -1291,9 +1306,15 @@ public final class WorkLoop implements Closeable {
         long start = System.nanoTime();
         long total = Math.max(0, budget.toNanos());
         long reserve = Math.min(total, Math.max(TimeUnit.SECONDS.toNanos(1), total / 4));
-        members.beat(); // announce stopping: peers stop counting this writer
+        long end = start + total;
+        long cleanupEnd = end + Math.max(0, shutdownCleanup.toNanos());
+        log.info("Writer {} stopping: drain {} s, then at most {} s for releasing leases and the heartbeat",
+                settings.node(), budget.toSeconds(), shutdownCleanup.toSeconds());
+        // announce stopping (peers stop counting this writer); a slow bucket must not eat the drain
+        Duration announce = BoundedCall.min(settings.leaseTtl().dividedBy(6), budget);
+        if (!announce.isZero() && !announce.isNegative()) members.announce(announce);
         if (s != null) s.shutdown(); // no interrupt: a run is stopped by its abort, never mid-I/O
-        boolean idle = awaitIdle(total - reserve);
+        boolean idle = awaitIdle(end - reserve - System.nanoTime());
         if (!idle) {
             Run r = current;
             if (r != null) {
@@ -1303,26 +1324,44 @@ public final class WorkLoop implements Closeable {
                     log.info("Stopping: the run of shard {} is past its commit; letting it publish", r.shard);
                 }
             }
-            idle = awaitIdle(total - (System.nanoTime() - start));
+            idle = awaitIdle(end - System.nanoTime());
         }
         if (!idle) {
-            log.warn("Stopping with a run still in progress after {} s; releasing its lease (its publish will fail"
-                    + " the lease check)", budget.toSeconds());
+            Run r = current;
+            log.warn("Stopping with {} still in progress after {} s; releasing its lease (a publish fails the lease"
+                    + " check)", r != null ? "the run of shard " + r.shard : "a tick", budget.toSeconds());
         }
-        for (Lease l : leases.held()) leases.release(l); // before close: after it a release cannot write
+        // before close: after it a release cannot write. Half the cleanup, the rest for the heartbeat.
+        long releaseEnd = System.nanoTime() + (cleanupEnd - System.nanoTime()) / 2;
+        leases.releaseAll(BoundedCall.until(releaseEnd));
         shards.clear();
-        leases.close();
-        members.close();
-        log.info("Writer {} stopped: leases released, heartbeat removed", settings.node());
+        leases.close(BoundedCall.min(Duration.ofSeconds(1), BoundedCall.until(cleanupEnd)));
+        members.close(BoundedCall.until(cleanupEnd));
+        log.info("Writer {} stopped in {} ms", settings.node(), (System.nanoTime() - start) / 1_000_000);
     }
 
+    /** Visible for tests: the cleanup bound of {@link #stop}. */
+    void shutdownCleanup(Duration d) {
+        shutdownCleanup = Objects.requireNonNull(d, "d");
+    }
+
+    /**
+     * Waits until no tick runs, or until the tick in progress has nothing to drain: no run and no
+     * shard being restored, only bucket or source I/O (which may hang on a slow store). False when
+     * {@code nanos} passed first.
+     */
     private boolean awaitIdle(long nanos) {
+        long deadline = System.nanoTime() + Math.max(0, nanos);
         try {
-            if (tickLock.tryLock(Math.max(0, nanos), TimeUnit.NANOSECONDS)) {
-                tickLock.unlock();
-                return true;
+            while (true) {
+                long slice = Math.min(TimeUnit.MILLISECONDS.toNanos(25), Math.max(0, deadline - System.nanoTime()));
+                if (tickLock.tryLock(slice, TimeUnit.NANOSECONDS)) {
+                    tickLock.unlock();
+                    return true;
+                }
+                if (current == null && busy == null) return true; // nothing to drain
+                if (System.nanoTime() >= deadline) return false;
             }
-            return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
