@@ -58,6 +58,15 @@ UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
 - A takeover that restores a generation with an older writer-state backup (the newest one was lost)
   runs a full index, so documents of files deleted since never stay behind.
 
+### Maintainers
+- Phase 4 gate (`scripts/cluster-gate-phase4.sh`): ports (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`,
+  `GATE_ROUTER_PORT`, `GATE_WEBHOOK_PORT`, `GATE_R1_PORT`/`GATE_R2_PORT`, `GATE_W1_PORT`..`GATE_W6_PORT`,
+  `GATE_WLOW_PORT`), sources (`GATE_LUCENE_SRC`, `GATE_PHAROS_SRC`), `GATE_MODELS_SRC` and an optional
+  embedding-cache seed (`GATE_SEED_FROM`) are configurable, with a bounded port probe and curl connects
+  (`GATE_PORT_PROBE_TIMEOUT`). `GATE_KEYWORD_ONLY=1` runs failover, scaling, status and the disk guard with no
+  embedding model on any node (K2 then kills the `GATE_K2_SHARD` holder in `GATE_K2_PHASE`). Run it under
+  `scripts/gate-watchdog.sh`. Defaults are unchanged.
+
 ## [1.8.0] - 2026-11-23
 
 **Index format:** 1 (unchanged)
