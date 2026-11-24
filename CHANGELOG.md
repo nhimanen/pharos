@@ -59,6 +59,8 @@ Requires no re-index; cluster readers should read UPGRADING.md (config validatio
   shutdown hooks (ONNX Runtime's environment closer among them) start only after that, so a signal no longer
   frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies to `web`, `mcp-server`,
   `index`, `embed` and `upgrade-indexes`.
+- Lazy readers missed a corrupt checksum when a file's footer straddles two blocks (or fills the last block
+  alone); present since 1.7.0. The real footer is now compared wherever it falls in the blocks.
 
 ### Changed
 - A vector, hybrid or unified search over several projects no longer fails when one of them has no vectors
