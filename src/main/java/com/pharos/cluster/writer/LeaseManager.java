@@ -121,6 +121,8 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     });
     private ScheduledExecutorService renewer;
     private boolean closed;
+    /** Told about each lease seen lost (the work loop aborts the shard's run); never null. */
+    private volatile java.util.function.Consumer<ShardId> lostListener = s -> { };
 
     /**
      * @param writer   this writer's node id, written into the lease
@@ -151,6 +153,15 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     }
 
     public String writer() { return writer; }
+
+    /**
+     * Calls {@code listener} with the shard each time a held lease is seen lost (a failed or
+     * conflicting renewal, a failed check), on the thread that saw it, after the state changed. It
+     * must not block on the store.
+     */
+    public void onLost(java.util.function.Consumer<ShardId> listener) {
+        lostListener = Objects.requireNonNull(listener, "listener");
+    }
 
     public Duration ttl() { return ttl; }
 
@@ -463,6 +474,11 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             held.put(shard, h.lostCopy());
         }
         log.warn("Lease of shard {} lost ({}): writer {} stops publishing it", shard, why, writer);
+        try {
+            lostListener.accept(shard);
+        } catch (RuntimeException e) {
+            log.warn("Handling the lost lease of shard {} failed: {}", shard, e.toString());
+        }
     }
 
     // Holding the shard lock. Records a successful lease write; its bucket LastModified (by a stat,

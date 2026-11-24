@@ -103,6 +103,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * checks run per shard, in parallel, under a per-shard lock: an unreachable remote (its
  * {@code ls-remote} killed after {@code lsRemoteTimeoutSeconds}) stalls only its own shard.
  *
+ * <p><b>Lost lease</b>: when the renewer (or the publish check) sees the lease of the shard being
+ * run lost, the run is aborted at its next safe point ({@link #leaseLost}): its publish could only
+ * fail the lease check.
+ *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
  * its commit finishes, publish included); then every lease is released (before the lease manager is
@@ -310,6 +314,24 @@ public final class WorkLoop implements Closeable {
                 this::heartbeat);
         // The heartbeat is the bucket's "now" for lease expiry: without it no expired lease is taken over.
         this.leases = new LeaseManager(store, layout, settings.node(), settings.leaseTtl(), members::bucketNow, clock);
+        this.leases.onLost(this::leaseLost);
+    }
+
+    /**
+     * A held lease was seen lost (renewer thread, or the publish check): the run of that shard can
+     * no longer publish, so it is aborted at its next safe point instead of parsing, embedding and
+     * committing for nothing. A run past its commit finishes; its publish fails the lease check.
+     */
+    private void leaseLost(ShardId shard) {
+        Run r = current;
+        if (r == null || !r.shard.equals(shard)) return;
+        if (r.abort.request("writer " + settings.node() + " lost the lease of shard " + shard)) {
+            log.warn("Shard {}: writer {} lost its lease; aborting the run at its next safe point (nothing is"
+                    + " committed, the new owner indexes it)", shard, settings.node());
+        } else {
+            log.info("Shard {}: writer {} lost its lease after the run's commit; its publish fails the lease check",
+                    shard, settings.node());
+        }
     }
 
     /** Starts the heartbeat, the lease renewer and the polling loop (daemon threads). */

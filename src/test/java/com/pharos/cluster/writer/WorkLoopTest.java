@@ -1160,6 +1160,39 @@ class WorkLoopTest {
     }
 
     /**
+     * Gate run 2 for 1.9.0, w6: the lucene lease was lost 55 s into a full run, and the run went on
+     * parsing (and would have embedded and committed) for nothing: its publish fails the lease check.
+     * A lost lease aborts the run at its next safe point.
+     */
+    @Test
+    void lostLeaseAbortsTheRunInProgress() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Optional<Generation> before = latest(s);
+        change(s, "slow");
+        // a FULL run, as w6's (takeover at another checkout path): its parse is one parseFiles call
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        // another writer took the lease meanwhile: the renewal finds another ETag
+        store.put(layout.leaseKey(s), "{\"writer\":\"node-x\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        a.loop.leaseManager().renewAll();
+
+        runner.join(10_000);
+        assertThat(runner.isAlive()).as("the run stopped").isFalse();
+        assertThat(parser.aborted).as("aborted inside its parse").isTrue();
+        assertThat(latest(s)).isEqualTo(before);
+        assertThat(warnings()).anyMatch(m -> m.contains("lost") && m.contains("aborting the run"));
+    }
+
+    /**
      * A parser whose parse of the armed run takes up to 30 s, checking the run's abort every 10 ms
      * like {@link JavaCodeParser} does between files.
      */
