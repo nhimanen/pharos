@@ -267,7 +267,11 @@ class Node(p2.Reader):
         cfg = {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
-            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": True,
+            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"],
+            # GATE_READER_CROSS_ENCODER=0: readers and the router skip the cross-encoder (it loads at
+            # warm-up), for an elasticity-only run on a tight memory cap; the reference always has it.
+            "crossEncoderEnabled": self.kind == "reference"
+                                   or os.environ.get("GATE_READER_CROSS_ENCODER", "1") != "0",
         }
         if self.kind != "reference":
             cfg["cluster"] = {

@@ -43,12 +43,14 @@
 #   GATE_MODELS_SRC    .djl.ai dir the models are copied from (default ~/.djl.ai)
 #   GATE_MINIO_PORT / GATE_MINIO_CONSOLE_PORT  MinIO ports (default 9000 / 9001)
 #   GATE_R1_PORT .. GATE_R4_PORT / GATE_REF_PORT / GATE_ROUTER_PORT  (default 7301..7304 / 7305 / 7080)
+#   GATE_READER_CROSS_ENCODER  1 (default); 0: readers/router run without the cross-encoder (saves memory;
+#                      only for an elasticity-only run: hybrid-reranked rankings would differ)
 #   GATE_PORT_PROBE_TIMEOUT  seconds per port probe and curl connect (default 2; on hosts where an
 #                            unused port hangs instead of refusing, a timed-out probe counts as free)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
