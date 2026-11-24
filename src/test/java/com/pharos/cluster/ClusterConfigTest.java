@@ -220,6 +220,29 @@ class ClusterConfigTest {
         assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
     }
 
+    @Test
+    void objectStoreCallTimeoutsDefaultAndAreValidated() throws Exception {
+        String base = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\","
+                + "\"token\":\"t\",\"objectStore\":{\"bucket\":\"b\"%s}}}";
+        ClusterConfig c = parse(String.format(base, ""));
+        assertThat(c.getObjectStore().callAttemptTimeout()).isEqualTo(java.time.Duration.ofSeconds(20));
+        assertThat(c.getObjectStore().callTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(60));
+        assertThat(c.getObjectStore().getUploadMinBytesPerSecond()).isEqualTo(1L << 20);
+        String[][] bad = {
+                {",\"callAttemptTimeoutSeconds\":0", "callAttemptTimeoutSeconds"},
+                {",\"callAttemptTimeoutSeconds\":3601", "callAttemptTimeoutSeconds"},
+                {",\"callAttemptTimeoutSeconds\":30,\"callTimeoutSeconds\":20", "callTimeoutSeconds"},
+                {",\"callTimeoutSeconds\":3601", "callTimeoutSeconds"},
+                {",\"uploadMinBytesPerSecond\":1023", "uploadMinBytesPerSecond"}};
+        for (String[] b : bad) {
+            assertThatThrownBy(() -> parse(String.format(base, b[0])))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.objectStore." + b[1]);
+        }
+        ClusterConfig ok = parse(String.format(base, ",\"callAttemptTimeoutSeconds\":5,\"callTimeoutSeconds\":5"));
+        assertThat(ok.getObjectStore().callTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(5));
+    }
+
     private static final String READER = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
             + "\"objectStore\":{\"bucket\":\"b\"}%s}}";
 
