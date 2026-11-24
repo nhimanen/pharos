@@ -21,11 +21,49 @@ public class ClusterConfig {
     /** Host name looked up on first use only: {@code getLocalHost()} can stall for seconds. */
     private transient String resolvedNodeId;
     private int pollIntervalSeconds = 10;
+    /**
+     * Readers: how long a shard's directory is kept after the reader stops serving it (pinned away),
+     * so queries and fan-out calls already reading it finish. Keep it at least as long as the longest
+     * query or fan-out timeout; the effective value is never below {@code pollIntervalSeconds}.
+     */
+    private int retireGraceSeconds = 120;
     private Path cacheDir = IndexConfig.DEFAULT_BASE.resolve("cluster-cache");
     private int retentionGenerations = 3;
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
     private ReaderConfig reader = new ReaderConfig();
+    /** Base URL other nodes reach this reader at; required on readers. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String advertiseUrl;
+    /** Shared secret of the cluster's internal endpoints; required on readers. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String token;
+    private int heartbeatSeconds = 10;
+    private int readerTtlSeconds = 30;
+    /** Timeout of one internal shard call (term statistics, shard search, snippets, callees). */
+    private int fanoutTimeoutMillis = 5000;
+    /** Connect timeout of an internal shard call; a dead reader fails this fast. */
+    private int connectTimeoutMillis = 1000;
+    /**
+     * Budget of one fanned-out query, every shard round included; 0 means the default
+     * ({@link #DEFAULT_QUERY_TIMEOUT_MILLIS}, or {@code fanoutTimeoutMillis} when that is larger).
+     */
+    private int queryTimeoutMillis = 0;
+    /** How old the last good read of the shard catalog may get before unscoped routing is refused. */
+    private int maxCatalogAgeSeconds = 600;
+    /**
+     * Readers: on shutdown (SIGTERM), how long the node keeps running while draining: it announces
+     * {@code draining} (heartbeat and {@code /health} 503) at once and stops when its in-flight
+     * requests reach 0, or after this many seconds. 0 stops at once (still announcing first).
+     */
+    private int drainSeconds = DEFAULT_DRAIN_SECONDS;
+
+    public static final int DEFAULT_DRAIN_SECONDS = 20;
+    static final int MAX_DRAIN_SECONDS = 3600;
+
+    public static final int DEFAULT_QUERY_TIMEOUT_MILLIS = 20_000;
+    /** A pinned local reader is retired this long after a swap: a query must finish well before. */
+    static final long RETIRE_DELAY_MILLIS = com.pharos.indexer.LuceneIndexer.RETIRE_DELAY.toMillis();
 
     /** How the default node id is found; package-private so tests can count lookups. */
     static Supplier<String> hostnameResolver = ClusterConfig::hostName;
@@ -70,8 +108,72 @@ public class ClusterConfig {
         if (pollIntervalSeconds <= 0) {
             throw new IllegalStateException("cluster.pollIntervalSeconds must be positive, got " + pollIntervalSeconds);
         }
+        if (retireGraceSeconds <= 0) {
+            throw new IllegalStateException("cluster.retireGraceSeconds must be positive, got " + retireGraceSeconds);
+        }
+        if (retireGraceSeconds < 2L * pollIntervalSeconds) {
+            throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
+                    + ") must be at least twice cluster.pollIntervalSeconds (" + pollIntervalSeconds + ")");
+        }
+        if (fanoutTimeoutMillis <= 0) {
+            throw new IllegalStateException("cluster.fanoutTimeoutMillis must be positive, got " + fanoutTimeoutMillis);
+        }
+        if (connectTimeoutMillis <= 0) {
+            throw new IllegalStateException("cluster.connectTimeoutMillis must be positive, got " + connectTimeoutMillis);
+        }
+        if (queryTimeoutMillis < 0) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis must not be negative (0 = default), got "
+                    + queryTimeoutMillis);
+        }
+        if (queryTimeoutMillis > 0 && queryTimeoutMillis < fanoutTimeoutMillis) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis (" + queryTimeoutMillis
+                    + ") must be at least cluster.fanoutTimeoutMillis (" + fanoutTimeoutMillis + ")");
+        }
+        if (effectiveQueryTimeoutMillis() >= RETIRE_DELAY_MILLIS) {
+            throw new IllegalStateException("cluster.queryTimeoutMillis (effective " + effectiveQueryTimeoutMillis()
+                    + " ms, from cluster.fanoutTimeoutMillis when unset) must stay below " + RETIRE_DELAY_MILLIS
+                    + " ms, how long a swapped-out index reader stays open");
+        }
+        if (drainSeconds < 0 || drainSeconds > MAX_DRAIN_SECONDS) {
+            throw new IllegalStateException("cluster.drainSeconds must be between 0 and " + MAX_DRAIN_SECONDS
+                    + ", got " + drainSeconds);
+        }
+        if (maxCatalogAgeSeconds <= 0) {
+            throw new IllegalStateException("cluster.maxCatalogAgeSeconds must be positive, got " + maxCatalogAgeSeconds);
+        }
+        if (retireGraceSeconds * 1000L < fanoutTimeoutMillis) {
+            throw new IllegalStateException("cluster.retireGraceSeconds (" + retireGraceSeconds
+                    + " s) must cover cluster.fanoutTimeoutMillis (" + fanoutTimeoutMillis
+                    + " ms): a retired shard directory must outlive the longest shard call");
+        }
         if (role != NodeRole.ALL && nodeId != null && nodeId.isBlank()) {
             throw new IllegalStateException("cluster.nodeId must not be blank (omit it to use the host name)");
+        }
+        if (heartbeatSeconds <= 0) {
+            throw new IllegalStateException("cluster.heartbeatSeconds must be positive, got " + heartbeatSeconds);
+        }
+        if (readerTtlSeconds <= heartbeatSeconds) {
+            throw new IllegalStateException("cluster.readerTtlSeconds must exceed cluster.heartbeatSeconds ("
+                    + heartbeatSeconds + "), got " + readerTtlSeconds);
+        }
+        if (role == NodeRole.READER) {
+            if (advertiseUrl == null || advertiseUrl.isBlank()) {
+                throw new IllegalStateException("cluster.advertiseUrl is required on a reader (the base URL other nodes reach it at)");
+            }
+            try {
+                java.net.URI u = new java.net.URI(advertiseUrl.trim());
+                String scheme = u.getScheme();
+                if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
+                        || u.getHost() == null) {
+                    throw new IllegalStateException("cluster.advertiseUrl must be an http:// or https:// URL with a host, got '"
+                            + advertiseUrl + "'");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new IllegalStateException("cluster.advertiseUrl is not a valid URL: '" + advertiseUrl + "'");
+            }
+            if (token == null || token.isBlank()) {
+                throw new IllegalStateException("cluster.token is required on a reader (shared secret of the cluster)");
+            }
         }
         if (reader == null) reader = new ReaderConfig();
         reader.validate();
@@ -92,12 +194,21 @@ public class ClusterConfig {
         }
     }
 
+    /** Redacts the token: this is what logs and error messages show. */
+    @Override
+    public String toString() {
+        return "ClusterConfig[role=" + role + ", backend=" + backend + ", nodeId=" + nodeId
+                + ", advertiseUrl=" + advertiseUrl + ", token=" + (token == null ? "unset" : "***") + "]";
+    }
+
     public NodeRole getRole() { return role; }
     public void setRole(NodeRole role) { this.role = role; }
     public BackendKind getBackend() { return backend; }
     public void setBackend(BackendKind backend) { this.backend = backend; }
     public String getNodeId() { return nodeId; }
     public void setNodeId(String nodeId) { this.nodeId = nodeId; }
+    public int getRetireGraceSeconds() { return retireGraceSeconds; }
+    public void setRetireGraceSeconds(int v) { this.retireGraceSeconds = v; }
     public int getPollIntervalSeconds() { return pollIntervalSeconds; }
     public void setPollIntervalSeconds(int v) { this.pollIntervalSeconds = v; }
     public Path getCacheDir() { return cacheDir; }
@@ -110,6 +221,29 @@ public class ClusterConfig {
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
+    public int getDrainSeconds() { return drainSeconds; }
+    public void setDrainSeconds(int v) { this.drainSeconds = v; }
+    public String getAdvertiseUrl() { return advertiseUrl; }
+    public void setAdvertiseUrl(String v) { this.advertiseUrl = v; }
+    /** Serialised for config persistence ({@code IndexConfig.save}); every output surface redacts it. */
+    public String getToken() { return token; }
+    public void setToken(String v) { this.token = v; }
+    public int getHeartbeatSeconds() { return heartbeatSeconds; }
+    public void setHeartbeatSeconds(int v) { this.heartbeatSeconds = v; }
+    public int getFanoutTimeoutMillis() { return fanoutTimeoutMillis; }
+    public void setFanoutTimeoutMillis(int v) { this.fanoutTimeoutMillis = v; }
+    public int getConnectTimeoutMillis() { return connectTimeoutMillis; }
+    public int getQueryTimeoutMillis() { return queryTimeoutMillis; }
+    public void setQueryTimeoutMillis(int v) { this.queryTimeoutMillis = v; }
+    /** {@code queryTimeoutMillis}, or its default when unset (0): 20000, or {@code fanoutTimeoutMillis} if larger. */
+    public int effectiveQueryTimeoutMillis() {
+        return queryTimeoutMillis > 0 ? queryTimeoutMillis : Math.max(DEFAULT_QUERY_TIMEOUT_MILLIS, fanoutTimeoutMillis);
+    }
+    public int getMaxCatalogAgeSeconds() { return maxCatalogAgeSeconds; }
+    public void setMaxCatalogAgeSeconds(int v) { this.maxCatalogAgeSeconds = v; }
+    public void setConnectTimeoutMillis(int v) { this.connectTimeoutMillis = v; }
+    public int getReaderTtlSeconds() { return readerTtlSeconds; }
+    public void setReaderTtlSeconds(int v) { this.readerTtlSeconds = v; }
 
     /**
      * {@code cluster.reader}: how a reader node serves a generation. {@code lazy} (the default) keeps
@@ -132,9 +266,19 @@ public class ClusterConfig {
         private int maxConcurrentFetches = 16;
         /** Cap of a private block cache (a second process on the cache dir); 0 derives it. */
         private long privateCacheMaxBytes = 0;
+        /** Project names this reader is pinned to; empty means every shard. */
+        private java.util.List<String> shards = java.util.List.of();
 
         /** @throws IllegalStateException naming the offending field */
         public void validate() {
+            if (shards == null) shards = java.util.List.of();
+            for (String s : shards) {
+                try {
+                    new com.pharos.cluster.ShardId(s);
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalStateException("cluster.reader.shards: " + e.getMessage());
+                }
+            }
             if (!LAZY.equals(mode) && !FULL.equals(mode)) {
                 throw new IllegalStateException("cluster.reader.mode must be 'lazy' or 'full', got '" + mode + "'");
             }
@@ -182,6 +326,8 @@ public class ClusterConfig {
         public void setPrefetchExtensions(java.util.List<String> v) { this.prefetchExtensions = v; }
         public int getPrefetchTimeoutSeconds() { return prefetchTimeoutSeconds; }
         public void setPrefetchTimeoutSeconds(int v) { this.prefetchTimeoutSeconds = v; }
+        public java.util.List<String> getShards() { return shards; }
+        public void setShards(java.util.List<String> v) { this.shards = v == null ? java.util.List.of() : java.util.List.copyOf(v); }
         public int getMaxConcurrentFetches() { return maxConcurrentFetches; }
         public long getPrivateCacheMaxBytes() { return privateCacheMaxBytes; }
         public void setPrivateCacheMaxBytes(long v) { this.privateCacheMaxBytes = v; }

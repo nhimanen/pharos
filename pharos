@@ -101,7 +101,7 @@ def _jvm_flags() -> list:
 # ── Daemon management ─────────────────────────────────────────────────────────
 
 def _health_status():
-    """HTTP status of the daemon's /health (200 ready, 503 warming or degraded), or None when nothing answers."""
+    """HTTP status of the daemon's /health (200 ready or degraded, 503 warming or draining), or None when nothing answers."""
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=1) as resp:
             return resp.status
@@ -232,6 +232,11 @@ def _print_header_warnings(value):
         print(f"\u26a0 {w}", file=sys.stderr)
 
 
+# Exit codes of a 409 from the daemon (see _api_get)
+EXIT_INDEX_INCOMPATIBLE = 4   # a project's index format is not served by this pharos
+EXIT_NO_SEARCH_VECTORS = 6    # a search scoped to one project that has no vectors of the search model
+
+
 def _api_get(path: str, params: dict = None) -> object:
     """Make a GET request to the daemon API. Returns parsed JSON."""
     url = f"{BASE_URL}{path}"
@@ -248,13 +253,18 @@ def _api_get(path: str, params: dict = None) -> object:
         body = e.read().decode(errors="replace")
         _print_header_warnings(e.headers.get("X-Pharos-Warnings"))
         if e.code == 409:
-            # Index format incompatible with this pharos version — exit code 4
+            # Two conflicts between the request and the index, told apart by the body:
+            #   {"error", "project", "status"}  index format incompatible with this pharos → exit 4
+            #   {"error"} only                  a search scoped to one project without vectors
+            #                                   of the search model → exit 6
             try:
-                msg = json.loads(body).get("error", body)
+                parsed = json.loads(body)
             except ValueError:
-                msg = body
+                parsed = None
+            msg = parsed.get("error", body) if isinstance(parsed, dict) else body
             print(msg, file=sys.stderr)
-            sys.exit(4)
+            incompatible = isinstance(parsed, dict) and "status" in parsed
+            sys.exit(EXIT_INDEX_INCOMPATIBLE if incompatible else EXIT_NO_SEARCH_VECTORS)
         die(f"API error {e.code}: {body}")
     except urllib.error.URLError as e:
         die(f"Cannot reach pharos daemon: {e.reason}\n"
@@ -950,6 +960,21 @@ def cmd_web(args):
             pass
 
 
+def cmd_router(args):
+    """Run `pharos router` in the foreground (a stateless front for the cluster's readers).
+
+    Spawns its own JVM like publish; it needs the cluster config (object store + cluster.token) and
+    no daemon or index. Ctrl+C stops it.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "router", "--port", str(args.port)]
+    try:
+        sys.exit(subprocess.run(cmd).returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def cmd_backfill_embedding_cache(args):
     """Seed the embedding cache from the existing Lucene index without calling ONNX."""
     if not JAR.exists():
@@ -1317,6 +1342,7 @@ COMMANDS
   upgrade-indexes Re-index projects whose index format is not current
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   publish                   Publish a project's local index to the cluster object store (writer nodes)
+  router                    Route queries over the cluster's healthy readers (runs in the foreground)
   embeddings                Enable/disable semantic search (enable|disable|status)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
@@ -1422,6 +1448,12 @@ EXAMPLES
   pharos search "LuceneIndexer" --type keyword
   pharos search "authentication" --project myapp --limit 20
   pharos search "token stream" --doc-type method --expand
+
+EXIT CODES
+  0 results (or none) printed, 1 error,
+  4 a project's index format is not served by this pharos (re-index or upgrade),
+  6 --project names a project without vectors of the search model
+    (vector/hybrid/unified; re-index it with embeddings, or use --type keyword)
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1848,6 +1880,27 @@ EXAMPLES
         help="Which files to invalidate: docs (.md/.yml/etc), java (.java), go (.go), or all (default: docs)",
     )
     p_inv.set_defaults(func=cmd_invalidate_embeddings)
+
+    # router
+    p_router = sub.add_parser(
+        "router",
+        help="Route queries over the cluster's healthy readers (runs in the foreground)",
+        description="""\
+Run a stateless HTTP router in front of the cluster's readers (multi-node pharos).
+
+It lists the live readers from the bucket, polls each one's /health every 2 s, and
+round-robins /api/* and /health over those answering 200 (draining or warming readers
+answer 503 and get no traffic). GET requests (and POST /api/search) are retried once on
+another reader after a connect error or a 5xx. /internal/* is never forwarded (404).
+Needs the cluster config (cluster.backend "object-store", objectStore, cluster.token).
+
+EXAMPLES
+  pharos router --port 7080
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_router.add_argument("--port", type=int, default=7080, help="HTTP port to listen on (default: 7080)")
+    p_router.set_defaults(func=cmd_router)
 
     # daemon
     p_daemon = sub.add_parser(

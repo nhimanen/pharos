@@ -701,4 +701,99 @@ class ReplicaSyncerTest {
             assertThat(genDirNames()).containsExactly("gen-3", "gen-4");
         }
     }
+
+    // ---- pinning ----
+
+    @Test
+    void pinnedReaderSyncsOnlyItsShards() throws Exception {
+        publishFull();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEmpty();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
+        assertThat(cacheDir.resolve(PROJECT)).doesNotExist();
+    }
+
+    @Test
+    void unpinningSyncsTheRest() throws Exception {
+        publishFull();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        syncer.pin(java.util.Set.of());
+        syncer.syncOnce();
+        assertThat(syncer.served()).containsKey(SHARD);
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+    }
+
+    @Test
+    void repinningAwayUnregistersAndPrunesAfterGrace() throws Exception {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(1_000_000);
+        syncer.setClock(now::get);
+        syncer.setRetireGrace(Duration.ofSeconds(120));
+        publishFull();
+        syncer.syncOnce();
+        Path dir = genDir(1);
+        assertThat(dir).isDirectory();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEmpty();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
+        now.addAndGet(119_000);
+        syncer.syncOnce();
+        assertThat(dir).as("kept for the grace period").isDirectory();
+        now.addAndGet(2_000);
+        syncer.syncOnce();
+        assertThat(dir).doesNotExist();
+    }
+
+    @Test
+    void graceIsNeverBelowPollInterval() throws Exception {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(1_000_000);
+        syncer.setClock(now::get);
+        syncer.setRetireGrace(Duration.ofSeconds(1)); // poll interval is 10 s
+        publishFull();
+        syncer.syncOnce();
+        syncer.pin(java.util.Set.of(new ShardId("elsewhere")));
+        syncer.syncOnce();
+        now.addAndGet(5_000);
+        syncer.syncOnce();
+        assertThat(genDir(1)).isDirectory();
+        now.addAndGet(6_000);
+        syncer.syncOnce();
+        assertThat(genDir(1)).doesNotExist();
+    }
+
+    @Test
+    void startupSweepRemovesDirsOfShardsNeitherWantedNorRegistered() throws Exception {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(1_000_000);
+        syncer.setClock(now::get);
+        syncer.setRetireGrace(Duration.ofSeconds(60));
+        publishFull();
+        Path stray = Files.createDirectories(cacheDir.resolve("stray-shard").resolve("gen-3"));
+        Path hidden = Files.createDirectories(cacheDir.resolve(".blocks"));
+        syncer.syncOnce();
+        assertThat(stray).isDirectory();
+        now.addAndGet(61_000);
+        syncer.syncOnce();
+        assertThat(stray).doesNotExist();
+        assertThat(hidden).isDirectory();
+        assertThat(genDir(1)).isDirectory();
+    }
+
+    @Test
+    void emptyCatalogReadDoesNotDropServedShards() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        ReplicaSyncer empty = new ReplicaSyncer(() -> List.of(), new ObjectStoreReplicaSource(store, layout), cache,
+                readerRegistry, cacheDir, readerSynonyms, Duration.ofSeconds(10), lazy);
+        try {
+            empty.syncOnce();
+        } finally {
+            empty.close();
+        }
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+        assertThat(cache.active(PROJECT)).isPresent();
+    }
 }

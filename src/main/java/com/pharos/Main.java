@@ -66,9 +66,11 @@ public class Main {
         ReplicationBackend backend = Backends.create(config);
         LuceneIndexer luceneIndexer = new LuceneIndexer(config, backend.localCache());
         // Owns the backend (object-store client) and, on readers, the syncer thread. Closed when
-        // the command returns and, for daemons stopped by a signal, by the shutdown hook.
+        // the command returns and, for daemons stopped by a signal, by the shutdown hook; a serving
+        // reader drains first (announces draining, waits up to cluster.drainSeconds for its
+        // in-flight requests). The web server keeps serving meanwhile: Javalin registers no hook.
         ClusterRuntime clusterRuntime = new ClusterRuntime(config, backend, registry, luceneIndexer);
-        Runtime.getRuntime().addShutdownHook(new Thread(clusterRuntime::close, "pharos-cluster-shutdown"));
+        Runtime.getRuntime().addShutdownHook(new Thread(clusterRuntime::drainAndClose, "pharos-cluster-shutdown"));
         ModuleGraphBuilder moduleGraphBuilder = new ModuleGraphBuilder(registry);
         int parseThreads = config.resolvedParseThreads();
         // Tier-2 regex-based parsers — no external runtime needed
@@ -243,6 +245,8 @@ public class Main {
                         registry, config);
             if (cls == PublishCommand.class)
                 return (K) new PublishCommand(config, registry, clusterRuntime);
+            if (cls == RouterCommand.class)
+                return (K) new RouterCommand(config);
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

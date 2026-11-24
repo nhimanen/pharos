@@ -7,7 +7,6 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
@@ -43,7 +42,7 @@ public abstract class ObjectStoreContract {
     void downloadMissingThrowsNoSuchFile() {
         Path target = tmp.resolve("out.bin");
         assertThatThrownBy(() -> store().download("nope/missing", target))
-                .isInstanceOf(NoSuchFileException.class)
+                .isInstanceOf(ObjectMissingException.class)
                 .hasMessageContaining("nope/missing");
         assertThat(target).doesNotExist();
     }
@@ -171,7 +170,7 @@ public abstract class ObjectStoreContract {
     void rangeOfMissingKeyIsNoSuchFile() {
         Path t = tmp.resolve("missing.bin");
         assertThatThrownBy(() -> store().downloadRange("range/nope", 0, 10, t))
-                .isInstanceOf(NoSuchFileException.class);
+                .isInstanceOf(ObjectMissingException.class);
         assertThat(t).doesNotExist();
     }
 
@@ -188,7 +187,7 @@ public abstract class ObjectStoreContract {
     void zeroLengthRangeOfMissingKeyIsNoSuchFile() {
         Path t = tmp.resolve("zero-missing.bin");
         assertThatThrownBy(() -> store().downloadRange("range/nope-zero", 0, 0, t))
-                .isInstanceOf(NoSuchFileException.class);
+                .isInstanceOf(ObjectMissingException.class);
         assertThat(t).doesNotExist();
     }
 
@@ -246,7 +245,7 @@ public abstract class ObjectStoreContract {
     @Test
     void openRangeOfMissingKeyIsNoSuchFile() {
         assertThatThrownBy(() -> readRange("orange/nope", 0, 10))
-                .isInstanceOf(NoSuchFileException.class)
+                .isInstanceOf(ObjectMissingException.class)
                 .hasMessageContaining("orange/nope");
     }
 
@@ -256,7 +255,7 @@ public abstract class ObjectStoreContract {
         assertThat(readRange("orange/zero", 5, 0)).isEmpty();
         assertThat(readRange("orange/zero", 10_000, 0)).isEmpty();
         assertThatThrownBy(() -> readRange("orange/zero", 10_001, 0)).isInstanceOf(EOFException.class);
-        assertThatThrownBy(() -> readRange("orange/nope-zero", 0, 0)).isInstanceOf(NoSuchFileException.class);
+        assertThatThrownBy(() -> readRange("orange/nope-zero", 0, 0)).isInstanceOf(ObjectMissingException.class);
     }
 
     @Test

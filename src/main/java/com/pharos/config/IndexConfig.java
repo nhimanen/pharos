@@ -318,7 +318,11 @@ public class IndexConfig {
     }
 
     public void save() throws IOException {
-        Path configFile = DEFAULT_BASE.resolve("config.json");
+        save(DEFAULT_BASE.resolve("config.json"));
+    }
+
+    /** Writes this config to {@code configFile} (tests save into their own temp dir). */
+    public void save(Path configFile) throws IOException {
         Files.createDirectories(configFile.getParent());
         createMapper().writerWithDefaultPrettyPrinter()
                 .writeValue(configFile.toFile(), this);

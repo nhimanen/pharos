@@ -11,12 +11,18 @@ import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IncompatibleIndexException;
 import com.pharos.indexer.DocumentMapper;
 import com.pharos.indexer.LuceneIndexer;
+import com.pharos.cluster.ShardId;
+import com.pharos.cluster.routing.CatalogTooOldException;
+import com.pharos.cluster.routing.CatalogUnavailableException;
+import com.pharos.search.distributed.DistributedSearch;
+import com.pharos.search.distributed.LocalShardService;
 import com.pharos.search.pipeline.CrossEncoder;
 import com.pharos.search.pipeline.NoOpCrossEncoder;
 import com.pharos.search.pipeline.PipelineConfig;
 import com.pharos.search.pipeline.PipelineDescriptor;
 import com.pharos.search.pipeline.PipelineFactory;
 import com.pharos.search.pipeline.SearchPipeline;
+import com.pharos.search.pipeline.UnifiedRetrievalStage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import org.apache.lucene.document.Document;
@@ -46,7 +52,10 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -146,6 +155,12 @@ public class SearchEngine {
      */
     public record ModelWarmup(ModelState state, String failure, long millis) {}
 
+    /**
+     * The fan-out coordinator of a reader node (Phase 3); null on every other node, which always
+     * searches locally. Even when set, a query whose shards are all held here runs the local path.
+     */
+    private volatile DistributedSearch distributed;
+
     /** True when an embedding model is configured (a bare no-op provider means none is). */
     private final boolean modelConfigured;
     private final java.util.concurrent.CompletableFuture<ModelWarmup> warmup =
@@ -166,6 +181,17 @@ public class SearchEngine {
     public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
                         ProjectRegistry registry, CrossEncoder crossEncoder,
                         QueryRouter queryRouter) {
+        this(luceneIndexer, embedder, registry, crossEncoder, queryRouter,
+                com.pharos.config.IndexConfig.DEFAULT_BASE);
+    }
+
+    /**
+     * @param configBase where {@code synonyms.txt} and {@code pipelines.yaml} are read from
+     *                   (the pharos home by default); tests pass their own to stay hermetic
+     */
+    public SearchEngine(LuceneIndexer luceneIndexer, EmbeddingProvider embedder,
+                        ProjectRegistry registry, CrossEncoder crossEncoder,
+                        QueryRouter queryRouter, java.nio.file.Path configBase) {
         this.luceneIndexer = luceneIndexer;
         this.registry      = registry;
         this.embedder      = embedder;
@@ -173,14 +199,141 @@ public class SearchEngine {
         this.modelConfigured = !(embedder instanceof com.pharos.embedding.NoOpEmbeddingProvider);
         this.modelState = modelConfigured ? ModelState.LOADING : ModelState.NONE;
 
-        KeywordSearchStrategy kw  = new KeywordSearchStrategy();
+        KeywordSearchStrategy kw  = new KeywordSearchStrategy(
+                configBase.resolve("synonyms.txt"), new org.apache.lucene.search.SearcherFactory());
         this.keywordStrategy = kw;
         VectorSearchStrategy  vec = new VectorSearchStrategy(embedder);
         this.vectorStrategy  = vec;
         this.zeroResultAdvisor = new ZeroResultAdvisor(luceneIndexer, registry, kw);
 
         this.builtPipelines = memoize(() ->
-                new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs()));
+                new PipelineFactory(kw, vec, embedder, crossEncoder, queryRouter).build(loadPipelineConfigs(configBase)));
+    }
+
+    /** Makes this engine a coordinator for shards it does not hold (reader nodes only). */
+    public void setDistributed(DistributedSearch distributed) {
+        this.distributed = distributed;
+    }
+
+    /** Why a shard held here is degraded (null when it is not); readers only. */
+    private volatile Function<String, String> localDegradation = shard -> null;
+
+    /**
+     * Reader nodes: why a shard this node holds is degraded (null when it is not). A search that
+     * reads such a shard here carries a warning naming it.
+     */
+    public void setLocalDegradation(Function<String, String> reason) {
+        this.localDegradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /** One warning per shard of {@code shards} that is degraded on this node. */
+    private void warnDegraded(java.util.Collection<String> shards, List<String> warnings) {
+        Function<String, String> why = localDegradation;
+        for (String shard : shards) {
+            String reason = why.apply(shard);
+            if (reason == null) continue;
+            String w = "shard " + shard + " is degraded on this reader: " + reason + "; its results may be incomplete";
+            if (!warnings.contains(w)) warnings.add(w);
+        }
+    }
+
+    /**
+     * The shard side of fan-out over this engine's index, analysers and embedder: what a reader's
+     * {@code /internal/*} endpoints and a coordinator's own shards run.
+     *
+     * @param serves           whether this node holds a shard
+     * @param modelFingerprint the fingerprint of this node's search model's configuration, or null
+     */
+    public LocalShardService shardService(Predicate<String> serves, String modelFingerprint) {
+        return new LocalShardService(luceneIndexer, serves, keywordStrategy, vectorStrategy,
+                new UnifiedRetrievalStage(keywordStrategy, embedder), registry,
+                new LocalShardService.Model(embedder.modelId(), embedder.dimensions(), modelFingerprint));
+    }
+
+    /** The query embedder (the coordinator embeds each query once and sends the vector). */
+    public EmbeddingProvider embedder() {
+        return embedder;
+    }
+
+    /** The vector strategy (snippet hints of a coordinator's own shards). */
+    public VectorSearchStrategy vectorStrategy() {
+        return vectorStrategy;
+    }
+
+    /** The projects a request names, in order; empty for "every project". */
+    private static List<String> requestedProjects(SearchRequest req) {
+        if (req.project() != null && !req.project().isEmpty()) return List.of(req.project());
+        if (req.projects() != null && !req.projects().isEmpty()) return req.projects();
+        return List.of();
+    }
+
+    /**
+     * The fan-out of a graph or lookup call over {@code project} (null: every shard), or null when
+     * this node holds every shard involved (then the local code runs, unchanged).
+     */
+    private record FanOut<T>(T value) {}
+
+    /**
+     * Runs {@code op} over the fan-out of a graph or lookup call over {@code project} (null: every
+     * shard), adding its warnings; null when this node holds every shard involved (the local code
+     * then runs, unchanged), or when the shard catalog was never read (local, with a warning).
+     */
+    private <T> FanOut<T> fannedOut(String project, List<String> warnings, Function<DistributedSearch.Query, T> op) {
+        DistributedSearch ds = distributed;
+        if (ds == null) return null;
+        DistributedSearch.Query q;
+        try {
+            q = ds.open(project == null || project.isEmpty() ? List.of() : List.of(project));
+        } catch (CatalogUnavailableException e) { // never read, or too old: this reader's shards
+            warnings.add(catalogFallbackWarning(e));
+            return null;
+        }
+        try (q) {
+            if (!q.fansOut()) {
+                // The local code answers; shards no live reader serves are still named, never dropped silently.
+                if (!q.unservedShards().isEmpty()) {
+                    for (String w : q.warnings()) if (!warnings.contains(w)) warnings.add(w);
+                }
+                return null;
+            }
+            T value = op.apply(q);
+            q.requireAnAnswer(); // nothing answered and nothing is held here: 503, not an empty answer
+            warnings.addAll(q.warnings());
+            return new FanOut<>(value);
+        }
+    }
+
+    /**
+     * The project names a query may mention ({@code project:query}, or a bare project name): this
+     * node's projects plus, on a reader, every shard of the cluster catalog, so a coordinator boosts a
+     * named project it does not hold exactly as a single node holding it would.
+     */
+    List<String> knownProjects() {
+        Set<String> names = new java.util.LinkedHashSet<>();
+        for (ProjectMeta m : registry.listAll()) if (m.getName() != null) names.add(m.getName());
+        DistributedSearch ds = distributed;
+        if (ds != null) names.addAll(ds.catalogShardNames());
+        return List.copyOf(names);
+    }
+
+    static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
+
+    /**
+     * The warning of an answer from this reader's shards alone because the catalog cannot route: why,
+     * and, for a catalog too old, the shards of its last good read this reader does not hold.
+     */
+    private String catalogFallbackWarning(CatalogUnavailableException e) {
+        String w = CATALOG_UNREAD_WARNING + e.getMessage();
+        if (e instanceof CatalogTooOldException old) {
+            Set<String> held = new java.util.HashSet<>();
+            for (ProjectMeta m : registry.listAll()) if (m.getName() != null) held.add(m.getName());
+            List<String> missing = old.lastKnown().stream().map(ShardId::value).filter(n -> !held.contains(n)).toList();
+            if (missing.isEmpty()) { // this reader holds every shard of the last good catalog: nothing is lost
+                return "catalog is " + old.ageSeconds() + " s old; serving this reader's shards (complete)";
+            }
+            w += "; not searched: " + String.join(", ", missing);
+        }
+        return w;
     }
 
     /** Returns the ordered list of available pipelines for UI display. */
@@ -231,9 +384,7 @@ public class SearchEngine {
         trace.start();
 
         // Parse query modifiers (project:query, in:lang) before dispatching
-        List<String> knownProjects = registry.listAll().stream()
-                .map(ProjectMeta::getName).collect(Collectors.toList());
-        QueryHints hints = parseQueryHints(req.query(), knownProjects);
+        QueryHints hints = parseQueryHints(req.query(), knownProjects());
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
                     req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor());
@@ -245,7 +396,34 @@ public class SearchEngine {
         if (modelState == ModelState.FAILED && requiresVectors(req.type())) {
             warnings.add("vector search unavailable: " + modelFailure + "; vector results are missing");
         }
-        List<String> projects = resolveUsable(req, warnings);
+        List<String> projects;
+        DistributedSearch ds = distributed;
+        DistributedSearch.Query fanout = null;
+        if (ds != null) {
+            try {
+                fanout = ds.open(requestedProjects(req));
+            } catch (CatalogUnavailableException e) { // never read, or too old: as before fan-out, this reader's shards
+                warnings.add(catalogFallbackWarning(e));
+            }
+        }
+        if (fanout != null && fanout.fansOut()) {
+            try (DistributedSearch.Query q = fanout) {
+                warnDegraded(q.localShards(), warnings);
+                return searchFannedOut(req, hints, expand, trace, warnings, q);
+            }
+        }
+        if (fanout != null) fanout.close(); // routed, nothing pinned: released all the same
+        if (fanout != null && !fanout.unservedShards().isEmpty()) {
+            // Shards nobody serves are named, never silently dropped; the held ones search locally.
+            warnings.addAll(fanout.warnings());
+            Set<String> held = Set.copyOf(fanout.localShards());
+            boolean explicit = !requestedProjects(req).isEmpty();
+            List<String> heldProjects = resolveProjects(req).stream().filter(held::contains).toList();
+            projects = usable(heldProjects, explicit && heldProjects.size() == 1, warnings);
+        } else {
+            projects = resolveUsable(req, warnings);
+        }
+        warnDegraded(projects, warnings);
         if (projects.isEmpty()) {
             if (warnings.isEmpty()) {
                 log.warn("No indexed projects found. Run 'pharos index <path>' first.");
@@ -254,13 +432,18 @@ public class SearchEngine {
                     null, null, null, List.copyOf(warnings));
         }
 
-        // Refuse vector-shaped queries when the configured search model has no
-        // corresponding vectors in one or more of the resolved projects. Throwing
-        // a clear exception beats silently returning empty results, which is the
-        // failure mode an unsuspecting user would otherwise see after swapping
-        // searchEmbeddingModel without re-indexing.
+        // Vector-shaped queries and projects without vectors of the configured search model: an
+        // explicitly requested single project fails loud (silently empty results are the failure
+        // mode an unsuspecting user would otherwise see after swapping searchEmbeddingModel without
+        // re-indexing); any other search leaves those projects out of the vector part, with a
+        // warning, and still runs the keyword part over them (as a cluster coordinator does).
         if (requiresVectors(req.type()) && embedder.isAvailable()) {
-            validateSearchModelAvailable(projects);
+            // the REQUESTED count, as a coordinator decides: [a, b] with b unusable still only warns for a
+            boolean explicitSingle = requestedProjects(req).size() == 1;
+            for (String p : projectsWithoutSearchModel(projects)) {
+                if (explicitSingle) throw new VectorModelUnavailableException(searchModelMissingMessage(p));
+                warnings.add(noVectorsWarning(p, embedder.modelId()));
+            }
         }
 
         IndexReader reader = luceneIndexer.openMultiReader(projects);
@@ -340,6 +523,56 @@ public class SearchEngine {
         List<SearchResult> expanded = expandNeighborhood(primary, req.project());
         trace.record("neighborhood expansion", tExpand);
         return new SearchResponse(expanded, trace, resolvedTypeName, null, kwResolver, vecResolver, List.copyOf(warnings));
+    }
+
+    /**
+     * The coordinator path of {@link #searchWithTrace}: the same pipeline, with every retrieval stage
+     * fanned out over the query's shards ({@link DistributedSearch}),
+     * then the same boosts, snippets and expansion as the local path. Shards left out are named in
+     * the warnings.
+     */
+    private SearchResponse searchFannedOut(SearchRequest req, QueryHints hints, boolean expand, SearchTrace trace,
+                                           List<String> warnings,
+                                           DistributedSearch.Query fanout)
+            throws IOException {
+        SearchRequest.SearchType resolvedType = req.type();
+        final String resolvedTypeName = resolvedType.name().toLowerCase();
+        if (req.oversampleFactor() == 0) {
+            int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
+            if (adaptive > 0) {
+                req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+            }
+        }
+        Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
+        SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
+                pipelines.get(SearchRequest.SearchType.HYBRID));
+        // Mergers and rerankers read result fields only: they get no reader here.
+        List<SearchResult> primary = pipeline.execute(null, req, trace, fanout.runner());
+        primary = applyProjectAffinityBoost(primary, req.project());
+        primary = applyQueryHintBoosts(primary, hints);
+
+        if (primary.isEmpty()) {
+            fanout.requireAnAnswer(); // every shard failed and none is held here: 503, not "no matches"
+            warnings.addAll(fanout.warnings());
+            // Suggestions from the shards held here (cheap: local terms only); none when it holds none.
+            List<String> held = fanout.localShards();
+            ZeroResultAdvisor.Suggestions suggestions = held.isEmpty() ? null : zeroResultAdvisor.advise(req, held);
+            return new SearchResponse(List.of(), trace, resolvedTypeName, suggestions, null, null, List.copyOf(warnings));
+        }
+        SnippetResolver kwResolver = keywordStrategy.buildKeywordResolver(
+                keywordStrategy.buildQuery(new SearchRequest(
+                        hints.cleanedQuery(), resolvedType, req.project(), req.projects(),
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())));
+        SnippetResolver vecResolver = fanout.vectorResolver(primary, hints.cleanedQuery());
+        if (expand) {
+            long tExpand = System.currentTimeMillis();
+            primary = fanout.expand(primary);
+            trace.record("neighborhood expansion", tExpand);
+        }
+        warnings.addAll(fanout.warnings());
+        return new SearchResponse(primary, trace, resolvedTypeName, null, kwResolver, vecResolver,
+                List.copyOf(warnings));
     }
 
     /**
@@ -604,6 +837,8 @@ public class SearchEngine {
     }
 
     private SearchResult getByFqn(String fqn, List<String> warnings) throws IOException {
+        FanOut<SearchResult> fanned = fannedOut(null, warnings, q -> q.docs(List.of(fqn)).get(fqn));
+        if (fanned != null) return fanned.value();
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return null;
 
@@ -637,6 +872,8 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public Map<String, SearchResult> getByFqns(List<String> fqns, List<String> warnings) throws IOException {
         if (fqns.isEmpty()) return Map.of();
+        FanOut<Map<String, SearchResult>> fanned = fannedOut(null, warnings, q -> q.docs(fqns));
+        if (fanned != null) return fanned.value();
 
         List<String> projects = allUsable(warnings);
         if (projects.isEmpty()) return Map.of();
@@ -682,9 +919,11 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public CallChainResult traceCallChain(String rootFqn, int depth, String direction,
                                           int maxBodyChars, List<String> warnings) throws IOException {
-        List<GraphView> graphs = openAllGraphs(null, warnings);
+        FanOut<BfsResult> fanned = fannedOut(null, warnings,
+                q -> bfsLevels(level -> q.neighbors(level, direction), rootFqn, depth, 50));
+        List<GraphView> graphs = fanned != null ? List.of() : openAllGraphs(null, warnings);
         try {
-            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, direction, 50);
+            BfsResult bfs = fanned != null ? fanned.value() : bfsCallGraph(graphs, rootFqn, depth, direction, 50);
 
             // Bulk-fetch bodies — one Lucene query for all visited FQNs.
             Map<String, SearchResult> bodies = getByFqns(new ArrayList<>(bfs.fqnDepth().keySet()), warnings);
@@ -790,6 +1029,54 @@ public class SearchEngine {
         return new BfsResult(fqnDepth, fqnChildren, truncated);
     }
 
+    /**
+     * {@link #bfsCallGraph} for a fan-out: the same traversal (FIFO order is level order), with the
+     * neighbours of a whole level fetched in one call per shard.
+     */
+    private static BfsResult bfsLevels(Function<List<String>, Map<String, Set<String>>> neighbors,
+                                       String rootFqn, int depth, int maxNodes) {
+        Map<String, Integer>      fqnDepth    = new LinkedHashMap<>();
+        Map<String, List<String>> fqnChildren = new LinkedHashMap<>();
+        boolean truncated = false;
+        fqnDepth.put(rootFqn, 0);
+        List<String> level = List.of(rootFqn);
+        outer:
+        while (!level.isEmpty()) {
+            int d = fqnDepth.get(level.get(0));
+            if (d >= depth) break;
+            Map<String, Set<String>> nb = neighbors.apply(level);
+            List<String> next = new ArrayList<>();
+            for (String current : level) {
+                List<String> children = new ArrayList<>(nb.getOrDefault(current, Set.of()));
+                fqnChildren.put(current, children);
+                for (String neighbor : children) {
+                    if (fqnDepth.containsKey(neighbor)) continue;
+                    if (fqnDepth.size() >= maxNodes) { truncated = true; break outer; }
+                    fqnDepth.put(neighbor, d + 1);
+                    next.add(neighbor);
+                }
+            }
+            level = next;
+        }
+        return new BfsResult(fqnDepth, fqnChildren, truncated);
+    }
+
+    /**
+     * Callers (or callees) of {@code fqn} over a fan-out's call graphs; empty when this node holds
+     * every shard (the caller then reads its local graphs as before).
+     */
+    public Optional<Set<String>> fannedOutNeighbors(String fqn, boolean callers, List<String> warnings) {
+        FanOut<Set<String>> fanned = fannedOut(null, warnings,
+                q -> q.neighbors(List.of(fqn), callers ? "callers" : "callees").getOrDefault(fqn, Set.of()));
+        return fanned == null ? Optional.empty() : Optional.of(fanned.value());
+    }
+
+    /** The shortest call path over a fan-out's shards (first found in shard order); empty when all are held here. */
+    public Optional<List<String>> fannedOutCallPath(String from, String to, List<String> warnings) {
+        FanOut<List<String>> fanned = fannedOut(null, warnings, q -> q.callPath(from, to));
+        return fanned == null ? Optional.empty() : Optional.of(fanned.value());
+    }
+
     // -------------------------------------------------------------------------
     // Transitive callers — lightweight impact-analysis variant (no body fetch)
     // -------------------------------------------------------------------------
@@ -818,10 +1105,12 @@ public class SearchEngine {
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public TransitiveCallersResult findTransitiveCallers(String rootFqn, int depth,
                                                           int maxCallers, List<String> warnings) throws IOException {
-        List<GraphView> graphs = openAllGraphs(null, warnings);
+        FanOut<BfsResult> fanned = fannedOut(null, warnings,
+                q -> bfsLevels(level -> q.neighbors(level, "callers"), rootFqn, depth, Math.max(1, maxCallers + 1)));
+        List<GraphView> graphs = fanned != null ? List.of() : openAllGraphs(null, warnings);
         try {
             // +1 to include root in the cap budget, then exclude it from results
-            BfsResult bfs = bfsCallGraph(graphs, rootFqn, depth, "callers",
+            BfsResult bfs = fanned != null ? fanned.value() : bfsCallGraph(graphs, rootFqn, depth, "callers",
                     Math.max(1, maxCallers + 1));
 
             List<Map.Entry<String, Integer>> callers = bfs.fqnDepth().entrySet().stream()
@@ -959,10 +1248,10 @@ public class SearchEngine {
      * otherwise falls back to the bundled {@code pipelines.yaml} on the classpath.
      * This lets operators customise or extend the pipeline set without recompiling.
      */
-    private static List<PipelineConfig> loadPipelineConfigs() {
+    private static List<PipelineConfig> loadPipelineConfigs(java.nio.file.Path configBase) {
         ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
         try {
-            java.nio.file.Path external = com.pharos.config.IndexConfig.DEFAULT_BASE.resolve("pipelines.yaml");
+            java.nio.file.Path external = configBase.resolve("pipelines.yaml");
             java.io.InputStream in;
             if (java.nio.file.Files.isReadable(external)) {
                 log.info("Loading pipeline config from {}", external);
@@ -1011,6 +1300,8 @@ public class SearchEngine {
 
     /** As above; skipped incompatible projects are explained in {@code warnings}. */
     public List<SearchResult> findCallers(String calleeFqn, String project, List<String> warnings) throws IOException {
+        FanOut<List<SearchResult>> fanned = fannedOut(project, warnings, q -> q.callers(calleeFqn, 100));
+        if (fanned != null) return fanned.value();
         SearchRequest req = SearchRequest.keyword("", project, 100);
         List<String> projects = resolveUsable(req, warnings);
         if (projects.isEmpty()) return List.of();
@@ -1032,6 +1323,13 @@ public class SearchEngine {
     public List<SearchResult> findCallees(String callerFqn, String project, List<String> warnings) throws IOException {
         SearchResult caller = getMethodByFqn(callerFqn, warnings);
         if (caller == null) return List.of();
+        // callee fqns from the shard holding the caller, their documents from any shard
+        FanOut<List<String>> fanned = fannedOut(project, warnings, q -> q.calleeFqns(callerFqn));
+        if (fanned != null) {
+            List<String> called = fanned.value();
+            Map<String, SearchResult> docs = getByFqns(called, warnings);
+            return called.stream().map(docs::get).filter(r -> r != null).collect(Collectors.toList());
+        }
 
         // The calledMethods field stores FQNs; we look them up directly
         // For now return the caller with its callees via a direct document lookup
@@ -1076,37 +1374,50 @@ public class SearchEngine {
     }
 
     /**
-     * Checks every resolved project's {@code embeddedModels} carries the model
-     * id the configured search embedder uses. Pre-upgrade indexes have an empty
+     * The resolved projects whose {@code embeddedModels} lack the model id the
+     * configured search embedder uses. Pre-upgrade indexes have an empty
      * {@code embeddedModels} list and are allowed only when the search embedder
      * is the synthesized legacy one — they're served from the legacy
      * {@code vectorEmbedding} field.
      */
-    private void validateSearchModelAvailable(List<String> projects) {
-        String modelId = embedder.modelId();
-        boolean isLegacyModel = com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId);
+    private List<String> projectsWithoutSearchModel(List<String> projects) {
+        List<String> out = new ArrayList<>();
         for (String p : projects) {
             ProjectMeta meta = registry.find(p).orElse(null);
             if (meta == null) continue;  // shouldn't happen; resolveProjects already filtered
-            List<String> embeddedModels = meta.getEmbeddedModels();
-            boolean has = embeddedModels.contains(modelId)
-                    || (embeddedModels.isEmpty() && isLegacyModel);
-            if (!has) {
-                String available = embeddedModels.isEmpty()
-                        ? "<legacy / none recorded>"
-                        : String.join(", ", embeddedModels);
-                // `pharos embed` only adds a model next to existing vectors; a project with none
-                // (keyword-only, e.g. right after `pharos embeddings enable`) needs a full index.
-                String fullIndex = com.pharos.indexer.ReindexHint.fullIndexCommand(p, meta.getRootPath());
-                String fix = embeddedModels.isEmpty()
-                        ? fullIndex
-                        : "pharos embed --model=" + modelId + " " + p + " (or " + fullIndex + ")";
-                throw new VectorModelUnavailableException(String.format(
-                        "Project '%s' has no vectors for search embedding model '%s'. " +
-                        "Available model(s): %s. Run: %s",
-                        p, modelId, available, fix));
-            }
+            if (!hasSearchModel(meta)) out.add(p);
         }
+        return out;
+    }
+
+    private boolean hasSearchModel(ProjectMeta meta) {
+        String modelId = embedder.modelId();
+        List<String> embeddedModels = meta.getEmbeddedModels();
+        return embeddedModels.contains(modelId)
+                || (embeddedModels.isEmpty() && com.pharos.config.IndexConfig.LEGACY_MODEL_ID.equals(modelId));
+    }
+
+    private String searchModelMissingMessage(String project) {
+        String modelId = embedder.modelId();
+        List<String> embeddedModels = registry.find(project).map(ProjectMeta::getEmbeddedModels).orElse(List.of());
+        String available = embeddedModels.isEmpty() ? "<legacy / none recorded>" : String.join(", ", embeddedModels);
+        // `pharos embed` only adds a model next to existing vectors; a project with none
+        // (keyword-only, e.g. right after `pharos embeddings enable`) needs a full index.
+        String fullIndex = com.pharos.indexer.ReindexHint.fullIndexCommand(project,
+                registry.find(project).map(ProjectMeta::getRootPath).orElse(null));
+        String fix = embeddedModels.isEmpty()
+                ? fullIndex
+                : "pharos embed --model=" + modelId + " " + project + " (or " + fullIndex + ")";
+        return String.format("Project '%s' has no vectors for search embedding model '%s'. "
+                + "Available model(s): %s. Run: %s", project, modelId, available, fix);
+    }
+
+    /**
+     * The warning of a search that leaves {@code project} out of its vector part because it has no
+     * vectors of {@code modelId}: the same text on a single node and on a cluster coordinator.
+     */
+    public static String noVectorsWarning(String project, String modelId) {
+        return "project " + project + " has no vectors for model " + modelId + "; vector results exclude it";
     }
 
     /**
@@ -1209,6 +1520,15 @@ public class SearchEngine {
         List<String> returning      = new ArrayList<>();
         List<String> taking         = new ArrayList<>();
 
+        FanOut<Map<String, List<String>>> fanned = fannedOut(project, warnings, q -> q.usages(fqn, kind));
+        if (fanned != null) {
+            Map<String, List<String>> u = fanned.value();
+            return new UsageResult(fqn, u.getOrDefault("callers", List.of()),
+                    u.getOrDefault("subclasses", List.of()), u.getOrDefault("superTypes", List.of()),
+                    u.getOrDefault("fieldReaders", List.of()), u.getOrDefault("fieldWriters", List.of()),
+                    u.getOrDefault("annotatedWith", List.of()), u.getOrDefault("methodsReturning", List.of()),
+                    u.getOrDefault("methodsTaking", List.of()));
+        }
         List<GraphView> graphs = openAllGraphs(project, warnings);
         try {
             for (GraphView g : graphs) {

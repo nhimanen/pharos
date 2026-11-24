@@ -71,11 +71,24 @@ public final class ClusterRuntime implements Closeable {
     /** Registered generation dirs already reported as not servable; their WARN is not repeated. */
     private final java.util.Set<Path> reportedUnservable = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    private com.pharos.cluster.membership.ReaderRegistry readerRegistry;
+    /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
+    private com.pharos.search.distributed.DistributedSearch distributed;
+    /** How often the coordinator re-reads the shard catalog (in the background) for "every project" queries. */
+    static final Duration CATALOG_CACHE = Duration.ofSeconds(5);
+    private volatile com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
     private ScheduledExecutorService follower;
     private Thread firstSyncThread;
     private boolean serving;
+    /**
+     * True when this process serves {@code /internal/*} (the {@code pharos web} reader): only then does
+     * it join reader membership (heartbeat) and register the shutdown drain. Guarded by this.
+     */
+    private boolean advertised;
+    /** Re-reads the coordinator's shard catalog every {@link #CATALOG_CACHE}; null until a coordinator exists. */
+    private ScheduledExecutorService catalogTimer;
     private volatile boolean ready;
     private boolean closed;
     /** The search models' warm-up readiness also waits for; settled at once unless given. */
@@ -189,6 +202,20 @@ public final class ClusterRuntime implements Closeable {
         return lazy == null ? null : lazy.degradation();
     }
 
+    /**
+     * The shards this reader can't serve fully (sorted; empty when none): a lazy reader's shards
+     * whose active generation was garbage-collected on the bucket. Reported per shard by
+     * {@code /health} and the heartbeat, so routers keep sending the node its other shards.
+     */
+    public List<String> degradedShards() {
+        return lazy == null ? List.of() : lazy.degradedShards();
+    }
+
+    /** Why {@code shard} is degraded on this reader, or null when it is not. */
+    public String degradation(String shard) {
+        return lazy == null ? null : lazy.degradation(shard);
+    }
+
     /** The generation number of the shard's active generation dir; empty when none is active. */
     private java.util.OptionalLong activeGeneration(String shard) {
         if (!(backend.localCache() instanceof ReaderLocalCache cache)) return java.util.OptionalLong.empty();
@@ -201,8 +228,264 @@ public final class ClusterRuntime implements Closeable {
         return java.util.OptionalLong.of(Long.parseLong(dirName.substring("gen-".length())));
     }
 
+    /** The requests a drain waits for (the web server's in-flight count); none until set. */
+    private volatile java.util.function.IntSupplier inFlight = () -> 0;
+    private volatile boolean draining;
+    /** Removes this runtime's signal-time drain step; set while serving. Guarded by this. */
+    private AutoCloseable drainStep;
+
+    /** Where a drain reads the requests still being served (the web server's {@code inFlightRequests}). */
+    public void setInFlight(java.util.function.IntSupplier inFlight) {
+        this.inFlight = Objects.requireNonNull(inFlight, "inFlight");
+    }
+
+    /** True once {@link #drain} or {@link #drainAndClose} ran: {@code /health} answers 503 draining. */
+    public boolean draining() {
+        return draining;
+    }
+
+    /**
+     * How long a router needs to notice a draining reader: one {@code /health} poll interval plus
+     * the probe's timeout ({@code pharos router}: 2 s + 2 s).
+     */
+    public static final Duration ROUTER_NOTICE = Duration.ofSeconds(4);
+    /**
+     * Added to one {@code heartbeatSeconds} in the drain's notice floor: a coordinator's reader list
+     * lags our draining write by up to one of its ticks plus its bucket list and get latency.
+     */
+    static final Duration HEARTBEAT_NOTICE_MARGIN = Duration.ofSeconds(2);
+
+    /** The least a drain stays up after announcing: {@code max(ROUTER_NOTICE, heartbeatSeconds + 2 s)}. */
+    static Duration drainNotice(int heartbeatSeconds) {
+        Duration coordinators = Duration.ofSeconds(heartbeatSeconds).plus(HEARTBEAT_NOTICE_MARGIN);
+        return coordinators.compareTo(ROUTER_NOTICE) > 0 ? coordinators : ROUTER_NOTICE;
+    }
+
+    /** In-flight requests must stay at 0 this long before a drain closes. */
+    static final Duration FINAL_QUIET = Duration.ofSeconds(1);
+
+    /**
+     * Shutdown of a serving reader (run first on a signal by {@link com.pharos.ShutdownSequence},
+     * and by the JVM shutdown hook as the fallback): announces {@code draining} at once (its
+     * heartbeat, so coordinators stop routing shard calls to it, and {@code /health} 503, so the
+     * router and load balancers stop sending queries), then keeps serving: it stays up at least
+     * {@link #drainNotice} ({@code max(4 s, heartbeatSeconds + 2 s)}) so others can see the draining
+     * state, and until no request has been in flight for {@link #FINAL_QUIET}; everything is capped
+     * by {@code cluster.drainSeconds}. Requests arriving meanwhile are served. Then it
+     * {@link #close}s. Any other node, or one not serving, closes at once. Idempotent.
+     */
+    public void drainAndClose() {
+        boolean serve;
+        synchronized (this) {
+            serve = isReader() && serving && advertised && !closed;
+        }
+        if (serve) {
+            drain();
+            ClusterConfig c = config.getCluster();
+            long start = System.nanoTime();
+            long max = TimeUnit.SECONDS.toNanos(c.getDrainSeconds());
+            long notice = Math.min(max, drainNotice(c.getHeartbeatSeconds()).toNanos());
+            long quiet = FINAL_QUIET.toNanos();
+            log.info("Draining: announced; stopping when no request has been in flight for {} ms, after at least"
+                    + " {} ms, at most {} s (cluster.drainSeconds)", FINAL_QUIET.toMillis(),
+                    TimeUnit.NANOSECONDS.toMillis(notice), c.getDrainSeconds());
+            long idleSince = -1;
+            int busy = 0;
+            while (true) {
+                long now = System.nanoTime();
+                busy = inFlight.getAsInt();
+                if (busy > 0) {
+                    idleSince = -1;
+                } else if (idleSince < 0) {
+                    idleSince = now;
+                }
+                if (now - start >= max) break;
+                if (now - start >= notice && idleSince >= 0 && now - idleSince >= quiet) break;
+                try {
+                    Thread.sleep(25);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (busy > 0) {
+                log.warn("Draining: stopping after {} s with {} request(s) still in flight (cluster.drainSeconds)",
+                        c.getDrainSeconds(), busy);
+            } else {
+                log.info("Drained: no request in flight; stopping");
+            }
+        }
+        close();
+    }
+
+    /** Where the heartbeat takes {@code inFlight}/{@code qps} from (the web server's counter). */
+    public void setLoad(com.pharos.cluster.membership.LoadCounter load) {
+        this.load = Objects.requireNonNull(load, "load");
+    }
+
+    /** The live readers of the cluster; empty unless this reader is serving with a registry. */
+    public List<com.pharos.cluster.membership.ReaderRegistry.LiveReader> liveReaders() {
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        return r == null ? List.of() : r.liveWithAge();
+    }
+
+    /**
+     * Marks this reader draining: {@code /health} answers 503 {@code draining} from now on, and the
+     * heartbeat (readers with a registry) is rewritten with {@code draining} at once.
+     */
+    public void drain() {
+        draining = true;
+        stopCatalogTimer(); // queries still refresh on demand while the drain runs
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        if (r != null) r.drain();
+    }
+
+    com.pharos.cluster.membership.ReaderHeartbeat selfHeartbeat() {
+        ClusterConfig c = config.getCluster();
+        // The shards actually held, so routing never guesses what "all" means; a pinned reader
+        // advertises only what it holds of its pin.
+        java.util.TreeSet<String> names = new java.util.TreeSet<>();
+        synchronized (this) {
+            if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
+        }
+        registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
+        List<String> pin = c.getReader().getShards();
+        if (!pin.isEmpty()) names.retainAll(pin);
+        List<String> shards = new ArrayList<>(names);
+        List<String> degraded = degradedShards();
+        String state = draining ? com.pharos.cluster.membership.ReaderHeartbeat.DRAINING
+                : !ready() ? com.pharos.cluster.membership.ReaderHeartbeat.WARMING
+                : degraded.isEmpty() ? com.pharos.cluster.membership.ReaderHeartbeat.READY
+                : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
+        return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
+                draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded);
+    }
+
+    // Holding the monitor of this.
+    private void startMembership() {
+        if (!(backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend os)) return;
+        try {
+            readerRegistry = new com.pharos.cluster.membership.ReaderRegistry(os.store(), os.layout(),
+                    config.getCluster(), this::selfHeartbeat);
+            readerRegistry.start();
+        } catch (RuntimeException e) {
+            log.warn("Starting reader membership failed: {}", e.toString());
+        }
+    }
+
     public IndexPublisher publisher() {
         return backend.publisher();
+    }
+
+    /**
+     * The {@code /internal/*} API of this reader, token-guarded; null on other roles. Its shard
+     * search service is set once the raw retrieval exists ({@code InternalApi#service}); until then
+     * the endpoints answer 503 and coordinators fail over.
+     */
+    public com.pharos.cluster.internal.InternalApi internalApi() {
+        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().getToken()) : null;
+    }
+
+    /**
+     * How long a query waits for a catalog read in flight when the held catalog is stale but no read
+     * failed: 500 ms, and never more than a tenth of the query budget.
+     */
+    static Duration catalogWait(long queryTimeoutMillis) {
+        return Duration.ofMillis(Math.max(0, Math.min(500, queryTimeoutMillis / 10)));
+    }
+
+    /** The coordinator's catalog timer while it runs; null otherwise (tests). */
+    synchronized ScheduledExecutorService catalogTimer() {
+        return catalogTimer;
+    }
+
+    private void stopCatalogTimer() {
+        ScheduledExecutorService t;
+        synchronized (this) {
+            t = catalogTimer;
+            catalogTimer = null;
+        }
+        if (t != null) t.shutdownNow();
+    }
+
+    /**
+     * Readers: the {@code /internal/*} API with {@code engine}'s shard search behind it, and the
+     * engine made a coordinator for shards this reader does not hold (Phase 3 fan-out): it routes over
+     * the live readers of the bucket, with suspect marking, the cluster token and the configured
+     * fan-out and connect timeouts. A query whose shards are all held here keeps the local path.
+     * Null on other roles, which never build a Phase 3 class.
+     */
+    public com.pharos.cluster.internal.InternalApi internalApi(com.pharos.search.SearchEngine engine) {
+        if (!isReader()) return null;
+        ClusterConfig c = config.getCluster();
+        com.pharos.search.distributed.LocalShardService service =
+                engine.shardService(this::servesShard, modelFingerprint(engine.embedder().modelId()));
+        var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
+        var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
+                Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));
+        var catalog = new com.pharos.cluster.routing.CachedCatalog(backend.catalog(), CATALOG_CACHE,
+                Duration.ofSeconds(c.getMaxCatalogAgeSeconds()), System::nanoTime,
+                r -> Thread.ofVirtual().name("pharos-catalog-refresh").start(r),
+                c.getObjectStore() == null ? Duration.ofSeconds(60)
+                        : c.getObjectStore().readTotalTimeout().multipliedBy(2), // the store's own bound, with slack
+                catalogWait(c.effectiveQueryTimeoutMillis()));
+        var router = new com.pharos.cluster.routing.ShardRouter(this::liveHeartbeats, catalog, health,
+                id -> servesShard(id.value()), client::inFlight);
+        var ds = new com.pharos.search.distributed.DistributedSearch(router, client, service, engine.embedder(),
+                engine.vectorStrategy(), Duration.ofMillis(c.effectiveQueryTimeoutMillis()), catalog::staleSeconds);
+        com.pharos.search.distributed.DistributedSearch previous;
+        ScheduledExecutorService previousTimer;
+        ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pharos-catalog-timer");
+            t.setDaemon(true);
+            return t;
+        });
+        synchronized (this) {
+            previous = distributed;
+            distributed = ds;
+            previousTimer = catalogTimer;
+            catalogTimer = null;
+            if (!closed && !draining) { // an idle coordinator keeps its catalog fresh (no first-query wait)
+                long every = CATALOG_CACHE.toMillis();
+                timer.scheduleWithFixedDelay(catalog::tick, every, every, TimeUnit.MILLISECONDS);
+                catalogTimer = timer;
+            }
+        }
+        if (catalogTimer() != timer) timer.shutdownNow();
+        if (previousTimer != null) previousTimer.shutdownNow();
+        if (previous != null) previous.close();
+        engine.setDistributed(ds);
+        engine.setLocalDegradation(this::degradation);
+        return new com.pharos.cluster.internal.InternalApi(c.getToken()).service(service);
+    }
+
+    /**
+     * The fingerprint of the configured embedding provider whose model id is {@code modelId}
+     * ({@code IndexVersions.modelFingerprint}); null when none is configured under that id.
+     */
+    private String modelFingerprint(String modelId) {
+        for (var p : config.getEmbeddingProviders()) {
+            if (modelId != null && modelId.equals(p.getModelId())) return IndexVersions.modelFingerprint(p);
+        }
+        return null;
+    }
+
+    /** The fan-out coordinator built by {@link #internalApi(com.pharos.search.SearchEngine)}; null before. */
+    public synchronized com.pharos.search.distributed.DistributedSearch distributedSearch() {
+        return distributed;
+    }
+
+    /** True when this reader serves {@code shard}: it has an active generation of it. */
+    public boolean servesShard(String shard) {
+        return backend.localCache() instanceof ReaderLocalCache cache && cache.active(shard).isPresent();
+    }
+
+    private List<com.pharos.cluster.membership.ReaderHeartbeat> liveHeartbeats() {
+        com.pharos.cluster.membership.ReaderRegistry r;
+        synchronized (this) { r = readerRegistry; }
+        return r == null ? List.of() : r.live();
     }
 
     private boolean isReader() {
@@ -225,7 +508,15 @@ public final class ClusterRuntime implements Closeable {
      * not: failures are logged and retried every poll interval).
      */
     public void startServing() throws IOException {
-        beginServing();
+        startServing(false);
+    }
+
+    /**
+     * {@link #beginServing(java.util.concurrent.CompletionStage, boolean)} with no models to wait for,
+     * then waits for the first sync pass. {@code advertise}: see there.
+     */
+    public void startServing(boolean advertise) throws IOException {
+        beginServing(java.util.concurrent.CompletableFuture.completedFuture(null), advertise);
         awaitFirstSync();
     }
 
@@ -250,11 +541,26 @@ public final class ClusterRuntime implements Closeable {
      * readiness (the caller bounds a hanging load with a timeout).
      */
     public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded) throws IOException {
+        beginServing(modelsLoaded, false);
+    }
+
+    /**
+     * {@link #beginServing(java.util.concurrent.CompletionStage)}; with {@code advertise} the process
+     * also joins reader membership (its heartbeat in {@code catalog/readers/<node>.json}, so
+     * coordinators and the router send it shard calls and queries) and registers the shutdown drain.
+     * Only a process that serves {@code /internal/*} may advertise: {@code pharos web}. A
+     * {@code pharos mcp-server} on a reader does not: it has no {@code /internal/*} behind the
+     * advertise URL, and on a shared config it would overwrite, mark draining and delete the web
+     * reader's heartbeat (same node id). It searches only the shards this reader holds.
+     */
+    public void beginServing(java.util.concurrent.CompletionStage<?> modelsLoaded, boolean advertise)
+            throws IOException {
         java.util.Objects.requireNonNull(modelsLoaded, "modelsLoaded");
         synchronized (this) {
             if (!isReader() || serving) return;
             if (closed) throw new IllegalStateException("cluster runtime is closed");
             models = modelsLoaded;
+            advertised = advertise;
             ReaderLocalCache cache = readerCache();
             Optional<SyncLock> lock = SyncLock.tryAcquire(cacheDir());
             serving = true;
@@ -262,6 +568,15 @@ public final class ClusterRuntime implements Closeable {
                 becomeOwner(lock.get(), cache);
             } else {
                 becomeFollower();
+            }
+            if (advertise) startMembership();
+        }
+        if (advertise) {
+            // On a signal the drain runs before any shutdown hook (ONNX Runtime's environment closer
+            // among them), while queries that call the models are still served.
+            AutoCloseable step = com.pharos.ShutdownSequence.addDrainStep("reader drain", this::drainAndClose);
+            synchronized (this) {
+                drainStep = step;
             }
         }
         modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
@@ -327,6 +642,8 @@ public final class ClusterRuntime implements Closeable {
         ReplicaSyncer s = new ReplicaSyncer(backend.catalog(), backend.source(), cache, registry,
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
+        s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
+        s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);
@@ -377,6 +694,13 @@ public final class ClusterRuntime implements Closeable {
         follower.scheduleWithFixedDelay(this::followerTick, interval, interval, TimeUnit.SECONDS);
     }
 
+    /** Re-reads {@code cluster.reader.shards} into the sync owner's pin (takes effect on its next pass). */
+    public void repin() {
+        ReplicaSyncer s;
+        synchronized (this) { s = syncer; }
+        if (s != null) s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
+    }
+
     /** Follower poll: pick up what the lock holder registered; take over once it is gone. */
     void followerTick() {
         try {
@@ -421,6 +745,8 @@ public final class ClusterRuntime implements Closeable {
         for (ProjectMeta meta : registry.listAll()) {
             String name = meta.getName();
             if (name == null || meta.getIndexPath() == null) continue;
+            List<String> onlyPinned = config.getCluster().getReader().getShards();
+            if (!onlyPinned.isEmpty() && !onlyPinned.contains(name)) continue;
             try {
                 new ShardId(name);
             } catch (IllegalArgumentException e) {
@@ -457,6 +783,16 @@ public final class ClusterRuntime implements Closeable {
             if (cache.active(name).filter(dir::equals).isPresent()) continue;
             cache.activate(name, dir);
             changed.add(name);
+        }
+        // A shard the sync owner unregistered (or that the pin excludes) must stop being served here
+        // before the owner deletes its directory.
+        java.util.Set<String> registered = new java.util.HashSet<>();
+        registry.listAll().forEach(m -> { if (m.getName() != null) registered.add(m.getName()); });
+        List<String> pin = config.getCluster().getReader().getShards();
+        for (String name : cache.activeProjects()) {
+            if (registered.contains(name) && (pin.isEmpty() || pin.contains(name))) continue;
+            cache.deactivate(name);
+            log.info("Shard {} is no longer registered for this reader: stopped serving it", name);
         }
         if (!changed.isEmpty()) log.info("Activated registered generations of {}", changed);
         return changed;
@@ -521,9 +857,13 @@ public final class ClusterRuntime implements Closeable {
         SyncLock lock;
         ScheduledExecutorService f;
         Thread first;
+        AutoCloseable step;
+        com.pharos.cluster.membership.ReaderRegistry members;
         synchronized (this) {
             if (closed) return;
             closed = true;
+            members = readerRegistry;
+            readerRegistry = null;
             s = syncer;
             syncer = null;
             lock = syncLock;
@@ -531,7 +871,24 @@ public final class ClusterRuntime implements Closeable {
             f = follower;
             follower = null;
             first = firstSyncThread;
+            step = drainStep;
+            drainStep = null;
         }
+        if (step != null) {
+            try {
+                step.close();
+            } catch (Exception e) {
+                // removing from a list: cannot fail
+            }
+        }
+        if (members != null) members.close();
+        stopCatalogTimer();
+        com.pharos.search.distributed.DistributedSearch ds;
+        synchronized (this) {
+            ds = distributed;
+            distributed = null;
+        }
+        if (ds != null) ds.close();
         if (f != null) f.shutdownNow();
         if (s != null) s.close();
         if (first != null && first != Thread.currentThread()) {

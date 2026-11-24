@@ -2,7 +2,6 @@ package com.pharos.embedding;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import sun.misc.Signal;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -18,9 +17,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * signal-time crash.
  *
  * <p>Every native model call (load, inference, predictor close) holds a {@link Ticket}. On the
- * first such call pharos installs SIGTERM/SIGINT handlers that stop admitting new native calls,
- * wait up to {@link #DRAIN_TIMEOUT_MS} for in-flight ones, and only then exit — so ORT's hook
- * runs with nothing in flight. {@link #beginShutdown} does the same for a normal exit.
+ * first such call pharos installs the {@link com.pharos.ShutdownSequence} signal handlers: they run
+ * the registered drain steps, then stop admitting new native calls, wait up to
+ * {@link #DRAIN_TIMEOUT_MS} for in-flight ones, and only then exit — so ORT's hook runs with
+ * nothing in flight. {@link #beginShutdown} does the same for a normal exit.
  * Processes that never load a model never install the handlers.
  */
 public final class NativeInferenceGuard {
@@ -31,7 +31,6 @@ public final class NativeInferenceGuard {
     static final long DRAIN_TIMEOUT_MS = 15_000;
 
     private static final AtomicInteger inFlight = new AtomicInteger();
-    private static final AtomicInteger signalsReceived = new AtomicInteger();
     /** 128 + signo of the signal that started shutdown, or 0. */
     private static volatile int signalExitCode;
     private static final AtomicBoolean handlersInstalled = new AtomicBoolean();
@@ -108,17 +107,9 @@ public final class NativeInferenceGuard {
         closing = false;
     }
 
+    /** The signal handlers are {@link com.pharos.ShutdownSequence}'s (drain steps first, then model calls). */
     private static void installSignalHandlersOnce() {
-        if (!handlersInstalled.compareAndSet(false, true)) return;
-        // HUP too: closing the terminal of a foreground `pharos index` is a JVM shutdown signal
-        for (String name : new String[]{"TERM", "INT", "HUP"}) {
-            try {
-                Signal.handle(new Signal(name), NativeInferenceGuard::onSignal);
-            } catch (IllegalArgumentException e) {
-                // signal unavailable or reserved (e.g. -Xrs): keep the JVM's default behaviour
-                log.debug("Cannot install SIG{} handler: {}", name, e.getMessage());
-            }
-        }
+        if (handlersInstalled.compareAndSet(false, true)) com.pharos.ShutdownSequence.install();
     }
 
     /**
@@ -131,25 +122,13 @@ public final class NativeInferenceGuard {
         return s != 0 ? s : normalExitCode;
     }
 
-    private static void onSignal(Signal signal) {
-        signalExitCode = 128 + signal.getNumber();
-        if (signalsReceived.incrementAndGet() > 1) {
-            // Second signal (e.g. Ctrl+C again): exit now. halt() runs no shutdown hooks, so
-            // ORT's environment closer can't free anything under the running call either.
-            Runtime.getRuntime().halt(128 + signal.getNumber());
-        }
-        int running = inFlight.get();
-        if (running > 0) {
-            System.err.printf("pharos: finishing %d running model call(s) before exiting "
-                    + "(up to %d s; send the signal again — e.g. Ctrl+C — to exit immediately)%n",
-                    running, DRAIN_TIMEOUT_MS / 1000);
-        }
-        // Don't block the JVM's signal-dispatch thread; drain and exit on a dedicated thread.
-        Thread t = new Thread(() -> {
-            beginShutdown(DRAIN_TIMEOUT_MS);
-            System.exit(128 + signal.getNumber());   // 143 for TERM, 130 for INT — as without the handler
-        }, "pharos-graceful-shutdown");
-        t.setDaemon(false);
-        t.start();
+    /** {@link com.pharos.ShutdownSequence}: a signal with exit code {@code code} started the shutdown. */
+    public static void signalled(int code) {
+        signalExitCode = code;
+    }
+
+    /** Native calls running now (for the shutdown notice). */
+    public static int inFlightCalls() {
+        return inFlight.get();
     }
 }

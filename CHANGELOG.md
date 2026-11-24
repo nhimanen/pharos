@@ -3,6 +3,89 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.8.0] - 2026-11-23
+
+**Index format:** 1 (unchanged)
+
+Multi-node Phase 3: multi-shard fan-out and the router. A reader no longer has to hold every project: a query
+that needs shards held elsewhere is coordinated by the reader that received it, and `pharos router` spreads
+requests over the healthy readers. Fan-out rankings equal a single node's (Phase 3 gate: keyword 99/99
+bitwise, hybrid τ 0.9996, vector 99/99; 3 600/3 600 requests answered while a reader joined and another
+drained). **Single-node installs are unaffected** apart from the multi-project vector change under Changed.
+Requires no re-index; cluster readers should read UPGRADING.md (config validation, health probes, stop timeouts).
+
+### Added (multi-node Phase 3: fan-out and router)
+- `pharos router --port <p>` (`./pharos router`): a stateless router over the healthy readers. It polls each
+  reader's `/health` every 2 s, round-robins, retries an idempotent request once on another reader, never
+  forwards `/internal/*`, and answers 504 when a forwarded exchange (body included) exceeds 120 s. It needs
+  the object-store config and `cluster.token`, but no index.
+- Fan-out on readers: a reader that does not hold every shard a query needs coordinates it. It classifies
+  and embeds the query once, gathers BM25 term statistics from every shard (so keyword ranking equals a single
+  node's), fetches raw candidates from the readers serving the other shards, and applies graph boost, fusion
+  and reranking once over the merged lists. Vector first passes and unified recall pools are merged in two
+  rounds (global top candidates, then rescored on their shards). Snippets and neighbourhood expansion come
+  from the owning shard; each query pins one reader and generation per shard. A reader holding every
+  requested shard searches locally, unchanged.
+- Graph and lookup tools (callers, callees, usages, call chains, call paths, method and class lookup) reach
+  shards held elsewhere.
+- Partial answers: a shard no reader can answer for is named in the response warnings
+  (`shard <name> unavailable: <reason>; results exclude it`) and the other shards still answer. When none
+  answers and the reader holds none of them, the call answers 503 (`no shard answered`; MCP: a retryable tool
+  error), so the router retries it on another reader.
+- An internal shard API on readers (`/internal/term-stats`, `/internal/shard-search`, `/internal/snippets`,
+  `/internal/callees`, `/internal/graph`), guarded by `cluster.token` (`X-Pharos-Cluster-Token`,
+  constant-time compare, 401 without it). Coordinator and shard must use the same `synonyms.txt`; a shard
+  refuses otherwise (409). Right after a `synonyms.txt` change that refusal lasts up to one
+  `pollIntervalSeconds` and those shards are left out with a warning; it heals by itself.
+- Draining on SIGTERM: a serving reader announces `draining` (heartbeat, and `/health` 503
+  `{"status":"draining"}`), keeps serving for a quiet period (at least 4 s and one heartbeat plus 2 s, and
+  until nothing has been in flight for 1 s) and stops after at most `cluster.drainSeconds` (default 20).
+  Give the process manager a stop timeout above `drainSeconds` + 15 s (Kubernetes
+  `terminationGracePeriodSeconds`, e.g. 45).
+- Reader heartbeats carry `state` (`warming|ready|degraded|draining`) and `degradedShards`; coordinators skip
+  a reader only for its degraded shards. `GET /cluster/readers` lists the live readers; it needs the cluster
+  token (401 without it), as it names every reader's `advertiseUrl`.
+- New config: `cluster.fanoutTimeoutMillis` (5000), `cluster.connectTimeoutMillis` (1000),
+  `cluster.queryTimeoutMillis` (20000: one budget for all rounds of a query), `cluster.maxCatalogAgeSeconds`
+  (600: past it while catalog reads are failing, or before the catalog was first read, unscoped queries
+  answer from the reader's own shards with a warning naming the shards not searched; the catalog is re-read
+  every 5 s) and `cluster.drainSeconds` (20).
+
+### Fixed
+- `pharos mcp-server` on a reader no longer joins reader membership. It wrote the heartbeat of the `web`
+  daemon's node id (same config), and on exit marked it draining and deleted it; it now serves the reader's
+  own shards only, and exits without a drain wait.
+- Shutdown order on SIGTERM/SIGINT/SIGHUP: the reader drain, then the running model calls, then exit; JVM
+  shutdown hooks (ONNX Runtime's environment closer among them) start only after that, so a signal no longer
+  frees the model under a running query (SIGSEGV in `OrtSession.run`). Applies to `web`, `mcp-server`,
+  `index`, `embed` and `upgrade-indexes`.
+- Lazy readers missed a corrupt checksum when a file's footer straddles two blocks (or fills the last block
+  alone); present since 1.7.0. The real footer is now compared wherever it falls in the blocks.
+
+### Changed
+- A vector, hybrid or unified search over several projects no longer fails when one of them has no vectors
+  of the search model: that project is left out of the vector part with the warning
+  `project <name> has no vectors for model <id>; vector results exclude it`, on a single node and on every
+  cluster reader alike. A search scoped to that one project still fails, now with HTTP 409 on the web API
+  (was 500) and a tool error on MCP; `./pharos search` exits 6 for it (exit 4 stays "index format
+  incompatible").
+- `/health` on a reader whose lazy generation has lost objects on the bucket now answers HTTP 200
+  `{"status":"degraded","degradedShards":[…],"reason":…}` (1.7.0: 503), so the node stays routable for its
+  other shards. Probes that treated "degraded" as down need no change; probes that expected 503 for it do.
+- The S3 client waits up to `readTimeoutSeconds` or 30 s, whichever is longer, between reads of a response
+  (ranged block reads keep their `readTimeoutSeconds` bounds), so whole-object downloads and uploads on a slow
+  bucket are not cut short.
+- Config validation: `cluster.retireGraceSeconds` must be at least `2 x cluster.pollIntervalSeconds` and at
+  least `cluster.fanoutTimeoutMillis` (in seconds); a reader config that violates either now fails at startup
+  with a message naming both fields (see UPGRADING.md).
+
+### Maintainers
+- Phase 3 gate driver: `scripts/cluster-gate-phase3.sh` and `scripts/cluster_gate_phase3.py`. Ports are
+  configurable (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`, `GATE_R1_PORT`..`GATE_R4_PORT`,
+  `GATE_REF_PORT`, `GATE_ROUTER_PORT`; defaults 9000, 9001, 7301-7304, 7305, 7080), and so are the
+  sources, embed-cache seed and model source for hosts without a `~/.pharos` registry (`GATE_LUCENE_SRC`,
+  `GATE_EXTRA_PROJECT` / `GATE_EXTRA_SRC`, `GATE_SEED_FROM`, `GATE_MODELS_SRC`).
+
 ## [1.7.1] - 2026-11-23
 
 **Index format:** 1 (unchanged)

@@ -215,6 +215,25 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
         return String.join("; ", reasons);
     }
 
+    /** The shards whose active generation lost objects on the bucket ({@link #degradation}), sorted. */
+    public List<String> degradedShards() {
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        for (Map.Entry<String, Long> e : goneGenerations.entrySet()) {
+            java.util.OptionalLong active = activeGeneration.apply(e.getKey());
+            if (active.isPresent() && active.getAsLong() == e.getValue()) out.add(e.getKey());
+        }
+        return List.copyOf(out);
+    }
+
+    /** Why {@code shard} is degraded on this reader, or null when it is not. */
+    public String degradation(String shard) {
+        Long gone = goneGenerations.get(shard);
+        if (gone == null) return null;
+        java.util.OptionalLong active = activeGeneration.apply(shard);
+        if (active.isEmpty() || active.getAsLong() != gone) return null;
+        return "generation " + gone + " was garbage-collected on the bucket; this reader is behind retention";
+    }
+
     /** A lazy generation exists when its manifest names a commit whose {@code segments_N} is on disk. */
     @Override
     public boolean indexExists(Path luceneDir) throws IOException {
@@ -290,8 +309,9 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      * manifest (length and checksum) and moved into place; from then on new opens read it locally
      * and misses of inputs already open read their blocks from it. Smallest files first; it stops
      * (WARN) when the cache dir's disk would keep less than the block cache's remaining room plus a
-     * margin. Idempotent per generation dir: a second call for the same dir does nothing; a call
-     * for another dir of the shard cancels the first.
+     * margin. Idempotent per generation dir: a second call for the same dir does nothing while the
+     * first runs or after it succeeded or stopped for disk room; after a failure it starts again. A
+     * call for another dir of the shard cancels the first.
      *
      * @return true when a materialisation was started
      */
@@ -371,8 +391,9 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             log.info("Shard {}: generation {} is now fully local: this reader no longer needs the bucket for it",
                     shard, m.generation());
         } catch (IOException | RuntimeException e) {
-            log.warn("Shard {}: materialising generation dir {} in the background failed; it stays partly remote: {}",
-                    shard, job.genDir, e.toString());
+            materialisations.remove(shard.value(), job); // forgotten: the next refused poll starts it again
+            log.warn("Shard {}: materialising generation dir {} in the background failed; it stays partly remote"
+                    + " (retried on the next poll): {}", shard, job.genDir, e.toString());
         }
     }
 
@@ -563,6 +584,21 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             }
             return out;
         }
+    }
+
+    /**
+     * A shard this reader stops serving: cancels its still-queued prefetch blocks. Blocks already
+     * running finish into the block cache (not the shard dir), so nothing writes into a deleted dir.
+     *
+     * @return how many queued blocks were cancelled
+     */
+    public int cancelShard(String shard) {
+        BlockCache cache;
+        synchronized (this) {
+            if (closed || blockCache == null) return 0;
+            cache = blockCache;
+        }
+        return cancelPrevious(shard, cache);
     }
 
     /** Cancels the still-queued blocks of the shard's previous prefetch; returns how many. */
@@ -821,14 +857,26 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
      * volume) and after PID reuse. A staging dir ({@code .new}) is left alone for its first minute.
      */
     private void deleteStalePrivateDirs() {
-        deleteStalePrivateDirs(cacheDir);
+        java.util.Set<Path> own = new java.util.HashSet<>();
+        synchronized (this) {
+            if (privateDir != null) own.add(privateDir.toAbsolutePath().normalize());
+            retiredDirs.forEach(d -> own.add(d.toAbsolutePath().normalize()));
+        }
+        deleteStalePrivateDirs(cacheDir, own);
     }
 
-    private static void deleteStalePrivateDirs(Path cacheDir) {
+    /**
+     * @param own this process's own private dirs: skipped before their lock is tried. Trying it would
+     *            open a second channel on a file this JVM already locks, and closing that channel
+     *            releases the JVM's OS lock on it (POSIX drops a process's locks on any close of the
+     *            file), so another process's sweep could then delete a cache still in use here.
+     */
+    private static void deleteStalePrivateDirs(Path cacheDir, java.util.Set<Path> own) {
         Path parent = cacheDir.resolve(PRIVATE_BLOCKS_DIR);
         if (!Files.isDirectory(parent)) return;
         try (Stream<Path> s = Files.list(parent)) {
             for (Path p : s.toList()) {
+                if (own.contains(p.toAbsolutePath().normalize())) continue;
                 String name = p.getFileName().toString();
                 boolean staging = name.endsWith(STAGING_SUFFIX);
                 String base = staging ? name.substring(0, name.length() - STAGING_SUFFIX.length()) : name;
@@ -874,7 +922,7 @@ public final class LazyGenerations implements LuceneDirectoryFactory, Closeable 
             return false;
         }
         try {
-            deleteStalePrivateDirs(dir);
+            deleteStalePrivateDirs(dir, java.util.Set.of());
             if (!Files.exists(blocks)) return false;
             log.info("Full mode: deleting the lazy-mode block cache {} (no process uses it)", blocks);
             deleteRecursively(blocks);

@@ -7,10 +7,13 @@ import com.pharos.search.QueryClassification;
 import com.pharos.search.SearchRequest;
 import com.pharos.search.SearchResult;
 import com.pharos.search.SearchTrace;
+import com.pharos.search.distributed.CandidateShaper;
+import com.pharos.search.distributed.RawCandidate;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.*;
+import org.apache.lucene.search.similarities.BM25Similarity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,10 +88,21 @@ public class UnifiedRetrievalStage implements RetrievalStage {
     private final EmbeddingProvider     embedder;
     private final String vectorField;
     private final String chunkVectorField;
+    /** Creates the searcher of every search; a plain {@link IndexSearcher} unless injected. */
+    private final SearcherFactory searcherFactory;
+
+    /** Search type of unified results. */
+    public static final String TYPE = "unified";
 
     public UnifiedRetrievalStage(KeywordSearchStrategy keywordStrategy,
                                   EmbeddingProvider embedder) {
+        this(keywordStrategy, embedder, new SearcherFactory());
+    }
+
+    public UnifiedRetrievalStage(KeywordSearchStrategy keywordStrategy,
+                                  EmbeddingProvider embedder, SearcherFactory searcherFactory) {
         this.keywordStrategy  = keywordStrategy;
+        this.searcherFactory  = searcherFactory;
         this.embedder         = embedder;
         this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
         this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
@@ -97,59 +111,123 @@ public class UnifiedRetrievalStage implements RetrievalStage {
     @Override
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                         SearchTrace trace) throws IOException {
+        RawRetrieval raw = retrieveRaw(searcherFactory.newSearcher(reader, null), req, null, true, trace);
+        return CandidateShaper.shape(raw.candidates(), TYPE, raw.shapingIntent());
+    }
+
+    /**
+     * Raw candidates, the query embedded here (BM25 only when the embedder is unavailable). Sets the
+     * BM25 similarity on {@code searcher}: use one searcher per call.
+     */
+    @Override
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req,
+                                          SearchTrace trace) throws IOException {
+        return retrieveRaw(searcher, req, null, true, trace).candidates();
+    }
+
+    /**
+     * Raw candidates for an already embedded query (a shard serving a coordinator, which embeds
+     * once); {@code queryVec == null} means BM25 only. Returns the intent to shape them with, which
+     * depends on whether the vector pass ran. Sets the BM25 similarity on {@code searcher}: use one
+     * searcher per call.
+     */
+    public RawRetrieval retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] queryVec,
+                                    SearchTrace trace) throws IOException {
+        return retrieveRaw(searcher, req, queryVec, false, trace);
+    }
+
+    /**
+     * Raw candidates and the intent {@link CandidateShaper#shape} must use for them: the router's
+     * intent ({@code "default"} without a classification) when the vector pass ran, none for the
+     * BM25-only fallback.
+     */
+    public record RawRetrieval(List<RawCandidate> candidates, String shapingIntent) {}
+
+    private static String vectorPassIntent(SearchRequest req) {
+        return req.classification() != null ? req.classification().intent() : "default";
+    }
+
+    private RawRetrieval retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] givenVec,
+                            boolean embedHere, SearchTrace trace) throws IOException {
         long t0 = System.currentTimeMillis();
-        int  candidateSize = req.limit() * OVERSAMPLE;
+        TopDocs bm25Docs = bm25Recall(searcher, req);
 
-        IndexSearcher searcher = new IndexSearcher(reader);
+        if (embedHere && !embedder.isAvailable()) {
+            traceStep(trace, "unified retrieval (bm25 only — no embedder)", t0);
+            return bm25Only(searcher, req, bm25Docs);
+        }
 
-        // ── BM25 recall pass ──────────────────────────────────────────────────
+        float[] queryVec = givenVec;
+        if (embedHere) {
+            try {
+                queryVec = embedder.embedQuery(req.query());
+            } catch (com.pharos.embedding.EmbeddingException e) {
+                queryVec = null;   // already logged at WARN by the provider
+                if (trace != null) {
+                    trace.addWarning("vector embedding failed for model " + embedder.modelId()
+                            + "; results are keyword-only");
+                }
+            }
+        }
+        if (queryVec == null) {
+            traceStep(trace, embedHere ? "unified retrieval (embed failed)"
+                                    : "unified retrieval (bm25 only — no query vector)", t0);
+            return bm25Only(searcher, req, bm25Docs);
+        }
+
+        TopDocs knnDocs = knnRecall(searcher, req, queryVec);
+        RawRetrieval out = rescore(searcher, req, queryVec, bm25Docs.scoreDocs, knnDocs.scoreDocs);
+        traceStep(trace, "unified retrieval (bm25∪knn → vector rerank, intent=" + out.shapingIntent() + ")", t0);
+        return out;
+    }
+
+    /** Candidates each recall pass fetches for a result limit. */
+    public static int candidateSize(int limit) {
+        return limit * OVERSAMPLE;
+    }
+
+    /**
+     * The BM25 recall pass: the top {@link #candidateSize} by plain BM25 (an IndexSearcher's
+     * default), whatever the searcher was set to before. Sets the similarity on {@code searcher}.
+     */
+    public TopDocs bm25Recall(IndexSearcher searcher, SearchRequest req) throws IOException {
+        int  candidateSize = candidateSize(req.limit());
+        searcher.setSimilarity(new BM25Similarity());
+
         Query bm25Query = keywordStrategy.buildQuery(new SearchRequest(
                 req.query(), SearchRequest.SearchType.KEYWORD, req.project(),
                 req.projects(), candidateSize, req.outputFormat(),
                 req.docType(), req.scope(), req.oversampleFactor()));
 
-        TopDocs bm25Docs = (bm25Query != null)
+        return (bm25Query != null)
                 ? searcher.search(bm25Query, candidateSize)
                 : new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
+    }
 
-        if (!embedder.isAvailable()) {
-            trace.record("unified retrieval (bm25 only — no embedder)", t0);
-            int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);
-            TopDocs trimmed = new TopDocs(bm25Docs.totalHits,
-                    Arrays.copyOf(bm25Docs.scoreDocs, n));
-            return KeywordSearchStrategy.toResults(searcher, trimmed, "unified");
-        }
-
-        float[] queryVec;
-        try {
-            queryVec = embedder.embedQuery(req.query());
-        } catch (com.pharos.embedding.EmbeddingException e) {
-            queryVec = null;   // already logged at WARN by the provider
-            trace.addWarning("vector embedding failed for model " + embedder.modelId()
-                    + "; results are keyword-only");
-        }
-        if (queryVec == null) {
-            trace.record("unified retrieval (embed failed)", t0);
-            int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);
-            TopDocs trimmed = new TopDocs(bm25Docs.totalHits,
-                    Arrays.copyOf(bm25Docs.scoreDocs, n));
-            return KeywordSearchStrategy.toResults(searcher, trimmed, "unified");
-        }
-
-        // ── KNN recall pass ───────────────────────────────────────────────────
+    /** The KNN recall pass: the top {@link #candidateSize} by document-vector similarity. */
+    public TopDocs knnRecall(IndexSearcher searcher, SearchRequest req, float[] queryVec) throws IOException {
+        int candidateSize = candidateSize(req.limit());
         Query filter = buildFilter(req);
         Query knnQuery = filter != null
                 ? new KnnFloatVectorQuery(vectorField, queryVec, candidateSize, filter)
                 : new KnnFloatVectorQuery(vectorField, queryVec, candidateSize);
-        TopDocs knnDocs = searcher.search(knnQuery, candidateSize);
+        return searcher.search(knnQuery, candidateSize);
+    }
 
+    /**
+     * The union of the two recall passes' candidates (BM25 order first, then KNN-only ones), rescored
+     * by late interaction with the intent's BM25 bonus; the top {@code req.limit()} with the intent to
+     * shape them with. A coordinator passes the globally selected candidates of one shard.
+     */
+    public RawRetrieval rescore(IndexSearcher searcher, SearchRequest req, float[] queryVec, ScoreDoc[] bm25,
+                                ScoreDoc[] knn) throws IOException {
         // ── Union (BM25 ∪ KNN) ────────────────────────────────────────────────
         // Key: Lucene internal doc ID.  Value: BM25 score (0 for KNN-only hits).
         // LinkedHashMap preserves BM25 insertion order (higher BM25 scores first)
         // so that for ties in vector score the BM25 ordering is a stable tiebreaker.
         Map<Integer, Float> unionMap = new LinkedHashMap<>();
-        for (ScoreDoc sd : bm25Docs.scoreDocs) unionMap.put(sd.doc, sd.score);
-        for (ScoreDoc sd : knnDocs.scoreDocs)  unionMap.putIfAbsent(sd.doc, 0f);
+        for (ScoreDoc sd : bm25) unionMap.put(sd.doc, sd.score);
+        for (ScoreDoc sd : knn)  unionMap.putIfAbsent(sd.doc, 0f);
 
         ScoreDoc[] unionArray = new ScoreDoc[unionMap.size()];
         int idx = 0;
@@ -166,13 +244,29 @@ public class UnifiedRetrievalStage implements RetrievalStage {
 
         // Adaptive BM25 bonus from QueryRouter classification — or default if no router ran
         float bm25Bonus = adaptiveBm25Bonus(req.classification());
-        String intentLabel = req.classification() != null ? req.classification().intent() : "default";
+        String intentLabel = vectorPassIntent(req);
 
         TopDocs reranked = new UnifiedRescorer(chunkVectorField, queryMultiVec, bm25Bonus)
                 .rescore(searcher, unionDocs, req.limit());
+        return new RawRetrieval(KeywordSearchStrategy.rawCandidates(searcher, reranked, TYPE), intentLabel);
+    }
 
-        trace.record("unified retrieval (bm25∪knn → vector rerank, intent=" + intentLabel + ")", t0);
-        return KeywordSearchStrategy.toResults(searcher, reranked, "unified", intentLabel);
+    /** The BM25-only result (no query vector): the BM25 recall candidates trimmed to the limit. */
+    public RawRetrieval bm25Only(IndexSearcher searcher, SearchRequest req, ScoreDoc[] bm25) throws IOException {
+        return bm25Only(searcher, req, new TopDocs(new TotalHits(bm25.length, TotalHits.Relation.EQUAL_TO), bm25));
+    }
+
+    /** The BM25 recall pass trimmed to the limit, shaped without an intent. */
+    private static RawRetrieval bm25Only(IndexSearcher searcher, SearchRequest req, TopDocs bm25Docs)
+            throws IOException {
+        int n = Math.min(req.limit(), bm25Docs.scoreDocs.length);
+        TopDocs trimmed = new TopDocs(bm25Docs.totalHits,
+                Arrays.copyOf(bm25Docs.scoreDocs, n));
+        return new RawRetrieval(KeywordSearchStrategy.rawCandidates(searcher, trimmed, TYPE), null);
+    }
+
+    private static void traceStep(SearchTrace trace, String step, long t0) {
+        if (trace != null) trace.record(step, t0);
     }
 
     // ── Adaptive BM25 weight ──────────────────────────────────────────────────

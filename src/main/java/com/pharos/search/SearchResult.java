@@ -37,6 +37,13 @@ public record SearchResult(
                 score, searchType, docType, null);
     }
 
+    /** Returns a copy of this result with the given score and search type. */
+    public SearchResult withScore(float newScore, String newSearchType) {
+        return new SearchResult(id, project, packageName, className, qualifiedClassName, methodName,
+                signature, returnType, body, javadoc, accessModifier, filePath, startLine, endLine,
+                newScore, newSearchType, docType, snippet);
+    }
+
     /** Returns a copy of this result with the given snippet attached. */
     public SearchResult withSnippet(Snippet snippet) {
         return new SearchResult(id, project, packageName, className, qualifiedClassName,

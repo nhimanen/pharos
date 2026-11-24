@@ -3,7 +3,6 @@ package com.pharos.cluster.objectstore;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Clock;
@@ -39,14 +38,24 @@ public class InMemoryObjectStore implements ObjectStore {
     public void failMidBodyOn(String keySubstring) { midBodyFailSubstrings.add(keySubstring); }
 
     /** Removes all failure hooks. */
-    public void clearFailures() { failSubstrings.clear(); midBodyFailSubstrings.clear(); }
+    public void clearFailures() { failGetSubstrings.clear(); failSubstrings.clear(); midBodyFailSubstrings.clear(); }
 
     private Entry newEntry(byte[] data) {
         return new Entry(data.clone(), "\"" + UUID.randomUUID() + "\"", clock.instant());
     }
 
+    private final Set<String> failGetSubstrings = ConcurrentHashMap.newKeySet();
+
+    /** Makes any later {@code get} whose key contains {@code keySubstring} fail (until cleared). */
+    public void failGetOn(String keySubstring) { failGetSubstrings.add(keySubstring); }
+
     @Override
     public Optional<StoredObject> get(String key) {
+        for (String s : failGetSubstrings) { // unchecked: subclasses override get without a throws clause
+            if (key.contains(s)) {
+                throw new java.io.UncheckedIOException(new IOException("injected get failure for key: " + key));
+            }
+        }
         Entry e = map.get(key);
         return e == null ? Optional.empty() : Optional.of(new StoredObject(e.data().clone(), e.etag()));
     }
@@ -57,7 +66,7 @@ public class InMemoryObjectStore implements ObjectStore {
             if (key.contains(s)) throw new IOException("injected download failure for key: " + key);
         }
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         Path abs = target.toAbsolutePath();
         Files.createDirectories(abs.getParent());
         Path tmp = Files.createTempFile(abs.getParent(), abs.getFileName().toString(), ".part");
@@ -73,7 +82,7 @@ public class InMemoryObjectStore implements ObjectStore {
     public void downloadRange(String key, long offset, long length, Path target) throws IOException {
         long end = ObjectStore.checkRange(offset, length);
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         if (end > e.data().length) {
             throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
         }
@@ -99,7 +108,7 @@ public class InMemoryObjectStore implements ObjectStore {
     public java.io.InputStream openRange(String key, long offset, long length) throws IOException {
         long end = ObjectStore.checkRange(offset, length);
         Entry e = map.get(key);
-        if (e == null) throw new NoSuchFileException(key, null, "object not found: " + key);
+        if (e == null) throw new ObjectMissingException(key);
         if (end > e.data().length) {
             throw new EOFException("range " + offset + "+" + length + " exceeds size " + e.data().length);
         }

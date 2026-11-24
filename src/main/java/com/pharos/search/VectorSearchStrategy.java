@@ -2,6 +2,8 @@ package com.pharos.search;
 
 import com.pharos.embedding.EmbeddingProvider;
 import com.pharos.indexer.DocumentMapper;
+import com.pharos.search.distributed.CandidateShaper;
+import com.pharos.search.distributed.RawCandidate;
 import org.apache.lucene.document.LateInteractionField;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
@@ -42,9 +44,19 @@ public class VectorSearchStrategy {
      *  fallback path automatically (see {@link DocumentMapper#vectorFieldFor(String)}). */
     private final String vectorField;
     private final String chunkVectorField;
+    /** Creates the searcher of every search; a plain {@link IndexSearcher} unless injected. */
+    private final SearcherFactory searcherFactory;
+
+    /** Search type of vector results. */
+    public static final String TYPE = "vector";
 
     public VectorSearchStrategy(EmbeddingProvider embedder) {
+        this(embedder, new SearcherFactory());
+    }
+
+    public VectorSearchStrategy(EmbeddingProvider embedder, SearcherFactory searcherFactory) {
         this.embedder = embedder;
+        this.searcherFactory = searcherFactory;
         this.vectorField      = DocumentMapper.vectorFieldFor(embedder.modelId());
         this.chunkVectorField = DocumentMapper.chunkVectorFieldFor(embedder.modelId());
     }
@@ -53,8 +65,22 @@ public class VectorSearchStrategy {
         return search(reader, req, null);
     }
 
+    /** Embeds the query and runs {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])}; a failed
+     *  embedding yields no results and, with a trace, a warning. */
     public List<SearchResult> search(IndexReader reader, SearchRequest req,
                                      SearchTrace trace) throws IOException {
+        return CandidateShaper.shape(retrieveRaw(searcherFactory.newSearcher(reader, null), req, trace), TYPE, null);
+    }
+
+    /** {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])} with the query embedded here. */
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req) throws IOException {
+        return retrieveRaw(searcher, req, (SearchTrace) null);
+    }
+
+    /** {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])} with the query embedded here; a failed
+     *  embedding yields no candidates and, with a trace, a warning. */
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, SearchTrace trace)
+            throws IOException {
         if (!embedder.isAvailable()) {
             log.warn("Vector search requested but no embedding provider configured.");
             return List.of();
@@ -75,19 +101,46 @@ public class VectorSearchStrategy {
             return List.of();
         }
 
+        return retrieveRaw(searcher, req, queryVector);
+    }
+
+    /**
+     * Raw KNN retrieval for an already embedded query: HNSW first pass, then late-interaction
+     * rescoring when the index has chunk vectors; the top {@code req.limit()} with unboosted scores.
+     */
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, float[] queryVector)
+            throws IOException {
+        IndexReader reader = searcher.getIndexReader();
+        TopDocs firstPass = firstPass(searcher, req, queryVector);
+        return finish(searcher, firstPass, queryVector, req.limit(), hasChunkVectors(reader));
+    }
+
+    /** First-pass candidates per query for a result limit (the HNSW pass fetches this many). */
+    public static int firstPassK(int limit) {
+        return limit * RESCORE_FACTOR;
+    }
+
+    /** The HNSW first pass: the top {@link #firstPassK} documents by document-vector similarity. */
+    public TopDocs firstPass(IndexSearcher searcher, SearchRequest req, float[] queryVector) throws IOException {
         Query filter      = buildFilter(req);
-        int   limit       = req.limit();
-        int   firstPassK  = limit * RESCORE_FACTOR;
+        int   firstPassK  = firstPassK(req.limit());
 
         Query vectorQuery = filter != null
                 ? new KnnFloatVectorQuery(vectorField, queryVector, firstPassK, filter)
                 : new KnnFloatVectorQuery(vectorField, queryVector, firstPassK);
 
-        IndexSearcher searcher = new IndexSearcher(reader);
-        TopDocs firstPass = searcher.search(vectorQuery, firstPassK);
+        return searcher.search(vectorQuery, firstPassK);
+    }
 
+    /**
+     * The second pass over first-pass candidates: late-interaction rescoring when the index (all of
+     * it, for a coordinator: any shard) has chunk vectors, else the first pass truncated; the top
+     * {@code limit} with unboosted scores.
+     */
+    public List<RawCandidate> finish(IndexSearcher searcher, TopDocs firstPass, float[] queryVector, int limit,
+                                     boolean chunkVectors) throws IOException {
         // Late-interaction rescoring when chunkVectors field is present
-        if (hasChunkVectors(reader) && firstPass.totalHits.value() > 0) {
+        if (chunkVectors && firstPass.totalHits.value() > 0) {
             // Wrap single query vector as float[][] — the rescorer treats it as a 1-element
             // multi-vector, so SUM_MAX_SIM becomes MAX(cosine(queryVec, chunkVec_i)).
             float[][] queryMultiVec = new float[][] { queryVector };
@@ -96,7 +149,7 @@ public class VectorSearchStrategy {
                             chunkVectorField, queryMultiVec,
                             VectorSimilarityFunction.COSINE)
                     .rescore(searcher, firstPass, limit);
-            return KeywordSearchStrategy.toResults(searcher, reranked, "vector");
+            return KeywordSearchStrategy.rawCandidates(searcher, reranked, TYPE);
         }
 
         // Fallback: old index or no chunks — truncate first-pass to limit
@@ -104,7 +157,7 @@ public class VectorSearchStrategy {
             firstPass = new TopDocs(firstPass.totalHits,
                     java.util.Arrays.copyOf(firstPass.scoreDocs, limit));
         }
-        return KeywordSearchStrategy.toResults(searcher, firstPass, "vector");
+        return KeywordSearchStrategy.rawCandidates(searcher, firstPass, TYPE);
     }
 
     /**
@@ -164,7 +217,7 @@ public class VectorSearchStrategy {
     }
 
     /** Returns true when the index contains the per-model chunk-vectors late-interaction field. */
-    private boolean hasChunkVectors(IndexReader reader) {
+    public boolean hasChunkVectors(IndexReader reader) {
         return reader.leaves().stream().anyMatch(
                 ctx -> ctx.reader().getFieldInfos().fieldInfo(chunkVectorField) != null);
     }

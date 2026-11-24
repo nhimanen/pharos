@@ -40,8 +40,12 @@ public class McpServerCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
-            clusterRuntime.startServing(); // readers: wait for the first sync pass (failures are logged and retried)
+            // Readers: wait for the first sync pass (failures are logged and retried). No membership:
+            // this process serves no /internal/*, so it never advertises itself (nor drains) and
+            // answers from the shards this reader holds only.
+            clusterRuntime.startServing(false);
         } catch (Exception e) {
             // stdout is the JSON-RPC channel: report on stderr only
             System.err.println("Cannot start serving: " + e.getMessage());

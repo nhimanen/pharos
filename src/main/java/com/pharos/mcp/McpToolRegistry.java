@@ -470,7 +470,8 @@ public class McpToolRegistry {
         String from = args.path("from_fqn").asText();
         String to = args.path("to_fqn").asText();
 
-        for (ProjectMeta meta : registry.listAll()) {
+        java.util.Optional<List<String>> fanned = searchEngine.fannedOutCallPath(from, to, skipped.get());
+        for (ProjectMeta meta : fanned.isPresent() ? List.<ProjectMeta>of() : registry.listAll()) {
             // GraphViews checks the index format before opening anything
             try (GraphView g = GraphViews.open(meta)) {
                 List<String> path = g.shortestPath(from, to);
@@ -489,6 +490,17 @@ public class McpToolRegistry {
                 log.warn("Skipping call graph of '{}': {}", meta.getName(), e.getMessage());
                 skipped.get().add(e.getMessage());
             } catch (Exception ignored) {}
+        }
+        if (fanned.isPresent() && !fanned.get().isEmpty()) {
+            List<String> path = fanned.get();
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("from", from);
+            out.put("to", to);
+            out.put("hops", path.size() - 1);
+            out.put("path", path.stream()
+                    .map(n -> { Map<String, Object> m = new LinkedHashMap<>(); m.put("fqn", n); return m; })
+                    .collect(Collectors.toList()));
+            return mapper.writeValueAsString(out);
         }
         return "No call path found from `" + from + "` to `" + to + "`";
     }
@@ -810,6 +822,9 @@ public class McpToolRegistry {
     }
 
     private Set<String> getFromGraph(String fqn, boolean callers) {
+        // a reader not holding every shard asks the readers serving the others
+        java.util.Optional<Set<String>> fanned = searchEngine.fannedOutNeighbors(fqn, callers, skipped.get());
+        if (fanned.isPresent()) return fanned.get();
         Set<String> result = new LinkedHashSet<>();
         for (ProjectMeta meta : registry.listAll()) {
             // GraphViews checks the index format before opening anything

@@ -184,9 +184,13 @@ public final class BlockCache implements Closeable {
     }
 
     /**
-     * @param fetchTimeout how long an {@link #acquire} waits for a missing block's fetch (queueing
-     *                     included) before it gives up with an {@link IOException}; the fetch itself
-     *                     goes on for later acquires. Zero or null waits without bound.
+     * @param fetchTimeout how long an {@link #acquire} waits for a missing block's fetch before it
+     *                     gives up with an {@link IOException}; the fetch itself goes on for later
+     *                     acquires. Zero or null waits without bound. The wait starts at the acquire, so
+     *                     it includes the time the fetch sits queued behind {@code maxConcurrentFetches}
+     *                     running ones: under a burst of cold misses a block can time out although the
+     *                     store answers every single fetch in time (deliberate: the bound is what a
+     *                     query waits, not what the store takes).
      */
     public BlockCache(Path dir, long maxBytes, int blockSize, int maxConcurrentFetches, java.time.Duration fetchTimeout)
             throws IOException {

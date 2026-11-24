@@ -204,19 +204,130 @@ class ClusterConfigTest {
 
     @Test
     void objectStoreReadTimeoutDefaultsAndIsValidated() throws Exception {
-        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                 + "\"objectStore\":{\"bucket\":\"b\"}}}");
         assertThat(c.getObjectStore().getReadTimeoutSeconds()).isEqualTo(10);
         assertThat(c.getObjectStore().readAttemptTimeout()).isEqualTo(java.time.Duration.ofSeconds(10));
         assertThat(c.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
         for (int bad : new int[]{0, -1, 3601}) {
-            assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                     + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":" + bad + "}}}"))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("cluster.objectStore.readTimeoutSeconds");
         }
-        ClusterConfig five = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+        ClusterConfig five = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
                 + "\"objectStore\":{\"bucket\":\"b\",\"readTimeoutSeconds\":5}}}");
         assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
+    }
+
+    private static final String READER = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+            + "\"objectStore\":{\"bucket\":\"b\"}%s}}";
+
+    @Test
+    void readerNeedsAdvertiseUrl() {
+        assertThatThrownBy(() -> parse(READER.formatted(",\"token\":\"t\"")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.advertiseUrl");
+    }
+
+    @Test
+    void readerNeedsToken() {
+        assertThatThrownBy(() -> parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\"")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.token");
+    }
+
+    @Test
+    void readerMembershipDefaultsAndShards() throws Exception {
+        ClusterConfig c = parse(READER.formatted(
+                ",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\",\"reader\":{\"shards\":[\"a\",\"b-1\"]}"));
+        assertThat(c.getHeartbeatSeconds()).isEqualTo(10);
+        assertThat(c.getReaderTtlSeconds()).isEqualTo(30);
+        assertThat(c.getReader().getShards()).containsExactly("a", "b-1");
+    }
+
+    @Test
+    void readerShardsMustBeValidShardIds() {
+        assertThatThrownBy(() -> parse(READER.formatted(
+                ",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\",\"reader\":{\"shards\":[\"ok\",\"../x\"]}")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
+    }
+
+    @Test
+    void ttlMustExceedHeartbeat() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"heartbeatSeconds\":30,\"readerTtlSeconds\":30}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.readerTtlSeconds");
+    }
+
+    @Test
+    void retireGraceSecondsDefaultsAndValidates() {
+        ClusterConfig c = new ClusterConfig();
+        org.assertj.core.api.Assertions.assertThat(c.getRetireGraceSeconds()).isEqualTo(120);
+        c.setRetireGraceSeconds(0);
+        org.assertj.core.api.Assertions.assertThatThrownBy(c::validate)
+                .hasMessageContaining("cluster.retireGraceSeconds");
+    }
+
+    @Test
+    void retireGraceMustBeTwicePollInterval() {
+        ClusterConfig c = new ClusterConfig();
+        c.setPollIntervalSeconds(60);
+        c.setRetireGraceSeconds(119);
+        org.assertj.core.api.Assertions.assertThatThrownBy(c::validate)
+                .hasMessageContaining("cluster.retireGraceSeconds").hasMessageContaining("cluster.pollIntervalSeconds");
+        c.setRetireGraceSeconds(120);
+        c.validate();
+    }
+
+    @Test
+    void retireGraceMustCoverFanoutTimeout() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"retireGraceSeconds\":20,\"fanoutTimeoutMillis\":25000}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.retireGraceSeconds")
+                .hasMessageContaining("cluster.fanoutTimeoutMillis");
+        assertThatCode(() -> parse("{\"cluster\":{\"retireGraceSeconds\":25,\"fanoutTimeoutMillis\":25000}}"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void fanoutTimeoutsHaveDefaultsAndMustBePositive() throws Exception {
+        ClusterConfig c = parse("{}");
+        assertThat(c.getFanoutTimeoutMillis()).isEqualTo(5000);
+        assertThat(c.getConnectTimeoutMillis()).isEqualTo(1000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"connectTimeoutMillis\":0}}"))
+                .hasMessageContaining("cluster.connectTimeoutMillis");
+    }
+
+    @Test
+    void advertiseUrlMustBeHttpOrHttps() {
+        String reader = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                + "\"token\":\"t\",\"advertiseUrl\":\"%s\"}}";
+        for (String bad : new String[]{"r:7171", "ftp://r:7171", "file:///x", "http://", "not a url"}) {
+            assertThatThrownBy(() -> parse(reader.formatted(bad)))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.advertiseUrl");
+        }
+        assertThatCode(() -> parse(reader.formatted("https://r.example:7171"))).doesNotThrowAnyException();
+    }
+
+    @Test
+    void queryTimeoutDefaultsAndBounds() throws Exception {
+        ClusterConfig c = parse("{}");
+        assertThat(c.effectiveQueryTimeoutMillis()).isEqualTo(20_000);
+        assertThat(c.getMaxCatalogAgeSeconds()).isEqualTo(600);
+        assertThat(parse("{\"cluster\":{\"retireGraceSeconds\":25,\"fanoutTimeoutMillis\":25000}}")
+                .effectiveQueryTimeoutMillis()).as("unset: raised to the fan-out timeout").isEqualTo(25_000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"queryTimeoutMillis\":4000}}"))
+                .hasMessageContaining("cluster.queryTimeoutMillis").hasMessageContaining("cluster.fanoutTimeoutMillis");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"queryTimeoutMillis\":60000}}"))
+                .hasMessageContaining("cluster.queryTimeoutMillis").hasMessageContaining("60000 ms");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"maxCatalogAgeSeconds\":0}}"))
+                .hasMessageContaining("cluster.maxCatalogAgeSeconds");
+        assertThat(parse("{\"cluster\":{\"queryTimeoutMillis\":5000}}").effectiveQueryTimeoutMillis()).isEqualTo(5000);
+    }
+
+    @Test
+    void drainSecondsDefaultsAndBounds() throws Exception {
+        assertThat(parse("{}").getDrainSeconds()).isEqualTo(20);
+        assertThat(parse("{\"cluster\":{\"drainSeconds\":0}}").getDrainSeconds()).isZero();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":-1}}")).hasMessageContaining("cluster.drainSeconds");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":3601}}")).hasMessageContaining("cluster.drainSeconds");
     }
 }

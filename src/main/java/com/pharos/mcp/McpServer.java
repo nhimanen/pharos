@@ -66,7 +66,8 @@ public class McpServer {
         log.info("MCP server stopped");
     }
 
-    private String handleMessage(String jsonLine) throws Exception {
+    /** One JSON-RPC message in, its response out (null for a notification). Package-private for tests. */
+    String handleMessage(String jsonLine) throws Exception {
         JsonNode msg = mapper.readTree(jsonLine);
         String method = msg.path("method").asText();
         JsonNode id = msg.get("id");
@@ -143,6 +144,33 @@ public class McpServer {
                     toolName, arguments, ms, e.getMessage());
             ObjectNode result = mapper.createObjectNode();
             result.putArray("content").addObject().put("type", "text").put("text", e.getMessage());
+            result.put("isError", true);
+            return successResponse(id, result);
+        } catch (com.pharos.search.VectorModelUnavailableException e) {
+            // as HTTP 409: the scoped project has no vectors of the search model; a tool error, not a crash
+            log.warn("tool={} args={} status=no-vectors error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text").put("text", "conflict (409): " + e.getMessage());
+            result.put("isError", true);
+            return successResponse(id, result);
+        } catch (com.pharos.cluster.routing.InvalidProjectException e) {
+            // the caller's fault, as HTTP 400: JSON-RPC "invalid params"
+            log.warn("tool={} args={} status=invalid-project error={}", toolName, arguments, e.getMessage());
+            return errorResponse(id, -32602, "Invalid params: " + e.getMessage());
+        } catch (com.pharos.cluster.routing.NoShardAnsweredException e) {
+            // as HTTP 503: every shard of the call failed; a tool error the client may retry
+            log.warn("tool={} args={} status=no-shard-answered error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text")
+                    .put("text", "unavailable (503): " + e.getMessage() + "; retry shortly");
+            result.put("isError", true);
+            return successResponse(id, result);
+        } catch (com.pharos.cluster.routing.CatalogUnavailableException e) {
+            // transient, as HTTP 503: a tool error the client may retry
+            log.warn("tool={} args={} status=catalog-unavailable error={}", toolName, arguments, e.getMessage());
+            ObjectNode result = mapper.createObjectNode();
+            result.putArray("content").addObject().put("type", "text")
+                    .put("text", "unavailable (503): " + e.getMessage() + "; retry shortly");
             result.put("isError", true);
             return successResponse(id, result);
         } catch (Exception e) {

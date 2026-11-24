@@ -43,14 +43,28 @@ class ReaderServingTest {
     /** A second reader process on the same cache dir: same config, its own backend, registry, indexer. */
     private record Reader(ClusterRuntime runtime, SearchEngine engine, LuceneIndexer lucene) {}
 
+    private ReaderLocalCache lastCache;
+
     private Reader secondReader(InMemoryObjectStore store) {
-        ReplicationBackend backend = TestBackends.objectStore(cluster.readerConfig, store);
-        ProjectRegistry registry = ClusterRuntime.registryFor(cluster.readerConfig);
-        LuceneIndexer lucene = new LuceneIndexer(cluster.readerConfig, backend.localCache());
-        ClusterRuntime runtime = new ClusterRuntime(cluster.readerConfig, backend, registry, lucene);
+        return secondReader(store, cluster.readerConfig);
+    }
+
+    /** A follower with its own, independent config (same home, so the same cache dir). */
+    private Reader independentFollower(InMemoryObjectStore store, List<String> pin) {
+        com.pharos.config.IndexConfig own = ClusterFixture.config(tmp.resolve("reader"), NodeRole.READER, "test-bucket");
+        own.getCluster().getReader().setShards(pin);
+        return secondReader(store, own);
+    }
+
+    private Reader secondReader(InMemoryObjectStore store, com.pharos.config.IndexConfig cfg) {
+        ReplicationBackend backend = TestBackends.objectStore(cfg, store);
+        lastCache = (ReaderLocalCache) backend.localCache();
+        ProjectRegistry registry = ClusterRuntime.registryFor(cfg);
+        LuceneIndexer lucene = new LuceneIndexer(cfg, backend.localCache());
+        ClusterRuntime runtime = new ClusterRuntime(cfg, backend, registry, lucene);
         extra.add(lucene);
         extra.add(runtime);
-        return new Reader(runtime, new SearchEngine(lucene, EmbeddingProvider.create(cluster.readerConfig), registry),
+        return new Reader(runtime, new SearchEngine(lucene, EmbeddingProvider.create(cfg), registry),
                 lucene);
     }
 
@@ -304,5 +318,93 @@ class ReaderServingTest {
         assertThat(restarted.lucene().getProjectIndexDir(JAVA).getFileName().toString()).isEqualTo("none");
         assertThat(warns).anySatisfy(w -> assertThat(w).contains(JAVA, "gen-2", "index format " + newer,
                 "reads index formats", "No servable generation on disk"));
+    }
+
+    @Test
+    void unpinnedFollowerStopsServingAShardTheOwnerPinnedAway() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        Reader follower = independentFollower(store, List.of()); // its own config: no pin
+        follower.runtime().startServing();
+        assertThat(follower.runtime().ownsSync()).isFalse();
+        assertThat(lastCache.active(JAVA)).isPresent();
+        Path dir = lastCache.active(JAVA).orElseThrow();
+
+        cluster.readerConfig.getCluster().getReader().setShards(List.of("elsewhere")); // only the owner
+        cluster.readerRuntime.repin();
+        cluster.readerRuntime.syncNow();
+        follower.runtime().followerTick();
+
+        assertThat(lastCache.active(JAVA)).as("follower deactivated it via the registry").isEmpty();
+        assertThat(dir).as("grace not elapsed").isDirectory();
+    }
+
+    @Test
+    void pinnedFollowerDeactivatesAShardTheRegistryStillLists() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        cluster = new ClusterFixture(tmp, store, store, "test-bucket");
+        cluster.index(JAVA, false);
+        cluster.readerRuntime.startServing();
+        Reader follower = independentFollower(store, List.of());
+        follower.runtime().startServing();
+        assertThat(lastCache.active(JAVA)).isPresent();
+
+        Path dir = lastCache.active(JAVA).orElseThrow();
+
+        // a follower pinned elsewhere, holding the shard active (as after a pin change), registry still lists it
+        Reader pinned = independentFollower(store, List.of("elsewhere"));
+        pinned.runtime().startServing();
+        assertThat(lastCache.active(JAVA)).as("a pinned follower never activates it").isEmpty();
+        lastCache.activate(JAVA, dir);
+        pinned.runtime().followerTick();
+        assertThat(cluster.readerRegistry.find(JAVA)).isPresent();
+        assertThat(lastCache.active(JAVA)).isEmpty();
+        assertThat(dir).as("deactivating keeps the directory for the retire grace").isDirectory();
+    }
+
+    /** Final review I1: a coordinator's catalog is re-read on a timer; draining and close stop it. */
+    @Test
+    void coordinatorRunsACatalogTimerUntilDrainOrClose() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        var parts = ClusterFixture.reader(tmp.resolve("timer"), store, "b", "t1", List.of());
+        extra.add(parts.lucene());
+        extra.add(parts.runtime());
+        SearchEngine engine = new SearchEngine(parts.lucene(), EmbeddingProvider.create(parts.config()), parts.registry());
+        assertThat(parts.runtime().catalogTimer()).as("no coordinator yet").isNull();
+        parts.runtime().internalApi(engine);
+        var first = parts.runtime().catalogTimer();
+        assertThat(first).isNotNull();
+        assertThat(first.isShutdown()).isFalse();
+        parts.runtime().internalApi(engine); // a replaced coordinator replaces its timer
+        assertThat(first.isShutdown()).isTrue();
+        var second = parts.runtime().catalogTimer();
+        assertThat(second).isNotNull().isNotSameAs(first);
+        parts.runtime().drain();
+        assertThat(parts.runtime().catalogTimer()).isNull();
+        assertThat(second.isShutdown()).isTrue();
+
+        var other = ClusterFixture.reader(tmp.resolve("timer2"), store, "b", "t2", List.of());
+        extra.add(other.lucene());
+        other.runtime().internalApi(new SearchEngine(other.lucene(), EmbeddingProvider.create(other.config()),
+                other.registry()));
+        var t = other.runtime().catalogTimer();
+        other.runtime().close();
+        assertThat(t.isShutdown()).as("close stops it").isTrue();
+    }
+
+    @Test
+    void catalogWaitIsBoundedByTheQueryBudget() {
+        assertThat(ClusterRuntime.catalogWait(10_000)).isEqualTo(java.time.Duration.ofMillis(500));
+        assertThat(ClusterRuntime.catalogWait(2_000)).isEqualTo(java.time.Duration.ofMillis(200));
+    }
+
+    /** Final review minor 10: the drain's notice floor covers a coordinator's tick plus its bucket latency. */
+    @Test
+    void drainNoticeHasAMarginOverOneHeartbeat() {
+        assertThat(ClusterRuntime.drainNotice(10)).isEqualTo(java.time.Duration.ofSeconds(12));
+        assertThat(ClusterRuntime.drainNotice(1)).as("the router's notice is the floor").isEqualTo(java.time.Duration.ofSeconds(4));
+        assertThat(ClusterRuntime.drainNotice(3)).isEqualTo(java.time.Duration.ofSeconds(5));
     }
 }

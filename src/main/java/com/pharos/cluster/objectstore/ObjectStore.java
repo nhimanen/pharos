@@ -17,7 +17,7 @@ public interface ObjectStore extends Closeable {
      * Streams an object to {@code target} (via a temp file in the same directory, then moved into
      * place, so a partial target is never left behind).
      *
-     * @throws java.nio.file.NoSuchFileException when the key does not exist
+     * @throws ObjectMissingException when the key does not exist (a {@link java.nio.file.NoSuchFileException})
      */
     void download(String key, Path target) throws IOException;
 
@@ -25,7 +25,7 @@ public interface ObjectStore extends Closeable {
      * Streams exactly {@code length} bytes starting at {@code offset} to {@code target} (temp file in
      * the same directory, then an atomic move; a failure leaves no target behind).
      *
-     * @throws java.nio.file.NoSuchFileException when the key does not exist
+     * @throws ObjectMissingException when the key does not exist (a {@link java.nio.file.NoSuchFileException})
      * @throws java.io.EOFException when {@code offset + length} exceeds the object size
      * @throws IOException on a short body
      */
@@ -38,7 +38,7 @@ public interface ObjectStore extends Closeable {
      * exactly {@code length} bytes. A zero-length range returns an empty stream after checking that
      * the object exists and {@code offset} is not past its end.
      *
-     * @throws java.nio.file.NoSuchFileException when the key does not exist
+     * @throws ObjectMissingException when the key does not exist (a {@link java.nio.file.NoSuchFileException})
      * @throws java.io.EOFException when {@code offset + length} exceeds the object size
      */
     InputStream openRange(String key, long offset, long length) throws IOException;

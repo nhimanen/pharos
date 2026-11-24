@@ -1,5 +1,25 @@
 # Upgrading
 
+## Upgrading to 1.8.0
+
+Index format: 1 (unchanged); no re-index. Single-node installs need nothing. Cluster readers:
+
+### `retireGraceSeconds` rules
+
+`cluster.retireGraceSeconds` (default 120) must be at least `2 x cluster.pollIntervalSeconds` and at
+least `cluster.fanoutTimeoutMillis / 1000` (default 5 s). A reader whose config breaks either rule
+refuses to start and names both fields; raise `retireGraceSeconds` (or lower the other value).
+Readers also need `cluster.token` (already required) for the new `/internal/*` shard API.
+
+### Health probes and stop timeouts
+
+- `/health` now answers **200** `{"status":"degraded",…}` for a reader with a degraded shard (1.7.0: 503),
+  so the reader stays routable for its other shards, and **503** `{"status":"draining"}` while it drains.
+  A readiness probe that only checks the HTTP status keeps working.
+- On SIGTERM a reader drains for up to `cluster.drainSeconds` (default 20) before exiting. Set the
+  process manager's stop timeout above `drainSeconds` + 15 s (Kubernetes
+  `terminationGracePeriodSeconds`, e.g. 45), or it will be killed mid-drain.
+
 ## Upgrading to 1.5.0
 
 Index format: 1 (unchanged). No default changes: semantic search stays off unless you configured it, and

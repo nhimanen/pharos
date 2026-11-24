@@ -52,17 +52,28 @@ public class WebCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             // The model warm-up starts first and runs in parallel with a reader's first sync;
             // readiness waits for both (a hanging load is bounded by MODEL_WARMUP_TIMEOUT).
             if (searchEngine != null) searchEngine.warmUpInBackground();
             if (clusterRuntime != null) {
+                clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
+                clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for
                 clusterRuntime.beginServing(searchEngine != null
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
-                        : java.util.concurrent.CompletableFuture.completedFuture(null)); // no wait
+                        : java.util.concurrent.CompletableFuture.completedFuture(null), // no wait
+                        true); // serves /internal/*: joins reader membership, drains on shutdown
                 webServer.setReadiness(clusterRuntime::ready);
+                webServer.setDraining(clusterRuntime::draining);
                 webServer.setReaderCacheStats(clusterRuntime::readerCacheStats);
                 webServer.setDegradation(clusterRuntime::degradation);
+                webServer.setDegradedShards(clusterRuntime::degradedShards);
+                webServer.setLiveReaders(clusterRuntime::liveReaders);
+                // With the engine, this reader also coordinates queries over shards it does not hold.
+                com.pharos.cluster.internal.InternalApi internal = searchEngine != null
+                        ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();
+                if (internal != null) webServer.setInternalApi(internal);
             }
             webServer.start(port);
             if (!noOpen) {

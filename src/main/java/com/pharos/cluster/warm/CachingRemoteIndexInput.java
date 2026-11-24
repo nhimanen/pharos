@@ -618,6 +618,12 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
         }
 
         private BlockCache.Lease acquire(long index) throws IOException {
+            BlockCache.Lease lease = acquireUnchecked(index);
+            if (footer != null) checkFooter(index, lease);
+            return lease;
+        }
+
+        private BlockCache.Lease acquireUnchecked(long index) throws IOException {
             BlockKey key = new BlockKey(file.key(), index);
             BlockCache.Lease lease;
             try {
@@ -637,32 +643,63 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
                 }
                 throw new IOException("cannot read block " + index + " of " + where() + ": " + e.getMessage(), e);
             }
-            if (footer != null) checkFooter(key, index, lease);
             return lease;
         }
 
-        /** True when {@code e} (or a cause) says the object is not in the store. */
+        /**
+         * True when {@code e} (or a cause) says the object is not in the store: only the store's own
+         * {@link com.pharos.cluster.objectstore.ObjectMissingException}, never a local
+         * {@code NoSuchFileException} (a cache file gone from disk is no garbage-collected generation).
+         */
         static boolean objectMissing(Throwable e) {
             for (Throwable t = e; t != null; t = t.getCause()) {
-                if (t instanceof java.nio.file.NoSuchFileException) return true;
+                if (t instanceof com.pharos.cluster.objectstore.ObjectMissingException) return true;
                 if (t.getCause() == t) break;
             }
             return false;
         }
 
-        /** A block holding the whole footer must end with the synthesised one. */
-        private void checkFooter(BlockKey key, long index, BlockCache.Lease lease) throws IOException {
-            long inBlock = footerStart - index * blockSize;
-            if (inBlock < 0 || inBlock + FOOTER > lease.length()) return;
-            if (MemorySegment.mismatch(lease.segment(), inBlock, inBlock + FOOTER,
-                    MemorySegment.ofArray(footer), 0, FOOTER) < 0) {
-                return;
+        /**
+         * A block holding the file's last body byte or any footer byte must agree with the synthesised
+         * footer. Where the footer falls depends on the file's length: it can straddle two blocks, or
+         * fill the last block alone (a tail of 1..16 bytes). A whole-file read never fetches such a
+         * tail block (the footer is served from the manifest), so the check reads the real footer from
+         * every block it spans, fetching the at most 16-byte tail block when it is not this one.
+         */
+        private void checkFooter(long index, BlockCache.Lease lease) throws IOException {
+            long first = Math.max(footerStart - 1, 0) / blockSize;
+            if (index < first) return;
+            long footerFirst = footerStart / blockSize;
+            long last = (length - 1) / blockSize;
+            boolean ok = true;
+            for (long b = footerFirst; b <= last && ok; b++) {
+                long from = Math.max(footerStart, b * blockSize);
+                long to = Math.min(length, (b + 1) * blockSize);
+                if (b == index) {
+                    ok = matches(lease, from - b * blockSize, from, to);
+                } else {
+                    try (BlockCache.Lease other = acquireUnchecked(b)) {
+                        ok = matches(other, from - b * blockSize, from, to);
+                    } catch (IOException | RuntimeException e) {
+                        lease.close();
+                        throw e;
+                    }
+                }
             }
-            cache.invalidate(key, objectHash);
+            if (ok) return;
+            for (long b = footerFirst; b <= last; b++) cache.invalidate(new BlockKey(file.key(), b), objectHash);
             lease.close();
-            throw new IOException("block " + index + " of " + where() + " does not end with the footer that the"
-                    + " manifest's checksum " + file.checksum() + " implies (corrupt object or cached block);"
-                    + " dropped it from the cache");
+            throw new IOException("blocks " + footerFirst + (last == footerFirst ? "" : ".." + last) + " of " + where()
+                    + " do not end with the footer that the manifest's checksum " + file.checksum()
+                    + " implies (corrupt object or cached block); dropped them from the cache");
+        }
+
+        /** True when the lease's bytes at {@code inBlock} equal the synthesised footer's bytes [from, to). */
+        private boolean matches(BlockCache.Lease lease, long inBlock, long from, long to) {
+            int n = (int) (to - from);
+            int at = (int) (from - footerStart);
+            return MemorySegment.mismatch(lease.segment(), inBlock, inBlock + n,
+                    MemorySegment.ofArray(footer), at, at + n) < 0;
         }
     }
 }

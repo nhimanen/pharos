@@ -53,6 +53,13 @@ public class WebServer {
     private volatile java.util.function.Supplier<Map<String, Object>> readerCacheStats = () -> null;
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
+    private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
+    private volatile java.util.function.BooleanSupplier draining = () -> false;
+    /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
+    private final int[] active = new int[1];
+    private volatile java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> liveReaders = null;
+    private volatile com.pharos.cluster.internal.InternalApi internalApi = null;
+    private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
 
     public WebServer(SearchEngine searchEngine, ProjectRegistry registry,
                      ModuleGraphBuilder moduleGraphBuilder, LuceneIndexer luceneIndexer,
@@ -89,32 +96,138 @@ public class WebServer {
 
     /**
      * Degradation reported by {@code /health}: while it returns a reason (non-null), a ready node
-     * answers HTTP 503 {@code {"status":"degraded","reason":…}}, so routers drain it (a lazy reader
-     * whose served generation was garbage-collected on the bucket).
+     * answers HTTP 200 {@code {"status":"degraded","reason":…}} (a lazy reader whose served generation
+     * was garbage-collected on the bucket); see {@link #setDegradedShards}.
      */
     public void setDegradation(java.util.function.Supplier<String> reason) {
         this.degradation = java.util.Objects.requireNonNull(reason, "reason");
+    }
+
+    /**
+     * The shards this reader can't serve fully, reported by {@code /health} as {@code degradedShards}
+     * with status {@code degraded} and HTTP 200: the node stays routable for its other shards (the
+     * coordinators' routers skip it for these shards only, from its heartbeat).
+     */
+    public void setDegradedShards(java.util.function.Supplier<java.util.List<String>> shards) {
+        this.degradedShards = java.util.Objects.requireNonNull(shards, "shards");
+    }
+
+    /**
+     * Draining reported by {@code /health}: while it returns true the node answers HTTP 503
+     * {@code {"status":"draining"}} (whatever else holds), so the router and load balancers stop
+     * sending it requests; requests already running, and any still arriving, are served.
+     */
+    public void setDraining(java.util.function.BooleanSupplier draining) {
+        this.draining = java.util.Objects.requireNonNull(draining, "draining");
+    }
+
+    /** Requests being served now ({@code /api/*}, {@code /internal/*}, {@code /cluster/*}); what a drain waits for. */
+    public int inFlightRequests() {
+        synchronized (active) {
+            return active[0];
+        }
+    }
+
+    /** Waits up to {@code max} for {@link #inFlightRequests} to reach 0; true when it did. */
+    public boolean awaitIdle(java.time.Duration max) {
+        long deadline = System.nanoTime() + max.toNanos();
+        synchronized (active) {
+            while (active[0] > 0) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) return false;
+                try {
+                    java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(active, left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    /** Paths whose requests count as in-flight work for a drain (not {@code /health} or static files). */
+    private static boolean drainCounted(String path) {
+        return path.startsWith("/api/") || path.startsWith("/internal/") || path.startsWith("/cluster/");
+    }
+
+    /** Request load counter the reader heartbeat reports ({@code inFlight}, {@code qps}). */
+    public com.pharos.cluster.membership.LoadCounter load() { return load; }
+
+    /**
+     * The {@code /internal/*} shard API. Mounted on reader nodes only: on any other role the API is
+     * ignored and the routes stay absent (404).
+     */
+    public void setInternalApi(com.pharos.cluster.internal.InternalApi api) {
+        if (!readerNode) {
+            log.warn("ignoring the internal shard API: /internal/* is served by reader nodes only");
+            return;
+        }
+        this.internalApi = java.util.Objects.requireNonNull(api, "api");
+    }
+
+    /**
+     * Source of {@code GET /cluster/readers}; without one the endpoint answers 404. It requires the
+     * cluster token ({@code X-Pharos-Cluster-Token}, checked by the internal API): 401 otherwise.
+     */
+    public void setLiveReaders(java.util.function.Supplier<java.util.List<com.pharos.cluster.membership.ReaderRegistry.LiveReader>> s) {
+        this.liveReaders = java.util.Objects.requireNonNull(s, "s");
+    }
+
+    /** {@code {readers:[{node, advertiseUrl, shards, draining, state, degradedShards, ageSeconds}]}}. */
+    Map<String, Object> readersPayload() {
+        java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (var l : liveReaders.get()) {
+            var h = l.heartbeat();
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("node", h.node());
+            r.put("advertiseUrl", h.advertiseUrl());
+            r.put("shards", h.shards());
+            r.put("draining", h.draining());
+            r.put("state", h.state());
+            r.put("degradedShards", h.degradedShards());
+            r.put("ageSeconds", l.ageSeconds());
+            rows.add(r);
+        }
+        return Map.of("readers", rows);
     }
 
     /** One {@code /health} answer: the HTTP status and the payload, from one read of each signal. */
     record HealthAnswer(int status, Map<String, Object> body) {}
 
     /**
-     * {@code /health}: 200 {@code ok} when ready; 503 {@code warming} while a reader's first sync or
-     * model load runs, and 503 {@code degraded} (with a {@code reason}) while a ready reader can't
-     * serve a shard. The 503 keeps load balancers and the router from sending traffic. A client that
-     * only wants liveness treats any answer as "running". Readiness and degradation are read once.
+     * {@code /health}, one code path for every state:
+     * <ul>
+     *   <li>503 {@code draining} once a reader is shutting down (it finishes its in-flight requests);</li>
+     *   <li>503 {@code warming} while a reader's first sync or model load runs;</li>
+     *   <li>200 {@code degraded} (with {@code degradedShards} and a {@code reason}) while a ready reader
+     *       can't fully serve some shards: it stays routable for the others, and routers skip it for
+     *       those shards only;</li>
+     *   <li>200 {@code ok} otherwise.</li>
+     * </ul>
+     * The 503 keeps load balancers and the router from sending traffic. A client that only wants
+     * liveness treats any answer as "running". Every signal is read once.
      */
     HealthAnswer healthAnswer() {
+        boolean drain = draining.getAsBoolean();
         boolean ready = readiness.getAsBoolean();
-        String degraded = ready ? degradation.get() : null;
+        if (drain) { // wins over every other state: the node is going away
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "draining");
+            out.put("ready", ready);
+            return new HealthAnswer(503, out);
+        }
+        String reason = ready ? degradation.get() : null;
+        java.util.List<String> shards = ready ? degradedShards.get() : java.util.List.of();
+        boolean degraded = reason != null || (shards != null && !shards.isEmpty());
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("status", !ready ? "warming" : degraded != null ? "degraded" : "ok");
+        out.put("status", !ready ? "warming" : degraded ? "degraded" : "ok");
         out.put("ready", ready);
-        if (degraded != null) out.put("reason", degraded);
+        if (shards != null && !shards.isEmpty()) out.put("degradedShards", shards);
+        if (reason != null) out.put("reason", reason);
         Map<String, Object> cache = readerCacheStats.get();
         if (cache != null) out.put("readerCache", cache);
-        return new HealthAnswer(ready && degraded == null ? 200 : 503, out);
+        return new HealthAnswer(ready ? 200 : 503, out);
     }
 
     /** The {@code /health} payload; see {@link #healthAnswer}. */
@@ -146,16 +259,38 @@ public class WebServer {
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
+            // Global on a reader: Javalin has one request-size cap, so every route (not only /internal/*)
+            // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
+            if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
         });
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
         UsageLogger usage = new UsageLogger(pharosDir);
         app.before(ctx -> {
+            if (drainCounted(ctx.path())) {
+                ctx.attribute("drain.counted", Boolean.TRUE);
+                synchronized (active) {
+                    active[0]++;
+                }
+            }
             if (ctx.path().startsWith("/api/")) {
                 ctx.attribute("usage.start", System.currentTimeMillis());
+                ctx.attribute("load.counted", Boolean.TRUE);
+                load.begin();
             }
         });
         app.after(ctx -> {
+            if (ctx.attribute("drain.counted") != null) {
+                ctx.attribute("drain.counted", null);
+                synchronized (active) {
+                    active[0]--;
+                    active.notifyAll();
+                }
+            }
+            if (ctx.attribute("load.counted") != null) {
+                ctx.attribute("load.counted", null);
+                load.end();
+            }
             Long start = ctx.attribute("usage.start");
             if (start == null) return;          // not an /api/* call, or before-handler skipped it
             long latency = System.currentTimeMillis() - start;
@@ -187,6 +322,22 @@ public class WebServer {
             body.put("status", e.status().wireName());
             ctx.status(409).json(body);
         });
+
+        // A search scoped to one project without vectors of the search model → 409 (a conflict
+        // between the request and the index, as an incompatible index), never a generic 500
+        app.exception(com.pharos.search.VectorModelUnavailableException.class, (e, ctx) ->
+                ctx.status(409).json(Map.of("error", e.getMessage())));
+
+        // Fan-out routing (reader nodes): a project name that is no shard id → 400; the shard
+        // catalog unreadable → 503
+        app.exception(com.pharos.cluster.routing.InvalidProjectException.class, (e, ctx) ->
+                ctx.status(400).json(Map.of("error", e.getMessage())));
+        app.exception(com.pharos.cluster.routing.CatalogUnavailableException.class, (e, ctx) ->
+                ctx.status(503).json(Map.of("error", e.getMessage())));
+        // A fanned-out call none of whose shards answered (none held here) → 503 with the reasons, so
+        // pharos router retries it once on another reader instead of passing on an empty answer
+        app.exception(com.pharos.cluster.routing.NoShardAnsweredException.class, (e, ctx) ->
+                ctx.status(503).json(Map.of("error", e.getMessage(), "warnings", e.warnings())));
 
         // Project without a call graph (never indexed with one, or a failed build) → 404
         app.exception(com.pharos.graph.GraphNotFoundException.class, (e, ctx) ->
@@ -311,7 +462,10 @@ public class WebServer {
                 } else {
                     ctx.json(results);
                 }
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // handled by the 409 exception mapper above
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
@@ -393,7 +547,10 @@ public class WebServer {
                     recordSingle(ctx, r.id());
                     ctx.json(classToMap(r));
                 }
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("getClass failed for '{}': {}", fqn, e.getMessage(), e);
@@ -448,7 +605,10 @@ public class WebServer {
                 var res = searchEngine.findTransitiveCallers(fqn, depth, maxCallers, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findTransitiveCallers failed for '{}': {}", fqn, e.getMessage(), e);
@@ -466,7 +626,10 @@ public class WebServer {
                 var res = searchEngine.findUsages(fqn, kind, null, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("findUsages failed for '{}': {}", fqn, e.getMessage(), e);
@@ -486,7 +649,10 @@ public class WebServer {
                 var res = searchEngine.traceCallChain(fqn, depth, direction, maxBodyChars, warnings);
                 warningsHeader(ctx, warnings);
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 log.error("traceCallChain failed for '{}': {}", fqn, e.getMessage(), e);
@@ -501,7 +667,9 @@ public class WebServer {
             if (from == null || to == null) { ctx.status(400).result("from and to required"); return; }
             List<String> path = List.of();
             List<String> warnings = new ArrayList<>();
-            for (ProjectMeta meta : registry.listAll()) {
+            java.util.Optional<List<String>> fanned = searchEngine.fannedOutCallPath(from, to, warnings);
+            if (fanned.isPresent()) path = fanned.get();
+            else for (ProjectMeta meta : registry.listAll()) {
                 try (GraphView g = loadCallGraphCached(meta)) {
                     List<String> candidate = g.shortestPath(from, to);
                     if (!candidate.isEmpty()) { path = candidate; break; }
@@ -624,7 +792,10 @@ public class WebServer {
                 res.put("exitPoints", exits);
                 res.put("totalExitPoints", result.totalExitPoints());
                 ctx.json(res);
-            } catch (IncompatibleIndexException e) {
+            } catch (IncompatibleIndexException | com.pharos.cluster.routing.InvalidProjectException
+                     | com.pharos.cluster.routing.CatalogUnavailableException
+                     | com.pharos.cluster.routing.NoShardAnsweredException
+                     | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // 409 via the registered exception handler
             } catch (Exception e) {
                 ctx.status(500).result("Error analyzing boundary: " + e.getMessage());
@@ -654,6 +825,24 @@ public class WebServer {
             HealthAnswer h = healthAnswer(); // status and body from the same reads
             ctx.status(h.status()).json(h.body());
         });
+
+        // The internal topology (every reader's advertiseUrl): cluster members only, with the
+        // cluster token as on /internal/*. Nothing in pharos reads it (coordinators and the router
+        // list readers from the bucket); it is for operators and the gate scripts.
+        app.get("/cluster/readers", ctx -> {
+            if (liveReaders == null) {
+                ctx.status(404).result("not a cluster reader");
+                return;
+            }
+            com.pharos.cluster.internal.InternalApi api = internalApi;
+            if (api == null || !api.authorized(ctx)) {
+                ctx.status(401).json(Map.of("error", "unauthorized: send " + com.pharos.cluster.internal.InternalApi.TOKEN_HEADER));
+                return;
+            }
+            ctx.json(readersPayload());
+        });
+
+        if (readerNode && internalApi != null) internalApi.mount(app);
 
         app.start(port);
         System.out.printf("Web UI available at http://localhost:%d%n", port);

@@ -26,6 +26,7 @@ import java.util.Objects;
 public final class ObjectStoreBackend implements ReplicationBackend {
 
     private final ObjectStore store;
+    private final ObjectStoreLayout layout;
     private final ObjectStoreCatalog catalog;
     private final ObjectStoreReplicaSource source;
     private final LocalCache cache;
@@ -47,6 +48,7 @@ public final class ObjectStoreBackend implements ReplicationBackend {
         ClusterConfig cfg = config.getCluster();
         cfg.validate();
         ObjectStoreLayout layout = new ObjectStoreLayout(cfg.getObjectStore().getPrefix());
+        this.layout = layout;
         this.catalog = new ObjectStoreCatalog(store, layout);
         this.source = new ObjectStoreReplicaSource(store, layout);
         if (cfg.getRole() == NodeRole.READER) {
@@ -60,6 +62,11 @@ public final class ObjectStoreBackend implements ReplicationBackend {
                     config.getSynonymsFile());
         }
     }
+
+    /** The bucket client (shared with the membership registry; closed by {@link #close}). */
+    public ObjectStore store() { return store; }
+
+    public ObjectStoreLayout layout() { return layout; }
 
     @Override public BackendKind kind() { return BackendKind.OBJECT_STORE; }
 

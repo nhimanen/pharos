@@ -58,6 +58,7 @@ public class EmbedCommand implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
+        com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             RoleGuard.requireIndexing(config);
         } catch (IllegalStateException e) {

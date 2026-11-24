@@ -57,8 +57,27 @@ public final class SearchPipeline {
         this.oversampleFactor = b.oversampleFactor;
     }
 
+    /**
+     * Runs one retrieval stage in place of {@code stage.retrieve(reader, req, trace)}: how a
+     * coordinator retrieves from shards it does not hold. Mergers and rerankers run as usual.
+     */
+    @FunctionalInterface
+    public interface StageRunner {
+        List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace) throws IOException;
+    }
+
     public List<SearchResult> execute(IndexReader reader, SearchRequest req,
                                       SearchTrace trace) throws IOException {
+        return execute(reader, req, trace, null);
+    }
+
+    /**
+     * As {@link #execute(IndexReader, SearchRequest, SearchTrace)}, with every retrieval stage run
+     * by {@code runner} when it is set (a {@link RouterDispatcher} still selects its child pipeline,
+     * which runs with the same runner). Mergers and rerankers get {@code reader}, which they don't read.
+     */
+    public List<SearchResult> execute(IndexReader reader, SearchRequest req,
+                                      SearchTrace trace, StageRunner runner) throws IOException {
         // ── Step 0: QueryRouter — classify once, propagate to all stages ──────
         if (router != null && req.classification() == null) {
             QueryClassification classification = router.classify(req.query());
@@ -77,7 +96,14 @@ public final class SearchPipeline {
         // ── Retrieval ─────────────────────────────────────────────────────────
         List<List<SearchResult>> candidates = new ArrayList<>(retrievers.size());
         for (RetrievalStage r : retrievers) {
-            List<SearchResult> list = r.retrieve(reader, fetchReq, trace);
+            List<SearchResult> list;
+            if (runner == null) {
+                list = r.retrieve(reader, fetchReq, trace);
+            } else if (r instanceof RouterDispatcher d) {
+                list = d.select(fetchReq).execute(reader, fetchReq, trace, runner);
+            } else {
+                list = runner.retrieve(r, fetchReq, trace);
+            }
             for (RerankStage pre : premergeFilters) {
                 list = pre.rerank(list, fetchReq, reader, list.size(), trace);
             }

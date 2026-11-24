@@ -180,4 +180,51 @@ class LazyGenerationsTest {
             assertThat(again.blocks()).isZero();
         }
     }
+
+    // ---------------------------------------------------------------- sweep keeps this process's own locks
+
+    /** Inodes of the POSIX locks /proc/locks lists for this process. */
+    private static Set<Long> lockedInodes() throws Exception {
+        long pid = ProcessHandle.current().pid();
+        Set<Long> out = new TreeSet<>();
+        for (String line : Files.readAllLines(Path.of("/proc/locks"))) {
+            String[] f = line.trim().split("\\s+");
+            // "1: POSIX  ADVISORY  WRITE 12345 08:02:1234567 0 EOF"
+            for (int i = 0; i + 1 < f.length; i++) {
+                if (f[i].equals(Long.toString(pid)) && f[i + 1].contains(":")) {
+                    String[] dev = f[i + 1].split(":");
+                    out.add(Long.parseLong(dev[dev.length - 1]));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Phase 2 follow-up M6: the sweep skips this process's own private dirs before trying their
+     * owner lock. Trying it opens a second channel on a file this JVM already locks, and closing that
+     * channel releases the JVM's OS lock on the file (POSIX: any close drops the process's locks), so
+     * another process's sweep would delete a private cache still read through retired readers.
+     */
+    @Test
+    void sweepKeepsTheOsLockOfItsOwnRetiredPrivateCache() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(Files.isReadable(Path.of("/proc/locks")), "Linux /proc/locks");
+        ClusterConfig.ReaderConfig cfg = new ClusterConfig.ReaderConfig();
+        LazyGenerations holder = new LazyGenerations(tmp, cfg, unusedSource());
+        holder.blockCache(); // the shared cache
+        try (LazyGenerations self = new LazyGenerations(tmp, cfg, unusedSource())) {
+            Path privateDir = self.blockCache().dir();
+            assertThat(privateDir.getParent().getFileName().toString()).isEqualTo(LazyGenerations.PRIVATE_BLOCKS_DIR);
+            long inode = (Long) Files.getAttribute(privateDir.resolve(LazyGenerations.PRIVATE_OWNER_LOCK), "unix:ino");
+            assertThat(lockedInodes()).as("the owner lock is held").contains(inode);
+
+            holder.close(); // the shared cache is free: the next sweep adopts it and retires the private one
+            self.sweep();
+            assertThat(self.blockCacheDir()).isEqualTo(tmp.toAbsolutePath().resolve(LazyGenerations.BLOCKS_DIR));
+            assertThat(privateDir).as("retired, still read by earlier readers").isDirectory();
+            assertThat(lockedInodes()).as("the OS lock of the retired private dir survives the sweep").contains(inode);
+            self.sweep();
+            assertThat(lockedInodes()).contains(inode);
+        }
+    }
 }

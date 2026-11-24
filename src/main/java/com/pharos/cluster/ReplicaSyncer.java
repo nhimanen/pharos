@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -125,6 +126,13 @@ public class ReplicaSyncer implements Closeable {
     private final Map<ShardId, Generation> registered = new HashMap<>();
     /** Generation last refused per shard by the format gate; its WARN is not repeated every poll. */
     private final Map<ShardId, Generation> refused = new HashMap<>();
+    /** Shards this reader is pinned to; empty serves every catalog shard. */
+    private volatile Set<ShardId> pinned = Set.of();
+    /** Shards dropped by pinning: unregistered, directories removed one pass later (in-flight queries). */
+    private final Map<ShardId, Long> retired = new HashMap<>();
+    private java.util.function.LongSupplier clock = System::currentTimeMillis;
+    private Duration retireGrace = Duration.ofSeconds(120);
+    private boolean swept;
     private final Object syncLock = new Object();
     private final Object lifecycleLock = new Object();
     private ScheduledExecutorService scheduler;
@@ -158,6 +166,24 @@ public class ReplicaSyncer implements Closeable {
         }
     }
 
+    /** Test hook: the wall clock (millis) retirement is timed with. */
+    void setClock(java.util.function.LongSupplier clock) {
+        this.clock = clock;
+    }
+
+    /**
+     * How long a retired shard's directory outlives its unregistration (at least the poll interval),
+     * so queries already reading it finish. Set to {@code cluster.retireGraceSeconds}.
+     */
+    public void setRetireGrace(Duration grace) {
+        this.retireGrace = Objects.requireNonNull(grace, "grace");
+    }
+
+    /** Pins this reader to {@code shards}; empty serves all. Takes effect on the next pass. */
+    public void pin(Collection<ShardId> shards) {
+        this.pinned = Set.copyOf(shards);
+    }
+
     /** Generation currently served per shard. */
     public Map<ShardId, Generation> served() {
         return Map.copyOf(served);
@@ -176,8 +202,19 @@ public class ReplicaSyncer implements Closeable {
             } catch (RuntimeException e) {
                 throw new IOException("unreadable shard catalog: " + e.getMessage(), e);
             }
+            boolean catalogEmpty = shards.isEmpty();
+            Set<ShardId> pin = pinned;
+            if (!pin.isEmpty()) shards = shards.stream().filter(pin::contains).toList();
+            if (catalogEmpty && !served.isEmpty()) {
+                // an empty read may be transient (a catalog object being rewritten): drop nothing
+                log.warn("The shard catalog lists no shard; keeping the {} served shard(s)",
+                        served.size());
+            } else {
+                dropUnwanted(shards);
+            }
             for (ShardId shard : shards) {
                 if (closed) return;
+                retired.remove(shard);
                 try {
                     syncShard(shard);
                 } catch (IOException | RuntimeException e) {
@@ -212,6 +249,70 @@ public class ReplicaSyncer implements Closeable {
             });
             scheduler.scheduleWithFixedDelay(this::syncQuietly, initialDelay.toMillis(), pollInterval.toMillis(),
                     TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Stops serving shards no longer wanted (pinned away, or gone from the catalog): unregisters and
+     * deactivates them at once, and deletes their directories on the next pass so queries already
+     * reading them finish.
+     */
+    private void dropUnwanted(List<ShardId> wanted) {
+        Set<ShardId> keep = new HashSet<>(wanted);
+        long now = clock.getAsLong();
+        if (!swept) {
+            swept = true;
+            sweepStrays(keep, now);
+        }
+        long graceMillis = Math.max(retireGrace.toMillis(), pollInterval.toMillis());
+        for (Map.Entry<ShardId, Long> e : List.copyOf(retired.entrySet())) {
+            ShardId shard = e.getKey();
+            if (keep.contains(shard)) continue;
+            if (now - e.getValue() < graceMillis) continue;
+            try {
+                deleteRecursively(cacheDir.resolve(shard.value()));
+                retired.remove(shard);
+            } catch (IOException | RuntimeException ex) {
+                log.warn("Shard {}: removing its cache dir failed (retried next pass): {}", shard, ex.toString());
+            }
+        }
+        for (ShardId shard : served.keySet()) {
+            if (keep.contains(shard)) continue;
+            Path active = cache.active(shard.value()).orElse(null);
+            try {
+                registry.unregister(shard.value());
+            } catch (RuntimeException ex) {
+                log.warn("Shard {}: unregistering failed (retried next pass): {}", shard, ex.toString());
+                continue;
+            }
+            cache.deactivate(shard.value());
+            if (active != null) GraphViews.evict(active);
+            if (lazy != null) lazy.cancelShard(shard.value());
+            served.remove(shard);
+            registered.remove(shard);
+            refused.remove(shard);
+            retired.put(shard, now);
+            log.info("Shard {} is no longer served by this reader", shard);
+        }
+    }
+
+    /** Once per process: shard dirs left by an earlier run that are neither wanted nor registered retire too. */
+    private void sweepStrays(Set<ShardId> keep, long now) {
+        try (Stream<Path> s = Files.list(cacheDir)) {
+            for (Path p : s.toList()) {
+                if (!Files.isDirectory(p)) continue;
+                ShardId id;
+                try {
+                    id = new ShardId(p.getFileName().toString());
+                } catch (IllegalArgumentException notAShard) {
+                    continue; // .blocks, .blocks-private, ...
+                }
+                if (keep.contains(id) || served.containsKey(id) || retired.containsKey(id)
+                        || registry.find(id.value()).isPresent()) continue;
+                retired.put(id, now);
+            }
+        } catch (IOException | RuntimeException e) {
+            log.warn("Sweeping {} for stray shard dirs failed: {}", cacheDir, e.toString());
         }
     }
 
