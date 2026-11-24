@@ -1,9 +1,24 @@
 # Upgrading
 
-## Work-queue writers (multi-node)
+## Upgrading to 1.9.0
 
-`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`). On such a
-writer:
+Index format: 1 (unchanged); no re-index. Single-node installs (`role: all`) and readers need nothing.
+**Cluster writers change behaviour** — read this before restarting them.
+
+### Work-queue writers are the default
+
+`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`): `pharos web`
+on the writer takes shards from the catalog under leases, polls their sources and indexes and publishes
+changes by itself. Hand-run `pharos index` / `pharos publish` are refused there (exit 2).
+
+- **To keep your current hand-run writer**, add `"writer": {"workQueue": false}` to its `cluster`
+  section before restarting it on 1.9.0. Nothing else changes for it.
+- **To adopt the work queue**, every shard needs a source in the catalog, or it stays pinned to the writer
+  that has its path: index it once on a hand-run writer with `--source-git <url> --ref <branch>` (or
+  `--source-path <dir>` readable by every writer), see README "Work-queue writers". Give every writer the
+  same `workDir` path, or each takeover re-parses the shard in full.
+
+On a work-queue writer:
 
 - **Upgrading is restarting it on the new release.** Its work loop gives every shard it holds a full
   run when this release needs one (an older local or published index format, a broken graph pointer,

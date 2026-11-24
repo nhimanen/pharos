@@ -3,11 +3,26 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.9.0] - 2026-11-24
 
 **Index format:** 1 (unchanged)
 
-### Added
+Multi-node Phase 4: work-queue writers. Writers take shards from the catalog under leases, poll each
+shard's source (a git remote or a shared directory), index and publish its changes on their own, share the
+shards among however many writers run, and take over a dead writer's shards with its writer state restored
+from the bucket (Phase 4 gate: a writer killed mid-commit or mid-embed was replaced within 25–31 s, the resume
+re-embedded only the changed files, 51 changes over scaling 1→4→1 writers were each published exactly once,
+0 of 23 881 queries failed). New: a writer disk guard, `/cluster/status` with an SSE stream and a webhook for
+scaling proposals, and a **Cluster** page in the web UI. **Single-node installs are unaffected** (they gain the
+Cluster page, showing one node). No re-index.
+
+**Behaviour change for cluster writers: `role: writer` now defaults to the work queue**
+(`cluster.writer.workQueue: true`). A writer config without the key no longer accepts hand-run
+`pharos index` / `pharos publish`; add `"writer": {"workQueue": false}` to keep indexing by hand. Its
+`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds` (30), or it does not start. Read
+UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
+
+### Added (multi-node Phase 4: work-queue writers)
 - Work-queue writers (README "Work-queue writers"): `role: writer` nodes take shards from the
   catalog under leases (`cluster.writer.leaseTtlSeconds`, 30), detect source changes every
   `pollSeconds` at a fixed rate, also during runs (`pharos index|publish --source-git <url> --ref
