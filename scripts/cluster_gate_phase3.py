@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phase 3 gate driver (standard library only). Driven by scripts/cluster-gate-phase3.sh, which has
-already started MinIO on 127.0.0.1:9000, published lucene (--no-embed), pharos and mypal (both
+already started MinIO on 127.0.0.1:$GATE_MINIO_PORT (default 9000), published lucene (--no-embed), pharos and mypal (both
 embedded; GATE_PROJECTS lists them), and built the single-node reference home ($GATE/reference) from
 a copy of the writer's local indexes.
 
@@ -57,10 +57,19 @@ PIPELINES = ("keyword", "hybrid", "hybrid-reranked", "vector")
 KEYWORD_IDENTICAL_MIN = 0.98
 TAU_MIN = 0.95
 TOP1_MIN = 0.95
-PORTS = {"reference": 7305, "r1": 7301, "r2": 7302, "r3": 7303, "r4": 7304, "router": 7080}
+MINIO_PORT = int(os.environ.get("GATE_MINIO_PORT", "9000"))
+PORTS = {name: int(os.environ.get(f"GATE_{name.upper()}_PORT", str(default)))
+         for name, default in (("ref", 7305), ("r1", 7301), ("r2", 7302), ("r3", 7303), ("r4", 7304),
+                               ("router", 7080))}
+PORTS["reference"] = PORTS.pop("ref")
 # GATE_PROJECTS: the published projects (the shell script's list). With mypal (embedded, decision of
 # 2026-11-19) the vector family merges two embedded shards: R1 {pharos}, R2 {lucene, mypal}, R3 all.
 PROJECTS = os.environ.get("GATE_PROJECTS", "lucene,pharos,mypal").split(",")
+# GATE_ELASTICITY_KEYWORD_ONLY=1 (elasticity-only runs on a tight memory cap): readers and the router
+# load no embedding model and no cross-encoder (about 2 GB of a reader's RSS under hybrid load is the
+# query-embedding model), and the elasticity load is keyword only: half unscoped, half scoped to the
+# query's own project. Router failover, joining and draining do not depend on vectors. Default 0.
+KEYWORD_ONLY = os.environ.get("GATE_ELASTICITY_KEYWORD_ONLY", "0") == "1"
 SHARDS = {"r1": ["pharos"], "r2": [p for p in PROJECTS if p != "pharos"], "r3": [], "r4": []}
 
 # --------------------------------------------------------------------------- statistics
@@ -260,11 +269,18 @@ class Node(p2.Reader):
         link = self.home / ".djl.ai"
         if not link.is_symlink():
             link.symlink_to(os.environ["GATE_MODELS"])
-        cfg = {
+        no_models = self.kind != "reference" and KEYWORD_ONLY
+        cfg = {} if no_models else {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
-            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": True,
+            "searchEmbeddingModel": os.environ["GATE_MODEL_ID"],
+            # GATE_READER_CROSS_ENCODER=0: readers and the router skip the cross-encoder (it loads at
+            # warm-up), for an elasticity-only run on a tight memory cap; the reference always has it.
+            "crossEncoderEnabled": self.kind == "reference"
+                                   or os.environ.get("GATE_READER_CROSS_ENCODER", "1") != "0",
         }
+        if no_models:  # GATE_ELASTICITY_KEYWORD_ONLY: no embedding model, no cross-encoder
+            cfg["crossEncoderEnabled"] = False
         if self.kind != "reference":
             cfg["cluster"] = {
                 "role": "reader", "backend": "object-store", "nodeId": "gate-" + self.name,
@@ -272,7 +288,7 @@ class Node(p2.Reader):
                 "advertiseUrl": f"http://127.0.0.1:{self.port}", "token": os.environ["GATE_TOKEN"],
                 "reader": {"mode": "lazy", "shards": self.shards},
                 "objectStore": {
-                    "endpoint": "http://127.0.0.1:9000", "region": "us-east-1", "bucket": "pharos-gate",
+                    "endpoint": f"http://127.0.0.1:{MINIO_PORT}", "region": "us-east-1", "bucket": "pharos-gate",
                     "prefix": "pharos", "pathStyle": True,
                     "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"},
             }
@@ -539,6 +555,8 @@ def phase_elasticity(load_s, qps, join_at, drain_at):
             plan.append((i / qps, q, None, "keyword"))
         elif kind == 1:
             plan.append((i / qps, q, proj, "keyword"))
+        elif KEYWORD_ONLY:  # GATE_ELASTICITY_KEYWORD_ONLY: the same split, keyword only
+            plan.append((i / qps, q, None if kind == 2 else proj, "keyword"))
         elif kind == 2:
             plan.append((i / qps, q, None, "hybrid"))
         else:

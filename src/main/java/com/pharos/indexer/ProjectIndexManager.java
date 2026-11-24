@@ -610,6 +610,22 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
+        // 1.4.0-1.4.1 stored the legacy model's vectors under vec.legacy, which search never reads.
+        // Only a full index embeds exactly like a fresh one (chunked text, chunk vectors), so it also
+        // reuses the existing embedding cache; an incremental run would miss it and downgrade chunks.
+        if (incremental && !force && generateEmbeddings && !embedders.isEmpty()
+                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
+            if (availableEmbedders().isEmpty()) {
+                // A full run without a usable model writes no vectors and the project would stay flagged.
+                log.warn("project {}: vectors need re-embedding but no embedding model is available", projectName);
+            } else {
+                String msg = "vectors stored under vec.legacy by pharos 1.4.0-1.4.1; "
+                        + "running a full re-index to re-embed (cached vectors are reused)";
+                log.warn("project {}: {}", projectName, msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -1118,6 +1134,11 @@ public class ProjectIndexManager {
 
         Map<String, List<ParsedMethod>> methodsByClass = project.allMethods().stream()
                 .collect(Collectors.groupingBy(ParsedMethod::qualifiedClassName));
+        // The synthesized bodies are cached by file and class: two files can yield the same qualified name (a
+        // Python module and a non-code file of the same path stem, e.g. releaseWizard.py and releaseWizard.yaml),
+        // and each document must get its own body, never the other file's (found by the Phase 6 gate: which body
+        // both got depended on file order, so a resharded project's statistics differed from the unsplit one's).
+        // Methods stay grouped by name: a type's methods may be declared in several files (Go).
         ConcurrentHashMap<String, String> synthesizedBodyCache = new ConcurrentHashMap<>();
 
         boolean doEmbed = generateEmbeddings && !runtimes.isEmpty();
@@ -1146,8 +1167,9 @@ public class ProjectIndexManager {
                         ParsedFile file = files.get(fi);
                         List<String> synthBodies = file.classes().stream()
                                 .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                                        cls.qualifiedClassName(),
-                                        k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
+                                        classKey(cls.filePath(), cls.qualifiedClassName()),
+                                        k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(
+                                                cls.qualifiedClassName(), List.of()))))
                                 .collect(Collectors.toList());
                         fileSynthBodies.add(synthBodies);
                         fileOffsets[fi] = totalSlots;
@@ -1197,8 +1219,9 @@ public class ProjectIndexManager {
                     ParsedFile file = files.get(fi);
                     List<String> synthBodies = file.classes().stream()
                             .map(cls -> synthesizedBodyCache.computeIfAbsent(
-                                    cls.qualifiedClassName(),
-                                    k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(k, List.of()))))
+                                    classKey(cls.filePath(), cls.qualifiedClassName()),
+                                    k -> buildSynthesizedBody(cls, methodsByClass.getOrDefault(
+                                            cls.qualifiedClassName(), List.of()))))
                             .collect(Collectors.toList());
                     fileSynthBodies.add(synthBodies);
                     fileMethodChunks.add(List.of()); // empty = no-embed fallback
@@ -1433,9 +1456,14 @@ public class ProjectIndexManager {
      * <p>Threads count is from {@code rt.threads}; 1 collapses to a single
      * worker, equivalent to the previous serial pass.
      */
-    private void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
-                               ProgressListener progress, String projectName,
-                               IndexAbort abort) throws IOException {
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                      ProgressListener progress, String projectName) throws IOException {
+        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName, IndexAbort.none());
+    }
+
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                      ProgressListener progress, String projectName,
+                      IndexAbort abort) throws IOException {
         if (totalSlots == 0) return;
         int chunkSize = rt.chunkSize;
         int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
@@ -1523,6 +1551,17 @@ public class ProjectIndexManager {
                     throw new IOException("Embed task failed: " + cause.getMessage(), cause);
                 }
             }
+        } catch (IOException | RuntimeException failure) {
+            // Keep what was already embedded so the next run does not redo it.
+            pool.shutdownNow();
+            try {
+                pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (rt.cache != null) rt.cache.save();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                failure.addSuppressed(interrupted);
+            }
+            throw failure;
         } finally {
             pool.shutdown();
         }
@@ -1685,6 +1724,11 @@ public class ProjectIndexManager {
      * the raw file content so chunkers and BM25 see the actual text.
      * For code classes it is the concatenation of method signatures and javadocs.
      */
+    /** A class's key within one file (two files may declare the same qualified name). */
+    private static String classKey(String filePath, String qualifiedClassName) {
+        return filePath + "\u0000" + qualifiedClassName;
+    }
+
     private static String buildSynthesizedBody(ParsedClass cls, List<ParsedMethod> methods) {
         if ("document".equals(cls.kind())) {
             return DocumentMapper.readBodyFromFile(cls.filePath(), cls.startLine(), cls.endLine());

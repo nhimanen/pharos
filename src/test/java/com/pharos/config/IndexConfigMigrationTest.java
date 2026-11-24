@@ -120,8 +120,8 @@ class IndexConfigMigrationTest {
         Path configFile = tempDir.resolve("config.json");
         json.writeValue(configFile.toFile(), Map.of(
                 "embeddingProviders", List.of(
-                        Map.of("type", "djl", "modelId", "first",  "url", "hf://x", "dimensions", 128),
-                        Map.of("type", "djl", "modelId", "second", "url", "hf://y", "dimensions", 256)
+                        Map.of("type", "djl", "modelId", "first",  "url", "hf://o/x", "dimensions", 128),
+                        Map.of("type", "djl", "modelId", "second", "url", "hf://o/y", "dimensions", 256)
                 )
         ));
         IndexConfig config = loadFrom(configFile);
@@ -194,8 +194,8 @@ class IndexConfigMigrationTest {
         Path configFile = tempDir.resolve("config.json");
         json.writeValue(configFile.toFile(), Map.of(
                 "embeddingProviders", List.of(
-                        Map.of("type", "djl", "modelId", "alpha", "url", "hf://a", "dimensions", 64),
-                        Map.of("type", "djl", "modelId", "beta",  "url", "hf://b", "dimensions", 128)
+                        Map.of("type", "djl", "modelId", "alpha", "url", "hf://o/a", "dimensions", 64),
+                        Map.of("type", "djl", "modelId", "beta",  "url", "hf://o/b", "dimensions", 128)
                 ),
                 "searchEmbeddingModel", "beta"
         ));
@@ -211,8 +211,8 @@ class IndexConfigMigrationTest {
         Path configFile = tempDir.resolve("config.json");
         json.writeValue(configFile.toFile(), Map.of(
                 "embeddingProviders", List.of(
-                        Map.of("type", "djl", "modelId", "alpha", "url", "hf://a", "dimensions", 64),
-                        Map.of("type", "djl", "modelId", "beta",  "url", "hf://b", "dimensions", 128)
+                        Map.of("type", "djl", "modelId", "alpha", "url", "hf://o/a", "dimensions", 64),
+                        Map.of("type", "djl", "modelId", "beta",  "url", "hf://o/b", "dimensions", 128)
                 )
         ));
         IndexConfig config = loadFrom(configFile);

@@ -779,13 +779,21 @@ class RemoteDirectoryTest {
     private record Flat(Path files, ShardManifest manifest) {}
 
     private Flat flatFixture() throws IOException {
+        Path src = tmp.resolve("flat-src");
         Path dir = tmp.resolve("flat");
+        Files.createDirectories(src);
         Files.createDirectories(dir);
-        for (ManifestFile f : luceneFiles(manifest)) Files.copy(fullCopy.resolve(f.name()), dir.resolve(f.name()));
+        for (ManifestFile f : luceneFiles(manifest)) Files.copy(fullCopy.resolve(f.name()), src.resolve(f.name()));
         org.apache.lucene.index.TieredMergePolicy mp = new org.apache.lucene.index.TieredMergePolicy();
         mp.setNoCFSRatio(0.0);
-        try (FSDirectory fs = FSDirectory.open(dir); IndexWriter w = new IndexWriter(fs,
+        // rewritten into a fresh dir, so the result is never the source's (possibly compound) single segment
+        try (FSDirectory from = FSDirectory.open(src);
+             org.apache.lucene.index.DirectoryReader r = org.apache.lucene.index.DirectoryReader.open(from);
+             FSDirectory fs = FSDirectory.open(dir); IndexWriter w = new IndexWriter(fs,
                 new IndexWriterConfig(new StandardAnalyzer()).setUseCompoundFile(false).setMergePolicy(mp))) {
+            List<org.apache.lucene.index.CodecReader> leaves = new ArrayList<>();
+            for (var leaf : r.leaves()) leaves.add(org.apache.lucene.index.SlowCodecReaderWrapper.wrap(leaf.reader()));
+            w.addIndexes(leaves.toArray(new org.apache.lucene.index.CodecReader[0]));
             w.forceMerge(1);
             w.commit();
         }
@@ -885,6 +893,54 @@ class RemoteDirectoryTest {
         }
         long last = (victim.length() - 1) / KIB;
         assertThat(cache.isCached(new BlockKey(victim.key(), last))).as("dropped from the cache").isFalse();
+    }
+
+    /**
+     * The check must not depend on where the footer falls in the blocks: the fixture's file lengths
+     * vary run to run, and a footer straddling two blocks (or filling the last block alone) went
+     * unchecked. Each tail length {@code r} is forced with a block size that leaves {@code r} bytes in
+     * the last block; a correct manifest must still read cleanly.
+     */
+    @Test
+    void footerCheckHoldsWhereverTheFooterFallsInTheBlocks() throws Exception {
+        ManifestFile victim = luceneFiles(manifest).stream()
+                .filter(f -> !Files.exists(eagerCopy.resolve(f.name())))
+                .max(java.util.Comparator.comparingLong(ManifestFile::length)).orElseThrow();
+        byte[] real = Files.readAllBytes(fullCopy.resolve(victim.name()));
+        long wrong = Long.parseUnsignedLong(victim.checksum(), 16) ^ 0x5a5aL;
+        for (int r : new int[]{0, 1, 2, 4, 8, 12, 14, 15, 16, 17, 100}) {
+            int blockSize = (int) victim.length() - r; // r > 0: two blocks, the last one r bytes long
+            for (boolean corrupt : new boolean[]{false, true}) {
+                List<ManifestFile> files = new ArrayList<>(luceneFiles(manifest));
+                if (corrupt) {
+                    files.replaceAll(f -> f == victim ? new ManifestFile(f.role(), f.name(), f.key(), f.length(),
+                            Long.toHexString(wrong)) : f);
+                }
+                BlockCache cache = track(new BlockCache(tmp.resolve("blocks-tail-" + r + "-" + corrupt), 1L << 30,
+                        blockSize, 4));
+                RemoteDirectory dir = track(new RemoteDirectory(SHARD, manifestOf(9, files), null, cache, source,
+                        true));
+                byte[] all = new byte[(int) victim.length()];
+                try (IndexInput in = dir.openInput(victim.name(), IOContext.DEFAULT)) {
+                    if (corrupt) {
+                        assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> in.readBytes(all, 0, all.length)))
+                                .as("tail of %d B", r)
+                                .isInstanceOf(IOException.class)
+                                .hasMessageContaining("footer")
+                                .hasMessageContaining(victim.key());
+                    } else {
+                        in.readBytes(all, 0, all.length);
+                        assertThat(all).as("tail of %d B", r).isEqualTo(real);
+                    }
+                }
+                if (corrupt) { // every block holding footer bytes is dropped
+                    for (long b = (victim.length() - 16) / blockSize; b <= (victim.length() - 1) / blockSize; b++) {
+                        assertThat(cache.isCached(new BlockKey(victim.key(), b)))
+                                .as("tail of %d B: block %d dropped", r, b).isFalse();
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- read-only
