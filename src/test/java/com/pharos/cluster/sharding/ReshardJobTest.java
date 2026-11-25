@@ -1005,6 +1005,46 @@ public class ReshardJobTest {
     }
 
     /**
+     * 1.11.0 merge (1.10.0's damaged-graph detection × resharding): a reshard reads the writer's local call
+     * graph (in-degrees and callers of the moved documents) and, from {@code [project]}, exports it as the
+     * project graph of the new version. A graph whose property dictionary is damaged decodes wrongly and
+     * must not be split or exported: the writer's damage check turns the pending work into a full run,
+     * which builds a new graph generation, before the reshard step; then the reshard flips.
+     */
+    @Test
+    void aReshardOverADamagedLocalGraphRebuildsTheGraphFirst() throws IOException {
+        List<String> files = filesFor(RING2, RING3, 2);
+        writeFiles(files);
+        catalog.register(new ShardId(P), Optional.of(ShardSource.path(src.toString())));
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        assertThat(replicas.latest(new ShardId(P))).contains(Generation.FIRST);
+        Path dir = a.lucene.getProjectIndexDir(P);
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(dir);
+        try (java.util.stream.Stream<Path> w = Files.walk(live)) {
+            for (Path p : w.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(p);
+        }
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(live);
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(live)).as("damaged").isNotNull();
+
+        Reader r = new Reader("r1");
+        catalog.requestReshard(P, RING2, clock.instant());
+        for (int i = 0; i < 6 && !catalog.projectShards().shardsOf(P).equals(ring(2)); i++) {
+            clock.advance(10);
+            a.loop.tick();
+            r.sync();
+        }
+        assertThat(catalog.projectShards().shardsOf(P)).as("flipped").isEqualTo(ring(2));
+        assertThat(replicas.latest(new ShardId(P)).orElseThrow().value()).as("a full run published first")
+                .isEqualTo(2);
+        Path rebuilt = com.pharos.graph.CallGraph.projectGraphDir(dir);
+        assertThat(rebuilt).isNotEqualTo(live);
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(rebuilt)).isNull();
+        r.sync();
+        assertEveryFileOnce(r, files, "after resharding a project whose graph was damaged");
+    }
+
+    /**
      * Integration carry I5: after a reshard every shard carries a copy of the source; registering a new
      * source (pharos index without a path, the operator's Job when the CR's url or ref changes) must reach
      * the writer, not be shadowed by those copies.
