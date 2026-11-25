@@ -42,6 +42,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -257,6 +258,8 @@ public final class DistributedSearch implements Closeable {
         private final long deadlineNanos;
         private final List<String> warnings = new ArrayList<>();
         private final Map<String, float[]> vectors = new HashMap<>();
+        /** Queries whose embedding threw (the provider logged it); their vector is null. */
+        private final Set<String> embedFailed = new HashSet<>();
         private final Set<Future<?>> outstanding = java.util.concurrent.ConcurrentHashMap.newKeySet();
         private final Set<String> vectorless = new LinkedHashSet<>();
         /**
@@ -532,8 +535,29 @@ public final class DistributedSearch implements Closeable {
 
         private synchronized float[] queryVector(String query) {
             if (vectors.containsKey(query)) return vectors.get(query);
-            float[] v = embedder.isAvailable() ? embedder.embed(query) : null; // embedded once, here
+            float[] v = null;
+            if (embedder.isAvailable()) {
+                try {
+                    v = embedder.embedQuery(query); // embedded once, here; the provider applies its query prefix
+                } catch (com.pharos.embedding.EmbeddingException e) {
+                    embedFailed.add(query);         // already logged at WARN by the provider
+                }
+            }
             vectors.put(query, v);
+            return v;
+        }
+
+        /** The query vector for a retrieval stage; a failed embedding warns as the local stages do. */
+        private float[] queryVector(SearchRequest req) {
+            float[] v = queryVector(req.query());
+            boolean failed;
+            synchronized (this) {
+                failed = v == null && embedFailed.contains(req.query());
+            }
+            if (failed) {
+                warn("vector embedding failed for model " + embedder.modelId() + "; "
+                        + (req.type() == SearchRequest.SearchType.VECTOR ? "no vector results" : "results are keyword-only"));
+            }
             return v;
         }
 
@@ -599,7 +623,7 @@ public final class DistributedSearch implements Closeable {
             } else {
                 throw new UnsupportedOperationException(stage.getClass().getSimpleName() + " cannot fan out");
             }
-            float[] vec = "keyword".equals(retriever) ? null : queryVector(req.query());
+            float[] vec = "keyword".equals(retriever) ? null : queryVector(req);
             if ("vector".equals(retriever) && vec == null) return List.of(); // as the local stage: no vectors
             GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             List<ShardState> targets = new ArrayList<>();

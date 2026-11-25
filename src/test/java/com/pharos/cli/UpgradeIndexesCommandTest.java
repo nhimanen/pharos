@@ -125,7 +125,7 @@ class UpgradeIndexesCommandTest {
         deleteRecursively(rootB);
         int rc = run(cmd(), "--yes");
         assertThat(rc).isEqualTo(1);
-        assertThat(out.toString()).contains("re-index manually: pharos index --full b");
+        assertThat(out.toString()).contains("re-index manually: pharos index --full --single --project b <root path>");
         assertThat(IndexFormat.status(dir("c"))).isEqualTo(IndexFormat.Status.OK);
         assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
     }
@@ -292,5 +292,25 @@ class UpgradeIndexesCommandTest {
         String usage = new CommandLine(cmd()).getUsageMessage();
         assertThat(usage).contains("Exit codes:").contains("0").contains("1").contains("2")
                 .contains("5").contains("reader node");
+    }
+
+    @Test
+    void listsLegacyVectorProjectsWithTheirIndexCommandButDoesNotRunThem() throws Exception {
+        config.setEmbeddingProviders(List.of(IndexConfig.presetProvider("jina-v2-code")));
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).as("exit codes unchanged: nothing to upgrade").isZero();
+        assertThat(out.toString())
+                .contains("pharos index --full --single --project mis " + tmp.resolve("src-mis"))
+                .contains("does not migrate");
+        assertThat(com.pharos.indexer.LegacyVectorFields.hasLiveMisnamedVectors(
+                tmp.resolve("indexes").resolve("mis").resolve("lucene"))).as("not run").isTrue();
+    }
+
+    @Test
+    void legacyVectorProjectsNotListedWithoutEmbeddings() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(run(cmd(), "--yes")).isZero();
+        assertThat(out.toString()).doesNotContain("--project mis");
     }
 }

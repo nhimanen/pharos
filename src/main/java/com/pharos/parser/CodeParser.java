@@ -66,6 +66,22 @@ public interface CodeParser {
     }
 
     /**
+     * {@link #parseFiles(List, Path, String)} with the run's cooperative abort: an implementation
+     * that parses many files checks {@code abort} between files, so a requested abort (the writer's
+     * graceful stop, a lost lease, low disk) lands inside the parse instead of after its last file.
+     * The default checks it before and after the whole batch only.
+     *
+     * @throws com.pharos.indexer.IndexAbortedException when an abort was requested
+     */
+    default ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
+                                     com.pharos.indexer.IndexAbort abort) throws IOException {
+        abort.checkpoint();
+        ParsedProject p = parseFiles(files, projectRoot, projectName);
+        abort.checkpoint();
+        return p;
+    }
+
+    /**
      * Extracts structural relationships (inheritance, field access, annotations, type refs)
      * from an already-parsed project.  Called immediately after {@link #parseFiles} in the
      * indexing pipeline; implementations may reuse internal solver state from the prior call.

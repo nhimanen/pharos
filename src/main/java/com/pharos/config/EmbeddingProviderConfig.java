@@ -1,6 +1,7 @@
 package com.pharos.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -17,7 +18,7 @@ import java.util.List;
  *     "embeddingProviders": [
  *       {
  *         "type": "djl",
- *         "modelId": "jina-code-v2",
+ *         "modelId": "jina-v2-code",
  *         "url": "hf://jinaai/jina-embeddings-v2-base-code",
  *         "dimensions": 768,
  *         "maxTokens": 512
@@ -53,7 +54,7 @@ public class EmbeddingProviderConfig {
 
     /**
      * Stable identifier used to derive Lucene field names and persist per-project
-     * embedding metadata. Choose a short, human-readable alias (e.g. {@code "jina-code-v2"},
+     * embedding metadata. Choose a short, human-readable alias (e.g. {@code "jina-v2-code"},
      * {@code "qwen3-emb-1024"}). Must be unique within a config.
      */
     private String modelId;
@@ -139,7 +140,60 @@ public class EmbeddingProviderConfig {
      */
     private List<EmbeddingProviderConfig> fallbacks = new ArrayList<>();
 
+    /**
+     * DJL-only: how token hidden states are pooled into one vector. {@code mean} (default,
+     * historic behaviour) or {@code cls}. Setting anything but {@code mean} on an
+     * {@code openai} provider is a validation error: the remote server pools.
+     */
+    private Pooling pooling = Pooling.MEAN;
+
+    /** Text prepended to every query before embedding (e.g. {@code "query: "}). Default empty. */
+    private String queryPrefix = "";
+
+    /** Text prepended to every document/chunk before embedding. Default empty. */
+    private String documentPrefix = "";
+
     public EmbeddingProviderConfig() {}
+
+    /** Jackson value filter: omit {@code pooling} from saved JSON when it is the default. */
+    static final class MeanPoolingFilter {
+        @Override public boolean equals(Object o) { return o == null || o == Pooling.MEAN; }
+        @Override public int hashCode() { return 0; }
+    }
+
+    private static final java.util.regex.Pattern HF_REPO_ID =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9][\\w.-]*/[\\w.-]+$");
+
+    private static final java.util.regex.Pattern HF_REVISION =
+            java.util.regex.Pattern.compile("^[0-9a-fA-F]{7,40}$");
+
+    /**
+     * True for {@code owner/name} or {@code owner/name@<sha>} repo ids that cannot traverse
+     * directories. The optional revision pins the download to a commit (7-40 hex chars).
+     */
+    public static boolean isValidHfRepoId(String id) {
+        if (id == null) return false;
+        int at = id.indexOf('@');
+        String repo = at < 0 ? id : id.substring(0, at);
+        if (at >= 0 && !HF_REVISION.matcher(id.substring(at + 1)).matches()) return false;
+        if (!HF_REPO_ID.matcher(repo).matches()) return false;
+        for (String seg : repo.split("/")) {
+            if (seg.equals(".") || seg.equals("..")) return false;
+        }
+        return true;
+    }
+
+    /** The {@code owner/name} part of {@code owner/name[@sha]}. */
+    public static String hfRepo(String id) {
+        int at = id.indexOf('@');
+        return at < 0 ? id : id.substring(0, at);
+    }
+
+    /** The pinned revision of {@code owner/name@sha}, or {@code "main"} when unpinned. */
+    public static String hfRevision(String id) {
+        int at = id.indexOf('@');
+        return at < 0 ? "main" : id.substring(at + 1);
+    }
 
     /**
      * Validates the config. Called by {@link IndexConfig#load()} so misconfiguration
@@ -164,10 +218,26 @@ public class EmbeddingProviderConfig {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].url is required");
         }
+        if ("djl".equals(type) && url.startsWith("hf://")
+                && !isValidHfRepoId(url.substring("hf://".length()))) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].url='" + url
+                    + "' is not a valid HuggingFace repo id (expected hf://owner/name or hf://owner/name@<7-40 hex commit sha>)");
+        }
         if ("openai".equals(type) && (model == null || model.isBlank())) {
             throw new IllegalArgumentException(
                     "embeddingProvider['" + modelId + "'].model is required for type=openai " +
                     "(the model name passed in the request body)");
+        }
+        if ("openai".equals(type) && pooling != Pooling.MEAN) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].pooling='" + pooling.json() +
+                    "' is not supported for type=openai (the remote server pools); remove it");
+        }
+        if ("djl".equals(type) && pooling != Pooling.MEAN && !url.startsWith("hf://")) {
+            throw new IllegalArgumentException(
+                    "embeddingProvider['" + modelId + "'].pooling='" + pooling.json() +
+                    "' is only supported for hf:// models (this url uses the model zoo's own pooling); remove it");
         }
         if (dimensions <= 0) {
             throw new IllegalArgumentException(
@@ -231,6 +301,42 @@ public class EmbeddingProviderConfig {
     public int resolvedEmbeddingThreads() {
         if (embeddingThreads > 0) return embeddingThreads;
         return "openai".equals(type) ? 4 : 1;
+    }
+
+    @JsonInclude(value = JsonInclude.Include.CUSTOM, valueFilter = MeanPoolingFilter.class)
+    public Pooling getPooling() { return pooling; }
+    public void setPooling(Pooling pooling) { this.pooling = pooling == null ? Pooling.MEAN : pooling; }
+
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String getQueryPrefix() { return queryPrefix; }
+    public void setQueryPrefix(String queryPrefix) { this.queryPrefix = queryPrefix == null ? "" : queryPrefix; }
+
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String getDocumentPrefix() { return documentPrefix; }
+    public void setDocumentPrefix(String documentPrefix) { this.documentPrefix = documentPrefix == null ? "" : documentPrefix; }
+
+    /**
+     * Makes this fallback runtime agree with {@code parent} on everything that changes the
+     * vectors (pooling, prefixes): the fingerprint, cache key and {@code vec.<modelId>} field
+     * are the parent's, so a differently-embedding fallback would corrupt them. Unset (default)
+     * values are copied from the parent; an explicit conflicting value is an error.
+     */
+    public void inheritRuntimeSettings(EmbeddingProviderConfig parent) {
+        if (modelId == null || modelId.isBlank()) modelId = parent.modelId;
+        if (dimensions <= 0) dimensions = parent.dimensions;
+        if (pooling == Pooling.MEAN) pooling = parent.pooling;
+        else if (pooling != parent.pooling) throw conflict("pooling", pooling.json(), parent.pooling.json(), parent);
+        if (queryPrefix.isEmpty()) queryPrefix = parent.queryPrefix;
+        else if (!queryPrefix.equals(parent.queryPrefix)) throw conflict("queryPrefix", queryPrefix, parent.queryPrefix, parent);
+        if (documentPrefix.isEmpty()) documentPrefix = parent.documentPrefix;
+        else if (!documentPrefix.equals(parent.documentPrefix)) throw conflict("documentPrefix", documentPrefix, parent.documentPrefix, parent);
+    }
+
+    private static IllegalArgumentException conflict(String field, String mine, String theirs,
+                                                     EmbeddingProviderConfig parent) {
+        return new IllegalArgumentException("embeddingProvider['" + parent.modelId + "'].fallbacks: " + field
+                + "='" + mine + "' conflicts with the parent's '" + theirs + "'. A fallback must embed "
+                + "identically to its parent; omit it to inherit.");
     }
 
     public List<EmbeddingProviderConfig> getFallbacks() { return fallbacks; }

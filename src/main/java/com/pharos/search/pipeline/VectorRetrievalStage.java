@@ -23,7 +23,7 @@ public final class VectorRetrievalStage implements RetrievalStage {
     public List<SearchResult> retrieve(IndexReader reader, SearchRequest req,
                                        SearchTrace trace) throws IOException {
         long t = System.currentTimeMillis();
-        List<SearchResult> results = strategy.search(reader, req);
+        List<SearchResult> results = strategy.search(reader, req, trace);
         if (trace != null) trace.record("vector search (incl. embed)", t);
         return results;
     }
@@ -32,7 +32,7 @@ public final class VectorRetrievalStage implements RetrievalStage {
     public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req,
                                           SearchTrace trace) throws IOException {
         long t = System.currentTimeMillis();
-        List<RawCandidate> raw = strategy.retrieveRaw(searcher, req);
+        List<RawCandidate> raw = strategy.retrieveRaw(searcher, req, trace);
         if (trace != null) trace.record("vector search (incl. embed) (raw)", t);
         return raw;
     }

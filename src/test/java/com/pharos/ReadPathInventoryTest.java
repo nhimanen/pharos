@@ -72,7 +72,12 @@ class ReadPathInventoryTest {
 
     @Test
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
-        assertThat(files("DirectoryReader.open(")).containsExactly("indexer/LuceneIndexer.java");
+        assertThat(files("DirectoryReader.open(")).containsExactlyInAnyOrder(
+                "indexer/LuceneIndexer.java",
+                // 1.5.0: one-shot "does this dir hold live vectors" probe on a directory the caller
+                // resolved (index-status / embeddings status / upgrade-indexes hints, and the writer's
+                // legacy-vector re-index check); never on the search serving path
+                "indexer/LegacyVectorFields.java");
         // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
         // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
         assertThat(files("FSDirectory::open")).isEmpty();

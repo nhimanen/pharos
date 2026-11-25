@@ -20,13 +20,17 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.SearcherFactory;
 import org.apache.lucene.search.similarities.ClassicSimilarity;
+import org.apache.lucene.util.Constants;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIfSystemProperty;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
+
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -40,6 +44,7 @@ import static com.pharos.search.distributed.ParityCorpus.PY;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The pipeline split (raw candidates + {@link CandidateShaper}) must not move a single local result:
@@ -50,6 +55,12 @@ import static org.assertj.core.api.Assertions.fail;
  *
  * <p>Hermetic: the engine reads {@code synonyms.txt} and {@code pipelines.yaml} from a private empty
  * directory, never from the shared {@code pharos.home} other tests write to.
+ *
+ * <p>Float arithmetic: the expected vector scores were computed with fused multiply-add. Lucene
+ * chooses fused or unfused FMA per CPU ({@code Constants.HAS_FAST_SCALAR_FMA}: unfused on AMD without
+ * AVX-512), which moves cosine scores by an ulp, so surefire pins {@code -Dlucene.useScalarFMA=true}
+ * (see the pom). The 16-dim test vectors stay on Lucene's scalar loop at 256- and 512-bit vector
+ * widths; narrower hardware takes a vectorized loop and cannot reproduce the bits.
  *
  * <p>Regenerate (only when ranking is meant to change):
  * {@code mvn test -Dtest=PipelineSplitParityTest -Dpharos.regenerateParity=true}.
@@ -89,6 +100,7 @@ class PipelineSplitParityTest {
     @DisabledIfSystemProperty(named = "pharos.regenerateParity", matches = "true")
     void localResultsBitwiseIdentical() throws Exception {
         if (!Files.exists(FIXTURE)) fail("parity fixture missing — record it with -Dpharos.regenerateParity=true");
+        assumeRecordedArithmetic();
         String actual = ParityCorpus.snapshot(engine);
         String expected = Files.readString(FIXTURE);
         if (!actual.equals(expected)) {
@@ -97,6 +109,23 @@ class PipelineSplitParityTest {
             fail("local results moved — diff " + FIXTURE + " " + out);
         }
         assertThat(actual).isEqualTo(expected);
+    }
+
+    /**
+     * Skips where the recorded float bits cannot be reproduced (no FMA, vectors narrower than 256 bits,
+     * or a C1-only VM, where Lucene never fuses); fails when only the configuration is missing (Lucene chose unfused FMA on a CPU that has it).
+     */
+    static void assumeRecordedArithmetic() {
+        HotSpotDiagnosticMXBean hotspot = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+        boolean fma = Boolean.parseBoolean(hotspot.getVMOption("UseFMA").getValue());
+        int maxVectorBytes = Integer.parseInt(hotspot.getVMOption("MaxVectorSize").getValue());
+        assumeTrue(fma && maxVectorBytes >= 32 && !Constants.IS_CLIENT_VM,
+                "parity fixture needs FMA, >= 256-bit vectors and C2 (UseFMA=" + fma + ", MaxVectorSize="
+                        + maxVectorBytes + ", clientVM=" + Constants.IS_CLIENT_VM + ")");
+        if (!Constants.HAS_FAST_SCALAR_FMA) {
+            fail("Lucene uses unfused multiply-add on this CPU, so vector scores differ from the fixture by an ulp:"
+                    + " run with -Dlucene.useScalarFMA=true (the surefire argLine sets it)");
+        }
     }
 
     /** The stage-level raw API a shard serves, shaped by the coordinator, equals the stage's own results. */

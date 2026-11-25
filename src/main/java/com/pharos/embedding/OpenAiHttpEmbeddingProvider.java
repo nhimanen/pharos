@@ -197,11 +197,27 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
         return true;
     }
 
+    /** Raw (unprefixed) single embed; the query/document variants add their prefix. */
     @Override
     public float[] embed(String text) {
         if (text == null || text.isBlank()) return null;
-        float[][] r = embedBatch(List.of(text));
-        return r[0];
+        return embedBatchRaw(List.of(text))[0];
+    }
+
+    @Override
+    public float[] embedQuery(String text) {
+        return embed(EmbeddingProvider.withPrefix(cfg.getQueryPrefix(), text));
+    }
+
+    @Override
+    public float[] embedDocument(String text) {
+        return embed(EmbeddingProvider.withPrefix(cfg.getDocumentPrefix(), text));
+    }
+
+    /** Batch embedding is document-side: the document prefix is applied to every text. */
+    @Override
+    public float[][] embedBatch(List<String> texts) {
+        return embedBatchRaw(EmbeddingProvider.withPrefix(cfg.getDocumentPrefix(), texts));
     }
 
     /**
@@ -211,8 +227,7 @@ public class OpenAiHttpEmbeddingProvider implements EmbeddingProvider {
      * recursively (bisection) so callers can pass arbitrarily long lists
      * without manual sizing.
      */
-    @Override
-    public float[][] embedBatch(List<String> texts) {
+    private float[][] embedBatchRaw(List<String> texts) {
         if (texts == null || texts.isEmpty()) return new float[0][];
         float[][] out = new float[texts.size()][];
 

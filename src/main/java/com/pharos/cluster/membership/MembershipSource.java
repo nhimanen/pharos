@@ -35,6 +35,14 @@ public interface MembershipSource extends Closeable {
     /** Announces this reader draining at once (members only). */
     default void drain() {}
 
+    /**
+     * {@link #drain()}, waiting for the announce at most {@code timeout} (a shutdown must not hang on
+     * a slow bucket or writer); the draining flag is set first, so a later tick still carries it.
+     */
+    default void drain(java.time.Duration timeout) {
+        drain();
+    }
+
     /** Stops, and withdraws this reader's own entry so peers drop it at once (members only). */
     @Override
     default void close() {}

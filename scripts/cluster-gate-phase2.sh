@@ -28,10 +28,14 @@
 #   GATE_JAR           pharos jar to run (default target/pharos-*.jar; a copy lets you rebuild meanwhile)
 #   GATE_WARM_RUNS     timed warm runs per side (default 3)
 #   GATE_READER_JVM_OPTS  extra JVM options for the reader JVMs (e.g. JFR flags)
+#   GATE_MINIO_PORT / GATE_MINIO_CONSOLE_PORT  MinIO ports (default 9000 / 9001)
+#   GATE_LAZY_PORT / GATE_FULL_PORT            lazy and full reader web ports (default 7301 / 7302)
+#   GATE_PORT_PROBE_TIMEOUT  seconds per port probe and curl connect (default 2; on hosts where an
+#                            unused port hangs instead of refusing, a timed-out probe counts as free)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
@@ -53,6 +57,11 @@ MODEL_DIR_NAME="$(echo "${MODEL_URL#hf://}" | tr '/' '-')"
 MODEL_ID="${GATE_MODEL_ID:-jina-code-v2}"
 PHASES="${GATE_PHASES:-cold,warm,cap}"
 TRIALS="${GATE_TRIALS:-20}"
+MINIO_PORT="${GATE_MINIO_PORT:-9000}"
+MINIO_CONSOLE_PORT="${GATE_MINIO_CONSOLE_PORT:-9001}"
+LAZY_PORT="${GATE_LAZY_PORT:-7301}"
+FULL_PORT="${GATE_FULL_PORT:-7302}"
+PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
 JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
 
 if (( DRY )); then
@@ -60,7 +69,8 @@ if (( DRY )); then
 cluster-gate-phase2 (dry run): nothing is started.
   repo        $REPO
   jar         ${JAR:-<missing: mvn clean package -DskipTests>}
-  minio       $MINIO_BIN on 127.0.0.1:9000
+  minio       $MINIO_BIN on 127.0.0.1:$MINIO_PORT (console $MINIO_CONSOLE_PORT)
+  readers     lazy :$LAZY_PORT, full :$FULL_PORT
   gate dir    ${GATE:-<GATE unset>}
   heaps       index $INDEX_HEAP, reader web $WEB_HEAP
   model       $MODEL_URL (copied from ~/.djl.ai/pharos/$MODEL_DIR_NAME)
@@ -86,8 +96,8 @@ except (OSError, ValueError, KeyError, TypeError) as e:
 PY
 )" || exit 2
 
-for port in 9000 9001 7301 7302; do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+for port in "$MINIO_PORT" "$MINIO_CONSOLE_PORT" "$LAZY_PORT" "$FULL_PORT"; do
+  if timeout "$PROBE_TIMEOUT" bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" 2>/dev/null; then
     echo "cluster-gate-phase2: port $port is already in use; refusing to start" >&2; exit 2
   fi
 done
@@ -128,7 +138,7 @@ cat > "$W_PH/config.json" <<JSON
     "writer": {"workQueue": false},
     "cacheDir": "$W_PH/cluster-cache",
     "objectStore": {
-      "endpoint": "http://127.0.0.1:9000", "region": "us-east-1", "bucket": "pharos-gate",
+      "endpoint": "http://127.0.0.1:$MINIO_PORT", "region": "us-east-1", "bucket": "pharos-gate",
       "prefix": "pharos", "pathStyle": true,
       "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"
     }
@@ -151,7 +161,7 @@ JVM_FLAGS=(--enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.cha
            -Dlogback.configurationFile="$LOGBACK")
 wait_http() {
   local end=$((SECONDS + $2))
-  until curl -fs -o /dev/null "$1"; do
+  until curl -fs --connect-timeout "$PROBE_TIMEOUT" --max-time 10 -o /dev/null "$1"; do
     (( SECONDS < end )) || { echo "cluster-gate-phase2: timeout waiting for $1" >&2; return 1; }
     sleep 1
   done
@@ -159,11 +169,11 @@ wait_http() {
 mem() { awk '/MemAvailable/{printf "%.1f GiB", $2/1048576}' /proc/meminfo; }
 
 echo "== gate dir $GATE; MemAvailable $(mem)"
-"$MINIO_BIN" server "$MINIO_DATA" --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
+"$MINIO_BIN" server "$MINIO_DATA" --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE_PORT" \
   > "$GATE/minio.log" 2>&1 &
 PIDS+=($!)
-echo "== MinIO pid $! on 127.0.0.1:9000"
-wait_http http://127.0.0.1:9000/minio/health/live 60
+echo "== MinIO pid $! on 127.0.0.1:$MINIO_PORT"
+wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 60
 
 if [[ "${GATE_REUSE_INDEX:-0}" == 1 && -f "$GATE/writer.done" ]]; then
   echo "== reusing the published bucket ($(cat "$GATE/writer.done"))"
@@ -187,6 +197,7 @@ fi
 
 export GATE GATE_JAR="$JAR" GATE_LOGBACK="$LOGBACK" GATE_WEB_HEAP="$WEB_HEAP" GATE_MODELS="$MODELS"
 export GATE_MODEL_URL="$MODEL_URL" GATE_MODEL_ID="$MODEL_ID"
+export GATE_MINIO_PORT="$MINIO_PORT" GATE_LAZY_PORT="$LAZY_PORT" GATE_FULL_PORT="$FULL_PORT"
 rc=0
 python3 -I -u "$REPO/scripts/cluster_gate_phase2.py" --phases "$PHASES" --trials "$TRIALS" || rc=$?
 echo "== MinIO bucket: $(du -sh "$MINIO_DATA/pharos-gate" | cut -f1); gate exit $rc (logs in $GATE)"
