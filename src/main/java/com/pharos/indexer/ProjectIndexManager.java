@@ -416,6 +416,9 @@ public class ProjectIndexManager {
      *   <li>A broken graph pointer (malformed, or naming a generation that is gone, e.g. left behind
      *       by an older pharos) can't be patched: patching would need a fresh, empty graph. A full
      *       run rebuilds the graph and replaces the pointer.</li>
+     *   <li>A call graph with a damaged property dictionary (written before 1.10.0) decodes wrongly
+     *       and can't be patched or published: a full run builds a new graph generation. This is how
+     *       work-queue writers, which refuse {@code index --full}, repair it.</li>
      * </ul>
      */
     public String fullRunReason(String projectName) {
@@ -425,7 +428,10 @@ public class ProjectIndexManager {
             return "index format changed (" + IndexFormat.read(existingDir).format()
                     + " → " + IndexVersions.INDEX_FORMAT + ")";
         }
-        return CallGraph.pointerProblem(existingDir);
+        String pointer = CallGraph.pointerProblem(existingDir);
+        if (pointer != null) return pointer;
+        String damage = CallGraph.dictionaryProblem(CallGraph.projectGraphDir(existingDir));
+        return damage == null ? null : "the call graph has a " + damage;
     }
 
     /**

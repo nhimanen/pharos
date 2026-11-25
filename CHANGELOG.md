@@ -72,9 +72,12 @@ the network except reader-to-writer with TLS. Read README "Without a bucket: pee
   on disk before anything else is written.
 - Graphs damaged that way by an older release are now detected when opened (pharos always added the
   dictionary names in a fixed order) and logged as a WARN with the repair:
-  - a project's call graph: `pharos index --full <project>` rebuilds it. Until then a writer refuses
-    to publish it (and to export it as `graph.cgf.gz`), so readers and takeovers never receive it;
-    `index-status` reports it (`graphDamage` in `--json`), and `upgrade-indexes` re-indexes it.
+  - a project's call graph: the project's next index run is a full one, which rebuilds it; work-queue
+    writers (which refuse `index --full`) repair their shards this way on their own. A standalone
+    `pharos index --full <project>` is still recommended, to find the damage before a run does. As a
+    backstop a writer refuses to publish a damaged graph (and to export it as `graph.cgf.gz`), so
+    readers and takeovers never receive it; `index-status` reports it (`graphDamage` in `--json`),
+    and `upgrade-indexes` re-indexes it.
   - the cross-project graph: the next `pharos link` rebuilds it.
   - the module graph (`~/.pharos/module-graph.arcadedb`, never re-created by a re-index): rebuilt
     empty automatically; each project's modules return when it is next indexed.

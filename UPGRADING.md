@@ -14,15 +14,19 @@ missing, other vertices have shuffled properties, so callers, callees, usages an
 1.10.0 creates graphs safely and recognises the damaged ones, but cannot repair a graph in place.
 
 - **Every project:** run `pharos index --full <project>` once (or `pharos upgrade-indexes`, which
-  re-indexes the damaged ones it finds). A full run builds a new call graph. In a cluster, run it on
-  the writer: its next publish replaces the generation readers serve.
+  re-indexes the damaged ones it finds). A full run builds a new call graph. Any index run of a
+  damaged project now turns full by itself, so the graph is repaired at the latest on the project's
+  next change; the explicit run repairs it now. Work-queue writers refuse `index --full` and need
+  nothing: a shard whose local graph is damaged gets a full run and publishes a clean generation,
+  which replaces the one readers serve. Writers without the work queue: run it on the writer.
 - **Cross-project graph:** re-run `pharos link` afterwards; it rebuilds the graph when it is damaged.
 - **Module graph** (`~/.pharos/module-graph.arcadedb`): a re-index never re-creates it. 1.10.0 rebuilds
   a damaged one automatically (empty; each project's modules return when it is next indexed, so the
   full re-indexes above refill it).
 
-What 1.10.0 does when it finds a damaged graph: it logs a WARN naming the graph and the repair. A writer
-refuses to publish a damaged project graph until the full re-index (the publish fails with that message).
+What 1.10.0 does when it finds a damaged graph: it logs a WARN naming the graph and the repair, and the
+project's next index run is a full one. As a backstop a writer refuses to publish a damaged project graph
+(the publish fails with that message) until a full run has rebuilt it.
 `pharos index-status` shows a `warning:` line (`graphDamage` in `--json`). A reader can only check an
 ArcadeDB graph, not a published `graph.cgf.gz`: repair on the writer.
 
