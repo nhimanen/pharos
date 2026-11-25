@@ -193,7 +193,8 @@ def queries():
     plus vector and hybrid on the pharos ones (lucene is indexed without embeddings)."""
     base = cluster_gate.load_queries()
     out = [(q, p, "keyword") for q, p in base]
-    out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
+    if os.environ.get("GATE_NO_MODELS", "0") != "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY: keyword only
+        out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
     return base, out
 
 
