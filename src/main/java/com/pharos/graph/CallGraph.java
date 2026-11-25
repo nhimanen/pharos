@@ -126,6 +126,10 @@ public class CallGraph implements GraphView {
         // Checked before initSchema, which may add names to an older graph's dictionary.
         String damage = created ? null : dictionaryProblem(db, DICTIONARY_ORDER);
         if (damage != null) warnDamaged(dbDir, damage);
+        // setAsyncFlush applies to this thread's transaction context only: every write to this
+        // graph must stay on the opening thread. Commits from another thread go through ArcadeDB's
+        // asynchronous flush queue, which can land after a later synchronous write of the same
+        // page (see awaitDictionaryOnDisk).
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);

@@ -34,11 +34,27 @@ class CallGraphDictionaryTest {
     }
 
     @Test
-    void freshGraphHasTheFixedOrderAndNoDamage() throws Exception {
+    void freshGraphHasTheFixedOrderAndWritesAddNoNames() throws Exception {
         Path dir = tmp.resolve("p").resolve("callgraph.arcadedb");
         try (CallGraph g = CallGraph.open(dir)) {
             assertThat(g.dictionaryDamage()).isNull();
             assertThat(g.dictionaryMap()).isEqualTo(canonical(CallGraph.DICTIONARY_ORDER));
+            // every kind of record the builders write, stubs included
+            g.addMethod("p.A#run()", "p.A");
+            g.addCall("p.A#run()", "ext.X#go()");                                    // Method stub
+            g.addCodeType("p.A", "p.A");
+            g.addCodeField("p.A#n", "p.A", "int", "private");
+            g.addKgEdge("declares_field", "p.A", "CodeType", "p.A#n", "CodeField");
+            g.addKgEdge("reads_field", "p.A#run()", "Method", "p.B#m", "CodeField");  // CodeField stub
+            g.addKgEdge("returns_type", "p.A#run()", "Method", "p.T", "CodeType");    // CodeType stub
+            g.addKgEdge("annotated_by", "p.A", "CodeType", "p.Ann", "CodeType");
+            g.flush();
+            g.flushKnowledge();
+            g.evictClasses(List.of("p.A"));
+            g.addMethod("p.A#run()", "p.A");
+            g.completeEviction();
+            assertThat(g.dictionaryMap()).as("no name added after initSchema")
+                    .isEqualTo(canonical(CallGraph.DICTIONARY_ORDER));
         }
         try (CallGraph g = CallGraph.openExisting(dir)) {
             assertThat(g.dictionaryDamage()).isNull();
