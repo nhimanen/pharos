@@ -417,7 +417,9 @@ def phase_cold(trials, variant="cold"):
             dl, res_l = search(r.base, lq, "lucene", "keyword")
             mid = (health(r.base).get("readerCache") or {}).get("bytesFetched")
             vq = pharos_q[t % len(pharos_q)]
-            dv, res_v = search(r.base, vq, "pharos", "vector")
+            # keyword only (GATE_NO_MODELS=1): the pharos query is keyword too (no model to embed it)
+            dv, res_v = search(r.base, vq, "pharos",
+                               "keyword" if os.environ.get("GATE_NO_MODELS", "0") == "1" else "vector")
             rc = health(r.base).get("readerCache") or {}
             models_ms = r.models_ready_ms()
         finally:
@@ -571,6 +573,8 @@ def phase_warm():
             warm_ok = ratio <= WARM_RATIO_LIMIT
             print(f"WARM keyword p95 ratio {ratio:.3f} limit <= {WARM_RATIO_LIMIT} -> {'PASS' if warm_ok else 'FAIL'}")
         for pl in ("vector", "hybrid"):
+            if pl not in out["timings"]["lazy"]:
+                continue  # keyword only (GATE_NO_MODELS=1)
             lv, fv = out["timings"]["lazy"][pl], out["timings"]["full"][pl]
             print(f"   {pl} p95 lazy {lv['p95'] * 1000:.1f} ms vs full {fv['p95'] * 1000:.1f} ms (not gated)")
         mm = check(lazy_res, full_res, "strict")
