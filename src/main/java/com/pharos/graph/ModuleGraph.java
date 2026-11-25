@@ -49,7 +49,16 @@ public class ModuleGraph implements AutoCloseable {
 
     public static ModuleGraph open(Path dbDir) {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
-        Database db = factory.exists() ? factory.open() : factory.create();
+        boolean created = !factory.exists();
+        Database db = created ? factory.create() : factory.open();
+        if (created) {
+            try {
+                CallGraph.awaitDictionaryOnDisk(db); // same ArcadeDB race as a new call graph
+            } catch (RuntimeException e) {
+                db.close();
+                throw e;
+            }
+        }
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
         return new ModuleGraph(db);

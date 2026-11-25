@@ -66,7 +66,7 @@ the network except reader-to-writer with TLS. Read README "Without a bucket: pee
   when the queued copy reached the disk last, every later open decoded the records' property names
   wrongly: methods and edges vanished from the graph and other vertices came back with shuffled
   properties, with no error. Any graph creation could hit it: a full index, a writer takeover's
-  restore, the cross-project link graph. A new graph now waits until that page is on disk before
+  restore, the cross-project link graph, the module graph. A new graph now waits until that page is on disk before
   anything else is written. A graph that already has it is repaired by `pharos index --full`.
 
 ### Maintainers

@@ -149,7 +149,7 @@ public class CallGraph implements GraphView {
      * marks the batch in flight before writing it, so the file size plus ArcadeDB's own wait cover
      * the whole window.
      */
-    private static void awaitDictionaryOnDisk(Database db) {
+    static void awaitDictionaryOnDisk(Database db) {
         var internal = (com.arcadedb.database.DatabaseInternal) db;
         var dictionary = internal.getSchema().getEmbedded().getDictionary();
         var file = (com.arcadedb.engine.PaginatedComponentFile) internal.getFileManager().getFile(dictionary.getFileId());
