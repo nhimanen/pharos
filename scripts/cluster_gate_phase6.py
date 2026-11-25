@@ -30,6 +30,12 @@ shard's LATEST every 0.5 s.
              is open, and the job resumes on the other writer and flips.
   check      0 failed queries over the whole run; docCount per version; the marker check.
 
+GATE_KEYWORD_ONLY=1: no node has an embedding model (pharos was indexed --no-embed too). The ranking
+passes, the load and the pruning traces use the keyword pipeline only, so hybrid and vector parity after
+the reshards is not checked; every other check is unchanged.
+
+Ports: GATE_ROUTER_PORT, GATE_R1_PORT..GATE_R3_PORT, GATE_W1_PORT, GATE_W2_PORT (defaults below).
+
 --dry-run prints the plan.
 """
 import argparse
@@ -59,10 +65,13 @@ POLL = 10
 TTL = 30
 MIN_HOLD = 120
 QPS = 10
-PORTS = {"router": 7690, "r1": 7601, "r2": 7602, "r3": 7603, "w1": 7611, "w2": 7612}
+_DEFAULT_PORTS = {"router": 7690, "r1": 7601, "r2": 7602, "r3": 7603, "w1": 7611, "w2": 7612}
+PORTS = {n: int(os.environ.get(f"GATE_{n.upper()}_PORT", p)) for n, p in _DEFAULT_PORTS.items()}
 READERS = ["r1", "r2", "r3"]
 WRITERS = ["w1", "w2"]
-PIPELINES = ("keyword", "hybrid", "vector")
+# GATE_KEYWORD_ONLY=1: no embedding model on any node; only the keyword pipeline is compared (docstring)
+KEYWORD_ONLY = os.environ.get("GATE_KEYWORD_ONLY", "0") == "1"
+PIPELINES = ("keyword",) if KEYWORD_ONLY else ("keyword", "hybrid", "vector")
 PHAROS_MODULE = "src/test/resources/test-projects/sample-app"
 LUCENE_PREFIX = "lucene/core"
 SPEC_RING4 = "[project, ring(path, shards=4)]"
@@ -128,8 +137,10 @@ class Node:
         cluster = {"backend": "object-store", "nodeId": self.node_id, "cacheDir": str(self.ph / "cluster-cache"),
                    "heartbeatSeconds": HB, "pollIntervalSeconds": 10, "token": os.environ["GATE_TOKEN"],
                    "retentionGenerations": 1000, "retentionMinutes": 100000, "objectStore": s3_cfg()}
-        cfg = {"crossEncoderEnabled": False, "embeddingProviders": provider(),
-               "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "cluster": cluster}
+        cfg = {"crossEncoderEnabled": False, "cluster": cluster}
+        if not KEYWORD_ONLY:
+            cfg["embeddingProviders"] = provider()
+            cfg["searchEmbeddingModel"] = os.environ["GATE_MODEL_ID"]
         if self.kind == "writer":
             cluster["role"] = "writer"
             cluster["writer"] = {"workQueue": True, "workDir": str(self.home / "work"), "pollSeconds": POLL,
@@ -347,7 +358,9 @@ class Monitors:
 
     def _load_loop(self):
         router = f"http://127.0.0.1:{PORTS['router']}"
-        kinds = ["keyword", "keyword-scoped", "hybrid", "keyword-module", "keyword-path"]
+        kinds = ["keyword", "keyword-scoped", "keyword-module", "keyword-path"]
+        if not KEYWORD_ONLY:
+            kinds.insert(2, "hybrid")
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
         i = 0
         with open(gate() / "load.jsonl", "w") as out:
@@ -679,9 +692,10 @@ def phase_reshard():
     pe = [e for e in rp["embeds"] if e["project"] == "pharos"]
     misses = sum(e["misses"] for e in pe)
     hits = sum(e["hits"] for e in pe)
-    emb_ok = misses == 0 and hits > 0
+    # keyword only: pharos has no vectors, so its reshard embeds nothing and logs no cache line
+    emb_ok = misses == 0 and (hits > 0 or KEYWORD_ONLY)
     out["criterion_pharos_embed"] = {"embed_lines": pe, "provider_calls": misses, "cache_hits": hits,
-                                     "pass": emb_ok}
+                                     "keyword_only": KEYWORD_ONLY, "pass": emb_ok}
     ok = ok and emb_ok
     out["pass"] = ok
     save_part("reshard", out)
@@ -802,7 +816,8 @@ def phase_pruning():
     _, ph_shards = active_spec(ph)
     _, lu_shards = active_spec(lu)
     mod = traced({"q": "Calculator", "pipeline": "keyword", "project": "pharos", "module": PHAROS_MODULE})
-    mod_h = traced({"q": "greeting service", "pipeline": "hybrid", "project": "pharos", "module": PHAROS_MODULE})
+    mod_h = traced({"q": "greeting service", "pipeline": "keyword" if KEYWORD_ONLY else "hybrid",
+                    "project": "pharos", "module": PHAROS_MODULE})
     path = traced({"q": "IndexWriter", "pipeline": "keyword", "project": "lucene", "pathPrefix": LUCENE_PREFIX})
     n = len(ph_shards)
     mod_ok = (any(f"search: 1 of {n}" in r for r in mod["routing"]) and mod["fanout_shards"] == [1]
@@ -896,6 +911,9 @@ def main():
     phases = [p for p in a.phases.split(",") if p]
     if a.dry_run:
         print(__doc__)
+        print("mode:", "keyword only (pipelines: keyword)" if KEYWORD_ONLY else "embed (pipelines: "
+              + ", ".join(PIPELINES) + ")")
+        print("ports:", PORTS)
         print("phases:", phases)
         return 0
     (gate() / "logs").mkdir(exist_ok=True)
