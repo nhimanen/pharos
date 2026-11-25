@@ -2,8 +2,29 @@
 
 ## Upgrading to 1.10.0
 
-Index format: 1 (unchanged); no re-index. Nothing changes for single-node installs (`role: all`) or for
+Index format: 1 (unchanged). Peer pull changes nothing for single-node installs (`role: all`) or for
 clusters with a bucket (`cluster.backend: object-store`, still the default): restart on the new jar.
+One recommended step applies to every install:
+
+### Recommended: rebuild the call graphs once
+
+Every release since the ArcadeDB graph backend could, rarely, write a new graph whose property
+dictionary was stale. Such a graph opens without an error but decodes wrongly: methods and edges are
+missing, other vertices have shuffled properties, so callers, callees, usages and call paths are wrong.
+1.10.0 creates graphs safely and recognises the damaged ones, but cannot repair a graph in place.
+
+- **Every project:** run `pharos index --full <project>` once (or `pharos upgrade-indexes`, which
+  re-indexes the damaged ones it finds). A full run builds a new call graph. In a cluster, run it on
+  the writer: its next publish replaces the generation readers serve.
+- **Cross-project graph:** re-run `pharos link` afterwards; it rebuilds the graph when it is damaged.
+- **Module graph** (`~/.pharos/module-graph.arcadedb`): a re-index never re-creates it. 1.10.0 rebuilds
+  a damaged one automatically (empty; each project's modules return when it is next indexed, so the
+  full re-indexes above refill it).
+
+What 1.10.0 does when it finds a damaged graph: it logs a WARN naming the graph and the repair. A writer
+refuses to publish a damaged project graph until the full re-index (the publish fails with that message).
+`pharos index-status` shows a `warning:` line (`graphDamage` in `--json`). A reader can only check an
+ArcadeDB graph, not a published `graph.cgf.gz`: repair on the writer.
 
 ### Optional: moving a cluster to peer pull (no bucket)
 

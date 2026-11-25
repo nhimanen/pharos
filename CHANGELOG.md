@@ -17,7 +17,9 @@ membership and the cluster status state live on the writers, so coordinators, `p
 callers and usages identical to a single node on 99/99 queries, a new publish visible to readers within
 0.6 s, 0 failed queries over 2 minutes with the writer killed, and the Phase 2/3 cold, warm, fan-out and
 router-elasticity criteria passed as in bucket mode. **Single-node installs and bucket clusters are unaffected**
-(`object-store` stays the default backend). No re-index.
+by peer pull (`object-store` stays the default backend). The index format is unchanged, but run
+`pharos index --full` once for every project and re-run `pharos link`: older releases could write a call
+graph that silently decodes wrong (see Fixed; UPGRADING.md "Upgrading to 1.10.0").
 
 **When to use it.** Peer mode is for small or on-premises clusters where running S3 or MinIO is not worth
 it. Prefer the bucket when you have one: peer mode has **no writer takeover** (no leases; the Phase 4 work
@@ -66,8 +68,18 @@ the network except reader-to-writer with TLS. Read README "Without a bucket: pee
   when the queued copy reached the disk last, every later open decoded the records' property names
   wrongly: methods and edges vanished from the graph and other vertices came back with shuffled
   properties, with no error. Any graph creation could hit it: a full index, a writer takeover's
-  restore, the cross-project link graph, the module graph. A new graph now waits until that page is on disk before
-  anything else is written. A graph that already has it is repaired by `pharos index --full`.
+  restore, the cross-project link graph, the module graph. A new graph now waits until that page is
+  on disk before anything else is written.
+- Graphs damaged that way by an older release are now detected when opened (pharos always added the
+  dictionary names in a fixed order) and logged as a WARN with the repair:
+  - a project's call graph: `pharos index --full <project>` rebuilds it. Until then a writer refuses
+    to publish it (and to export it as `graph.cgf.gz`), so readers and takeovers never receive it;
+    `index-status` reports it (`graphDamage` in `--json`), and `upgrade-indexes` re-indexes it.
+  - the cross-project graph: the next `pharos link` rebuilds it.
+  - the module graph (`~/.pharos/module-graph.arcadedb`, never re-created by a re-index): rebuilt
+    empty automatically; each project's modules return when it is next indexed.
+  A reader serving a published `graph.cgf.gz` cannot check it (the file has no dictionary): re-index
+  on the writer, which then publishes a clean generation.
 
 ### Maintainers
 - Phase 5 gate (`scripts/cluster-gate-phase5.sh`): every port is a setting (`GATE_W1_PORT`,
