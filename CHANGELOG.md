@@ -3,6 +3,22 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.11.1] - 2026-11-26
+
+**Index format:** 2 (unchanged from 1.11.0)
+
+The first published build of 1.11: the 1.11.0 tag produced no release, because the release workflow failed
+in `scripts/test-setup.sh`. 1.11.1 has the same code as 1.11.0, so read 1.11.0's notes below (including its
+index format change 1 → 2 and "Upgrading to 1.11.0") for what changed since 1.10.0. The container images
+`ghcr.io/<owner>/pharos:1.11.1` and `ghcr.io/<owner>/pharos-operator:1.11.1` are the first ones published;
+`deploy/` names them.
+
+### Fixed
+- `scripts/test-setup.sh`: two installer tests used an unstamped index as their "one format behind, still
+  searchable" project. Unstamped reads as format 0, which 1.11's format 2 no longer serves, so the installer
+  correctly asked to re-index and the tests failed. They now stamp the project with INDEX_FORMAT − 1, read
+  from the source (test only; no runtime change).
+
 ## [1.11.0] - 2026-11-25
 
 **Index format:** 1 → 2 (documents carry key fields for the search filters and shard keys; format-1

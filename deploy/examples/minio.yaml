@@ -9,7 +9,7 @@ metadata:
   name: demo
   namespace: pharos
 spec:
-  version: "1.11.0"                   # pharos image tag (ghcr.io/<owner>/pharos:<version>; 1.11.0 is the first published)
+  version: "1.11.1"                   # pharos image tag (ghcr.io/<owner>/pharos:<version>; 1.11.1 is the first published)
   storage:
     minio:
       storage: 20Gi                   # MinIO PVC size

@@ -8,7 +8,7 @@ metadata:
   name: prod
   namespace: pharos
 spec:
-  version: "1.11.0"
+  version: "1.11.1"
   storage:
     s3:
       endpoint: https://s3.eu-north-1.amazonaws.com
