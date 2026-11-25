@@ -4,6 +4,8 @@ import com.pharos.analysis.ConceptMiner;
 import com.pharos.cluster.IndexPublisher;
 import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.NoOpPublisher;
+import com.pharos.cluster.ShardId;
+import com.pharos.cluster.sharding.ShardPlan;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
@@ -422,6 +424,16 @@ public class ProjectIndexManager {
      * </ul>
      */
     public String fullRunReason(String projectName) {
+        return fullRunReason(projectName, ShardPlan.single(projectName));
+    }
+
+    /**
+     * {@link #fullRunReason(String)} for a run under {@code plan}, which also needs a full run when the
+     * local index is in another shard layout ({@link LocalShardLayout}: split under another spec or
+     * shard set, split while the plan is {@code [project]}, or the reverse) or a previous split run
+     * stopped between its shard commits.
+     */
+    public String fullRunReason(String projectName, ShardPlan plan) {
         Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
         if (!Files.isDirectory(existingDir)) return null;
         if (IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
@@ -431,7 +443,25 @@ public class ProjectIndexManager {
         String pointer = CallGraph.pointerProblem(existingDir);
         if (pointer != null) return pointer;
         String damage = CallGraph.dictionaryProblem(CallGraph.projectGraphDir(existingDir));
-        return damage == null ? null : "the call graph has a " + damage;
+        if (damage != null) return "the call graph has a " + damage;
+        if (Files.exists(existingDir.resolve(LocalShardLayout.COMMITTING))) {
+            return "a previous run stopped between the commits of its shards";
+        }
+        Optional<LocalShardLayout.Layout> layout = LocalShardLayout.read(existingDir);
+        if (plan.isSplit()) {
+            if (layout.isEmpty()) {
+                return luceneIndexer.indexExists(projectName)
+                        ? "the project is now split by spec " + plan.spec() + " into " + plan.shards().size() + " shards"
+                        : null;
+            }
+            if (!layout.get().matches(plan)) {
+                return "the local index is split by " + layout.get().spec() + " into " + layout.get().shards()
+                        + ", the project's spec is now " + plan.spec() + " with " + plan.shards();
+            }
+        } else if (layout.isPresent()) {
+            return "the local index is split by " + layout.get().spec() + ", the project's spec is now [project]";
+        }
+        return null;
     }
 
     /**
@@ -482,9 +512,20 @@ public class ProjectIndexManager {
         if (!Files.isDirectory(projectIndexDir)) return 0;
         Path luceneDir = projectIndexDir.resolve("lucene");
         long before = sizeOf(projectIndexDir);
-        try (org.apache.lucene.store.Directory dir = Files.isDirectory(luceneDir)
-                ? org.apache.lucene.store.FSDirectory.open(luceneDir) : null;
-             org.apache.lucene.store.Lock lock = dir == null ? null : dir.obtainLock(IndexWriter.WRITE_LOCK_NAME)) {
+        // A split project's run holds every shard's write lock: take them all (the legacy dir's too).
+        List<Path> luceneDirs = new ArrayList<>();
+        if (Files.isDirectory(luceneDir)) luceneDirs.add(luceneDir);
+        luceneIndexer.localLayout(projectName).ifPresent(l -> l.shards().forEach(sh -> {
+            Path d = luceneIndexer.getShardLucenePath(projectName, sh);
+            if (Files.isDirectory(d)) luceneDirs.add(d);
+        }));
+        List<java.io.Closeable> held = new ArrayList<>();
+        try (java.io.Closeable releaseAll = () -> closeAllReverse(held)) {
+            for (Path d : luceneDirs) {
+                org.apache.lucene.store.Directory dir = org.apache.lucene.store.FSDirectory.open(d);
+                held.add(dir);
+                held.add(dir.obtainLock(IndexWriter.WRITE_LOCK_NAME));
+            }
             CallGraph.removeUnusedGraphs(projectIndexDir);
             try (var files = Files.list(projectIndexDir)) {
                 for (Path f : files.toList()) {
@@ -500,6 +541,18 @@ public class ProjectIndexManager {
         long freed = Math.max(0, before - sizeOf(projectIndexDir));
         if (freed > 0) log.info("Removed {} bytes of run leftovers of '{}'", freed, projectName);
         return freed;
+    }
+
+    private static void closeAllReverse(List<java.io.Closeable> closeables) throws IOException {
+        IOException first = null;
+        for (int i = closeables.size() - 1; i >= 0; i--) {
+            try {
+                closeables.get(i).close();
+            } catch (IOException e) {
+                if (first == null) first = e; else first.addSuppressed(e);
+            }
+        }
+        if (first != null) throw first;
     }
 
     /** Total size of the regular files under {@code dir} (0 when absent; best effort). */
@@ -586,12 +639,30 @@ public class ProjectIndexManager {
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress, IndexAbort abort,
                               String sourceRevision) throws IOException {
+        return index(projectRoot, projectName, incremental, force, generateEmbeddings, buildSynonyms, progress,
+                abort, sourceRevision, ShardPlan.single(projectName));
+    }
+
+    /**
+     * An index run that splits the project into the shards of {@code plan} (ruling P6-R1): one parse
+     * pass, one Lucene writer per shard ({@link ShardedWriter}), one call graph, one file state and one
+     * embedding cache for the project, and one publish of all its shards. {@link ShardPlan#single} is
+     * the {@code [project]} run of Phases 1–5, unchanged. A local index in another layout than
+     * {@code plan}'s is rebuilt by a full run ({@link #fullRunReason(String, ShardPlan)}).
+     */
+    public ProjectMeta index(Path projectRoot, String projectName,
+                              boolean incremental, boolean force, boolean generateEmbeddings,
+                              boolean buildSynonyms, ProgressListener progress, IndexAbort abort,
+                              String sourceRevision, ShardPlan plan) throws IOException {
         ProjectNames.validate(projectName, config.getIndexDir());
+        if (!plan.project().equals(projectName)) {
+            throw new IllegalArgumentException("shard plan of project " + plan.project() + " for " + projectName);
+        }
         // Fail fast (before any parsing) when the publisher could never publish this name.
         publisher.checkPublishable(projectName);
         abort.checkpoint();
         ProjectMeta meta = indexLocally(projectRoot, projectName, incremental, force,
-                generateEmbeddings, buildSynonyms, progress, abort);
+                generateEmbeddings, buildSynonyms, progress, abort, plan);
         if (sourceRevision != null) {
             meta.setSourceRevision(sourceRevision);
             registry.register(meta);
@@ -599,16 +670,16 @@ public class ProjectIndexManager {
         // Same rule as the file-state fingerprint: never load models for --no-embed.
         String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
         publisher.publish(new LocalSnapshot(projectName,
-                luceneIndexer.getProjectIndexDir(projectName), meta, modelFp));
+                luceneIndexer.getProjectIndexDir(projectName), meta, modelFp, plan));
         return meta;
     }
 
     private ProjectMeta indexLocally(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress,
-                              IndexAbort abort) throws IOException {
+                              IndexAbort abort, ShardPlan plan) throws IOException {
         if (incremental) {
-            String reason = fullRunReason(projectName);
+            String reason = fullRunReason(projectName, plan);
             if (reason != null) {
                 String msg = reason + ": running a full re-index";
                 log.warn(msg);
@@ -632,6 +703,22 @@ public class ProjectIndexManager {
                 incremental = false;
             }
         }
+        // [project, module]: a build file added or removed moves every file below it to another shard
+        // without editing any of them, so the run is full whenever the module dirs changed.
+        List<String> modules = keysOnModule(plan) ? moduleDirs(projectRoot) : List.of();
+        if (incremental && keysOnModule(plan)) {
+            List<String> recorded = luceneIndexer.localLayout(projectName)
+                    .map(LocalShardLayout.Layout::modules).orElse(List.of());
+            if (!recorded.equals(modules)) {
+                String msg = "build modules changed (" + recorded + " → " + modules + ") under spec " + plan.spec()
+                        + ": running a full re-index";
+                log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
+        RunPlan run = new RunPlan(plan, new FileShardRouter(plan, projectRoot,
+                f -> parserFor(f) instanceof GenericFileParser), modules);
         if (force) {
             log.info("Force re-index: removing all project data for '{}'", projectName);
             removeProject(projectName);
@@ -654,18 +741,344 @@ public class ProjectIndexManager {
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, run);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort, run);
         }
+    }
+
+    // ------------------------------------------------------------------------- resharding (Task 4)
+
+    /** The progress stage {@link #reshard} reports once it knows how many files move ({@code total}). */
+    public static final String RESHARD_MOVING = "Moving";
+
+    /**
+     * What a reshard build changed in the local index: the shards of the new version that gained or lost
+     * files (or are new), those it left exactly as they were, the shards of the old version it dropped,
+     * how many files moved, and how many the parsers parsed (the moved ones).
+     */
+    public record ReshardBuild(List<ShardId> affected, List<ShardId> unaffected, List<ShardId> removed,
+                               int movedFiles, int parsedFiles) {
+        public ReshardBuild {
+            affected = List.copyOf(affected);
+            unaffected = List.copyOf(unaffected);
+            removed = List.copyOf(removed);
+        }
+    }
+
+    /**
+     * The shards of {@code project} under {@code spec}, from the files a full run of {@code projectRoot}
+     * would index: every key value the files have, and for a ring every ring shard of each key group
+     * (empty ones included, since a ring's shards are its names), sorted by id.
+     */
+    public List<ShardId> shardsFor(Path projectRoot, String project, com.pharos.cluster.sharding.ShardSpec spec)
+            throws IOException {
+        if (spec.isDefault()) return List.of(ShardId.ofProject(project));
+        ShardPlan any = new ShardPlan(project, spec, List.of(ShardId.ofProject(project)));
+        FileShardRouter keys = new FileShardRouter(any, projectRoot, f -> parserFor(f) instanceof GenericFileParser);
+        java.util.TreeMap<String, ShardId> out = new java.util.TreeMap<>();
+        var ring = spec.ring();
+        for (Path f : sourceFiles(projectRoot)) {
+            ShardId id = spec.assign(keys.keysOf(f));
+            out.put(id.value(), id);
+            if (ring.isPresent()) {
+                for (String name : ring.get().names()) {
+                    java.util.LinkedHashMap<String, String> kv = new java.util.LinkedHashMap<>(id.keyValues());
+                    kv.put(ring.get().key(), name);
+                    ShardId r = ShardId.keyed(project, kv);
+                    out.put(r.value(), r);
+                }
+            }
+        }
+        if (out.isEmpty() && ring.isPresent() && spec.fields().size() == 2) {
+            for (String name : ring.get().names()) {
+                ShardId r = ShardId.keyed(project, new java.util.LinkedHashMap<>(java.util.Map.of(ring.get().key(), name)));
+                out.put(r.value(), r);
+            }
+        }
+        if (out.isEmpty()) throw new IOException("project " + project + " has no indexable files under " + projectRoot);
+        return List.copyOf(out.values());
+    }
+
+    /** The files a full run of {@code projectRoot} indexes (the same walk, skip rules and size limit). */
+    private List<Path> sourceFiles(Path projectRoot) throws IOException {
+        List<Path> out = new ArrayList<>();
+        OversizedFiles oversized = new OversizedFiles();
+        Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                if (SKIP_DIRS.contains(name) || name.startsWith(".")) return FileVisitResult.SKIP_SUBTREE;
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                String name = file.getFileName().toString();
+                for (CodeParser p : parsers) {
+                    if (p.supportedExtensions().stream().anyMatch(name::endsWith)) {
+                        if (!oversized.skip(file, attrs.size(), p)) out.add(file);
+                        break;
+                    }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return out;
+    }
+
+    /**
+     * Rebuilds the local index of {@code projectName}, now in the layout of {@code from} (the active
+     * version, as published), into the layout of {@code to} (a reshard's new version), re-indexing only
+     * the files whose shard changes (ruling: a ring change is incremental):
+     * <ul>
+     *   <li>each indexed file's shard under {@code from} is the shard whose index holds it; under
+     *       {@code to}, the spec's; a file moves when the two differ;</li>
+     *   <li>the moved files are parsed again (nothing else is) and written to their new shards with the
+     *       full run's documents (chunks, in-degrees and callers from the project's call graph, which a
+     *       reshard does not change); embeddings come from the persistent cache, so unchanged text is
+     *       never embedded again;</li>
+     *   <li>shards of {@code to} that gain or lose files, and new ones, are written (the others are not
+     *       touched: their commits stay byte-identical); the moved files' documents leave their old
+     *       shard in the same commit; shards {@code to} drops (and a {@code [project]} {@code lucene/}) are
+     *       removed after the commit.</li>
+     * </ul>
+     * Crash-safe like an index run: the commit marker, then the shard commits, the file state, and the
+     * layout last; nothing is published. The call graph is the project's and stays as it is.
+     *
+     * @throws IOException when the local index is not {@code from}'s, a file it holds is gone from the
+     *         source (the source changed since the published run: index it first), or the spec puts a
+     *         file in a shard {@code to} does not list
+     */
+    public ReshardBuild reshard(Path projectRoot, String projectName, ShardPlan from, ShardPlan to,
+                                boolean generateEmbeddings, ProgressListener progress, IndexAbort abort)
+            throws IOException {
+        ProjectNames.validate(projectName, config.getIndexDir());
+        if (!to.project().equals(projectName) || !from.project().equals(projectName)) {
+            throw new IllegalArgumentException("shard plans of " + from.project() + "/" + to.project() + " for " + projectName);
+        }
+        if (!to.isSplit()) {
+            throw new IllegalArgumentException("a reshard to [project] is not supported; use a single-shard ring,"
+                    + " [project, ring(path, shards=1)]");
+        }
+        String reason = fullRunReason(projectName, from);
+        if (reason != null || !luceneIndexer.indexExists(projectName)) {
+            throw new IOException("the local index of " + projectName + " is not the active version's ("
+                    + (reason != null ? reason : "no index") + "); index it first");
+        }
+        Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
+        abort.checkpoint();
+        progress.onProgress("Scanning", 0, 0);
+
+        // Where every indexed file is now: the shard whose index holds its documents.
+        List<ShardId> fromIds = from.clusterShards();
+        Map<String, ShardId> holder = new LinkedHashMap<>();
+        for (ShardId s : fromIds) {
+            Path dir = from.isSplit() ? LocalShardLayout.luceneDir(projectIndexDir, s) : projectIndexDir.resolve("lucene");
+            for (String path : liveFilePaths(dir)) holder.put(path, s);
+        }
+        FileShardRouter router = new FileShardRouter(to, projectRoot, f -> parserFor(f) instanceof GenericFileParser);
+        Map<String, ShardId> moved = new LinkedHashMap<>();
+        Set<ShardId> affected = new LinkedHashSet<>();
+        for (Map.Entry<String, ShardId> e : holder.entrySet()) {
+            if (!Files.isRegularFile(Path.of(e.getKey()))) {
+                throw new IOException("file " + e.getKey() + " of project " + projectName + " is gone from the source;"
+                        + " the source changed since the published run, which must be indexed first");
+            }
+            ShardId target;
+            try {
+                target = router.shardOf(e.getKey());
+            } catch (IllegalArgumentException ex) {
+                throw new IOException(ex.getMessage(), ex);
+            }
+            if (target.equals(e.getValue())) continue;
+            moved.put(e.getKey(), target);
+            affected.add(target);
+            if (to.shards().contains(e.getValue())) affected.add(e.getValue());
+        }
+        for (ShardId s : to.shards()) if (!fromIds.contains(s)) affected.add(s);
+        List<ShardId> affectedList = to.shards().stream().filter(affected::contains).toList();
+        List<ShardId> unaffected = to.shards().stream().filter(sh -> !affected.contains(sh)).toList();
+        List<ShardId> removed = fromIds.stream().filter(sh -> !to.shards().contains(sh)).toList();
+        log.info("Reshard of '{}' from {} to {}: {} of {} files move; shards written {}, kept {}, dropped {}",
+                projectName, from.spec(), to.spec(), moved.size(), holder.size(), affectedList, unaffected, removed);
+        progress.onProgress(RESHARD_MOVING, 0, moved.size());
+
+        // Parse only the moved files, grouped by parser.
+        Map<CodeParser, List<Path>> byParser = new LinkedHashMap<>();
+        for (String path : moved.keySet()) {
+            Path f = Path.of(path);
+            CodeParser parser = parserFor(f);
+            if (parser != null) byParser.computeIfAbsent(parser, k -> new ArrayList<>()).add(f);
+        }
+        List<ParsedProject> perLang = new ArrayList<>();
+        int parsed = 0;
+        for (Map.Entry<CodeParser, List<Path>> e : byParser.entrySet()) {
+            abort.checkpoint();
+            perLang.add(e.getKey().parseFiles(e.getValue(), projectRoot, projectName));
+            parsed += e.getValue().size();
+        }
+        ParsedProject subset = merge(projectName, projectRoot, perLang);
+        GraphIndexData graphData;
+        try (CallGraph graph = CallGraph.openExisting(CallGraph.writerGraphDir(projectIndexDir))) {
+            graphData = GraphIndexData.build(graph, subset);
+        } catch (RuntimeException e) {
+            log.warn("Reshard of '{}': the call graph could not be read ({}); moved methods get no in-degree", projectName,
+                    e.toString());
+            graphData = GraphIndexData.failed(e);
+        }
+
+        FileStateTracker stateTracker = stateTracker(projectIndexDir, generateEmbeddings);
+        List<EmbedRuntime> runtimes = buildRuntimes(projectIndexDir, generateEmbeddings, "embed-reshard");
+        Map<ShardId, IndexWriter> writers = ShardedWriter.openAll(affectedList,
+                sh -> luceneIndexer.openShardWriter(projectName, sh, !fromIds.contains(sh)));
+        try (ShardedWriter writer = ShardedWriter.split(writers, router)) {
+            try {
+                for (String path : moved.keySet()) writer.deleteFile(path);
+                indexProject(writer, subset, stateTracker, generateEmbeddings, graphData, progress, projectIndexDir,
+                        runtimes, abort);
+                abort.checkpoint();
+                // the moved files' old documents must leave the term statistics too, not only the live docs
+                writer.expungeDeletes(abort);
+                abort.enterCommit();
+                markCommitting(projectIndexDir, to);
+                writer.commit();
+            } catch (IndexAbortedException aborted) {
+                writer.rollback();
+                throw aborted;
+            }
+        }
+        stateTracker.save();
+        LocalShardLayout.write(projectIndexDir, to, keysOnModule(to) ? moduleDirs(projectRoot) : List.of());
+        luceneIndexer.dropOtherLayouts(projectName, to.shards());
+        Files.deleteIfExists(projectIndexDir.resolve(LocalShardLayout.COMMITTING));
+        progress.onProgress("Done", moved.size(), moved.size());
+        return new ReshardBuild(affectedList, unaffected, removed, moved.size(), parsed);
+    }
+
+    /** The {@code filePath} of every live document of the Lucene index in {@code luceneDir}. */
+    private static Set<String> liveFilePaths(Path luceneDir) throws IOException {
+        Set<String> out = new LinkedHashSet<>();
+        if (!Files.isDirectory(luceneDir)) return out;
+        try (org.apache.lucene.store.Directory d = org.apache.lucene.store.FSDirectory.open(luceneDir);
+             org.apache.lucene.index.DirectoryReader r = org.apache.lucene.index.DirectoryReader.open(d)) {
+            for (org.apache.lucene.index.LeafReaderContext leaf : r.leaves()) {
+                org.apache.lucene.index.Terms terms = leaf.reader().terms(DocumentMapper.F_FILE_PATH);
+                if (terms == null) continue;
+                org.apache.lucene.util.Bits live = leaf.reader().getLiveDocs();
+                org.apache.lucene.index.TermsEnum te = terms.iterator();
+                org.apache.lucene.index.PostingsEnum pe = null;
+                for (org.apache.lucene.util.BytesRef t = te.next(); t != null; t = te.next()) {
+                    pe = te.postings(pe, org.apache.lucene.index.PostingsEnum.NONE);
+                    for (int doc = pe.nextDoc(); doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+                         doc = pe.nextDoc()) {
+                        if (live == null || live.get(doc)) {
+                            out.add(t.utf8ToString());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * One run's shard routing: the plan, its file router (null for {@code [project]}) and the build-module
+     * dirs found at the start of the run (recorded in the layout for a spec keyed on {@code module}).
+     */
+    private record RunPlan(ShardPlan plan, FileShardRouter router, List<String> modules) {
+        /**
+         * Routes every file now, before anything is parsed or written: a file whose shard the catalog
+         * doesn't list (a new module, language, ...) fails the run here rather than after parsing and
+         * embedding.
+         */
+        void preRoute(java.util.Collection<Path> files) {
+            if (!plan.isSplit()) return;
+            for (Path f : files) router.shardOf(f.toAbsolutePath().toString());
+        }
+    }
+
+    /** True when the plan splits by the {@code module} key. */
+    static boolean keysOnModule(ShardPlan plan) {
+        return plan.isSplit() && plan.spec().fields().stream()
+                .anyMatch(f -> f instanceof com.pharos.cluster.sharding.ShardSpec.KeyField k && k.key().equals("module"));
+    }
+
+    /**
+     * The build-module dirs below {@code root} ({@link FileShardRouter#BUILD_FILES}), as normalised relative
+     * paths, sorted; the dirs a run skips ({@link #SKIP_DIRS}, dot dirs) are skipped, as their files are
+     * never indexed.
+     */
+    static List<String> moduleDirs(Path root) throws IOException {
+        Path abs = root.toAbsolutePath().normalize();
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        Files.walkFileTree(abs, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                if (!dir.equals(abs) && (SKIP_DIRS.contains(name) || name.startsWith("."))) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                Path dir = file.getParent();
+                if (dir != null && !dir.equals(abs) && FileShardRouter.BUILD_FILES.contains(file.getFileName().toString())) {
+                    out.add(com.pharos.cluster.sharding.DocKeys.normalizePath(abs, dir));
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return List.copyOf(out);
+    }
+
+    /**
+     * The run's Lucene writers: the project's one writer for {@code [project]}, else one per shard of
+     * {@code plan} with routing by file ({@link FileShardRouter}).
+     */
+    private ShardedWriter openWriters(String projectName, RunPlan run, boolean fresh) throws IOException {
+        if (!run.plan().isSplit()) {
+            return ShardedWriter.single(fresh ? luceneIndexer.openWriterFresh(projectName)
+                    : luceneIndexer.openWriter(projectName), run.router());
+        }
+        return ShardedWriter.split(ShardedWriter.openAll(run.plan().shards(),
+                s -> luceneIndexer.openShardWriter(projectName, s, fresh)), run.router());
+    }
+
+    /** Before a split run commits its shards one by one: a crash in between makes the next run full. */
+    private static void markCommitting(Path projectIndexDir, ShardPlan plan) throws IOException {
+        if (plan.isSplit()) Files.writeString(projectIndexDir.resolve(LocalShardLayout.COMMITTING), "");
+    }
+
+    /**
+     * After a run's commits and its file state: a split run records its layout last and clears the
+     * commit marker; a full run also removes the Lucene dirs of any other layout (a {@code [project]}
+     * run those of an earlier split). A {@code [project]} project that was never split has nothing to do.
+     */
+    private void finishLayout(String projectName, Path projectIndexDir, RunPlan run, boolean full)
+            throws IOException {
+        ShardPlan plan = run.plan();
+        if (plan.isSplit()) {
+            LocalShardLayout.write(projectIndexDir, plan, run.modules());
+            if (full) luceneIndexer.dropOtherLayouts(projectName, plan.shards());
+        } else if (full && (Files.exists(projectIndexDir.resolve(LocalShardLayout.FILE_NAME))
+                || Files.exists(projectIndexDir.resolve(LocalShardLayout.SHARDS_DIR)))) {
+            Files.deleteIfExists(projectIndexDir.resolve(LocalShardLayout.FILE_NAME));
+            luceneIndexer.dropOtherLayouts(projectName, List.of());
+        }
+        Files.deleteIfExists(projectIndexDir.resolve(LocalShardLayout.COMMITTING));
     }
 
     private ProjectMeta indexFull(Path projectRoot, String projectName,
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
                                    ProgressListener progress,
-                                   List<EmbedRuntime> runtimes, IndexAbort abort) throws IOException {
+                                   List<EmbedRuntime> runtimes, IndexAbort abort, RunPlan run) throws IOException {
+        ShardPlan plan = run.plan();
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
         // Check dirty status against the pre-existing state before clearing it, so synonym mining
@@ -704,6 +1117,7 @@ public class ProjectIndexManager {
 
         oversized.report(projectName);
         abort.checkpoint();
+        for (List<Path> files : filesByParser.values()) run.preRoute(files);
 
         // Also treat removed files as a change.
         if (!anyChanges[0]) {
@@ -750,7 +1164,7 @@ public class ProjectIndexManager {
         // fails to get it before it can touch this run's graph generation. Lucene keeps the
         // previous commit visible to readers until the commit below.
         GraphIndexData graphData;
-        try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
+        try (ShardedWriter writer = openWriters(projectName, run, true)) {
           try {
             // No other run is in progress, so every graph dir but the live one is a leftover.
             CallGraph.removeUnusedGraphs(projectIndexDir);
@@ -774,6 +1188,7 @@ public class ProjectIndexManager {
             indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress,
                     projectIndexDir, runtimes, abort);
             abort.enterCommit();
+            markCommitting(projectIndexDir, plan);
             writer.commit();
 
             // Publish the rebuilt graph now that the matching Lucene commit is visible. A failed
@@ -797,6 +1212,7 @@ public class ProjectIndexManager {
 
         // Save file state
         stateTracker.save();
+        finishLayout(projectName, projectIndexDir, run, true);
 
         // Update registry — record which models actually wrote vectors so the
         // search engine can validate per-project model availability later.
@@ -822,7 +1238,7 @@ public class ProjectIndexManager {
         IndexFormat.write(projectIndexDir);
 
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
-                meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
+                projectName, meta.getMethodCount(), meta.getClassCount(), meta.getFileCount());
 
         if (buildSynonyms && anyChanges[0]) {
             progress.onProgress("Mining synonyms", 0, 0);
@@ -836,7 +1252,9 @@ public class ProjectIndexManager {
                                           Path projectIndexDir, FileStateTracker stateTracker,
                                           boolean generateEmbeddings, boolean buildSynonyms,
                                           ProgressListener progress,
-                                          List<EmbedRuntime> runtimes, IndexAbort abort) throws IOException {
+                                          List<EmbedRuntime> runtimes, IndexAbort abort,
+                                          RunPlan run) throws IOException {
+        ShardPlan plan = run.plan();
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -933,11 +1351,12 @@ public class ProjectIndexManager {
         // Collect parsed dirty files so we can use them for graph patching later (avoids re-parse)
         List<ParsedFile> parsedDirtyFiles = new ArrayList<>();
 
-        try (IndexWriter writer = luceneIndexer.openWriter(projectName)) {
+        run.preRoute(dirtyFiles);
+        try (ShardedWriter writer = openWriters(projectName, run, false)) {
           try {
             // Remove documents for deleted source files
             for (Path deleted : deletedFiles) {
-                writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH, deleted.toString()));
+                writer.deleteFile(deleted.toString());
                 stateTracker.remove(deleted);
                 log.debug("Removed index docs for deleted file {}", deleted.getFileName());
                 progress.onProgress("Removing deleted files", ++doneWork, totalWork);
@@ -957,8 +1376,7 @@ public class ProjectIndexManager {
                         : null) {
                     for (Path file : dirtyFiles) {
                         abort.checkpoint();
-                        writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH,
-                                file.toAbsolutePath().toString()));
+                        writer.deleteFile(file.toAbsolutePath().toString());
                         CodeParser fileParser = parserFor(file);
                         if (fileParser == null) {
                             log.debug("No parser for {}, skipping", file.getFileName());
@@ -1061,6 +1479,7 @@ public class ProjectIndexManager {
                     }
                 }
                 abort.enterCommit();
+                markCommitting(projectIndexDir, plan);
                 writer.commit();
             } finally {
                 Files.deleteIfExists(spoolPath);
@@ -1078,6 +1497,7 @@ public class ProjectIndexManager {
         }
 
         stateTracker.save();
+        finishLayout(projectName, projectIndexDir, run, false);
 
         // Patch call graph in-place — load existing graph, evict stale entries for
         // dirty/deleted files, splice in fresh edges from newly-parsed files.
@@ -1128,7 +1548,7 @@ public class ProjectIndexManager {
      * </ol>
      * Both temp files are deleted in a {@code finally} block even on error or OOM.
      */
-    private void indexProject(IndexWriter writer, ParsedProject project,
+    private void indexProject(ShardedWriter writer, ParsedProject project,
                                FileStateTracker stateTracker, boolean generateEmbeddings,
                                GraphIndexData graphData, ProgressListener progress,
                                Path projectIndexDir, List<EmbedRuntime> runtimes,
@@ -1632,7 +2052,7 @@ public class ProjectIndexManager {
      *                     this method slices the relevant chunk range per model and builds
      *                     a {@code Map<String, float[][]>} for the multi-model DocumentMapper.
      */
-    private void writeFileDocs(IndexWriter writer, ParsedFile file,
+    private void writeFileDocs(ShardedWriter writer, ParsedFile file,
                                FileStateTracker stateTracker,
                                GraphIndexData graphData,
                                List<String> synthesizedBodies,
@@ -1927,7 +2347,7 @@ public class ProjectIndexManager {
 
         // Count methods and classes from the Lucene index using TermQuery
         try {
-            org.apache.lucene.index.IndexReader reader = luceneIndexer.openReader(projectName);
+            org.apache.lucene.index.IndexReader reader = luceneIndexer.openMultiReader(List.of(projectName));
             org.apache.lucene.search.IndexSearcher searcher = new org.apache.lucene.search.IndexSearcher(reader);
             int methods = searcher.count(new org.apache.lucene.search.TermQuery(
                     new Term(DocumentMapper.F_DOC_TYPE, "method")));

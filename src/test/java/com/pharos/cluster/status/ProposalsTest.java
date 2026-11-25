@@ -43,14 +43,32 @@ class ProposalsTest {
     /** Advances the state over snapshots every {@code step} s from T0 to T0 + {@code until} s. */
     private static StatusState run(Function<Instant, StatusSnapshot> snap, StatusState from, long startSec,
                                    long untilSec, long step) {
+        return run(snap, from, startSec, untilSec, step, CFG);
+    }
+
+    private static StatusState run(Function<Instant, StatusSnapshot> snap, StatusState from, long startSec,
+                                   long untilSec, long step, StatusSettings cfg) {
         StatusState st = from;
-        for (long s = startSec; s <= untilSec; s += step) st = Proposals.advance(snap.apply(T0.plusSeconds(s)), st, CFG);
+        for (long s = startSec; s <= untilSec; s += step) st = Proposals.advance(snap.apply(T0.plusSeconds(s)), st, cfg);
         return st;
     }
 
     private static List<ClusterStatus.Proposal> proposals(Function<Instant, StatusSnapshot> snap, StatusState st,
                                                           long atSec) {
-        return StatusBuilder.build(snap.apply(T0.plusSeconds(atSec)), st, CFG).proposals();
+        return proposals(snap, st, atSec, CFG);
+    }
+
+    private static List<ClusterStatus.Proposal> proposals(Function<Instant, StatusSnapshot> snap, StatusState st,
+                                                          long atSec, StatusSettings cfg) {
+        return StatusBuilder.build(snap.apply(T0.plusSeconds(atSec)), st, cfg).proposals();
+    }
+
+    /** Settings from a {@code cluster.status} section built by {@code edit}. */
+    private static StatusSettings settings(java.util.function.Consumer<com.pharos.config.ClusterConfig.StatusConfig> edit) {
+        var c = new com.pharos.config.ClusterConfig.StatusConfig();
+        edit.accept(c);
+        c.validate();
+        return StatusSettings.of(c);
     }
 
     private static List<String> kinds(List<ClusterStatus.Proposal> ps) {
@@ -124,19 +142,19 @@ class ProposalsTest {
     void addWritersWhenBacklogAndFewerWritersThanShards() {
         List<StatusSnapshot.ShardObs> shards = List.of(shard("a", true, 10L, "w1", T0),
                 shard("b", true, 10L, "w1", T0), shard("c", true, 10L, "w1", T0));
-        // one writer holds all three; shard a has waited 601 s (> the 600 s backlog target)
+        // one writer holds all three; shard a has waited 301 s (> writers.oldestPendingSeconds, 300 s)
         var backlog = cluster(shards, List.of(writer("w1", List.of("a", "b", "c"),
-                Map.of("a", pending(601), "b", pending(30), "c", new WriterHeartbeat.Backlog("r", "r", false, null)),
+                Map.of("a", pending(301), "b", pending(30), "c", new WriterHeartbeat.Backlog("r", "r", false, null)),
                 null, null)), List.of());
         StatusState st = Proposals.advance(backlog.apply(T0), null, CFG);
         List<ClusterStatus.Proposal> ps = proposals(backlog, st, 0);
         assertThat(kinds(ps)).as("window 0: at once").containsExactly(Proposals.ADD_WRITERS);
         assertThat(ps.get(0).action()).isEqualTo("Start 1 writer; leases rebalance");
         assertThat(ps.get(0).metrics()).containsEntry("writers", 1).containsEntry("workableShards", 3)
-                .containsEntry("shardsPendingOverTarget", 1).containsEntry("oldestPendingAgeSeconds", 601L);
+                .containsEntry("shardsPendingOverTarget", 1).containsEntry("oldestPendingAgeSeconds", 301L);
 
-        // at the target (600 s) nothing is proposed
-        var atTarget = cluster(shards, List.of(writer("w1", List.of("a", "b", "c"), Map.of("a", pending(600)), null,
+        // at the threshold (300 s) nothing is proposed
+        var atTarget = cluster(shards, List.of(writer("w1", List.of("a", "b", "c"), Map.of("a", pending(300)), null,
                 null)), List.of());
         assertThat(proposals(atTarget, Proposals.advance(atTarget.apply(T0), null, CFG), 0)).isEmpty();
 
@@ -185,12 +203,114 @@ class ProposalsTest {
         List<ClusterStatus.Proposal> ps = proposals(snap, st, 0);
         assertThat(kinds(ps)).containsExactly(Proposals.RESHARD);
         assertThat(ps.get(0).target()).as("501 bytes > 50% of 1000; 500 is not").isEqualTo("a");
-        assertThat(ps.get(0).action()).isEqualTo("New shard spec, e.g. [project, hash(path) % 2]");
+        assertThat(ps.get(0).action()).isEqualTo("New shard spec [project, ring(path, shards=2)]:"
+                + " pharos reshard a --spec \"[project, ring(path, shards=2)]\"");
         assertThat(ps.get(0).metrics()).containsEntry("sizeBytes", 501L).containsEntry("readerCacheMaxBytes", 1000L);
 
         var big = cluster(List.of(shard("a", true, 1900L, null, null)), List.of(), List.of(small));
         List<ClusterStatus.Proposal> bigPs = proposals(big, Proposals.advance(big.apply(T0), null, CFG), 0);
-        assertThat(bigPs.get(0).action()).isEqualTo("New shard spec, e.g. [project, hash(path) % 4]");
+        assertThat(bigPs.get(0).action()).contains("--spec \"[project, ring(path, shards=4)]\"");
+    }
+
+    /** One catalog project for the reshard tests: its active version and shards, optionally an open request. */
+    private static StatusSnapshot.ProjectObs project(String name, Integer version, String spec, List<String> shards,
+                                                     boolean requested) {
+        return new StatusSnapshot.ProjectObs(name, version, com.pharos.cluster.sharding.ShardSpec.parse(spec), shards,
+                null, null, requested ? new StatusSnapshot.RequestObs(9,
+                com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=9)]"), T0) : null,
+                null, null, null);
+    }
+
+    private static StatusSnapshot withProjects(List<StatusSnapshot.ShardObs> shards, ReaderHeartbeat reader,
+                                               List<StatusSnapshot.ProjectObs> projects) {
+        return new StatusSnapshot(StatusSnapshot.CLUSTER, T0, shards, List.of(),
+                List.of(new StatusSnapshot.ReaderObs(reader, T0)), Duration.ofSeconds(30), false, projects, null, null);
+    }
+
+    /**
+     * Rulings P6-R14/R15: the proposal names a concrete spec and the exact command. An unringed project gets
+     * the ring appended with {@code S = ceil(largestShardBytes / trigger)}, at least 2 (the
+     * trigger: 50% of the smallest reader cache cap); a ringed project of N shards gets
+     * {@code shards = max(N + 1, S)}. A split project is one proposal, targeting the project.
+     */
+    @Test
+    void reshardProposalSuggestsConcreteRingSpec() {
+        ReaderHeartbeat r = new ReaderHeartbeat("r1", "http://r1", List.of(), false, StatusFixtures.cache(2000), 0, 1,
+                1L, ReaderHeartbeat.READY, List.of(), 10L, 1L); // trigger: 1000 bytes
+
+        // unringed [project]: 3300 bytes → S = ceil(3.3) = 4
+        StatusSnapshot plain = withProjects(List.of(shard("lucene", true, 3300L, null, null)), r,
+                List.of(project("lucene", null, "[project]", List.of("lucene"), false)));
+        ClusterStatus.Proposal p = StatusBuilder.build(plain, Proposals.advance(plain, null, CFG), CFG).proposals().get(0);
+        assertThat(p.kind()).isEqualTo(Proposals.RESHARD);
+        assertThat(p.target()).isEqualTo("lucene");
+        assertThat(p.action()).isEqualTo("New shard spec [project, ring(path, shards=4)]:"
+                + " pharos reshard lucene --spec \"[project, ring(path, shards=4)]\"");
+        assertThat(p.metrics()).containsEntry("suggestedRingShards", 4).containsEntry("sizeBytes", 3300L);
+        // the spec is one pharos reshard accepts
+        assertThat(com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=4)]").ring()).isPresent();
+
+        // unringed [project, module]: the ring is appended after the existing keys
+        StatusSnapshot moduled = withProjects(List.of(shard("app~module=core", true, 1500L, null, null),
+                        shard("app~module=web", true, 200L, null, null)), r,
+                List.of(project("app", 3, "[project, module]", List.of("app~module=core", "app~module=web"), false)));
+        ClusterStatus.Proposal pm = StatusBuilder.build(moduled, Proposals.advance(moduled, null, CFG), CFG)
+                .proposals().get(0);
+        assertThat(pm.target()).isEqualTo("app");
+        assertThat(pm.action()).endsWith("pharos reshard app --spec \"[project, module, ring(path, shards=2)]\"");
+
+        // fix round 1, I3 (P6-R15): [project, module] with 20 modules, one over the trigger: the ring splits
+        // every module, so S comes from the largest shard (1500 → 2), not the project's 1500 + 19 × 300 (→ 8)
+        List<StatusSnapshot.ShardObs> modules = new ArrayList<>();
+        List<String> moduleIds = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            String id = String.format("big~module=m%02d", i);
+            moduleIds.add(id);
+            modules.add(shard(id, true, i == 0 ? 1500L : 300L, null, null));
+        }
+        StatusSnapshot twenty = withProjects(modules, r, List.of(project("big", 5, "[project, module]", moduleIds,
+                false)));
+        ClusterStatus.Proposal p20 = StatusBuilder.build(twenty, Proposals.advance(twenty, null, CFG), CFG)
+                .proposals().get(0);
+        assertThat(p20.target()).isEqualTo("big");
+        assertThat(p20.metrics()).containsEntry("sizeBytes", 7200L).containsEntry("suggestedRingShards", 2);
+        assertThat(p20.action()).endsWith("pharos reshard big --spec \"[project, module, ring(path, shards=2)]\"");
+
+        // ringed, N = 4, the largest shard 1200 bytes → S = 2: max(N + 1, S) = 5
+        List<String> ring4 = List.of("idx~ring=s01", "idx~ring=s02", "idx~ring=s03", "idx~ring=s04");
+        StatusSnapshot ringed = withProjects(List.of(shard(ring4.get(0), true, 1200L, null, null),
+                        shard(ring4.get(1), true, 100L, null, null), shard(ring4.get(2), true, 100L, null, null),
+                        shard(ring4.get(3), true, 100L, null, null)), r,
+                List.of(project("idx", 2, "[project, ring(path, shards=4)]", ring4, false)));
+        List<ClusterStatus.Proposal> rps = StatusBuilder.build(ringed, Proposals.advance(ringed, null, CFG), CFG)
+                .proposals();
+        assertThat(rps).as("one proposal for the project, not one per shard").singleElement().satisfies(x -> {
+            assertThat(x.target()).isEqualTo("idx");
+            assertThat(x.action()).isEqualTo("New shard spec [project, ring(path, shards=5, vnodes=512)]:"
+                    + " pharos reshard idx --spec \"[project, ring(path, shards=5, vnodes=512)]\"");
+            assertThat(x.metrics()).containsEntry("shards", 4).containsEntry("sizeBytes", 1500L)
+                    .containsEntry("largestShardBytes", 1200L).containsEntry("suggestedRingShards", 5);
+        });
+
+        // ringed, N = 4, the largest shard 9500 bytes → S = 10 > N + 1 (from the largest shard, not the project)
+        StatusSnapshot heavy = withProjects(List.of(shard(ring4.get(0), true, 9500L, null, null),
+                        shard(ring4.get(1), true, 2500L, null, null), shard(ring4.get(2), true, 2500L, null, null),
+                        shard(ring4.get(3), true, 2500L, null, null)), r,
+                List.of(project("idx", 2, "[project, ring(path, shards=4)]", ring4, false)));
+        assertThat(StatusBuilder.build(heavy, Proposals.advance(heavy, null, CFG), CFG).proposals().get(0).action())
+                .endsWith("--spec \"[project, ring(path, shards=10, vnodes=512)]\"");
+
+        // a ring with a removed shard keeps its names: [s01, s02, s04] + one → s01..s04
+        assertThat(Proposals.proposedSpec(com.pharos.cluster.sharding.ShardSpec.parse(
+                "[project, ring(path, shards=[s01, s02, s04], vnodes=128)]"), 4))
+                .isEqualTo("[project, ring(path, shards=4, vnodes=128)]");
+        assertThat(Proposals.suggestedRingShards(100, 1000, 0)).as("at least 2").isEqualTo(2);
+        assertThat(Proposals.suggestedRingShards(100, 1000, 7)).isEqualTo(8);
+
+        // while a reshard of the project is open, nothing is proposed for it
+        StatusSnapshot open = withProjects(List.of(shard("lucene", true, 3300L, null, null)), r,
+                List.of(project("lucene", null, "[project]", List.of("lucene"), true)));
+        assertThat(StatusBuilder.build(open, Proposals.advance(open, null, CFG), CFG).proposals()).isEmpty();
     }
 
     @Test
@@ -267,5 +387,130 @@ class ProposalsTest {
         assertThat(st.pendingSince()).isEmpty();
         assertThat(StatusBuilder.build(done.apply(T0.plusSeconds(70)), st, CFG).backlogSummary())
                 .isEqualTo(new ClusterStatus.BacklogSummary(0, null));
+    }
+
+    // ── delta and configurable thresholds (operator Task 1) ──────────────────────────────────────
+
+    @Test
+    void addReadersCarriesPositiveDelta() {
+        // 2 readers at 120 QPS: 2.4 × target, so 5 readers are needed: start 3
+        var hot = cluster(List.of(), List.of(), List.of(reader("r1", 120, null), reader("r2", 120, null)));
+        ClusterStatus.Proposal p = proposals(hot, run(hot, null, 0, 300, 10), 300).get(0);
+        assertThat(p.kind()).isEqualTo(Proposals.ADD_READERS);
+        assertThat(p.action()).isEqualTo("Start 3 readers");
+        assertThat(p.delta()).isEqualTo(3);
+
+        // add-writers: two shards over the backlog age, one writer of three workable shards: start 2
+        List<StatusSnapshot.ShardObs> shards = List.of(shard("a", true, 10L, "w1", T0),
+                shard("b", true, 10L, "w1", T0), shard("c", true, 10L, "w1", T0));
+        var backlog = cluster(shards, List.of(writer("w1", List.of("a", "b", "c"),
+                Map.of("a", pending(900), "b", pending(900)), null, null)), List.of());
+        ClusterStatus.Proposal w = proposals(backlog, Proposals.advance(backlog.apply(T0), null, CFG), 0).get(0);
+        assertThat(w.kind()).isEqualTo(Proposals.ADD_WRITERS);
+        assertThat(w.action()).isEqualTo("Start 2 writers; leases rebalance");
+        assertThat(w.delta()).isEqualTo(2);
+
+        // reshard and writer-disk carry no delta
+        ReaderHeartbeat small = new ReaderHeartbeat("r1", "http://r1", List.of("a"), false,
+                StatusFixtures.cache(1000), 0, 1, 1L, ReaderHeartbeat.READY, List.of(), 10L, 1L);
+        var other = cluster(List.of(shard("a", true, 900L, "w1", T0)), List.of(writer("w1", List.of("a"), Map.of(),
+                null, new WriterHeartbeat.Disk(1L << 30, 100L << 30, true))), List.of(small));
+        List<ClusterStatus.Proposal> ps = proposals(other, Proposals.advance(other.apply(T0), null, CFG), 0);
+        assertThat(kinds(ps)).containsExactly(Proposals.RESHARD, Proposals.WRITER_DISK);
+        assertThat(ps).allSatisfy(x -> assertThat(x.delta()).isNull());
+    }
+
+    @Test
+    void removeReadersCarriesNegativeDelta() {
+        // 6 readers at 1 QPS: 6 QPS fits one reader at half load, so drain 5
+        List<ReaderHeartbeat> six = new ArrayList<>();
+        for (int i = 1; i <= 6; i++) six.add(reader("r" + i, 1, 20L));
+        var quiet = cluster(List.of(), List.of(), six);
+        ClusterStatus.Proposal p = proposals(quiet, run(quiet, null, 0, 1800, 10), 1800).get(0);
+        assertThat(p.kind()).isEqualTo(Proposals.REMOVE_READERS);
+        assertThat(p.action()).isEqualTo("Drain and stop 5 readers");
+        assertThat(p.delta()).isEqualTo(-5);
+
+        // remove-writers: three idle writers, stop 2
+        List<StatusSnapshot.ShardObs> shards = List.of(shard("a", true, 10L, "w1", T0),
+                shard("b", true, 10L, "w2", T0), shard("c", true, 10L, "w3", T0));
+        var idle = cluster(shards, List.of(idleWriter("w1", List.of("a")), idleWriter("w2", List.of("b")),
+                idleWriter("w3", List.of("c"))), List.of());
+        ClusterStatus.Proposal w = proposals(idle, run(idle, null, 0, 1800, 10), 1800).get(0);
+        assertThat(w.kind()).isEqualTo(Proposals.REMOVE_WRITERS);
+        assertThat(w.action()).isEqualTo("Stop 2 writers; leases move");
+        assertThat(w.delta()).isEqualTo(-2);
+
+        // the delta is part of the shared state and of the events, like the action
+        StatusState st = run(idle, null, 0, 1800, 10);
+        assertThat(st.rules().values()).singleElement().satisfies(r -> assertThat(r.delta()).isEqualTo(-2));
+        List<StatusEvent> events = Proposals.events(StatusState.EMPTY, st,
+                Proposals.candidates(idle.apply(T0.plusSeconds(1800)), st, CFG));
+        assertThat(events).singleElement().satisfies(e -> assertThat(e.proposal().delta()).isEqualTo(-2));
+
+        // a node older than delta rewrites the state without it: no event, and the status still shows the
+        // delta (from the candidate, whose action matches the recorded one)
+        java.util.TreeMap<String, StatusState.Rule> stripped = new java.util.TreeMap<>();
+        st.rules().forEach((id, r) -> stripped.put(id, new StatusState.Rule(r.kind(), r.target(), r.since(),
+                r.falseSince(), r.active(), r.reason(), r.action(), null)));
+        StatusState old = new StatusState(StatusState.VERSION, st.asOf(), stripped, st.pendingSince(), st.layout());
+        var cands = Proposals.candidates(idle.apply(T0.plusSeconds(1800)), old, CFG);
+        assertThat(Proposals.events(old, st, cands)).isEmpty();
+        assertThat(proposals(idle, old, 1800).get(0).delta()).isEqualTo(-2);
+    }
+
+    @Test
+    void removeReadersLoadIsConfigurable() {
+        // 5 readers at 20 QPS each: 40% of the target; 100 QPS needs 4 readers at half load
+        List<ReaderHeartbeat> five = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) five.add(reader("r" + i, 20, 20L));
+        var at40 = cluster(List.of(), List.of(), five);
+        assertThat(proposals(at40, run(at40, null, 0, 1900, 10), 1900)).as("default 20%: not below").isEmpty();
+
+        StatusSettings half = settings(c -> c.setRemoveReadersLoad(0.5));
+        List<ClusterStatus.Proposal> ps = proposals(at40, run(at40, null, 0, 1800, 10, half), 1800, half);
+        assertThat(kinds(ps)).containsExactly(Proposals.REMOVE_READERS);
+        assertThat(ps.get(0).reason()).isEqualTo("readers below 50% load for 30 min");
+        assertThat(ps.get(0).delta()).isEqualTo(-1);
+    }
+
+    @Test
+    void writerBacklogTriggersUseConfiguredShardsAndAge() {
+        List<StatusSnapshot.ShardObs> shards = List.of(shard("a", true, 10L, "w1", T0),
+                shard("b", true, 10L, "w1", T0), shard("c", true, 10L, "w1", T0));
+        // a has waited 400 s, b 350 s, c nothing pending; one writer holds all three
+        var backlog = cluster(shards, List.of(writer("w1", List.of("a", "b", "c"),
+                Map.of("a", pending(400), "b", pending(350), "c", new WriterHeartbeat.Backlog("r", "r", false, null)),
+                null, null)), List.of());
+        java.util.function.Function<StatusSettings, List<ClusterStatus.Proposal>> at0 =
+                cfg -> proposals(backlog, Proposals.advance(backlog.apply(T0), null, cfg), 0, cfg);
+
+        // defaults: older than 300 s, at least 1 shard: both count, start 2
+        List<ClusterStatus.Proposal> d = at0.apply(CFG);
+        assertThat(kinds(d)).containsExactly(Proposals.ADD_WRITERS);
+        assertThat(d.get(0).delta()).isEqualTo(2);
+        assertThat(d.get(0).metrics()).containsEntry("shardsPendingOverTarget", 2)
+                .containsEntry("targetOldestPendingSeconds", 300L).containsEntry("targetBacklogShards", 1);
+
+        // 3 shards over the age needed: only 2 are
+        assertThat(at0.apply(settings(c -> c.getWriters().setBacklogShards(3)))).isEmpty();
+        assertThat(kinds(at0.apply(settings(c -> c.getWriters().setBacklogShards(2)))))
+                .containsExactly(Proposals.ADD_WRITERS);
+        // older than 360 s: only a, start 1; older than 400 s: none (at the threshold is not above it)
+        List<ClusterStatus.Proposal> one = at0.apply(settings(c -> c.getWriters().setOldestPendingSeconds(360L)));
+        assertThat(one).singleElement().satisfies(p -> {
+            assertThat(p.action()).isEqualTo("Start 1 writer; leases rebalance");
+            assertThat(p.delta()).isEqualTo(1);
+        });
+        assertThat(at0.apply(settings(c -> c.getWriters().setOldestPendingSeconds(400L)))).isEmpty();
+
+        // writers.idleSeconds is the remove-writers window
+        StatusSettings quick = settings(c -> c.getWriters().setIdleSeconds(600L));
+        var idle = cluster(shards, List.of(idleWriter("w1", List.of("a", "b")), idleWriter("w2", List.of("c"))),
+                List.of());
+        assertThat(proposals(idle, run(idle, null, 0, 590, 10, quick), 590, quick)).isEmpty();
+        List<ClusterStatus.Proposal> rm = proposals(idle, run(idle, null, 0, 600, 10, quick), 600, quick);
+        assertThat(kinds(rm)).containsExactly(Proposals.REMOVE_WRITERS);
+        assertThat(rm.get(0).reason()).isEqualTo("writers idle for 10 min");
     }
 }

@@ -136,7 +136,10 @@ public final class ShardClient implements AutoCloseable {
      * for the shard; it need not still be among the route's candidates), then the route's other
      * candidates, at most two attempts in all. A connection error, timeout or 5xx marks the reader
      * suspect and moves on; a 404 (shard not served there) or a synonyms mismatch moves on without
-     * marking it; a generation mismatch (409) is thrown at once.
+     * marking it; a generation mismatch (409) of the first reader tried is thrown at once. A later reader's
+     * generation mismatch only means that reader lacks the generation: it never hides an earlier reader's
+     * refusal at the right generation (a model mismatch: the shard has no vectors of the model, which the
+     * coordinator handles), and is thrown only when no other refusal explains the failure.
      *
      * @throws ShardUnavailableException when no attempt answered
      */
@@ -151,6 +154,7 @@ public final class ShardClient implements AutoCloseable {
             throw new ShardUnavailableException(route.shard(), "no live reader serves it", null);
         }
         Exception last = null;
+        GenerationMismatchException laterMismatch = null;
         int attempts = Math.min(2, candidates.size());
         for (int i = 0; i < attempts; i++) {
             ReaderHeartbeat reader = candidates.get(i);
@@ -163,12 +167,19 @@ public final class ShardClient implements AutoCloseable {
             long bound = Math.min(requestTimeout.toNanos() * 2, remaining / (attempts - i));
             try {
                 return new Answer<>(reader, callOn(reader, endpoint, request.apply(reader), bound));
+            } catch (GenerationMismatchException g) {
+                if (i == 0) throw g;
+                laterMismatch = g; // the fallback reader serves another generation of the shard
             } catch (RetryableFailure f) {
                 if (f.suspect) health.markSuspect(reader.node()); // not for a timeout the query budget cut short
                 last = f;
-            } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException n) {
+            } catch (NotServedException | SynonymsMismatchException | ModelMismatchException | BusyException
+                     | KeyFiltersRefused n) {
                 last = n; // not a sick reader
             }
+        }
+        if (laterMismatch != null && !(last instanceof ModelMismatchException) && !(last instanceof KeyFiltersRefused)) {
+            throw laterMismatch;
         }
         throw new ShardUnavailableException(route.shard(), last == null ? null : last.getMessage(), last);
     }
@@ -274,9 +285,12 @@ public final class ShardClient implements AutoCloseable {
                 if (InternalApi.MODEL_MISMATCH.equals(error)) {
                     throw new ModelMismatchException(reasonOf(body), detailOf(body));
                 }
+                if (InternalApi.KEY_FILTERS_UNSUPPORTED.equals(error)) {
+                    throw new KeyFiltersRefused(reader.node() + ": " + detailOf(body));
+                }
                 if (InternalApi.SYNONYMS_MISMATCH.equals(error)) {
                     throw new SynonymsMismatchException(reader.node() + " analyses queries with other synonyms"
-                            + " (synonyms.txt differs from this coordinator's)");
+                            + " (synonyms.txt differs from this coordinator's)", synonymsHashOf(body));
                 }
                 throw new GenerationMismatchException(reader.node(), servedGeneration(body));
             }
@@ -316,6 +330,11 @@ public final class ShardClient implements AutoCloseable {
         }
     }
 
+    /** The reader's index of the shard predates the key fields: it refuses a filtered query (not sick). */
+    private static final class KeyFiltersRefused extends ShardCallException {
+        KeyFiltersRefused(String message) { super(message); }
+    }
+
     /** This coordinator already has {@code perNodeConcurrency} calls open to the reader: try another. */
     private static final class BusyException extends ShardCallException {
         BusyException(String message) { super(message); }
@@ -325,6 +344,17 @@ public final class ShardClient implements AutoCloseable {
         try {
             return mapper.readTree(body).path("error").asText(null);
         } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** The {@code synonymsHash} of a synonyms-mismatch 409 (P6-R19); null when absent. */
+    private String synonymsHashOf(byte[] body) {
+        try {
+            JsonNode n = mapper.readTree(body);
+            JsonNode h = n == null ? null : n.get("synonymsHash");
+            return h != null && h.isTextual() ? h.asText() : null;
+        } catch (IOException | RuntimeException e) {
             return null;
         }
     }

@@ -230,12 +230,14 @@ class CompactGraphParityTest {
     @Test
     void graphViewsOpensCompactFileAndSurfacesCorruption() throws Exception {
         Path shard = Files.createDirectory(tempDir.resolve("shard-compact"));
+        com.pharos.indexer.IndexFormat.write(shard); // unstamped is format 0, below the read window
         Files.copy(compactFile, shard.resolve(GraphViews.COMPACT_FILE));
         try (GraphView g = GraphViews.open(shard)) {
             assertThat(g).isInstanceOf(CompactGraph.class);
             assertThat(g.methodCount()).isEqualTo(arcade.methodCount());
         }
         Path bad = Files.createDirectory(tempDir.resolve("shard-bad"));
+        com.pharos.indexer.IndexFormat.write(bad);
         Files.writeString(bad.resolve(GraphViews.COMPACT_FILE), "garbage");
         assertThatThrownBy(() -> GraphViews.open(bad))
                 .isInstanceOf(java.io.UncheckedIOException.class)

@@ -33,6 +33,8 @@ public final class InternalApi {
     public static final String SYNONYMS_MISMATCH = "synonyms mismatch";
     /** The {@code error} of a 409 refusing a vector request the shard has no vectors for. */
     public static final String MODEL_MISMATCH = "model mismatch";
+    /** 409: the request has key filters, and the shard's index predates the key fields. */
+    public static final String KEY_FILTERS_UNSUPPORTED = "key filters unsupported";
 
     /** Null until the shard search is wired: authenticated calls then get 503 and fail over. */
     private volatile ShardSearchService service;
@@ -111,7 +113,8 @@ public final class InternalApi {
                 throw new Rejected(503, "shard search not available");
             }
         });
-        app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard, null,
+        app.post("/internal/term-stats", ctx -> handle(ctx, TermStatsRequest.class, TermStatsRequest::shard,
+                TermStatsRequest::generation,
                 false, TermStatsResponse::generation, InternalApi::check, r -> service.termStats(r)));
         app.post("/internal/shard-search", ctx -> handle(ctx, ShardSearchRequest.class, ShardSearchRequest::shard,
                 ShardSearchRequest::generation, false, ShardSearchResponse::generation, InternalApi::check,
@@ -163,7 +166,7 @@ public final class InternalApi {
             error(ctx, 404, "shard not served here: " + shard);
             return;
         }
-        if (wanted != null && wanted != served.getAsLong()) {
+        if (wanted != null && wanted != served.getAsLong() && !service.servesGeneration(shard, wanted)) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", "generation mismatch",
                             "servedGeneration", served.getAsLong())));
@@ -178,13 +181,23 @@ public final class InternalApi {
                 return;
             }
             ctx.status(200).contentType("application/json").result(mapper.writeValueAsBytes(response));
+        } catch (GenerationUnavailableException e) { // P6-R21: the planned version's generation is gone here
+            ctx.status(409).contentType("application/json")
+                    .result(mapper.writeValueAsBytes(Map.of("error", "generation mismatch",
+                            "servedGeneration", e.servedGeneration(), "detail", e.getMessage())));
         } catch (ModelMismatchException e) {
             ctx.status(409).contentType("application/json")
                     .result(mapper.writeValueAsBytes(Map.of("error", MODEL_MISMATCH, "detail", e.getMessage(),
                             "reason", e.reason().name())));
-        } catch (SynonymsMismatchException e) {
+        } catch (com.pharos.search.KeyFiltersUnsupportedException e) {
             ctx.status(409).contentType("application/json")
-                    .result(mapper.writeValueAsBytes(Map.of("error", SYNONYMS_MISMATCH, "detail", e.getMessage())));
+                    .result(mapper.writeValueAsBytes(Map.of("error", KEY_FILTERS_UNSUPPORTED, "detail", e.getMessage())));
+        } catch (SynonymsMismatchException e) {
+            Map<String, Object> out = new java.util.LinkedHashMap<>();
+            out.put("error", SYNONYMS_MISMATCH);
+            out.put("detail", e.getMessage());
+            if (e.servedHash() != null) out.put("synonymsHash", e.servedHash()); // P6-R19
+            ctx.status(409).contentType("application/json").result(mapper.writeValueAsBytes(out));
         } catch (Exception e) {
             log.warn("internal call on shard '{}' failed: {}", shard, e.toString());
             error(ctx, 500, "internal error");

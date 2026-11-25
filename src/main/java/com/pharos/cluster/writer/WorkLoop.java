@@ -11,6 +11,8 @@ import com.pharos.cluster.objectstore.ObjectStore;
 import com.pharos.cluster.objectstore.ObjectStoreCatalog;
 import com.pharos.cluster.objectstore.ObjectStoreLayout;
 import com.pharos.cluster.objectstore.ShardManifest;
+import com.pharos.cluster.sharding.ProjectShards;
+import com.pharos.cluster.sharding.ShardPlan;
 import com.pharos.config.ProjectMeta;
 import com.pharos.config.ProjectRegistry;
 import com.pharos.indexer.IndexAbort;
@@ -63,6 +65,18 @@ import java.util.concurrent.locks.ReentrantLock;
  *   <li>release surplus shards that have nothing unpublished (a clean point too).</li>
  * </ol>
  *
+ * <p><b>Work units</b> (ruling P6-R1). The loop works on projects, as the catalog's project mapping
+ * ({@link ProjectShards}) lists them; a unit is keyed by {@code ShardId.ofProject(project)}. A
+ * {@code [project]} project is one shard, so its unit is that shard and everything below reads exactly
+ * as in Phase 4. A project split into N shards is one unit too: one source, one checkout, one local
+ * index dir, one run (one parse pass feeding N shard writers) and one publish of all N shards; the
+ * balancer counts it once. Its N shard leases are taken all or none (in id order; a partial acquisition
+ * is released at once), renewed and released together, and a unit whose leases are not all held any
+ * more (one was lost) is dropped and its remaining leases released. A split project's source is that
+ * of its first shard with one, else that of the catalog entry named after the project (its source
+ * before the split). When the catalog maps a held project to other shards (a reshard flip), its leases
+ * are released and the new set is acquired like any free unit.
+ *
  * <p><b>Shards without a source</b> (indexed by hand before work-queue mode) can only be indexed
  * where their files are. A writer whose registry has such a shard with an existing root directory
  * <i>pins</i> it: it takes the shard's lease whenever free (a real lease, so two writers that both
@@ -107,7 +121,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p><b>Lost lease</b>: when the renewer (or the publish check) sees the lease of the shard being
  * run definitely lost (taken over, or gone), the run is aborted at its next safe point
  * ({@link #leaseLost}): its publish could only fail the lease check. A renewal that merely failed
- * (an I/O error or its deadline) does not abort it.
+ * (an I/O error or its deadline) does not abort it: the renewer re-reads that lease every round
+ * ({@link LeaseManager#renewAll}) and reclaims it once the bucket answers with this writer's ETag, so
+ * the run publishes; a re-read that finds the lease taken reports a definite loss and aborts the run.
  *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
@@ -155,6 +171,12 @@ public final class WorkLoop implements Closeable {
 
     /** What the loop knows about one held shard. Written by the loop thread, read by the heartbeat. */
     private static final class ShardState {
+        /** The unit's plan when its leases were acquired ({@link ShardPlan#single} for {@code [project]}). */
+        volatile ShardPlan plan;
+        /** The shard leases this unit holds: the unit itself for {@code [project]}, else its N shards. */
+        volatile List<ShardId> leaseShards = List.of();
+        /** The {@code LATEST} generation of each lease shard when {@link #publishedRevision} was read. */
+        volatile List<Generation> publishedGens;
         volatile ShardSource source;
         volatile boolean pinned;
         volatile boolean prepared;
@@ -183,6 +205,12 @@ public final class WorkLoop implements Closeable {
         volatile String localUpgrade;
         /** Why this shard needs a full run though its source is unchanged; null when it doesn't. */
         volatile String upgrade;
+        /**
+         * Why a reshard step needs a full run of this project first (a takeover restored an index built
+         * under another checkout path, or a writer state older than its generation); kept until a full run
+         * commits, so every poll keeps the project pending ({@link #upgradeReason}) and the run happens.
+         */
+        volatile String fullRunFirst;
         /** {@code file-state.json} size and mtime when {@link #embeddingsOutdated} was computed. */
         long stateStamp = Long.MIN_VALUE;
         boolean stateEmbed;
@@ -192,6 +220,8 @@ public final class WorkLoop implements Closeable {
     /** The run in progress. */
     private static final class Run {
         final ShardId shard;
+        /** The shard leases of the unit being run: the ones its publish may commit. */
+        final List<ShardId> leaseShards;
         final Thread thread = Thread.currentThread();
         final IndexAbort abort = new IndexAbort();
         final long startedAt;
@@ -202,8 +232,9 @@ public final class WorkLoop implements Closeable {
         /** What the run had consumed when the guard aborted it for low disk; -1 when it didn't. */
         volatile long consumedAtDiskAbort = -1;
 
-        Run(ShardId shard, long startedAt) {
+        Run(ShardId shard, List<ShardId> leaseShards, long startedAt) {
             this.shard = shard;
+            this.leaseShards = List.copyOf(leaseShards);
             this.startedAt = startedAt;
         }
 
@@ -247,9 +278,18 @@ public final class WorkLoop implements Closeable {
     private final WriterRegistry members;
     private final LeaseManager leases;
     private final DiskGuard disk;            // null: no disk guard
+    private final ObjectStore store;
+    private final ObjectStoreLayout layout;
+    /** Runs the projects' reshards; null until {@link #enableResharding}. */
+    private volatile com.pharos.cluster.sharding.ReshardJob reshard;
+    /** The catalog mapping of the last tick. */
+    private volatile ProjectShards lastMap = ProjectShards.identity(List.of());
     private final long startedAt;
 
+    /** The held work units (see the class javadoc), keyed by {@code ShardId.ofProject(project)}. */
     private final Map<ShardId, ShardState> shards = new ConcurrentHashMap<>();
+    /** The catalog's units as last read: each unit's plan. */
+    private volatile Map<ShardId, ShardPlan> plans = Map.of();
     private final Map<ShardId, Integer> publishes = new ConcurrentHashMap<>();
     private volatile Set<ShardId> pinnedMine = Set.of();
     private volatile Run current;
@@ -270,6 +310,8 @@ public final class WorkLoop implements Closeable {
     private ScheduledExecutorService diskWatch;
     /** Change detection at a fixed rate, on its own thread: it runs while the loop thread indexes. */
     private ScheduledExecutorService detector;
+    /** Renews the reshard leases while their units are held (see {@link #renewReshardLeases}). */
+    private ScheduledExecutorService reshardRenewer;
     private volatile boolean stopping;
     private final ReentrantLock tickLock = new ReentrantLock();
     private final Object stopMu = new Object();
@@ -301,6 +343,8 @@ public final class WorkLoop implements Closeable {
                     LuceneIndexer lucene, ProjectRegistry projects, SourceCheckout checkout, Clock clock,
                     DiskGuard disk) {
         this.disk = disk;
+        this.store = Objects.requireNonNull(store, "store");
+        this.layout = Objects.requireNonNull(layout, "layout");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.replicas = Objects.requireNonNull(replicas, "replicas");
@@ -309,6 +353,7 @@ public final class WorkLoop implements Closeable {
         this.lucene = Objects.requireNonNull(lucene, "lucene");
         this.projects = Objects.requireNonNull(projects, "projects");
         this.checkout = Objects.requireNonNull(checkout, "checkout");
+        checkout.useProjects(s -> lastMap.projectOf(s)); // credentials by project, also for keyed shards (I3a)
         this.clock = Objects.requireNonNull(clock, "clock");
         this.balancer = new Balancer(settings.minHold());
         this.startedAt = clock.millis();
@@ -323,14 +368,15 @@ public final class WorkLoop implements Closeable {
      * A held lease was seen lost (renewer thread, or the publish check). A definite loss (another
      * writer took it, or it is gone) aborts the run of that shard at its next safe point instead of
      * parsing, embedding and committing for nothing. An ambiguous one (a renewal's I/O error or
-     * deadline on a slow bucket) does not: the lease is often still ours and reclaimed on the next
-     * tick, and aborting would make the next run full again; the run commits locally, its publish
-     * re-checks the lease, and the next (incremental) run publishes. A run past its commit finishes;
-     * its publish fails the lease check.
+     * deadline on a slow bucket) does not: the lease is often still ours, and aborting would make the
+     * next run full again. The renewer re-reads it every round: reclaimed, the run publishes; found
+     * taken, it is reported again as definite and the run is aborted then. A run past its commit
+     * finishes; its publish fails the lease check if the lease is still unconfirmed or lost.
      */
     private void leaseLost(LeaseManager.Lost lost) {
         Run r = current;
-        if (r == null || !r.shard.equals(lost.shard())) return;
+        // a split project's run holds one lease per shard under its unit (the project's id): any of them counts
+        if (r == null || !(r.shard.equals(lost.shard()) || r.leaseShards.contains(lost.shard()))) return;
         if (!lost.definite()) {
             log.info("Shard {}: writer {} could not confirm its lease ({}); the run goes on, its publish re-checks"
                     + " the lease", lost.shard(), settings.node(), lost.why());
@@ -351,6 +397,9 @@ public final class WorkLoop implements Closeable {
             if (stopped || scheduler != null) return;
             members.start();
             leases.start();
+            // the reshard lease is renewed on its own thread too: a reshard build runs inside a tick, which
+            // would otherwise not renew it for the whole build (any build longer than the TTL lost it)
+            if (reshard != null) startReshardRenewer();
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "pharos-writer-work-loop");
                 t.setDaemon(true);
@@ -400,15 +449,23 @@ public final class WorkLoop implements Closeable {
             members.beat();
             if (!members.lastWriteOk()) return; // can't tell "peers are gone" from "the bucket is unreachable"
             leases.renewAll();
+            com.pharos.cluster.sharding.ReshardJob job = reshard;
             forgetLost();
-            List<ShardEntry> entries;
+            if (job != null) {
+                // a reshard lease lives only as long as its project's work unit here
+                Set<ShardId> held = heldSet();
+                for (Lease l : job.leases().held()) if (!held.contains(l.shard())) job.releaseLease(l.shard());
+                job.leases().renewAll();
+            }
+            ObjectStoreCatalog.View view;
             try {
-                entries = catalog.entries();
+                view = catalog.view();
             } catch (IOException | RuntimeException e) {
                 log.warn("Reading the shard catalog failed (retrying next poll): {}", e.toString());
                 return;
             }
-            Map<ShardId, ShardSource> sources = resolveSources(entries);
+            lastMap = view.projects();
+            Map<ShardId, ShardSource> sources = resolveSources(view.entries(), view.projects());
             if (diskLow()) {
                 if (!announcedLow) {
                     announcedLow = true;
@@ -427,10 +484,18 @@ public final class WorkLoop implements Closeable {
                 acquire(sources);
             }
             members.beat(); // announce the leases now, before a long run
+            Set<ShardId> noRun = finishFlips(view.projects());
             List<ShardId> pending = poll();
             for (ShardId shard : pending) {
                 if (stopping) return;
-                if (!leases.isHeld(shard)) continue;
+                if (!unitHeld(shard)) continue;
+                if (noRun.contains(shard)) continue;
+                if (job != null && (job.builtLocally(shard.value(), view.projects()) || reshardPinned(shard))) {
+                    // an index run now would publish the active version under the staged one's feet: the flip
+                    // (or a cancel) comes first
+                    log.debug("Project {}: its reshard is built and waits for the flip; no index run now", shard);
+                    continue;
+                }
                 if (diskLow()) {
                     log.info("Shard {}: not indexing, writer {} is low on disk", shard, settings.node());
                     continue;
@@ -445,6 +510,7 @@ public final class WorkLoop implements Closeable {
                 }
                 members.beat();
             }
+            reshardSteps(view.projects());
             // a shard whose source checks keep failing (an unreachable remote) is released like a failing run's
             for (ShardId shard : shards.keySet().stream().sorted(Comparator.comparing(ShardId::value)).toList()) {
                 ShardState st = shards.get(shard);
@@ -465,27 +531,53 @@ public final class WorkLoop implements Closeable {
         }
     }
 
-    /** The shards of the catalog this writer could index, with their source; pins source-less local ones. */
-    private Map<ShardId, ShardSource> resolveSources(List<ShardEntry> entries) {
+    /**
+     * The units (projects) of the catalog this writer could index, with their source; pins source-less
+     * local ones. Also records each unit's plan, and releases held units the catalog no longer lists, or
+     * maps to other shards.
+     */
+    private Map<ShardId, ShardSource> resolveSources(List<ShardEntry> entries, ProjectShards mapping) {
+        Map<ShardId, Optional<ShardSource>> sourceOf = new LinkedHashMap<>();
+        for (ShardEntry e : entries) sourceOf.put(e.id(), e.source());
         Map<ShardId, ShardSource> out = new LinkedHashMap<>();
+        Map<ShardId, ShardPlan> unitPlans = new LinkedHashMap<>();
         Set<ShardId> pins = new HashSet<>();
-        for (ShardEntry e : entries) {
-            if (e.source().isPresent()) {
-                out.put(e.id(), e.source().get());
+        for (String project : mapping.projects()) {
+            ShardId unit = ShardId.ofProject(project);
+            ShardPlan plan = ShardPlan.of(mapping, project);
+            // the entry named after the project first: registration (pharos index/publish with a source, the
+            // operator's Job) always writes it, so a new url or ref wins over a split project's shards, whose
+            // copies a reshard wrote (integration carry I5); a split project's shards may also carry none yet
+            Optional<ShardSource> source = sourceOf.getOrDefault(unit, Optional.empty());
+            for (ShardId s : plan.clusterShards()) {
+                if (source.isPresent()) break;
+                source = sourceOf.getOrDefault(s, Optional.empty());
+            }
+            if (source.isPresent()) {
+                out.put(unit, source.get());
+                unitPlans.put(unit, plan);
                 continue;
             }
-            Optional<ProjectMeta> local = projects.find(e.id().value());
+            Optional<ProjectMeta> local = projects.find(project);
             if (local.isPresent() && local.get().getRootPath() != null
                     && Files.isDirectory(Path.of(local.get().getRootPath()))) {
-                out.put(e.id(), ShardSource.path(local.get().getRootPath()));
-                pins.add(e.id());
+                out.put(unit, ShardSource.path(local.get().getRootPath()));
+                unitPlans.put(unit, plan);
+                pins.add(unit);
             }
         }
+        plans = Map.copyOf(unitPlans);
         pinnedMine = Set.copyOf(pins);
-        // a held shard that left the catalog (or lost its source here) is released
+        // a held unit that left the catalog (or lost its source here), or whose shards changed, is released
         for (ShardId held : heldSet()) {
-            if (!out.containsKey(held)) {
+            ShardState st = shards.get(held);
+            ShardPlan plan = unitPlans.get(held);
+            if (plan == null) {
                 log.info("Shard {} is no longer workable here (not in the catalog, or no source); releasing it", held);
+                release(held);
+            } else if (st != null && !plan.clusterShards().equals(st.leaseShards)) {
+                log.info("Project {} is now mapped to shards {} (was {}); releasing its leases", held,
+                        plan.clusterShards(), st.leaseShards);
                 release(held);
             }
         }
@@ -522,7 +614,7 @@ public final class WorkLoop implements Closeable {
     /** Takes the pinned shards, then free or expired leases up to the share. @return the share */
     private int acquire(Map<ShardId, ShardSource> sources) {
         for (ShardId pin : pinnedMine) {
-            if (!leases.isHeld(pin)) tryAcquire(pin, sources.get(pin));
+            if (!unitHeld(pin)) tryAcquire(pin, sources.get(pin));
         }
         int share = currentShare(sources);
         Set<ShardId> held = heldSet();
@@ -547,14 +639,36 @@ public final class WorkLoop implements Closeable {
         return share;
     }
 
+    /**
+     * Acquires every shard lease of {@code unit}, in id order, or none: a lease that cannot be taken
+     * releases the ones this attempt took.
+     */
     private boolean tryAcquire(ShardId shard, ShardSource source) {
-        try {
-            if (leases.tryAcquire(shard).isEmpty()) return false;
-        } catch (IOException e) {
-            log.warn("Acquiring the lease of shard {} failed: {}", shard, e.toString());
-            return false;
+        ShardPlan plan = plans.get(shard);
+        if (plan == null) plan = ShardPlan.single(shard.value());
+        List<ShardId> wanted = plan.clusterShards().stream().sorted(Comparator.comparing(ShardId::value)).toList();
+        List<Lease> taken = new ArrayList<>();
+        for (ShardId s : wanted) {
+            Optional<Lease> lease;
+            try {
+                lease = leases.tryAcquire(s);
+            } catch (IOException e) {
+                log.warn("Acquiring the lease of shard {} failed: {}", s, e.toString());
+                lease = Optional.empty();
+            }
+            if (lease.isEmpty()) {
+                if (!taken.isEmpty()) {
+                    log.info("Project {}: lease of shard {} not available; releasing the {} lease(s) taken (all or"
+                            + " none)", shard, s, taken.size());
+                }
+                taken.forEach(leases::release);
+                return false;
+            }
+            taken.add(lease.get());
         }
         ShardState st = new ShardState();
+        st.plan = plan;
+        st.leaseShards = plan.clusterShards();
         st.source = source;
         st.pinned = pinnedMine.contains(shard);
         st.acquiredAt = clock.instant();
@@ -562,14 +676,26 @@ public final class WorkLoop implements Closeable {
         return true;
     }
 
-    /** Drops the state of shards whose lease was lost (taken over, a failed renewal). */
+    /**
+     * Drops the state of units a lease of which was lost (taken over, a failed renewal), releasing the
+     * unit's other leases, and releases leases that belong to no held unit.
+     */
     private void forgetLost() {
-        Set<ShardId> held = heldSet();
+        Set<ShardId> leased = leasedShards();
         for (ShardId s : new ArrayList<>(shards.keySet())) {
-            if (!held.contains(s)) {
+            ShardState st = shards.get(s);
+            if (st != null && !leased.containsAll(st.leaseShards)) {
                 shards.remove(s);
+                for (Lease l : leases.held()) if (st.leaseShards.contains(l.shard())) leases.release(l);
+                com.pharos.cluster.sharding.ReshardJob job = reshard;
+                if (job != null) job.releaseLease(s);
                 log.warn("Writer {} no longer holds the lease of shard {}; stopped working on it", settings.node(), s);
             }
+        }
+        Set<ShardId> owned = new HashSet<>();
+        for (ShardState st : shards.values()) owned.addAll(st.leaseShards);
+        for (Lease l : leases.held()) {
+            if (!owned.contains(l.shard())) leases.release(l);
         }
     }
 
@@ -704,18 +830,44 @@ public final class WorkLoop implements Closeable {
 
     /** The source revision {@code LATEST} holds (from its manifest's project meta); null when unknown. */
     private void refreshPublished(ShardId shard, ShardState st) throws IOException {
-        Optional<Generation> latest = replicas.latest(shard);
-        if (latest.isEmpty()) {
-            st.publishedGeneration = null;
-            st.publishedRevision = null;
-            return;
+        List<Generation> gens = new ArrayList<>();
+        for (ShardId s : st.leaseShards) {
+            Optional<Generation> latest = replicas.latest(s);
+            if (latest.isEmpty()) {
+                // a shard of the unit was never published: the unit is unpublished
+                st.publishedGeneration = null;
+                st.publishedGens = null;
+                st.publishedRevision = null;
+                return;
+            }
+            gens.add(latest.get());
         }
-        if (latest.get().equals(st.publishedGeneration)) return;
-        ShardManifest manifest = replicas.manifest(shard, latest.get());
-        ProjectMeta meta = manifest.projectMeta();
-        st.publishedRevision = meta == null ? null : meta.getSourceRevision();
-        st.publishedFormat = manifest.indexFormatVersion();
-        st.publishedGeneration = latest.get();
+        if (gens.equals(st.publishedGens)) return;
+        String revision = null;
+        boolean oneRun = true;
+        int format = Integer.MAX_VALUE;
+        List<String> projectFiles = null;
+        for (int i = 0; i < gens.size(); i++) {
+            ShardManifest manifest = replicas.manifest(st.leaseShards.get(i), gens.get(i));
+            ProjectMeta meta = manifest.projectMeta();
+            String r = meta == null ? null : meta.getSourceRevision();
+            // one run's content: the same project files (a reshard's rewritten shards carry a new run number,
+            // P6-R21, but the content, and so the project files, of the run they split)
+            List<String> files = manifest.projectFileList().stream().map(f -> f.key()).sorted().toList();
+            if (i == 0) {
+                revision = r;
+                projectFiles = files;
+            } else if (!Objects.equals(r, revision) || !Objects.equals(projectFiles, files)) {
+                oneRun = false;
+            }
+            format = Math.min(format, manifest.indexFormatVersion());
+        }
+        // the shards of a split project published by different runs (a publish that stopped between two
+        // shards): no revision covers the unit, so it is pending, and its next run publishes every shard
+        st.publishedRevision = oneRun ? revision : null;
+        st.publishedFormat = format;
+        st.publishedGeneration = gens.getFirst();
+        st.publishedGens = List.copyOf(gens);
     }
 
     /**
@@ -730,7 +882,7 @@ public final class WorkLoop implements Closeable {
             return "the published generation " + st.publishedGeneration.value() + " has index format "
                     + st.publishedFormat + ", this writer indexes format " + com.pharos.indexer.IndexVersions.INDEX_FORMAT;
         }
-        return st.localUpgrade;
+        return st.localUpgrade != null ? st.localUpgrade : st.fullRunFirst;
     }
 
     /**
@@ -742,7 +894,7 @@ public final class WorkLoop implements Closeable {
      */
     String localUpgradeReason(ShardId shard, ShardState st) {
         if (!lucene.indexExists(shard.value())) return null;
-        String reason = indexer.fullRunReason(shard.value());
+        String reason = indexer.fullRunReason(shard.value(), planOf(st, shard));
         if (reason != null) return reason;
         Path dir = lucene.getProjectIndexDir(shard.value());
         Path state = dir.resolve("file-state.json");
@@ -816,45 +968,10 @@ public final class WorkLoop implements Closeable {
         if (!lucene.indexExists(shard.value())) {
             // the restore downloads the published generation, then (at worst) a full run follows
             if (!admitted(shard, estimateWithoutLocalIndex(shard, root))) return Outcome.REFUSED;
-            requireRestorable(shard);
-            Optional<WriterStateStore.Restored> restored;
-            try {
-                restored = writerState.restore(shard, indexDir);
-            } catch (IOException e) {
-                // a store outage: retry later rather than paying for a full re-embed now
-                log.warn("Restoring the writer state of shard {} failed (retrying next poll): {}", shard, e.toString());
-                return Outcome.FAILED;
-            }
-            if (restored.isPresent()) {
-                Generation gen = restored.get().generation();
-                String originalRoot;
-                try {
-                    // before registering: a run that dies before its commit must not be followed by an
-                    // incremental one on the mismatched file state (the marker goes after a publish)
-                    if (!restored.get().stateMatches()) Files.writeString(indexDir.resolve(FULL_RUN_REQUIRED), "");
-                    originalRoot = registerRestored(shard, gen, root, indexDir);
-                } catch (IOException | RuntimeException e) {
-                    log.warn("Registering the restored shard {} failed (retrying next poll): {}", shard, e.toString());
-                    return Outcome.FAILED;
-                }
-                if (!restored.get().stateMatches()) {
-                    // the file state is an older generation's: it doesn't describe the restored documents
-                    // (a file added since and deleted again would keep its documents in an incremental run)
-                    full = true;
-                    why = "restored generation " + gen.value() + " with the writer state of generation "
-                            + restored.get().stateGeneration().value();
-                } else if (!sameRoot(originalRoot, root)) {
-                    full = true;
-                    why = "restored generation " + gen.value() + " was indexed under " + originalRoot
-                            + ", this writer checks out at " + root;
-                } else {
-                    full = false;
-                    why = "restored generation " + gen.value();
-                }
-            } else {
-                full = true;
-                why = "no usable writer state to resume from";
-            }
+            Restore r = restoreLocal(shard, st, root, indexDir);
+            if (r == null) return Outcome.FAILED;
+            full = r.full();
+            why = r.why();
         } else {
             Optional<ProjectMeta> local = projects.find(shard.value());
             if (local.isEmpty()) {
@@ -879,7 +996,7 @@ public final class WorkLoop implements Closeable {
         if (full) log.warn("Shard {}: running a FULL index ({})", shard, why);
         else log.info("Shard {}: incremental index from {}", shard, why);
 
-        Run run = new Run(shard, clock.millis());
+        Run run = new Run(shard, st.leaseShards, clock.millis());
         run.freeAtStart = disk == null ? -1 : admittedFree;
         current = run;
         try {
@@ -887,15 +1004,17 @@ public final class WorkLoop implements Closeable {
             if (diskLow()) run.abort.request("writer low on disk");
             String headAtStart = st.sourceRevision;
             indexer.index(root, shard.value(), !full, false, embeds(shard), settings.buildSynonyms(),
-                    run.listener(), run.abort, revision);
+                    run.listener(), run.abort, revision, planOf(st, shard));
             st.pollLock.lock();
             try {
                 if (full) { // rebuilt by this release: nothing left to upgrade
                     st.localUpgrade = null;
                     st.upgrade = null;
+                    st.fullRunFirst = null;
                 }
                 st.publishedRevision = revision;
                 st.publishedGeneration = null; // re-read on the next poll
+                st.publishedGens = null;
                 String head = st.sourceRevision;
                 if (head != null && !head.equals(headAtStart) && !head.equals(revision)) {
                     // the detector saw a newer source during the run: still pending after this publish
@@ -909,7 +1028,7 @@ public final class WorkLoop implements Closeable {
             }
             if (full) Files.deleteIfExists(indexDir.resolve(FULL_RUN_REQUIRED));
             publishes.merge(shard, 1, Integer::sum);
-            leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::renew);
+            renewUnit(st);
             estimateFloor.remove(shard);
             return Outcome.PUBLISHED;
         } catch (IndexAbortedException e) {
@@ -922,12 +1041,13 @@ public final class WorkLoop implements Closeable {
             }
             return Outcome.ABORTED;
         } catch (PublishConflictException e) {
-            if (!leases.isHeld(shard)) {
-                shards.remove(shard);
+            if (!unitHeld(shard)) {
+                release(shard);
                 log.warn("Shard {} not published: writer {} lost its lease and stops working on it ({})", shard,
                         settings.node(), e.getMessage());
             } else {
                 st.publishedGeneration = null;
+                st.publishedGens = null;
                 log.warn("Shard {} not published ({}); retrying next poll from the new LATEST", shard, e.getMessage());
             }
             return Outcome.CONFLICT;
@@ -936,6 +1056,299 @@ public final class WorkLoop implements Closeable {
             return Outcome.FAILED;
         } finally {
             current = null;
+        }
+    }
+
+    /** What a restore came to: whether the next run must be full, and why (or from what it resumes). */
+    private record Restore(boolean full, String why) {}
+
+    /**
+     * Restores the writer state of {@code shard} (this writer has no local index of it) and registers
+     * it; null when the store failed (logged; retried next poll).
+     */
+    private Restore restoreLocal(ShardId shard, ShardState st, Path root, Path indexDir) {
+        requireRestorable(shard);
+        Optional<WriterStateStore.Restored> restored;
+        try {
+            ShardPlan plan = planOf(st, shard);
+            restored = plan.isSplit() ? writerState.restoreProject(plan, indexDir)
+                    : writerState.restore(shard, indexDir);
+        } catch (IOException e) {
+            // a store outage: retry later rather than paying for a full re-embed now
+            log.warn("Restoring the writer state of shard {} failed (retrying next poll): {}", shard, e.toString());
+            return null;
+        }
+        if (restored.isEmpty()) return new Restore(true, "no usable writer state to resume from");
+        Generation gen = restored.get().generation();
+        String originalRoot;
+        try {
+            // before registering: a run that dies before its commit must not be followed by an
+            // incremental one on the mismatched file state (the marker goes after a publish)
+            if (!restored.get().stateMatches()) Files.writeString(indexDir.resolve(FULL_RUN_REQUIRED), "");
+            originalRoot = registerRestored(shard, st, gen, root, indexDir);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Registering the restored shard {} failed (retrying next poll): {}", shard, e.toString());
+            return null;
+        }
+        if (!restored.get().stateMatches()) {
+            // the file state is an older generation's: it doesn't describe the restored documents
+            // (a file added since and deleted again would keep its documents in an incremental run)
+            return new Restore(true, "restored generation " + gen.value() + " with the writer state of generation "
+                    + restored.get().stateGeneration().value());
+        }
+        if (!sameRoot(originalRoot, root)) {
+            return new Restore(true, "restored generation " + gen.value() + " was indexed under " + originalRoot
+                    + ", this writer checks out at " + root);
+        }
+        return new Restore(false, "restored generation " + gen.value());
+    }
+
+    // ------------------------------------------------------------------------------ resharding
+
+    /**
+     * Turns on resharding (Phase 6 Task 4): this loop runs the {@link ReshardJob} of the projects it holds
+     * (one step per tick), finishes interrupted flips before any run, and GCs retired versions.
+     */
+    public void enableResharding(com.pharos.cluster.objectstore.ObjectStorePublisher publisher,
+                                 com.pharos.cluster.objectstore.GenerationGc gc,
+                                 java.util.function.Supplier<List<com.pharos.cluster.membership.ReaderHeartbeat>> readers,
+                                 com.pharos.cluster.sharding.ReshardJob.Settings reshardSettings) {
+        LeaseManager reshardLeases = new LeaseManager(store, layout, settings.node(), settings.leaseTtl(),
+                members::bucketNow, clock, id -> layout.reshardLeaseKey(id.value()));
+        reshardLeases.onLost(this::reshardLeaseLost);
+        this.reshard = new com.pharos.cluster.sharding.ReshardJob(settings.node(), store, layout, catalog, publisher,
+                replicas, writerState, indexer, lucene, reshardLeases, readers, gc, clock, reshardSettings);
+        synchronized (stopMu) {
+            if (scheduler != null) startReshardRenewer(); // enabled after start(): renew from now on
+        }
+    }
+
+    /** Holding stopMu: renews the reshard leases every TTL/3 on their own thread. */
+    private void startReshardRenewer() {
+        if (reshardRenewer != null || stopped) return;
+        reshardRenewer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pharos-writer-reshard-lease");
+            t.setDaemon(true);
+            return t;
+        });
+        long every = Math.max(1, settings.leaseTtl().dividedBy(3).toMillis());
+        reshardRenewer.scheduleWithFixedDelay(this::renewReshardLeasesQuietly, every, every, TimeUnit.MILLISECONDS);
+    }
+
+    /** The reshard lease of a project was seen lost: a definite loss aborts that project's build. */
+    private void reshardLeaseLost(LeaseManager.Lost lost) {
+        if (!lost.definite()) return; // re-read every reshard renewal round (renewReshardLeases)
+        Run r = current;
+        if (r != null && r.shard.equals(lost.shard())
+                && r.abort.request("writer " + settings.node() + " lost the reshard lease of " + lost.shard())) {
+            log.warn("Reshard of project {}: writer {} lost its reshard lease ({}); aborting the build at its next"
+                    + " safe point", lost.shard(), settings.node(), lost.why());
+        }
+    }
+
+    private void renewReshardLeasesQuietly() {
+        try {
+            renewReshardLeases();
+        } catch (RuntimeException e) {
+            log.warn("Renewing the reshard leases failed (retried next interval): {}", e.toString());
+        }
+    }
+
+    /**
+     * Renews each reshard lease while this writer holds every shard lease of its project's work unit
+     * (a reshard runs only on the unit's holder). Once the unit is definitely lost (a lease taken over
+     * or gone) the running build of that project is aborted and the reshard lease released at once, so
+     * the writer that holds the project now takes the reshard over without waiting out the TTL. A unit
+     * whose leases are only unconfirmed (a renewal's I/O error or deadline: most likely still ours, as
+     * for a run, see {@link #leaseLost}) keeps its build and its reshard lease: the lease manager's
+     * renewal round re-reads those leases and either reclaims them (the build stages and flips) or finds
+     * one taken, a definite loss, which the next round here acts on as above. An unconfirmed reshard
+     * lease is re-read here the same way first.
+     */
+    void renewReshardLeases() {
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        if (job == null) return;
+        job.leases().reconfirmUnconfirmed();
+        for (Lease l : job.leases().held()) {
+            ShardId unit = l.shard();
+            if (unitHeld(unit)) {
+                job.leases().renew(l);
+                continue;
+            }
+            if (unitUnconfirmed(unit)) {
+                log.info("Reshard of project {}: writer {} could not confirm the project's shard leases; the build"
+                        + " goes on and its reshard lease is kept", unit, settings.node());
+                job.leases().renew(l);
+                continue;
+            }
+            Run r = current;
+            if (r != null && r.shard.equals(unit)) {
+                r.abort.request("this writer lost the shard leases of project " + unit);
+            }
+            log.warn("Reshard of project {}: this writer no longer holds the project's shard leases; releasing its"
+                    + " reshard lease", unit);
+            job.releaseLease(unit);
+        }
+    }
+
+    /** Tests only: a run of {@code unit} is in progress; its abort. */
+    IndexAbort runningForTest(ShardId unit) {
+        tickLock.lock(); // after a tick in progress, which clears current when it ends
+        try {
+            Run r = new Run(unit, List.of(unit), clock.millis());
+            current = r;
+            return r.abort;
+        } finally {
+            tickLock.unlock();
+        }
+    }
+
+    /** The reshard job, when {@link #enableResharding} turned it on. */
+    public Optional<com.pharos.cluster.sharding.ReshardJob> reshardJob() {
+        return Optional.ofNullable(reshard);
+    }
+
+    /**
+     * Before any run: moves the {@code LATEST} of the held projects' pinned shards that lag their pins (a
+     * flip whose finish was interrupted). Returns the units that could not be finished: no run of them
+     * this tick (it would number its generations from the old {@code LATEST}).
+     */
+    private Set<ShardId> finishFlips(ProjectShards map) {
+        Set<ShardId> unfinished = new HashSet<>();
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        for (ShardId unit : heldSet()) {
+            String project = unit.value();
+            if (map.pinsOf(project).isEmpty()) continue;
+            try {
+                if (job != null) job.finish(project, map, leases);
+                else unfinished.add(unit);
+            } catch (IOException | RuntimeException e) {
+                log.warn("Project {}: finishing its reshard flip failed (no run until it is): {}", project, e.toString());
+                unfinished.add(unit);
+            }
+        }
+        return unfinished;
+    }
+
+    /** Marks the unit pending with a full run, which stays pending until a full run commits. */
+    private void needFullRunFirst(ShardState st, String why) {
+        st.fullRunFirst = why;
+        st.upgrade = why;
+        if (st.pendingSince == null) st.pendingSince = clock.instant();
+    }
+
+    /**
+     * One reshard step per held project with a reshard requested (and GC of retired versions for every
+     * held project). The step needs this writer's local index of the active version's published run: a
+     * pending project runs its index first; a project without a local index is restored first.
+     */
+    private void reshardSteps(ProjectShards map) {
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        if (job == null) return;
+        for (ShardId unit : heldSet().stream().sorted(Comparator.comparing(ShardId::value)).toList()) {
+            if (stopping) return;
+            String project = unit.value();
+            job.collect(project, map);
+            if (map.reshardRequestOf(project).isEmpty()) continue;
+            ShardState st = shards.get(unit);
+            if (st == null || diskLow()) continue;
+            boolean built = job.builtLocally(project, map);
+            // A pinned reshard is published: the step only waits for the readers and flips, which needs neither a
+            // local build nor the source. It goes first whatever else the project waits for (a source change, a
+            // restore or a full run): those are done after the flip, on the new version.
+            boolean pinned = reshardPinned(unit);
+            if (!pinned && st.pendingSince != null && !built) continue; // the source changed: its index run goes first
+            busy = unit;
+            try {
+                Path indexDir = lucene.getProjectIndexDir(project);
+                Path root = indexDir; // unused by a pinned step
+                if (!pinned) {
+                    try {
+                        root = checkout.prepare(unit, st.source).toAbsolutePath().normalize();
+                        st.prepared = true;
+                    } catch (IOException | RuntimeException e) {
+                        log.warn("Reshard of project {}: checking out the source failed (retrying next poll): {}",
+                                project, e.toString());
+                        continue;
+                    }
+                    if (!lucene.indexExists(project)) {
+                        Restore r = restoreLocal(unit, st, root, indexDir);
+                        if (r == null) continue;
+                        if (r.full()) { // its full run goes first
+                            needFullRunFirst(st, r.why());
+                            continue;
+                        }
+                    }
+                    Optional<ProjectMeta> local = projects.find(project);
+                    if (Files.exists(indexDir.resolve(FULL_RUN_REQUIRED)) || local.isEmpty()
+                            || !sameRoot(local.get().getRootPath(), root)) {
+                        log.info("Reshard of project {}: its local index needs a full run first", project);
+                        needFullRunFirst(st, local.isEmpty() ? "the local index is not registered"
+                                : Files.exists(indexDir.resolve(FULL_RUN_REQUIRED))
+                                ? "the restored writer state was older than the restored generation"
+                                : "the local index was built under " + local.get().getRootPath() + ", the checkout is at "
+                                        + root);
+                        continue;
+                    }
+                    String localRevision = local.get().getSourceRevision();
+                    if (!built && st.publishedRevision != null && !st.publishedRevision.equals(localRevision)) {
+                        // the local index is not the published run: another writer published since this one last
+                        // indexed the project (a lease that came back, e.g. after a writer scale-down and up, with
+                        // the old index still on disk). Splitting it would publish the new version without what
+                        // that writer added; the run that catches up goes first (integration e2e, run 2)
+                        log.info("Reshard of project {}: the local index is at revision {}, the published run at {};"
+                                + " indexing it first", project, localRevision, st.publishedRevision);
+                        needFullRunFirst(st, "the local index (revision " + localRevision + ") is behind the published"
+                                + " run (revision " + st.publishedRevision + ")");
+                        continue;
+                    }
+                    if (!built && !admitted(unit, estimate(unit, indexDir, root, true))) {
+                        // ruling P6-R18: the build rewrites its affected shards whole (the expunge merges
+                        // them), so their old and new segments coexist until the commit: about twice their
+                        // size at the peak. Estimated as a full run (2x the project's Lucene files), an
+                        // upper bound: a reshard rewrites at most all of its shards. Retried next poll.
+                        continue;
+                    }
+                    if (!built && !atPublishedRevision(unit, st)) {
+                        // the reshard splits the published run: what changed since is indexed (and published) first
+                        log.info("Reshard of project {}: its source moved past the published revision; indexing it"
+                                + " first", project);
+                        if (st.pendingSince == null) st.pendingSince = clock.instant();
+                        continue;
+                    }
+                }
+                Run run = new Run(unit, st.leaseShards, clock.millis());
+                current = run;
+                try {
+                    if (stopping) run.abort.request("stopping");
+                    com.pharos.cluster.sharding.ReshardJob.Step step = job.step(project, planOf(st, unit), st.source,
+                            root, embeds(unit), run.abort, leases);
+                    if (step == com.pharos.cluster.sharding.ReshardJob.Step.FLIPPED) {
+                        st.publishedGeneration = null; // re-read: LATEST moved to the new version's generations
+                        st.publishedGens = null;
+                    }
+                } finally {
+                    current = null;
+                }
+            } finally {
+                busy = null;
+            }
+            members.beat();
+        }
+    }
+
+    /** True when the prepared checkout of {@code unit} is at the revision its published generations hold. */
+    private boolean atPublishedRevision(ShardId unit, ShardState st) {
+        String published = st.publishedRevision;
+        if (published == null) return false;
+        try {
+            if (st.source.kind() == ShardSource.Kind.GIT) {
+                return published.equals(checkout.checkedOutRevision(unit).orElse(null));
+            }
+            return checkout.changedSince(unit, published).isEmpty();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Project {}: checking its source revision failed: {}", unit, e.toString());
+            return false;
         }
     }
 
@@ -980,13 +1393,15 @@ public final class WorkLoop implements Closeable {
     DiskGuard.EstimatedRun estimate(ShardId shard, Path indexDir, Path root, boolean full) {
         if (disk == null) return null;
         if (!full) {
-            String reason = indexer.fullRunReason(shard.value());
+            ShardState st = shards.get(shard);
+            String reason = indexer.fullRunReason(shard.value(), planOf(st, shard));
             if (reason != null) {
                 log.info("Shard {}: estimating a full run ({})", shard, reason);
                 full = true;
             }
         }
-        long luceneBytes = ProjectIndexManager.sizeOf(indexDir.resolve("lucene"));
+        long luceneBytes = ProjectIndexManager.sizeOf(indexDir.resolve("lucene"))
+                + ProjectIndexManager.sizeOf(indexDir.resolve(com.pharos.indexer.LocalShardLayout.SHARDS_DIR));
         long graphBytes = ProjectIndexManager.sizeOf(com.pharos.graph.CallGraph.projectGraphDir(indexDir));
         long cacheBytes = embedCacheBytes(indexDir);
         java.util.function.Predicate<Path> changed = null;
@@ -1011,12 +1426,20 @@ public final class WorkLoop implements Closeable {
         long graphBytes = 0;
         boolean published = false;
         try {
-            Optional<Generation> latest = replicas.latest(shard);
-            if (latest.isPresent()) {
+            ShardState st = shards.get(shard);
+            boolean projectFilesCounted = false;
+            for (ShardId s : st == null ? List.of(shard) : st.leaseShards) {
+                Optional<Generation> latest = replicas.latest(s);
+                if (latest.isEmpty()) continue;
                 published = true;
-                for (com.pharos.cluster.objectstore.ManifestFile f : replicas.manifest(shard, latest.get()).files()) {
+                ShardManifest m = replicas.manifest(s, latest.get());
+                for (com.pharos.cluster.objectstore.ManifestFile f : m.files()) {
                     if (com.pharos.cluster.objectstore.ManifestFile.LUCENE.equals(f.role())) luceneBytes += f.length();
                     else graphBytes += f.length();
+                }
+                if (!projectFilesCounted) { // one graph for the whole project
+                    for (com.pharos.cluster.objectstore.ManifestFile f : m.projectFileList()) graphBytes += f.length();
+                    projectFilesCounted = true;
                 }
             }
         } catch (IOException | RuntimeException e) {
@@ -1149,8 +1572,17 @@ public final class WorkLoop implements Closeable {
     }
 
     /** Registers a restored generation under this writer's paths; returns the root it was indexed under. */
-    private String registerRestored(ShardId shard, Generation gen, Path root, Path indexDir) throws IOException {
-        ShardManifest m = replicas.manifest(shard, gen);
+    private String registerRestored(ShardId shard, ShardState st, Generation gen, Path root, Path indexDir)
+            throws IOException {
+        ShardManifest m;
+        if (planOf(st, shard).isSplit()) {
+            // gen is the project's run; every shard manifest carries the project's meta: take the first's
+            ShardId first = st.leaseShards.getFirst();
+            m = replicas.manifest(first, replicas.latest(first).orElseThrow(() -> new IOException(
+                    "shard " + first + " has no published generation")));
+        } else {
+            m = replicas.manifest(shard, gen);
+        }
         ProjectMeta meta = ShardManifest.stripRefs(m.projectMeta()); // refs stay in the restored unresolved-refs.json
         String originalRoot = meta.getRootPath();
         meta.setName(shard.value());
@@ -1172,7 +1604,7 @@ public final class WorkLoop implements Closeable {
     /** Right after a publish of {@code shard}: release it when this writer holds more than its share. */
     private void maybeRelease(ShardId shard, int share) {
         ShardState st = shards.get(shard);
-        if (st == null) return;
+        if (st == null || reshardPinned(shard)) return;
         if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
             log.info("Releasing shard {} after its publish: writer {} holds {} lease(s), its share is {}", shard,
                     settings.node(), heldSet().size(), share);
@@ -1187,6 +1619,7 @@ public final class WorkLoop implements Closeable {
             ShardState st = shards.get(shard);
             // only when the last poll confirmed LATEST covers the source (M5)
             if (st == null || st.pendingSince != null || !st.prepared || !st.lastPollOk) continue;
+            if (reshardPinned(shard)) continue; // its holder flips it first
             if (balancer.mayRelease(heldSet().size(), share, st.pinned, st.acquiredAt, clock.instant())) {
                 log.info("Releasing idle shard {}: writer {} holds {} lease(s), its share is {}", shard,
                         settings.node(), heldSet().size(), share);
@@ -1231,15 +1664,70 @@ public final class WorkLoop implements Closeable {
         avoidUntil.put(shard, clock.instant().plus(d));
     }
 
+    /** Releases every lease of the unit and forgets it. */
     private void release(ShardId shard) {
-        shards.remove(shard);
-        leases.held().stream().filter(l -> l.shard().equals(shard)).findFirst().ifPresent(leases::release);
+        ShardState st = shards.remove(shard);
+        List<ShardId> own = st != null ? st.leaseShards : List.of(shard);
+        for (Lease l : leases.held()) if (own.contains(l.shard())) leases.release(l);
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        if (job != null) job.releaseLease(shard);
     }
 
+    /**
+     * True when the project's reshard is published and pinned but not flipped: its unit is not released
+     * at a clean point (its holder flips it), and no index run of it starts.
+     */
+    private boolean reshardPinned(ShardId unit) {
+        ProjectShards map = lastMap;
+        return map.reshardRequestOf(unit.value()).isPresent()
+                && map.stagedOf(unit.value()).filter(st -> !st.abandoned() && st.pinned()).isPresent();
+    }
+
+    /** Renews every lease of the unit (right after its publish). */
+    private void renewUnit(ShardState st) {
+        for (Lease l : leases.held()) if (st.leaseShards.contains(l.shard())) leases.renew(l);
+    }
+
+    /** The held units: those whose every shard lease this writer holds. */
     private Set<ShardId> heldSet() {
+        Set<ShardId> leased = leasedShards();
+        Set<ShardId> s = new HashSet<>();
+        for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
+            if (leased.containsAll(e.getValue().leaseShards)) s.add(e.getKey());
+        }
+        return s;
+    }
+
+    /** True when this writer holds every shard lease of the unit. */
+    private boolean unitHeld(ShardId unit) {
+        ShardState st = shards.get(unit);
+        return st != null && leasedShards().containsAll(st.leaseShards);
+    }
+
+    /**
+     * True when this writer still has the unit's state and each of its shard leases is either held or
+     * only unconfirmed ({@link LeaseManager#lostUnconfirmed}), none definitely lost or released.
+     */
+    private boolean unitUnconfirmed(ShardId unit) {
+        ShardState st = shards.get(unit);
+        if (st == null) return false;
+        for (ShardId s : st.leaseShards) {
+            if (!leases.isHeld(s) && !leases.lostUnconfirmed(s)) return false;
+        }
+        return true;
+    }
+
+    private Set<ShardId> leasedShards() {
         Set<ShardId> s = new HashSet<>();
         for (Lease l : leases.held()) s.add(l.shard());
         return s;
+    }
+
+    /** The unit's plan: as acquired, else as the catalog last listed it, else {@code [project]}. */
+    private ShardPlan planOf(ShardState st, ShardId unit) {
+        if (st != null && st.plan != null) return st.plan;
+        ShardPlan p = plans.get(unit);
+        return p != null ? p : ShardPlan.single(unit.value());
     }
 
     // ------------------------------------------------------------------------- publish check
@@ -1250,7 +1738,7 @@ public final class WorkLoop implements Closeable {
      */
     void assertPublishing(ShardId shard) throws PublishConflictException {
         Run r = current;
-        if (r == null || r.thread != Thread.currentThread() || !r.shard.equals(shard)) {
+        if (r == null || r.thread != Thread.currentThread() || !r.leaseShards.contains(shard)) {
             throw new PublishConflictException(WorkQueueLeaseGuard.refusal(shard.value()));
         }
         leases.assertHeld(shard);
@@ -1265,9 +1753,10 @@ public final class WorkLoop implements Closeable {
         List<String> pinned = new ArrayList<>();
         Map<String, WriterHeartbeat.Backlog> backlog = new TreeMap<>();
         Instant now = clock.instant();
+        Set<ShardId> heldUnits = heldSet();
         for (Map.Entry<ShardId, ShardState> e : shards.entrySet()) {
             ShardState st = e.getValue();
-            if (!held.contains(e.getKey().value())) continue;
+            if (!heldUnits.contains(e.getKey())) continue;
             if (st.pinned) pinned.add(e.getKey().value());
             Instant since = st.pendingSince;
             backlog.put(e.getKey().value(), new WriterHeartbeat.Backlog(st.sourceRevision, st.publishedRevision,
@@ -1308,7 +1797,8 @@ public final class WorkLoop implements Closeable {
         return members.live();
     }
 
-    LeaseManager leaseManager() {
+    /** The shard leases of this writer (tests, diagnostics). */
+    public LeaseManager leaseManager() {
         return leases;
     }
 
@@ -1334,6 +1824,8 @@ public final class WorkLoop implements Closeable {
             diskWatch = null;
             if (detector != null) detector.shutdownNow(); // read-only source checks: nothing to drain
             detector = null;
+            if (reshardRenewer != null) reshardRenewer.shutdownNow(); // the leases are released below
+            reshardRenewer = null;
         }
         stopping = true;
         long start = System.nanoTime();
@@ -1366,7 +1858,15 @@ public final class WorkLoop implements Closeable {
         }
         // before close: after it a release cannot write. Half the cleanup, the rest for the heartbeat.
         long releaseEnd = System.nanoTime() + (cleanupEnd - System.nanoTime()) / 2;
-        leases.releaseAll(BoundedCall.until(releaseEnd));
+        com.pharos.cluster.sharding.ReshardJob job = reshard;
+        // with a reshard job, its leases get the second half of the release window (the work leases
+        // finish early when the bucket answers, leaving the rest to the reshard leases)
+        long workReleaseEnd = job == null ? releaseEnd : System.nanoTime() + (releaseEnd - System.nanoTime()) / 2;
+        leases.releaseAll(BoundedCall.until(workReleaseEnd));
+        if (job != null) {
+            job.leases().releaseAll(BoundedCall.until(releaseEnd));
+            job.leases().close(BoundedCall.min(Duration.ofSeconds(1), BoundedCall.until(cleanupEnd)));
+        }
         shards.clear();
         leases.close(BoundedCall.min(Duration.ofSeconds(1), BoundedCall.until(cleanupEnd)));
         members.close(BoundedCall.until(cleanupEnd));

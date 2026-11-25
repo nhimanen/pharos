@@ -485,7 +485,7 @@ class PeerMembershipTest {
     /** A state with one proposal in force since long before {@code asOf}. */
     private static byte[] activeProposal(long asOfSeconds, long sinceSeconds) throws Exception {
         String id = com.pharos.cluster.status.Proposals.id("add-readers", "readers");
-        var rule = new StatusState.Rule("add-readers", "readers", sinceSeconds, null, true, "load", "Start 1 reader");
+        var rule = new StatusState.Rule("add-readers", "readers", sinceSeconds, null, true, "load", "Start 1 reader", 1);
         return new StatusState(StatusState.VERSION, asOfSeconds, new java.util.TreeMap<>(Map.of(id, rule)), null,
                 new StatusState.Summary(0, 2, 1)).toJson();
     }

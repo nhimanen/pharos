@@ -93,7 +93,7 @@ public final class PeerBackend implements ReplicationBackend {
         storeMismatch(cfg.getPeers().getStoreDir(), config.getIndexDir(), FILE_STORE).ifPresent(log::warn);
         this.cache = new LocalFsCache(config);
         GenerationGc gc = new GenerationGc(peer.store(), peer.layout(), cfg.getRetentionGenerations(),
-                Duration.ofMinutes(cfg.getRetentionMinutes()));
+                Duration.ofMinutes(cfg.getRetentionMinutes()), cfg.previousGenerationGrace());
         this.publisher = new SignallingPublisher(new ObjectStorePublisher(peer.store(), peer.layout(),
                 peer.catalog(), gc, cfg.effectiveNodeId(), config.getSynonymsFile(), LeaseGuard.IMPLICIT,
                 WriterStateStore.NONE), peer.signal());
@@ -155,7 +155,7 @@ public final class PeerBackend implements ReplicationBackend {
     public ReplicationEndpoint endpoint() {
         ClusterConfig cfg = config.getCluster();
         return new ReplicationEndpoint(peerStore(), cfg.effectiveNodeId(),
-                com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.getToken()),
+                com.pharos.cluster.internal.InternalApi.tokenMatcher(cfg.effectiveToken()),
                 cfg.getPeers().getMaxTransfersPerWriter(), cfg.getPeers().getMaxLongPolls(), () -> knownPeers(cfg),
                 new PeerReaderRegistry(Duration.ofSeconds(cfg.getReaderTtlSeconds()), System::nanoTime),
                 new PeerStatusState(PeerStatusState.idleExpiry(cfg), System::nanoTime), System::currentTimeMillis,
@@ -177,7 +177,7 @@ public final class PeerBackend implements ReplicationBackend {
             }
         }
         if (cfg.getPeers().getDiscovery() != null
-                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof PeerDiscovery.Seeds s) {
+                && PeerDiscovery.parse(cfg.getPeers().getDiscovery()) instanceof DiscoverySpec.Seeds s) {
             s.urls().forEach(u -> out.add(u.toString()));
         }
         return java.util.List.copyOf(out);
@@ -220,6 +220,10 @@ public final class PeerBackend implements ReplicationBackend {
 
         @Override
         public Optional<Generation> publish(LocalSnapshot snapshot) throws IOException {
+            if (snapshot.plan().isSplit()) { // P6-R9: config validation refuses this; never publish it here
+                throw new com.pharos.cluster.PublishException("peer mode publishes only the default spec [project];"
+                        + " project " + snapshot.project() + " was indexed as spec " + snapshot.plan().spec());
+            }
             Optional<Generation> gen = inner.publish(snapshot);
             gen.ifPresent(g -> signal.published(ShardId.ofProject(snapshot.project()), g));
             return gen;

@@ -50,7 +50,8 @@ class ReadPathInventoryTest {
         assertThat(files("CallGraph.openExisting(")).containsExactlyInAnyOrder(
                 "graph/GraphViews.java",                          // the read path
                 "graph/CrossProjectLinker.java",                  // writer: link (reads project graphs)
-                "cluster/objectstore/ObjectStorePublisher.java"); // writer: compact graph snapshot
+                "cluster/objectstore/ObjectStorePublisher.java",  // writer: compact graph snapshot
+                "indexer/ProjectIndexManager.java");              // writer: reshard build (in-degrees, callers)
     }
 
     @Test
@@ -74,6 +75,8 @@ class ReadPathInventoryTest {
     void luceneReadersAreOpenedOnlyByLuceneIndexer() throws IOException {
         assertThat(files("DirectoryReader.open(")).containsExactlyInAnyOrder(
                 "indexer/LuceneIndexer.java",
+                "indexer/ProjectIndexManager.java", // writer: reshard build lists each local shard's files
+                "indexer/ShardedWriter.java",       // writer: a reshard applies its deletes (NRT) to expunge them
                 // 1.5.0: one-shot "does this dir hold live vectors" probe on a directory the caller
                 // resolved (index-status / embeddings status / upgrade-indexes hints, and the writer's
                 // legacy-vector re-index check); never on the search serving path

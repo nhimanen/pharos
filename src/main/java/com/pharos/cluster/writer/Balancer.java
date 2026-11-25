@@ -16,6 +16,11 @@ import java.util.Set;
 /**
  * Fair-share rules of the work queue, as pure functions (the work loop supplies the state).
  *
+ * <p>The unit of work is a project (ruling P6-R1): the work loop passes one {@link ShardId} per
+ * project ({@code ShardId.ofProject}), so a project split into N shards counts once in the share and in
+ * a writer's held count, and is acquired and released as a whole (all N leases or none). For a
+ * {@code [project]} project the unit is its one shard, as in Phase 4.
+ *
  * <ul>
  *   <li><b>Share</b> = {@code ceil(workable shards / live writers)}. Workable shards are those with a
  *       {@code source} plus the source-less shards some live writer pins; live writers are those

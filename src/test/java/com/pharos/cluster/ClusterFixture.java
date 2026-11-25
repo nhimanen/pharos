@@ -132,6 +132,46 @@ public final class ClusterFixture implements AutoCloseable {
     }
 
     /**
+     * Splits {@code project} by {@code spec} into {@code shards} in the catalog (a new spec version and
+     * the project entry), then indexes {@code root} as that split project and publishes every shard.
+     * {@code incremental} runs after the first only re-index what changed.
+     */
+    public void indexSplit(Path root, String project, com.pharos.cluster.sharding.ShardSpec spec, List<ShardId> shards,
+                           boolean incremental) throws IOException {
+        var catalog = (com.pharos.cluster.objectstore.ObjectStoreCatalog) writerBackend.catalog();
+        var current = catalog.projectShards();
+        if (!current.specOf(project).equals(spec) || !current.shardsOf(project).equals(shards)) {
+            int v = catalog.addSpec(java.util.Optional.of(project), spec);
+            catalog.putProject(project, v, shards);
+        }
+        writerManager.index(root, project, incremental, false, embed, false, ProgressListener.SILENT,
+                com.pharos.indexer.IndexAbort.none(), null, new com.pharos.cluster.sharding.ShardPlan(project, spec, shards));
+    }
+
+    /**
+     * The resharding job of this fixture's writer (Phase 6 Task 4), driven by hand: its reshard lease, the
+     * writer's index manager and publisher, {@code readers} as the live readers the flip waits for.
+     */
+    public com.pharos.cluster.sharding.ReshardJob reshardJob(
+            java.util.function.Supplier<List<com.pharos.cluster.membership.ReaderHeartbeat>> readers,
+            java.time.Clock clock, java.time.Duration syncTimeout) {
+        var os = (com.pharos.cluster.objectstore.ObjectStoreBackend) writerBackend;
+        var leases = new com.pharos.cluster.writer.LeaseManager(os.store(), os.layout(), "writer-1",
+                java.time.Duration.ofSeconds(30), com.pharos.cluster.writer.LeaseManager.BucketNow.NONE, clock,
+                id -> os.layout().reshardLeaseKey(id.value()));
+        return new com.pharos.cluster.sharding.ReshardJob("writer-1", os.store(), os.layout(), os.objectStoreCatalog(),
+                (com.pharos.cluster.objectstore.ObjectStorePublisher) os.publisher(), os.source(), os.writerState(),
+                writerManager, writerLucene, leases, readers,
+                new com.pharos.cluster.objectstore.GenerationGc(os.store(), os.layout(), 2, java.time.Duration.ofMinutes(10)),
+                clock, new com.pharos.cluster.sharding.ReshardJob.Settings(syncTimeout, java.time.Duration.ofMinutes(10)));
+    }
+
+    /** The writer's catalog, with its write side. */
+    public com.pharos.cluster.objectstore.ObjectStoreCatalog writerCatalog() {
+        return (com.pharos.cluster.objectstore.ObjectStoreCatalog) writerBackend.catalog();
+    }
+
+    /**
      * A reader node of this cluster's bucket in its own home, as {@code Main} wires a serving
      * reader: its backend over {@code store}, registry, indexer and runtime. Not started.
      */

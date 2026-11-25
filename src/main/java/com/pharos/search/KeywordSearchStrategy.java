@@ -193,17 +193,87 @@ public class KeywordSearchStrategy {
         reloadAnalyzer();
     }
 
+    /** A view analysing with {@code analyzer} (the synonyms of {@code hash}) for good: never reloads. */
+    private KeywordSearchStrategy(Analyzer analyzer, String hash, SearcherFactory searcherFactory) {
+        this.synonymFile = null;
+        this.searcherFactory = searcherFactory;
+        this.analyzer = analyzer;
+        this.synonymsHash = hash;
+    }
+
+    /** The synonyms a reload replaced, kept for {@link #setPreviousSynonymsGrace} (ruling P6-R19). */
+    private record Previous(String hash, Analyzer analyzer, long untilMillis) {}
+
+    private volatile Previous previous;
+    private volatile java.time.Duration previousSynonymsGrace = java.time.Duration.ZERO;
+    private volatile java.util.function.LongSupplier clock = System::currentTimeMillis;
+
+    /**
+     * Ruling P6-R19: how long the synonyms a reload replaced stay usable ({@link #forSynonyms}): a cluster
+     * node's coordinator or shard requests analysed with them are still answered meanwhile (a synonyms
+     * publish reaches the nodes at different moments). Zero (the default, a single node) keeps none.
+     */
+    public void setPreviousSynonymsGrace(java.time.Duration grace) {
+        this.previousSynonymsGrace = java.util.Objects.requireNonNull(grace, "grace");
+    }
+
+    /** The clock the previous synonyms' grace is timed with (tests). */
+    public void setClock(java.util.function.LongSupplier clock) {
+        this.clock = java.util.Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * This strategy when {@code hash} names the synonyms it analyses with; a view analysing with the previous
+     * synonyms when {@code hash} names those and their grace lasts (P6-R19); else null.
+     */
+    public KeywordSearchStrategy forSynonyms(String hash) {
+        if (hash == null || hash.equals(synonymsHash())) return this;
+        Previous p = previous;
+        if (p == null || !p.hash().equals(hash) || clock.getAsLong() >= p.untilMillis()) return null;
+        return new KeywordSearchStrategy(p.analyzer(), p.hash(), searcherFactory);
+    }
+
+    /** The hash of the previous synonyms while their grace lasts (P6-R19); empty otherwise. */
+    public java.util.Optional<String> previousSynonymsHash() {
+        synonymsHash(); // a reload due now replaces them first
+        Previous p = previous;
+        if (p == null || clock.getAsLong() >= p.untilMillis()) return java.util.Optional.empty();
+        return java.util.Optional.of(p.hash());
+    }
+
     /**
      * Rebuilds the query analyzer from the current synonyms.txt.
      * Called at construction and whenever the file's last-modified time advances.
      */
-    private void reloadAnalyzer() {
-        this.analyzer = LuceneIndexer.buildQueryAnalyzer(synonymFile.getParent());
+    private synchronized void reloadAnalyzer() {
+        if (synonymFile == null) return;
+        Analyzer before = this.analyzer;
+        String beforeHash = this.synonymsHash;
+        long stamp;
         try {
-            this.synonymFileLastModified = Files.exists(synonymFile)
-                    ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
+            stamp = Files.exists(synonymFile) ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
         } catch (IOException e) {
-            this.synonymFileLastModified = -1;
+            stamp = -1;
+        }
+        String hash = hashOf(synonymFile);
+        this.analyzer = LuceneIndexer.buildQueryAnalyzer(synonymFile.getParent());
+        this.synonymsHash = hash;
+        this.synonymsHashOf = stamp;
+        this.synonymFileLastModified = stamp;
+        java.time.Duration grace = previousSynonymsGrace;
+        if (before != null && beforeHash != null && !beforeHash.equals(hash) && !grace.isZero()) {
+            previous = new Previous(beforeHash, before, clock.getAsLong() + grace.toMillis());
+        }
+    }
+
+    private static String hashOf(Path file) {
+        try {
+            return Files.exists(file)
+                    ? java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(Files.readAllBytes(file)))
+                    : "none";
+        } catch (IOException | java.security.NoSuchAlgorithmException e) {
+            return "unreadable";
         }
     }
 
@@ -213,6 +283,7 @@ public class KeywordSearchStrategy {
      * the file-stat is a single syscall and is negligible compared to Lucene I/O.
      */
     private void reloadIfChanged() {
+        if (synonymFile == null) return; // a view of fixed synonyms
         try {
             long current = Files.exists(synonymFile)
                     ? Files.getLastModifiedTime(synonymFile).toMillis() : -1;
@@ -236,17 +307,11 @@ public class KeywordSearchStrategy {
      */
     public String synonymsHash() {
         reloadIfChanged();
+        if (synonymFile == null) return synonymsHash;
         long stamp = synonymFileLastModified;
         String h = synonymsHash;
         if (h != null && synonymsHashOf == stamp) return h;
-        try {
-            h = Files.exists(synonymFile)
-                    ? java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
-                            .digest(Files.readAllBytes(synonymFile)))
-                    : "none";
-        } catch (IOException | java.security.NoSuchAlgorithmException e) {
-            h = "unreadable";
-        }
+        h = hashOf(synonymFile);
         synonymsHash = h;
         synonymsHashOf = stamp;
         return h;
@@ -272,8 +337,76 @@ public class KeywordSearchStrategy {
         Query query = buildQuery(req);
         if (query == null) return List.of();
 
-        TopDocs hits = searcher.search(query, req.limit());
-        return rawCandidates(searcher, hits, TYPE);
+        int limit = req.limit();
+        if (limit <= 0) return List.of();
+        TopDocs hits = searcher.search(query, limit + 1);
+        ScoreDoc[] sd = hits.scoreDocs;
+        if (sd.length > limit && sd[limit - 1].score == sd[limit].score) {
+            // the cut falls inside a group of equal scores: read the whole group (up to MAX_TIE_WINDOW
+            // hits), so which of its documents stay is decided by the stable key, not by doc ids
+            float cut = sd[limit - 1].score;
+            int n = limit + 1;
+            while (sd.length == n && sd[n - 1].score == cut && n < MAX_TIE_WINDOW) {
+                n = Math.min(MAX_TIE_WINDOW, n * 4);
+                sd = searcher.search(query, n).scoreDocs;
+            }
+            sd = stableCut(searcher, sd, limit);
+        } else if (sd.length > limit) {
+            sd = java.util.Arrays.copyOf(sd, limit);
+        }
+        return stableTop(rawCandidates(searcher, new TopDocs(hits.totalHits, sd), TYPE), limit);
+    }
+
+    /** The most hits a retrieval reads to resolve a tie at the cut. */
+    static final int MAX_TIE_WINDOW = 10_000;
+
+    private static final java.util.Set<String> TIE_KEY_FIELDS = java.util.Set.of(DocumentMapper.F_ID,
+            DocumentMapper.F_DOC_TYPE, DocumentMapper.F_START_LINE, DocumentMapper.F_END_LINE);
+
+    /** The first {@code limit} hits by score, equal scores by {@link #tieKey}; reads only the key's fields. */
+    private static ScoreDoc[] stableCut(IndexSearcher searcher, ScoreDoc[] hits, int limit) throws IOException {
+        StoredFields stored = searcher.storedFields();
+        List<Map.Entry<ScoreDoc, String>> keyed = new ArrayList<>(hits.length);
+        for (ScoreDoc h : hits) {
+            Document d = stored.document(h.doc, TIE_KEY_FIELDS);
+            keyed.add(Map.entry(h, tieKey(d.get(DocumentMapper.F_ID), d.get(DocumentMapper.F_DOC_TYPE),
+                    getInt(d, DocumentMapper.F_START_LINE), getInt(d, DocumentMapper.F_END_LINE))));
+        }
+        keyed.sort(java.util.Comparator.<Map.Entry<ScoreDoc, String>>comparingDouble(e -> -e.getKey().score)
+                .thenComparing(Map.Entry::getValue));
+        ScoreDoc[] out = new ScoreDoc[Math.min(limit, keyed.size())];
+        for (int i = 0; i < out.length; i++) out[i] = keyed.get(i).getKey();
+        return out;
+    }
+
+    /**
+     * The order keyword candidates rank in: by raw score, and equal scores by {@link #tieKey}, so the
+     * ranking and the documents kept at the cut do not depend on Lucene doc ids. Doc ids depend on how
+     * an index was built (parallel writes, segments, how a project is split into shards); without this,
+     * two builds of the same source kept different documents of a tie at the cut, and since the graph
+     * boost is normalised by the page's highest in-degree ({@link
+     * com.pharos.search.distributed.CandidateShaper}), that changed every score on the page (found by the
+     * Phase 6 gate: a resharded project's keyword pages drifted by up to 0.2 % against the unsplit build).
+     */
+    public static final java.util.Comparator<RawCandidate> STABLE_ORDER =
+            java.util.Comparator.comparing(RawCandidate::rawScore, java.util.Comparator.reverseOrder())
+                    .thenComparing(KeywordSearchStrategy::tieKey);
+
+    /** A build-independent key of a candidate: its id, document type and line range. */
+    public static String tieKey(RawCandidate c) {
+        SearchResult r = c.result();
+        return tieKey(r.id(), c.docType(), r.startLine(), r.endLine());
+    }
+
+    private static String tieKey(String id, String docType, int startLine, int endLine) {
+        return id + '\u0000' + docType + '\u0000' + startLine + '\u0000' + endLine;
+    }
+
+    /** The first {@code limit} of {@code raw} in {@link #STABLE_ORDER}. */
+    static List<RawCandidate> stableTop(List<RawCandidate> raw, int limit) {
+        List<RawCandidate> sorted = new ArrayList<>(raw);
+        sorted.sort(STABLE_ORDER);
+        return sorted.size() > limit ? List.copyOf(sorted.subList(0, limit)) : sorted;
     }
 
     /** The intent {@link #search} shapes with: the router's classification, if any. */
@@ -355,6 +488,11 @@ public class KeywordSearchStrategy {
         if (req.scope() != null && !req.scope().isEmpty()) {
             filtered.add(new TermQuery(new Term(DocumentMapper.F_SCOPE, req.scope())),
                     BooleanClause.Occur.FILTER);
+            hasFilter = true;
+        }
+        Query keys = DocumentMapper.keyFilterQuery(req.keyFilter()); // non-scoring: BM25 is unchanged
+        if (keys != null) {
+            filtered.add(keys, BooleanClause.Occur.FILTER);
             hasFilter = true;
         }
         return hasFilter ? filtered.build() : query;

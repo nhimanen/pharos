@@ -139,7 +139,7 @@ public class EmbeddingCacheBackfiller {
         Map<String, float[]>       idToVector    = new LinkedHashMap<>();
 
         int totalVectors = 0, skippedDocs = 0, skippedMultiChunk = 0, skippedNotEligible = 0;
-        IndexReader reader = luceneIndexer.openReader(projectName);
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(projectName));
         for (LeafReaderContext ctx : reader.leaves()) {
             LeafReader leaf = ctx.reader();
             FloatVectorValues fvv = leaf.getFloatVectorValues(DocumentMapper.F_VECTOR_LEGACY);

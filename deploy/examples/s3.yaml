@@ -1,0 +1,38 @@
+# A PharosCluster on an existing S3-compatible bucket.
+# First create the credentials Secret in the operator's namespace (the keys are fixed: accessKey, secretKey):
+#   kubectl -n pharos create secret generic pharos-s3 --from-literal=accessKey=... --from-literal=secretKey=...
+# The keys reach the pods only as env; they never appear in this resource, its status or a ConfigMap.
+apiVersion: pharos.dev/v1alpha1
+kind: PharosCluster
+metadata:
+  name: prod
+  namespace: pharos
+spec:
+  version: "1.11.0"
+  storage:
+    s3:
+      endpoint: https://s3.eu-north-1.amazonaws.com
+      bucket: my-pharos
+      region: eu-north-1
+      pathStyle: false
+      credentialsSecret: pharos-s3
+  embeddings:
+    model: none
+  projects:
+    - name: lucene
+      git: { url: https://github.com/apache/lucene.git, ref: main }
+      embed: false
+  writers:
+    min: 1
+    max: 2
+    workVolume: 50Gi
+  readers:
+    min: 2
+    max: 6
+    mode: lazy
+    cacheVolume: 20Gi
+  router:
+    replicas: 2
+    service: { type: LoadBalancer }
+  autoscaling:
+    enabled: true                     # cooldownSeconds 300, maxStepUp 2, maxStepDown 1 by default

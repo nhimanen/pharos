@@ -37,9 +37,13 @@ public final class IndexVersions {
      * <ul>
      *   <li>1 — #18 Java ids, #23 script/doc ids, #24 call-graph index repair,
      *       #19 per-model embedding caches</li>
+     *   <li>2 — key fields for the module / pathPrefix / language / kind filters (Phase 6, P6-R12:
+     *       {@code keyModule}, {@code keyDir}, {@code keyPath}, {@code keyLanguage}, {@code keyKind}). A
+     *       format-1 index stays searchable unfiltered; a filtered query over it is refused
+     *       ({@code KeyFiltersUnsupportedException}) until it is re-indexed.</li>
      * </ul>
      */
-    public static final int INDEX_FORMAT = 1;
+    public static final int INDEX_FORMAT = 2;
 
     /**
      * Bump whenever {@link DefaultChunker}, {@link Chunker}, or any method that builds

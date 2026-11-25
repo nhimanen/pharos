@@ -661,16 +661,21 @@ body.cluster-mode #btn-hide-external { display: none; }
 .cl-chip rect { stroke-width: 1; }
 .cl-chip.cl-degraded rect { stroke-dasharray: 3 2; stroke-width: 1.6; }
 .cl-pending { fill: #ffd54f; stroke: var(--bg2); stroke-width: 1.5; }
+/* Resharding: a staged shard (not served yet) dashed in the accent colour; a retired one faded */
+.cl-chip.cl-staged rect { stroke: var(--accent); stroke-dasharray: 4 2; stroke-width: 1.6; }
+.cl-chip.cl-retired { opacity: .5; }
 
 /* Shard state colours: SVG chips, HTML chips and legend swatches */
 .cl-chip.cl-st-current rect       { fill: rgba(63,185,80,.15);  stroke: #3fb950; }
 .cl-chip.cl-st-lagging rect       { fill: rgba(210,153,34,.18); stroke: #d29922; }
 .cl-chip.cl-st-lease-expired rect { fill: rgba(248,81,73,.16);  stroke: #f85149; }
 .cl-chip.cl-st-unpublished rect   { fill: rgba(120,144,156,.15); stroke: #78909c; }
+.cl-chip.cl-st-staged rect        { fill: rgba(56,139,253,.10); stroke: var(--accent); }
 .cl-chip.cl-st-current text       { fill: #7ee787; }
 .cl-chip.cl-st-lagging text       { fill: #e3b341; }
 .cl-chip.cl-st-lease-expired text { fill: #ff7b72; }
 .cl-chip.cl-st-unpublished text   { fill: #9aa7b0; }
+.cl-chip.cl-st-staged text        { fill: #79c0ff; }
 .cl-chip-h, .cl-sw { display: inline-block; border: 1px solid; border-radius: 4px; }
 .cl-chip-h { font-family: var(--mono); font-size: 11px; padding: 0 6px; line-height: 16px; }
 .cl-sw { width: 12px; height: 10px; vertical-align: -1px; margin-right: 5px; }
@@ -678,7 +683,10 @@ body.cluster-mode #btn-hide-external { display: none; }
 .cl-chip-h.cl-st-lagging, .cl-sw.cl-st-lagging             { background: rgba(210,153,34,.18); border-color: #d29922; color: #e3b341; }
 .cl-chip-h.cl-st-lease-expired, .cl-sw.cl-st-lease-expired { background: rgba(248,81,73,.16);  border-color: #f85149; color: #ff7b72; }
 .cl-chip-h.cl-st-unpublished, .cl-sw.cl-st-unpublished     { background: rgba(120,144,156,.15); border-color: #78909c; color: #9aa7b0; }
+.cl-chip-h.cl-st-staged, .cl-sw.cl-st-staged               { background: rgba(56,139,253,.10); border-color: var(--accent); color: #79c0ff; }
 .cl-sw-degraded { border: 1.6px dashed var(--text-dim); background: transparent; }
+.cl-sw-staged { border: 1.6px dashed var(--accent); background: transparent; }
+.cl-sw-retired { border-color: var(--text-xdim); background: transparent; opacity: .5; }
 .cl-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ffd54f;
           margin-right: 5px; vertical-align: 0; }
 .cl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; color: var(--text-dim); font-size: 11px; }
@@ -690,6 +698,7 @@ body.cluster-mode #btn-hide-external { display: none; }
 .cl-b-bad    { background: rgba(248,81,73,.14);  color: #ff7b72; border-color: rgba(248,81,73,.5); }
 .cl-b-warn   { background: rgba(210,153,34,.14); color: #e3b341; border-color: rgba(210,153,34,.5); }
 .cl-b-accent { background: rgba(56,139,253,.14); color: #79c0ff; border-color: rgba(56,139,253,.5); }
+.cl-b-ok     { background: rgba(63,185,80,.14);  color: #7ee787; border-color: rgba(63,185,80,.5); }
 
 /* Tables */
 .cl-table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -730,6 +739,13 @@ body.cluster-mode #btn-hide-external { display: none; }
 .cl-progress { display: block; height: 6px; background: var(--bg); border: 1px solid var(--border);
                border-radius: 3px; overflow: hidden; }
 .cl-progress-fill { display: block; height: 100%; background: var(--accent); }
+
+/* Resharding */
+.cl-reshard { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 8px; }
+.cl-reshard-spec { margin-top: 4px; color: var(--text-dim); font-size: 11px; overflow-wrap: anywhere; }
+.cl-reshard-row { display: grid; grid-template-columns: 48px minmax(60px, 1fr) max-content; gap: 8px;
+                  align-items: center; padding: 3px 0; font-size: 12px; }
+.cl-reshard-row > span:first-child { color: var(--text-dim); }
 
 /* Health */
 .cl-health { list-style: none; }

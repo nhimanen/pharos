@@ -36,6 +36,8 @@ import picocli.CommandLine.*;
                 UpgradeIndexesCommand.class,
                 PublishCommand.class,
                 RouterCommand.class,
+                ReshardCommand.class,
+                ConfigCommand.class,
                 EmbeddingsCommand.class,
                 CommandLine.HelpCommand.class
         },

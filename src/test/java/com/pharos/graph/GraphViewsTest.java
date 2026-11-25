@@ -16,17 +16,19 @@ class GraphViewsTest {
 
     @Test
     void missingGraphIsEmptyAndCreatesNothing() throws Exception {
+        stamp(tmp, com.pharos.indexer.IndexVersions.INDEX_FORMAT);
         try (GraphView v = GraphViews.open(tmp)) {
             assertTrue(v.callers("x").isEmpty());
             assertEquals(0, v.methodCount());
         }
         try (Stream<Path> s = Files.list(tmp)) {
-            assertEquals(0, s.count());
+            assertEquals(1, s.count(), "only the stamp");
         }
     }
 
     @Test
-    void arcadeGraphIsUsedWhenPresent() {
+    void arcadeGraphIsUsedWhenPresent() throws Exception {
+        stamp(tmp, com.pharos.indexer.IndexVersions.INDEX_FORMAT);
         try (CallGraph g = CallGraph.open(tmp.resolve(GraphViews.ARCADE_DIR), true)) {
             g.addMethod("a.A#caller()", "a.A");
             g.addMethod("a.A#callee()", "a.A");
@@ -47,6 +49,7 @@ class GraphViewsTest {
             g.addCall("a.A#caller()", callee);
             g.flush();
             Path dir = Files.createDirectories(tmp.resolve("cache").resolve(name));
+            stamp(dir, com.pharos.indexer.IndexVersions.INDEX_FORMAT);
             CompactGraphWriter.export(g, dir.resolve(GraphViews.COMPACT_FILE));
             return dir;
         }

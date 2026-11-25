@@ -1,0 +1,877 @@
+package com.pharos.operator.reconcile;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.pharos.cluster.status.ClusterStatus;
+import com.pharos.cluster.status.StatusState;
+import com.pharos.operator.OperatorSettings;
+import com.pharos.operator.TestClusters;
+import com.pharos.operator.api.PharosCluster;
+import com.pharos.operator.api.PharosClusterSpec;
+import com.pharos.operator.api.PharosClusterStatus;
+import com.pharos.operator.render.Labels;
+import com.pharos.operator.status.ClusterStatusEventSource;
+import com.pharos.operator.status.StatusReading;
+import io.fabric8.kubernetes.api.model.ConfigMap;
+import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
+import io.fabric8.kubernetes.api.model.Secret;
+import io.fabric8.kubernetes.api.model.Service;
+import io.fabric8.kubernetes.api.model.apps.Deployment;
+import io.fabric8.kubernetes.api.model.apps.StatefulSet;
+import io.fabric8.kubernetes.api.model.batch.v1.Job;
+import io.fabric8.kubernetes.api.model.networking.v1.NetworkPolicy;
+import io.fabric8.kubernetes.api.model.policy.v1.PodDisruptionBudget;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
+import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
+import io.fabric8.kubernetes.client.utils.Serialization;
+import io.javaoperatorsdk.operator.Operator;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * The reconciler running in a real JOSDK {@link Operator} against fabric8's in-memory API server.
+ *
+ * <p>The mock server does not implement server-side apply, so this operator is configured to use
+ * JOSDK's create/update path instead (production keeps SSA). What is under test is the same: every
+ * desired object is created once, and a further reconcile of an unchanged cluster changes nothing.
+ */
+@EnableKubernetesMockClient(crud = true)
+class ReconcilerMockServerTest {
+
+    private static final String NS = "pharos";
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
+    private static final OperatorSettings SETTINGS = new OperatorSettings("pharos", "minio:test", "mc:test");
+    private static final List<Class<? extends HasMetadata>> KINDS = List.of(Secret.class, ConfigMap.class,
+            Service.class, StatefulSet.class, Deployment.class, PersistentVolumeClaim.class, Job.class,
+            PodDisruptionBudget.class, NetworkPolicy.class);
+
+    KubernetesClient client;
+    KubernetesMockServer server;
+
+    private Operator operator;
+    private PharosClusterReconciler reconciler;
+    private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
+    private final Map<String, Level> savedLevels = new TreeMap<>();
+    /** The console appender, detached while DEBUG is on so the build output stays readable. */
+    private ch.qos.logback.core.Appender<ILoggingEvent> console;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        Path crd = Path.of(System.getProperty("pharos.crdCommitted", "../deploy/crd"), "pharosclusters.pharos.dev-v1.yml");
+        try (var in = Files.newInputStream(crd)) {
+            client.apiextensions().v1().customResourceDefinitions().load(in).create();
+        }
+        // Capture everything the operator logs, at DEBUG for the operator and JOSDK.
+        Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        logs.start();
+        root.addAppender(logs);
+        console = root.getAppender("STDOUT");
+        if (console != null) root.detachAppender(console);
+        for (String name : List.of("com.pharos", "io.javaoperatorsdk")) {
+            Logger l = (Logger) LoggerFactory.getLogger(name);
+            savedLevels.put(name, l.getLevel());
+            l.setLevel(Level.DEBUG);
+        }
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (operator != null) operator.stop();
+        Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        root.detachAppender(logs);
+        if (console != null) root.addAppender(console);
+        savedLevels.forEach((name, level) -> ((Logger) LoggerFactory.getLogger(name)).setLevel(level));
+    }
+
+    private final MutableClock clock = new MutableClock(java.time.Instant.parse("2026-11-22T10:00:00Z"));
+
+    /** A clock the test moves by hand (the bucket Job's backoff). */
+    static final class MutableClock extends java.time.Clock {
+        private volatile java.time.Instant now;
+
+        MutableClock(java.time.Instant now) { this.now = now; }
+
+        void advance(Duration d) { now = now.plus(d); }
+
+        @Override public java.time.ZoneId getZone() { return java.time.ZoneOffset.UTC; }
+
+        @Override public java.time.Clock withZone(java.time.ZoneId zone) { return this; }
+
+        @Override public java.time.Instant instant() { return now; }
+    }
+
+    private void startOperator() {
+        startOperator(SETTINGS);
+    }
+
+    private void startOperator(OperatorSettings settings) {
+        startOperator(new PharosClusterReconciler(clock, settings));
+    }
+
+    private void startOperator(PharosClusterReconciler r) {
+        reconciler = r;
+        operator = new Operator(o -> o.withKubernetesClient(client)
+                .withCloseClientOnStop(false)
+                .withSSABasedCreateUpdateMatchForDependentResources(false)
+                .withUseSSAToPatchPrimaryResource(false));
+        operator.register(reconciler, c -> c.settingNamespace(NS));
+        operator.start();
+    }
+
+    private static void await(String what, BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) throw new AssertionError("timed out waiting for " + what);
+            Thread.sleep(50);
+        }
+    }
+
+    private PharosCluster current(String name) {
+        return client.resources(PharosCluster.class).inNamespace(NS).withName(name).get();
+    }
+
+    /** kind/name → resourceVersion of everything the operator manages. */
+    private Map<String, String> managedVersions() {
+        Map<String, String> m = new TreeMap<>();
+        for (Class<? extends HasMetadata> kind : KINDS) {
+            for (HasMetadata o : client.resources(kind).inNamespace(NS).withLabel(Labels.MANAGED_BY, Labels.OPERATOR)
+                    .list().getItems()) {
+                m.put(kind.getSimpleName() + "/" + o.getMetadata().getName(), o.getMetadata().getResourceVersion());
+            }
+        }
+        return m;
+    }
+
+    private List<HasMetadata> allManaged() {
+        List<HasMetadata> all = new ArrayList<>();
+        for (Class<? extends HasMetadata> kind : KINDS) {
+            all.addAll(client.resources(kind).inNamespace(NS).list().getItems());
+        }
+        return all;
+    }
+
+    private String secretValue(String secret, String key) {
+        String b64 = client.secrets().inNamespace(NS).withName(secret).get().getData().get(key);
+        return new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void reconcileCreatesEverythingIdempotently() throws Exception {
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+
+        List<String> expected = List.of("Secret/demo-token", "Secret/demo-minio",
+                "ConfigMap/demo-config-writer", "ConfigMap/demo-config-reader", "ConfigMap/demo-config-router",
+                "Service/demo-writers-hl", "Service/demo-readers-hl", "Service/demo-router", "Service/demo-minio",
+                "StatefulSet/demo-writers", "StatefulSet/demo-readers", "StatefulSet/demo-minio",
+                "Deployment/demo-router", "PersistentVolumeClaim/demo-minio", "Job/demo-minio-bucket",
+                "PodDisruptionBudget/demo-writers", "PodDisruptionBudget/demo-readers", "NetworkPolicy/demo-internal");
+        await("every object", () -> managedVersions().keySet().containsAll(expected));
+        await("status Provisioning", () -> {
+            PharosCluster c = current("demo");
+            return c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        assertThat(managedVersions()).containsOnlyKeys(expected);
+        PharosClusterStatus status = current("demo").getStatus();
+        assertThat(status.writers()).isEqualTo(new PharosClusterStatus.Replicas(1, 0));
+        assertThat(status.readers()).isEqualTo(new PharosClusterStatus.Replicas(2, 0));
+        assertThat(status.storage()).isEqualTo(new PharosClusterStatus.StorageStatus("minio", false, null));
+        assertThat(client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get()
+                .getMetadata().getOwnerReferences()).singleElement()
+                .satisfies(o -> assertThat(o.getName()).isEqualTo("demo"));
+        // the bucket's data and keys outlive the cluster: no owner reference, so no garbage collection
+        assertThat(client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(client.secrets().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(client.secrets().inNamespace(NS).withName("demo-token").get()
+                .getMetadata().getOwnerReferences()).singleElement();
+
+        // Let any reconcile triggered by our own writes finish, then: nothing changes any more.
+        long seen = reconciler.reconciles.get();
+        await("a quiet reconcile loop", () -> {
+            long now = reconciler.reconciles.get();
+            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return reconciler.reconciles.get() == now;
+        });
+        assertThat(reconciler.reconciles.get()).isGreaterThanOrEqualTo(seen);
+        Map<String, String> before = managedVersions();
+        String token = secretValue("demo-token", "token");
+        String minioSecret = secretValue("demo-minio", "secretKey");
+
+        // A spec change that renders nothing differently reconciles again (new generation): no object changes.
+        PharosCluster c = current("demo");
+        PharosClusterSpec s = c.getSpec();
+        long reconciles = reconciler.reconciles.get();
+        c.setSpec(new PharosClusterSpec(s.version(), s.storage(), s.embeddings(), s.projects(), s.writers(), s.readers(),
+                s.router(), new PharosClusterSpec.Autoscaling(true, 600, null, null, s.autoscaling().triggers(),
+                s.autoscaling().schedule()), s.pharosConfig()));
+        client.resource(c).update();
+        await("the reconcile of the new generation", () -> {
+            PharosCluster now = current("demo");
+            return reconciler.reconciles.get() > reconciles && now.getStatus().observedGeneration()
+                    .equals(now.getMetadata().getGeneration());
+        });
+        assertThat(managedVersions()).isEqualTo(before);
+
+        // An operator restart reconciles everything again: still no change, and no Secret is regenerated.
+        operator.stop();
+        startOperator();
+        await("the first reconcile after the restart", () -> reconciler.reconciles.get() >= 1);
+        assertThat(managedVersions()).isEqualTo(before);
+        assertThat(secretValue("demo-token", "token")).isEqualTo(token);
+        assertThat(secretValue("demo-minio", "secretKey")).isEqualTo(minioSecret);
+
+        assertNoSecretAnywhere("demo", List.of(token, secretValue("demo-minio", "accessKey"), minioSecret));
+    }
+
+    /**
+     * Final review I1: a cluster deleted and applied again under the same name adopts the MinIO PVC and
+     * the MinIO credentials Secret that survived it, so the keys still match the data.
+     */
+    @Test
+    void reappliedClusterAdoptsTheBucketsPvcAndKeys() throws Exception {
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("the MinIO PVC and Secret", () -> client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio")
+                .get() != null && client.secrets().inNamespace(NS).withName("demo-minio").get() != null);
+        String accessKey = secretValue("demo-minio", "accessKey");
+        String secretKey = secretValue("demo-minio", "secretKey");
+        String pvcUid = client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getMetadata().getUid();
+
+        client.resources(PharosCluster.class).inNamespace(NS).withName("demo").delete();
+        await("the cluster gone", () -> current("demo") == null);
+        // what the garbage collector would do (the mock server has none): delete every owned object
+        for (HasMetadata o : allManaged()) {
+            if (o.getMetadata().getOwnerReferences() != null && !o.getMetadata().getOwnerReferences().isEmpty()) {
+                client.resource(o).delete();
+            }
+        }
+        assertThat(client.secrets().inNamespace(NS).withName("demo-token").get()).isNull();
+
+        client.resource(TestClusters.minio()).create();
+        await("status Provisioning again", () -> {
+            PharosCluster c = current("demo");
+            return c != null && c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        await("a new token", () -> client.secrets().inNamespace(NS).withName("demo-token").get() != null);
+        assertThat(secretValue("demo-minio", "accessKey")).isEqualTo(accessKey);
+        assertThat(secretValue("demo-minio", "secretKey")).isEqualTo(secretKey);
+        var pvc = client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get();
+        assertThat(pvc.getMetadata().getUid()).isEqualTo(pvcUid);
+        assertThat(pvc.getMetadata().getOwnerReferences()).isEmpty();
+        assertThat(pvc.getMetadata().getLabels()).containsEntry(Labels.CLUSTER, "demo");
+    }
+
+    /**
+     * Review Focus 4, on a live reconcile: the generated secrets appear only in their own Secrets, never in
+     * another object, the resource's status, an Event or the operator's logs.
+     */
+    private void assertNoSecretAnywhere(String cluster, List<String> secrets) {
+        List<String> forms = new ArrayList<>();
+        for (String s : secrets) {
+            assertThat(s).hasSizeGreaterThanOrEqualTo(20);
+            forms.add(s);
+            forms.add(Base64.getEncoder().encodeToString(s.getBytes(StandardCharsets.UTF_8)));
+        }
+        for (HasMetadata o : allManaged()) {
+            if (o instanceof Secret && (o.getMetadata().getName().equals(cluster + "-token")
+                    || o.getMetadata().getName().equals(cluster + "-minio"))) {
+                continue;
+            }
+            String yaml = Serialization.asYaml(o);
+            forms.forEach(f -> assertThat(yaml).as("%s/%s", o.getKind(), o.getMetadata().getName()).doesNotContain(f));
+        }
+        String resource = Serialization.asYaml(current(cluster));
+        forms.forEach(f -> assertThat(resource).as("the PharosCluster and its status").doesNotContain(f));
+        Stream.concat(client.v1().events().inNamespace(NS).list().getItems().stream().map(Serialization::asYaml),
+                        client.events().v1().events().inNamespace(NS).list().getItems().stream().map(Serialization::asYaml))
+                .forEach(e -> forms.forEach(f -> assertThat(e).as("an Event").doesNotContain(f)));
+        List<ILoggingEvent> operatorLogs = logs.list.stream()
+                .filter(e -> !e.getLoggerName().startsWith("io.fabric8.mockwebserver")
+                        && !e.getLoggerName().startsWith("io.fabric8.kubernetes.client.server.mock"))
+                .toList();
+        assertThat(operatorLogs).isNotEmpty();
+        for (ILoggingEvent e : operatorLogs) {
+            String line = e.getFormattedMessage() + (e.getThrowableProxy() == null ? "" : e.getThrowableProxy().getMessage());
+            forms.forEach(f -> assertThat(line).as("log line of %s", e.getLoggerName()).doesNotContain(f));
+        }
+    }
+
+    @Test
+    void invalidSpecCreatesNothingAndListsOwnedKeys() throws Exception {
+        startOperator();
+        PharosCluster c = TestClusters.minio();
+        c.setSpec(TestClusters.withPharosConfig(c.getSpec(), Map.of(
+                "tokenEnv", JsonNodeFactory.instance.textNode("X"),
+                "writer.workDir", JsonNodeFactory.instance.textNode("/tmp"))));
+        client.resource(c).create();
+        await("status SpecInvalid", () -> {
+            PharosCluster now = current("demo");
+            return now.getStatus() != null && now.getStatus().conditions() != null;
+        });
+        PharosClusterStatus status = current("demo").getStatus();
+        assertThat(status.phase()).isEqualTo("Pending");
+        assertThat(status.conditions()).anySatisfy(cond -> {
+            assertThat(cond.getType()).isEqualTo("SpecInvalid");
+            assertThat(cond.getStatus()).isEqualTo("True");
+            assertThat(cond.getMessage())
+                    .isEqualTo("spec.pharosConfig: keys owned by the operator: tokenEnv, writer.workDir");
+        });
+        assertThat(managedVersions()).isEmpty();
+    }
+
+    @Test
+    void s3ModeCreatesNoStorageObjects() throws Exception {
+        startOperator();
+        client.resource(TestClusters.s3()).create();
+        await("status Provisioning", () -> {
+            PharosCluster c = current("prod");
+            return c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        Map<String, String> objects = managedVersions();
+        assertThat(objects).containsKeys("Secret/prod-token", "StatefulSet/prod-writers", "Deployment/prod-router");
+        assertThat(objects.keySet()).noneMatch(k -> k.contains("minio"));
+        assertThat(objects.keySet()).filteredOn(k -> k.startsWith("Secret/")).containsExactly("Secret/prod-token");
+        assertThat(current("prod").getStatus().storage()).isEqualTo(new PharosClusterStatus.StorageStatus("s3", true, null));
+    }
+
+    private PharosCluster provisionedMinio() throws InterruptedException {
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("status Provisioning", () -> {
+            PharosCluster c = current("demo");
+            return c.getStatus() != null && "Provisioning".equals(c.getStatus().phase());
+        });
+        await("every minio object", () -> managedVersions().keySet().containsAll(List.of("PersistentVolumeClaim/demo-minio",
+                "Secret/demo-minio", "Secret/demo-token", "Job/demo-minio-bucket", "StatefulSet/demo-minio")));
+        return current("demo");
+    }
+
+    private io.fabric8.kubernetes.api.model.Condition condition(String cluster, String type) {
+        PharosClusterStatus st = current(cluster).getStatus();
+        return st == null || st.conditions() == null ? null
+                : st.conditions().stream().filter(c -> c.getType().equals(type)).findFirst().orElse(null);
+    }
+
+    private boolean conditionTrue(String cluster, String type) {
+        var c = condition(cluster, type);
+        return c != null && "True".equals(c.getStatus());
+    }
+
+    private static PharosClusterSpec spec(PharosClusterSpec s, PharosClusterSpec.Storage storage, String version,
+                                          PharosClusterSpec.RoleSpec writers) {
+        return new PharosClusterSpec(version, storage, s.embeddings(), s.projects(), writers, s.readers(), s.router(),
+                s.autoscaling(), s.pharosConfig());
+    }
+
+    @Test
+    void storageKindIsImmutableAndNothingIsDeleted() throws Exception {
+        PharosCluster c = provisionedMinio();
+        Map<String, String> uids = new TreeMap<>();
+        for (HasMetadata o : allManaged()) uids.put(o.getKind() + "/" + o.getMetadata().getName(), o.getMetadata().getUid());
+
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, TestClusters.s3().getSpec().storage(), s.version(), s.writers()));
+        client.resource(c).update();
+        await("SpecInvalid", () -> conditionTrue("demo", "SpecInvalid"));
+        assertThat(condition("demo", "SpecInvalid").getMessage())
+                .contains("spec.storage: the storage kind is immutable (it is minio; the spec asks for s3)");
+        assertThat(current("demo").getStatus().storage().kind()).isEqualTo("minio");
+
+        // The data-bearing objects (and everything else) are still there, the very same objects.
+        Map<String, String> after = new TreeMap<>();
+        for (HasMetadata o : allManaged()) after.put(o.getKind() + "/" + o.getMetadata().getName(), o.getMetadata().getUid());
+        assertThat(after).isEqualTo(uids);
+        assertThat(after).containsKeys("PersistentVolumeClaim/demo-minio", "Secret/demo-minio", "Secret/demo-token");
+    }
+
+    @Test
+    void volumeChangeIsNotAppliedButReplicasAre() throws Exception {
+        PharosCluster c = provisionedMinio();
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("10Gi"), null), "1.6.1",
+                new PharosClusterSpec.RoleSpec(2, 4, s.writers().resources(), "80Gi", null, null)));
+        client.resource(c).update();
+        await("VolumeChangeNotApplied", () -> conditionTrue("demo", "VolumeChangeNotApplied"));
+
+        StatefulSet writers = client.apps().statefulSets().inNamespace(NS).withName("demo-writers").get();
+        assertThat(writers.getSpec().getReplicas()).isEqualTo(2);
+        // a version change waits for its pre-flight check (the storage is not even ready here)
+        assertThat(writers.getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("pharos:1.6.0");
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("WaitingForStorage");
+        assertThat(writers.getSpec().getVolumeClaimTemplates().getFirst().getSpec().getResources().getRequests()
+                .get("storage").toString()).isEqualTo("50Gi");
+        assertThat(client.persistentVolumeClaims().inNamespace(NS).withName("demo-minio").get()
+                .getSpec().getResources().getRequests().get("storage").toString()).isEqualTo("20Gi");
+        assertThat(condition("demo", "VolumeChangeNotApplied").getMessage())
+                .contains("spec.writers.workVolume: 50Gi -> 80Gi is not applied")
+                .contains("spec.storage.minio.storage: 20Gi -> 10Gi is not applied");
+        assertThat(conditionTrue("demo", "ApplyFailed")).isFalse();
+
+        // Growing the MinIO volume is applied.
+        PharosCluster again = current("demo");
+        again.setSpec(spec(again.getSpec(), new PharosClusterSpec.Storage(new PharosClusterSpec.Minio("30Gi"), null),
+                "1.6.1", again.getSpec().writers()));
+        client.resource(again).update();
+        await("the MinIO PVC grows", () -> "30Gi".equals(client.persistentVolumeClaims().inNamespace(NS)
+                .withName("demo-minio").get().getSpec().getResources().getRequests().get("storage").toString()));
+    }
+
+    @Test
+    void bumpedMcImageChangesNoJobAndFailsNothing() throws Exception {
+        provisionedMinio();
+        Map<String, String> before = managedVersions();
+        operator.stop();
+        startOperator(new OperatorSettings("pharos", "minio:test", "mc:newer"));
+        await("the first reconcile after the restart", () -> reconciler.reconciles.get() >= 1);
+        assertThat(managedVersions()).isEqualTo(before);
+        assertThat(client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get()
+                .getSpec().getTemplate().getSpec().getContainers().getFirst().getImage()).isEqualTo("mc:test");
+        assertThat(conditionTrue("demo", "ApplyFailed")).isFalse();
+    }
+
+    @Test
+    void applyFailureIsReportedAsACondition() throws Exception {
+        server.expect().post().withPath("/apis/networking.k8s.io/v1/namespaces/pharos/networkpolicies")
+                .andReturn(500, "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\","
+                        + "\"message\":\"injected failure\",\"code\":500}")
+                .always();
+        startOperator();
+        client.resource(TestClusters.minio()).create();
+        await("ApplyFailed", () -> conditionTrue("demo", "ApplyFailed"));
+        assertThat(condition("demo", "ApplyFailed").getReason()).isEqualTo("ApplyFailed");
+        assertThat(condition("demo", "ApplyFailed").getMessage()).contains("network-policy");
+        // everything else was still applied
+        assertThat(managedVersions()).containsKeys("StatefulSet/demo-writers", "Secret/demo-token");
+    }
+
+    @Test
+    void failedBucketJobIsReportedThenRetried() throws Exception {
+        provisionedMinio();
+        Job job = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        String firstUid = job.getMetadata().getUid();
+        job.setStatus(new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withFailed(7)
+                .addNewCondition().withType("Failed").withStatus("True").withReason("BackoffLimitExceeded")
+                .withLastTransitionTime(clock.instant().toString()).endCondition().build());
+        client.batch().v1().jobs().resource(job).updateStatus();
+
+        await("BucketJobFailed", () -> {
+            var c = condition("demo", "StorageReady");
+            return c != null && "BucketJobFailed".equals(c.getReason());
+        });
+        assertThat(condition("demo", "StorageReady").getMessage()).contains("BackoffLimitExceeded")
+                .contains("re-created after 60 s");
+        assertThat(client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get().getMetadata().getUid())
+                .isEqualTo(firstUid); // within the backoff: not retried yet
+
+        clock.advance(Duration.ofSeconds(61));
+        Job touch = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        touch.getMetadata().getAnnotations().put("test/touch", "1"); // any event: reconcile now
+        client.batch().v1().jobs().resource(touch).update();
+        await("a new bucket Job", () -> {
+            Job now = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+            return now != null && !now.getMetadata().getUid().equals(firstUid);
+        });
+        await("retries counted", () -> Integer.valueOf(1).equals(current("demo").getStatus().storage().bucketRetries()));
+    }
+
+    @Test
+    void proposalsScaleTheStatefulSetsAndAreRecorded() throws Exception {
+        AtomicReference<StatusReading> reading = new AtomicReference<>();
+        AtomicReference<String> token = new AtomicReference<>();
+        AtomicReference<Runnable> update = new AtomicReference<>();
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { token.set(t); }
+
+                @Override public Optional<StatusReading> latest() { return Optional.ofNullable(reading.get()); }
+
+                @Override public String problem() { return reading.get() == null ? "nobody home" : null; }
+
+                @Override public void close() { }
+            };
+        });
+        startOperator(new PharosClusterReconciler(clock, SETTINGS, source));
+        client.resource(TestClusters.minio()).create();
+
+        // no node answers: the floors (readers min 2) apply and the status says why nothing else does
+        await("readers at the floor", () -> replicas("demo-readers") == 2);
+        await("ClusterStatusAvailable=False", () -> {
+            var c = current("demo") == null ? null : condition("demo", "ClusterStatusAvailable");
+            return c != null && "False".equals(c.getStatus()) && c.getMessage().startsWith("nobody home");
+        });
+        await("the token handed to the watch", () -> token.get() != null);
+        assertThat(token.get()).isEqualTo(secretValue("demo-token", "token"));
+
+        var add = new ClusterStatus.Proposal("add-r", "add-readers", "readers", "p95 above target", Map.of(),
+                "start 3 readers", 3, "2026-11-22T09:50:00Z");
+        var reshard = new ClusterStatus.Proposal("rs", "reshard", "lucene", "big", Map.of("sizeBytes", 5),
+                "split lucene", null, "2026-11-22T09:40:00Z");
+        reading.set(new StatusReading(new ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                new ClusterStatus.Layout(new StatusState.Summary(1, 1, 2), List.of(), List.of(), List.of()),
+                new ClusterStatus.BacklogSummary(0, null), List.of(), List.of(add, reshard)), clock.instant(), "test"));
+        update.get().run();
+
+        // maxStepUp 2 (the example): 2 -> 4, once
+        await("readers scaled", () -> replicas("demo-readers") == 4);
+        await("the application recorded", () -> {
+            PharosClusterStatus st = current("demo").getStatus();
+            return st.proposals() != null && st.reshardProposals() != null;
+        });
+        PharosClusterStatus st = current("demo").getStatus();
+        assertThat(st.proposals()).containsExactly(new PharosClusterStatus.ProposalStatus("add-r", "add-readers",
+                "readers", "2026-11-22T09:50:00Z", true, "2026-11-22T10:00:00Z", 2, 4));
+        assertThat(st.reshardProposals()).singleElement().satisfies(r -> assertThat(r.target()).isEqualTo("lucene"));
+        assertThat(st.readers().desired()).isEqualTo(4);
+        assertThat(condition("demo", "ClusterStatusAvailable").getStatus()).isEqualTo("True");
+        assertThat(replicas("demo-writers")).isEqualTo(1);
+        await("the Events", () -> client.v1().events().inNamespace(NS).list().getItems().stream()
+                .map(e -> e.getReason()).toList().containsAll(List.of("Scaled", "ReshardProposed")));
+
+        // still in force, inside the cooldown: further reads change nothing
+        long reconciles = reconciler.reconciles.get();
+        update.get().run();
+        await("another reconcile", () -> reconciler.reconciles.get() > reconciles);
+        assertThat(replicas("demo-readers")).isEqualTo(4);
+        // after the cooldown (300 s), the next step
+        clock.advance(Duration.ofSeconds(300));
+        StatusReading old = reading.get();
+        reading.set(new StatusReading(old.status(), clock.instant(), old.from())); // a fresh read
+        update.get().run();
+        await("readers ramped", () -> replicas("demo-readers") == 6);
+    }
+
+    private int replicas(String sts) {
+        StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(sts).get();
+        return s == null ? -1 : s.getSpec().getReplicas();
+    }
+
+    @Test
+    void aFailedDependentDoesNotLetAProposalApplyTwice() throws Exception {
+        // the NetworkPolicy never applies, so no reconcile ends in a status patch with the record
+        server.expect().post().withPath("/apis/networking.k8s.io/v1/namespaces/pharos/networkpolicies")
+                .andReturn(500, "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\","
+                        + "\"message\":\"denied by a webhook\",\"code\":500}")
+                .always();
+        var add = new ClusterStatus.Proposal("add-r", "add-readers", "readers", "p95 above target", Map.of(),
+                "start 1 reader", 1, "2026-11-22T09:50:00Z");
+        AtomicReference<Runnable> update = new AtomicReference<>();
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { }
+
+                @Override public Optional<StatusReading> latest() {
+                    return Optional.of(new StatusReading(new ClusterStatus("cluster", "2026-11-22T10:00:00Z",
+                            new ClusterStatus.Layout(new StatusState.Summary(1, 1, 2), List.of(), List.of(), List.of()),
+                            new ClusterStatus.BacklogSummary(0, null), List.of(), List.of(add)), clock.instant(), "t"));
+                }
+
+                @Override public String problem() { return null; }
+
+                @Override public void close() { }
+            };
+        });
+        startOperator(new PharosClusterReconciler(clock, SETTINGS, source));
+        client.resource(TestClusters.minio()).create();
+
+        // the first reconcile creates the readers at the floor 2, a retry applies the proposal: 3
+        await("readers scaled once", () -> replicas("demo-readers") == 3);
+        await("ApplyFailed", () -> conditionTrue("demo", "ApplyFailed"));
+        StatefulSet readers = client.apps().statefulSets().inNamespace(NS).withName("demo-readers").get();
+        assertThat(readers.getMetadata().getAnnotations()).containsEntry(Labels.LAST_SCALE,
+                new com.pharos.operator.scale.LastScale("add-r", "add-readers", "readers", "2026-11-22T09:50:00Z",
+                        "2026-11-22T10:00:00Z", 2, 3).toJson());
+        assertThat(current("demo").getStatus().proposals()).isNull(); // the status never got the record
+
+        // more reconciles inside the cooldown (JOSDK retries, status reads): replicas stay
+        for (int i = 0; i < 3; i++) {
+            long n = reconciler.reconciles.get();
+            update.get().run();
+            await("another reconcile", () -> reconciler.reconciles.get() > n);
+        }
+        assertThat(replicas("demo-readers")).isEqualTo(3);
+
+        // after the cooldown, one more step
+        clock.advance(Duration.ofSeconds(300));
+        update.get().run();
+        await("the next step", () -> replicas("demo-readers") == 4);
+        Thread.sleep(500);
+        update.get().run();
+        Thread.sleep(500);
+        assertThat(replicas("demo-readers")).isEqualTo(4);
+    }
+
+    // ── upgrades ────────────────────────────────────────────────────────────────────────────────
+
+    /** A watch whose reading the test sets; {@code update} triggers a reconcile like a real read. */
+    private final AtomicReference<StatusReading> reading = new AtomicReference<>();
+    private final AtomicReference<Runnable> update = new AtomicReference<>();
+
+    private PharosClusterReconciler withFakeWatch() {
+        ClusterStatusEventSource source = new ClusterStatusEventSource((name, namespace, onUpdate) -> {
+            update.set(onUpdate);
+            return new ClusterStatusEventSource.Watch() {
+                @Override public void token(String t) { }
+
+                @Override public Optional<StatusReading> latest() { return Optional.ofNullable(reading.get()); }
+
+                @Override public String problem() { return reading.get() == null ? "nobody home" : null; }
+
+                @Override public void close() { }
+            };
+        });
+        return new PharosClusterReconciler(clock, SETTINGS, source);
+    }
+
+    /** A fresh {@code /cluster/status} read listing these reader and writer heartbeats, started at {@code startedAt}. */
+    private void heartbeats(long startedAt, List<String> readers, List<String> writers) {
+        List<ClusterStatus.Reader> rs = readers.stream().map(n -> new ClusterStatus.Reader(n, null, List.of(), "ready",
+                List.of(), Map.of(), 0, 0.0, startedAt, null, null, 2)).toList();
+        List<ClusterStatus.Writer> ws = writers.stream().map(n -> new ClusterStatus.Writer(n, true, List.of(), List.of(),
+                null, startedAt, false, null, 2)).toList();
+        reading.set(new StatusReading(new ClusterStatus("cluster", clock.instant().toString(),
+                new ClusterStatus.Layout(new StatusState.Summary(0, ws.size(), rs.size()), List.of(), ws, rs),
+                new ClusterStatus.BacklogSummary(0, null), List.of(), List.of()), clock.instant(), "test"));
+        if (update.get() != null) update.get().run();
+    }
+
+    /** MinIO ready and the bucket created: the storage is ready. */
+    private void storageReady() {
+        StatefulSet minio = client.apps().statefulSets().inNamespace(NS).withName("demo-minio").get();
+        minio.setStatus(new io.fabric8.kubernetes.api.model.apps.StatefulSetStatusBuilder().withReplicas(1)
+                .withReadyReplicas(1).build());
+        client.apps().statefulSets().resource(minio).updateStatus();
+        Job bucket = client.batch().v1().jobs().inNamespace(NS).withName("demo-minio-bucket").get();
+        bucket.setStatus(new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withSucceeded(1).build());
+        client.batch().v1().jobs().resource(bucket).updateStatus();
+    }
+
+    /** Kubernetes' view of a finished rollout of StatefulSet {@code name}: every replica updated and ready. */
+    private void rolledOut(String name) {
+        StatefulSet s = client.apps().statefulSets().inNamespace(NS).withName(name).get();
+        int n = s.getSpec().getReplicas();
+        long gen = s.getMetadata().getGeneration() == null ? 1 : s.getMetadata().getGeneration();
+        s.setStatus(new io.fabric8.kubernetes.api.model.apps.StatefulSetStatusBuilder().withObservedGeneration(gen)
+                .withReplicas(n).withReadyReplicas(n).withUpdatedReplicas(n).withCurrentRevision("r2")
+                .withUpdateRevision("r2").build());
+        client.apps().statefulSets().resource(s).updateStatus();
+    }
+
+    private void routerRolledOut() {
+        Deployment d = client.apps().deployments().inNamespace(NS).withName("demo-router").get();
+        int n = d.getSpec().getReplicas();
+        long gen = d.getMetadata().getGeneration() == null ? 1 : d.getMetadata().getGeneration();
+        d.setStatus(new io.fabric8.kubernetes.api.model.apps.DeploymentStatusBuilder().withObservedGeneration(gen)
+                .withReplicas(n).withReadyReplicas(n).withUpdatedReplicas(n).withAvailableReplicas(n).build());
+        client.apps().deployments().resource(d).updateStatus();
+    }
+
+    private String image(String workload) {
+        var template = workload.equals("demo-router")
+                ? client.apps().deployments().inNamespace(NS).withName(workload).get().getSpec().getTemplate()
+                : client.apps().statefulSets().inNamespace(NS).withName(workload).get().getSpec().getTemplate();
+        return template.getSpec().getContainers().getFirst().getImage();
+    }
+
+    private Job job(String name) {
+        return client.batch().v1().jobs().inNamespace(NS).withName(name).get();
+    }
+
+    private void finish(String jobName, boolean ok, String reason) {
+        Job j = job(jobName);
+        j.setStatus(ok
+                ? new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withSucceeded(1).addNewCondition()
+                        .withType("Complete").withStatus("True").endCondition().build()
+                : new io.fabric8.kubernetes.api.model.batch.v1.JobStatusBuilder().withFailed(1).addNewCondition()
+                        .withType("Failed").withStatus("True").withReason(reason)
+                        .withLastTransitionTime(clock.instant().toString()).endCondition().build());
+        client.batch().v1().jobs().resource(j).updateStatus();
+    }
+
+    /** A provisioned minio cluster with ready storage, everything on 1.6.0, then {@code spec.version} set to {@code version}. */
+    private void upgradeTo(String version) throws InterruptedException {
+        startOperator(withFakeWatch());
+        client.resource(TestClusters.minio()).create();
+        await("every workload", () -> managedVersions().keySet().containsAll(List.of("StatefulSet/demo-writers",
+                "StatefulSet/demo-readers", "Deployment/demo-router", "Job/demo-minio-bucket")));
+        storageReady();
+        await("storage ready", () -> conditionTrue("demo", "StorageReady"));
+        PharosCluster c = current("demo");
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, s.storage(), version, s.writers()));
+        client.resource(c).update();
+    }
+
+    /** kind/name → resourceVersion of the workloads and their ConfigMaps. */
+    private Map<String, String> workloadVersions() {
+        Map<String, String> m = new TreeMap<>(managedVersions());
+        m.keySet().removeIf(k -> !(k.startsWith("StatefulSet/") || k.startsWith("Deployment/") || k.startsWith("ConfigMap/")));
+        return m;
+    }
+
+    /**
+     * Review Focus 5: an upgrade to a version that would refuse existing indexes. The pre-flight Job runs
+     * the new image with {@code upgrade-indexes --check}; when it fails on a refused shard, the cluster is
+     * Degraded with {@code UpgradeBlocked} and no workload changes, also across its retries.
+     */
+    @Test
+    void upgradeBlockedWhenPreflightRefusesChangesNoWorkload() throws Exception {
+        startOperator(withFakeWatch());
+        client.resource(TestClusters.minio()).create();
+        await("every workload", () -> managedVersions().keySet().containsAll(List.of("StatefulSet/demo-writers",
+                "StatefulSet/demo-readers", "Deployment/demo-router", "Job/demo-minio-bucket")));
+        storageReady();
+        await("storage ready", () -> conditionTrue("demo", "StorageReady"));
+        await("a quiet reconcile loop", () -> {
+            long n = reconciler.reconciles.get();
+            try { Thread.sleep(300); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return reconciler.reconciles.get() == n;
+        });
+        Map<String, String> before = workloadVersions();
+
+        PharosCluster c = current("demo");
+        PharosClusterSpec s = c.getSpec();
+        c.setSpec(spec(s, s.storage(), "1.7.0", s.writers()));
+        client.resource(c).update();
+
+        await("the pre-flight Job", () -> job("demo-preflight-1.7.0") != null);
+        Job preflight = job("demo-preflight-1.7.0");
+        var container = preflight.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getImage()).isEqualTo("pharos:1.7.0"); // the NEW image
+        assertThat(container.getArgs()).containsExactly("upgrade-indexes", "--check");
+        assertThat(container.getEnv()).anySatisfy(e -> assertThat(e.getName()).isEqualTo("PHAROS_ROLE"));
+        assertThat(preflight.getSpec().getTemplate().getSpec().getVolumes())
+                .anySatisfy(v -> assertThat(v.getConfigMap() == null ? null : v.getConfigMap().getName())
+                        .isEqualTo("demo-config-writer"));
+        assertThat(preflight.getSpec().getPodFailurePolicy().getRules()).singleElement()
+                .satisfies(r -> assertThat(r.getOnExitCodes().getValues()).containsExactly(3));
+        assertThat(preflight.getMetadata().getOwnerReferences()).singleElement()
+                .satisfies(o -> assertThat(o.getName()).isEqualTo("demo"));
+        await("UpgradeBlocked=False while it runs", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "PreflightRunning".equals(cond.getReason());
+        });
+        assertThat(current("demo").getStatus().upgrade())
+                .isEqualTo(new PharosClusterStatus.UpgradeStatus("1.6.0", "1.7.0", "Preflight", null));
+        assertThat(workloadVersions()).isEqualTo(before);
+
+        finish("demo-preflight-1.7.0", false, "PodFailurePolicy"); // exit 3: a shard would be refused
+        await("UpgradeBlocked", () -> conditionTrue("demo", "UpgradeBlocked"));
+        PharosClusterStatus st = current("demo").getStatus();
+        assertThat(st.phase()).isEqualTo("Degraded");
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("PreflightRefused");
+        assertThat(condition("demo", "UpgradeBlocked").getMessage()).contains("would refuse")
+                .contains("No workload is changed").contains("after 60 s");
+        assertThat(condition("demo", "Degraded").getReason()).isEqualTo("UpgradeBlocked");
+        assertThat(workloadVersions()).isEqualTo(before);
+        for (String w : List.of("demo-writers", "demo-readers", "demo-router")) {
+            assertThat(image(w)).as(w).isEqualTo("pharos:1.6.0");
+        }
+
+        // after the backoff the check runs again (the shards may have been re-indexed); still blocked meanwhile
+        String firstUid = job("demo-preflight-1.7.0").getMetadata().getUid();
+        clock.advance(Duration.ofSeconds(61));
+        update.get().run();
+        await("a new pre-flight Job", () -> {
+            Job j = job("demo-preflight-1.7.0");
+            return j != null && !j.getMetadata().getUid().equals(firstUid);
+        });
+        await("the retry counted", () -> {
+            var u = current("demo").getStatus().upgrade();
+            return u != null && Integer.valueOf(1).equals(u.preflightRetries());
+        });
+        assertThat(conditionTrue("demo", "UpgradeBlocked")).isTrue();
+        assertThat(condition("demo", "UpgradeBlocked").getReason()).isEqualTo("PreflightRetrying");
+        assertThat(workloadVersions()).isEqualTo(before);
+
+        // setting the version back ends the upgrade: the pre-flight Job goes, nothing was ever rolled
+        PharosCluster back = current("demo");
+        back.setSpec(spec(back.getSpec(), back.getSpec().storage(), "1.6.0", back.getSpec().writers()));
+        client.resource(back).update();
+        await("UpgradeBlocked=False, up to date", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "UpToDate".equals(cond.getReason()) && current("demo").getStatus().upgrade() == null;
+        });
+        await("the pre-flight Job deleted", () -> job("demo-preflight-1.7.0") == null);
+        assertThat(workloadVersions()).isEqualTo(before);
+    }
+
+    /** The roll after a passed pre-flight: readers, then writers, then the router, each gated on the previous. */
+    @Test
+    void upgradeRollsReadersThenWritersThenRouter() throws Exception {
+        upgradeTo("1.7.0");
+        await("the pre-flight Job", () -> job("demo-preflight-1.7.0") != null);
+        long t0 = clock.instant().toEpochMilli();
+        finish("demo-preflight-1.7.0", true, null);
+
+        await("the readers take 1.7.0", () -> image("demo-readers").equals("pharos:1.7.0"));
+        StatefulSet readers = client.apps().statefulSets().inNamespace(NS).withName("demo-readers").get();
+        assertThat(readers.getMetadata().getAnnotations()).containsEntry(Labels.VERSION_SINCE,
+                "1.7.0@" + clock.instant());
+        assertThat(image("demo-writers")).isEqualTo("pharos:1.6.0");
+        assertThat(image("demo-router")).isEqualTo("pharos:1.6.0");
+        await("step Readers", () -> current("demo").getStatus().upgrade() != null
+                && "Readers".equals(current("demo").getStatus().upgrade().step()));
+
+        // Kubernetes says the readers are rolled, but /cluster/status still shows the old pods: writers wait
+        rolledOut("demo-readers");
+        heartbeats(t0 - Duration.ofMinutes(10).toMillis(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the message names the missing heartbeats", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && cond.getMessage().contains("heartbeats of demo-readers-0, demo-readers-1");
+        });
+        assertThat(image("demo-writers")).isEqualTo("pharos:1.6.0");
+
+        // new reader pods answer: the writers roll, the router still waits
+        clock.advance(Duration.ofSeconds(30));
+        heartbeats(clock.instant().toEpochMilli(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the writers take 1.7.0", () -> image("demo-writers").equals("pharos:1.7.0"));
+        assertThat(image("demo-router")).isEqualTo("pharos:1.6.0");
+        assertThat(image("demo-readers")).isEqualTo("pharos:1.7.0");
+
+        // the writers rolled and heartbeating: the router rolls last
+        rolledOut("demo-writers");
+        clock.advance(Duration.ofSeconds(30));
+        heartbeats(clock.instant().toEpochMilli(), List.of("demo-readers-0", "demo-readers-1"),
+                List.of("demo-writers-0"));
+        await("the router takes 1.7.0", () -> image("demo-router").equals("pharos:1.7.0"));
+
+        // every workload on 1.7.0: the upgrade is over and its pre-flight Job is cleaned up
+        routerRolledOut();
+        await("up to date", () -> {
+            var cond = condition("demo", "UpgradeBlocked");
+            return cond != null && "UpToDate".equals(cond.getReason()) && current("demo").getStatus().upgrade() == null;
+        });
+        await("the pre-flight Job deleted", () -> job("demo-preflight-1.7.0") == null);
+        assertThat(conditionTrue("demo", "Degraded")).isFalse();
+    }
+}

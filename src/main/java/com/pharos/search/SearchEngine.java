@@ -310,10 +310,22 @@ public class SearchEngine {
      */
     List<String> knownProjects() {
         Set<String> names = new java.util.LinkedHashSet<>();
-        for (ProjectMeta m : registry.listAll()) if (m.getName() != null) names.add(m.getName());
         DistributedSearch ds = distributed;
-        if (ds != null) names.addAll(ds.catalogShardNames());
+        for (ProjectMeta m : registry.listAll()) {
+            // a reader registers shards: a split project's shard ids are not project names
+            if (m.getName() != null && (ds == null || ShardId.isProjectName(m.getName()))) names.add(m.getName());
+        }
+        if (ds != null) names.addAll(ds.catalogProjectNames());
         return List.copyOf(names);
+    }
+
+    /**
+     * The cluster catalog's project ↔ shards mapping on a node that routes queries (a reader or router):
+     * which project a registered shard serves. Empty on a single node, or when the catalog can't be read.
+     */
+    public java.util.Optional<com.pharos.cluster.sharding.ProjectShards> clusterProjects() {
+        DistributedSearch ds = distributed;
+        return ds == null ? java.util.Optional.empty() : ds.catalogProjects();
     }
 
     static final String CATALOG_UNREAD_WARNING = "searching only this reader's shards: ";
@@ -327,7 +339,8 @@ public class SearchEngine {
         if (e instanceof CatalogTooOldException old) {
             Set<String> held = new java.util.HashSet<>();
             for (ProjectMeta m : registry.listAll()) if (m.getName() != null) held.add(m.getName());
-            List<String> missing = old.lastKnown().stream().map(ShardId::value).filter(n -> !held.contains(n)).toList();
+            List<String> missing = old.lastKnownProjects().shards().stream().map(ShardId::value)
+                    .filter(n -> !held.contains(n)).toList();
             if (missing.isEmpty()) { // this reader holds every shard of the last good catalog: nothing is lost
                 return "catalog is " + old.ageSeconds() + " s old; serving this reader's shards (complete)";
             }
@@ -375,11 +388,27 @@ public class SearchEngine {
         return searchWithTrace(req, expand).results();
     }
 
+    /** {@link #searchWithTrace(SearchRequest, boolean)} with {@code keyFilter} as the request's key filters. */
+    public SearchResponse searchWithTrace(SearchRequest req, boolean expand,
+                                          com.pharos.cluster.routing.ShardFilter keyFilter) throws IOException {
+        return searchWithTrace(req.withKeyFilter(keyFilter), expand);
+    }
+
     /**
      * Search and return results together with a detailed timing trace.
-     * Use this from {@link com.pharos.cli.SearchCommand} when {@code --debug} is set.
+     *
+     * <p><b>Key filters</b> ({@link SearchRequest#keyFilter}: module, pathPrefix, language, kind, P6-R12)
+     * select documents as non-scoring filters, so scores are those of the unfiltered query. On a cluster
+     * reader they also prune the shards of split projects (Phase 6), and the trace notes what was pruned
+     * and why it could not be. A project indexed before documents carried the key fields refuses a
+     * filtered query ({@link KeyFiltersUnsupportedException}).
+     *
+     * @throws IllegalArgumentException a key filter that is not a relative path (module, pathPrefix)
      */
     public SearchResponse searchWithTrace(SearchRequest req, boolean expand) throws IOException {
+        if (req.hasKeyFilter()) req.keyFilter().validated();
+        com.pharos.cluster.routing.ShardFilter shardFilter = req.hasKeyFilter() ? req.keyFilter()
+                : com.pharos.cluster.routing.ShardFilter.NONE;
         SearchTrace trace = new SearchTrace();
         trace.start();
 
@@ -387,7 +416,8 @@ public class SearchEngine {
         QueryHints hints = parseQueryHints(req.query(), knownProjects());
         if (!hints.cleanedQuery().equals(req.query())) {
             req = new SearchRequest(hints.cleanedQuery(), req.type(), req.project(),
-                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor());
+                    req.projects(), req.limit(), req.outputFormat(), req.docType(), req.scope(), req.oversampleFactor())
+                    .withKeyFilter(req.keyFilter());
             log.debug("Query rewritten: '{}' → project={} lang={} query='{}'",
                     hints.cleanedQuery(), hints.projectBoost(), hints.langExtension(), hints.cleanedQuery());
         }
@@ -401,16 +431,58 @@ public class SearchEngine {
         DistributedSearch.Query fanout = null;
         if (ds != null) {
             try {
-                fanout = ds.open(requestedProjects(req));
+                fanout = ds.open(requestedProjects(req), shardFilter);
+                for (String note : fanout.routingNotes()) trace.note(note);
             } catch (CatalogUnavailableException e) { // never read, or too old: as before fan-out, this reader's shards
                 warnings.add(catalogFallbackWarning(e));
             }
         }
         if (fanout != null && fanout.fansOut()) {
+            List<String> before = List.copyOf(warnings);
+            SearchResponse resp = null;
+            String retryCause;
+            com.pharos.cluster.routing.NoShardAnsweredException noAnswer = null;
             try (DistributedSearch.Query q = fanout) {
                 warnDegraded(q.localShards(), warnings);
-                return searchFannedOut(req, hints, expand, trace, warnings, q);
+                try {
+                    resp = searchFannedOut(req, hints, expand, trace, warnings, q);
+                } catch (com.pharos.cluster.routing.NoShardAnsweredException e) {
+                    if (q.retryCause() == null || !ds.retries()) throw e;
+                    noAnswer = e; // every shard lost to a swap or synonyms: the re-plan below may answer
+                }
+                for (String note : q.lateNotes()) trace.note(note);
+                if (q.statsSummary() != null) trace.statistics(q.statsSummary());
+                retryCause = q.retryCause();
             }
+            if (retryCause != null && ds.retries()) {
+                // Ruling P6-R16: a reader swapped a shard's generation during the query, or analyses with
+                // other synonyms. Plan the query once more on the state the readers have moved to; if that
+                // still loses shards, its answer (partial, with the warnings) is returned, as before.
+                trace.note("re-planned once (" + retryCause + ")");
+                try (DistributedSearch.Query q = ds.reopen(fanout, requestedProjects(req), shardFilter)) {
+                    if (q.fansOut()) {
+                        List<String> retryWarnings = new ArrayList<>(before);
+                        warnDegraded(q.localShards(), retryWarnings);
+                        SearchResponse second = searchFannedOut(req, hints, expand, trace, retryWarnings, q);
+                        for (String note : q.lateNotes()) trace.note(note);
+                        if (q.statsSummary() != null) trace.statistics(q.statsSummary());
+                        resp = second;
+                        noAnswer = null;
+                    }
+                } catch (RuntimeException | IOException e) {
+                    // the re-plan failed (no shard answered it, the catalog, ...): the first answer stands,
+                    // partial with its warnings; with none, the first attempt's own failure is reported
+                    log.debug("Query '{}': the re-plan failed ({}); keeping the first answer", req.query(), e.toString());
+                    trace.note("the re-plan failed (" + e.getMessage() + "); the first answer stands");
+                    if (resp == null) {
+                        if (noAnswer != null) throw noAnswer;
+                        if (e instanceof IOException io) throw io;
+                        throw (RuntimeException) e;
+                    }
+                }
+            }
+            if (noAnswer != null) throw noAnswer;
+            return resp;
         }
         if (fanout != null) fanout.close(); // routed, nothing pinned: released all the same
         if (fanout != null && !fanout.unservedShards().isEmpty()) {
@@ -446,6 +518,9 @@ public class SearchEngine {
             }
         }
 
+        if (req.hasKeyFilter()) { // an index without key fields would silently match nothing
+            for (String p : projects) KeyFiltersUnsupportedException.check(p, luceneIndexer.getProjectIndexDir(p));
+        }
         IndexReader reader = luceneIndexer.openMultiReader(projects);
 
         // Classification for AUTO and UNIFIED is now handled inside SearchPipeline via QueryRouter.
@@ -462,7 +537,8 @@ public class SearchEngine {
             int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
             if (adaptive > 0) {
                 req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
-                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive)
+                        .withKeyFilter(req.keyFilter());
                 log.debug("Adaptive oversample: type={} query='{}' factor={}",
                         resolvedTypeName, hints.cleanedQuery(), adaptive);
             }
@@ -471,7 +547,13 @@ public class SearchEngine {
         Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
-        List<SearchResult> primary = pipeline.execute(reader, req, trace);
+        List<SearchResult> primary;
+        com.pharos.search.distributed.CandidateShaper.RAW_SCORES.set(trace); // P6-R20: raw scores in the trace
+        try {
+            primary = pipeline.execute(reader, req, trace);
+        } finally {
+            com.pharos.search.distributed.CandidateShaper.RAW_SCORES.remove();
+        }
         warnings.addAll(trace.warnings());
 
         primary = applyProjectAffinityBoost(primary, req.project());
@@ -541,14 +623,21 @@ public class SearchEngine {
             int adaptive = adaptiveOversample(resolvedType, hints.cleanedQuery());
             if (adaptive > 0) {
                 req = new SearchRequest(req.query(), req.type(), req.project(), req.projects(),
-                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive);
+                        req.limit(), req.outputFormat(), req.docType(), req.scope(), adaptive)
+                        .withKeyFilter(req.keyFilter());
             }
         }
         Map<SearchRequest.SearchType, SearchPipeline> pipelines = builtPipelines.get().pipelines();
         SearchPipeline pipeline = pipelines.getOrDefault(resolvedType,
                 pipelines.get(SearchRequest.SearchType.HYBRID));
         // Mergers and rerankers read result fields only: they get no reader here.
-        List<SearchResult> primary = pipeline.execute(null, req, trace, fanout.runner());
+        List<SearchResult> primary;
+        com.pharos.search.distributed.CandidateShaper.RAW_SCORES.set(trace); // P6-R20: raw scores in the trace
+        try {
+            primary = pipeline.execute(null, req, trace, fanout.runner());
+        } finally {
+            com.pharos.search.distributed.CandidateShaper.RAW_SCORES.remove();
+        }
         primary = applyProjectAffinityBoost(primary, req.project());
         primary = applyQueryHintBoosts(primary, hints);
 

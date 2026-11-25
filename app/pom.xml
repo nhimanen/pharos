@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      The pharos application. Its sources stay at the repository root (../src) and it builds into
+      the root target/, so the fat jar is still target/pharos-<version>.jar; tests run with the
+      repository root as working directory (they use paths such as src/test/resources).
+    -->
+    <parent>
+        <groupId>com.pharos</groupId>
+        <artifactId>pharos-parent</artifactId>
+        <version>1.11.0</version>
+    </parent>
+
+    <artifactId>pharos</artifactId>
+    <packaging>jar</packaging>
+    <name>pharos</name>
+    <description>Pharos — code-aware search tool with BM25 + vector search and call graph analysis</description>
+
+    <dependencies>
+        <!-- ===== Shared with the operator: ClusterConfig, status records ===== -->
+        <dependency>
+            <groupId>com.pharos</groupId>
+            <artifactId>pharos-api</artifactId>
+        </dependency>
+
+        <!-- ===== Apache Lucene ===== -->
+        <dependency>
+            <groupId>org.apache.lucene</groupId>
+            <artifactId>lucene-core</artifactId>
+            <version>${lucene.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.lucene</groupId>
+            <artifactId>lucene-analysis-common</artifactId>
+            <version>${lucene.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.lucene</groupId>
+            <artifactId>lucene-queryparser</artifactId>
+            <version>${lucene.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.lucene</groupId>
+            <artifactId>lucene-highlighter</artifactId>
+            <version>${lucene.version}</version>
+        </dependency>
+
+        <!-- ===== JavaParser with symbol solver ===== -->
+        <dependency>
+            <groupId>com.github.javaparser</groupId>
+            <artifactId>javaparser-symbol-solver-core</artifactId>
+            <version>${javaparser.version}</version>
+        </dependency>
+
+        <!-- ===== picocli CLI framework ===== -->
+        <dependency>
+            <groupId>info.picocli</groupId>
+            <artifactId>picocli</artifactId>
+            <version>${picocli.version}</version>
+        </dependency>
+
+        <!-- ===== ArcadeDB for call graph and module graph ===== -->
+        <dependency>
+            <groupId>com.arcadedb</groupId>
+            <artifactId>arcadedb-engine</artifactId>
+            <version>25.1.1</version>
+        </dependency>
+
+        <!-- ===== DJL + ONNX Runtime (optional vector embeddings) ===== -->
+        <dependency>
+            <groupId>ai.djl</groupId>
+            <artifactId>api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.onnxruntime</groupId>
+            <artifactId>onnxruntime-engine</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>com.microsoft.onnxruntime</groupId>
+            <artifactId>onnxruntime</artifactId>
+            <version>${onnxruntime.version}</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.huggingface</groupId>
+            <artifactId>tokenizers</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ===== Jackson for JSON ===== -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!-- ===== Logging ===== -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+
+        <!-- ===== Javalin web server (for web UI) ===== -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+            <version>6.3.0</version>
+        </dependency>
+
+        <!-- ===== S3-compatible object storage (cluster replication) ===== -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+        </dependency>
+
+        <!-- ===== Testing ===== -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>minio</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <directory>${project.basedir}/../target</directory>
+        <sourceDirectory>${project.basedir}/../src/main/java</sourceDirectory>
+        <testSourceDirectory>${project.basedir}/../src/test/java</testSourceDirectory>
+        <resources>
+            <resource>
+                <directory>${project.basedir}/../src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>pharos-version.properties</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>${project.basedir}/../src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes>
+                    <exclude>pharos-version.properties</exclude>
+                </excludes>
+            </resource>
+        </resources>
+        <testResources>
+            <testResource>
+                <directory>${project.basedir}/../src/test/resources</directory>
+            </testResource>
+        </testResources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>info.picocli</groupId>
+                            <artifactId>picocli-codegen</artifactId>
+                            <version>${picocli.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                    <compilerArgs>
+                        <arg>-Aproject=${project.groupId}/${project.artifactId}</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- Tests use repository-relative paths (src/..., target/...). -->
+                    <workingDirectory>${project.basedir}/..</workingDirectory>
+                    <!-- JavaParser reflects on JDK classes including jdk.incubator.vector
+                         when parsing corpora (e.g. Lucene) that use the Vector API.
+                         lucene.use{Scalar,Vector}FMA: Lucene picks fused or unfused multiply-add per CPU
+                         (unfused on AMD without AVX-512, e.g. some GitHub runners), which moves vector
+                         scores by an ulp. Pinned so bitwise fixtures (PipelineSplitParityTest) match on
+                         every machine with FMA. Read once at class init: must be JVM flags, not set in a test. -->
+                    <argLine>--add-modules jdk.incubator.vector -Darcadedb.txWalFlush=2 -Dpolyglot.engine.WarnInterpreterOnly=false -Dlucene.useScalarFMA=true -Dlucene.useVectorFMA=true</argLine>
+                    <!-- excludedGroups and pharos.home (tests never touch ~/.pharos) come from the parent -->
+                    <!-- Excluded due to ArcadeDB temp-dir contention when run in parallel
+                         with the full suite. Pass individually with -Dtest=ClassName. -->
+                    <excludes>
+                        <exclude>**/CrossProjectLinkerTest.java</exclude>
+                        <exclude>**/IndexCommandParallelTest.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <!-- Fat JAR with ServicesResourceTransformer (required for Lucene ServiceLoader) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.pharos.Main</mainClass>
+                                </transformer>
+                                <!-- CRITICAL: merges META-INF/services for Lucene codec ServiceLoader -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/spring.handlers</resource>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

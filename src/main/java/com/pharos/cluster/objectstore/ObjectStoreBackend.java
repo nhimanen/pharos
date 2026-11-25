@@ -64,15 +64,17 @@ public final class ObjectStoreBackend implements ReplicationBackend {
         } else {
             this.cache = new LocalFsCache(config);
             GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
-                    Duration.ofMinutes(cfg.getRetentionMinutes()));
+                    Duration.ofMinutes(cfg.getRetentionMinutes()), cfg.previousGenerationGrace());
             this.writerState = new ObjectStoreWriterStateStore(store, layout, source, cfg.effectiveNodeId());
             // Work-queue mode: only this process's work loop publishes, under the shard's lease (R3);
             // every other writer keeps the implicit lease of Phases 1-3.
             this.workQueueGuard = cfg.getRole() == NodeRole.WRITER && cfg.getWriter().isWorkQueue()
                     ? new com.pharos.cluster.writer.WorkQueueLeaseGuard() : null;
-            this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
+            ObjectStorePublisher publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
                     config.getSynonymsFile(), workQueueGuard != null ? workQueueGuard : LeaseGuard.IMPLICIT,
                     writerState);
+            publisher.setFlipSettle(cfg.previousGenerationGrace()); // P6-R19 (5)
+            this.publisher = publisher;
         }
     }
 

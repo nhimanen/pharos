@@ -97,6 +97,8 @@ class ReplicationEndpointTest {
         cc.setToken(TOKEN);
         cc.setRetentionGenerations(retentionGenerations);
         cc.setRetentionMinutes(retentionMinutes);
+        // with retentionMinutes 0 GC prunes at once: no previous-generation grace either (P6-R19)
+        if (retentionMinutes == 0) cc.getReader().setPreviousGenerationGraceSeconds(0);
         cc.getPeers().setStoreDir(tmp.resolve("peer-store"));
         cc.validate();
         c.setCluster(cc);

@@ -1,0 +1,16 @@
+{
+  "embeddingProviders" : [ {
+    "type" : "djl",
+    "modelId" : "jina-v2-code",
+    "url" : "hf://jinaai/jina-embeddings-v2-base-code",
+    "model" : null,
+    "apiKeyEnv" : null,
+    "dimensions" : 768,
+    "maxTokens" : 512,
+    "batchSize" : 0,
+    "timeoutMillis" : 60000,
+    "embeddingThreads" : 0,
+    "fallbacks" : [ ]
+  } ],
+  "searchEmbeddingModel" : "jina-v2-code"
+}

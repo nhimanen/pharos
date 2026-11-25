@@ -31,7 +31,11 @@
         "pending" : true,
         "oldestUnpublishedChangeAgeSeconds" : 493
       },
-      "state" : "lagging"
+      "state" : "lagging",
+      "project" : "alpha",
+      "role" : "active",
+      "staged" : false,
+      "stagedGeneration" : null
     }, {
       "shard" : "beta",
       "specVersion" : 1,
@@ -56,7 +60,11 @@
         "pending" : true,
         "oldestUnpublishedChangeAgeSeconds" : 420
       },
-      "state" : "lease-expired"
+      "state" : "lease-expired",
+      "project" : "beta",
+      "role" : "active",
+      "staged" : false,
+      "stagedGeneration" : null
     }, {
       "shard" : "gamma",
       "specVersion" : 1,
@@ -81,7 +89,11 @@
         "pending" : false,
         "oldestUnpublishedChangeAgeSeconds" : null
       },
-      "state" : "current"
+      "state" : "current",
+      "project" : "gamma",
+      "role" : "active",
+      "staged" : false,
+      "stagedGeneration" : null
     } ],
     "writers" : [ {
       "node" : "w1",
@@ -204,18 +216,39 @@
       "warmP95Millis" : 640
     },
     "action" : "Start 1 reader",
+    "delta" : 1,
     "since" : "2026-11-21T10:00:00Z"
+  }, {
+    "id" : "cfee3b6736da69c26cc9cb0c98314f66992cd5d8",
+    "kind" : "add-writers",
+    "target" : "writers",
+    "reason" : "indexing backlog above target and fewer writers than shards",
+    "metrics" : {
+      "oldestPendingAgeSeconds" : 493,
+      "shardsPending" : 2,
+      "shardsPendingOverTarget" : 2,
+      "targetBacklogShards" : 1,
+      "targetOldestPendingSeconds" : 300,
+      "workableShards" : 3,
+      "writers" : 2
+    },
+    "action" : "Start 1 writer; leases rebalance",
+    "delta" : 1,
+    "since" : "2026-11-21T10:03:30Z"
   }, {
     "id" : "285a2b0ddbe37d749157b2eca82a826950c5248f",
     "kind" : "reshard",
     "target" : "alpha",
     "reason" : "shard above 50% of a reader's cache cap",
     "metrics" : {
+      "largestShardBytes" : 734003200,
       "readerCacheMaxBytes" : 1073741824,
+      "shards" : 1,
       "shareOfCache" : 0.68,
-      "sizeBytes" : 734003200
+      "sizeBytes" : 734003200,
+      "suggestedRingShards" : 2
     },
-    "action" : "New shard spec, e.g. [project, hash(path) % 2]",
+    "action" : "New shard spec [project, ring(path, shards=2)]: pharos reshard alpha --spec \"[project, ring(path, shards=2)]\"",
     "since" : "2026-11-21T10:00:00Z"
   }, {
     "id" : "bef5d6d3813b7eace15feb55c151f2f348201942",
@@ -228,5 +261,46 @@
     },
     "action" : "add writer capacity / free disk on w2",
     "since" : "2026-11-21T10:00:00Z"
-  } ]
+  } ],
+  "projects" : [ {
+    "project" : "alpha",
+    "specVersion" : null,
+    "spec" : "[project]",
+    "shards" : [ "alpha" ],
+    "docCount" : 48210,
+    "sizeBytes" : 734003200,
+    "staged" : null,
+    "previous" : null,
+    "reshard" : null,
+    "published" : true,
+    "generation" : 12,
+    "pending" : true
+  }, {
+    "project" : "beta",
+    "specVersion" : null,
+    "spec" : "[project]",
+    "shards" : [ "beta" ],
+    "docCount" : 9120,
+    "sizeBytes" : 88080384,
+    "staged" : null,
+    "previous" : null,
+    "reshard" : null,
+    "published" : true,
+    "generation" : 7,
+    "pending" : true
+  }, {
+    "project" : "gamma",
+    "specVersion" : null,
+    "spec" : "[project]",
+    "shards" : [ "gamma" ],
+    "docCount" : 1204,
+    "sizeBytes" : 6291456,
+    "staged" : null,
+    "previous" : null,
+    "reshard" : null,
+    "published" : true,
+    "generation" : 3,
+    "pending" : false
+  } ],
+  "specs" : [ ]
 }

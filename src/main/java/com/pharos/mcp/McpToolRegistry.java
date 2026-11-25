@@ -83,15 +83,19 @@ public class McpToolRegistry {
         return List.of(
                 toolDef("search_code",
                         "Search for code across indexed Java projects using BM25, vector, or hybrid search",
-                        Map.of(
-                                "query", Map.of("type", "string", "description", "Natural language or keyword search query"),
-                                "type", Map.of("type", "string", "enum", List.of("auto", "keyword", "vector", "hybrid", "unified"), "description", "Search strategy: auto (default) classifies and picks automatically; keyword for identifiers; vector for semantic; hybrid for two-pass keyword+vector; unified for single-pass BM25 boosted by multi-vector similarity (requires re-indexed project)"),
-                                "project", Map.of("type", "string", "description", "Restrict search to a specific project (optional)"),
-                                "limit", Map.of("type", "integer", "description", "Maximum results (default: 10)"),
-                                "expand", Map.of("type", "boolean", "description", "Append callee methods of top-3 hits as related results (default: false)"),
-                                "doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)"),
-                                "scope", Map.of("type", "string", "enum", List.of("prod", "test", "docs", "all"), "description", "Filter by source scope: prod (production Java), test (test/benchmark), docs (non-Java files), or all (default: all)"),
-                                "snippet_lines", Map.of("type", "integer", "description", "Lines of source to include per result as a snippet centred on the best-matching content (default: 15, min: 5, max: 50)")
+                        Map.ofEntries(
+                                Map.entry("query", Map.of("type", "string", "description", "Natural language or keyword search query")),
+                                Map.entry("type", Map.of("type", "string", "enum", List.of("auto", "keyword", "vector", "hybrid", "unified"), "description", "Search strategy: auto (default) classifies and picks automatically; keyword for identifiers; vector for semantic; hybrid for two-pass keyword+vector; unified for single-pass BM25 boosted by multi-vector similarity (requires re-indexed project)")),
+                                Map.entry("project", Map.of("type", "string", "description", "Restrict search to a specific project (optional)")),
+                                Map.entry("limit", Map.of("type", "integer", "description", "Maximum results (default: 10)")),
+                                Map.entry("expand", Map.of("type", "boolean", "description", "Append callee methods of top-3 hits as related results (default: false)")),
+                                Map.entry("doc_type", Map.of("type", "string", "enum", List.of("method", "class", "all"), "description", "Filter by document type: method, class, or all (default: all)")),
+                                Map.entry("scope", Map.of("type", "string", "enum", List.of("prod", "test", "docs", "all"), "description", "Filter by source scope: prod (production Java), test (test/benchmark), docs (non-Java files), or all (default: all)")),
+                                Map.entry("snippet_lines", Map.of("type", "integer", "description", "Lines of source to include per result as a snippet centred on the best-matching content (default: 15, min: 5, max: 50)")),
+                                Map.entry("module", Map.of("type", "string", "description", "Filter by build module: the module's directory relative to the project root (e.g. core or services/api; the nearest directory holding a build file), not the Maven artifactId. '_' selects files outside any module (optional)")),
+                                Map.entry("path_prefix", Map.of("type", "string", "description", "Filter by a directory relative to the project root, matched on whole path segments: src/main matches src/main/java/..., not src/mainframe (optional)")),
+                                Map.entry("language", Map.of("type", "string", "description", "Filter by file extension, case-insensitive: java, py, md, ... (optional)")),
+                                Map.entry("kind", Map.of("type", "string", "enum", List.of("code", "doc"), "description", "Filter by file kind (optional)"))
                         ),
                         List.of("query")),
                 toolDef("find_transitive_callers",
@@ -256,7 +260,10 @@ public class McpToolRegistry {
         if (project != null && project.isEmpty()) project = null;
 
         SearchRequest req = new SearchRequest(
-                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope, 0);
+                query, SearchRequest.SearchType.from(type), project, null, limit, "text", docType, scope, 0)
+                .withKeyFilter(new com.pharos.cluster.routing.ShardFilter(args.path("module").asText(null),
+                        args.path("path_prefix").asText(null), args.path("language").asText(null),
+                        args.path("kind").asText(null)));
         SearchResponse response = searchEngine.searchWithTrace(req, expand);
         List<SearchResult> results = response.results();
         if (log.isDebugEnabled()) {
@@ -509,14 +516,34 @@ public class McpToolRegistry {
         List<ProjectMeta> projects = registry.listAll();
         if (projects.isEmpty()) return "No projects indexed yet. Run `pharos index <path>` first.";
 
-        List<Map<String, Object>> projectList = projects.stream().map(p -> {
+        // On a cluster reader the registry holds shards: a split project's shards are one project, named
+        // by the catalog (never derived from the shard id), with its shards listed.
+        Optional<com.pharos.cluster.sharding.ProjectShards> catalog = searchEngine.clusterProjects();
+        Map<String, List<ProjectMeta>> byProject = new LinkedHashMap<>();
+        for (ProjectMeta p : projects) {
+            String name = p.getName();
+            String project = name;
+            if (catalog.isPresent() && name != null && com.pharos.cluster.ShardId.isValid(name)) {
+                project = catalog.get().projectOf(new com.pharos.cluster.ShardId(name)).orElse(name);
+            }
+            byProject.computeIfAbsent(project, k -> new ArrayList<>()).add(p);
+        }
+        List<Map<String, Object>> projectList = new ArrayList<>();
+        for (Map.Entry<String, List<ProjectMeta>> e : byProject.entrySet()) {
+            List<ProjectMeta> held = e.getValue();
+            // every shard of a split project carries the project's meta: show the newest, don't add them up
+            ProjectMeta p = held.stream().max(Comparator.comparing(ProjectMeta::getLastIndexed,
+                    Comparator.nullsFirst(Comparator.naturalOrder()))).orElse(held.get(0));
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("name", p.getName());
+            m.put("name", e.getKey());
             m.put("methodCount", p.getMethodCount());
             m.put("classCount", p.getClassCount());
             m.put("lastIndexed", p.getLastIndexed() != null ? p.getLastIndexed().toString() : null);
-            return m;
-        }).collect(Collectors.toList());
+            if (held.size() > 1 || !e.getKey().equals(held.get(0).getName())) {
+                m.put("shards", held.stream().map(ProjectMeta::getName).sorted().toList());
+            }
+            projectList.add(m);
+        }
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("count", projectList.size());

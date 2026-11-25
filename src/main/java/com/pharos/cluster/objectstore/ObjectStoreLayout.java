@@ -36,7 +36,11 @@ public final class ObjectStoreLayout {
 
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
-    public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }
+    /**
+     * {@code shards/<shard>/}, the id URL-safe encoded ({@link ShardId#pathSegment()}): a project id
+     * gives the Phase 1–5 key byte for byte. Every per-shard key below builds on it.
+     */
+    public String shardPrefix(ShardId shard) { return root + "shards/" + shard.pathSegment() + "/"; }
 
     public String latestKey(ShardId shard) { return shardPrefix(shard) + "LATEST"; }
 
@@ -83,5 +87,42 @@ public final class ObjectStoreLayout {
     /** Content-addressed writer-state blob (embedding cache files): {@code writer-state/blobs/<sha256>}. */
     public String writerStateBlobKey(ShardId shard, String sha256Hex) {
         return writerStatePrefix(shard) + "blobs/" + sha256Hex;
+    }
+
+    // ---- project-level keys (split projects, Phase 6) ---------------------------------------
+
+    /**
+     * {@code projects/<project>/}: what belongs to a split project as a whole rather than to one shard
+     * (ruling P6-R2): its call graph and refs per index run, and its writer state. The name is checked
+     * as a project name ({@link ShardId#ofProject}) and encoded like a shard id (a project name encodes
+     * to itself).
+     */
+    public String projectPrefix(String project) {
+        return root + "projects/" + ShardId.ofProject(project).pathSegment() + "/";
+    }
+
+    /** The project's call graph of index run {@code projectGen}, content-named like {@link #graphKey}. */
+    public String projectGraphKey(String project, long projectGen, String checksumHex) {
+        return projectPrefix(project) + "graph/gen-" + projectGen + "@" + checksumHex + ".cgf.gz";
+    }
+
+    /** The project's unresolved refs of index run {@code projectGen}, content-named. */
+    public String projectRefsKey(String project, long projectGen, String checksumHex) {
+        return projectPrefix(project) + "refs/gen-" + projectGen + "@" + checksumHex + ".json.gz";
+    }
+
+    /** A split project's writer state: {@code projects/<project>/writer-state/} (once per project). */
+    public String projectWriterStatePrefix(String project) {
+        return projectPrefix(project) + "writer-state/";
+    }
+
+    /** The per-project reshard lease ({@code projects/<project>/reshard-lease}): one reshard job at a time. */
+    public String reshardLeaseKey(String project) {
+        return projectPrefix(project) + "reshard-lease";
+    }
+
+    /** The state of a project's reshard job ({@code projects/<project>/reshard/job.json}), for status and resume. */
+    public String reshardJobKey(String project) {
+        return projectPrefix(project) + "reshard/job.json";
     }
 }

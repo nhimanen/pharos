@@ -115,8 +115,13 @@ class GoldenStatusTest {
                 .isEqualTo("http://r1.cluster.local:7171");
 
         // what the fixture is for: every section populated
+        // alpha (493 s) and beta (420 s) wait longer than writers.oldestPendingSeconds (300 s): add-writers
         assertThat(st.proposals()).extracting(ClusterStatus.Proposal::kind).containsExactly(
-                Proposals.ADD_READERS, Proposals.RESHARD, Proposals.WRITER_DISK);
+                Proposals.ADD_READERS, Proposals.ADD_WRITERS, Proposals.RESHARD, Proposals.WRITER_DISK);
+        // the signed delta of the scaling proposals (an operator steps by it); none on the others
+        assertThat(st.proposals()).extracting(ClusterStatus.Proposal::delta).containsExactly(1, 1, null, null);
+        assertThat(pub.path("proposals").get(0).path("delta").asInt()).isEqualTo(1);
+        assertThat(pub.path("proposals").get(2).has("delta")).as("absent, not null").isFalse();
         assertThat(st.health()).extracting(ClusterStatus.Health::kind).contains("lease-expired", "reader-degraded",
                 "shard-unassigned", "writer-low-disk");
         assertThat(st.layout().shards()).extracting(ClusterStatus.Shard::state)

@@ -571,8 +571,18 @@ public class WebServer {
             if (project != null && project.isBlank()) project = null;
             boolean trace       = "true".equalsIgnoreCase(ctx.queryParam("trace"));
             int snippetLines    = ctx.queryParamAsClass("snippetLines", Integer.class).getOrDefault(15);
+            // key filters (P6-R12): module dir, path prefix (whole directories), file extension, code|doc
+            com.pharos.cluster.routing.ShardFilter keyFilter = new com.pharos.cluster.routing.ShardFilter(
+                    ctx.queryParam("module"), ctx.queryParam("pathPrefix"), ctx.queryParam("language"),
+                    ctx.queryParam("kind"));
+            try {
+                keyFilter.validated();
+            } catch (IllegalArgumentException e) {
+                ctx.status(400).json(Map.of("error", e.getMessage()));
+                return;
+            }
             SearchRequest req = new SearchRequest(q, SearchRequest.SearchType.from(type),
-                    project, null, limit, "text", docType, scope, oversample);
+                    project, null, limit, "text", docType, scope, oversample).withKeyFilter(keyFilter);
             if (!readiness.getAsBoolean()) {
                 log.warn("Search '{}' answered before the first sync finished", q);
                 warningsHeader(ctx, List.of(SYNCING_WARNING)); // kept on a 409/500 answer too
@@ -601,6 +611,10 @@ public class WebServer {
                             Map<String, Object> stage = new LinkedHashMap<>();
                             stage.put("name", s.name()); stage.put("ms", s.durationMs()); return stage;
                         }).collect(Collectors.toList()));
+                        if (!resp.trace().notes().isEmpty()) meta.put("routing", resp.trace().notes());
+                        // P6-R20: each stage's raw (pre-graph-boost) score per result id
+                        if (!resp.trace().rawScores().isEmpty()) meta.put("rawScores", resp.trace().rawScores());
+                        if (resp.trace().statistics() != null) meta.put("statistics", resp.trace().statistics());
                         var cls = resp.trace().getClassification();
                         if (cls != null) {
                             meta.put("classIntent",  cls.intent());
@@ -626,6 +640,9 @@ public class WebServer {
                      | com.pharos.cluster.routing.NoShardAnsweredException
                      | com.pharos.search.VectorModelUnavailableException e) {
                 throw e;  // handled by the 409 exception mapper above
+            } catch (com.pharos.search.KeyFiltersUnsupportedException e) {
+                // like an incompatible index (the client exits 4): re-indexing fixes it
+                ctx.status(409).json(Map.of("error", e.getMessage(), "status", "key-filters-unsupported"));
             } catch (Exception e) {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
@@ -1378,7 +1395,7 @@ public class WebServer {
     /** Returns a sorted map of file-extension → doc count for the given project. */
     private Map<String, Integer> buildLanguageBreakdown(ProjectMeta meta) throws IOException {
         if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
-        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(meta.getName()));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();
@@ -1413,7 +1430,7 @@ public class WebServer {
                 : null;
         final int depthLimit = depth; // -1 = unlimited
 
-        IndexReader reader = luceneIndexer.openReader(projectName);
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(projectName));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();
@@ -1477,7 +1494,7 @@ public class WebServer {
     /** Builds a FQN → filePath map by scanning the Lucene index for a project. */
     private Map<String, String> buildFqnToFilePath(ProjectMeta meta) throws IOException {
         if (!luceneIndexer.indexExists(meta.getName())) return Map.of();
-        IndexReader reader = luceneIndexer.openReader(meta.getName());
+        IndexReader reader = luceneIndexer.openMultiReader(List.of(meta.getName()));
         IndexSearcher searcher = new IndexSearcher(reader);
         TopDocs all = searcher.search(new MatchAllDocsQuery(), Integer.MAX_VALUE);
         StoredFields sf = searcher.storedFields();

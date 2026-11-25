@@ -3,6 +3,7 @@ package com.pharos.indexer;
 import com.pharos.analysis.SynonymProvider;
 import com.pharos.cluster.LocalCache;
 import com.pharos.cluster.LocalFsCache;
+import com.pharos.cluster.ShardId;
 import com.pharos.config.IndexConfig;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
@@ -39,7 +40,7 @@ public class LuceneIndexer implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(LuceneIndexer.class);
 
     /** How long a reader replaced by a shard-path change stays open for in-flight searches. */
-    public static final Duration RETIRE_DELAY = Duration.ofSeconds(60);
+    public static final Duration RETIRE_DELAY = com.pharos.config.ClusterConfig.RETIRE_DELAY;
 
     /** A cached reader and the lucene directory it was opened on. */
     private record CachedReader(Path path, DirectoryReader reader) {}
@@ -47,6 +48,11 @@ public class LuceneIndexer implements Closeable {
     private final IndexConfig config;
     /** Guarded by {@code this}. */
     private final Map<String, CachedReader> openReaders = new HashMap<>();
+    /**
+     * Ruling P6-R19: per shard, the reader of its retained previous generation ({@link LocalCache#retainedDir});
+     * released ({@link #releasePrevious}) when the cache ends the retention. Guarded by {@code this}.
+     */
+    private final Map<String, CachedReader> previousReaders = new HashMap<>();
     /** Readers swapped out by a path change, awaiting their delayed close; guarded by {@code this}. */
     private final Set<DirectoryReader> retired = new HashSet<>();
     /** Lazily created single daemon thread closing retired readers; guarded by {@code this}. */
@@ -69,6 +75,7 @@ public class LuceneIndexer implements Closeable {
         this.config = config;
         this.cache = cache;
         this.retireDelay = retireDelay;
+        if (cache instanceof com.pharos.cluster.ReaderLocalCache rc) rc.onRelease(this::releasePrevious);
     }
 
     /**
@@ -80,15 +87,7 @@ public class LuceneIndexer implements Closeable {
      */
     public IndexWriter openWriter(String projectName) throws IOException {
         ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
-        Path luceneDir = getLucenePath(projectName);
-        Files.createDirectories(luceneDir);
-        Directory dir = openDirectory(luceneDir);
-        IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
-        iwc.setSimilarity(new BM25Similarity());
-        iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
-        iwc.setCommitOnClose(false);
-        iwc.setRAMBufferSizeMB(128);
-        return new IndexWriter(dir, iwc);
+        return openWriterAt(getLucenePath(projectName), false);
     }
 
     /**
@@ -100,12 +99,24 @@ public class LuceneIndexer implements Closeable {
      */
     public IndexWriter openWriterFresh(String projectName) throws IOException {
         ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
-        Path luceneDir = getLucenePath(projectName);
+        return openWriterAt(getLucenePath(projectName), true);
+    }
+
+    /**
+     * An IndexWriter on one shard's Lucene dir of a split project ({@link LocalShardLayout#luceneDir}),
+     * with the semantics of {@link #openWriterFresh} ({@code fresh}) or {@link #openWriter}.
+     */
+    public IndexWriter openShardWriter(String projectName, ShardId shard, boolean fresh) throws IOException {
+        ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
+        return openWriterAt(getShardLucenePath(projectName, shard), fresh);
+    }
+
+    private IndexWriter openWriterAt(Path luceneDir, boolean fresh) throws IOException {
         Files.createDirectories(luceneDir);
         Directory dir = openDirectory(luceneDir);
         IndexWriterConfig iwc = new IndexWriterConfig(buildAnalyzer());
         iwc.setSimilarity(new BM25Similarity());
-        iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
+        iwc.setOpenMode(fresh ? IndexWriterConfig.OpenMode.CREATE : IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
         iwc.setCommitOnClose(false);
         iwc.setRAMBufferSizeMB(128);
         return new IndexWriter(dir, iwc);
@@ -121,28 +132,88 @@ public class LuceneIndexer implements Closeable {
      */
     public synchronized DirectoryReader openReader(String projectName) throws IOException {
         IndexFormat.check(projectName, getProjectIndexDir(projectName));
-        Path luceneDir = getLucenePath(projectName);
+        if (localLayout(projectName).isPresent()) {
+            throw new IOException("Project " + projectName + " is split into shards locally; read it with"
+                    + " openMultiReader");
+        }
+        return openCached(projectName, getLucenePath(projectName), projectName);
+    }
+
+    /**
+     * The cached reader under {@code key} on {@code luceneDir}, refreshed or reopened; caller holds
+     * {@code this}.
+     */
+    private DirectoryReader openCached(String key, Path luceneDir, String projectName) throws IOException {
         if (!Files.exists(luceneDir) || !indexExists(luceneDir)) {
             throw new IOException("No valid index found for project: " + projectName
                     + " (run 'pharos index' first)");
         }
-        CachedReader cached = openReaders.get(projectName);
+        CachedReader cached = openReaders.get(key);
         if (cached != null && cached.path().equals(luceneDir)) {
             DirectoryReader refreshed = DirectoryReader.openIfChanged(cached.reader());
             if (refreshed != null) {
                 cached.reader().close();
-                openReaders.put(projectName, new CachedReader(luceneDir, refreshed));
+                openReaders.put(key, new CachedReader(luceneDir, refreshed));
                 return refreshed;
             }
             return cached.reader();
         }
         DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
-        openReaders.put(projectName, new CachedReader(luceneDir, reader));
+        openReaders.put(key, new CachedReader(luceneDir, reader));
         if (cached != null) {
-            log.info("Project '{}' moved to {}; retiring the reader on {}", projectName, luceneDir, cached.path());
-            retire(cached.reader());
+            Path oldDir = cached.path().getParent();
+            long oldGen = generationOf(oldDir);
+            if (oldGen >= 0 && cache.retainedDir(key, oldGen).filter(d -> d.equals(oldDir)).isPresent()) {
+                // P6-R19: the generation stays answerable for its grace; the reader with it
+                log.info("Project '{}' moved to {}; keeping the reader on {} for the previous generation's grace",
+                        projectName, luceneDir, cached.path());
+                CachedReader before = previousReaders.put(key, cached);
+                if (before != null && before.reader() != cached.reader()) retire(before.reader());
+            } else {
+                log.info("Project '{}' moved to {}; retiring the reader on {}", projectName, luceneDir, cached.path());
+                retire(cached.reader());
+            }
         }
         return reader;
+    }
+
+    /** {@code gen-N} → N, else -1. */
+    private static long generationOf(Path dir) {
+        if (dir == null || dir.getFileName() == null) return -1;
+        var m = java.util.regex.Pattern.compile("gen-(\\d{1,18})").matcher(dir.getFileName().toString());
+        return m.matches() ? Long.parseLong(m.group(1)) : -1;
+    }
+
+    /**
+     * Ruling P6-R19: the reader of {@code projectName}'s retained previous generation {@code generation}
+     * ({@link LocalCache#retainedDir}) with its lucene dir; empty when the node does not answer that
+     * generation (any more). The active generation is {@link #openPinnedReader}'s.
+     */
+    public synchronized Optional<PinnedReader> openPinnedPreviousReader(String projectName, long generation)
+            throws IOException {
+        Optional<Path> dir = cache.retainedDir(projectName, generation);
+        if (dir.isEmpty()) return Optional.empty();
+        Path luceneDir = dir.get().resolve("lucene");
+        CachedReader cached = previousReaders.get(projectName);
+        if (cached != null && cached.path().equals(luceneDir)) {
+            return Optional.of(new PinnedReader(luceneDir, cached.reader()));
+        }
+        if (!Files.exists(luceneDir) || !indexExists(luceneDir)) return Optional.empty();
+        DirectoryReader reader = DirectoryReader.open(openDirectory(luceneDir));
+        previousReaders.put(projectName, new CachedReader(luceneDir, reader));
+        if (cached != null) retire(cached.reader());
+        return Optional.of(new PinnedReader(luceneDir, reader));
+    }
+
+    /** The shards whose retained previous generation has an open reader here (P6-R19). */
+    public synchronized Set<String> previousGenerationReaders() {
+        return Set.copyOf(previousReaders.keySet());
+    }
+
+    /** Ends the retention of {@code projectName}'s previous generation: its reader is retired (closed later). */
+    public synchronized void releasePrevious(String projectName) {
+        CachedReader cached = previousReaders.remove(projectName);
+        if (cached != null) retire(cached.reader());
     }
 
     /**
@@ -193,19 +264,97 @@ public class LuceneIndexer implements Closeable {
         if (projectNames.isEmpty()) {
             throw new IllegalArgumentException("No projects specified");
         }
-        if (projectNames.size() == 1) {
-            return openReader(projectNames.get(0));
+        List<IndexReader> readers = new ArrayList<>();
+        for (String project : projectNames) readers.addAll(openProjectReaders(project));
+        if (readers.size() == 1) return readers.getFirst();
+        return new MultiReader(readers.toArray(IndexReader[]::new));
+    }
+
+    /**
+     * The readers of one project: its one reader, or, for a project split into shards locally, one per
+     * shard (cached like a project's), so a {@link MultiReader} over them sees the whole project with
+     * global term statistics.
+     */
+    synchronized List<IndexReader> openProjectReaders(String projectName) throws IOException {
+        Optional<LocalShardLayout.Layout> layout = localLayout(projectName);
+        if (layout.isEmpty()) return List.of(openReader(projectName));
+        IndexFormat.check(projectName, getProjectIndexDir(projectName));
+        if (!indexExists(projectName)) {
+            throw new IOException("No valid index found for project: " + projectName
+                    + " (run 'pharos index' first)");
         }
-        IndexReader[] readers = new IndexReader[projectNames.size()];
-        for (int i = 0; i < projectNames.size(); i++) {
-            readers[i] = openReader(projectNames.get(i));
+        List<IndexReader> out = new ArrayList<>();
+        for (ShardId shard : layout.get().shards()) {
+            out.add(openCached(shardKey(projectName, shard), getShardLucenePath(projectName, shard), projectName));
         }
-        return new MultiReader(readers);
+        return out;
+    }
+
+    /** The reader-cache key of one shard of a split project; '#' never occurs in a project name. */
+    private static String shardKey(String projectName, ShardId shard) {
+        return projectName + "#" + shard.pathSegment();
     }
 
     /** Returns true if a valid (committed) Lucene index exists for the given project. */
     public boolean indexExists(String projectName) {
-        return indexExists(getLucenePath(projectName));
+        Optional<LocalShardLayout.Layout> layout = localLayout(projectName);
+        if (layout.isEmpty()) return indexExists(getLucenePath(projectName));
+        if (layout.get().shards().isEmpty()) return false;
+        for (ShardId shard : layout.get().shards()) {
+            if (!indexExists(getShardLucenePath(projectName, shard))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * The local shard layout of the project ({@link LocalShardLayout}); empty for a {@code [project]}
+     * index, whose Lucene dir is {@link #getLucenePath}.
+     */
+    public Optional<LocalShardLayout.Layout> localLayout(String projectName) {
+        return LocalShardLayout.read(getProjectIndexDir(projectName));
+    }
+
+    /** The Lucene dir of one shard of a split project. */
+    public Path getShardLucenePath(String projectName, ShardId shard) {
+        return LocalShardLayout.luceneDir(getProjectIndexDir(projectName), shard);
+    }
+
+    /**
+     * After a full run committed the project under {@code shards} (empty: the {@code [project]} layout):
+     * removes the Lucene dirs of any other layout (the {@code lucene/} dir of a project now split, the
+     * shard dirs of one no longer split or no longer listed) and evicts their cached readers.
+     */
+    public synchronized void dropOtherLayouts(String projectName, List<ShardId> shards) throws IOException {
+        Path projectDir = getProjectIndexDir(projectName);
+        java.util.Set<Path> keep = new java.util.HashSet<>();
+        for (ShardId s : shards) keep.add(getShardLucenePath(projectName, s).getParent());
+        if (!shards.isEmpty()) {
+            evict(projectName);
+            deleteTree(getLucenePath(projectName));
+        }
+        String prefix = projectName + "#";
+        for (String key : new ArrayList<>(openReaders.keySet())) {
+            if (key.startsWith(prefix) && !keep.contains(openReaders.get(key).path().getParent())) evict(key);
+        }
+        Path shardsDir = projectDir.resolve(LocalShardLayout.SHARDS_DIR);
+        if (Files.isDirectory(shardsDir)) {
+            try (var dirs = Files.list(shardsDir)) {
+                for (Path d : dirs.toList()) if (!keep.contains(d)) deleteTree(d);
+            }
+            if (shards.isEmpty()) deleteTree(shardsDir);
+        }
+    }
+
+    private void evict(String key) {
+        CachedReader cached = openReaders.remove(key);
+        if (cached != null) retire(cached.reader());
+    }
+
+    private static void deleteTree(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var stream = Files.walk(dir)) {
+            for (Path p : stream.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(p);
+        }
     }
 
     /**
@@ -214,7 +363,21 @@ public class LuceneIndexer implements Closeable {
      * can't be read. For {@code /cluster/status} on a single node.
      */
     public long committedDocCount(String projectName) {
-        Path luceneDir = getLucenePath(projectName);
+        Optional<LocalShardLayout.Layout> layout = localLayout(projectName);
+        if (layout.isPresent()) {
+            if (!indexExists(projectName)) return -1;
+            long total = 0;
+            for (ShardId shard : layout.get().shards()) {
+                long n = committedDocCount(getShardLucenePath(projectName, shard));
+                if (n < 0) return -1;
+                total += n;
+            }
+            return total;
+        }
+        return committedDocCount(getLucenePath(projectName));
+    }
+
+    private long committedDocCount(Path luceneDir) {
         if (!indexExists(luceneDir)) return -1;
         try (Directory dir = openDirectory(luceneDir)) {
             org.apache.lucene.index.SegmentInfos infos = org.apache.lucene.index.SegmentInfos.readLatestCommit(dir);
@@ -270,6 +433,11 @@ public class LuceneIndexer implements Closeable {
         return cache.shardDir(projectName);
     }
 
+    /** Where this indexer finds the shard dirs it serves. */
+    public LocalCache localCache() {
+        return cache;
+    }
+
     /**
      * Deletes the Lucene index directory for a project and evicts any cached reader.
      * Called by force re-index to clear incompatible or corrupt index state.
@@ -277,10 +445,15 @@ public class LuceneIndexer implements Closeable {
     public synchronized void deleteIndex(String projectName) throws IOException {
         // Refuse before touching anything: a name like "." resolves to the index root itself.
         ProjectNames.resolveProjectDir(config.getIndexDir(), projectName);
-        CachedReader cached = openReaders.remove(projectName);
-        if (cached != null) {
+        String prefix = projectName + "#";
+        for (String key : new ArrayList<>(openReaders.keySet())) {
+            if (!key.equals(projectName) && !key.startsWith(prefix)) continue;
+            CachedReader cached = openReaders.remove(key);
             try { cached.reader().close(); } catch (IOException ignored) {}
         }
+        Path projectDir = getProjectIndexDir(projectName);
+        deleteTree(projectDir.resolve(LocalShardLayout.SHARDS_DIR));
+        Files.deleteIfExists(projectDir.resolve(LocalShardLayout.FILE_NAME));
         Path luceneDir = getLucenePath(projectName);
         if (Files.exists(luceneDir)) {
             try (var stream = Files.walk(luceneDir)) {
@@ -391,6 +564,14 @@ public class LuceneIndexer implements Closeable {
             }
         }
         openReaders.clear();
+        for (CachedReader r : previousReaders.values()) {
+            try {
+                r.reader().close();
+            } catch (IOException e) {
+                log.warn("Error closing a previous generation's reader: {}", e.getMessage());
+            }
+        }
+        previousReaders.clear();
         for (DirectoryReader r : retired) {
             try {
                 r.close();

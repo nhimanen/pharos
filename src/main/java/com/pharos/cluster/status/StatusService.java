@@ -162,7 +162,7 @@ public final class StatusService implements AutoCloseable {
                     break;
                 }
                 if (states.write(next, v.etag())) {
-                    recorded = StatusEvent.diff(v.state(), next, Proposals.candidates(snap, next, settings));
+                    recorded = Proposals.events(v.state(), next, Proposals.candidates(snap, next, settings));
                     used = next;
                     break;
                 }
@@ -173,7 +173,7 @@ public final class StatusService implements AutoCloseable {
             byte[] full = built.toJson();
             byte[] pub = built.withoutAddresses().toJson();
             seen = lastSeen == null ? List.of()
-                    : StatusEvent.diff(lastSeen, used, Proposals.candidates(snap, used, settings));
+                    : Proposals.events(lastSeen, used, Proposals.candidates(snap, used, settings));
             lastSeen = used;
             status = built;
             tokenJson = full;

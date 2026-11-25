@@ -79,6 +79,8 @@ public final class ClusterRuntime implements Closeable {
     private volatile com.pharos.indexer.ProjectIndexManager indexManager;
     /** The work queue of a writer with {@code cluster.writer.workQueue: true} while it runs. Guarded by this. */
     private com.pharos.cluster.writer.WorkLoop workLoop;
+    /** The live readers a writer's reshard flip waits for (an observer of the bucket's heartbeats). */
+    private com.pharos.cluster.membership.ReaderRegistry reshardReaders;
     /** Removes the writer's signal-time stop step. Guarded by this. */
     private AutoCloseable writerStopStep;
     /** {@code <workDir>/.work-loop.lock} while this process runs the work loop. */
@@ -90,7 +92,7 @@ public final class ClusterRuntime implements Closeable {
     /** The fan-out coordinator, once {@link #internalApi(com.pharos.search.SearchEngine)} built it. */
     private com.pharos.search.distributed.DistributedSearch distributed;
     /** How often the coordinator re-reads the shard catalog (in the background) for "every project" queries. */
-    static final Duration CATALOG_CACHE = Duration.ofSeconds(5);
+    static final Duration CATALOG_CACHE = Duration.ofSeconds(ClusterConfig.CATALOG_CACHE_SECONDS);
     private volatile com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     private ReplicaSyncer syncer;
     private SyncLock syncLock;
@@ -131,7 +133,9 @@ public final class ClusterRuntime implements Closeable {
             // shards held on disk stay listed until a live writer releases them (a writer down at start)
             peer.peerCatalog().ifPresent(c -> c.setHeld(this::registeredShards));
         }
-        if (isReader() && backend.localCache() instanceof ReaderLocalCache) {
+        if (isReader() && backend.localCache() instanceof ReaderLocalCache rc) {
+            // P6-R19: a shard's previous generation stays answerable for the grace after an activation
+            rc.setPreviousGenerationGrace(config.getCluster().previousGenerationGrace());
             try {
                 activateRegistered();
             } catch (RuntimeException e) {
@@ -221,9 +225,9 @@ public final class ClusterRuntime implements Closeable {
             out.put("peerFetch", fetch);
         });
         List<Map<String, Object>> unavailable = new ArrayList<>();
-        List<String> pin = config.getCluster().getReader().getShards();
+        ReaderPin pin = readerPin();
         for (ShardId shard : cat.knownShards()) {
-            if (!pin.isEmpty() && !pin.contains(shard.value())) continue;
+            if (!pin.matches(shard, this::projectOfShard)) continue;
             if (servesShard(shard.value())) continue;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("shard", shard.value());
@@ -470,8 +474,8 @@ public final class ClusterRuntime implements Closeable {
             if (syncer != null) syncer.served().keySet().forEach(id -> names.add(id.value()));
         }
         registry.listAll().forEach(m -> { if (m.getName() != null) names.add(m.getName()); });
-        List<String> pin = c.getReader().getShards();
-        if (!pin.isEmpty()) names.retainAll(pin);
+        ReaderPin pin = readerPin();
+        if (!pin.isEmpty()) names.removeIf(n -> !pin.matches(n, this::projectOfShard));
         List<String> shards = new ArrayList<>(names);
         List<String> degraded = degradedShards();
         String state = draining ? com.pharos.cluster.membership.ReaderHeartbeat.DRAINING
@@ -480,9 +484,24 @@ public final class ClusterRuntime implements Closeable {
                 : com.pharos.cluster.membership.ReaderHeartbeat.DEGRADED;
         com.pharos.cluster.routing.CachedCatalog cat = coordinatorCatalog;
         Long catalogAge = cat == null || cat.ageSeconds() < 0 ? null : cat.ageSeconds();
+        Map<String, Long> generations = new java.util.TreeMap<>();
+        Map<String, Long> prepared = new java.util.TreeMap<>();
+        Map<String, Long> retained = new java.util.TreeMap<>();
+        ReplicaSyncer sy;
+        synchronized (this) { sy = syncer; }
+        if (sy != null) {
+            sy.served().forEach((id, g) -> { if (names.contains(id.value())) generations.put(id.value(), g.value()); });
+            sy.preparedGenerations().forEach((id, g) -> {
+                if (pin.isEmpty() || pin.matches(id.value(), this::projectOfShard)) prepared.put(id.value(), g.value());
+            });
+        }
+        if (backend.localCache() instanceof ReaderLocalCache rc) { // P6-R19: still answered after a switch
+            rc.retainedGenerations().forEach((shard, g) -> { if (names.contains(shard)) retained.put(shard, g); });
+        }
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
-                catalogAge);
+                catalogAge, Boolean.TRUE, // applies key filters on /internal search (P6-R12)
+                generations, prepared, retained);
     }
 
     // Holding the monitor of this.
@@ -587,9 +606,22 @@ public final class ClusterRuntime implements Closeable {
                     w.getMaxConsecutiveFailures()),
                     os.store(), os.layout(), os.objectStoreCatalog(), os.source(), os.writerState(), pim,
                     luceneIndexer, registry, new com.pharos.cluster.writer.SourceCheckout(w.getWorkDir(),
-                            Duration.ofSeconds(w.getLsRemoteTimeoutSeconds())),
+                            Duration.ofSeconds(w.getLsRemoteTimeoutSeconds()), w.getGitCredentials()),
                     java.time.Clock.systemUTC(), disk);
             os.workQueueGuard().ifPresent(g -> g.attach(loop));
+            if (os.publisher() instanceof com.pharos.cluster.objectstore.ObjectStorePublisher publisher) {
+                // resharding (Phase 6 Task 4): the flip waits for the readers this observer lists
+                com.pharos.cluster.membership.ReaderRegistry readersSeen =
+                        com.pharos.cluster.membership.ReaderRegistry.observer(os.store(), os.layout(), c);
+                readersSeen.start();
+                reshardReaders = readersSeen;
+                loop.enableResharding(publisher, new com.pharos.cluster.objectstore.GenerationGc(os.store(), os.layout(),
+                                c.getRetentionGenerations(), Duration.ofMinutes(c.getRetentionMinutes()),
+                                c.previousGenerationGrace()),
+                        readersSeen::live, new com.pharos.cluster.sharding.ReshardJob.Settings(
+                                Duration.ofSeconds(w.getReshardSyncTimeoutSeconds()),
+                                Duration.ofMinutes(c.getRetentionMinutes()), CATALOG_CACHE.multipliedBy(3)));
+            }
             workLoop = loop;
         }
         loop.start();
@@ -665,10 +697,14 @@ public final class ClusterRuntime implements Closeable {
     /** Graceful stop of the work loop within {@code cluster.drainSeconds}; idempotent. */
     private void stopWriting() {
         com.pharos.cluster.writer.WorkLoop loop;
+        com.pharos.cluster.membership.ReaderRegistry readersSeen;
         synchronized (this) {
             loop = workLoop;
+            readersSeen = reshardReaders;
+            reshardReaders = null;
         }
         if (loop != null) loop.stop(Duration.ofSeconds(config.getCluster().getDrainSeconds()));
+        if (readersSeen != null) readersSeen.close();
     }
 
     /** Frees the work-loop lock once the loop has stopped (on {@link #close}). */
@@ -791,7 +827,16 @@ public final class ClusterRuntime implements Closeable {
      * (never matches without one); the token itself does not leave the config.
      */
     public java.util.function.Predicate<String> clusterTokenMatcher() {
-        return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken());
+        return com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().effectiveToken());
+    }
+
+    /**
+     * The object-store backend (catalog and published generations in the bucket), or empty on another
+     * backend; {@code upgrade-indexes --check} reads the bucket through it.
+     */
+    public Optional<ReplicationBackend> objectStoreBackend() {
+        return backend instanceof com.pharos.cluster.objectstore.ObjectStoreBackend ? Optional.of(backend)
+                : Optional.empty();
     }
 
     /** The writable shard catalog (shard sources); empty on a backend without one (single node). */
@@ -827,7 +872,7 @@ public final class ClusterRuntime implements Closeable {
         if (peerFiles == null) {
             LazyGenerations l = lazy;
             peerFiles = new com.pharos.cluster.peer.PeerFileSource(readerCache, l == null ? null : l::blockCache,
-                    com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().getToken()),
+                    com.pharos.cluster.internal.InternalApi.tokenMatcher(config.getCluster().effectiveToken()),
                     config.getCluster().getPeers().getMaxTransfersPerReader(), System::nanoTime);
         }
         return Optional.of(peerFiles);
@@ -878,7 +923,7 @@ public final class ClusterRuntime implements Closeable {
      * the endpoints answer 503 and coordinators fail over.
      */
     public com.pharos.cluster.internal.InternalApi internalApi() {
-        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().getToken()) : null;
+        return isReader() ? new com.pharos.cluster.internal.InternalApi(config.getCluster().effectiveToken()) : null;
     }
 
     /**
@@ -915,8 +960,17 @@ public final class ClusterRuntime implements Closeable {
         ClusterConfig c = config.getCluster();
         com.pharos.search.distributed.LocalShardService service =
                 engine.shardService(this::servesShard, modelFingerprint(engine.embedder().modelId()));
+        // P6-R19: synonyms a publish replaced stay usable for the grace (readers see the publish at different times)
+        service.keyword().setPreviousSynonymsGrace(c.previousGenerationGrace());
+        // P6-R21: a coordinator planning an older spec version of a project (its catalog predates a flip) is
+        // answered with the generations that version names, by this reader's last catalog read
+        service.setVersions((shard, v) -> {
+            ReplicaSyncer sy;
+            synchronized (this) { sy = syncer; }
+            return sy == null ? java.util.Optional.empty() : sy.mapping().generationOfVersion(shard, v);
+        });
         var health = new com.pharos.cluster.membership.ReaderHealth(c.getReaderTtlSeconds());
-        var client = new com.pharos.cluster.internal.ShardClient(health, c.getToken(),
+        var client = new com.pharos.cluster.internal.ShardClient(health, c.effectiveToken(),
                 Duration.ofMillis(c.getConnectTimeoutMillis()), Duration.ofMillis(c.getFanoutTimeoutMillis()));
         var catalog = new com.pharos.cluster.routing.CachedCatalog(backend.catalog(), CATALOG_CACHE,
                 Duration.ofSeconds(c.getMaxCatalogAgeSeconds()), System::nanoTime,
@@ -952,7 +1006,7 @@ public final class ClusterRuntime implements Closeable {
         if (previous != null) previous.close();
         engine.setDistributed(ds);
         engine.setLocalDegradation(this::degradation);
-        return new com.pharos.cluster.internal.InternalApi(c.getToken()).service(service);
+        return new com.pharos.cluster.internal.InternalApi(c.effectiveToken()).service(service);
     }
 
     /**
@@ -1137,7 +1191,7 @@ public final class ClusterRuntime implements Closeable {
                 cacheDir(), config.getSynonymsFile(),
                 Duration.ofSeconds(config.getCluster().getPollIntervalSeconds()), lazy);
         s.setRetireGrace(Duration.ofSeconds(config.getCluster().getRetireGraceSeconds()));
-        s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
+        s.pin(readerPin());
         syncer = s;
         firstSyncThread = new Thread(() -> firstPass(s), "pharos-replica-first-sync");
         firstSyncThread.setDaemon(true);
@@ -1198,7 +1252,41 @@ public final class ClusterRuntime implements Closeable {
     public void repin() {
         ReplicaSyncer s;
         synchronized (this) { s = syncer; }
-        if (s != null) s.pin(config.getCluster().getReader().getShards().stream().map(ShardId::new).toList());
+        if (s != null) s.pin(readerPin());
+    }
+
+    /** {@code cluster.reader.shards}: shard ids and project wildcards (P6-R5); validated with the config. */
+    private ReaderPin readerPin() {
+        return ReaderPin.of(config.getCluster().getReader().getShards());
+    }
+
+    /**
+     * The project of a shard this reader deals with: the syncer's catalog mapping, else (a follower,
+     * or before the first pass) the project its registered generation was published for.
+     */
+    Optional<String> projectOfShard(ShardId shard) {
+        ReplicaSyncer s;
+        synchronized (this) {
+            s = syncer;
+        }
+        if (s != null) {
+            Optional<String> p = s.projectOf(shard);
+            if (p.isPresent()) return p;
+        }
+        return registry.find(shard.value()).map(ProjectMeta::getIndexPath)
+                .flatMap(dir -> publishedProject(Path.of(dir)));
+    }
+
+    /** The project a generation dir's manifest was published for; empty when it has none. */
+    private static Optional<String> publishedProject(Path genDir) {
+        Path manifest = genDir.resolve(ReplicaSyncer.MANIFEST_FILE);
+        if (!Files.isRegularFile(manifest)) return Optional.empty();
+        try {
+            ProjectMeta meta = com.pharos.cluster.objectstore.ShardManifest.read(Files.readAllBytes(manifest)).projectMeta();
+            return Optional.ofNullable(meta == null ? null : meta.getName());
+        } catch (IOException | RuntimeException e) {
+            return Optional.empty();
+        }
     }
 
     /** Follower poll: pick up what the lock holder registered; take over once it is gone. */
@@ -1245,19 +1333,21 @@ public final class ClusterRuntime implements Closeable {
         for (ProjectMeta meta : registry.listAll()) {
             String name = meta.getName();
             if (name == null || meta.getIndexPath() == null) continue;
-            List<String> onlyPinned = config.getCluster().getReader().getShards();
-            if (!onlyPinned.isEmpty() && !onlyPinned.contains(name)) continue;
+            ShardId shardId;
             try {
-                new ShardId(name);
+                shardId = new ShardId(name);
             } catch (IllegalArgumentException e) {
                 continue;
             }
+            ReaderPin onlyPinned = readerPin();
+            if (!onlyPinned.matches(shardId, id -> publishedProject(Path.of(meta.getIndexPath())))) continue;
+            Path shardRoot = root.resolve(shardId.pathSegment());
             Path dir = Path.of(meta.getIndexPath()).toAbsolutePath().normalize();
-            if (!root.resolve(name).equals(dir.getParent()) || !completeGeneration(dir)) {
+            if (!shardRoot.equals(dir.getParent()) || !completeGeneration(dir)) {
                 continue;
             }
             if (!IndexFormat.servable(IndexFormat.status(dir))) {
-                Optional<Path> fallback = newestServableGeneration(root.resolve(name));
+                Optional<Path> fallback = newestServableGeneration(shardRoot);
                 if (reportedUnservable.add(dir)) {
                     log.warn("Shard {}: registered generation {} has index format {} ({}); this reader (pharos {})"
                             + " reads index formats {}-{}. {}", name, dir.getFileName(),
@@ -1288,9 +1378,9 @@ public final class ClusterRuntime implements Closeable {
         // before the owner deletes its directory.
         java.util.Set<String> registered = new java.util.HashSet<>();
         registry.listAll().forEach(m -> { if (m.getName() != null) registered.add(m.getName()); });
-        List<String> pin = config.getCluster().getReader().getShards();
+        ReaderPin pin = readerPin();
         for (String name : cache.activeProjects()) {
-            if (registered.contains(name) && (pin.isEmpty() || pin.contains(name))) continue;
+            if (registered.contains(name) && pin.matches(name, this::projectOfShard)) continue;
             cache.deactivate(name);
             log.info("Shard {} is no longer registered for this reader: stopped serving it", name);
         }

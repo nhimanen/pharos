@@ -173,7 +173,7 @@ public class RouterCommand implements Callable<Integer> {
             return "needs cluster.backend \"object-store\" and cluster.objectStore.bucket (the readers are listed"
                     + " from the bucket), or cluster.backend \"peer-pull\" and cluster.peers.discovery";
         }
-        if (c.getToken() == null || c.getToken().isBlank()) {
+        if (c.effectiveToken() == null || c.effectiveToken().isBlank()) {
             return "cluster.token is required on a router (shared secret of the cluster)";
         }
         return null;

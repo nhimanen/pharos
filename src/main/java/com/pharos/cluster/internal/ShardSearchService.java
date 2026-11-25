@@ -18,6 +18,15 @@ public interface ShardSearchService {
     /** Generation this reader currently serves for {@code shard}; empty when it does not serve it. */
     OptionalLong servedGeneration(ShardId shard);
 
+    /**
+     * Ruling P6-R19: true when a request for {@code generation} of {@code shard} is answered here: the served
+     * generation, or (an implementation that retains them) the previous one for its grace.
+     */
+    default boolean servesGeneration(ShardId shard, long generation) {
+        OptionalLong served = servedGeneration(shard);
+        return served.isPresent() && served.getAsLong() == generation;
+    }
+
     TermStatsResponse termStats(TermStatsRequest request) throws Exception;
 
     ShardSearchResponse searchRaw(ShardSearchRequest request) throws Exception;

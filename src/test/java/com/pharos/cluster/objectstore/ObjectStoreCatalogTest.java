@@ -4,6 +4,8 @@ import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.ShardEntry;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.ShardSource;
+import com.pharos.cluster.sharding.ProjectShards;
+import com.pharos.cluster.sharding.ShardSpec;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -35,6 +37,38 @@ class ObjectStoreCatalogTest {
             }
             return super.putIfAbsent(key, data);
         }
+    }
+
+    /**
+     * Operator final review I2, kept for future id shapes (integration item 7): an id this build cannot
+     * parse (here a separator no release uses yet) after a downgrade. Phase 6's keyed ids are parsed now
+     * and keep the catalog authoritative.
+     */
+    @Test
+    void anUnparseableEntryMakesTheCatalogNotAuthoritative() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"proj~k:v\"}]}".getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.shards()).isEmpty();
+        assertThat(catalog.unparseableEntries()).containsExactly("proj~k:v");
+        assertThat(catalog.authoritativeShards()).isEmpty(); // readers keep what they serve
+        assertThat(catalog.mappingRead().authoritative()).isFalse();
+
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~k:v\"}]}"
+                .getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.authoritativeShards()).isEmpty();
+        assertThat(catalog.mappingRead().map().listed()).containsExactly(new ShardId("good")); // still synced
+
+        // a split project's keyed ids (Phase 6) are this build's own: authoritative
+        store.put(layout.catalogKey(), "{\"shards\":[{\"id\":\"good\"},{\"id\":\"proj~ring=s01\"}]}"
+                .getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.unparseableEntries()).isEmpty();
+        assertThat(catalog.authoritativeShards()).contains(List.of(new ShardId("good"), new ShardId("proj~ring=s01")));
+
+        store.put(layout.catalogKey(), "{\"shards\":[]}".getBytes(StandardCharsets.UTF_8));
+        assertThat(catalog.unparseableEntries()).isEmpty();
+        assertThat(catalog.mappingRead().authoritative()).isTrue();
+        assertThat(catalog.authoritativeShards()).contains(List.of()); // really empty: authoritative
     }
 
     @Test
@@ -79,6 +113,116 @@ class ObjectStoreCatalogTest {
         catalog.register(new ShardId("s"));
         assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
         assertThat(sleeps).isEmpty();
+    }
+
+    @Test
+    void unregisterRemovesOnlyThatEntryAndIsIdempotent() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.unregister(new ShardId("s"))).as("no catalog yet").isFalse();
+        ShardSource src = ShardSource.git("https://example.org/r.git", "main");
+        catalog.register(new ShardId("s"), Optional.of(src));
+        catalog.register(new ShardId("t"), Optional.of(src));
+
+        assertThat(catalog.unregister(new ShardId("s"))).isTrue();
+        assertThat(catalog.entries()).containsExactly(new ShardEntry(new ShardId("t"), Optional.of(src)));
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.unregister(new ShardId("s"))).isFalse();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("absent: no write").isEqualTo(etag);
+        assertThat(sleeps).isEmpty();
+    }
+
+    /** Counts conditional catalog writes. */
+    private static final class CountingStore extends InMemoryObjectStore {
+        int conditionalWrites;
+
+        @Override
+        public Optional<String> putIfMatch(String key, byte[] data, String etag) {
+            conditionalWrites++;
+            return super.putIfMatch(key, data, etag);
+        }
+    }
+
+    /**
+     * Integration carry I4: remove-index --from-catalog removes a whole split project in one CAS: its
+     * projects[] entry with the staged version and the open reshard, every shard any version names, and
+     * its pre-split [project] id. Another project (even one whose name shares the prefix) stays; specs stay.
+     */
+    @Test
+    void removeProjectRemovesASplitProjectInOneWrite() throws Exception {
+        CountingStore store = new CountingStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        ShardId s01 = new ShardId("lucene~ring=s01");
+        ShardId s02 = new ShardId("lucene~ring=s02");
+        ShardId s03 = new ShardId("lucene~ring=s03");
+        catalog.register(ShardId.ofProject("lucene"), Optional.of(ShardSource.git("https://example.org/l.git", "main")));
+        catalog.register(ShardId.ofProject("other"));
+        catalog.register(new ShardId("lucene.x~ring=s01")); // another project's keyed id, same prefix
+        int v1 = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        catalog.putProject("lucene", v1, List.of(s01, s02));
+        int v2 = catalog.requestReshard("lucene", ShardSpec.parse("[project, ring(path, shards=3)]"),
+                java.time.Instant.parse("2026-11-23T10:00:00Z"));
+        catalog.stageReshard("lucene", v2, java.util.OptionalInt.of(v1), List.of(s01, s02, s03),
+                java.time.Instant.parse("2026-11-23T10:00:00Z"));
+        assertThat(catalog.projectShards().stagedOf("lucene")).isPresent();
+
+        int before = store.conditionalWrites;
+        assertThat(catalog.removeProject("lucene")).containsExactlyInAnyOrder(ShardId.ofProject("lucene"), s01, s02, s03);
+        assertThat(store.conditionalWrites - before).as("one CAS").isEqualTo(1);
+        assertThat(catalog.shards()).containsExactly(ShardId.ofProject("other"), new ShardId("lucene.x~ring=s01"));
+        ProjectShards map = catalog.projectShards();
+        assertThat(map.projects()).doesNotContain("lucene");
+        assertThat(map.stagedOf("lucene")).isEmpty();
+        String json = new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8);
+        assertThat(json).doesNotContain("\"reshard\"").doesNotContain("\"staged\"").contains("\"specs\"");
+
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.removeProject("lucene")).as("already gone").isEmpty();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("no write").isEqualTo(etag);
+    }
+
+    /**
+     * Integration carry I5: a source registered for a split project lands on its entry and on every shard of
+     * it that carries one, in one write; another project's shards are untouched.
+     */
+    @Test
+    void recordSourceUpdatesEveryShardOfASplitProject() throws Exception {
+        CountingStore store = new CountingStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        ShardSource v1 = ShardSource.git("https://example.org/l.git", "main");
+        ShardSource v2 = ShardSource.git("https://example.org/l.git", "v2");
+        ShardId s01 = new ShardId("lucene~ring=s01");
+        ShardId s02 = new ShardId("lucene~ring=s02");
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        catalog.putProject("lucene", v, List.of(s01, s02));
+        catalog.register(s01, Optional.of(v1)); // as a reshard records it
+        catalog.register(s02, Optional.of(v1));
+        catalog.register(new ShardId("lucene.x~ring=s01"), Optional.of(v1)); // another project, same prefix
+
+        int before = store.conditionalWrites;
+        assertThat(catalog.recordSource("lucene", v2)).containsExactlyInAnyOrder(s01, s02, ShardId.ofProject("lucene"));
+        assertThat(store.conditionalWrites - before).as("one CAS").isEqualTo(1);
+        assertThat(catalog.entries()).containsExactlyInAnyOrder(
+                new ShardEntry(s01, Optional.of(v2)), new ShardEntry(s02, Optional.of(v2)),
+                new ShardEntry(new ShardId("lucene.x~ring=s01"), Optional.of(v1)),
+                new ShardEntry(ShardId.ofProject("lucene"), Optional.of(v2)));
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.recordSource("lucene", v2)).as("unchanged").isEmpty();
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
+    }
+
+    @Test
+    void removeProjectRemovesAnUnsplitProject() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.removeProject("a")).as("no catalog yet").isEmpty();
+        catalog.register(ShardId.ofProject("a"), Optional.of(ShardSource.git("https://example.org/a.git", "main")));
+        catalog.register(ShardId.ofProject("b"));
+        assertThat(catalog.removeProject("a")).containsExactly(ShardId.ofProject("a"));
+        assertThat(catalog.shards()).containsExactly(ShardId.ofProject("b"));
+        assertThat(catalog.removeProject("b")).containsExactly(ShardId.ofProject("b"));
+        assertThat(catalog.authoritativeShards()).as("the last project: an empty, authoritative catalog")
+                .contains(List.of());
     }
 
     @Test
@@ -154,5 +298,103 @@ class ObjectStoreCatalogTest {
         catalog.register(new ShardId("a"), Optional.of(ShardSource.git("ssh://git@example.org/r.git", "main")));
         catalog.register(new ShardId("b"), Optional.of(ShardSource.git("git@example.org:r.git", "main")));
         assertThat(catalog.entries()).hasSize(2);
+    }
+
+    // ── Phase 6: spec versions and the project ↔ shards mapping ─────────────────────────────
+
+    @Test
+    void phase5CatalogReadsAsTheProjectIdentity() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        assertThat(catalog.projectShards().projects()).isEmpty();
+        catalog.register(new ShardId("pharos"), Optional.of(ShardSource.path("/srv/pharos")));
+        catalog.register(new ShardId("lucene"));
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.projects()).containsExactly("lucene", "pharos");
+        assertThat(ps.shardsOf("pharos")).containsExactly(ShardId.ofProject("pharos"));
+        assertThat(ps.specOf("pharos")).isEqualTo(ShardSpec.PROJECT);
+        assertThat(new String(store.get(layout.catalogKey()).orElseThrow().data(), StandardCharsets.UTF_8))
+                .as("nothing Phase 6 is written for [project]").doesNotContain("specs").doesNotContain("projects");
+    }
+
+    @Test
+    void specVersionsAreAppendedNeverEdited() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("pharos"));
+        assertThat(catalog.addSpec(Optional.empty(), ShardSpec.PROJECT)).isEqualTo(1);
+        ShardSpec ring4 = ShardSpec.parse("[project, ring(path, shards=4)]");
+        assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).isEqualTo(2);
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project,ring(path,shards=4,vnodes=512)]")))
+                .as("same as the newest of its scope: no new version").isEqualTo(2);
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).isEqualTo(etag);
+        assertThat(catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=5)]"))).isEqualTo(3);
+        assertThat(catalog.addSpec(Optional.of("lucene"), ring4)).as("going back is a new version").isEqualTo(4);
+        assertThat(catalog.projectShards().specs()).extracting(v -> v.version() + " " + v.project().orElse("-") + " " + v.spec())
+                .containsExactly("1 - [project]", "2 lucene [project, ring(path, shards=4, vnodes=512)]",
+                        "3 lucene [project, ring(path, shards=5, vnodes=512)]",
+                        "4 lucene [project, ring(path, shards=4, vnodes=512)]");
+        catalog.setActiveVersion(1);
+        assertThat(catalog.projectShards().activeVersion()).hasValue(1);
+        assertThatThrownBy(() -> catalog.setActiveVersion(2)).hasMessageContaining("belongs to project 'lucene'");
+        assertThatThrownBy(() -> catalog.setActiveVersion(9)).hasMessageContaining("no spec version 9");
+        assertThatThrownBy(() -> catalog.addSpec(Optional.of("a~b=c"), ring4)).hasMessageContaining("not a valid");
+        assertThat(catalog.shards()).as("register's list untouched").containsExactly(new ShardId("pharos"));
+    }
+
+    @Test
+    void putProjectMapsShardsAndListsThem() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        catalog.register(new ShardId("lucene"), Optional.of(ShardSource.git("https://example.org/l.git", "main")));
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=2)]"));
+        List<ShardId> ring = List.of(new ShardId("lucene~ring=s01"), new ShardId("lucene~ring=s02"));
+        catalog.putProject("lucene", v, ring);
+        String etag = store.get(layout.catalogKey()).orElseThrow().etag();
+        catalog.putProject("lucene", v, ring);
+        assertThat(store.get(layout.catalogKey()).orElseThrow().etag()).as("idempotent").isEqualTo(etag);
+
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.shardsOf("lucene")).containsExactlyElementsOf(ring);
+        assertThat(ps.projectOf(new ShardId("lucene~ring=s02"))).contains("lucene");
+        assertThat(ps.specVersionOf("lucene")).hasValue(v);
+        assertThat(catalog.shards()).containsExactly(new ShardId("lucene"), ring.get(0), ring.get(1));
+        assertThat(catalog.entries().get(0).source()).as("existing entries and sources are kept").isPresent();
+
+        // a reshard flip replaces the entry in one CAS
+        int v2 = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, ring(path, shards=3)]"));
+        List<ShardId> three = List.of(ring.get(0), ring.get(1), new ShardId("lucene~ring=s03"));
+        catalog.putProject("lucene", v2, three);
+        assertThat(catalog.projectShards().shardsOf("lucene")).containsExactlyElementsOf(three);
+        assertThat(catalog.projectShards().specVersionOf("lucene")).hasValue(v2);
+
+        assertThatThrownBy(() -> catalog.putProject("lucene", v2, List.of(new ShardId("lucene~ring=s09"))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("not a shard id of project");
+        assertThatThrownBy(() -> catalog.putProject("other", v2, List.of(new ShardId("other~ring=s01"))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("belongs to project 'lucene'");
+        assertThatThrownBy(() -> catalog.putProject("lucene", 42, three))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("no spec version 42");
+    }
+
+    @Test
+    void phase6FieldsSurviveOlderWritersRegister() throws Exception {
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
+        int v = catalog.addSpec(Optional.of("lucene"), ShardSpec.parse("[project, module]"));
+        catalog.putProject("lucene", v, List.of(new ShardId("lucene~module=core")));
+        catalog.register(new ShardId("pharos")); // the Phase 5 write path
+        ProjectShards ps = catalog.projectShards();
+        assertThat(ps.projects()).containsExactly("lucene", "pharos");
+        assertThat(ps.shardsOf("lucene")).containsExactly(new ShardId("lucene~module=core"));
+    }
+
+    @Test
+    void phase6WritesRetryUnderContention() throws Exception {
+        ContendedStore store = new ContendedStore(2);
+        ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout, sleeps::add);
+        assertThat(catalog.addSpec(Optional.empty(), ShardSpec.PROJECT)).isEqualTo(1);
+        assertThat(store.conditionalPuts).isEqualTo(3);
+        assertThat(sleeps).hasSize(2);
     }
 }

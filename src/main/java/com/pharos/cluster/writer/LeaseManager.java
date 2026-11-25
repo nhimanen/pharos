@@ -52,6 +52,15 @@ import java.util.concurrent.TimeoutException;
  *   <li><b>Renewal</b> is a {@code putIfMatch} on the held ETag, every TTL/3 on a daemon thread
  *       ({@link #start}). A failed renewal (an I/O error, or the lease taken) marks the lease lost
  *       at once: {@link #assertHeld} throws from then on, until the lease is acquired again.</li>
+ *   <li><b>Unconfirmed losses</b> (a renewal's I/O error or deadline: the lease may well still be
+ *       ours) are re-read every renewal round ({@link #renewAll}) until a read decides them: a
+ *       lease that still carries this writer's last ETag (or the exact body of its own unanswered
+ *       write, which the bucket applied) is reclaimed by a conditional put and held again; one that
+ *       carries another ETag or is gone is upgraded to a definite loss and the listener told. A read
+ *       that fails again leaves it unconfirmed for the next round, past the lease's expiry too: an
+ *       untouched lease is still ours to reclaim, a taken one shows another ETag. So a run longer
+ *       than the TTL survives a bucket blip, and one whose lease was taken meanwhile learns it within
+ *       a renewal interval of the bucket answering, not at its publish.</li>
  *   <li><b>Release</b> is a {@code putIfMatch} that marks the lease {@code "released": true}, so a
  *       lease taken over in the meantime is never clobbered, and any writer may take it at once.</li>
  * </ul>
@@ -91,9 +100,14 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         Optional<Instant> now() throws IOException;
     }
 
-    /** A lease this manager holds; {@code lastModified} is null when the stat after the write failed. */
-    private record Held(Lease lease, Instant lastModified, boolean lost) {
-        Held lostCopy() { return new Held(lease, lastModified, true); }
+    /**
+     * A lease this manager holds; {@code lastModified} is null when the stat after the write failed.
+     * {@code definite}: only meaningful once lost (see {@link Lost#definite}). {@code pending}: the body
+     * of this writer's latest lease write whose answer was lost (it may have been applied), else null.
+     */
+    private record Held(Lease lease, Instant lastModified, boolean lost, boolean definite, byte[] pending) {
+        Held lostCopy(boolean definite, byte[] pending) { return new Held(lease, lastModified, true, definite, pending); }
+        boolean unconfirmed() { return lost && !definite; }
     }
 
     /** A store call on the lease path. */
@@ -136,9 +150,24 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         this(store, layout, writer, ttl, ownWrite, clock, ttl == null ? null : ttl.dividedBy(6));
     }
 
+    /**
+     * Leases on other keys than the shard leases: {@code leaseKey} maps the id a caller acquires to its
+     * lease object (the per-project reshard lease, {@link ObjectStoreLayout#reshardLeaseKey}, keyed by
+     * {@code ShardId.ofProject(project)}).
+     */
+    public LeaseManager(ObjectStore store, ObjectStoreLayout layout, String writer, Duration ttl,
+                        BucketNow ownWrite, Clock clock, java.util.function.Function<ShardId, String> leaseKey) {
+        this(store, layout, writer, ttl, ownWrite, clock, ttl == null ? null : ttl.dividedBy(6));
+        this.leaseKey = Objects.requireNonNull(leaseKey, "leaseKey");
+    }
+
+    /** The lease object of an id: the shard lease unless another mapping was given. */
+    private java.util.function.Function<ShardId, String> leaseKey;
+
     /** Visible for tests: an explicit deadline per store call. */
     LeaseManager(ObjectStore store, ObjectStoreLayout layout, String writer, Duration ttl,
                  BucketNow ownWrite, Clock clock, Duration ioTimeout) {
+        this.leaseKey = layout::leaseKey;
         this.store = Objects.requireNonNull(store, "store");
         this.layout = Objects.requireNonNull(layout, "layout");
         this.writer = Objects.requireNonNull(writer, "writer");
@@ -160,7 +189,9 @@ public final class LeaseManager implements LeaseGuard, Closeable {
      * @param definite true when another writer has it or it is gone (a conditional put refused, the
      *                 lease object missing or carrying another ETag); false when the answer is
      *                 unknown (an I/O error or a deadline on the bucket, an expiry by the bucket's
-     *                 clock), so the lease may well still be this writer's and be reclaimed at once
+     *                 clock), so the lease may well still be this writer's and be reclaimed at once.
+     *                 A later renewal round re-reads such a lease: reclaimed, it is held again (no
+     *                 call); taken or gone, it is reported once more, as definite
      */
     public record Lost(ShardId shard, String why, boolean definite) {}
 
@@ -190,23 +221,54 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     }
 
     /**
-     * One renewal round: every held lease is renewed in parallel, so a slow one (bounded by the
+     * One renewal round: every held lease is renewed, and every lease lost without a definite answer
+     * is re-read ({@link #reconfirmUnconfirmed}), all in parallel, so a slow one (bounded by the
      * deadline) never holds up the others. Never throws.
      */
-    void renewAll() {
+    public void renewAll() {
+        round(true);
+    }
+
+    /**
+     * Re-reads every lease lost without a definite answer (see the class doc): reclaims the untouched
+     * ones, upgrades the taken or gone ones to a definite loss (telling the listener), and leaves the
+     * ones still unanswered for the next call. Never throws.
+     */
+    public void reconfirmUnconfirmed() {
+        round(false);
+    }
+
+    private void round(boolean renewHeld) {
         List<Lease> leases;
+        List<ShardId> unconfirmed;
         synchronized (mu) {
             if (closed) return;
-            leases = held.values().stream().filter(h -> !h.lost()).map(Held::lease).toList();
+            leases = renewHeld ? held.values().stream().filter(h -> !h.lost()).map(Held::lease).toList() : List.of();
+            unconfirmed = held.entrySet().stream().filter(e -> e.getValue().unconfirmed()).map(Map.Entry::getKey)
+                    .toList();
         }
-        List<Callable<Boolean>> tasks = leases.stream().<Callable<Boolean>>map(l -> () -> {
-            try {
-                return renew(l);
-            } catch (RuntimeException e) {
-                log.warn("Renewing the lease of shard {} failed: {}", l.shard(), e.toString());
-                return false;
-            }
-        }).toList();
+        List<Callable<Boolean>> tasks = new java.util.ArrayList<>();
+        for (Lease l : leases) {
+            tasks.add(() -> {
+                try {
+                    return renew(l);
+                } catch (RuntimeException e) {
+                    log.warn("Renewing the lease of shard {} failed: {}", l.shard(), e.toString());
+                    return false;
+                }
+            });
+        }
+        for (ShardId s : unconfirmed) {
+            tasks.add(() -> {
+                try {
+                    return reconfirm(s);
+                } catch (RuntimeException e) {
+                    log.warn("Re-reading the unconfirmed lease of shard {} failed: {}", s, e.toString());
+                    return false;
+                }
+            });
+        }
+        if (tasks.isEmpty()) return;
         try {
             io.invokeAll(tasks);
         } catch (InterruptedException e) {
@@ -227,7 +289,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         synchronized (lockFor(shard)) {
             Held mine = current(shard);
             if (mine != null && !mine.lost()) return Optional.of(mine.lease());
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             Optional<StoredObject> cur = call("get " + key, () -> store.get(key));
             Optional<String> etag;
             if (cur.isEmpty()) {
@@ -285,13 +347,14 @@ public final class LeaseManager implements LeaseGuard, Closeable {
                 h = held.get(shard);
                 if (h == null || h.lost() || closed) return false;
             }
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             String etagNow = h.lease().etag();
+            byte[] next = body(false);
             Optional<String> etag;
             try {
-                etag = call("putIfMatch " + key, () -> store.putIfMatch(key, body(false), etagNow));
+                etag = call("putIfMatch " + key, () -> store.putIfMatch(key, next, etagNow));
             } catch (IOException | RuntimeException e) {
-                markLost(shard, h, "renewal failed: " + e, false);
+                markLost(shard, h, "renewal failed: " + e, false, next);
                 return false;
             }
             if (etag.isEmpty()) {
@@ -299,6 +362,74 @@ public final class LeaseManager implements LeaseGuard, Closeable {
                 return false;
             }
             recordWrite(shard, key, etag.get(), h);
+            return true;
+        }
+    }
+
+    /**
+     * Holding no lock. Re-reads a lease lost without a definite answer and decides it if the bucket
+     * answers: reclaimed (held again) when it still carries this writer's last ETag or the body of
+     * its own unanswered write; a definite loss when it carries anything else or is gone. A read or
+     * reclaim that fails again leaves it unconfirmed.
+     *
+     * @return true when the lease was reclaimed
+     */
+    private boolean reconfirm(ShardId shard) {
+        synchronized (lockFor(shard)) {
+            Held h;
+            synchronized (mu) {
+                h = held.get(shard);
+                if (h == null || !h.unconfirmed() || closed) return false;
+            }
+            String key = leaseKey.apply(shard);
+            Optional<StoredObject> cur;
+            try {
+                cur = call("get " + key, () -> store.get(key));
+            } catch (IOException | RuntimeException e) {
+                log.debug("Lease of shard {} still unconfirmed (re-read failed): {}", shard, e.toString());
+                return false;
+            }
+            if (cur.isEmpty()) {
+                markLost(shard, h, "the lease object is gone", true);
+                return false;
+            }
+            String seen = cur.get().etag();
+            boolean untouched = h.lease().etag().equals(seen);
+            boolean ownWrite = !untouched && h.pending() != null && java.util.Arrays.equals(h.pending(), cur.get().data());
+            if (!untouched && !ownWrite) {
+                markLost(shard, h, "it was taken by another writer", true);
+                return false;
+            }
+            Held from = h;
+            if (ownWrite) { // our unanswered write was applied: it is our latest write, under the ETag just read
+                from = new Held(new Lease(shard, writer, h.lease().expires(), seen), h.lastModified(), true, false, null);
+                if (!replace(shard, h, from)) return false;
+            }
+            byte[] next = body(false);
+            Optional<String> etag;
+            try {
+                etag = call("putIfMatch " + key, () -> store.putIfMatch(key, next, seen));
+            } catch (IOException | RuntimeException e) {
+                replace(shard, from, from.lostCopy(false, next));
+                log.debug("Lease of shard {} still unconfirmed (reclaim failed): {}", shard, e.toString());
+                return false;
+            }
+            if (etag.isEmpty()) {
+                markLost(shard, from, "it was taken by another writer", true);
+                return false;
+            }
+            Held now = recordWrite(shard, key, etag.get(), from);
+            if (now != current(shard)) return false; // replaced meanwhile (released, re-acquired)
+            log.info("Reclaimed the lease of shard {} after an unconfirmed loss: writer {} holds it again", shard, writer);
+            return true;
+        }
+    }
+
+    // Replaces the shard's entry under mu, only if it is still {@code expected}.
+    private boolean replace(ShardId shard, Held expected, Held next) {
+        synchronized (mu) {
+            if (held.get(shard) != expected) return false;
+            held.put(shard, next);
             return true;
         }
     }
@@ -315,7 +446,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
                 h = held.remove(shard);
             }
             if (h == null || h.lost()) return;
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             try {
                 if (call("putIfMatch " + key, () -> store.putIfMatch(key, body(true), h.lease().etag())).isPresent()) {
                     log.info("Released the lease of shard {}", shard);
@@ -370,6 +501,19 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         }
     }
 
+    /**
+     * True while the shard's lease was seen lost without a definite answer (a renewal's I/O error or
+     * deadline, an expiry by the bucket's clock: {@link Lost#definite} false) and nothing has replaced
+     * or released it since: the lease may well still be this writer's. Each renewal round re-reads it
+     * until the bucket answers ({@link #reconfirmUnconfirmed}). Never waits on the store.
+     */
+    public boolean lostUnconfirmed(ShardId shard) {
+        synchronized (mu) {
+            Held h = held.get(shard);
+            return h != null && h.lost() && !h.definite();
+        }
+    }
+
     /** The leases currently held (not lost). Never waits on the store. */
     public List<Lease> held() {
         synchronized (mu) {
@@ -388,7 +532,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             Held h = current(shard);
             if (h == null) throw new PublishConflictException("writer " + writer + " holds no lease on shard " + shard);
             if (h.lost()) throw new PublishConflictException("writer " + writer + " lost the lease on shard " + shard);
-            String key = layout.leaseKey(shard);
+            String key = leaseKey.apply(shard);
             try {
                 Optional<StoredObject> cur = call("get " + key, () -> store.get(key));
                 if (cur.isEmpty() || !h.lease().etag().equals(cur.get().etag())) {
@@ -477,12 +621,18 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         }
     }
 
-    // Applies under mu, only if the shard's entry is still the one the caller started from.
     private void markLost(ShardId shard, Held expected, String why, boolean definite) {
+        markLost(shard, expected, why, definite, expected.pending());
+    }
+
+    // Applies under mu, only if the shard's entry is still the one the caller started from, and only to
+    // a held lease or (upgrading it to definite) an unconfirmed loss: a definite loss stays as it was.
+    private void markLost(ShardId shard, Held expected, String why, boolean definite, byte[] pending) {
         synchronized (mu) {
             Held h = held.get(shard);
-            if (h == null || h != expected || h.lost()) return;
-            held.put(shard, h.lostCopy());
+            if (h == null || h != expected) return;
+            if (h.lost() && (h.definite() || !definite)) return;
+            held.put(shard, h.lostCopy(definite, definite ? null : pending));
         }
         log.warn("Lease of shard {} lost ({}): writer {} stops publishing it", shard, why, writer);
         try {
@@ -503,7 +653,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             log.debug("Stat of the lease of shard {} failed: {}", shard, e.toString());
         }
         Instant expires = (lastModified != null ? lastModified : clock.instant()).plus(ttl);
-        Held h = new Held(new Lease(shard, writer, expires, etag), lastModified, false);
+        Held h = new Held(new Lease(shard, writer, expires, etag), lastModified, false, false, null);
         synchronized (mu) {
             if (held.get(shard) == expected) held.put(shard, h);
         }

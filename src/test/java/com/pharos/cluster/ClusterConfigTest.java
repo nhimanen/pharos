@@ -28,6 +28,23 @@ class ClusterConfigTest {
         assertThat(c.getRetentionGenerations()).isEqualTo(3);
     }
 
+    /** Ruling P6-R19: the previous-generation grace's default, an explicit value, 0, and a negative one. */
+    @Test
+    void previousGenerationGrace() throws Exception {
+        ClusterConfig c = parse("{\"verbose\": true}");
+        assertThat(c.previousGenerationGrace()).as("heartbeat 10 s: 3 x 5 s + 2 x 10 s")
+                .isEqualTo(java.time.Duration.ofSeconds(35));
+        c.setHeartbeatSeconds(5);
+        assertThat(c.previousGenerationGrace()).as("at least 30 s").isEqualTo(java.time.Duration.ofSeconds(30));
+        assertThat(ClusterRuntime.CATALOG_CACHE.toSeconds()).isEqualTo(ClusterConfig.CATALOG_CACHE_SECONDS);
+        c.getReader().setPreviousGenerationGraceSeconds(90);
+        assertThat(c.previousGenerationGrace()).isEqualTo(java.time.Duration.ofSeconds(90));
+        c.getReader().setPreviousGenerationGraceSeconds(0);
+        assertThat(c.previousGenerationGrace()).isZero();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"reader\":{\"previousGenerationGraceSeconds\":-1}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("previousGenerationGraceSeconds");
+    }
+
     @Test
     void readerNeedsObjectStore() {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"local\"}}"))
@@ -272,6 +289,27 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse(READER.formatted(
                 ",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\",\"reader\":{\"shards\":[\"ok\",\"../x\"]}")))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
+    }
+
+    /** P6-R5: shard ids of split projects and project wildcards; a wildcard must name a valid project. */
+    @Test
+    void readerShardsAcceptKeyedIdsAndProjectWildcards() throws Exception {
+        ClusterConfig ok = parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
+                + "\"reader\":{\"shards\":[\"app\",\"lucene~ring=s01\",\"kafka~*\"]}"));
+        ReaderPin pin = ReaderPin.of(ok.getReader().getShards());
+        assertThat(pin.matches(new ShardId("app"), s -> java.util.Optional.empty())).isTrue();
+        assertThat(pin.matches(new ShardId("lucene~ring=s01"), s -> java.util.Optional.of("lucene"))).isTrue();
+        assertThat(pin.matches(new ShardId("lucene~ring=s02"), s -> java.util.Optional.of("lucene"))).isFalse();
+        assertThat(pin.matches(new ShardId("kafka~module=core"), s -> java.util.Optional.of("kafka"))).isTrue();
+        assertThat(pin.matches(new ShardId("kafka"), s -> java.util.Optional.of("kafka")))
+                .as("the [project] shard of a pinned project too").isTrue();
+        assertThat(pin.matches(new ShardId("kafkaesque~ring=s01"), s -> java.util.Optional.of("kafkaesque"))).isFalse();
+        assertThat(ReaderPin.of(java.util.List.of()).matches(new ShardId("x"), s -> java.util.Optional.empty())).isTrue();
+        for (String bad : java.util.List.of("~*", "../x~*", "a~", "a~ring")) {
+            assertThatThrownBy(() -> parse(READER.formatted(",\"advertiseUrl\":\"http://r:7171\",\"token\":\"t\","
+                    + "\"reader\":{\"shards\":[\"" + bad + "\"]}")))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.reader.shards");
+        }
     }
 
     @Test
@@ -541,5 +579,173 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
                 + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:1\",\"token\":\"t\"," + trust + "}}"))
                 .hasMessageContaining("cluster.tls is not supported");
+    }
+
+    // ── cluster.sharding (Phase 6) ──────────────────────────────────────────────────────────
+
+    @Test
+    void shardingDefaultsToProject() throws Exception {
+        ClusterConfig c = parse("{\"verbose\": true}");
+        assertThat(c.getSharding().defaultSpec()).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThat(c.getSharding().specFor("anything")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThat(c.getSharding().getProjects()).isEmpty();
+    }
+
+    @Test
+    void shardingByDefaultAndPerProject() throws Exception {
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"writer\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                + "\"sharding\":{\"default\":\"[project, module]\","
+                + "\"projects\":{\"lucene\":\"[project, ring(path, shards=8)]\"}}}}");
+        assertThat(c.getSharding().specFor("lucene").toString()).isEqualTo("[project, ring(path, shards=8, vnodes=512)]");
+        assertThat(c.getSharding().specFor("pharos").toString()).isEqualTo("[project, module]");
+        String saved = mapper.writeValueAsString(c);
+        assertThat(saved).contains("\"default\":\"[project, module]\"");
+        ClusterConfig back = mapper.readValue(saved, ClusterConfig.class);
+        back.validate();
+        assertThat(back.getSharding().specFor("lucene")).isEqualTo(c.getSharding().specFor("lucene"));
+    }
+
+    @Test
+    void invalidShardingIsRejected() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, hash(path) % 8]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.default: invalid shard spec '[project, hash(path) % 8]'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"projects\":{\"lucene\":\"[owner]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.projects.lucene: invalid shard spec");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"projects\":{\"my project\":\"[project]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not a valid cluster project name");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"\"}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("must not be empty");
+    }
+
+    /** Ruling P6-R9: the local single node keeps [project] too; the message names the backend. */
+    @Test
+    void localBackendAllowsOnlyTheDefaultSpec() throws Exception {
+        assertThat(parse("{\"cluster\":{\"sharding\":{\"projects\":{\"a\":\"[project]\"}}}}")
+                .getSharding().specFor("a")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"sharding\":{\"default\":\"[project, module]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("cluster.sharding.default is [project, module], but cluster.backend 'local' supports only"
+                        + " the default spec [project]: splitting a project into several shards needs cluster.backend"
+                        + " 'object-store'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"backend\":\"local\",\"sharding\":{\"projects\":"
+                + "{\"lucene\":\"[project, ring(path, shards=4)]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.projects.lucene is [project, ring(path, shards=4, vnodes=512)],"
+                        + " but cluster.backend 'local'");
+    }
+
+    /** Ruling P6-R9: a split project needs the object store; peer mode keeps [project]. */
+    @Test
+    void peerPullAllowsOnlyTheDefaultSpec() throws Exception {
+        String peer = "{\"cluster\":{\"role\":\"writer\",\"backend\":\"peer-pull\",\"token\":\"t\",";
+        assertThat(parse(peer + "\"sharding\":{\"default\":\"[project]\",\"projects\":{\"a\":\"[ project ]\"}}}}")
+                .getSharding().specFor("a")).isEqualTo(com.pharos.cluster.sharding.ShardSpec.PROJECT);
+        assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"projects\":{\"lucene\":\"[project, ring(path, shards=4)]\"}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("cluster.sharding.projects.lucene is [project, ring(path, shards=4, vnodes=512)], but cluster.backend"
+                        + " 'peer-pull' supports only the default spec [project]: splitting a project into several"
+                        + " shards needs cluster.backend 'object-store'");
+        assertThatThrownBy(() -> parse(peer + "\"sharding\":{\"default\":\"[project, module]\"}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("cluster.sharding.default is [project, module], but cluster.backend 'peer-pull'");
+    }
+
+    // ── cluster.tokenEnv and the scale thresholds (operator Task 1) ───────────────────────────
+
+    /** An env var no test machine sets. */
+    private static final String UNSET_ENV = "PHAROS_TEST_TOKEN_ENV_THAT_IS_NEVER_SET_7F3A";
+
+    @Test
+    void tokenFromEnv() throws Exception {
+        String home = System.getenv("PATH"); // set on every machine and CI runner (the value stands in for a token)
+        assertThat(home).isNotBlank();
+        ClusterConfig c = parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:7171\",\"tokenEnv\":\"PATH\"}}");
+        assertThat(c.getTokenEnv()).isEqualTo("PATH");
+        assertThat(c.effectiveToken()).as("read from the env var").isEqualTo(home);
+        assertThat(c.getToken()).as("the configured token stays unset").isNull();
+        assertThat(c.toString()).contains("tokenEnv=PATH").doesNotContain(home);
+        // the token read from env is never written back into config.json
+        String saved = mapper.writeValueAsString(mapper.readValue("{\"cluster\":{\"tokenEnv\":\"PATH\"}}",
+                IndexConfig.class));
+        assertThat(saved).contains("\"tokenEnv\":\"PATH\"").doesNotContain(home);
+
+        // a literal token still works as before
+        assertThat(parse("{\"cluster\":{\"token\":\"t\"}}").effectiveToken()).isEqualTo("t");
+        assertThat(parse("{}").effectiveToken()).isNull();
+
+        // an env var that is not set: refused, naming the variable (never a value)
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tokenEnv\":\"" + UNSET_ENV + "\"}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.tokenEnv").hasMessageContaining(UNSET_ENV);
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tokenEnv\":\" \"}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.tokenEnv");
+    }
+
+    @Test
+    void tokenAndTokenEnvTogetherIsInvalid() {
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"token\":\"s3cret\",\"tokenEnv\":\"PATH\"}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.token").hasMessageContaining("cluster.tokenEnv")
+                .hasMessageContaining("mutually exclusive")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("s3cret"));
+    }
+
+    @Test
+    void statusScaleThresholds() throws Exception {
+        ClusterConfig d = parse("{}");
+        assertThat(d.getStatus().getRemoveReadersLoad()).isEqualTo(0.2);
+        assertThat(d.getStatus().getWriters().getBacklogShards()).isEqualTo(1);
+        assertThat(d.getStatus().getWriters().getOldestPendingSeconds()).isEqualTo(300);
+        assertThat(d.getStatus().getWriters().getIdleSeconds()).as("unset: windows.removeWritersSeconds applies").isNull();
+        var ds = com.pharos.cluster.status.StatusSettings.of(d.getStatus());
+        assertThat(ds.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(1800);
+
+        ClusterConfig c = parse("{\"cluster\":{\"status\":{\"removeReadersLoad\":0.35,"
+                + "\"writers\":{\"backlogShards\":2,\"oldestPendingSeconds\":120,\"idleSeconds\":900}}}}");
+        var st = com.pharos.cluster.status.StatusSettings.of(c.getStatus());
+        assertThat(st.removeReadersLoad()).isEqualTo(0.35);
+        assertThat(st.backlogShards()).isEqualTo(2);
+        assertThat(st.oldestPendingSeconds()).isEqualTo(120);
+        assertThat(st.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(900);
+        // the older windows.removeWritersSeconds still applies when writers.idleSeconds is not set
+        var legacy = com.pharos.cluster.status.StatusSettings.of(parse(
+                "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}").getStatus());
+        assertThat(legacy.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(60);
+
+        // writers.idleSeconds and windows.removeWritersSeconds set the same window: different values are refused
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60},"
+                + "\"writers\":{\"idleSeconds\":900}}}}"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cluster.status.writers.idleSeconds")
+                .hasMessageContaining("cluster.status.windows.removeWritersSeconds");
+        var same = com.pharos.cluster.status.StatusSettings.of(parse("{\"cluster\":{\"status\":{\"windows\":"
+                + "{\"removeWritersSeconds\":900},\"writers\":{\"idleSeconds\":900}}}}").getStatus());
+        assertThat(same.window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("equal: allowed").isEqualTo(900);
+        // the default (1800) is not a setting: idleSeconds alone, saved and reloaded, stays valid
+        String saved = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"writers\":{\"idleSeconds\":900}}}}", IndexConfig.class));
+        assertThat(saved).doesNotContain("removeWritersSeconds");
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(saved).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).isEqualTo(900);
+        String savedLegacy = mapper.writeValueAsString(mapper.readValue(
+                "{\"cluster\":{\"status\":{\"windows\":{\"removeWritersSeconds\":60}}}}", IndexConfig.class));
+        assertThat(com.pharos.cluster.status.StatusSettings.of(parse(savedLegacy).getStatus())
+                .window(com.pharos.cluster.status.Proposals.REMOVE_WRITERS)).as("an explicit value round-trips")
+                .isEqualTo(60);
+
+        for (String bad : new String[]{"0", "1", "-0.1", "1.5"}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"removeReadersLoad\":" + bad + "}}}"))
+                    .as(bad).hasMessageContaining("cluster.status.removeReadersLoad");
+        }
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"backlogShards\":0}}}}"))
+                .hasMessageContaining("cluster.status.writers.backlogShards");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"oldestPendingSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.writers.oldestPendingSeconds");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"writers\":{\"idleSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.writers.idleSeconds");
     }
 }

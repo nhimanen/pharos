@@ -1078,6 +1078,90 @@ class WorkLoopTest {
         assertThatThrownBy(() -> detached.assertHeld(s)).hasMessageContaining("does not hold the lease");
     }
 
+    /**
+     * A project split into two ring shards whose source sits on the catalog entry named after it (its
+     * source before the split): {@code n} files in different packages, so both shards get some.
+     */
+    private List<ShardId> splitProject(String name, int files) throws IOException {
+        ShardId plain = pathShard(name);
+        Path dir = sourceDirs.get(plain);
+        for (int i = 0; i < files; i++) {
+            Path pkg = dir.resolve("src/main/java/com/example/p" + i);
+            Files.createDirectories(pkg);
+            Files.writeString(pkg.resolve("Part" + i + ".java"), "package com.example.p" + i + ";\n\n"
+                    + "public class Part" + i + " {\n    public int f" + i + "(int x) { return x + " + i + "; }\n}\n");
+        }
+        com.pharos.cluster.sharding.ShardSpec spec =
+                com.pharos.cluster.sharding.ShardSpec.parse("[project, ring(path, shards=2)]");
+        int v = catalog.addSpec(Optional.of(name), spec);
+        List<ShardId> ring = List.of(new ShardId(name + "~ring=s01"), new ShardId(name + "~ring=s02"));
+        catalog.putProject(name, v, ring);
+        sourceDirs.put(ShardId.ofProject(name), dir);
+        return ring;
+    }
+
+    @Test
+    void splitProjectIsOneWorkUnit() throws IOException {
+        List<ShardId> ring = splitProject("big", 12);
+        ShardId other = pathShard("other");
+        Writer a = new Writer("node-a");
+
+        a.loop.tick();
+        // both shard leases of the project, plus the [project] one
+        assertThat(a.held()).containsExactlyInAnyOrder(ring.get(0), ring.get(1), other);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(Generation.FIRST);
+            assertThat(replicas.manifest(s, Generation.FIRST).projectGeneration()).isEqualTo(1L);
+            assertThat(lease(s).path("writer").asText()).isEqualTo("node-a");
+        }
+        assertThat(latest(new ShardId("big"))).as("the project's plain id is never published").isEmpty();
+        assertThat(a.loop.publishes(new ShardId("big"))).isEqualTo(1);
+        JsonNode hb = heartbeatOf("node-a").orElseThrow();
+        assertThat(hb.path("leases")).hasSize(3);
+        assertThat(hb.path("backlog").has("big")).isTrue();
+        int docsA = a.lucene.openMultiReader(List.of("big")).numDocs();
+
+        // idle: no new generation of any shard
+        rounds(2, 10, a);
+        for (ShardId s : ring) assertThat(latest(s)).contains(Generation.FIRST);
+
+        // a change publishes every shard of the project once, as one run
+        change(new ShardId("big"), "three");
+        rounds(1, 10, a);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(new Generation(2));
+            assertThat(replicas.manifest(s, new Generation(2)).projectGeneration()).isEqualTo(2L);
+        }
+
+        // all or none: with one shard's lease taken elsewhere, a new owner takes neither
+        a.loop.stop(Duration.ofSeconds(5));
+        LeaseManager x = new LeaseManager(store, layout, "node-x", TTL, LeaseManager.BucketNow.NONE, clock);
+        Lease taken = x.tryAcquire(ring.get(1)).orElseThrow();
+        Writer b = new Writer("node-b");
+        change(new ShardId("big"), "four");
+        b.loop.tick();
+        assertThat(b.held()).containsExactly(other);
+        assertThat(lease(ring.get(0)).path("released").asBoolean()).as("the partial lease went back").isTrue();
+        assertThat(lease(ring.get(0)).path("writer").asText()).as("taken, then released by B").isEqualTo("node-b");
+        assertThat(latest(ring.get(0))).contains(new Generation(2));
+
+        // once free, the new owner takes both, restores the project and resumes incrementally
+        x.release(taken);
+        clock.advance(10);
+        int before = b.embedder.calls.get();
+        b.loop.tick();
+        assertThat(b.held()).containsExactlyInAnyOrder(ring.get(0), ring.get(1), other);
+        for (ShardId s : ring) {
+            assertThat(latest(s)).contains(new Generation(3));
+            assertThat(replicas.manifest(s, new Generation(3)).writerNode()).isEqualTo("node-b");
+            assertThat(replicas.manifest(s, new Generation(3)).projectGeneration()).isEqualTo(3L);
+        }
+        assertThat(b.embedder.calls.get() - before).as("the restored cache serves the unchanged texts")
+                .isLessThan(a.embedder.calls.get() / 2);
+        assertThat(b.lucene.openMultiReader(List.of("big")).numDocs()).isEqualTo(docsA + 2);
+        x.close();
+    }
+
     @Test
     void gracefulStopAbortsARunThatCannotFinishAndReleasesLeases() throws Exception {
         ShardId s = pathShard("solo");
@@ -1222,6 +1306,40 @@ class WorkLoopTest {
     }
 
     /**
+     * 1.11.0 merge (1.9.0's abort on a definite loss × Phase 6's split projects): a split project's
+     * run holds one lease per ring shard, under the project's work unit. Another writer taking any of
+     * them aborts the run, as for an unsplit shard; matching the lost lease against the unit's id only
+     * (the project name, never a ring shard's) let the run parse on for nothing.
+     */
+    @Test
+    void lostLeaseOfOneRingShardAbortsTheSplitProjectsRun() throws Exception {
+        List<ShardId> ring = splitProject("big", 12);
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Optional<Generation> before = latest(ring.get(1));
+        assertThat(before).contains(Generation.FIRST);
+        change(new ShardId("big"), "slow");
+        Files.writeString(a.lucene.getProjectIndexDir("big").resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        // another writer took the second ring shard's lease meanwhile
+        store.put(layout.leaseKey(ring.get(1)), "{\"writer\":\"node-x\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        a.loop.leaseManager().renewAll();
+
+        runner.join(10_000);
+        assertThat(runner.isAlive()).as("the run stopped").isFalse();
+        assertThat(parser.aborted).as("aborted inside its parse").isTrue();
+        for (ShardId s : ring) assertThat(latest(s)).isEqualTo(before);
+        assertThat(warnings()).anyMatch(m -> m.contains("lost") && m.contains("aborting the run"));
+    }
+
+    /**
      * Review I1: a renewal that fails without a definite answer (an I/O error or its deadline on a
      * slow bucket) may leave the lease ours. Aborting would throw a full run away and the next run
      * would be full again; on a bucket slow often enough the shard would never publish. Such a run
@@ -1262,6 +1380,84 @@ class WorkLoopTest {
         assertThat(a.held()).containsExactly(s);
         assertThat(latest(s).orElseThrow().value()).isGreaterThan(before.value());
         assertThat(warnings()).noneMatch(m -> m.contains("aborting the run"));
+    }
+
+    /**
+     * 1.11.0 review: an unconfirmed loss was never re-read during a run (the renewer skipped it; only
+     * a tick reclaims it, and no tick runs during a run), so a bucket stall longer than the TTL cost
+     * the run its publish. A later renewal round reclaims the untouched lease: the same run publishes.
+     */
+    @Test
+    void aStallPastTheTtlDuringALongRunIsReclaimedAndTheRunPublishes() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Generation before = latest(s).orElseThrow();
+        change(s, "slow");
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.failPutIfMatchOn(layout.leaseKey(s)); // one renewal gets no answer
+        a.loop.leaseManager().renewAll();
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).isTrue();
+        clock.advance(TTL.toSeconds() + 10); // the stall outlasts the lease's TTL
+        a.loop.leaseManager().renewAll();
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).as("still unanswered").isTrue();
+        store.release();
+        a.loop.leaseManager().renewAll(); // a later renewal gets an answer
+
+        assertThat(a.loop.leaseManager().isHeld(s)).as("reclaimed during the run").isTrue();
+        parser.armed.set(false);
+        parser.finish = true;
+        runner.join(30_000);
+        assertThat(runner.isAlive()).isFalse();
+        assertThat(parser.aborted).isFalse();
+        assertThat(latest(s).orElseThrow().value()).as("the same run published").isGreaterThan(before.value());
+        assertThat(warnings()).noneMatch(m -> m.contains("aborting the run"));
+    }
+
+    /**
+     * An unconfirmed loss followed by another writer taking the lease: the next renewal round that
+     * reads the bucket sees the takeover as a definite loss and aborts the run, instead of the run
+     * working on to a publish that can only fail.
+     */
+    @Test
+    void anUnconfirmedLossThenATakeoverAbortsTheRun() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Optional<Generation> before = latest(s);
+        change(s, "slow");
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.failPutIfMatchOn(layout.leaseKey(s));
+        a.loop.leaseManager().renewAll();
+        Thread.sleep(300);
+        assertThat(parser.aborted).as("not aborted on the ambiguous failure").isFalse();
+
+        // another writer takes the lease meanwhile; then the bucket answers again
+        store.put(layout.leaseKey(s), "{\"writer\":\"node-x\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        store.release();
+        a.loop.leaseManager().renewAll();
+
+        runner.join(10_000);
+        assertThat(runner.isAlive()).as("the run stopped").isFalse();
+        assertThat(parser.aborted).as("aborted inside its parse").isTrue();
+        assertThat(latest(s)).isEqualTo(before);
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).as("a definite loss now").isFalse();
     }
 
     /**

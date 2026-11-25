@@ -25,8 +25,7 @@ public class IndexConfig {
 
     private static final Logger log = LoggerFactory.getLogger(IndexConfig.class);
     /** Pharos state directory; override with {@code -Dpharos.home=...} (tests do, via surefire). */
-    public static final Path DEFAULT_BASE = Path.of(System.getProperty("pharos.home",
-            Path.of(System.getProperty("user.home"), ".pharos").toString()));
+    public static final Path DEFAULT_BASE = PharosHome.DEFAULT_BASE;
 
     private Path indexDir;
     private Path synonymsFile;
@@ -213,37 +212,48 @@ public class IndexConfig {
             return defaults();
         }
         try {
-            ObjectMapper mapper = createMapper();
-            IndexConfig config = mapper.readValue(configFile.toFile(), IndexConfig.class);
-            if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
-            if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
-            config.migrateLegacyEmbeddingConfig();
-            if (config.cluster == null) config.cluster = new ClusterConfig();
-            config.cluster.validate();
-            for (EmbeddingProviderConfig p : config.embeddingProviders) {
-                p.validate();
-                validateFallbacks(p);
-            }
-            if (config.searchEmbeddingProvider != null) {
-                config.searchEmbeddingProvider.validate();
-                // Routing safety: the search-time runtime must target a modelId
-                // that was actually written to the index. Otherwise vec.<id>
-                // queries hit a missing field and return empty.
-                boolean matches = config.embeddingProviders.stream()
-                        .anyMatch(p -> p.getModelId().equals(config.searchEmbeddingProvider.getModelId()));
-                if (!matches) {
-                    throw new IllegalArgumentException(String.format(
-                            "searchEmbeddingProvider.modelId='%s' does not match any " +
-                            "embeddingProviders entry. Vectors would not be queryable. " +
-                            "Either fix the modelId or remove the searchEmbeddingProvider entry.",
-                            config.searchEmbeddingProvider.getModelId()));
-                }
-            }
-            return config;
+            return load(configFile);
         } catch (IOException e) {
             log.warn("Could not read config file {}, using defaults: {}", configFile, e.getMessage());
             return defaults();
         }
+    }
+
+    /**
+     * Reads and validates {@code configFile} strictly ({@code pharos config validate}): an
+     * unreadable or malformed file throws instead of falling back to the defaults.
+     *
+     * @throws IOException           when the file cannot be read or is not a config (JSON, types)
+     * @throws IllegalStateException or {@link IllegalArgumentException} when a setting is invalid
+     */
+    public static IndexConfig load(Path configFile) throws IOException {
+        ObjectMapper mapper = createMapper();
+        IndexConfig config = mapper.readValue(configFile.toFile(), IndexConfig.class);
+        if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
+        if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
+        config.migrateLegacyEmbeddingConfig();
+        if (config.cluster == null) config.cluster = new ClusterConfig();
+        config.cluster.validate();
+        for (EmbeddingProviderConfig p : config.embeddingProviders) {
+            p.validate();
+            validateFallbacks(p);
+        }
+        if (config.searchEmbeddingProvider != null) {
+            config.searchEmbeddingProvider.validate();
+            // Routing safety: the search-time runtime must target a modelId
+            // that was actually written to the index. Otherwise vec.<id>
+            // queries hit a missing field and return empty.
+            boolean matches = config.embeddingProviders.stream()
+                    .anyMatch(p -> p.getModelId().equals(config.searchEmbeddingProvider.getModelId()));
+            if (!matches) {
+                throw new IllegalArgumentException(String.format(
+                        "searchEmbeddingProvider.modelId='%s' does not match any " +
+                        "embeddingProviders entry. Vectors would not be queryable. " +
+                        "Either fix the modelId or remove the searchEmbeddingProvider entry.",
+                        config.searchEmbeddingProvider.getModelId()));
+            }
+        }
+        return config;
     }
 
     /**

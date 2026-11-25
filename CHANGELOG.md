@@ -3,6 +3,259 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.11.0] - 2026-11-25
+
+**Index format:** 1 → 2 (documents carry key fields for the search filters and shard keys; format-1
+indexes stay searchable unfiltered under the N-1 rule, the next index run rewrites them as format 2;
+format 0 is no longer read — see UPGRADING.md)
+
+Multi-node Phase 6 (sharding and live resharding) and the Kubernetes operator v1. A project on an
+object-store cluster can be split into shards by a **shard spec** (`[project, module]`,
+`[project, ring(path, shards=N)]`, …) and resharded live with `pharos reshard`, while readers keep
+answering; the same documents carry key fields that every node can filter on (`module`, `pathPrefix`,
+`language`, `kind`). The operator deploys and runs a whole cluster from one `PharosCluster` resource.
+Gates: the Phase 6 gate (two work-queue writers, three lazy readers, the router, 10 QPS throughout,
+three live reshards of lucene and pharos and a writer killed mid-reshard) answered 0 of 4 883 queries
+with a failure, kept keyword top-10s identical 99 / 99 (score-bitwise), hybrid τ 1.0000 and vector
+overlap 0.997 after the reshards, re-indexed 19.7 % of lucene's files for a 4 → 5 ring change and
+called the embedding model 0 times while resharding pharos (4 786 cache hits); the operator's
+minikube end-to-end run passed 65 of 65 checks (install, scaling, takeover, writer scale-down,
+pre-flight, upgrade, a live reshard, secrets, re-apply, teardown).
+
+Single nodes: the format change makes each project's next `pharos index` a full run (or run
+`pharos upgrade-indexes`); nothing else changes. Clusters: upgrade every reader before resharding
+(UPGRADING.md "Upgrading to 1.11.0").
+
+### Added (multi-node Phase 6: sharding and live resharding)
+- Shard specs (object-store clusters): a project is split by shard keys: `project`, `module` (the
+  nearest directory with a build file), `language`, `kind`, `prefix(path, depth=D)` and
+  `ring(path, shards=N[, vnodes=V])` (a consistent-hash ring over file paths: growing it from N to
+  N + 1 shards moves about 1/(N + 1) of the files). Every project starts as `[project]` (one shard, as
+  before) and `pharos reshard` (below) sets its spec. A split project is one work unit on one writer
+  (one lease per shard, taken all or none, one index run publishing every shard) and its shards are
+  served like any other (`<project>~<key>=<value>` ids); the coordinator plans each query over the
+  project's shards. `cluster.sharding.default` and `cluster.sharding.projects.<name>` are validated at
+  startup (a non-default spec needs `cluster.backend: object-store`) but not applied yet.
+- Search key filters: `module` (the module's directory relative to the project root, the
+  nearest directory holding a build file — not the Maven artifactId; `_` for files outside any
+  module), `pathPrefix` (a directory relative to the project root, whole path segments),
+  `language` (the file extension, case-insensitive) and `kind` (`code` or `doc`), on `/api/search`
+  (`module`, `pathPrefix`, `language`, `kind`), `pharos search` (`--module`, `--path-prefix`,
+  `--language`, `--kind`) and MCP `search_code` (`module`, `path_prefix`, `language`, `kind`).
+  They only select documents: scores are those of the unfiltered query. On a cluster they also
+  prune the shards of split projects; `--trace` shows the routing notes, and a filter that matches
+  no shard of a project says so in the warnings. Readers advertise filter support in their
+  heartbeat; a coordinator never sends a filtered query to a reader without it.
+- `cluster.reader.shards` accepts shard ids of split projects and project wildcards (`lucene~*`:
+  every shard of the project).
+- Live resharding (object-store clusters): `pharos reshard <project> --spec "[project, ring(path,
+  shards=4)]"` requests a new spec version; `--status` shows the project's versions and the job's
+  progress, `--cancel` abandons it. The writer holding the project builds the new shards from its
+  index (a ring change re-indexes only the files that change shard; shards that neither gain nor
+  lose files keep their generations; embeddings come from the cache), readers keep serving the
+  current version and prepare the new one, and one catalog CAS flips routing once they have it
+  (or after `cluster.writer.reshardSyncTimeoutSeconds`, default 600). A query reads one version:
+  right after the flip it reads the previous one until its readers serve the new one. The retired
+  version is removed after `retentionMinutes`. An index run never adds shards: a new module under
+  `[project, module]` needs `pharos reshard` with the same spec.
+  A writer whose local index is behind the published run (it got the project back after another
+  writer published, e.g. a writer scale-down and up that kept its disk) catches up with a full
+  run before it splits the project, so the new version never lacks that writer's files.
+- Writer leases on a reshard: another writer taking any shard lease of the project (or the reshard
+  lease) aborts the running build at its next safe point and releases the reshard lease within one
+  renewal interval of the writer seeing it; a renewal that only fails to get an answer from a slow
+  bucket does not (as for index runs since 1.9.0), so the build is not thrown away and the reshard
+  stays with its writer.
+- A lease loss without a definite answer (a renewal's I/O error or timeout) is now resolved while
+  the run or reshard build goes on: every renewal round re-reads such a lease until the bucket
+  answers, reclaims it when it is untouched (still this writer's last write) and treats it as taken
+  otherwise. Before, nothing re-read it during a run, so only runs shorter than about one lease TTL
+  survived a bucket blip: a longer one lost its lease to expiry, kept working for nothing (holding
+  the reshard lease, which blocked the project's new owner), and failed at its publish. Now a long
+  run or build survives the blip and publishes, and one whose lease was taken meanwhile is aborted,
+  and its reshard lease released, within a renewal interval of the bucket answering.
+- Resharding is visible: `/cluster/status` gains `projects[]` (a split project is one entry over
+  its shards, with its staged and retired spec versions and the reshard's phase — requested,
+  building, pinned, flipped, abandoned — progress in shards and in files, and the reshard lease
+  holder, and `published`, `generation`, `docCount` and `pending` over its active shards only) and
+  `specs[]` (every spec version: active, staged, requested, retired, abandoned or
+  superseded); shards gain `project`, `role`, `staged` and `stagedGeneration` (fields are only
+  added). `/cluster/events` sends a `reshard` event at each phase and at each quarter of the
+  shards or files. The Cluster page shows a Resharding panel, one sharding table per spec version,
+  and marks staged shards in the layout. The `reshard` proposal targets a project and names the
+  exact command, e.g. `pharos reshard lucene --spec "[project, ring(path, shards=4)]"` (a ringed
+  project gets one more shard, or more for its size). MCP `list_projects` on a reader lists a split
+  project once, with its shards.
+
+### Added (Kubernetes operator v1)
+- `pharos-operator` (image `ghcr.io/<owner>/pharos-operator:<version>`): a namespaced operator for the
+  `PharosCluster` resource (`pharos.dev/v1alpha1`, CRD in `deploy/crd/`, least-privilege RBAC in
+  `deploy/rbac.yaml`, one replica). From one resource it runs the writers and readers as
+  StatefulSets with volume claims, the router as a Deployment with its Service, PodDisruptionBudgets,
+  NetworkPolicies, the rendered `config.json` (validated by `ClusterConfig` before it is applied) and
+  a generated cluster token; secrets reach the pods only as environment variables, never a ConfigMap,
+  the resource or its status. Examples: `deploy/examples/minio.yaml`, `deploy/examples/s3.yaml`.
+- Storage: `storage.minio` (the operator deploys MinIO and creates the bucket with `mc`) or `storage.s3`
+  (an existing S3-compatible bucket; its keys come from a Secret with `accessKey` and `secretKey`).
+  MinIO no longer publishes images, so the defaults are the community builds
+  `docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z` and `docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z`;
+  `MINIO_IMAGE` and `MC_IMAGE` on the operator Deployment select a mirror. Deleting a `PharosCluster`
+  keeps the bucket: the MinIO volume and its credentials Secret have no owner reference, so applying a
+  cluster of the same name again adopts them (indexes and keys intact); writer and reader claims also
+  outlive their StatefulSets. `kubectl delete pvc,secret -l pharos.dev/cluster=<name>` removes the data.
+- Projects: `spec.projects[]` (`name`, `git.url`, `git.ref`, `git.credentialsSecret` for an SSH key or
+  HTTPS credentials, `embed`) become Jobs: registration runs `pharos index --project <p> --source-git …
+  --ref …` without a path, a removed project runs `pharos remove-index --from-catalog <p>`; the work
+  queue does the indexing. `embeddings.model` picks the model as `pharos embeddings enable` does.
+- Autoscaling: `writers` and `readers` take `min`/`max` ranges, and `autoscaling` (`cooldownSeconds`,
+  `maxStepUp`, `maxStepDown`) applies pharos's own scaling proposals from `/cluster/status` within them.
+  `autoscaling.triggers` set the thresholds pharos raises the proposals at (readers: warm p95, QPS per
+  reader, load below a percentage; writers: backlog shards, oldest pending change, idle time), and
+  `autoscaling.schedule` raises the floors on a timetable (5-field cron with a timezone). The last
+  scale decision is kept on each StatefulSet, so cooldowns survive an operator restart; a writer is
+  removed only once its heartbeat and leases are gone.
+- Upgrades: changing `spec.version` first runs a pre-flight Job with the new image
+  (`pharos upgrade-indexes --check`; a shard the new release would refuse blocks the upgrade with the
+  `UpgradeBlocked` condition and nothing is applied), then rolls readers, writers and the router in that
+  order, each once the previous role is rolled out and heartbeating. A downgrade rolls writers first and
+  checks the bucket again before readers and the router move.
+- Status: `phase` and the conditions `StorageReady`, `ReadersReady`, `WritersReady`,
+  `ProjectsPublished` and `UpgradeBlocked`; per-project published state, generation and document count
+  (a split project once, over its active shards); the scaling proposals in force.
+- `pharosConfig`: extra `cluster.*` keys (for example `writer.reshardSyncTimeoutSeconds`,
+  `reader.previousGenerationGraceSeconds`) merged into the rendered config. `pharos reshard` runs from a
+  writer pod or a one-off Job.
+
+**Installing the operator** (the images are published for each release from 1.11.0 on; on ghcr.io they
+are private until the package is made public, otherwise add an image pull secret):
+
+```bash
+kubectl apply -f deploy/crd/ -f deploy/rbac.yaml        # CRD, namespace pharos, RBAC
+# deploy/operator.yaml: replace OWNER with the lowercased GitHub owner and VERSION with 1.11.0
+kubectl apply -f deploy/operator.yaml
+kubectl apply -f deploy/examples/minio.yaml             # or s3.yaml, after creating its Secret
+kubectl -n pharos get pharoscluster demo -w             # phase, conditions, projects
+```
+
+### Added (for the operator, also without it)
+- Scaling proposals for an operator: every scaling proposal on `/cluster/status`, in
+  `/cluster/events` and to the webhook carries a signed `delta` (`+N` start, `-N` stop, the N its
+  `action` names; none on `reshard` and `writer-disk`). New `cluster.status` keys for what were
+  constants: `removeReadersLoad` (0.2), `writers.backlogShards` (1),
+  `writers.oldestPendingSeconds` (300) and `writers.idleSeconds` (the remove-writers window;
+  unset, `windows.removeWritersSeconds` applies; both set to different values is a startup error).
+  README "Scaling proposals".
+- `cluster.tokenEnv`: read the cluster token from the named environment variable instead of
+  `cluster.token` (mutually exclusive with it; surrounding whitespace is stripped; an unset or
+  empty value, or one with inner whitespace or control characters, is a startup error).
+- `pharos config validate <file>` (and `./pharos config validate <file>`): runs a node's startup
+  validation on a config file; prints `ok` and exits 0, or prints the problem and exits 2.
+- Registering a cluster source without indexing: `pharos index --project <name> --source-git <url>
+  --ref <ref> [--no-embed]` with no path only records the source in the shard catalog (also
+  `./pharos index` without a path). It publishes nothing, so a work-queue writer runs it too and no
+  writer needs to be running; the work queue then indexes the project. `pharos remove-index
+  --from-catalog <name>` drops a project from the catalog in one write (a split project's every
+  shard, its staged and retired versions and an open reshard too): writers release it and readers stop
+  serving it, the last project too (readers keep their shards only while the catalog object is
+  missing, no longer when it lists no shard); its generations stay in the bucket, and registering
+  it again resumes from them. The
+  Kubernetes operator runs both as Jobs.
+- Per-project git credentials on writers: `cluster.writer.gitCredentials` maps a project to a
+  directory holding `ssh-privatekey` (optional `known_hosts`; without it host keys are learned on
+  first contact into `<workDir>/.ssh-known-hosts`) and/or `username` and `password` (HTTPS). Only
+  that project's git calls use them, through `GIT_SSH_COMMAND` and a credential helper that reads
+  the files when git asks; the config holds paths only.
+- Container image: arguments run one pharos command instead of the server (`docker run pharos:<v>
+  index --project p --source-git <url> --ref main`).
+- `pharos upgrade-indexes --check` changes nothing and exits 3 when this release would refuse an
+  index: with an object-store backend it reads every catalog shard's `LATEST` manifest from the
+  bucket (on any role, work-queue writers included), otherwise the local
+  registry's projects. The Kubernetes operator runs it with the new image before an upgrade.
+  A catalog entry this release cannot parse (a newer release's shard id) counts as refused, and
+  readers no longer treat such a catalog as authoritative: they keep serving what they have instead
+  of dropping every shard.
+
+### Changed (upgrade note)
+- `add-writers` is now raised when a shard's unpublished change is older than
+  `cluster.status.writers.oldestPendingSeconds` (default 300 s), no longer
+  `cluster.status.targets.backlog` (600 s), which now drives only the `shard-lagging` health
+  finding. The proposal's metric `targetBacklogSeconds` is replaced by `targetOldestPendingSeconds`
+  and `targetBacklogShards`. Set `writers.oldestPendingSeconds` to keep the old threshold.
+
+### Changed
+- Keyword search ranks equal scores in a stable, build-independent order (document id, type and line
+  range) instead of by Lucene doc id, on a single node too: it reads the whole group of equal scores
+  at the page's cut (up to 10 000 hits), so two builds of the same source (a re-index, a resharded
+  project) return the same page, scores included. Results with equal scores may come back in another
+  order than before, and where another tied document is kept at the cut the page's graph-boosted
+  scores can change slightly.
+- Multi-node: a query that loses a shard because a reader switched the shard's generation during
+  the query (right after a reshard flip or a publish) or analyses with other synonyms (a synonyms
+  publish not yet everywhere) is planned again once: the coordinator waits up to 2 s (at most half
+  of the query's remaining budget) for its view to move on and runs the query again within the
+  original timeout, at most 16 such re-plans at once. Those queries can take up to that much longer
+  (the trace notes "re-planned once"); a re-plan that fails returns the first, partial answer with
+  its warnings, as before.
+- Multi-node: a reader keeps a shard's previous generation open and answerable for a grace after it
+  activates a new one (`cluster.reader.previousGenerationGraceSeconds`; default max(30 s,
+  3 × 5 s + 2 × `heartbeatSeconds`), 0 turns it off), so a coordinator still routing the previous
+  generation (a reshard flip, a split project's next run, a reader lagging another) is answered
+  instead of losing the shard. Requests carry their generation; heartbeats add `retained`; the
+  bucket GC keeps a generation superseded less than the grace ago. A reader's disk and memory hold
+  up to two generations of a changed shard during the grace. After a flip the rewritten shards are
+  activated at once (the 15 s activation hold is gone), and the next run of the project clears the
+  flipped version's pins before its first commit. Likewise the synonyms a publish replaced stay
+  usable for the grace: a coordinator whose reader has not synced new synonyms yet analyses the
+  query with the previous ones, and a reader answers a coordinator still on them.
+- `?trace=true` search answers carry `searchMeta.rawScores`: each retrieval stage's raw
+  (pre-graph-boost) score per result id, and `searchMeta.statistics`: the shards, generations and
+  field totals a fanned-out query's statistics round read.
+- Multi-node: a shard's first request names the spec version of its project the coordinator
+  planned; a reader whose catalog has moved on answers with the generation that version names
+  (the previous one, retained) or refuses, so a coordinator whose catalog predates a reshard never
+  silently misses the files that moved. Every shard of a reshard's new version is at one new index
+  run number: a shard that neither gains nor loses files gets a metadata-only manifest at that run
+  (its Lucene files unchanged, nothing uploaded or downloaded again; readers hard-link them), so once
+  the next run clears the reshard's pins a query no longer leaves such a shard out, or reads the
+  rewritten shards' previous generations and misses a removed shard's files.
+- Multi-node: `pharos reshard` is refused while a live reader runs an older release without
+  sharding (a rolling upgrade in progress), and an open reshard holds before staging and before its
+  flip until every live reader is upgraded: an older coordinator would otherwise route only the
+  previous version and lose the project from its answers once retention dropped it (UPGRADING.md).
+- Multi-node: a replica's generation mismatch no longer hides the first reader's "no vectors for
+  the model" answer (a vector or hybrid query right after a flip left every shard of a project
+  without vectors out).
+
+### Fixed
+- Multi-node: a reader frees the generations it prepared for a reshard that was cancelled or rebuilt
+  within one sync pass (their dirs are deleted unless active or retained for the grace, and
+  heartbeats stop reporting them); before, they stayed on disk until the shard's next activation.
+- A reshard rewrites each affected shard whole: the moved files' documents are expunged (their
+  deletes merged away) before the commit, so BM25 statistics count every document once. Those
+  shards, HNSW vector graphs included, get new segment files, are re-uploaded in full and
+  re-downloaded in full by readers. The expunge can be aborted (a graceful stop, a lost lease) and
+  rolls back; the disk guard admits a reshard build only when about twice the project's Lucene
+  files fit (old and new segments coexist until the commit).
+
+### Build
+- Multi-module Maven build: the root `pom.xml` is now the parent of `app` (pharos itself, sources
+  still in `src/`), `pharos-api` (`ClusterConfig` and the `/cluster/status` records, Jackson only) and
+  `operator`. `mvn clean package` at the root still produces `target/pharos-<version>.jar`; a release
+  bumps every pom (`mvn versions:set`).
+- Container images: `docker/pharos/Dockerfile` (the image the operator deploys: Temurin 25 JRE, the
+  fat jar, python3 with `python-hcl2`, node, git; uid 10001; arguments run one pharos command) and
+  `docker/operator/Dockerfile`. A release tag now also pushes `ghcr.io/<owner>/pharos:<version>` and
+  `ghcr.io/<owner>/pharos-operator:<version>`.
+
+### Maintainers
+- The Phase 6 gate (`scripts/cluster-gate-phase6.sh`) gains main's gate settings: `GATE_KEYWORD_ONLY=1`
+  (no embedding model on any node, pharos indexed `--no-embed`, only the keyword pipeline compared; a
+  `GATE` dir set up in the other mode is refused), `GATE_ROUTER_PORT`, `GATE_R1_PORT`..`GATE_R3_PORT`,
+  `GATE_W1_PORT`, `GATE_W2_PORT`, `GATE_PORT_PROBE_TIMEOUT`, a header showing how to run it under
+  `scripts/gate-watchdog.sh`, and the jar picked by version (`sort -V`). The defaults are unchanged.
+- `scripts/operator-e2e.sh` runs the operator's minikube end-to-end test (its own `pharos-e2e`
+  profile with calico; images built inside minikube, no registry).
+
 ## [1.10.0] - 2026-11-25
 
 **Index format:** 1 (unchanged)

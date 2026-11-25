@@ -54,7 +54,7 @@ public class MineCommand implements Callable<Integer> {
             System.err.println("Run 'pharos index <path>' first.");
             return 1;
         }
-        IndexReader reader = luceneIndexer.openReader(project);
+        IndexReader reader = luceneIndexer.openMultiReader(java.util.List.of(project));
         if (write) {
             Path synonymFile = config.getSynonymsFile();
             int added = new ConceptMiner().appendNewSynonyms(reader, synonymFile, project, sources);

@@ -131,6 +131,16 @@ public final class PeerCatalog implements ShardCatalog {
         }
     }
 
+    /**
+     * The {@code [project]} identity of {@link #shards}: peer mode serves only the default spec (P6-R9),
+     * so every listed shard is its own project. Explicit, so the mapping the coordinator and the syncer
+     * read here is never mistaken for a missing override.
+     */
+    @Override
+    public com.pharos.cluster.sharding.ProjectShards projectShards() throws IOException {
+        return com.pharos.cluster.sharding.ProjectShards.identity(shards());
+    }
+
     /** What {@link #shards} lists, without refreshing (sorted): owned, orphaned and held shards. */
     public List<ShardId> knownShards() {
         Set<ShardId> h = heldNow();

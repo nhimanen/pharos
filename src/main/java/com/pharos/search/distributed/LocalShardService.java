@@ -75,13 +75,27 @@ public final class LocalShardService implements ShardSearchService {
     /**
      * One shard pinned: the generation and the reader of that generation, holding a reference on the
      * reader until {@link #close} (a swap retires the reader; it is closed only once released).
+     * {@code project} is the project whose documents the generation holds (their ids are
+     * {@code <project>:<fqn>}), {@code projectGeneration} the index run of a split project's shard
+     * (null otherwise); both from the generation's manifest.
      */
-    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) implements AutoCloseable {
+    public record Pin(ShardId shard, long generation, IndexReader reader, Path shardDir, String project,
+                      Long projectGeneration) implements AutoCloseable {
+        public Pin(ShardId shard, long generation, IndexReader reader, Path shardDir) {
+            this(shard, generation, reader, shardDir, shard.value(), null);
+        }
+
         @Override
         public void close() throws IOException {
             reader.decRef();
         }
     }
+
+    /** What a generation dir's manifest says about its documents; see {@link Pin}. */
+    private record GenInfo(String project, Long projectGeneration) {}
+
+    /** Per generation dir (immutable once materialised): read once, its manifest is small. */
+    private final Map<Path, GenInfo> genInfo = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** What a node knows of the search embedding model it serves vectors for. */
     public record Model(String modelId, int dims, String fingerprint) {}
@@ -131,15 +145,137 @@ public final class LocalShardService implements ShardSearchService {
         return OptionalLong.of(generationOf(lucene.getProjectIndexDir(shard.value())));
     }
 
+    /**
+     * Ruling P6-R19: true when this node answers {@code shard} at {@code generation}: the one it serves, or
+     * the previous one it still retains after activating a newer one.
+     */
+    @Override
+    public boolean servesGeneration(ShardId shard, long generation) {
+        if (!serves.test(shard.value())) return false;
+        if (generationOf(lucene.getProjectIndexDir(shard.value())) == generation) return true;
+        return retainedDir(shard, generation).isPresent();
+    }
+
+    private java.util.Optional<Path> retainedDir(ShardId shard, long generation) {
+        return lucene.localCache().retainedDir(shard.value(), generation);
+    }
+
     /** Pins the shard's current reader and its generation, holding a reference: close the pin. */
     public Pin pin(ShardId shard) throws IOException {
         for (int attempt = 0; attempt < 3; attempt++) {
             LuceneIndexer.PinnedReader p = lucene.openPinnedReader(shard.value());
             if (!p.reader().tryIncRef()) continue; // closed between the open and here: take the new one
-            Path shardDir = p.luceneDir().getParent();
-            return new Pin(shard, generationOf(shardDir), p.reader(), shardDir);
+            return pinOf(shard, p);
         }
         throw new IOException("the reader of shard " + shard + " kept closing while being pinned");
+    }
+
+    private Pin pinOf(ShardId shard, LuceneIndexer.PinnedReader p) {
+        Path shardDir = p.luceneDir().getParent();
+        GenInfo info = genInfo(shard, shardDir);
+        return new Pin(shard, generationOf(shardDir), p.reader(), shardDir, info.project(), info.projectGeneration());
+    }
+
+    /**
+     * Pins the shard at {@code generation} (null: the current one): the current reader when it is that
+     * generation, else the retained previous generation's (P6-R19), else the current one (whose generation
+     * the caller then finds to differ, and refuses).
+     */
+    public Pin pin(ShardId shard, Long generation) throws IOException {
+        Pin current = pin(shard);
+        if (generation == null || current.generation() == generation) return current;
+        Pin previous = pinPrevious(shard, generation);
+        if (previous == null) return current;
+        current.close();
+        return previous;
+    }
+
+    /**
+     * Pins the shard at the generation of index run {@code run} of its split project ({@code projectGeneration}):
+     * the current one when it is at that run, else the retained previous one when that is (P6-R19), else the
+     * current one.
+     */
+    public Pin pinRun(ShardId shard, long run) throws IOException {
+        Pin current = pin(shard);
+        if (current.projectGeneration() != null && current.projectGeneration() == run) return current;
+        var r = lucene.localCache() instanceof com.pharos.cluster.ReaderLocalCache rc ? rc.retained(shard.value())
+                : java.util.Optional.<com.pharos.cluster.ReaderLocalCache.Retained>empty();
+        if (r.isEmpty()) return current;
+        GenInfo info = genInfo(shard, r.get().dir());
+        if (info.projectGeneration() == null || info.projectGeneration() != run) return current;
+        Pin previous = pinPrevious(shard, r.get().generation());
+        if (previous == null) return current;
+        current.close();
+        return previous;
+    }
+
+    /** Ruling P6-R21: which generation an older spec version names for a shard (see {@link #pinVersion}). */
+    private volatile java.util.function.BiFunction<ShardId, Integer, java.util.Optional<Long>> versions =
+            (shard, v) -> java.util.Optional.empty();
+
+    /** Sets how a shard's generation of a spec version that is not its project's active one is found. */
+    public void setVersions(java.util.function.BiFunction<ShardId, Integer, java.util.Optional<Long>> versions) {
+        this.versions = java.util.Objects.requireNonNull(versions, "versions");
+    }
+
+    /**
+     * Ruling P6-R21: pins the shard as spec version {@code specVersion} of its project has it (the version a
+     * coordinator planned the query with). When this node's catalog has another active version and that one
+     * names a generation of the shard (the version before a flip), that generation is pinned (the retained
+     * previous one); if it is not answerable any more, {@link GenerationUnavailableException}. Otherwise the
+     * current generation.
+     */
+    public Pin pinVersion(ShardId shard, Integer specVersion) throws IOException {
+        if (specVersion == null) return pin(shard);
+        java.util.Optional<Long> g = versions.apply(shard, specVersion);
+        if (g.isEmpty()) return pin(shard);
+        Pin p = pin(shard, g.get());
+        if (p.generation() != g.get()) {
+            long served = p.generation();
+            p.close();
+            throw new com.pharos.cluster.internal.GenerationUnavailableException("shard " + shard + ": spec version "
+                    + specVersion + " of its project is generation " + g.get() + ", which this reader no longer"
+                    + " answers (it serves " + served + ")", served);
+        }
+        return p;
+    }
+
+    /** The retained previous generation {@code generation} pinned, or null when not answerable. */
+    private Pin pinPrevious(ShardId shard, long generation) throws IOException {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            var p = lucene.openPinnedPreviousReader(shard.value(), generation);
+            if (p.isEmpty()) return null;
+            if (!p.get().reader().tryIncRef()) continue;
+            return pinOf(shard, p.get());
+        }
+        return null;
+    }
+
+    /**
+     * The project and index run of a generation dir, from its {@code manifest.json} (a reader's
+     * generation); a dir without one (a single node's project dir) holds the documents of the project
+     * named like the shard. The project is the writer's: the one in the documents' ids.
+     */
+    private GenInfo genInfo(ShardId shard, Path shardDir) {
+        if (shardDir == null) return new GenInfo(shard.value(), null);
+        GenInfo cached = genInfo.get(shardDir);
+        if (cached != null) return cached;
+        GenInfo info = new GenInfo(shard.value(), null);
+        Path manifest = shardDir.resolve("manifest.json");
+        if (java.nio.file.Files.isRegularFile(manifest)) {
+            try {
+                com.pharos.cluster.objectstore.ShardManifest m = com.pharos.cluster.objectstore.ShardManifest.read(
+                        java.nio.file.Files.readAllBytes(manifest));
+                String project = m.projectMeta() != null && m.projectMeta().getName() != null
+                        ? m.projectMeta().getName() : shard.value();
+                info = new GenInfo(project, m.projectGeneration());
+            } catch (IOException | RuntimeException e) {
+                return info; // not cached: read again next time
+            }
+        }
+        if (genInfo.size() > 4096) genInfo.clear(); // generation dirs come and go; never grows without bound
+        genInfo.put(shardDir, info);
+        return info;
     }
 
     /**
@@ -181,10 +317,20 @@ public final class LocalShardService implements ShardSearchService {
     }
 
     private void checkSynonyms(String hash) {
-        if (hash != null && !hash.equals(synonymsHash())) {
-            throw new SynonymsMismatchException("synonyms hash " + hash + " differs from this reader's "
-                    + synonymsHash());
+        keywordFor(hash);
+    }
+
+    /**
+     * The keyword strategy analysing with the synonyms of {@code hash}: this node's, or the previous ones it
+     * still keeps (P6-R19); null hash: this node's. Another hash is refused with this node's own.
+     */
+    public KeywordSearchStrategy keywordFor(String hash) {
+        KeywordSearchStrategy kw = keyword.forSynonyms(hash);
+        if (kw == null) {
+            String own = synonymsHash();
+            throw new SynonymsMismatchException("synonyms hash " + hash + " differs from this reader's " + own, own);
         }
+        return kw;
     }
 
     private static boolean other(Long wanted, Pin pin) {
@@ -201,8 +347,10 @@ public final class LocalShardService implements ShardSearchService {
             for (TermStatsRequest.Term t : request.terms()) terms.add(new Term(t.field(), t.text()));
         }
         List<String> fields = request.fields() == null ? List.of() : request.fields();
-        try (Pin pin = pin(new ShardId(request.shard()))) {
-            return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms));
+        ShardId shard = new ShardId(request.shard());
+        try (Pin pin = request.generation() != null ? pin(shard, request.generation())
+                : request.run() != null ? pinRun(shard, request.run()) : pinVersion(shard, request.specVersion())) {
+            return new TermStatsResponse(pin.generation(), termStats(pin, fields, terms), pin.projectGeneration());
         }
     }
 
@@ -219,10 +367,10 @@ public final class LocalShardService implements ShardSearchService {
         if (request.queryVector() != null && !"keyword".equals(request.retriever())) {
             checkModel(new ShardId(request.shard()), request.modelId(), request.dims(), request.modelFingerprint());
         }
-        try (Pin pin = pin(new ShardId(request.shard()))) {
+        try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new ShardSearchResponse(pin.generation(), 1, List.of());
             return search(pin, request.retriever(), request.request(), request.queryVector(), request.globalStats(),
-                    request.selected(), request.selectedKnn(), request.chunkVectors());
+                    request.selected(), request.selectedKnn(), request.chunkVectors(), request.synonymsHash());
         }
     }
 
@@ -239,6 +387,18 @@ public final class LocalShardService implements ShardSearchService {
     public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
                                       GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
                                       boolean chunkVectors) throws IOException {
+        return search(pin, retriever, req, queryVector, stats, selected, selectedKnn, chunkVectors, null);
+    }
+
+    /** As above, analysing with the synonyms of {@code synonymsHash} (null: this node's; see {@link #keywordFor}). */
+    public ShardSearchResponse search(Pin pin, String retriever, SearchRequest req, float[] queryVector,
+                                      GlobalStats stats, List<ScoredId> selected, List<ScoredId> selectedKnn,
+                                      boolean chunkVectors, String synonymsHash) throws IOException {
+        KeywordSearchStrategy keyword = keywordFor(synonymsHash);
+        UnifiedRetrievalStage unified = this.unified.withKeyword(keyword);
+        if (req != null && req.hasKeyFilter()) {
+            com.pharos.search.KeyFiltersUnsupportedException.check(pin.project(), pin.shardDir());
+        }
         IndexSearcher searcher = stats == null ? new IndexSearcher(pin.reader())
                 : new GlobalStatsSearcher(pin.reader(), stats);
         List<RawCandidate> raw;
@@ -318,7 +478,7 @@ public final class LocalShardService implements ShardSearchService {
 
     @Override
     public SnippetsResponse snippets(SnippetsRequest request) throws IOException {
-        try (Pin pin = pin(new ShardId(request.shard()))) {
+        try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new SnippetsResponse(pin.generation(), Map.of());
             return new SnippetsResponse(pin.generation(),
                     snippets(pin, request.ids(), request.query(), request.queryVector()));
@@ -351,7 +511,7 @@ public final class LocalShardService implements ShardSearchService {
 
     @Override
     public CalleesResponse callees(CalleesRequest request) throws IOException {
-        try (Pin pin = pin(new ShardId(request.shard()))) {
+        try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new CalleesResponse(pin.generation(), Map.of());
             return new CalleesResponse(pin.generation(), callees(pin, request.fqns()));
         }
@@ -364,7 +524,7 @@ public final class LocalShardService implements ShardSearchService {
         IndexSearcher searcher = new IndexSearcher(pin.reader());
         StoredFields stored = searcher.storedFields();
         for (String fqn : fqns) {
-            TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_ID, pin.shard().value() + ":" + fqn)), 1);
+            TopDocs hits = searcher.search(new TermQuery(new Term(DocumentMapper.F_ID, pin.project() + ":" + fqn)), 1);
             if (hits.scoreDocs.length == 0) continue;
             Document doc = stored.document(hits.scoreDocs[0].doc);
             out.put(fqn, List.of(doc.getValues(DocumentMapper.F_CALLED_METHODS)));
@@ -376,7 +536,7 @@ public final class LocalShardService implements ShardSearchService {
 
     @Override
     public GraphResponse graph(GraphRequest request) throws IOException {
-        try (Pin pin = pin(new ShardId(request.shard()))) {
+        try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new GraphResponse(pin.generation(), null, null, null);
             return graph(pin, request);
         }
@@ -399,7 +559,7 @@ public final class LocalShardService implements ShardSearchService {
                         KeywordSearchStrategy.rawCandidates(searcher, hits, "graph"));
             }
             case "neighbors", "usages", "path" -> {
-                try (GraphView g = GraphViews.open(pin.shard().value(), pin.shardDir())) {
+                try (GraphView g = GraphViews.open(pin.project(), pin.shardDir())) {
                     yield new GraphResponse(pin.generation(), graphLists(g, op, fqns, request), null, null);
                 } catch (RuntimeException e) {
                     throw e;
@@ -452,11 +612,11 @@ public final class LocalShardService implements ShardSearchService {
     /** The documents of bare {@code fqns} on the pinned shard, keyed by fqn (score 1, type "exact"). */
     public Map<String, SearchResult> docsByFqn(Pin pin, List<String> fqns) throws IOException {
         List<String> ids = new ArrayList<>(fqns.size());
-        for (String fqn : fqns) ids.add(pin.shard().value() + ":" + fqn);
+        for (String fqn : fqns) ids.add(pin.project() + ":" + fqn);
         Map<String, SearchResult> byId = docsById(pin, ids);
         Map<String, SearchResult> out = new LinkedHashMap<>();
         for (String fqn : fqns) {
-            SearchResult r = byId.get(pin.shard().value() + ":" + fqn);
+            SearchResult r = byId.get(pin.project() + ":" + fqn);
             if (r != null) out.put(fqn, r);
         }
         return out;

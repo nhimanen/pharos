@@ -46,6 +46,11 @@ public class Main {
 
     static void main(String[] args) {
         optOutOfDjlTracking();
+        if (ConfigCommand.handles(args)) {
+            // `config validate <file>` checks a file: it must work when the node's own config is
+            // broken, and it needs no backend, index or model
+            System.exit(ConfigCommand.execute(args));
+        }
         IndexConfig config;
         try {
             config = IndexConfig.load();
@@ -227,7 +232,7 @@ public class Main {
                         moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, config.getCluster().getRole()),
                         searchEngine, clusterRuntime);
             if (cls == RemoveIndexCommand.class)
-                return (K) new RemoveIndexCommand(registry, indexManager, config);
+                return (K) new RemoveIndexCommand(registry, indexManager, config, clusterRuntime);
             if (cls == BackfillEmbeddingCacheCommand.class)
                 return (K) new BackfillEmbeddingCacheCommand(
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry), config);
@@ -235,7 +240,7 @@ public class Main {
                 return (K) new IndexStatusCommand(registry, config.getCluster().getRole(),
                         !config.getEmbeddingProviders().isEmpty(), clusterRuntime::readerCacheStats);
             if (cls == UpgradeIndexesCommand.class)
-                return (K) new UpgradeIndexesCommand(indexManager, registry, config);
+                return (K) new UpgradeIndexesCommand(indexManager, registry, config, clusterRuntime);
             if (cls == EmbeddingsCommand.class)
                 return (K) new EmbeddingsCommand(IndexConfig.DEFAULT_BASE, registry);
             if (cls == MineCommand.class)
@@ -248,6 +253,12 @@ public class Main {
                 return (K) new PublishCommand(config, registry, clusterRuntime);
             if (cls == RouterCommand.class)
                 return (K) new RouterCommand(config);
+            if (cls == ReshardCommand.class)
+                return (K) new ReshardCommand(config);
+            if (cls == ConfigCommand.class)
+                return (K) new ConfigCommand(); // no dependencies: Main runs `config` before wiring any
+            if (cls == ConfigCommand.Validate.class)
+                return (K) new ConfigCommand.Validate();
             // Fall back to default picocli factory for all other classes
             return CommandLine.defaultFactory().create(cls);
         }

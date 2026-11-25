@@ -31,8 +31,15 @@ public final class CandidateShaper {
      * @param type   the {@link SearchResult#searchType()} of the shaped results
      * @param intent the detected query intent (e.g. {@code "INTERFACE"}); null disables classType boosting
      */
+    /** The trace that records the raw scores shaped on this thread (P6-R20); set around a search. */
+    public static final ThreadLocal<com.pharos.search.SearchTrace> RAW_SCORES = new ThreadLocal<>();
+
     public static List<SearchResult> shape(List<RawCandidate> raw, String type, String intent) {
         if (raw.isEmpty()) return List.of();
+        com.pharos.search.SearchTrace sink = RAW_SCORES.get();
+        if (sink != null) {
+            for (RawCandidate c : raw) if (c.result() != null) sink.rawScore(type, c.result().id(), c.rawScore());
+        }
 
         int maxInDegree = 1; // avoid division by zero
         for (RawCandidate c : raw) {

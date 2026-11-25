@@ -82,4 +82,29 @@ public interface WriterStateStore {
      *                     than paying for a full re-embed)
      */
     Optional<Restored> restore(ShardId shard, Path indexDir) throws IOException;
+
+    // ---- split projects (ruling P6-R2) ------------------------------------------------------
+
+    /**
+     * Uploads the writer state of a split project's index dir once, as the state of its index run
+     * {@code projectGeneration} ({@link com.pharos.cluster.objectstore.ShardManifest#projectGeneration}),
+     * under {@code projects/<project>/writer-state/}. The default keeps nothing.
+     *
+     * @throws IOException when the backup could not be written (the publish itself has succeeded)
+     */
+    default void backupProject(String project, long projectGeneration, Path indexDir) throws IOException {}
+
+    /**
+     * {@link #restore} for a split project: replaces {@code indexDir} with every shard's {@code LATEST}
+     * generation (each shard's Lucene files in its local shard dir), the project's call graph and refs,
+     * and the newest project writer-state backup at or below the restored run. In the result,
+     * {@code generation} is the newest {@code projectGeneration} of the restored shards; when the shards
+     * are not all at that run (a publish that stopped between two shards), {@code stateGeneration} is
+     * below it, so the caller runs a full index. Same failure rules and precondition as {@link #restore};
+     * the default restores nothing.
+     */
+    default Optional<Restored> restoreProject(com.pharos.cluster.sharding.ShardPlan plan, Path indexDir)
+            throws IOException {
+        return Optional.empty();
+    }
 }

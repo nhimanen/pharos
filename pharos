@@ -726,6 +726,11 @@ def cmd_search(args):
         params["snippetLines"] = args.snippet_lines
     if getattr(args, "trace", False):
         params["trace"] = "true"
+    # key filters (same values as the server's: module dir, whole-directory path prefix, extension, code|doc)
+    for flag, param in (("module", "module"), ("path_prefix", "pathPrefix"),
+                        ("language", "language"), ("kind", "kind")):
+        if getattr(args, flag, None):
+            params[param] = getattr(args, flag)
 
     raw = _api_get("/api/search", params)
 
@@ -762,6 +767,8 @@ def cmd_search(args):
         print(f"\n[trace] type={type_info}  total={total_ms}ms")
         for stage in meta.get("stages", []):
             print(f"[trace]   {stage['name']:<28} {stage['ms']}ms")
+        for note in meta.get("routing", []):
+            print(f"[trace]   routing: {note}")
 
 
 def cmd_pipelines(args):
@@ -927,6 +934,16 @@ def cmd_index(args):
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
 
+    if not args.path:
+        # No path: only register --project's source in the cluster catalog (the jar checks the flags)
+        if not (args.source_git or args.source_path) or not args.project:
+            die("give a path to index, or --source-git URL --ref REF (or --source-path DIR) with --project NAME"
+                " to register a cluster source only")
+        cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "index", "--project", args.project] + _source_flags(args)
+        if args.no_embed:
+            cmd.append("--no-embed")
+        sys.exit(subprocess.run(cmd).returncode)
+
     # Parse path:name specs up front so we can validate the --project interaction
     specs = [_parse_path_spec(p) for p in args.path]
     any_inline_name = any(name is not None for _, name in specs)
@@ -1028,6 +1045,38 @@ def cmd_router(args):
         sys.exit(subprocess.run(cmd).returncode)
     except KeyboardInterrupt:
         sys.exit(130)
+
+
+def cmd_reshard(args):
+    """Request, follow or cancel a live reshard of a cluster project (`pharos reshard`).
+
+    Spawns its own JVM like publish; it needs the cluster config (cluster.backend "object-store").
+    Exit codes: 0 done, 1 refused (another reshard open, unknown project, nothing to cancel),
+    2 bad usage or config, 3 the bucket failed.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "reshard", args.project]
+    if args.spec is not None:
+        cmd += ["--spec", args.spec]
+    if args.status:
+        cmd.append("--status")
+    if args.cancel:
+        cmd.append("--cancel")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+def cmd_config(args):
+    """`pharos config validate <file>`: check a config.json as a node would at startup.
+
+    Runs the jar locally (a one-shot JVM, no daemon): it reads only the given file, so it works
+    when ~/.pharos/config.json itself is broken. Exit 0 and "ok", or exit 2 with the problem.
+    """
+    if not JAR.exists():
+        die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
+    cmd = ["java", "-Xmx256m", "-jar", str(JAR), "config", args.config_action,
+           str(Path(args.file).expanduser().resolve())]
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_backfill_embedding_cache(args):
@@ -1133,7 +1182,8 @@ def cmd_index_status(args):
 def cmd_upgrade_indexes(args):
     """Re-index projects whose index format is not current.
 
-    Exit codes: 0 done/nothing to do, 1 skipped or failed, 2 needs --yes, 5 reader node.
+    Exit codes: 0 done/nothing to do, 1 skipped or failed, 2 needs --yes,
+    3 (--check) an index this pharos would refuse, 5 reader node.
 
     Spawns its own JVM (holds the Lucene write locks) and inherits stdin/stdout so the
     confirmation prompt works.
@@ -1147,6 +1197,8 @@ def cmd_upgrade_indexes(args):
         cmd.append("--yes")
     if args.no_embed:
         cmd.append("--no-embed")
+    if args.check:
+        cmd.append("--check")
     cmd.extend(args.projects)
     sys.exit(subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr).returncode)
 
@@ -1398,6 +1450,8 @@ COMMANDS
   backfill-embedding-cache  Seed the embedding cache from an existing Lucene index (no ONNX)
   publish                   Publish a project's local index to the cluster object store (writer nodes)
   router                    Route queries over the cluster's healthy readers (runs in the foreground)
+  reshard                   Split a cluster project by a new shard spec, live (--spec, --status, --cancel)
+  config validate <file>    Check a config.json as a node would at startup (exit 0 "ok", or 2)
   embeddings                Enable/disable semantic search (enable|disable|status)
   invalidate-embeddings     Mark file embeddings as stale so the next incremental index re-embeds them
   daemon                    Manage the background daemon (start|stop|restart|status|logs)
@@ -1468,11 +1522,14 @@ EXAMPLES
   pharos index ~/git/yeast:y ~/git/reserve:r       # per-path name overrides
   pharos index /path/to/myproject --full           # force full re-index
   pharos index /path/to/myproject --force          # delete index then re-index
+  pharos index --project lucene --source-git https://github.com/apache/lucene.git --ref main
+                                                   # cluster: register the source only (no path)
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_index.add_argument("path", nargs="+",
-                         help="Path(s) — optionally 'path:name' to override the project name")
+    p_index.add_argument("path", nargs="*",
+                         help="Path(s) — optionally 'path:name' to override the project name. Omit with"
+                              " --source-git/--source-path and --project to only register a cluster source")
     p_index.add_argument("--project", "-p", metavar="NAME",
                          help="Project name (default: directory name)")
     p_index.add_argument("--full", action="store_true",
@@ -1536,6 +1593,15 @@ EXIT CODES
                           help="Print pipeline trace (resolved type, stage timings) after results")
     p_search.add_argument("--snippet-lines", dest="snippet_lines", type=int, default=15, metavar="N",
                           help="Lines of source per snippet centred on best keyword/vector match (default: 15)")
+    p_search.add_argument("--module", metavar="DIR",
+                          help="Filter by build module: the module's directory relative to the project root "
+                               "(e.g. core, services/api; the nearest directory with a build file), not the "
+                               "Maven artifactId. '_' selects files outside any module")
+    p_search.add_argument("--path-prefix", dest="path_prefix", metavar="DIR",
+                          help="Filter by a directory relative to the project root (whole path segments)")
+    p_search.add_argument("--language", metavar="EXT",
+                          help="Filter by file extension, case-insensitive (java, py, md, ...)")
+    p_search.add_argument("--kind", choices=["code", "doc"], help="Filter by file kind")
     p_search.set_defaults(func=cmd_search)
 
     # method
@@ -1804,6 +1870,8 @@ EXIT CODES
   0 nothing to upgrade, all upgraded, or aborted at the prompt
   1 a project was skipped (unknown, missing index, root gone) or failed
   2 confirmation needed but no terminal: re-run with --yes
+  3 --check: an index (cluster: a shard in the bucket) has a format this
+    pharos refuses (older than N-1, or newer)
   5 refused on a reader node: readers receive upgrades by syncing;
     upgrade (and re-publish) on the writer
 """,
@@ -1813,6 +1881,9 @@ EXIT CODES
     p_upgrade.add_argument("--dry-run", action="store_true", help="Print the plan and stop")
     p_upgrade.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
     p_upgrade.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
+    p_upgrade.add_argument("--check", action="store_true",
+                           help="Change nothing: exit 3 when this pharos would refuse an index "
+                                "(cluster: any shard in the bucket)")
     p_upgrade.set_defaults(func=cmd_upgrade_indexes)
 
     # publish
@@ -1961,6 +2032,58 @@ EXAMPLES
     )
     p_router.add_argument("--port", type=int, default=7080, help="HTTP port to listen on (default: 7080)")
     p_router.set_defaults(func=cmd_router)
+
+    # reshard
+    p_reshard = sub.add_parser(
+        "reshard",
+        help="Split a cluster project by a new shard spec, live (object-store clusters)",
+        description="""\
+Request a live reshard of a cluster project: a new spec version in the catalog. The writer
+holding the project builds the new shards from its index (only files that change shard are
+re-indexed, embeddings come from the cache), readers keep serving the current version, and
+one catalog CAS flips routing once the readers have the new shards. The retired version is
+removed after cluster.retentionMinutes. Object-store clusters only.
+
+EXIT CODES
+  0 done, 1 refused (another reshard of the project is open, unknown project, nothing to
+  cancel), 2 bad usage or config, 3 the bucket failed
+
+EXAMPLES
+  pharos reshard lucene --spec "[project, ring(path, shards=4)]"
+  pharos reshard lucene --status
+  pharos reshard lucene --cancel
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_reshard.add_argument("project", help="Project name (as in the cluster catalog)")
+    g_reshard = p_reshard.add_mutually_exclusive_group(required=True)
+    g_reshard.add_argument("--spec", help='The new shard spec, e.g. "[project, ring(path, shards=4)]"')
+    g_reshard.add_argument("--status", action="store_true", help="Show the spec versions and the reshard's progress")
+    g_reshard.add_argument("--cancel", action="store_true", help="Abandon the open reshard")
+    p_reshard.set_defaults(func=cmd_reshard)
+
+    # config
+    p_config = sub.add_parser(
+        "config",
+        help="Check a config.json file (config validate <file>)",
+        description="""\
+Commands on a pharos config.json file. They run the jar locally (no daemon) on the given
+file only, so they work even when ~/.pharos/config.json is broken.
+
+  validate <file>   Read the file and run the validation a node runs at startup
+                    (cluster.tokenEnv is read from this shell's environment).
+                    Prints "ok" and exits 0, or prints the problem and exits 2.
+
+EXAMPLES
+  pharos config validate ~/.pharos/config.json
+  pharos config validate /etc/pharos/reader.json
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_config.add_argument("config_action", choices=["validate"], metavar="validate",
+                          help="Action to perform (validate)")
+    p_config.add_argument("file", help="The config.json file to check")
+    p_config.set_defaults(func=cmd_config)
 
     # daemon
     p_daemon = sub.add_parser(

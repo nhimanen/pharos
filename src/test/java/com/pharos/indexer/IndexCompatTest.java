@@ -127,6 +127,32 @@ class IndexCompatTest {
         }
     }
 
+    /**
+     * P6-R12: key filters need the key fields of format 2. A readable older fixture still answers
+     * unfiltered queries, and refuses a filtered one with the fix; the current fixture filters.
+     */
+    @Test
+    void keyFiltersNeedTheKeyFieldsFormat() throws Exception {
+        TreeMap<Integer, Path> all = fixtures();
+        SearchEngine current = engineOver(all.get(IndexVersions.INDEX_FORMAT), "kf-current");
+        assertThat(current.searchWithTrace(keyword("GreetingService").withKeyFilter(
+                new com.pharos.cluster.routing.ShardFilter(null, null, "java", null)), false).results())
+                .extracting(SearchResult::id).contains(CLASS_ID);
+        assertThat(current.searchWithTrace(keyword("GreetingService").withKeyFilter(
+                new com.pharos.cluster.routing.ShardFilter(null, null, "py", null)), false).results()).isEmpty();
+
+        int older = IndexFormat.MIN_READABLE_FORMAT;
+        Assumptions.assumeTrue(older < com.pharos.search.KeyFiltersUnsupportedException.KEY_FIELDS_FORMAT);
+        SearchEngine old = engineOver(all.get(older), "kf-old");
+        assertThat(old.searchWithTrace(keyword("GreetingService"), false).results())
+                .as("unfiltered search is unchanged").extracting(SearchResult::id).contains(CLASS_ID);
+        assertThatThrownBy(() -> old.searchWithTrace(keyword("GreetingService").withKeyFilter(
+                new com.pharos.cluster.routing.ShardFilter(null, null, "java", null)), false))
+                .isInstanceOf(com.pharos.search.KeyFiltersUnsupportedException.class)
+                .hasMessageContaining("index format " + older)
+                .hasMessageContaining("pharos index --full " + PROJECT);
+    }
+
     @Test
     void refusesFixturesBelowMinimum() throws Exception {
         var below = fixtures().headMap(IndexFormat.MIN_READABLE_FORMAT, false);

@@ -103,6 +103,39 @@ class GenerationGcTest {
 
     // --- brief tests ----------------------------------------------------------------------------
 
+    /**
+     * Ruling P6-R19: a reader that skipped generation 2 (it went from 1 straight to 3) still answers 1 for its
+     * grace, a lazy one from these objects. GC keeps a generation superseded less than the grace ago even
+     * beyond {@code keepGenerations} and with no minimum age, never deletes it before, and does once the grace
+     * is over.
+     */
+    @Test
+    void aGenerationSupersededWithinTheGraceIsKeptThenCollected() throws Exception {
+        Duration grace = Duration.ofSeconds(30);
+        GenerationGc withGrace = new GenerationGc(store, layout, 2, Duration.ZERO, grace);
+        writeGeneration(1, T0.minus(Duration.ofHours(2)));
+        writeLatest(1, T0.minus(Duration.ofHours(2)));
+        writeGeneration(2, T0);
+        writeLatest(2, T0);
+        writeGeneration(3, T0.plusSeconds(5));
+        writeLatest(3, T0.plusSeconds(5));
+
+        for (int s = 5; s < 30; s += 10) {
+            withGrace.collect(SHARD, T0.plusSeconds(s));
+            assertGenerationIntact(1); // superseded by 2 at T0: within the grace
+        }
+        assertThat(new GenerationGc(store, layout, 2, Duration.ZERO).collect(SHARD, T0.plusSeconds(10)))
+                .as("the control without the grace deletes it at once").isPositive();
+        assertGenerationGone(1);
+
+        writeGeneration(1, T0.minus(Duration.ofHours(2)));
+        clock.now = T0.plusSeconds(31);
+        withGrace.collect(SHARD, T0.plusSeconds(31));
+        assertGenerationGone(1);
+        assertGenerationIntact(2);
+        assertGenerationIntact(3);
+    }
+
     @Test
     void keepsLastThreeAndYoung() throws Exception {
         generations(5, T0.minus(Duration.ofHours(2)));

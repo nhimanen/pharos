@@ -194,6 +194,52 @@ class ReplicaSyncerTest {
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
     }
 
+    /**
+     * Ruling P6-R19: after activating generation 2 the reader keeps generation 1 answerable for the grace
+     * (its directory and a reader on it; the pruning never deletes it meanwhile). A newer activation or the
+     * end of the grace releases it: the reader is retired and the directory becomes an old generation the
+     * pruning may delete.
+     */
+    @Test
+    void thePreviousGenerationIsAnsweredForTheGraceThenReleased() throws Exception {
+        long[] now = {1_000_000L};
+        cache.setClock(() -> now[0]);
+        cache.setPreviousGenerationGrace(Duration.ofSeconds(30));
+        publishFull();
+        syncer.syncOnce();
+        try (LuceneIndexer indexer = new LuceneIndexer(IndexConfig.defaults(), cache)) {
+            int before = indexer.openReader(PROJECT).numDocs();
+            publishIncremental("retainedOne");
+            syncer.syncOnce();
+            assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(2)));
+            assertThat(indexer.openReader(PROJECT).numDocs()).as("the new generation is served").isGreaterThan(before);
+            assertThat(cache.retainedDir(PROJECT, 1)).contains(genDir(1));
+            var previous = indexer.openPinnedPreviousReader(PROJECT, 1).orElseThrow();
+            assertThat(previous.reader().numDocs()).as("generation 1 still answers").isEqualTo(before);
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 7)).as("an unknown generation").isEmpty();
+
+            now[0] += 29_000; // within the grace: a pass keeps it
+            syncer.syncOnce();
+            assertThat(genDir(1)).isDirectory();
+            assertThat(cache.retainedGenerations()).isEqualTo(Map.of(PROJECT, 1L));
+
+            publishIncremental("retainedTwo"); // a newer activation replaces it: 2 is retained, 1 released
+            syncer.syncOnce();
+            assertThat(cache.retainedGenerations()).isEqualTo(Map.of(PROJECT, 2L));
+            assertThat(cache.retainedDir(PROJECT, 1)).isEmpty();
+            assertThat(genDirNames()).as("generation 1 pruned once released").doesNotContain("gen-1");
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 2)).isPresent();
+            assertThat(indexer.previousGenerationReaders()).containsExactly(PROJECT);
+
+            now[0] += 31_000; // the grace is over
+            syncer.syncOnce();
+            assertThat(cache.retainedDir(PROJECT, 2)).isEmpty();
+            assertThat(cache.retainedGenerations()).isEmpty();
+            assertThat(indexer.previousGenerationReaders()).as("its reader retired").isEmpty();
+            assertThat(indexer.openPinnedPreviousReader(PROJECT, 2)).isEmpty();
+        }
+    }
+
     @Test
     void beforeFirstActivationShardDirIsNone() {
         assertThat(cache.shardDir(PROJECT)).isEqualTo(cacheDir.resolve(PROJECT).resolve("none"));
@@ -387,6 +433,20 @@ class ReplicaSyncerTest {
         assertThat(new String(withBad, StandardCharsets.UTF_8)).contains("bad id");
         store.put(layout.catalogKey(), withBad);
 
+        syncer.syncOnce();
+
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+    }
+
+    /** Final review I2: after a downgrade from a release with keyed ids, the reader drops nothing. */
+    @Test
+    void catalogOfOnlyUnparseableIdsDropsNothing() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
+
+        // an id shape this build cannot parse (Phase 6's keyed ids it can; item 7 keeps the rule for later shapes)
+        store.put(layout.catalogKey(), "{\"shards\": [ {\"id\": \"proj~k:v\"} ]}".getBytes(StandardCharsets.UTF_8));
         syncer.syncOnce();
 
         assertThat(syncer.served()).isEqualTo(Map.of(SHARD, Generation.FIRST));
@@ -617,12 +677,10 @@ class ReplicaSyncerTest {
 
         syncer.syncOnce();
 
-        // format 0 is N-1 for this build: materialised and served, status upgrade-available
-        assertThat(syncer.served()).isEqualTo(Map.of(SHARD, new Generation(1)));
-        assertThat(genDir(1).resolve("index-format.json")).doesNotExist();
-        assertThat(com.pharos.indexer.IndexFormat.status(genDir(1)))
-                .isEqualTo(com.pharos.indexer.IndexFormat.statusOf(0))
-                .isEqualTo(com.pharos.indexer.IndexFormat.Status.UPGRADE_AVAILABLE);
+        // format 0 is below the read window since format 2 (N-1 = 1): the format gate refuses it
+        assertThat(com.pharos.indexer.IndexFormat.statusOf(0)).isEqualTo(com.pharos.indexer.IndexFormat.Status.OUTDATED);
+        assertThat(syncer.served()).isEmpty();
+        assertThat(genDir(1)).doesNotExist();
     }
 
     @Test
@@ -824,14 +882,43 @@ class ReplicaSyncerTest {
         syncer.setRetireGrace(Duration.ofSeconds(60));
         publishFull();
         Path stray = Files.createDirectories(cacheDir.resolve("stray-shard").resolve("gen-3"));
+        // a keyed shard's dir is its URL-safe encoded id (P6-R3); a raw or non-canonical name is not a shard dir
+        Path keyed = Files.createDirectories(cacheDir.resolve("lucene~ring%3Ds01").resolve("gen-2"));
+        Path raw = Files.createDirectories(cacheDir.resolve("lucene~ring=s01"));
         Path hidden = Files.createDirectories(cacheDir.resolve(".blocks"));
         syncer.syncOnce();
         assertThat(stray).isDirectory();
         now.addAndGet(61_000);
         syncer.syncOnce();
         assertThat(stray).doesNotExist();
+        assertThat(keyed).doesNotExist();
+        assertThat(raw).isDirectory();
         assertThat(hidden).isDirectory();
         assertThat(genDir(1)).isDirectory();
+    }
+
+    @Test
+    void absentCatalogKeepsServingButAnEmptyOneDropsEverything() throws Exception {
+        publishFull();
+        syncer.syncOnce();
+        // no catalog object at all (a store being reset, a wrong prefix): may be transient, drop nothing
+        ReplicaSyncer absent = new ReplicaSyncer(new ObjectStoreCatalog(new InMemoryObjectStore(), layout),
+                new ObjectStoreReplicaSource(store, layout), cache, readerRegistry, cacheDir, readerSynonyms,
+                Duration.ofSeconds(10), lazy);
+        try {
+            absent.syncOnce();
+        } finally {
+            absent.close();
+        }
+        assertThat(readerRegistry.find(PROJECT)).isPresent();
+        assertThat(cache.active(PROJECT)).isPresent();
+
+        // the catalog exists and lists no shard (its last project was removed): authoritative
+        assertThat(new ObjectStoreCatalog(store, layout).unregister(new ShardId(PROJECT))).isTrue();
+        assertThat(new ObjectStoreCatalog(store, layout).authoritativeShards()).contains(List.of());
+        syncer.syncOnce();
+        assertThat(readerRegistry.find(PROJECT)).isEmpty();
+        assertThat(cache.active(PROJECT)).isEmpty();
     }
 
     @Test
