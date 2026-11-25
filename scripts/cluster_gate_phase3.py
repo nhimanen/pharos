@@ -269,7 +269,8 @@ class Node(p2.Reader):
         link = self.home / ".djl.ai"
         if not link.is_symlink():
             link.symlink_to(os.environ["GATE_MODELS"])
-        no_models = self.kind != "reference" and KEYWORD_ONLY
+        # GATE_NO_MODELS=1 (the Phase 5 gate's GATE_KEYWORD_ONLY): no node loads a model, the reference included
+        no_models = (self.kind != "reference" and KEYWORD_ONLY) or os.environ.get("GATE_NO_MODELS", "0") == "1"
         cfg = {} if no_models else {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],

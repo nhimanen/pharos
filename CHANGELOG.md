@@ -56,10 +56,20 @@ the network except reader-to-writer with TLS. Read README "Without a bucket: pee
   the draining heartbeat and the withdraw each give up after 5 s with a `Stopping: gave up …` WARN,
   so the drain stays within `cluster.drainSeconds`.
 
+### Fixed
+- `./pharos` in a repo checkout runs the newest `target/pharos-*.jar` by version number. It sorted
+  the names as strings, so a leftover `pharos-1.9.0.jar` (a `mvn package` without `clean`) would have
+  won over `pharos-1.10.0.jar`. The gate scripts pick their default jar the same way (`sort -V`).
+
 ### Maintainers
-- Phase 5 gate (`scripts/cluster-gate-phase5.sh`): ports, paths, heaps and the embedding seed come
-  from `GATE_*` settings (defaults unchanged), `GATE_KEYWORD_ONLY=1` runs the steps that do not test
-  vectors without an embedding model, and the header shows how to run it under
+- Phase 5 gate (`scripts/cluster-gate-phase5.sh`): every port is a setting (`GATE_W1_PORT`,
+  `GATE_W2_PORT`, `GATE_P1_PORT`, `GATE_REF_PORT`, `GATE_ROUTER_PORT`, `GATE_D1_PORT`/`GATE_D2_PORT`,
+  `GATE_LOAD_BASE_PORT`, the Phase 2/3 drivers' `GATE_LAZY_PORT`/`GATE_FULL_PORT` and
+  `GATE_R1_PORT`..`GATE_R4_PORT`; probe bound `GATE_PORT_PROBE_TIMEOUT`), `GATE_PHAROS_SRC` snapshots
+  pharos from a git tree, and `GATE_SEED_FROM` seeds the pharos (and mypal) embedding caches; defaults
+  unchanged. `GATE_KEYWORD_ONLY=1` loads no embedding model anywhere: pharos and mypal are indexed
+  `--no-embed`, ranking compares the keyword pipeline only and the router load is keyword only; a
+  `GATE` set up in the other mode is refused. The header shows how to run it under
   `scripts/gate-watchdog.sh`.
 
 ## [1.9.0] - 2026-11-24

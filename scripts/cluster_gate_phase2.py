@@ -269,6 +269,8 @@ class Reader:
                 "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": False,
                 "cluster": peer_cluster(self.name, self.port, self.cache_dir, rc),
             }
+            if os.environ.get("GATE_NO_MODELS", "0") == "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY
+                del cfg["embeddingProviders"], cfg["searchEmbeddingModel"]
             (self.ph / "config.json").write_text(json.dumps(cfg, indent=2))
             return
         cfg = {

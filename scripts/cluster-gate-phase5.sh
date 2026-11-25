@@ -17,9 +17,13 @@
 # under $GATE; the jina and cross-encoder models are COPIED from ~/.djl.ai into $GATE/models-home/.djl.ai
 # (each node's .djl.ai is a symlink to that copy). Only ~/.pharos/registry.json is read.
 #
-# Run under a memory cap, e.g.
-#   GATE=/home/me/gate5-scratch systemd-run --user --scope -q -p MemoryMax=6G \
-#     bash scripts/cluster-gate-phase5.sh
+# On a shared host, run it under scripts/gate-watchdog.sh: one hard memory cap for every gate process
+# (a systemd user scope, or a cgroup-free fallback), and a watchdog that stops every recorded PID with
+# SIGTERM, then SIGKILL, when MemAvailable runs low, e.g.
+#   GATE=/home/me/gate5-scratch/run1 bash scripts/gate-watchdog.sh --state-dir /home/me/gate5-scratch/run1.wd \
+#     --mem-max 9G --min-available 3072 -- bash scripts/cluster-gate-phase5.sh
+# (the router step peaked at 6.9 GB with three jina readers). With GATE_KEYWORD_ONLY=1 (no embedding
+# model anywhere) --mem-max 6G is enough.
 #
 # Env:
 #   GATE               work dir (required unless --dry-run; on disk, not on a tmpfs /tmp)
@@ -39,10 +43,30 @@
 #   GATE_WITH_CE=0     do not copy the cross-encoder (no hybrid-reranked in the phases run)
 #   GATE_LOAD_ONLY=1   step 4 alone on another host (no models, no registry): W1 indexes lucene --no-embed
 #                      from the git repo GATE_LUCENE_GIT (a bare clone), then the driver runs "load,check"
+#   GATE_PHAROS_SRC    git work tree whose `git archive HEAD` src + pom.xml is the pharos snapshot (default:
+#                      a copy of this repo's src and pom.xml). With GATE_LUCENE_SRC and GATE_MYPAL_SRC set,
+#                      ~/.pharos/registry.json is not read at all.
+#   GATE_KEYWORD_ONLY  0 (default); 1: no embedding model on any node and none copied: pharos and mypal are
+#                      indexed --no-embed too, ranking compares the keyword pipeline only and the router
+#                      load is keyword only; every other step is keyword already (Phase 1 compare and
+#                      freshness, Phase 2 cold/warm/cap, second writer, writer down, writer load)
+#   GATE_SEED_FROM     dir holding <project>/embed-cache.<modelId>.{bin,meta} or <project>/embed-cache.{bin,meta}:
+#                      a COPY seeds W1's pharos (required) and mypal (if present) embedding caches before
+#                      they are indexed (default unset: no seed; pharos and mypal embed cold, ~1.5 h of
+#                      CPU on 1 thread locally). Ignored with GATE_KEYWORD_ONLY=1.
+#   GATE_W1_PORT / GATE_W2_PORT        writers (default 7300 / 7310)
+#   GATE_P1_PORT / GATE_REF_PORT       Phase 1 reader / single-node reference (default 7301 / 7305)
+#   GATE_LAZY_PORT / GATE_FULL_PORT    Phase 2 readers (default 7301 / 7302)
+#   GATE_R1_PORT .. GATE_R4_PORT       Phase 3 readers (default 7301 .. 7304)
+#   GATE_ROUTER_PORT                   router (default 7080)
+#   GATE_D1_PORT / GATE_D2_PORT        writer-down readers (default 7321 / 7322)
+#   GATE_LOAD_BASE_PORT                writer-load readers c1..c6 at base..base+5, c0 at base+6 (default 7321)
+#   GATE_PORT_PROBE_TIMEOUT  seconds per port probe (default 2; on hosts where an unused port hangs instead
+#                            of refusing, a timed-out probe counts as free)
 # Flags: --help, --dry-run (print the plan and exit; starts nothing)
 set -euo pipefail
 
-usage() { sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^set -euo/ { exit } NR > 1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 DRY=0
 for a in "$@"; do
   case "$a" in
@@ -58,13 +82,36 @@ MODEL_URL="${GATE_MODEL_URL:-hf://jinaai/jina-embeddings-v2-base-code}"
 MODEL_DIR_NAME="$(echo "${MODEL_URL#hf://}" | tr '/' '-')"
 CE_DIR_NAME="Xenova-ms-marco-MiniLM-L-6-v2"   # CrossEncoderProvider default (hybrid-reranked)
 DJL="${GATE_DJL:-$HOME/.djl.ai}"
+KEYWORD_ONLY="${GATE_KEYWORD_ONLY:-0}"
+[[ "$KEYWORD_ONLY" == 0 || "$KEYWORD_ONLY" == 1 ]] || { echo "cluster-gate-phase5: GATE_KEYWORD_ONLY must be 0 or 1" >&2; exit 2; }
+MODE=embed; (( KEYWORD_ONLY )) && MODE=keyword
 MODEL_DIRS=("$MODEL_DIR_NAME"); [[ "${GATE_WITH_CE:-1}" == 1 ]] && MODEL_DIRS+=("$CE_DIR_NAME")
+(( KEYWORD_ONLY )) && MODEL_DIRS=()
 MODEL_ID="${GATE_MODEL_ID:-jina-code-v2}"
+SEED_FROM="${GATE_SEED_FROM:-}"
+EMBED_FLAG=""; (( KEYWORD_ONLY )) && EMBED_FLAG="--no-embed"   # pharos and mypal
 PHASES="${GATE_PHASES:-p1,p2cold,p2warm,p2cap,reference,ranking,router,down,load,check}"
 MIN_FREE_GIB="${GATE_MIN_FREE_GIB:-10}"
-JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
+JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -V -r | head -1 || true)}"
 TOKEN="gate5-cluster-token-0123456789"
-PORTS=(7080 7300 7301 7302 7303 7304 7305 7310 7321 7322 7323 7324 7325 7326 7327)
+W1_PORT="${GATE_W1_PORT:-7300}"; W2_PORT="${GATE_W2_PORT:-7310}"
+P1_PORT="${GATE_P1_PORT:-7301}"; REF_PORT="${GATE_REF_PORT:-7305}"; ROUTER_PORT="${GATE_ROUTER_PORT:-7080}"
+LAZY_PORT="${GATE_LAZY_PORT:-7301}"; FULL_PORT="${GATE_FULL_PORT:-7302}"
+R1_PORT="${GATE_R1_PORT:-7301}"; R2_PORT="${GATE_R2_PORT:-7302}"; R3_PORT="${GATE_R3_PORT:-7303}"; R4_PORT="${GATE_R4_PORT:-7304}"
+D1_PORT="${GATE_D1_PORT:-7321}"; D2_PORT="${GATE_D2_PORT:-7322}"; LOAD_BASE_PORT="${GATE_LOAD_BASE_PORT:-7321}"
+PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
+W1_URL="http://127.0.0.1:$W1_PORT"; W2_URL="http://127.0.0.1:$W2_PORT"
+# shellcheck disable=SC2207
+PORTS=($(printf '%s\n' "$ROUTER_PORT" "$W1_PORT" "$W2_PORT" "$P1_PORT" "$REF_PORT" "$LAZY_PORT" "$FULL_PORT" \
+  "$R1_PORT" "$R2_PORT" "$R3_PORT" "$R4_PORT" "$D1_PORT" "$D2_PORT" \
+  $(seq "$LOAD_BASE_PORT" $((LOAD_BASE_PORT + 6))) | sort -n -u))
+# The drivers (cluster_gate_phase5.py and the Phase 2/3 drivers it imports) read the same settings.
+export GATE_W1_PORT="$W1_PORT" GATE_W2_PORT="$W2_PORT" GATE_P1_PORT="$P1_PORT" GATE_REF_PORT="$REF_PORT"
+export GATE_ROUTER_PORT="$ROUTER_PORT" GATE_LAZY_PORT="$LAZY_PORT" GATE_FULL_PORT="$FULL_PORT"
+export GATE_R1_PORT="$R1_PORT" GATE_R2_PORT="$R2_PORT" GATE_R3_PORT="$R3_PORT" GATE_R4_PORT="$R4_PORT"
+export GATE_D1_PORT="$D1_PORT" GATE_D2_PORT="$D2_PORT" GATE_LOAD_BASE_PORT="$LOAD_BASE_PORT"
+export GATE_DISCOVERY="seeds:$W1_URL" GATE_KEYWORD_ONLY="$KEYWORD_ONLY" GATE_NO_MODELS="$KEYWORD_ONLY"
+port_busy() { timeout "$PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 
 if (( DRY )); then
   cat <<PLAN
@@ -73,11 +120,13 @@ cluster-gate-phase5 (dry run): nothing is started.
   jar         ${JAR:-<missing: mvn clean package -DskipTests>}
   gate dir    ${GATE:-<GATE unset>}
   backend     peer-pull; no MinIO, no bucket; token-guarded /replication on the writers
-  models      $MODEL_URL as '$MODEL_ID' + cross-encoder $CE_DIR_NAME (copied from ~/.djl.ai/pharos)
-  writer W1   :7300; index lucene --no-embed, pharos and mypal with embeddings (heap $INDEX_HEAP)
-  writer W2   :7310; fixture project alpha (--no-embed), started mid-run (phase p1)
-  discovery   readers: seeds:http://127.0.0.1:7300 only; W1 lists :7300 and :7310
-  ports       ${PORTS[*]}
+  mode        $MODE (GATE_KEYWORD_ONLY=$KEYWORD_ONLY)
+  models      $( (( KEYWORD_ONLY )) && echo "none (keyword only)" || echo "$MODEL_URL as '$MODEL_ID' + ${MODEL_DIRS[*]} (copied from $DJL/pharos); seed: ${SEED_FROM:-none}")
+  writer W1   :$W1_PORT; index lucene --no-embed, pharos and mypal ${EMBED_FLAG:-with embeddings} (heap $INDEX_HEAP)
+  writer W2   :$W2_PORT; fixture project alpha (--no-embed), started mid-run (phase p1)
+  discovery   readers: seeds:$W1_URL only; W1 lists :$W1_PORT and :$W2_PORT
+  sources     lucene ${GATE_LUCENE_SRC:-<registry>}, mypal ${GATE_MYPAL_SRC:-<registry>}, pharos ${GATE_PHAROS_SRC:-$REPO (src + pom.xml)}
+  ports       ${PORTS[*]} (probe timeout ${PROBE_TIMEOUT} s)
   phases      $PHASES
 PLAN
   GATE_BACKEND=peer-pull python3 -I "$REPO/scripts/cluster_gate_phase5.py" --dry-run --phases "$PHASES"
@@ -91,7 +140,7 @@ if [[ "${GATE_LOAD_ONLY:-0}" == 1 ]]; then
   # Step 4 (writer load) alone, e.g. on a host with more cores: lucene --no-embed, no models.
   [[ -d "${GATE_LUCENE_GIT:-}" ]] || { echo "cluster-gate-phase5: GATE_LUCENE_GIT must name a git repo" >&2; exit 2; }
   for port in "${PORTS[@]}"; do
-    if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+    if port_busy "$port"; then
       echo "cluster-gate-phase5: port $port is already in use; refusing to start" >&2; exit 2
     fi
   done
@@ -107,9 +156,9 @@ if [[ "${GATE_LOAD_ONLY:-0}" == 1 ]]; then
   "crossEncoderEnabled": false,
   "cluster": {
     "role": "writer", "backend": "peer-pull", "nodeId": "gate-w1",
-    "token": "$TOKEN", "advertiseUrl": "http://127.0.0.1:7300",
+    "token": "$TOKEN", "advertiseUrl": "$W1_URL",
     "cacheDir": "$W1_PH/cluster-cache",
-    "peers": {"discovery": "seeds:http://127.0.0.1:7300", "storeDir": "$W1_PH/peer-store", "refreshSeconds": 10}
+    "peers": {"discovery": "seeds:$W1_URL", "storeDir": "$W1_PH/peer-store", "refreshSeconds": 10}
   }
 }
 JSON
@@ -135,6 +184,10 @@ fi
 for d in "${MODEL_DIRS[@]}"; do
   [[ -d "$DJL/pharos/$d" ]] || { echo "cluster-gate-phase5: model not in $DJL/pharos/$d" >&2; exit 2; }
 done
+PHAROS_SRC="${GATE_PHAROS_SRC:-}"
+if [[ -n "$PHAROS_SRC" ]]; then
+  git -C "$PHAROS_SRC" rev-parse --verify -q HEAD >/dev/null || { echo "cluster-gate-phase5: $PHAROS_SRC is not a git work tree" >&2; exit 2; }
+fi
 
 src_of() {  # $1 = project: its rootPath in ~/.pharos/registry.json (only read)
   python3 -I - "$HOME/.pharos/registry.json" "$1" <<'PY'
@@ -152,12 +205,20 @@ for s in "$LUCENE_SRC" "$MYPAL_SRC"; do
 done
 
 for port in "${PORTS[@]}"; do
-  if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+  if port_busy "$port"; then
     echo "cluster-gate-phase5: port $port is already in use; refusing to start" >&2; exit 2
   fi
 done
 
 mkdir -p "$GATE"
+if [[ -f "$GATE/gate.mode" ]]; then
+  prev_mode="$(cat "$GATE/gate.mode")"
+  [[ "$prev_mode" == "$MODE" ]] || { echo "cluster-gate-phase5: $GATE was set up in $prev_mode mode, this run is $MODE (GATE_KEYWORD_ONLY); use a fresh GATE" >&2; exit 2; }
+elif [[ "${GATE_REUSE:-0}" == 1 && -f "$GATE/src.done" ]]; then
+  # set up before the setting existed: embed mode
+  [[ "$MODE" == embed ]] || { echo "cluster-gate-phase5: $GATE was set up in embed mode, this run is keyword; use a fresh GATE" >&2; exit 2; }
+fi
+echo "$MODE" > "$GATE/gate.mode"
 free_gib() { df -Pk "$GATE" | awk 'NR==2{printf "%.1f", $4/1048576}'; }
 if awk -v f="$(free_gib)" -v m="$MIN_FREE_GIB" 'BEGIN{exit !(f < m)}'; then
   echo "cluster-gate-phase5: only $(free_gib) GiB free on $GATE's file system (< $MIN_FREE_GIB)" >&2; exit 2
@@ -171,7 +232,9 @@ MODELS="$GATE/models-home/.djl.ai"
 SRC="$GATE/src"
 mkdir -p "$SRC" "$GATE/nodes"
 
-if [[ ! -f "$MODELS/pharos/.copied" ]]; then
+if (( KEYWORD_ONLY )); then
+  mkdir -p "$MODELS/pharos"   # each node's .djl.ai still links here; nothing is copied
+elif [[ ! -f "$MODELS/pharos/.copied" ]]; then
   mkdir -p "$MODELS/pharos"
   for d in "${MODEL_DIRS[@]}"; do cp -r "$DJL/pharos/$d" "$MODELS/pharos/"; done
   for d in cache tokenizers; do [[ -d "$DJL/$d" ]] && cp -r "$DJL/$d" "$MODELS/"; done
@@ -218,24 +281,29 @@ else
   mkdir -p "$SRC/lucene" "$SRC/mypal" "$SRC/pharos"
   git -C "$LUCENE_SRC" archive --format=tar HEAD | tar -x -C "$SRC/lucene"
   git -C "$MYPAL_SRC" archive --format=tar HEAD | tar -x -C "$SRC/mypal"
-  cp -r "$REPO/src" "$REPO/pom.xml" "$SRC/pharos/"
+  if [[ -n "$PHAROS_SRC" ]]; then
+    git -C "$PHAROS_SRC" archive --format=tar HEAD src pom.xml | tar -x -C "$SRC/pharos"
+  else
+    cp -r "$REPO/src" "$REPO/pom.xml" "$SRC/pharos/"
+  fi
   fixture alpha
   { echo "lucene $(git -C "$LUCENE_SRC" rev-parse --short HEAD)"; echo "mypal $(git -C "$MYPAL_SRC" rev-parse --short HEAD)";
-    echo "pharos $(git -C "$REPO" rev-parse --short HEAD) (src + pom.xml)"; } > "$GATE/src.done"
+    echo "pharos $(git -C "${PHAROS_SRC:-$REPO}" rev-parse --short HEAD) (src + pom.xml)"; } > "$GATE/src.done"
   for n in lucene pharos mypal alpha; do echo "   source $n: $(find "$SRC/$n" -type f | wc -l) files, $(du -sh "$SRC/$n" | cut -f1)"; done
 fi
 
-# ---------------------------------------------------------------- writers W1 (:7300) and W2 (:7310)
+# ---------------------------------------------------------------- writers W1 ($W1_PORT) and W2 ($W2_PORT)
 writer_config() {  # $1 = name, $2 = port, $3 = discovery
-  local home="$GATE/nodes/$1" ph="$GATE/nodes/$1/.pharos"
+  local home="$GATE/nodes/$1" ph="$GATE/nodes/$1/.pharos" models=""
   mkdir -p "$ph"
   ln -sfn "$MODELS" "$home/.djl.ai"
+  (( KEYWORD_ONLY )) || models='"embeddingProviders": [
+    {"type": "djl", "modelId": "'"$MODEL_ID"'", "url": "'"$MODEL_URL"'", "dimensions": 768, "maxTokens": 512}
+  ],
+  "searchEmbeddingModel": "'"$MODEL_ID"'",'
   cat > "$ph/config.json" <<JSON
 {
-  "embeddingProviders": [
-    {"type": "djl", "modelId": "$MODEL_ID", "url": "$MODEL_URL", "dimensions": 768, "maxTokens": 512}
-  ],
-  "searchEmbeddingModel": "$MODEL_ID",
+  $models
   "crossEncoderEnabled": false,
   "cluster": {
     "role": "writer", "backend": "peer-pull", "nodeId": "gate-$1",
@@ -246,8 +314,8 @@ writer_config() {  # $1 = name, $2 = port, $3 = discovery
 }
 JSON
 }
-writer_config w1 7300 "seeds:http://127.0.0.1:7300,http://127.0.0.1:7310"
-writer_config w2 7310 "seeds:http://127.0.0.1:7300,http://127.0.0.1:7310"
+writer_config w1 "$W1_PORT" "seeds:$W1_URL,$W2_URL"
+writer_config w2 "$W2_PORT" "seeds:$W1_URL,$W2_URL"
 
 JVM_FLAGS=(--enable-native-access=ALL-UNNAMED --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED
            --add-modules jdk.incubator.vector -Dpolyglot.engine.WarnInterpreterOnly=false
@@ -264,11 +332,28 @@ index_on() {  # $1 = writer, $2 = project, $3 = flags; one JVM per run
   echo "   $2 indexed + published in $((SECONDS - t0)) s"
   grep -E "Published shard|Indexed project|Embedding cache|methods" "$GATE/index-$1-$2.log" | tail -n 4 || true
 }
-for spec in "w1|lucene|--no-embed" "w2|alpha|--no-embed" "w1|pharos|" "w1|mypal|"; do
+seed_cache() {  # $1 = project, $2 = required (1/0): copy GATE_SEED_FROM/<project>/embed-cache* into W1's index dir
+  local seed="" c dst="$GATE/nodes/w1/.pharos/indexes/$1"
+  for c in "$SEED_FROM/$1/embed-cache.$MODEL_ID" "$SEED_FROM/$1/embed-cache"; do
+    [[ -f "$c.bin" && -f "$c.meta" ]] && { seed="$c"; break; }
+  done
+  if [[ -z "$seed" ]]; then
+    (( $2 )) && { echo "cluster-gate-phase5: GATE_SEED_FROM has no $1/embed-cache[.$MODEL_ID].{bin,meta}: $SEED_FROM" >&2; exit 2; }
+    echo "== no $1 seed under $SEED_FROM; $1 embeds cold"; return 0
+  fi
+  mkdir -p "$dst"
+  cp "$seed.bin" "$dst/embed-cache.$MODEL_ID.bin"
+  cp "$seed.meta" "$dst/embed-cache.$MODEL_ID.meta"
+  echo "== seeded W1's $1 embed cache from a copy of $seed ($(cat "$dst/embed-cache.$MODEL_ID.meta"))"
+}
+for spec in "w1|lucene|--no-embed" "w2|alpha|--no-embed" "w1|pharos|$EMBED_FLAG" "w1|mypal|$EMBED_FLAG"; do
   IFS='|' read -r w name flag <<<"$spec"
   if [[ "${GATE_REUSE:-0}" == 1 && -f "$GATE/index-$name.done" ]]; then
     echo "== reusing $w's index of $name ($(cat "$GATE/index-$name.done"))"
   else
+    if (( ! KEYWORD_ONLY )) && [[ -n "$SEED_FROM" ]]; then
+      case "$name" in pharos) seed_cache pharos 1 ;; mypal) seed_cache mypal 0 ;; esac
+    fi
     index_on "$w" "$name" "$flag"
     date -Is > "$GATE/index-$name.done"
   fi
@@ -294,6 +379,7 @@ fi
 
 export GATE GATE_JAR="$JAR" GATE_LOGBACK="$LOGBACK" GATE_MODELS="$MODELS" GATE_MODEL_URL="$MODEL_URL"
 export GATE_MODEL_ID="$MODEL_ID" GATE_TOKEN="$TOKEN" GATE_BACKEND=peer-pull GATE_SRC="$SRC"
+export GATE_PHAROS_SRC="$SRC/pharos"   # the snapshot (cluster_gate.freshness edits it), never the work tree
 export GATE_PROJECTS="lucene,pharos,mypal"
 export GATE_WRITER_HEAP="${GATE_WRITER_HEAP:-512m}" GATE_WEB_HEAP="${GATE_WEB_HEAP:-640m}"
 export GATE_REF_HEAP="${GATE_REF_HEAP:-2g}" GATE_INDEX_HEAP="$INDEX_HEAP"

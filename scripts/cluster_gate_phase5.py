@@ -40,6 +40,16 @@ started and stopped by its PID; each has its own user.home and pharos.home under
   check      Marker check (nothing under ~/.pharos or ~/.djl.ai newer than $GATE/marker), every gate
              process stopped, every gate port free.
 
+The ports above are the defaults; the shell script exports GATE_W1_PORT, GATE_W2_PORT, GATE_P1_PORT,
+GATE_REF_PORT, GATE_ROUTER_PORT, GATE_D1_PORT, GATE_D2_PORT, GATE_LOAD_BASE_PORT (c1..c6 at base..base+5,
+c0 at base+6) and GATE_DISCOVERY, next to the Phase 2 and 3 drivers' GATE_LAZY_PORT, GATE_FULL_PORT and
+GATE_R1_PORT..GATE_R4_PORT.
+
+GATE_KEYWORD_ONLY=1: no node has an embedding model (pharos and mypal were indexed --no-embed). The
+phases are the same, with what does not test vectors: ranking compares the keyword pipeline only, the
+router load is keyword only (half unscoped, half scoped), and the freshness and down re-indexes run
+--no-embed. Phase 2, p1, down and load are keyword already.
+
 Results: $GATE/results-<phase>.json; memory samples: $GATE/memory.log. --dry-run prints the plan;
 --self-test checks the helpers.
 """
@@ -68,10 +78,27 @@ import cluster_gate_phase3 as p3  # noqa: E402
 
 PHASES = ["p1", "p2cold", "p2warm", "p2cap", "reference", "ranking", "router", "down", "load", "check"]
 REFRESH_S = int(os.environ.get("GATE_REFRESH_SECONDS", "10"))
-W1_URL = "http://127.0.0.1:7300"
-W2_URL = "http://127.0.0.1:7310"
-GATE_PORTS = [7080, 7300, 7301, 7302, 7303, 7304, 7305, 7310, 7321, 7322, 7323, 7324, 7325, 7326, 7327]
 LOAD_READERS = 6
+
+
+def _port(name, default):
+    return int(os.environ.get(f"GATE_{name}_PORT", str(default)))
+
+
+W1_PORT, W2_PORT, P1_PORT = _port("W1", 7300), _port("W2", 7310), _port("P1", 7301)
+REF_PORT, ROUTER_PORT = _port("REF", 7305), _port("ROUTER", 7080)
+D1_PORT, D2_PORT, LOAD_BASE_PORT = _port("D1", 7321), _port("D2", 7322), _port("LOAD_BASE", 7321)
+LOAD_PORTS = [LOAD_BASE_PORT + i for i in range(LOAD_READERS + 1)]  # c1..c6, then c0
+W1_URL = f"http://127.0.0.1:{W1_PORT}"
+W2_URL = f"http://127.0.0.1:{W2_PORT}"
+os.environ.setdefault("GATE_DISCOVERY", "seeds:" + W1_URL)  # p2.peer_cluster's reader discovery
+GATE_PORTS = sorted({W1_PORT, W2_PORT, P1_PORT, REF_PORT, ROUTER_PORT, D1_PORT, D2_PORT, p2.LAZY_PORT,
+                     p2.FULL_PORT, *p3.PORTS.values(), *LOAD_PORTS})
+# GATE_KEYWORD_ONLY=1: no embedding model on any node; only what does not test vectors (module docstring)
+KEYWORD_ONLY = os.environ.get("GATE_KEYWORD_ONLY", "0") == "1"
+if KEYWORD_ONLY:
+    p3.PIPELINES = ("keyword",)  # ranking: the keyword pipeline only
+    p3.KEYWORD_ONLY = True       # readers and the router: no model, no cross-encoder
 DOWN_BAR_S = 5.0
 JOIN_REFRESHES = 2
 ALL = []  # every Popen-backed node this driver started (for stop_all and the check phase)
@@ -347,12 +374,12 @@ W1_SHARDS = []  # the shards W1's catalog lists (a reader serving everything ser
 def ensure_w1():
     global W1, W1_SHARDS
     if W1 is None:
-        W1 = Writer("w1", 7300)
+        W1 = Writer("w1", W1_PORT)
     if not W1.alive():
         W1.start()
         t, cat = W1.wait_up()
         W1_SHARDS = sorted(s["shard"] for s in cat["shards"])
-        print(f"-- W1 `pharos web` :7300 up in {t:.1f}s (pid {W1.proc.pid}); catalog "
+        print(f"-- W1 `pharos web` :{W1_PORT} up in {t:.1f}s (pid {W1.proc.pid}); catalog "
               f"{[(s['shard'], s['latest']) for s in cat['shards']]}")
     return W1
 
@@ -368,7 +395,9 @@ def load_plan(qps, seconds, mix="keyword"):
     for i in range(int(qps * seconds)):
         q, proj = base[i % len(base)]
         k = i % 4
-        if mix == "phase3":
+        if mix == "phase3" and KEYWORD_ONLY:  # the same split, keyword only (as GATE_ELASTICITY_KEYWORD_ONLY)
+            plan.append((i / qps, q, [None, proj, None, proj][k], "keyword"))
+        elif mix == "phase3":
             plan.append((i / qps, q, [None, proj, None, "pharos"][k], ["keyword", "keyword", "hybrid", "hybrid"][k]))
         else:
             plan.append((i / qps, q, None if k % 2 == 0 else proj, "keyword"))
@@ -428,16 +457,16 @@ def append_probe(src_root, marker):
 def reindex_cmd(heap):
     home = gate() / "nodes" / "w1"
     return jvm(heap, home) + ["-jar", os.environ["GATE_JAR"], "index", str(Path(os.environ["GATE_SRC"]) / "pharos"),
-                              "--project", "pharos", "--no-progress"]
+                              "--project", "pharos", "--no-progress"] + (["--no-embed"] if KEYWORD_ONLY else [])
 
 
 def phase_p1():
     w1 = ensure_w1()
     out = {"w1_shards": W1_SHARDS}
     rebuild_reference()  # W1's indexes as they are now: the single node of the comparison
-    ref = Peer("reference", 7305, kind="reference", home=gate() / "reference", heap=os.environ.get("GATE_REF_HEAP", "2g"))
-    r = Peer("p1", 7301, mode="lazy", fresh=True)  # every shard: lucene, pharos, mypal (W2 not up yet)
-    print(f"-- p1: reference :7305 (role all, no models) and reader p1 :7301 (lazy, seeds:{W1_URL})")
+    ref = Peer("reference", REF_PORT, kind="reference", home=gate() / "reference", heap=os.environ.get("GATE_REF_HEAP", "2g"))
+    r = Peer("p1", P1_PORT, mode="lazy", fresh=True)  # every shard: lucene, pharos, mypal (W2 not up yet)
+    print(f"-- p1: reference :{REF_PORT} (role all, no models) and reader p1 :{P1_PORT} (lazy, seeds:{W1_URL})")
     out["ready_s"] = start_all([ref, r], want={"p1": len(W1_SHARDS)})
     args = argparse.Namespace(writer=ref.base, reader=r.base)
     out["compare"] = p1.compare(args)
@@ -452,7 +481,7 @@ def phase_p1():
     out["freshness"] = p1.freshness(args)
 
     # Second writer mid-run, under keyword load on the reader.
-    w2 = Writer("w2", 7310)
+    w2 = Writer("w2", W2_PORT)
     plan = load_plan(10, 90)
     res = {}
 
@@ -463,7 +492,7 @@ def phase_p1():
     t_load = now()
     th.start()
     time.sleep(15)
-    print(f"-- p1 second writer: start W2 :7310 (alpha) at t={now() - t_load:.1f}s of the load")
+    print(f"-- p1 second writer: start W2 :{W2_PORT} (alpha) at t={now() - t_load:.1f}s of the load")
     w2.start()
     up_s, cat = w2.wait_up()
     t_up = now()
@@ -712,10 +741,10 @@ def wait_visible(base, marker, deadline_s):
 def phase_down():
     w1 = ensure_w1()
     qs = p1.load_queries()
-    d1 = Peer("d1", 7321, mode="full", fresh=True)
-    d2 = Peer("d2", 7322, mode="lazy", fresh=True)
-    router = Peer("router-down", 7080, kind="router", fresh=True)
-    print("-- down: D1 (full) :7321, D2 (lazy) :7322, every shard; router :7080")
+    d1 = Peer("d1", D1_PORT, mode="full", fresh=True)
+    d2 = Peer("d2", D2_PORT, mode="lazy", fresh=True)
+    router = Peer("router-down", ROUTER_PORT, kind="router", fresh=True)
+    print(f"-- down: D1 (full) :{D1_PORT}, D2 (lazy) :{D2_PORT}, every shard; router :{ROUTER_PORT}")
     out = {"ready_s": start_all([d1, d2], want={"d1": len(W1_SHARDS), "d2": len(W1_SHARDS)})}
     router.start()
     router.wait_ready()
@@ -841,7 +870,7 @@ def phase_load():
     out = {"mode": mode, "heap": heap, "maxTransfersPerWriter": cap, "single": []}
     print(f"-- load: {mode}-mode readers, heap {heap}, no models; W1 maxTransfersPerWriter {cap}")
     for t in range(trials):
-        c = Peer("c0", 7327, mode=mode, fresh=True, heap=heap)
+        c = Peer("c0", LOAD_PORTS[LOAD_READERS], mode=mode, fresh=True, heap=heap)
         c.start(f"-{t + 1}")
         try:
             s = c.wait_ready(want=len(W1_SHARDS))
@@ -853,7 +882,7 @@ def phase_load():
     single = p2.median([x["ready_s"] for x in out["single"]])
     bound = 3 * single
     before = w1.transfers()
-    readers = [Peer(f"c{i + 1}", 7321 + i, mode=mode, fresh=True, heap=heap) for i in range(LOAD_READERS)]
+    readers = [Peer(f"c{i + 1}", LOAD_PORTS[i], mode=mode, fresh=True, heap=heap) for i in range(LOAD_READERS)]
     samples, stop_ev = [], threading.Event()
 
     def sampler():
@@ -960,7 +989,12 @@ def phase_check():
 
 
 def self_test():
-    os.environ.setdefault("GATE_TOKEN", "t")
+    for k, v in (("GATE_TOKEN", "t"), ("GATE", "/nonexistent/gate5-self-test"), ("GATE_JAR", "pharos.jar"),
+                 ("GATE_LOGBACK", "logback.xml"), ("GATE_SRC", "/nonexistent/src")):
+        os.environ.setdefault(k, v)  # only built into paths and commands; nothing is started or written
+    global KEYWORD_ONLY
+    saved = KEYWORD_ONLY
+    KEYWORD_ONLY = False
     plan = load_plan(10, 2)
     assert len(plan) == 20 and plan[1][0] == 0.1 and plan[0][2] is None and plan[1][2] is not None
     assert all(p[3] == "keyword" for p in plan)
@@ -971,6 +1005,16 @@ def self_test():
     assert s["failed"] == 1 and s["by_status"] == {"200": 1, "503": 1} and s["warnings"] == {"x": 1}
     cfg = p2.peer_cluster("n", 7301, Path("/tmp/c"), {"mode": "full"})
     assert cfg["backend"] == "peer-pull" and cfg["peers"]["discovery"].startswith("seeds:") and "objectStore" not in cfg
+    assert cfg["peers"]["discovery"] == os.environ["GATE_DISCOVERY"]
+    assert len(GATE_PORTS) == len(set(GATE_PORTS)) and W1_PORT in GATE_PORTS and LOAD_PORTS[-1] in GATE_PORTS
+    assert "--no-embed" not in reindex_cmd("1g")
+    try:
+        KEYWORD_ONLY = True
+        kw = load_plan(20, 1, mix="phase3")
+        assert all(p[3] == "keyword" for p in kw) and kw[0][2] is None and kw[1][2] is not None and kw[3][2] is not None
+        assert reindex_cmd("1g")[-1] == "--no-embed"
+    finally:
+        KEYWORD_ONLY = saved
     print("self-test OK")
 
 
@@ -990,7 +1034,11 @@ def main():
         ap.error(f"unknown phases {sorted(unknown)}")
     if args.dry_run:
         print(f"driver (dry run): phases {phases}; {len(p1.load_queries())} pharos+lucene queries;"
-              f" refresh {REFRESH_S} s; {LOAD_READERS} cold readers in the load phase")
+              f" refresh {REFRESH_S} s; {LOAD_READERS} cold readers in the load phase;"
+              f" {'keyword only (ranking: keyword pipeline; router: keyword load)' if KEYWORD_ONLY else 'with embeddings'}")
+        print(f"   W1 :{W1_PORT}, W2 :{W2_PORT}, p1 :{P1_PORT}, reference :{REF_PORT}, router :{ROUTER_PORT},"
+              f" down :{D1_PORT}/:{D2_PORT}, load :{LOAD_PORTS[0]}..:{LOAD_PORTS[-1]}, Phase 2 :{p2.LAZY_PORT}/:{p2.FULL_PORT},"
+              f" Phase 3 {p3.PORTS}; discovery {os.environ['GATE_DISCOVERY']}")
         return 0
     if not p2.peer_mode():
         print("cluster_gate_phase5: GATE_BACKEND must be peer-pull")
