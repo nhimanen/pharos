@@ -441,6 +441,95 @@ class LeaseManagerTest {
     }
 
     /** The in-memory bucket, whose conditional puts can be made to fail with an I/O error. */
+    /**
+     * 1.11.0 review: a lease lost without a definite answer was never re-read (the renewer skipped
+     * it, and only a tick's acquire reclaimed it), so during a run longer than the TTL it stayed lost.
+     * Each renewal round re-reads it: past the TTL too, an untouched lease is reclaimed and held again.
+     */
+    @Test
+    void renewalRoundReclaimsAnUnconfirmedLossPastTheTtl() throws Exception {
+        AtomicBoolean failPuts = new AtomicBoolean();
+        LeaseManager a = writer(failingConditionalPuts(failPuts), "node-a");
+        List<LeaseManager.Lost> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        a.onLost(seen::add);
+        Lease lease = a.tryAcquire(SHARD).orElseThrow();
+
+        failPuts.set(true);
+        a.renewAll();
+        assertThat(a.lostUnconfirmed(SHARD)).isTrue();
+        bucketClock.advance(31); // the bucket stays unanswering past the TTL
+        a.renewAll();
+        assertThat(a.lostUnconfirmed(SHARD)).as("still unanswered: stays unconfirmed").isTrue();
+
+        failPuts.set(false);
+        a.renewAll();
+
+        assertThat(a.isHeld(SHARD)).as("reclaimed").isTrue();
+        assertThat(a.lostUnconfirmed(SHARD)).isFalse();
+        assertThat(store.get(leaseKey).orElseThrow().etag()).isNotEqualTo(lease.etag());
+        a.assertHeld(SHARD);
+        assertThat(seen).extracting(LeaseManager.Lost::definite).containsExactly(false);
+    }
+
+    /** A renewal whose answer was lost after the bucket applied it: the lease carries our own body. */
+    @Test
+    void renewalRoundReclaimsALeaseItsOwnUnansweredRenewalWrote() throws Exception {
+        AtomicBoolean loseAnswers = new AtomicBoolean();
+        ObjectStore flaky = (ObjectStore) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ObjectStore.class}, (proxy, m, args) -> {
+                    Object out;
+                    try {
+                        out = m.invoke(store, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                    if (m.getName().equals("putIfMatch") && loseAnswers.get()) throw new IOException("answer lost");
+                    return out;
+                });
+        LeaseManager a = writer(flaky, "node-a");
+        Lease lease = a.tryAcquire(SHARD).orElseThrow();
+        bucketClock.advance(1);
+
+        loseAnswers.set(true);
+        a.renewAll();
+        assertThat(a.lostUnconfirmed(SHARD)).isTrue();
+        assertThat(store.get(leaseKey).orElseThrow().etag()).as("applied").isNotEqualTo(lease.etag());
+
+        loseAnswers.set(false);
+        a.renewAll();
+
+        assertThat(a.isHeld(SHARD)).as("its own write: reclaimed, not taken for another writer's").isTrue();
+        a.assertHeld(SHARD);
+    }
+
+    /**
+     * An unconfirmed loss whose lease another writer took meanwhile is upgraded to a definite loss on
+     * the next round that reads the bucket, and the listener is told again, as definite.
+     */
+    @Test
+    void renewalRoundUpgradesAnUnconfirmedLossToDefiniteOnceTaken() throws Exception {
+        AtomicBoolean failPuts = new AtomicBoolean();
+        LeaseManager a = writer(failingConditionalPuts(failPuts), "node-a");
+        List<LeaseManager.Lost> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        a.onLost(seen::add);
+        a.tryAcquire(SHARD).orElseThrow();
+
+        failPuts.set(true);
+        a.renewAll();
+        bucketClock.advance(31);
+        Lease taken = writer("node-b").tryAcquire(SHARD).orElseThrow();
+        failPuts.set(false);
+        a.renewAll();
+
+        assertThat(a.isHeld(SHARD)).isFalse();
+        assertThat(a.lostUnconfirmed(SHARD)).as("definite now").isFalse();
+        assertThat(seen).extracting(LeaseManager.Lost::definite).containsExactly(false, true);
+        assertThat(store.get(leaseKey).orElseThrow().etag()).as("the new owner untouched").isEqualTo(taken.etag());
+        assertThatThrownBy(() -> a.assertHeld(SHARD)).isInstanceOf(PublishConflictException.class);
+        a.renewAll();
+        assertThat(seen).as("a definite loss is reported once").hasSize(2);
+    }
+
     private ObjectStore failingConditionalPuts(AtomicBoolean fail) {
         return (ObjectStore) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
                 new Class<?>[]{ObjectStore.class}, (proxy, m, args) -> {

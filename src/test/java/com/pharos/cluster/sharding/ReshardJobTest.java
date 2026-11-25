@@ -114,9 +114,17 @@ public class ReshardJobTest {
     /** The Java parser, counting the files it parses. */
     static final class CountingParser extends JavaCodeParser {
         final List<Path> parsed = new CopyOnWriteArrayList<>();
+        /** Runs once, at the next parse (e.g. a bucket blip in the middle of a build). */
+        final AtomicReference<Runnable> onParse = new AtomicReference<>();
+
+        private void hook() {
+            Runnable r = onParse.getAndSet(null);
+            if (r != null) r.run();
+        }
 
         @Override
         public ParsedFile parseFile(Path file, String projectName) throws IOException {
+            hook();
             parsed.add(file);
             return super.parseFile(file, projectName);
         }
@@ -125,6 +133,7 @@ public class ReshardJobTest {
         @Override
         public ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
                                         com.pharos.indexer.IndexAbort abort) throws IOException {
+            hook();
             parsed.addAll(files);
             return super.parseFiles(files, projectRoot, projectName, abort);
         }
@@ -139,6 +148,8 @@ public class ReshardJobTest {
     private Path src;
     /** Manifest writes of shards whose key contains one of these fail (an interrupted publish). */
     private final Set<String> failManifestsOf = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Conditional puts on these keys fail with an I/O error, unapplied (a bucket that does not answer). */
+    private final Set<String> failPutIfMatchOf = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** The project's spec version after each catalog write that changed it. */
     private final List<Integer> activeVersions = new CopyOnWriteArrayList<>();
     private volatile List<ReaderHeartbeat> heartbeats = List.of();
@@ -336,6 +347,9 @@ public class ReshardJobTest {
 
             @Override
             public Optional<String> putIfMatch(String key, byte[] data, String etag) {
+                if (failPutIfMatchOf.contains(key)) {
+                    throw new UncheckedIOException(new IOException("injected putIfMatch failure: " + key));
+                }
                 java.util.function.Consumer<String> hook = latestCas;
                 if (hook != null && key.endsWith("/LATEST")) hook.accept(key);
                 Optional<String> out = super.putIfMatch(key, data, etag);
@@ -565,6 +579,42 @@ public class ReshardJobTest {
         r.sync();
         assertEveryFileOnce(r, files, "after the next run");
         assertThat(activeVersions).as("the project's version changed exactly once").containsExactly(n, v);
+    }
+
+    /**
+     * 1.11.0 review: a renewal of one of the unit's shard leases that gets no answer in the middle of
+     * the build left that lease unconfirmed for good (nothing re-read it while the build held the
+     * tick), so a stall longer than the TTL failed the build's publish. A later renewal round reclaims
+     * the untouched lease: the same step stages, builds, pins and flips.
+     */
+    @Test
+    void aStallPastTheTtlDuringTheBuildIsReclaimedAndTheReshardFlips() throws IOException {
+        List<String> files = filesFor(RING4, RING5, 4);
+        Writer a = new Writer("node-a");
+        startSplit(a, files, RING4, ring(4));
+        int v = catalog.requestReshard(P, RING5, clock.instant());
+        ShardId blipped = ring(4).get(1);
+        java.util.concurrent.atomic.AtomicBoolean unconfirmed = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean reclaimed = new java.util.concurrent.atomic.AtomicBoolean();
+        a.parser.onParse.set(() -> {
+            failPutIfMatchOf.add(layout.leaseKey(blipped)); // one renewal gets no answer
+            a.loop.leaseManager().renewAll();
+            unconfirmed.set(a.loop.leaseManager().lostUnconfirmed(blipped));
+            clock.advance(TTL.toSeconds() + 10); // the stall outlasts the lease's TTL
+            failPutIfMatchOf.clear();
+            a.loop.leaseManager().renewAll(); // a later one gets an answer
+            a.loop.reshardJob().orElseThrow().leases().renewAll();
+            reclaimed.set(a.loop.leaseManager().isHeld(blipped));
+        });
+
+        a.loop.tick();
+
+        assertThat(unconfirmed).as("the blip left the lease unconfirmed").isTrue();
+        assertThat(reclaimed).as("reclaimed during the build").isTrue();
+        ProjectShards map = catalog.projectShards();
+        assertThat(map.specVersionOf(P)).as("built, staged and flipped in the same step").hasValue(v);
+        assertThat(map.shardsOf(P)).isEqualTo(ring(5));
+        assertThat(map.stagedOf(P)).isEmpty();
     }
 
     /**

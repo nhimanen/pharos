@@ -121,7 +121,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p><b>Lost lease</b>: when the renewer (or the publish check) sees the lease of the shard being
  * run definitely lost (taken over, or gone), the run is aborted at its next safe point
  * ({@link #leaseLost}): its publish could only fail the lease check. A renewal that merely failed
- * (an I/O error or its deadline) does not abort it.
+ * (an I/O error or its deadline) does not abort it: the renewer re-reads that lease every round
+ * ({@link LeaseManager#renewAll}) and reclaims it once the bucket answers with this writer's ETag, so
+ * the run publishes; a re-read that finds the lease taken reports a definite loss and aborts the run.
  *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
@@ -366,10 +368,10 @@ public final class WorkLoop implements Closeable {
      * A held lease was seen lost (renewer thread, or the publish check). A definite loss (another
      * writer took it, or it is gone) aborts the run of that shard at its next safe point instead of
      * parsing, embedding and committing for nothing. An ambiguous one (a renewal's I/O error or
-     * deadline on a slow bucket) does not: the lease is often still ours and reclaimed on the next
-     * tick, and aborting would make the next run full again; the run commits locally, its publish
-     * re-checks the lease, and the next (incremental) run publishes. A run past its commit finishes;
-     * its publish fails the lease check.
+     * deadline on a slow bucket) does not: the lease is often still ours, and aborting would make the
+     * next run full again. The renewer re-reads it every round: reclaimed, the run publishes; found
+     * taken, it is reported again as definite and the run is aborted then. A run past its commit
+     * finishes; its publish fails the lease check if the lease is still unconfirmed or lost.
      */
     private void leaseLost(LeaseManager.Lost lost) {
         Run r = current;
@@ -1113,6 +1115,7 @@ public final class WorkLoop implements Closeable {
                                  com.pharos.cluster.sharding.ReshardJob.Settings reshardSettings) {
         LeaseManager reshardLeases = new LeaseManager(store, layout, settings.node(), settings.leaseTtl(),
                 members::bucketNow, clock, id -> layout.reshardLeaseKey(id.value()));
+        reshardLeases.onLost(this::reshardLeaseLost);
         this.reshard = new com.pharos.cluster.sharding.ReshardJob(settings.node(), store, layout, catalog, publisher,
                 replicas, writerState, indexer, lucene, reshardLeases, readers, gc, clock, reshardSettings);
         synchronized (stopMu) {
@@ -1132,6 +1135,17 @@ public final class WorkLoop implements Closeable {
         reshardRenewer.scheduleWithFixedDelay(this::renewReshardLeasesQuietly, every, every, TimeUnit.MILLISECONDS);
     }
 
+    /** The reshard lease of a project was seen lost: a definite loss aborts that project's build. */
+    private void reshardLeaseLost(LeaseManager.Lost lost) {
+        if (!lost.definite()) return; // re-read every reshard renewal round (renewReshardLeases)
+        Run r = current;
+        if (r != null && r.shard.equals(lost.shard())
+                && r.abort.request("writer " + settings.node() + " lost the reshard lease of " + lost.shard())) {
+            log.warn("Reshard of project {}: writer {} lost its reshard lease ({}); aborting the build at its next"
+                    + " safe point", lost.shard(), settings.node(), lost.why());
+        }
+    }
+
     private void renewReshardLeasesQuietly() {
         try {
             renewReshardLeases();
@@ -1146,12 +1160,15 @@ public final class WorkLoop implements Closeable {
      * or gone) the running build of that project is aborted and the reshard lease released at once, so
      * the writer that holds the project now takes the reshard over without waiting out the TTL. A unit
      * whose leases are only unconfirmed (a renewal's I/O error or deadline: most likely still ours, as
-     * for a run, see {@link #leaseLost}) keeps its build and its reshard lease; the build's publish
-     * re-checks the unit's leases, and the next tick reclaims or drops the unit.
+     * for a run, see {@link #leaseLost}) keeps its build and its reshard lease: the lease manager's
+     * renewal round re-reads those leases and either reclaims them (the build stages and flips) or finds
+     * one taken, a definite loss, which the next round here acts on as above. An unconfirmed reshard
+     * lease is re-read here the same way first.
      */
     void renewReshardLeases() {
         com.pharos.cluster.sharding.ReshardJob job = reshard;
         if (job == null) return;
+        job.leases().reconfirmUnconfirmed();
         for (Lease l : job.leases().held()) {
             ShardId unit = l.shard();
             if (unitHeld(unit)) {
@@ -1780,7 +1797,8 @@ public final class WorkLoop implements Closeable {
         return members.live();
     }
 
-    LeaseManager leaseManager() {
+    /** The shard leases of this writer (tests, diagnostics). */
+    public LeaseManager leaseManager() {
         return leases;
     }
 

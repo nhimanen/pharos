@@ -153,4 +153,41 @@ class ReshardLeaseRenewalTest {
         assertThat(store.get(layout.reshardLeaseKey("lib")).orElseThrow().etag())
                 .as("and renewed").isNotEqualTo(etag);
     }
+
+    /**
+     * 1.11.0 review: an unconfirmed loss of the project's shard lease was never re-read during the
+     * build, so a takeover after it went unseen: the build ran on and kept the reshard lease, which
+     * blocked the project's new owner for the whole build. The renewer re-reads the lease, sees the
+     * takeover as a definite loss, and the reshard renewer then aborts the build and releases the
+     * reshard lease within one renewal interval.
+     */
+    @Test
+    void anUnconfirmedLossThenATakeoverAbortsTheBuildAndReleasesTheReshardLease() throws Exception {
+        ReshardJob job = loop.reshardJob().orElseThrow();
+        assertThat(job.leases().tryAcquire(UNIT)).isPresent();
+        IndexAbort build = loop.runningForTest(UNIT);
+
+        store.failPutIfMatchOn(layout.leaseKey(UNIT)); // the shard lease's renewals get no answer
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (!loop.leaseManager().lostUnconfirmed(UNIT) && System.nanoTime() < deadline) Thread.sleep(20);
+        assertThat(loop.leaseManager().lostUnconfirmed(UNIT)).as("the shard lease is unconfirmed").isTrue();
+        assertThat(build.requested()).isFalse();
+
+        // another writer takes the project meanwhile; then the bucket answers again
+        store.put(layout.leaseKey(UNIT), "{\"writer\":\"w2\",\"released\":false}".getBytes(StandardCharsets.UTF_8));
+        store.release();
+
+        long interval = TTL.dividedBy(3).toMillis();
+        deadline = System.nanoTime() + (interval + 1000) * 1_000_000L; // the next renewal round
+        while (loop.leaseManager().lostUnconfirmed(UNIT) && System.nanoTime() < deadline) Thread.sleep(20);
+        assertThat(loop.leaseManager().lostUnconfirmed(UNIT)).as("seen as a definite loss").isFalse();
+        deadline = System.nanoTime() + (interval + 1000) * 1_000_000L; // then one reshard renewal interval
+        while (job.leases().isHeld(UNIT) && System.nanoTime() < deadline) Thread.sleep(20);
+        assertThat(job.leases().isHeld(UNIT)).as("the reshard lease is released").isFalse();
+        assertThat(build.requested()).as("the running build is aborted").isTrue();
+
+        LeaseManager b = new LeaseManager(store, layout, "w2", TTL, LeaseManager.BucketNow.NONE, Clock.systemUTC(),
+                id -> layout.reshardLeaseKey(id.value()));
+        assertThat(b.tryAcquire(UNIT)).as("the new owner takes the reshard at once").isPresent();
+    }
 }

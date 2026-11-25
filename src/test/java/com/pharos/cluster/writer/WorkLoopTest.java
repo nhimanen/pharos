@@ -1383,6 +1383,84 @@ class WorkLoopTest {
     }
 
     /**
+     * 1.11.0 review: an unconfirmed loss was never re-read during a run (the renewer skipped it; only
+     * a tick reclaims it, and no tick runs during a run), so a bucket stall longer than the TTL cost
+     * the run its publish. A later renewal round reclaims the untouched lease: the same run publishes.
+     */
+    @Test
+    void aStallPastTheTtlDuringALongRunIsReclaimedAndTheRunPublishes() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Generation before = latest(s).orElseThrow();
+        change(s, "slow");
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.failPutIfMatchOn(layout.leaseKey(s)); // one renewal gets no answer
+        a.loop.leaseManager().renewAll();
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).isTrue();
+        clock.advance(TTL.toSeconds() + 10); // the stall outlasts the lease's TTL
+        a.loop.leaseManager().renewAll();
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).as("still unanswered").isTrue();
+        store.release();
+        a.loop.leaseManager().renewAll(); // a later renewal gets an answer
+
+        assertThat(a.loop.leaseManager().isHeld(s)).as("reclaimed during the run").isTrue();
+        parser.armed.set(false);
+        parser.finish = true;
+        runner.join(30_000);
+        assertThat(runner.isAlive()).isFalse();
+        assertThat(parser.aborted).isFalse();
+        assertThat(latest(s).orElseThrow().value()).as("the same run published").isGreaterThan(before.value());
+        assertThat(warnings()).noneMatch(m -> m.contains("aborting the run"));
+    }
+
+    /**
+     * An unconfirmed loss followed by another writer taking the lease: the next renewal round that
+     * reads the bucket sees the takeover as a definite loss and aborts the run, instead of the run
+     * working on to a publish that can only fail.
+     */
+    @Test
+    void anUnconfirmedLossThenATakeoverAbortsTheRun() throws Exception {
+        ShardId s = pathShard("solo");
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Optional<Generation> before = latest(s);
+        change(s, "slow");
+        Files.writeString(a.lucene.getProjectIndexDir(s.value()).resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        store.failPutIfMatchOn(layout.leaseKey(s));
+        a.loop.leaseManager().renewAll();
+        Thread.sleep(300);
+        assertThat(parser.aborted).as("not aborted on the ambiguous failure").isFalse();
+
+        // another writer takes the lease meanwhile; then the bucket answers again
+        store.put(layout.leaseKey(s), "{\"writer\":\"node-x\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        store.release();
+        a.loop.leaseManager().renewAll();
+
+        runner.join(10_000);
+        assertThat(runner.isAlive()).as("the run stopped").isFalse();
+        assertThat(parser.aborted).as("aborted inside its parse").isTrue();
+        assertThat(latest(s)).isEqualTo(before);
+        assertThat(a.loop.leaseManager().lostUnconfirmed(s)).as("a definite loss now").isFalse();
+    }
+
+    /**
      * A parser whose parse of the armed run takes up to 30 s, checking the run's abort every 10 ms
      * like {@link JavaCodeParser} does between files.
      */
