@@ -4,6 +4,11 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# The index format this build writes, and N-1 (still served, "upgrade-available"), read from the source so the
+# fixtures follow an INDEX_FORMAT bump instead of hard-coding one.
+INDEX_FORMAT="$(sed -n 's/.*int INDEX_FORMAT = \([0-9][0-9]*\);.*/\1/p' "$REPO/src/main/java/com/pharos/indexer/IndexVersions.java")"
+[ -n "$INDEX_FORMAT" ] || { echo "test-setup: cannot read INDEX_FORMAT from IndexVersions.java" >&2; exit 1; }
+FORMAT_N1=$((INDEX_FORMAT - 1))
 SETUP="${SETUP:-$REPO/setup.sh}"
 JAR="$(ls "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v original | sort -V | tail -1 || true)"
 if [ -z "$JAR" ]; then
@@ -122,7 +127,7 @@ t_corrupt_checksum_aborts_without_touching_install() {
   check corrupt_checksum_aborts_without_touching_install $? "rc=$(rc "$h")"
 }
 
-# Blocking path: stamp format -1 is two behind INDEX_FORMAT=1 (MIN_READABLE_FORMAT=0) -> outdated.
+# Blocking path: stamp format -1 is older than N-1 (MIN_READABLE_FORMAT = INDEX_FORMAT - 1) -> outdated.
 t_warning_lists_outdated_projects_and_declines_noninteractive() {
   local h; h="$(new_home)"; preinstall "$h"
   register_project "$h" brokenproj -1
@@ -141,10 +146,10 @@ t_yes_installs_despite_outdated() {
   check yes_installs_despite_outdated $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
 }
 
-# N-1 (unstamped = format 0 = upgrade-available): listed as searchable, no prompt needed.
+# N-1 (format INDEX_FORMAT-1 = upgrade-available): listed as searchable, no prompt needed.
 t_searchable_only_installs_without_prompt() {
   local h; h="$(new_home)"; preinstall "$h"
-  register_project "$h" oldish none
+  register_project "$h" oldish "$FORMAT_N1"
   run_setup "$h" --release "$TAG"
   [ "$(rc "$h")" = 0 ] && grep -q oldish "$h/out.txt" && grep -qi 'searchable' "$h/out.txt"
   check searchable_only_installs_without_prompt $? "rc=$(rc "$h"); $(tail -8 "$h/out.txt")"
@@ -273,7 +278,7 @@ t_upgrade_indexes_refused_on_work_queue_writer() {
 # --release on a reader: the index-status warning points at the writer, not at --upgrade-indexes.
 t_release_on_reader_points_upgrades_at_the_writer() {
   local h; h="$(new_home)"; preinstall "$h"
-  register_project "$h" oldish none
+  register_project "$h" oldish "$FORMAT_N1"
   reader_config "$h"
   # a reader's registry lives in its cluster cache dir (default ~/.pharos/cluster-cache)
   mkdir -p "$h/.pharos/cluster-cache"
