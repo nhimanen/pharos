@@ -3,6 +3,84 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.9.0] - 2026-11-24
+
+**Index format:** 1 (unchanged)
+
+Multi-node Phase 4: work-queue writers. Writers take shards from the catalog under leases, poll each
+shard's source (a git remote or a shared directory), index and publish its changes on their own, share the
+shards among however many writers run, and take over a dead writer's shards with its writer state restored
+from the bucket (Phase 4 gate: a writer killed mid-commit or mid-embed was replaced within 25–31 s, the resume
+re-embedded only the changed files, 51 changes over scaling 1→4→1 writers were each published exactly once,
+0 of 23 881 queries failed). New: a writer disk guard, `/cluster/status` with an SSE stream and a webhook for
+scaling proposals, and a **Cluster** page in the web UI. **Single-node installs are unaffected** (they gain the
+Cluster page, showing one node). No re-index.
+
+**Behaviour change for cluster writers: `role: writer` now defaults to the work queue**
+(`cluster.writer.workQueue: true`). A writer config without the key no longer accepts hand-run
+`pharos index` / `pharos publish`; add `"writer": {"workQueue": false}` to keep indexing by hand. Its
+`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds` (30), or it does not start. Read
+UPGRADING.md ("Upgrading to 1.9.0") before restarting writers.
+
+### Added (multi-node Phase 4: work-queue writers)
+- Work-queue writers (README "Work-queue writers"): `role: writer` nodes take shards from the
+  catalog under leases (`cluster.writer.leaseTtlSeconds`, 30), detect source changes every
+  `pollSeconds` at a fixed rate, also during runs (`pharos index|publish --source-git <url> --ref
+  <ref>` or `--source-path` record the source; `--no-embed` is recorded as `"embed": false` and
+  work-queue runs of that shard skip embeddings), publish changes, share shards
+  (`minHoldSeconds`, 120) and take over a dead writer's shards with its writer state restored from
+  the bucket. Writer disk guard (`cluster.writer.disk`), `/cluster/status`, `/cluster/events`, a
+  webhook for scaling proposals (`cluster.status`) and the Cluster page. A writer's `pharos web`
+  no longer loads the search models.
+
+### Changed (upgrade note)
+- `cluster.writer.workQueue` defaults to `true` on `role: writer` (after the Phase 4 gate). A
+  writer config without the key now runs the work queue and refuses hand-run `pharos index` /
+  `pharos publish` (exit 2); add `"writer": {"workQueue": false}` to keep indexing and publishing
+  by hand. On a work-queue writer `remove-index` and `embed` are refused too (exit 2), and
+  `upgrade-indexes` / `./setup.sh --upgrade-indexes` (exit 5): restarting the writer on a new
+  release upgrades it, because its work loop gives a full run (and a re-publish) to every held shard
+  whose local or published index format, chunking version or model is out of date.
+- `cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds` (default 30) on a
+  work-queue writer, validated at startup: a Phase 1–3 writer config with `heartbeatSeconds` of 30
+  or more stops starting after the upgrade until it is lowered.
+- `cluster.writer.disk.minFreePercent` defaults to 0 (was 10): the threshold is `minFreeBytes`
+  (5 GiB), so a writer on a large disk no longer stays "low" and publishes nothing. A low writer
+  logs a WARN once per low episode.
+- Only one process per writer node runs the work loop (`<workDir>/.work-loop.lock`); another daemon
+  with the same config (e.g. one `./pharos` auto-starts) logs a WARN and serves without a loop.
+- Synonyms: a publish replaces only its own shard's section of the cluster's `synonyms.txt`
+  (conditional read-modify-write), so writers holding different shards no longer drop each other's
+  rules, and every reader serves the same file.
+- `git ls-remote` of a work-queue source is killed (with its helper processes) after
+  `cluster.writer.lsRemoteTimeoutSeconds` (default 30); an unreachable remote stalls only its own
+  shard, and its failed polls count toward `maxConsecutiveFailures`.
+- A takeover that restores a generation with an older writer-state backup (the newest one was lost)
+  runs a full index, so documents of files deleted since never stay behind.
+- A writer's graceful stop is bounded when the bucket is slow or hangs (gate run 2: two writers
+  needed SIGKILL 120 s after SIGTERM): the stopping heartbeat, the lease releases and the heartbeat
+  delete each have a deadline, so a stop ends within `cluster.drainSeconds` + 10 s and logs each call
+  it gave up on. A lease taken by another writer aborts that shard's run (a renewal that merely
+  timed out does not), and a full run's parse checks the abort between files (it could only stop after the parser's last file).
+- Object-store calls are bounded (new `cluster.objectStore.callAttemptTimeoutSeconds`, default 20,
+  `callTimeoutSeconds`, default 60, and `uploadMinBytesPerSecond`, default 1 MiB/s): a heartbeat put
+  on the gate's saturated MinIO took about 4 minutes (three 30 s socket timeouts). Uploads get the
+  call bounds plus their size at the minimum rate, so large generation uploads are not cut; a
+  download's body stays bounded by the 30 s idle-read timeout.
+- A reader's SIGTERM drain is bounded on a slow bucket too (the same pattern, also in 1.8.1): the
+  draining heartbeat waits at most 5 s (and never past `drainSeconds`) for a tick stuck on the
+  bucket and for its put, the heartbeat delete on close at most 5 s, and each call given up on is
+  logged (`Stopping: gave up …`); the drain's `drainSeconds` now includes the announce.
+
+### Maintainers
+- Phase 4 gate (`scripts/cluster-gate-phase4.sh`): ports (`GATE_MINIO_PORT`, `GATE_MINIO_CONSOLE_PORT`,
+  `GATE_ROUTER_PORT`, `GATE_WEBHOOK_PORT`, `GATE_R1_PORT`/`GATE_R2_PORT`, `GATE_W1_PORT`..`GATE_W6_PORT`,
+  `GATE_WLOW_PORT`), sources (`GATE_LUCENE_SRC`, `GATE_PHAROS_SRC`), `GATE_MODELS_SRC` and an optional
+  embedding-cache seed (`GATE_SEED_FROM`) are configurable, with a bounded port probe and curl connects
+  (`GATE_PORT_PROBE_TIMEOUT`). `GATE_KEYWORD_ONLY=1` runs failover, scaling, status and the disk guard with no
+  embedding model on any node (K2 then kills the `GATE_K2_SHARD` holder in `GATE_K2_PHASE`). Run it under
+  `scripts/gate-watchdog.sh`. Defaults are unchanged.
+
 ## [1.8.1] - 2026-11-24
 
 **Index format:** 1 (unchanged)

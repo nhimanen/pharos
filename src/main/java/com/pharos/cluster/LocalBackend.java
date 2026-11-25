@@ -24,5 +24,8 @@ public class LocalBackend implements ReplicationBackend {
         throw new UnsupportedOperationException("the local backend has no replica source");
     }
 
+    /** Single node: no writer state is backed up (byte-identical single-node behaviour). */
+    @Override public WriterStateStore writerState() { return WriterStateStore.NONE; }
+
     @Override public void close() {}
 }

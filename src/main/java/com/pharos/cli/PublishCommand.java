@@ -24,7 +24,7 @@ import java.util.concurrent.Callable;
 /**
  * Publishes a project's committed local index to the object store without re-indexing: the
  * retry after {@code pharos index} exited with code 3. Exit codes: 0 published, 1 not indexed,
- * 2 wrong node role, 3 publish failed, 4 the local index is not publishable as it is (its call
+ * 2 wrong node role or unusable source options, 3 publish failed, 4 the local index is not publishable as it is (its call
  * graph pointer is broken, or its index format is not this build's: re-index first).
  */
 @Command(
@@ -36,6 +36,14 @@ public class PublishCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Project name (as shown in 'pharos projects')")
     private String projectName;
+
+    @Mixin
+    private SourceOptions sourceOptions = new SourceOptions();
+
+    @picocli.CommandLine.Option(names = "--no-embed",
+            description = "With --source-git or --source-path: record that work-queue writers index this project"
+                    + " without embeddings (\"embed\": false), as 'pharos index --no-embed' records it")
+    private boolean noEmbed;
 
     private final IndexConfig config;
     private final ProjectRegistry registry;
@@ -53,6 +61,22 @@ public class PublishCommand implements Callable<Integer> {
             RoleGuard.requireWriter(config, "pharos publish");
         } catch (IllegalStateException e) {
             System.err.println(e.getMessage());
+            return 2;
+        }
+        Optional<String> refusal = runtime.manualPublishRefusal(projectName);
+        if (refusal.isPresent()) {
+            System.err.println("Not publishing " + projectName + ": " + refusal.get());
+            return 2;
+        }
+        Optional<com.pharos.cluster.ShardSource> source;
+        try {
+            source = sourceOptions.source(runtime).map(src -> src.withEmbed(!noEmbed));
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            return 2;
+        }
+        if (noEmbed && source.isEmpty()) {
+            System.err.println("--no-embed records how writers index the source: it needs --source-git or --source-path");
             return 2;
         }
         Optional<ProjectMeta> meta = registry.find(projectName);
@@ -78,6 +102,7 @@ public class PublishCommand implements Callable<Integer> {
             } else {
                 System.out.println("published " + projectName + " generation " + gen.get().value());
             }
+            if (source.isPresent()) SourceOptions.record(runtime, projectName, source.get());
             return 0;
         } catch (IllegalArgumentException e) { // project name unusable as a shard id
             System.err.println("Publishing " + projectName + " failed: " + e.getMessage());

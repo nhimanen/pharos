@@ -1,6 +1,8 @@
 package com.pharos.cluster.membership;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pharos.cluster.BoundedCall;
+import com.pharos.cluster.objectstore.BucketClock;
 import com.pharos.cluster.objectstore.ObjectInfo;
 import com.pharos.cluster.objectstore.ObjectStore;
 import com.pharos.cluster.objectstore.ObjectStoreLayout;
@@ -19,6 +21,7 @@ import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
@@ -50,11 +53,13 @@ public final class ReaderRegistry implements Closeable {
     private final String key;
     private final long startedAt = System.currentTimeMillis();
     /** Guards writes, refreshes and close: after close() nothing writes our object again. */
-    private final Object mu = new Object();
+    /** Serialises the ticks (held across their store calls); shutdown waits for it only so long. */
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Object mu = new Object(); // guards scheduler; never held across a store call
     private volatile List<LiveReader> live = List.of();
     private volatile boolean lastWriteOk;
-    private boolean draining;      // under mu
-    private boolean closed;        // under mu
+    private volatile boolean draining;
+    private volatile boolean closed;
     private long lastWarn = System.nanoTime() - WARN_EVERY_NANOS;
     private ScheduledExecutorService scheduler;
 
@@ -93,20 +98,59 @@ public final class ReaderRegistry implements Closeable {
 
     /** One heartbeat: write our object, then refresh the live list. Never throws. */
     void tick() {
-        synchronized (mu) {
+        lock.lock();
+        try {
             if (closed) return;
             write();
+            if (closed) {
+                // closed while the put was in flight: its delete may have run first
+                if (self != null && lastWriteOk) deleteQuietly();
+                return;
+            }
             refresh();
+        } finally {
+            lock.unlock();
         }
     }
 
-    /** Marks this reader draining and publishes that at once. */
+    /** The deadline of {@link #drain()} and of {@link #close()}'s heartbeat delete. */
+    static final Duration DEFAULT_SHUTDOWN_CALL = Duration.ofSeconds(5);
+
+    /** {@link #drain(Duration)} within {@link #DEFAULT_SHUTDOWN_CALL}. */
     public void drain() {
-        synchronized (mu) {
-            if (closed || self == null) return;
-            draining = true;
-            write();
-            refresh();
+        drain(DEFAULT_SHUTDOWN_CALL);
+    }
+
+    /**
+     * Marks this reader draining and publishes that at once. Waits for a tick in progress and for
+     * the write only until {@code timeout}, then gives up with a WARN: the next tick carries
+     * {@code draining} (the flag is set first), and the heartbeat is removed on close or expires.
+     * Never throws.
+     */
+    public void drain(Duration timeout) {
+        if (closed || self == null) return;
+        draining = true;
+        long deadline = System.nanoTime() + Math.max(0, timeout.toNanos());
+        try {
+            if (!lock.tryLock(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS)) {
+                log.warn("Stopping: gave up announcing draining in the reader heartbeat {}: a heartbeat write has been"
+                        + " in progress for over {} ms (the bucket is slow)", key, BoundedCall.millis(timeout));
+                return;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        try {
+            if (closed) return;
+            ReaderHeartbeat hb = self.get();
+            byte[] body = MAPPER.writeValueAsBytes(hb.with(true, startedAt));
+            BoundedCall.call("put " + key, BoundedCall.until(deadline), () -> store.put(key, body));
+            lastWriteOk = true;
+        } catch (IOException | RuntimeException e) {
+            log.warn("Stopping: gave up announcing draining in the reader heartbeat {}: {}", key, e.toString());
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -120,7 +164,7 @@ public final class ReaderRegistry implements Closeable {
         return live;
     }
 
-    // Holding mu.
+    // Holding the lock.
     private void write() {
         if (closed || self == null) return;
         try {
@@ -129,7 +173,7 @@ public final class ReaderRegistry implements Closeable {
             lastWriteOk = true;
         } catch (IOException | RuntimeException e) {
             lastWriteOk = false;
-            log.warn("Writing the reader heartbeat {} failed (retrying next tick): {}", key, e.toString());
+            if (!closed) log.warn("Writing the reader heartbeat {} failed (retrying next tick): {}", key, e.toString());
         }
     }
 
@@ -141,7 +185,7 @@ public final class ReaderRegistry implements Closeable {
         }
     }
 
-    // Holding mu. Liveness is measured against this node's own heartbeat object (the bucket's clock),
+    // Holding the lock. Liveness is measured against this node's own heartbeat object (the bucket's clock),
     // and only when our latest write succeeded: otherwise we cannot tell "peers are dead" from
     // "the bucket is unreachable", so the previous list stays.
     void refresh() {
@@ -152,10 +196,7 @@ public final class ReaderRegistry implements Closeable {
         try {
             List<ObjectInfo> infos = store.list(layout.readersPrefix()).stream()
                     .filter(i -> i.key().endsWith(".json") && i.lastModified() != null).toList();
-            Instant now = self == null
-                    ? infos.stream().map(ObjectInfo::lastModified).max(Comparator.naturalOrder()).orElse(null)
-                    : infos.stream().filter(i -> i.key().equals(key)).map(ObjectInfo::lastModified)
-                            .findFirst().orElse(null);
+            Instant now = BucketClock.nowFrom(infos, self == null ? null : key).orElse(null);
             if (now == null && self == null) {
                 live = List.of(); // no reader announces itself
                 return;
@@ -166,9 +207,9 @@ public final class ReaderRegistry implements Closeable {
             }
             Duration ttl = Duration.ofSeconds(cfg.getReaderTtlSeconds());
             List<LiveReader> out = new ArrayList<>();
-            for (ObjectInfo info : infos) {
-                Duration age = Duration.between(info.lastModified(), now);
-                if (age.compareTo(ttl) > 0) continue;
+            for (BucketClock.Aged aged : BucketClock.unexpired(infos, now, ttl)) {
+                ObjectInfo info = aged.info();
+                Duration age = aged.age();
                 try {
                     store.get(info.key()).ifPresent(o -> {
                         try {
@@ -189,35 +230,46 @@ public final class ReaderRegistry implements Closeable {
         }
     }
 
-    /** Stops the heartbeat and removes our object so peers drop this reader at once. */
+    /** {@link #close(Duration)} within {@link #DEFAULT_SHUTDOWN_CALL}. */
     @Override
     public void close() {
+        close(DEFAULT_SHUTDOWN_CALL);
+    }
+
+    /**
+     * Stops the heartbeat and removes our object so peers drop this reader at once. A tick stuck on
+     * the bucket is abandoned (its thread is a daemon; if its put lands later, it deletes what it
+     * wrote), and the delete gives up at {@code within} with a WARN: the heartbeat then expires after
+     * the TTL. Idempotent; returns within {@code within}.
+     */
+    public void close(Duration within) {
+        long deadline = System.nanoTime() + Math.max(0, within.toNanos());
         ScheduledExecutorService s;
         synchronized (mu) {
             if (closed) return;
-            closed = true; // an in-flight tick finished first (it holds mu); later ones return at once
+            closed = true; // later ticks return at once; one in flight deletes what it wrote
             s = scheduler;
             scheduler = null;
         }
-        if (s != null) {
-            s.shutdownNow();
-            try {
-                s.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        synchronized (mu) {
-            if (self == null) { // an observer owns no object
-                live = List.of();
-                return;
-            }
-            try {
+        if (s != null) s.shutdownNow(); // a tick blocked in a socket read ignores the interrupt: not awaited
+        live = List.of();
+        if (self == null) return; // an observer owns no object
+        try {
+            BoundedCall.call("delete " + key, BoundedCall.until(deadline), () -> {
                 store.delete(key);
-            } catch (IOException | RuntimeException e) {
-                log.warn("Removing the reader heartbeat {} failed (it expires after the TTL): {}", key, e.toString());
-            }
-            live = List.of();
+                return null;
+            });
+        } catch (IOException | RuntimeException e) {
+            log.warn("Stopping: gave up removing the reader heartbeat {} (it expires after {} s): {}", key,
+                    cfg.getReaderTtlSeconds(), e.toString());
+        }
+    }
+
+    private void deleteQuietly() {
+        try {
+            store.delete(key);
+        } catch (IOException | RuntimeException e) {
+            log.debug("Removing the reader heartbeat {} after a late tick failed: {}", key, e.toString());
         }
     }
 }

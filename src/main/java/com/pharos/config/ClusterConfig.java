@@ -32,6 +32,9 @@ public class ClusterConfig {
     private int retentionMinutes = 60;
     private ObjectStoreConfig objectStore = new ObjectStoreConfig();
     private ReaderConfig reader = new ReaderConfig();
+    private WriterConfig writer = new WriterConfig();
+    /** {@code /cluster/status}: proposal targets and windows, the events keep-alive and the webhook. */
+    private StatusConfig status = new StatusConfig();
     /** Base URL other nodes reach this reader at; required on readers. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String advertiseUrl;
@@ -156,6 +159,12 @@ public class ClusterConfig {
             throw new IllegalStateException("cluster.readerTtlSeconds must exceed cluster.heartbeatSeconds ("
                     + heartbeatSeconds + "), got " + readerTtlSeconds);
         }
+        if (role == NodeRole.WRITER && writer.isWorkQueue() && heartbeatSeconds >= writer.getLeaseTtlSeconds()) {
+            // a writer's heartbeat is its liveness (TTL = the lease TTL) and the bucket's clock for its leases
+            throw new IllegalStateException("cluster.heartbeatSeconds (" + heartbeatSeconds
+                    + ") must be below cluster.writer.leaseTtlSeconds (" + writer.getLeaseTtlSeconds()
+                    + ") in work-queue mode");
+        }
         if (role == NodeRole.READER) {
             if (advertiseUrl == null || advertiseUrl.isBlank()) {
                 throw new IllegalStateException("cluster.advertiseUrl is required on a reader (the base URL other nodes reach it at)");
@@ -177,6 +186,10 @@ public class ClusterConfig {
         }
         if (reader == null) reader = new ReaderConfig();
         reader.validate();
+        if (writer == null) writer = new WriterConfig();
+        writer.validate();
+        if (status == null) status = new StatusConfig();
+        status.validate();
         if (backend == BackendKind.OBJECT_STORE) {
             objectStore.validate();
             String prefix = objectStore.getPrefix();
@@ -220,7 +233,11 @@ public class ClusterConfig {
     public ObjectStoreConfig getObjectStore() { return objectStore; }
     public void setObjectStore(ObjectStoreConfig objectStore) { this.objectStore = objectStore; }
     public ReaderConfig getReader() { return reader; }
+    public WriterConfig getWriter() { return writer; }
+    public void setWriter(WriterConfig writer) { this.writer = writer == null ? new WriterConfig() : writer; }
     public void setReader(ReaderConfig reader) { this.reader = reader; }
+    public StatusConfig getStatus() { return status; }
+    public void setStatus(StatusConfig status) { this.status = status == null ? new StatusConfig() : status; }
     public int getDrainSeconds() { return drainSeconds; }
     public void setDrainSeconds(int v) { this.drainSeconds = v; }
     public String getAdvertiseUrl() { return advertiseUrl; }
@@ -343,6 +360,138 @@ public class ClusterConfig {
         public void setMaxConcurrentFetches(int v) { this.maxConcurrentFetches = v; }
     }
 
+    /**
+     * {@code cluster.writer}: where a writer keeps source checkouts and how it follows sources.
+     * Only writer nodes use it.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class WriterConfig {
+        private Path workDir = IndexConfig.DEFAULT_BASE.resolve("work");
+        /** How often a writer polls a shard's source (git ls-remote, directory state) for changes. */
+        private int pollSeconds = 60;
+        /**
+         * Work-queue mode (leases, takeover, source polling): the default on {@code role: writer}
+         * since the Phase 4 gate. {@code false} keeps the hand-run writer (index and publish by
+         * hand under an implicit lease). Ignored on every other role.
+         */
+        private boolean workQueue = true;
+        /**
+         * Lease TTL in work-queue mode. A lease whose last write (by the bucket's LastModified) is
+         * older than this may be taken over; the holder renews every TTL/3.
+         */
+        private int leaseTtlSeconds = 30;
+        /**
+         * Work-queue mode: a lease this writer acquired is never released for balance within this
+         * many seconds of acquiring it (and only right after a publish of that shard, or when it has
+         * nothing unpublished), so leases don't bounce while writers join and leave.
+         */
+        private int minHoldSeconds = 120;
+        /**
+         * Work-queue mode: after this many consecutive failed runs of a surplus shard (not pinned,
+         * held at least {@code minHoldSeconds}) the writer releases it so another writer can try.
+         */
+        private int maxConsecutiveFailures = 3;
+        /**
+         * Work-queue mode: a change check's {@code git ls-remote} is killed (with its transport
+         * helpers) after this many seconds, so an unreachable remote stalls only its own shard.
+         */
+        private int lsRemoteTimeoutSeconds = 30;
+        /** Work-queue mode: the disk guard ({@code cluster.writer.disk}). */
+        private DiskConfig disk = new DiskConfig();
+
+        static final int MIN_LEASE_TTL_SECONDS = 5;
+
+        public void validate() {
+            if (leaseTtlSeconds < MIN_LEASE_TTL_SECONDS) {
+                throw new IllegalStateException("cluster.writer.leaseTtlSeconds must be at least "
+                        + MIN_LEASE_TTL_SECONDS + ", got " + leaseTtlSeconds);
+            }
+            if (workDir == null) {
+                throw new IllegalStateException("cluster.writer.workDir must not be empty");
+            }
+            if (pollSeconds <= 0) {
+                throw new IllegalStateException("cluster.writer.pollSeconds must be positive, got " + pollSeconds);
+            }
+            if (minHoldSeconds < 0) {
+                throw new IllegalStateException("cluster.writer.minHoldSeconds must not be negative, got " + minHoldSeconds);
+            }
+            if (maxConsecutiveFailures < 1) {
+                throw new IllegalStateException("cluster.writer.maxConsecutiveFailures must be at least 1, got "
+                        + maxConsecutiveFailures);
+            }
+            if (lsRemoteTimeoutSeconds < 1) {
+                throw new IllegalStateException("cluster.writer.lsRemoteTimeoutSeconds must be at least 1, got "
+                        + lsRemoteTimeoutSeconds);
+            }
+            if (disk == null) disk = new DiskConfig();
+            disk.validate();
+        }
+
+        public Path getWorkDir() { return workDir; }
+        public void setWorkDir(Path workDir) { this.workDir = workDir; }
+        public int getPollSeconds() { return pollSeconds; }
+        public void setPollSeconds(int v) { this.pollSeconds = v; }
+        public boolean isWorkQueue() { return workQueue; }
+        public void setWorkQueue(boolean v) { this.workQueue = v; }
+        public int getLeaseTtlSeconds() { return leaseTtlSeconds; }
+        public void setLeaseTtlSeconds(int v) { this.leaseTtlSeconds = v; }
+        public int getMinHoldSeconds() { return minHoldSeconds; }
+        public void setMinHoldSeconds(int v) { this.minHoldSeconds = v; }
+        public int getMaxConsecutiveFailures() { return maxConsecutiveFailures; }
+        public void setMaxConsecutiveFailures(int v) { this.maxConsecutiveFailures = v; }
+        public int getLsRemoteTimeoutSeconds() { return lsRemoteTimeoutSeconds; }
+        public void setLsRemoteTimeoutSeconds(int v) { this.lsRemoteTimeoutSeconds = v; }
+        public DiskConfig getDisk() { return disk; }
+        public void setDisk(DiskConfig disk) { this.disk = disk == null ? new DiskConfig() : disk; }
+
+        /** {@code leaseTtlSeconds}. */
+        public java.time.Duration leaseTtl() { return java.time.Duration.ofSeconds(leaseTtlSeconds); }
+
+        /** How often a held lease is renewed: TTL/3. */
+        public java.time.Duration leaseRenewInterval() { return leaseTtl().dividedBy(3); }
+    }
+
+    /**
+     * {@code cluster.writer.disk}: the writer disk guard. A watched file store is <i>low</i> when its
+     * free space is below {@code minFreeBytes} or below {@code minFreePercent} of its size; it is
+     * no longer low once free space is back above that threshold plus {@code hysteresisBytes}.
+     * The guard probes every {@code checkSeconds}. {@code minFreePercent} defaults to 0: a
+     * percentage of a large disk (10 % of 2 TB is 200 GB) left upgraded writers permanently low.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DiskConfig {
+        private long minFreeBytes = 5L << 30;
+        private int minFreePercent = 0;
+        private int checkSeconds = 15;
+        private long hysteresisBytes = 1L << 30;
+
+        public void validate() {
+            if (minFreeBytes < 0) {
+                throw new IllegalStateException("cluster.writer.disk.minFreeBytes must not be negative, got " + minFreeBytes);
+            }
+            if (minFreePercent < 0 || minFreePercent > 100) {
+                throw new IllegalStateException("cluster.writer.disk.minFreePercent must be between 0 and 100, got "
+                        + minFreePercent);
+            }
+            if (checkSeconds <= 0) {
+                throw new IllegalStateException("cluster.writer.disk.checkSeconds must be positive, got " + checkSeconds);
+            }
+            if (hysteresisBytes < 0) {
+                throw new IllegalStateException("cluster.writer.disk.hysteresisBytes must not be negative, got "
+                        + hysteresisBytes);
+            }
+        }
+
+        public long getMinFreeBytes() { return minFreeBytes; }
+        public void setMinFreeBytes(long v) { this.minFreeBytes = v; }
+        public int getMinFreePercent() { return minFreePercent; }
+        public void setMinFreePercent(int v) { this.minFreePercent = v; }
+        public int getCheckSeconds() { return checkSeconds; }
+        public void setCheckSeconds(int v) { this.checkSeconds = v; }
+        public long getHysteresisBytes() { return hysteresisBytes; }
+        public void setHysteresisBytes(long v) { this.hysteresisBytes = v; }
+    }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ObjectStoreConfig {
         private String endpoint;
@@ -357,9 +506,29 @@ public class ClusterConfig {
          * timeouts); a whole call, retries included, gets {@value #READ_ATTEMPTS} times this.
          */
         private int readTimeoutSeconds = 10;
+        /**
+         * Bound of one attempt of every other call (heartbeats, leases, catalog and manifest reads,
+         * listings, deletes, the response headers of a whole-object download, an upload's request
+         * before its body is counted). A healthy bucket answers these in well under a second; 20 s
+         * leaves a saturated one room before the SDK retries.
+         */
+        private int callAttemptTimeoutSeconds = DEFAULT_CALL_ATTEMPT_TIMEOUT_SECONDS;
+        /** Bound of such a call with its retries (3 attempts): one hung call no longer takes minutes. */
+        private int callTimeoutSeconds = DEFAULT_CALL_TIMEOUT_SECONDS;
+        /**
+         * The slowest upload rate a healthy bucket is assumed to sustain. An upload (a single
+         * PutObject: Lucene segment and embedding-cache files can be gigabytes) gets the call bounds
+         * plus its size at this rate, per attempt and for the whole call, so a large generation upload
+         * on a slow bucket is never cut while a hung one still ends.
+         */
+        private long uploadMinBytesPerSecond = DEFAULT_UPLOAD_MIN_BYTES_PER_SECOND;
 
         static final int READ_ATTEMPTS = 3;
         static final int MAX_READ_TIMEOUT_SECONDS = 3600;
+        public static final int DEFAULT_CALL_ATTEMPT_TIMEOUT_SECONDS = 20;
+        public static final int DEFAULT_CALL_TIMEOUT_SECONDS = 60;
+        public static final long DEFAULT_UPLOAD_MIN_BYTES_PER_SECOND = 1L << 20; // 1 MiB/s
+        static final long MIN_UPLOAD_MIN_BYTES_PER_SECOND = 1024;
 
         /** @throws IllegalStateException naming the offending field */
         void validate() {
@@ -367,6 +536,42 @@ public class ClusterConfig {
                 throw new IllegalStateException("cluster.objectStore.readTimeoutSeconds must be between 1 and "
                         + MAX_READ_TIMEOUT_SECONDS + ", got " + readTimeoutSeconds);
             }
+            if (callAttemptTimeoutSeconds < 1 || callAttemptTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.callAttemptTimeoutSeconds must be between 1 and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + callAttemptTimeoutSeconds);
+            }
+            if (callTimeoutSeconds < callAttemptTimeoutSeconds || callTimeoutSeconds > MAX_READ_TIMEOUT_SECONDS) {
+                throw new IllegalStateException("cluster.objectStore.callTimeoutSeconds must be between"
+                        + " callAttemptTimeoutSeconds (" + callAttemptTimeoutSeconds + ") and "
+                        + MAX_READ_TIMEOUT_SECONDS + ", got " + callTimeoutSeconds);
+            }
+            if (uploadMinBytesPerSecond < MIN_UPLOAD_MIN_BYTES_PER_SECOND) {
+                throw new IllegalStateException("cluster.objectStore.uploadMinBytesPerSecond must be at least "
+                        + MIN_UPLOAD_MIN_BYTES_PER_SECOND + ", got " + uploadMinBytesPerSecond);
+            }
+        }
+
+        public int getCallAttemptTimeoutSeconds() { return callAttemptTimeoutSeconds; }
+        public void setCallAttemptTimeoutSeconds(int v) { this.callAttemptTimeoutSeconds = v; }
+        public int getCallTimeoutSeconds() { return callTimeoutSeconds; }
+        public void setCallTimeoutSeconds(int v) { this.callTimeoutSeconds = v; }
+        public long getUploadMinBytesPerSecond() { return uploadMinBytesPerSecond; }
+        public void setUploadMinBytesPerSecond(long v) { this.uploadMinBytesPerSecond = v; }
+
+        /** One attempt of a control-plane call: {@code callAttemptTimeoutSeconds}. */
+        public java.time.Duration callAttemptTimeout() {
+            return java.time.Duration.ofSeconds(callAttemptTimeoutSeconds);
+        }
+
+        /** A control-plane call with its retries: {@code callTimeoutSeconds}. */
+        public java.time.Duration callTotalTimeout() {
+            return java.time.Duration.ofSeconds(callTimeoutSeconds);
+        }
+
+        /** The time {@code bytes} take at {@code uploadMinBytesPerSecond}, rounded up to a second. */
+        public java.time.Duration uploadAllowance(long bytes) {
+            long rate = Math.max(MIN_UPLOAD_MIN_BYTES_PER_SECOND, uploadMinBytesPerSecond);
+            return java.time.Duration.ofSeconds((Math.max(0, bytes) + rate - 1) / rate);
         }
 
         public int getReadTimeoutSeconds() { return readTimeoutSeconds; }
@@ -396,5 +601,127 @@ public class ClusterConfig {
         public void setAccessKeyEnv(String v) { this.accessKeyEnv = v; }
         public String getSecretKeyEnv() { return secretKeyEnv; }
         public void setSecretKeyEnv(String v) { this.secretKeyEnv = v; }
+    }
+
+    /**
+     * {@code cluster.status}: what {@code /cluster/status} proposes and when.
+     * <ul>
+     *   <li>{@code targets.warmP95Millis} (default 500): a reader's p95 request latency target;</li>
+     *   <li>{@code targets.qpsPerReader} (default 50): the query rate one reader is sized for;</li>
+     *   <li>{@code targets.backlog} (default 600): seconds an unpublished source change may wait;</li>
+     *   <li>{@code windows.*Seconds}: how long a rule's condition must hold before its proposal is
+     *       raised (add readers 300, remove readers 1800, add writers 0, remove writers 1800, reshard 0,
+     *       writer disk 0), and {@code windows.clearGraceSeconds} (default 60) how long it must be
+     *       false before a raised proposal clears (or a pending condition resets);</li>
+     *   <li>{@code eventsKeepAliveSeconds} (default 15): the SSE keep-alive comment interval of
+     *       {@code /cluster/events} (the router cuts a stream idle for twice that);</li>
+     *   <li>{@code webhookUrl} (optional): receives every event as a JSON POST.</li>
+     * </ul>
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class StatusConfig {
+        private Targets targets = new Targets();
+        private Windows windows = new Windows();
+        private int eventsKeepAliveSeconds = 15;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private String webhookUrl;
+
+        static final int MAX_KEEP_ALIVE_SECONDS = 300;
+
+        public void validate() {
+            if (targets == null) targets = new Targets();
+            if (windows == null) windows = new Windows();
+            targets.validate();
+            windows.validate();
+            if (eventsKeepAliveSeconds < 1 || eventsKeepAliveSeconds > MAX_KEEP_ALIVE_SECONDS) {
+                throw new IllegalStateException("cluster.status.eventsKeepAliveSeconds must be between 1 and "
+                        + MAX_KEEP_ALIVE_SECONDS + ", got " + eventsKeepAliveSeconds);
+            }
+            if (webhookUrl != null && !webhookUrl.isBlank()) {
+                try {
+                    java.net.URI u = new java.net.URI(webhookUrl.trim());
+                    String scheme = u.getScheme();
+                    if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
+                            || u.getHost() == null) {
+                        throw new IllegalStateException("cluster.status.webhookUrl must be an http:// or https:// URL with a host");
+                    }
+                } catch (java.net.URISyntaxException e) {
+                    // never echo the value: it may carry a secret
+                    throw new IllegalStateException("cluster.status.webhookUrl is not a valid URL");
+                }
+            }
+        }
+
+        public Targets getTargets() { return targets; }
+        public void setTargets(Targets t) { this.targets = t == null ? new Targets() : t; }
+        public Windows getWindows() { return windows; }
+        public void setWindows(Windows w) { this.windows = w == null ? new Windows() : w; }
+        public int getEventsKeepAliveSeconds() { return eventsKeepAliveSeconds; }
+        public void setEventsKeepAliveSeconds(int v) { this.eventsKeepAliveSeconds = v; }
+        public String getWebhookUrl() { return webhookUrl; }
+        public void setWebhookUrl(String v) { this.webhookUrl = v; }
+    }
+
+    /** {@code cluster.status.targets}. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Targets {
+        private long warmP95Millis = 500;
+        private double qpsPerReader = 50;
+        /** Seconds the oldest unpublished source change of a shard may wait. */
+        private long backlog = 600;
+
+        void validate() {
+            if (warmP95Millis <= 0) {
+                throw new IllegalStateException("cluster.status.targets.warmP95Millis must be positive, got " + warmP95Millis);
+            }
+            if (!(qpsPerReader > 0) || Double.isInfinite(qpsPerReader)) {
+                throw new IllegalStateException("cluster.status.targets.qpsPerReader must be positive, got " + qpsPerReader);
+            }
+            if (backlog <= 0) {
+                throw new IllegalStateException("cluster.status.targets.backlog must be positive (seconds), got " + backlog);
+            }
+        }
+
+        public long getWarmP95Millis() { return warmP95Millis; }
+        public void setWarmP95Millis(long v) { this.warmP95Millis = v; }
+        public double getQpsPerReader() { return qpsPerReader; }
+        public void setQpsPerReader(double v) { this.qpsPerReader = v; }
+        public long getBacklog() { return backlog; }
+        public void setBacklog(long v) { this.backlog = v; }
+    }
+
+    /** {@code cluster.status.windows}: rule durations in seconds (shortened by the Phase 4 gate). */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Windows {
+        private long addReadersSeconds = 300;
+        private long removeReadersSeconds = 1800;
+        private long addWritersSeconds = 0;
+        private long removeWritersSeconds = 1800;
+        private long reshardSeconds = 0;
+        private long writerDiskSeconds = 0;
+        private long clearGraceSeconds = 60;
+
+        void validate() {
+            long[] all = {addReadersSeconds, removeReadersSeconds, addWritersSeconds, removeWritersSeconds,
+                    reshardSeconds, writerDiskSeconds, clearGraceSeconds};
+            for (long v : all) {
+                if (v < 0) throw new IllegalStateException("cluster.status.windows.* must not be negative, got " + v);
+            }
+        }
+
+        public long getAddReadersSeconds() { return addReadersSeconds; }
+        public void setAddReadersSeconds(long v) { this.addReadersSeconds = v; }
+        public long getRemoveReadersSeconds() { return removeReadersSeconds; }
+        public void setRemoveReadersSeconds(long v) { this.removeReadersSeconds = v; }
+        public long getAddWritersSeconds() { return addWritersSeconds; }
+        public void setAddWritersSeconds(long v) { this.addWritersSeconds = v; }
+        public long getRemoveWritersSeconds() { return removeWritersSeconds; }
+        public void setRemoveWritersSeconds(long v) { this.removeWritersSeconds = v; }
+        public long getReshardSeconds() { return reshardSeconds; }
+        public void setReshardSeconds(long v) { this.reshardSeconds = v; }
+        public long getWriterDiskSeconds() { return writerDiskSeconds; }
+        public void setWriterDiskSeconds(long v) { this.writerDiskSeconds = v; }
+        public long getClearGraceSeconds() { return clearGraceSeconds; }
+        public void setClearGraceSeconds(long v) { this.clearGraceSeconds = v; }
     }
 }

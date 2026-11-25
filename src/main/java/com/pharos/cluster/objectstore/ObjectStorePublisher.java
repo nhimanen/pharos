@@ -8,6 +8,8 @@ import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.WriterStateStore;
+import com.pharos.cluster.writer.LeaseGuard;
 import com.pharos.graph.CallGraph;
 import com.pharos.graph.CompactGraphWriter;
 import com.pharos.graph.GraphViews;
@@ -51,7 +53,9 @@ import java.util.zip.GZIPOutputStream;
  * content-named keys ({@code graph/gen-N@<crc32>.cgf.gz}, {@code refs/gen-N@<crc32>.json.gz}), so
  * a racing run for the same N cannot overwrite bytes a committed manifest references → ship
  * synonyms → register the shard in the catalog (idempotent; readers skip a listed shard without
- * {@code LATEST}) → {@code putIfAbsent} the manifest gen-N → CAS {@code LATEST} from P to N → GC.
+ * {@code LATEST}) → the {@link LeaseGuard} check (work-queue mode; a lost lease is a
+ * {@link PublishConflictException}) → {@code putIfAbsent} the manifest gen-N → the lease check again,
+ * and the manifest must still carry the ETag this run wrote → CAS {@code LATEST} from P to N → GC.
  * Registering before the commit point means a catalog failure can never be reported as a failed
  * publish of a generation that is in fact committed.
  *
@@ -61,6 +65,9 @@ import java.util.zip.GZIPOutputStream;
  * that race, or {@code LATEST} having moved, is a {@link PublishConflictException}). Nothing
  * becomes visible to readers until the {@code LATEST} CAS succeeds; every failure before it
  * leaves {@code LATEST} untouched.
+ *
+ * <p>After the commit point the shard's writer state is backed up ({@link WriterStateStore#backup}),
+ * then GC runs. Both are best-effort: a failure is a WARN, and the publish still succeeds.
  */
 public final class ObjectStorePublisher implements IndexPublisher {
 
@@ -75,6 +82,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private final GenerationGc gc;
     private final String nodeId;
     private final Path synonymsFile;
+    private final LeaseGuard leaseGuard;
+    private final WriterStateStore writerState;
 
     /**
      * @param gc           generation GC, run with the shard and the {@code LATEST} last-modified
@@ -83,12 +92,62 @@ public final class ObjectStorePublisher implements IndexPublisher {
      */
     public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
                                 GenerationGc gc, String nodeId, Path synonymsFile) {
+        this(store, layout, catalog, gc, nodeId, synonymsFile, LeaseGuard.IMPLICIT);
+    }
+
+    /**
+     * @param leaseGuard checked right before the {@code LATEST} CAS; {@link LeaseGuard#IMPLICIT}
+     *                   (the default) always passes
+     */
+    public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
+                                GenerationGc gc, String nodeId, Path synonymsFile, LeaseGuard leaseGuard) {
+        this(store, layout, catalog, gc, nodeId, synonymsFile, leaseGuard, WriterStateStore.NONE);
+    }
+
+    /**
+     * @param writerState backs up the writer state of each generation right after its commit, before
+     *                    GC; {@link WriterStateStore#NONE} keeps none
+     */
+    public ObjectStorePublisher(ObjectStore store, ObjectStoreLayout layout, ObjectStoreCatalog catalog,
+                                GenerationGc gc, String nodeId, Path synonymsFile, LeaseGuard leaseGuard,
+                                WriterStateStore writerState) {
+        this.writerState = Objects.requireNonNull(writerState, "writerState");
+        this.leaseGuard = Objects.requireNonNull(leaseGuard, "leaseGuard");
         this.store = store;
         this.layout = layout;
         this.catalog = catalog;
         this.gc = gc;
         this.nodeId = nodeId;
         this.synonymsFile = synonymsFile;
+    }
+
+    /** Attempts of the synonyms CAS before the publish fails. */
+    static final int SYNONYMS_CAS_ATTEMPTS = 8;
+
+    /**
+     * Merges this writer's synonyms into {@code catalog/synonyms.txt} ({@link SynonymsMerge}): only
+     * {@code shard}'s section is replaced, every other shard's rules stay, and the result is the same
+     * whichever writer publishes it. A conditional put on the ETag read; on a race it re-reads and
+     * merges again. Unchanged bytes are not rewritten. A bucket with the Phase 1–3 single file is
+     * read the same way (it has the same layout).
+     */
+    private void publishSynonyms(ShardId shard) throws IOException {
+        if (synonymsFile == null || !Files.isRegularFile(synonymsFile)) return;
+        String local = new String(Files.readAllBytes(synonymsFile), StandardCharsets.UTF_8);
+        String key = layout.synonymsKey();
+        for (int attempt = 0; attempt < SYNONYMS_CAS_ATTEMPTS; attempt++) {
+            Optional<StoredObject> remote = store.get(key);
+            byte[] merged = SynonymsMerge.merge(
+                    remote.map(r -> new String(r.data(), StandardCharsets.UTF_8)).orElse(null), local, shard.value())
+                    .getBytes(StandardCharsets.UTF_8);
+            if (remote.isPresent() && java.util.Arrays.equals(remote.get().data(), merged)) return;
+            Optional<String> written = remote.isPresent()
+                    ? store.putIfMatch(key, merged, remote.get().etag())
+                    : store.putIfAbsent(key, merged);
+            if (written.isPresent()) return;
+        }
+        throw new IOException("synonyms.txt changed under " + SYNONYMS_CAS_ATTEMPTS
+                + " concurrent publishes in a row; retry the publish");
     }
 
     /** Object keys embed the shard id, so the project name must be a valid one. */
@@ -182,10 +241,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 bytesUploaded += mf.length();
             }
 
-            // 4. Synonyms are cluster-wide; last writer wins.
-            if (synonymsFile != null && Files.isRegularFile(synonymsFile)) {
-                store.put(layout.synonymsKey(), synonymsFile);
-            }
+            // 4. Synonyms are cluster-wide: replace only this shard's section (a CAS read-modify-write).
+            publishSynonyms(shard);
 
             // 5. Catalog before the commit point (idempotent).
             catalog.register(shard);
@@ -198,12 +255,24 @@ public final class ObjectStorePublisher implements IndexPublisher {
                     ShardManifest.stripRefs(snapshot.meta()), formatStamp(snapshot.shardDir()));
             byte[] manifestJson = manifest.toJson();
             String manifestKey = layout.manifestKey(shard, gen);
-            if (store.putIfAbsent(manifestKey, manifestJson).isEmpty()) {
-                replaceOrphanManifest(shard, gen, manifestKey, manifestJson,
-                        previous.map(Latest::etag).orElse(null));
+            //    A writer that lost its lease must not write (or replace as an "orphan") the
+            //    manifest a new owner is about to commit: check before writing it.
+            leaseGuard.assertHeld(shard);
+            Optional<String> manifestEtag = store.putIfAbsent(manifestKey, manifestJson);
+            if (manifestEtag.isEmpty()) {
+                manifestEtag = Optional.of(replaceOrphanManifest(shard, gen, manifestKey, manifestJson,
+                        previous.map(Latest::etag).orElse(null)));
             }
 
-            // 7. Commit point: CAS LATEST from P to N.
+            // 7. Commit point: CAS LATEST from P to N, only while this writer holds the shard's lease,
+            //    and only onto the manifest this run wrote: a racing run that replaced it as an
+            //    "orphan" in the meantime must never be committed under this run's CAS.
+            leaseGuard.assertHeld(shard);
+            String ownManifest = manifestEtag.get();
+            if (!store.get(manifestKey).map(StoredObject::etag).filter(ownManifest::equals).isPresent()) {
+                throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
+                        + " was replaced by another writer before the commit of shard " + shard);
+            }
             byte[] latest = ("{\"generation\": " + gen.value() + ", \"manifest\": \""
                     + ObjectStoreLayout.manifestName(gen) + "\"}").getBytes(StandardCharsets.UTF_8);
             Optional<String> committed = previous.isPresent()
@@ -213,7 +282,8 @@ public final class ObjectStorePublisher implements IndexPublisher {
                 throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
             }
 
-            // 8. Best-effort GC.
+            // 8. Best-effort writer-state backup (before GC, so GC sees this generation's state), then GC.
+            backupWriterState(shard, gen, snapshot.shardDir());
             runGc(shard);
 
             log.info("Published shard {} generation {}: {} files uploaded, {} reused, {} bytes uploaded",
@@ -303,21 +373,22 @@ public final class ObjectStorePublisher implements IndexPublisher {
      * error) between writing it and the CAS, and is replaced by ETag-conditional put. Otherwise
      * another writer committed, and this run conflicts.
      */
-    private void replaceOrphanManifest(ShardId shard, Generation gen, String manifestKey, byte[] json,
-                                       String previousLatestEtag) throws IOException {
+    private String replaceOrphanManifest(ShardId shard, Generation gen, String manifestKey, byte[] json,
+                                         String previousLatestEtag) throws IOException {
         Optional<StoredObject> orphan = store.get(manifestKey);
         String currentLatestEtag = store.get(layout.latestKey(shard)).map(StoredObject::etag).orElse(null);
         if (!Objects.equals(currentLatestEtag, previousLatestEtag)) {
             throw new PublishConflictException("LATEST moved; another writer published shard " + shard);
         }
-        boolean replaced = orphan.isPresent()
-                ? store.putIfMatch(manifestKey, json, orphan.get().etag()).isPresent()
-                : store.putIfAbsent(manifestKey, json).isPresent();
-        if (!replaced) {
+        Optional<String> replaced = orphan.isPresent()
+                ? store.putIfMatch(manifestKey, json, orphan.get().etag())
+                : store.putIfAbsent(manifestKey, json);
+        if (replaced.isEmpty()) {
             throw new PublishConflictException("manifest " + ObjectStoreLayout.manifestName(gen)
                     + " changed while replacing an orphan; another writer is publishing shard " + shard);
         }
         log.warn("Replaced orphan manifest {} of shard {} (LATEST never moved to it)", manifestKey, shard);
+        return replaced.get();
     }
 
     /** CRC32 of a whole file as lower-case hex. */
@@ -332,6 +403,20 @@ public final class ObjectStorePublisher implements IndexPublisher {
     private ManifestFile upload(String role, String name, String key, Path file, String crcHex) throws IOException {
         store.put(key, file);
         return new ManifestFile(role, name, key, Files.size(file), crcHex);
+    }
+
+    /**
+     * Never fails the publish: the generation is committed. A missing backup of this generation makes
+     * a takeover restore it with an older backup's writer state, whose file state doesn't describe
+     * these documents: the new owner then runs a full index (embeddings from the older cache).
+     */
+    private void backupWriterState(ShardId shard, Generation gen, Path shardDir) {
+        try {
+            writerState.backup(shard, gen, shardDir);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Writer-state backup of shard {} generation {} failed (publish succeeded): {}",
+                    shard, gen.value(), e.toString());
+        }
     }
 
     private void runGc(ShardId shard) {

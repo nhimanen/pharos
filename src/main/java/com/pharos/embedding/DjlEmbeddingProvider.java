@@ -47,6 +47,11 @@ public class DjlEmbeddingProvider implements EmbeddingProvider {
     private static final Path MODEL_CACHE =
             Path.of(System.getProperty("user.home"), ".djl.ai", "pharos");
 
+    /** Where downloaded ONNX models are cached (the writer disk guard watches its file store). */
+    public static Path modelCacheDir() {
+        return MODEL_CACHE;
+    }
+
     /** Stable identifier from the provider config — used for Lucene field naming. */
     private final String modelId;
     /** Non-null for zoo models (has a no-arg newPredictor()); null for HF models. */

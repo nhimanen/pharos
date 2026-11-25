@@ -10,6 +10,8 @@ import com.pharos.cluster.ReaderLocalCache;
 import com.pharos.cluster.ReplicaSource;
 import com.pharos.cluster.ReplicationBackend;
 import com.pharos.cluster.ShardCatalog;
+import com.pharos.cluster.WriterStateStore;
+import com.pharos.cluster.writer.LeaseGuard;
 import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 
@@ -31,6 +33,9 @@ public final class ObjectStoreBackend implements ReplicationBackend {
     private final ObjectStoreReplicaSource source;
     private final LocalCache cache;
     private final IndexPublisher publisher;
+    private final WriterStateStore writerState;
+    /** The publisher's lease check on a work-queue writer; null otherwise. */
+    private final com.pharos.cluster.writer.WorkQueueLeaseGuard workQueueGuard;
 
     public ObjectStoreBackend(IndexConfig config) {
         // validated before the S3 client is built (arguments evaluate left to right)
@@ -54,12 +59,20 @@ public final class ObjectStoreBackend implements ReplicationBackend {
         if (cfg.getRole() == NodeRole.READER) {
             this.cache = new ReaderLocalCache(cfg.getCacheDir());
             this.publisher = NoOpPublisher.INSTANCE;
+            this.writerState = WriterStateStore.NONE;
+            this.workQueueGuard = null;
         } else {
             this.cache = new LocalFsCache(config);
             GenerationGc gc = new GenerationGc(store, layout, cfg.getRetentionGenerations(),
                     Duration.ofMinutes(cfg.getRetentionMinutes()));
+            this.writerState = new ObjectStoreWriterStateStore(store, layout, source, cfg.effectiveNodeId());
+            // Work-queue mode: only this process's work loop publishes, under the shard's lease (R3);
+            // every other writer keeps the implicit lease of Phases 1-3.
+            this.workQueueGuard = cfg.getRole() == NodeRole.WRITER && cfg.getWriter().isWorkQueue()
+                    ? new com.pharos.cluster.writer.WorkQueueLeaseGuard() : null;
             this.publisher = new ObjectStorePublisher(store, layout, catalog, gc, cfg.effectiveNodeId(),
-                    config.getSynonymsFile());
+                    config.getSynonymsFile(), workQueueGuard != null ? workQueueGuard : LeaseGuard.IMPLICIT,
+                    writerState);
         }
     }
 
@@ -67,6 +80,11 @@ public final class ObjectStoreBackend implements ReplicationBackend {
     public ObjectStore store() { return store; }
 
     public ObjectStoreLayout layout() { return layout; }
+
+    /** The publisher's lease check in work-queue mode (the work loop attaches to it); empty otherwise. */
+    public java.util.Optional<com.pharos.cluster.writer.WorkQueueLeaseGuard> workQueueGuard() {
+        return java.util.Optional.ofNullable(workQueueGuard);
+    }
 
     @Override public BackendKind kind() { return BackendKind.OBJECT_STORE; }
 
@@ -76,7 +94,12 @@ public final class ObjectStoreBackend implements ReplicationBackend {
 
     @Override public ShardCatalog catalog() { return catalog; }
 
+    /** The catalog with its write side ({@code register}, source entries). */
+    public ObjectStoreCatalog objectStoreCatalog() { return catalog; }
+
     @Override public ReplicaSource source() { return source; }
+
+    @Override public WriterStateStore writerState() { return writerState; }
 
     @Override
     public void close() throws IOException {

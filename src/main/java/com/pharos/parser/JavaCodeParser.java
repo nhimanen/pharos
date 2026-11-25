@@ -40,6 +40,8 @@ public class JavaCodeParser implements CodeParser {
     private final List<Path> additionalSourceRoots;
     private final List<Path> jarPaths;
     private final int parseThreads;
+    /** Test hook: called before each file of {@link #parseFiles} is parsed; null in production. */
+    volatile java.util.function.Consumer<Path> beforeFile;
 
     /**
      * Cache of (sourceRoot → [java21Parser, rawParser]) pairs, keyed by source root path.
@@ -358,6 +360,19 @@ public class JavaCodeParser implements CodeParser {
     @Override
     public ParsedProject parseFiles(List<Path> files, Path projectRoot,
                                      String projectName) throws IOException {
+        return parseFiles(files, projectRoot, projectName, com.pharos.indexer.IndexAbort.none());
+    }
+
+    /**
+     * {@link #parseFiles(List, Path, String)} that checks {@code abort} before every file: a
+     * requested abort stops the batch (files already queued on the pool are skipped) and throws
+     * {@link com.pharos.indexer.IndexAbortedException}, so a full run of a large project can be
+     * aborted mid-parse.
+     */
+    @Override
+    public ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
+                                     com.pharos.indexer.IndexAbort abort) throws IOException {
+        abort.checkpoint();
         if (files.isEmpty()) {
             return new ParsedProject(projectName, projectRoot.toString(), List.of());
         }
@@ -370,6 +385,8 @@ public class JavaCodeParser implements CodeParser {
             JavaParser java21Parser = createParser(sourceRoot, ParserConfiguration.LanguageLevel.JAVA_21);
             JavaParser rawParser    = createParser(sourceRoot, ParserConfiguration.LanguageLevel.RAW);
             for (Path file : files) {
+                abort.checkpoint();
+                beforeFile(file);
                 try {
                     results.add(doParseWithFallback(java21Parser, rawParser, file, projectName));
                     fileCount.incrementAndGet();
@@ -389,6 +406,8 @@ public class JavaCodeParser implements CodeParser {
                 List<Future<ParsedFile>> futures = new ArrayList<>(files.size());
                 for (Path file : files) {
                     futures.add(pool.submit(() -> {
+                        if (abort.requested()) return null; // aborted: skip the rest of the queue
+                        beforeFile(file);
                         try {
                             ParsedFile pf = doParseWithFallback(
                                     threadParserJava21.get(), threadParserRaw.get(), file, projectName);
@@ -402,6 +421,7 @@ public class JavaCodeParser implements CodeParser {
                     }));
                 }
                 for (Future<ParsedFile> f : futures) {
+                    abort.checkpoint();
                     try {
                         ParsedFile pf = f.get();
                         if (pf != null) results.add(pf);
@@ -417,9 +437,15 @@ public class JavaCodeParser implements CodeParser {
                 pool.shutdown();
             }
         }
+        abort.checkpoint();
         log.info("parseFiles: {} files ({} errors) in project '{}'",
                 fileCount.get(), errorCount.get(), projectName);
         return new ParsedProject(projectName, projectRoot.toString(), results);
+    }
+
+    private void beforeFile(Path file) {
+        java.util.function.Consumer<Path> hook = beforeFile;
+        if (hook != null) hook.accept(file);
     }
 
     @Override

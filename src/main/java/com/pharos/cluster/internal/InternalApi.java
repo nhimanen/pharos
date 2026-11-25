@@ -54,6 +54,17 @@ public final class InternalApi {
         return this;
     }
 
+    /**
+     * A constant-time check of a presented token against {@code token}, the same comparison as
+     * {@link #authorized} (both hashed first, so it is length-independent too). With no configured
+     * token nothing matches. The token itself is not kept, only its digest.
+     */
+    public static java.util.function.Predicate<String> tokenMatcher(String token) {
+        if (token == null || token.isBlank()) return presented -> false;
+        byte[] digest = sha256(token);
+        return presented -> presented != null && MessageDigest.isEqual(digest, sha256(presented));
+    }
+
     private static byte[] sha256(String s) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8));

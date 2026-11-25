@@ -8,6 +8,7 @@ import com.pharos.cluster.LocalSnapshot;
 import com.pharos.cluster.PublishConflictException;
 import com.pharos.cluster.PublishException;
 import com.pharos.cluster.ShardId;
+import com.pharos.cluster.writer.LeaseManager;
 import com.pharos.config.ClusterConfig;
 import com.pharos.config.IndexConfig;
 import com.pharos.config.ProjectMeta;
@@ -61,14 +62,24 @@ class ObjectStorePublisherTest {
 
     /** Delegating store that records unconditional puts and runs hooks before each write. */
     static final class SpyStore implements ObjectStore {
-        final InMemoryObjectStore delegate = new InMemoryObjectStore();
+        /** The bucket's clock: real time plus an offset a test can move forward. */
+        final java.util.concurrent.atomic.AtomicLong offsetSeconds = new java.util.concurrent.atomic.AtomicLong();
+        final java.time.Clock clock = new java.time.Clock() {
+            @Override public java.time.ZoneId getZone() { return java.time.ZoneOffset.UTC; }
+            @Override public java.time.Clock withZone(java.time.ZoneId z) { return this; }
+            @Override public java.time.Instant instant() { return java.time.Instant.now().plusSeconds(offsetSeconds.get()); }
+        };
+        final InMemoryObjectStore delegate = new InMemoryObjectStore(clock);
         final List<String> putKeys = new ArrayList<>();
         /** Keys whose next {@code get} returns empty once (a stale read). */
         final Set<String> hideOnce = new HashSet<>();
         Consumer<String> beforePut = k -> {};
         Consumer<String> beforeConditionalPut = k -> {};
 
+        Consumer<String> beforeGet = k -> {};
+
         @Override public Optional<StoredObject> get(String key) {
+            beforeGet.accept(key);
             return hideOnce.remove(key) ? Optional.empty() : delegate.get(key);
         }
         @Override public void download(String key, Path target) throws IOException { delegate.download(key, target); }
@@ -355,6 +366,113 @@ class ObjectStorePublisherTest {
         assertThat(now).isEqualTo(bytesA);
         assertThat(crc32Hex(now)).isEqualTo(stillA.get("checksum").asText());
         assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(1);
+    }
+
+    /**
+     * Review Focus 1: writer A is paused past its lease TTL, B takes the lease over, then A wakes and
+     * publishes. Its lease check fails before the LATEST CAS, so nothing is published.
+     */
+    @Test
+    void pausedWriterCannotPublish() throws Exception {
+        indexFull(manager(publisher)); // gen 1, by a writer with the implicit lease
+        StoredObject latestBefore = store.get(layout.latestKey(SHARD)).orElseThrow();
+
+        java.time.Duration ttl = java.time.Duration.ofSeconds(30);
+        LeaseManager a = new LeaseManager(store, layout, "node-a", ttl, heartbeat("node-a"), store.clock);
+        LeaseManager b = new LeaseManager(store, layout, "node-b", ttl, heartbeat("node-b"), store.clock);
+        a.tryAcquire(SHARD).orElseThrow();
+        ObjectStorePublisher publisherA = new ObjectStorePublisher(store, layout, catalog, gc(), "node-a",
+                synonyms, a);
+
+        // A has new local changes, then sleeps (GC pause, laptop lid) past its TTL; B takes over.
+        ProjectIndexManager local = manager(snapshot -> Optional.empty());
+        touchOneFileAndReindex(local);
+        store.offsetSeconds.addAndGet(ttl.toSeconds() + 5);
+        assertThat(b.tryAcquire(SHARD)).isPresent();
+
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        assertThatThrownBy(() -> publisherA.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
+                .isInstanceOf(PublishConflictException.class).hasMessageContaining("lease");
+
+        StoredObject latestAfter = store.get(layout.latestKey(SHARD)).orElseThrow();
+        assertThat(latestAfter.etag()).isEqualTo(latestBefore.etag());
+        assertThat(latestAfter.data()).isEqualTo(latestBefore.data());
+        assertThat(a.isHeld(SHARD)).isFalse();
+        b.assertHeld(SHARD);
+
+        // The new owner publishes normally on top of the same LATEST (A's orphan gen-2 manifest is replaced).
+        ObjectStorePublisher publisherB = new ObjectStorePublisher(store, layout, catalog, gc(), "node-b",
+                synonyms, b);
+        assertThat(publisherB.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
+                .contains(new Generation(2));
+        assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-b");
+    }
+
+    /**
+     * Fix round 1, I1: A (its lease lost, but its first check passed before the takeover) runs into
+     * the manifest B just wrote, sees LATEST unmoved and "replaces the orphan". B must then refuse
+     * to commit: LATEST may never point at a manifest written by A.
+     */
+    @Test
+    void lostWriterReplacingTheNewOwnersManifestNeverGetsCommitted() throws Exception {
+        indexFull(manager(publisher)); // gen 1
+        StoredObject latestBefore = store.get(layout.latestKey(SHARD)).orElseThrow();
+        java.time.Duration ttl = java.time.Duration.ofSeconds(30);
+        LeaseManager b = new LeaseManager(store, layout, "node-b", ttl, heartbeat("node-b"), store.clock);
+        assertThat(b.tryAcquire(SHARD)).isPresent();
+        // A's guard: its early check ran before B's takeover; its later checks see the lease lost.
+        java.util.concurrent.atomic.AtomicInteger aChecks = new java.util.concurrent.atomic.AtomicInteger();
+        com.pharos.cluster.writer.LeaseGuard aGuard = shard -> {
+            if (aChecks.incrementAndGet() > 1) throw new PublishConflictException("node-a lost the lease");
+        };
+        ObjectStorePublisher publisherA = new ObjectStorePublisher(store, layout, catalog, gc(), "node-a",
+                synonyms, aGuard);
+        ObjectStorePublisher publisherB = new ObjectStorePublisher(store, layout, catalog, gc(), "node-b",
+                synonyms, b);
+        touchOneFileAndReindex(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+        LocalSnapshot snap = new LocalSnapshot(SHARD.value(), shardDir, meta, "none");
+
+        // Once B's gen-2 manifest exists, B's next lease read (its final check) lets A run first.
+        String manifest2 = layout.manifestKey(SHARD, new Generation(2));
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        List<Throwable> aResult = new ArrayList<>();
+        store.beforeGet = k -> {
+            if (k.equals(layout.leaseKey(SHARD)) && store.delegate.get(manifest2).isPresent()
+                    && fired.compareAndSet(false, true)) {
+                try {
+                    publisherA.publish(snap);
+                } catch (Throwable t) {
+                    aResult.add(t);
+                }
+            }
+        };
+
+        assertThatThrownBy(() -> publisherB.publish(snap)).isInstanceOf(PublishConflictException.class)
+                .hasMessageContaining("replaced by another writer");
+        store.beforeGet = k -> {};
+
+        assertThat(fired).isTrue();
+        assertThat(aResult).singleElement().isInstanceOf(PublishConflictException.class);
+        assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-a"); // A did replace it ...
+        StoredObject latestAfter = store.get(layout.latestKey(SHARD)).orElseThrow();
+        assertThat(latestAfter.etag()).isEqualTo(latestBefore.etag()); // ... but nobody committed it
+
+        // B's retry replaces A's orphan and commits its own manifest.
+        assertThat(publisherB.publish(snap)).contains(new Generation(2));
+        assertThat(manifest(2).get("writerNode").asText()).isEqualTo("node-b");
+        assertThat(json(layout.latestKey(SHARD)).get("generation").asLong()).isEqualTo(2);
+    }
+
+    /** The bucket's "now" for {@code node}: it writes a heartbeat and reads back its LastModified. */
+    private LeaseManager.BucketNow heartbeat(String node) {
+        String key = "pharos/test-heartbeats/" + node + ".json";
+        return () -> {
+            store.put(key, new byte[0]);
+            return store.stat(key).map(ObjectInfo::lastModified);
+        };
     }
 
     private static Set<String> luceneEntries(JsonNode manifest) {

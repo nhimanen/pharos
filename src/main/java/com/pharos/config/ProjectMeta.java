@@ -46,6 +46,14 @@ public class ProjectMeta {
     private String artifactId;
     private String mavenVersion;   // named mavenVersion to avoid naming ambiguity
 
+    /**
+     * The source revision this index was built from (a git commit, or a path source's tree
+     * digest), set by the writer work loop; null when indexed by hand. Published in the manifest's
+     * {@code projectMeta}, so a new shard owner knows which revision {@code LATEST} holds.
+     */
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    private String sourceRevision;
+
     public ProjectMeta() {
         this.knownPackages = new ArrayList<>();
         this.linkedProjects = new ArrayList<>();
@@ -176,4 +184,7 @@ public class ProjectMeta {
 
     public int getUnresolvedRefsHash()                { return unresolvedRefsHash; }
     public void setUnresolvedRefsHash(int hash)       { this.unresolvedRefsHash = hash; }
+
+    public String getSourceRevision()             { return sourceRevision; }
+    public void setSourceRevision(String rev)     { this.sourceRevision = rev; }
 }

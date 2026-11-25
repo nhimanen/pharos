@@ -220,6 +220,29 @@ class ClusterConfigTest {
         assertThat(five.getObjectStore().readTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(15));
     }
 
+    @Test
+    void objectStoreCallTimeoutsDefaultAndAreValidated() throws Exception {
+        String base = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\",\"advertiseUrl\":\"http://r:7171\","
+                + "\"token\":\"t\",\"objectStore\":{\"bucket\":\"b\"%s}}}";
+        ClusterConfig c = parse(String.format(base, ""));
+        assertThat(c.getObjectStore().callAttemptTimeout()).isEqualTo(java.time.Duration.ofSeconds(20));
+        assertThat(c.getObjectStore().callTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(60));
+        assertThat(c.getObjectStore().getUploadMinBytesPerSecond()).isEqualTo(1L << 20);
+        String[][] bad = {
+                {",\"callAttemptTimeoutSeconds\":0", "callAttemptTimeoutSeconds"},
+                {",\"callAttemptTimeoutSeconds\":3601", "callAttemptTimeoutSeconds"},
+                {",\"callAttemptTimeoutSeconds\":30,\"callTimeoutSeconds\":20", "callTimeoutSeconds"},
+                {",\"callTimeoutSeconds\":3601", "callTimeoutSeconds"},
+                {",\"uploadMinBytesPerSecond\":1023", "uploadMinBytesPerSecond"}};
+        for (String[] b : bad) {
+            assertThatThrownBy(() -> parse(String.format(base, b[0])))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("cluster.objectStore." + b[1]);
+        }
+        ClusterConfig ok = parse(String.format(base, ",\"callAttemptTimeoutSeconds\":5,\"callTimeoutSeconds\":5"));
+        assertThat(ok.getObjectStore().callTotalTimeout()).isEqualTo(java.time.Duration.ofSeconds(5));
+    }
+
     private static final String READER = "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
             + "\"objectStore\":{\"bucket\":\"b\"}%s}}";
 
@@ -329,5 +352,65 @@ class ClusterConfigTest {
         assertThat(parse("{\"cluster\":{\"drainSeconds\":0}}").getDrainSeconds()).isZero();
         assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":-1}}")).hasMessageContaining("cluster.drainSeconds");
         assertThatThrownBy(() -> parse("{\"cluster\":{\"drainSeconds\":3601}}")).hasMessageContaining("cluster.drainSeconds");
+    }
+
+    @Test
+    void writerSectionDefaultsAndValidation() throws Exception {
+        ClusterConfig.WriterConfig w = parse("{}").getWriter();
+        assertThat(w.getPollSeconds()).isEqualTo(60);
+        assertThat(w.isWorkQueue()).as("work-queue mode is the writer default").isTrue();
+        assertThat(parse("{\"cluster\":{\"writer\":{\"workQueue\":false}}}").getWriter().isWorkQueue()).isFalse();
+        assertThat(w.getWorkDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("work"));
+        w = parse("{\"cluster\":{\"writer\":{\"workDir\":\"/w\",\"pollSeconds\":5,\"workQueue\":true}}}").getWriter();
+        assertThat(w.getWorkDir()).isEqualTo(Path.of("/w"));
+        assertThat(w.getPollSeconds()).isEqualTo(5);
+        assertThat(w.isWorkQueue()).isTrue();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"pollSeconds\":0}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.pollSeconds");
+    }
+
+    @Test
+    void writerLeaseTtlDefaultsAndValidation() throws Exception {
+        ClusterConfig.WriterConfig w = parse("{}").getWriter();
+        assertThat(w.getLeaseTtlSeconds()).isEqualTo(30);
+        assertThat(w.leaseRenewInterval()).isEqualTo(java.time.Duration.ofSeconds(10));
+        w = parse("{\"cluster\":{\"writer\":{\"leaseTtlSeconds\":5}}}").getWriter();
+        assertThat(w.leaseTtl()).isEqualTo(java.time.Duration.ofSeconds(5));
+        assertThat(w.leaseRenewInterval()).isEqualTo(java.time.Duration.ofNanos(1_666_666_666));
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"writer\":{\"leaseTtlSeconds\":4}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.leaseTtlSeconds");
+    }
+
+    /** Task 5: {@code cluster.status} defaults, shortened windows, and validation. */
+    @Test
+    void statusTargetsWindowsAndWebhook() throws Exception {
+        ClusterConfig d = parse("{}");
+        assertThat(d.getStatus().getTargets().getWarmP95Millis()).isEqualTo(500);
+        assertThat(d.getStatus().getTargets().getQpsPerReader()).isEqualTo(50.0);
+        assertThat(d.getStatus().getTargets().getBacklog()).isEqualTo(600);
+        assertThat(d.getStatus().getWindows().getAddReadersSeconds()).isEqualTo(300);
+        assertThat(d.getStatus().getWindows().getRemoveReadersSeconds()).isEqualTo(1800);
+        assertThat(d.getStatus().getEventsKeepAliveSeconds()).isEqualTo(15);
+        assertThat(d.getStatus().getWebhookUrl()).isNull();
+
+        ClusterConfig c = parse("{\"cluster\":{\"status\":{\"targets\":{\"warmP95Millis\":250,\"qpsPerReader\":5,"
+                + "\"backlog\":30},\"windows\":{\"addReadersSeconds\":20,\"clearGraceSeconds\":0},"
+                + "\"webhookUrl\":\"http://127.0.0.1:9/hook\"}}}");
+        var st = com.pharos.cluster.status.StatusSettings.of(c.getStatus());
+        assertThat(st.warmP95Millis()).isEqualTo(250);
+        assertThat(st.qpsPerReader()).isEqualTo(5.0);
+        assertThat(st.backlogSeconds()).isEqualTo(30);
+        assertThat(st.window(com.pharos.cluster.status.Proposals.ADD_READERS)).isEqualTo(20);
+        assertThat(st.clearGraceSeconds()).isZero();
+
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"targets\":{\"qpsPerReader\":0}}}}"))
+                .hasMessageContaining("cluster.status.targets.qpsPerReader");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"windows\":{\"reshardSeconds\":-1}}}}"))
+                .hasMessageContaining("cluster.status.windows");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"webhookUrl\":\"ftp://x/y?k=secret\"}}}"))
+                .hasMessageContaining("cluster.status.webhookUrl").satisfies(e -> assertThat(e.getMessage())
+                        .doesNotContain("secret"));
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"eventsKeepAliveSeconds\":0}}}"))
+                .hasMessageContaining("eventsKeepAliveSeconds");
     }
 }

@@ -156,6 +156,12 @@ public class InMemoryObjectStore implements ObjectStore {
     }
 
     @Override
+    public Optional<ObjectInfo> stat(String key) {
+        Entry e = map.get(key);
+        return e == null ? Optional.empty() : Optional.of(new ObjectInfo(key, e.data().length, e.lastModified()));
+    }
+
+    @Override
     public void delete(String key) { map.remove(key); }
 
     @Override

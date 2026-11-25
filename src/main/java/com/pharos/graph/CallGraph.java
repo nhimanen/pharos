@@ -891,6 +891,48 @@ public class CallGraph implements GraphView {
         }
     }
 
+    /**
+     * Bulk-loads {@code vertices} and, per {@link #EDGE_TYPES} index {@code t}, the edges
+     * {@code from[t][i] → to[t][i]} (vertex indexes into {@code vertices}) into this graph, which
+     * must be empty. Only the non-null properties of each record are set, exactly as the builders
+     * set them. Used by {@link CompactGraphImport}.
+     */
+    void load(List<VertexRecord> vertices, int[][] from, int[][] to) {
+        for (String type : new String[]{"Method", "CodeType", "CodeField"}) {
+            if (db.countType(type, false) != 0) throw new IllegalStateException("load needs an empty graph: " + dbDir);
+        }
+        com.arcadedb.database.RID[] rids = new com.arcadedb.database.RID[vertices.size()];
+        for (int start = 0; start < vertices.size(); start += BATCH_SIZE) {
+            db.begin();
+            for (int i = start; i < Math.min(vertices.size(), start + BATCH_SIZE); i++) {
+                VertexRecord r = vertices.get(i);
+                MutableVertex v = db.newVertex(r.kind());
+                v.set("fqn", r.fqn());
+                if (r.classPrefix() != null) v.set("classPrefix", r.classPrefix());
+                if (r.ownerFqn() != null) v.set("ownerFqn", r.ownerFqn());
+                if (r.fieldType() != null) v.set("fieldType", r.fieldType());
+                if (r.accessMod() != null) v.set("accessMod", r.accessMod());
+                v.save();
+                rids[i] = v.getIdentity();
+            }
+            db.commit();
+        }
+        for (int t = 0; t < EDGE_TYPES.size(); t++) {
+            String type = EDGE_TYPES.get(t);
+            int[] f = from[t], tt = to[t];
+            if (f == null) continue;
+            // ArcadeDB lists a vertex's out-edges newest first: inserting in reverse file order
+            // gives back the exported order.
+            for (int end = f.length; end > 0; end -= BATCH_SIZE) {
+                db.begin();
+                for (int i = end - 1; i >= Math.max(0, end - BATCH_SIZE); i--) {
+                    rids[f[i]].asVertex().modify().newEdge(type, rids[tt[i]], true);
+                }
+                db.commit();
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------

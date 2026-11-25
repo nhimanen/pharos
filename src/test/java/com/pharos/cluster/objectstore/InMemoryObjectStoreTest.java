@@ -17,6 +17,20 @@ class InMemoryObjectStoreTest extends ObjectStoreContract {
     ObjectStore store() { return store; }
 
     @Test
+    void defaultStatFiltersTheListingForTheExactKey() throws Throwable {
+        // A store that only implements the abstract methods gets stat() from the interface default.
+        ObjectStore viaDefault = (ObjectStore) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ObjectStore.class}, (proxy, m, args) -> m.isDefault()
+                        ? java.lang.reflect.InvocationHandler.invokeDefault(proxy, m, args)
+                        : m.invoke(store, args));
+        store.put("d/key", new byte[3]);
+        store.put("d/key2", new byte[7]);
+        assertThat(viaDefault.stat("d/key")).contains(store.stat("d/key").orElseThrow());
+        assertThat(viaDefault.stat("d/key").orElseThrow().size()).isEqualTo(3);
+        assertThat(viaDefault.stat("d/ke")).isEmpty();
+    }
+
+    @Test
     void failedRangeLeavesNoTarget(@TempDir Path dir) throws IOException {
         store.put("range/fail", new byte[1000]);
         store.failMidBodyOn("range/fail");

@@ -44,6 +44,11 @@ public class WebCommand implements Callable<Integer> {
         this(webServer, searchEngine, null);
     }
 
+    /** Whether the search-model warm-up is skipped: on {@code role: writer}. */
+    boolean isWriter() {
+        return clusterRuntime != null && clusterRuntime.isWriter();
+    }
+
     public WebCommand(WebServer webServer, SearchEngine searchEngine, ClusterRuntime clusterRuntime) {
         this.webServer = webServer;
         this.searchEngine = searchEngine;
@@ -56,11 +61,13 @@ public class WebCommand implements Callable<Integer> {
         try {
             // The model warm-up starts first and runs in parallel with a reader's first sync;
             // readiness waits for both (a hanging load is bounded by MODEL_WARMUP_TIMEOUT).
-            if (searchEngine != null) searchEngine.warmUpInBackground();
+            // A writer serves no search: it never warms (loads) the search models, which on a local
+            // ONNX model is ~1.1 GB per process. Its index runs load the embedding models they use.
+            if (searchEngine != null && !isWriter()) searchEngine.warmUpInBackground();
             if (clusterRuntime != null) {
                 clusterRuntime.setLoad(webServer.load()); // before the first heartbeat
                 clusterRuntime.setInFlight(webServer::inFlightRequests); // what the shutdown drain waits for
-                clusterRuntime.beginServing(searchEngine != null
+                clusterRuntime.beginServing(searchEngine != null && !isWriter() // a writer warms nothing
                         ? searchEngine.modelsSettled(MODEL_WARMUP_TIMEOUT)
                         : java.util.concurrent.CompletableFuture.completedFuture(null), // no wait
                         true); // serves /internal/*: joins reader membership, drains on shutdown
@@ -74,6 +81,14 @@ public class WebCommand implements Callable<Integer> {
                 com.pharos.cluster.internal.InternalApi internal = searchEngine != null
                         ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();
                 if (internal != null) webServer.setInternalApi(internal);
+                // a work-queue writer indexes and publishes the shards it holds the lease of
+                if (clusterRuntime.beginWriting()) {
+                    System.out.println("Writer work queue running (cluster.writer.workQueue)");
+                    webServer.setWriterDisk(clusterRuntime::writerDisk);
+                }
+                // /cluster/status and /cluster/events on every role (single node: from local state)
+                webServer.setClusterStatus(clusterRuntime.statusService());
+                webServer.setClusterToken(clusterRuntime.clusterTokenMatcher()); // token view: reader addresses
             }
             webServer.start(port);
             if (!noOpen) {

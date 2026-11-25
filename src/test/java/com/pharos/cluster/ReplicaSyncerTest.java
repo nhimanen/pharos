@@ -109,9 +109,14 @@ class ReplicaSyncerTest {
     }
 
     private ProjectIndexManager writerManager(IndexPublisher pub) {
+        return writerManager(pub, "writer");
+    }
+
+    /** A writer node's index manager: its own index dir and registry under {@code name}. */
+    private ProjectIndexManager writerManager(IndexPublisher pub, String name) {
         IndexConfig config = IndexConfig.defaults();
-        config.setIndexDir(tmp.resolve("writer-indexes"));
-        ProjectRegistry registry = ProjectRegistry.at(tmp.resolve("writer-registry.json"));
+        config.setIndexDir(tmp.resolve(name + "-indexes"));
+        ProjectRegistry registry = ProjectRegistry.at(tmp.resolve(name + "-registry.json"));
         ModuleGraphBuilder noopModules = new ModuleGraphBuilder(registry) {
             @Override
             public synchronized List<String> incorporate(
@@ -466,6 +471,53 @@ class ReplicaSyncerTest {
             assertThat(freshCache.active(PROJECT)).contains(genDir(1));
             assertThat(fileKey(genDir(1).resolve("manifest.json"))).isEqualTo(before);
         }
+    }
+
+    /**
+     * Final review I1: two writers hold different shards and each mines only its own. Every publish
+     * must keep the other shard's rules, and every reader must end up with the same bytes (the
+     * coordinator and shards compare synonyms hashes).
+     */
+    @Test
+    void synonymsOfTwoWritersAreMergedAndIdenticalOnEveryReader() throws Exception {
+        String date = "2026-11-21";
+        Files.writeString(writerSynonyms, "auth, authentication\n\n# ── Auto-mined from '" + PROJECT + "' on "
+                + date + " (1 rules) ─\nledger                           => accountbook  # auto:" + PROJECT + ":"
+                + date + "\n");
+        // writer B: another shard, plus a stale rule of A's shard from when B held it
+        Path bSynonyms = tmp.resolve("b-synonyms.txt");
+        Files.writeString(bSynonyms, "auth, authentication\n\n# ── Auto-mined from 'other' on " + date
+                + " (1 rules) ─\nwidget                           => gizmo  # auto:other:" + date + "\n\n"
+                + "# ── Auto-mined from '" + PROJECT + "' on 2026-11-01 (1 rules) ─\n"
+                + "stale                            => oldname  # auto:" + PROJECT + ":2026-11-01\n");
+        ClusterConfig cfg = new ClusterConfig();
+        ObjectStorePublisher publisherB = new ObjectStorePublisher(store, layout, catalog,
+                new GenerationGc(store, layout, cfg.getRetentionGenerations(),
+                        Duration.ofMinutes(cfg.getRetentionMinutes())), "writer-b", bSynonyms);
+        ProjectIndexManager writerB = writerManager(publisherB, "writer-b");
+
+        publishFull();                                                                   // A: sample-app
+        writerB.index(source, "other", false, false, false, false, ProgressListener.SILENT); // B: other
+        String afterB = new String(store.get(layout.synonymsKey()).orElseThrow().data(), StandardCharsets.UTF_8);
+        publishIncremental("again");                                                     // A again
+        String afterA = new String(store.get(layout.synonymsKey()).orElseThrow().data(), StandardCharsets.UTF_8);
+        assertThat(afterA).as("the same rules whichever writer published last").isEqualTo(afterB);
+        assertThat(afterA).contains("auth, authentication", "=> accountbook", "=> gizmo").doesNotContain("oldname");
+
+        Path cache2 = tmp.resolve("reader2-cache");
+        Path synonyms2 = tmp.resolve("reader2-home").resolve("synonyms.txt");
+        try (ReplicaSyncer reader2 = new ReplicaSyncer(catalog, new ObjectStoreReplicaSource(store, layout),
+                new ReaderLocalCache(cache2), ProjectRegistry.at(tmp.resolve("reader2-registry.json")), cache2,
+                synonyms2, Duration.ofSeconds(10), null)) {
+            syncer.syncOnce();
+            reader2.syncOnce();
+        }
+        String hash1 = new com.pharos.search.KeywordSearchStrategy(readerSynonyms,
+                new org.apache.lucene.search.SearcherFactory()).synonymsHash();
+        String hash2 = new com.pharos.search.KeywordSearchStrategy(synonyms2,
+                new org.apache.lucene.search.SearcherFactory()).synonymsHash();
+        assertThat(hash1).isEqualTo(hash2).isNotEqualTo("none");
+        assertThat(Files.readString(readerSynonyms)).contains("=> accountbook", "=> gizmo");
     }
 
     @Test

@@ -95,6 +95,27 @@ public abstract class ObjectStoreContract {
     }
 
     @Test
+    void statReturnsTheExactKeyWithSizeAndLastModified() throws IOException {
+        store().put("stat/a", b("12345"));
+        store().put("stat/ab", b("1"));
+        ObjectInfo info = store().stat("stat/a").orElseThrow();
+        assertThat(info.key()).isEqualTo("stat/a");
+        assertThat(info.size()).isEqualTo(5);
+        assertThat(info.lastModified()).isNotNull();
+        ObjectInfo listed = store().list("stat/a").stream().filter(i -> i.key().equals("stat/a")).findFirst().orElseThrow();
+        // HEAD (stat) reports LastModified to the second on S3/MinIO, a listing often to the millisecond.
+        assertThat(info.lastModified().truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
+                .isEqualTo(listed.lastModified().truncatedTo(java.time.temporal.ChronoUnit.SECONDS));
+    }
+
+    @Test
+    void statMissingIsEmpty() throws IOException {
+        store().put("stat/prefix-only/x", b("x"));
+        assertThat(store().stat("stat/missing")).isEmpty();
+        assertThat(store().stat("stat/prefix-only")).isEmpty(); // a prefix is not an object
+    }
+
+    @Test
     void deleteMissingIsNoop() throws IOException {
         store().delete("never/existed");
         store().put("del/x", b("x"));

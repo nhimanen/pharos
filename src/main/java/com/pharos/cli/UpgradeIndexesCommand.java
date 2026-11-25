@@ -29,7 +29,7 @@ import java.util.function.Function;
  * <p>Exit codes: {@value #EXIT_OK} nothing to do, all upgraded, or aborted at the prompt;
  * {@value #EXIT_INCOMPLETE} a project was skipped (unknown, missing index, root gone) or failed;
  * {@value #EXIT_NEEDS_YES} confirmation needed but no terminal (use --yes);
- * {@value #EXIT_READER} refused on a reader node.
+ * {@value #EXIT_READER} refused on this node: a reader, or a work-queue writer (its work loop upgrades).
  */
 @Command(
         name = "upgrade-indexes",
@@ -41,7 +41,7 @@ import java.util.function.Function;
                 "0:nothing to upgrade, all upgraded, or aborted at the prompt",
                 "1:a project was skipped (unknown, missing index, root gone) or failed",
                 "2:confirmation needed but no terminal; re-run with --yes",
-                "5:refused on a reader node (readers receive upgrades by syncing; upgrade the writer)"}
+                "5:refused on a reader node (readers receive upgrades by syncing) or on a work-queue writer (its work loop upgrades: restart it on the new release)"}
 )
 public class UpgradeIndexesCommand implements Callable<Integer> {
 
@@ -104,6 +104,12 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         com.pharos.ShutdownSequence.install(); // a signal stops it in order (drain, model calls, hooks)
         try {
             RoleGuard.requireUpgrades(config);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return EXIT_READER;
+        }
+        try {
+            RoleGuard.requireNoWorkQueue(config, "pharos upgrade-indexes");
         } catch (IllegalStateException e) {
             System.err.println(e.getMessage());
             return EXIT_READER;

@@ -1,5 +1,42 @@
 # Upgrading
 
+## Upgrading to 1.9.0
+
+Index format: 1 (unchanged); no re-index. Single-node installs (`role: all`) and readers need nothing.
+**Cluster writers change behaviour** — read this before restarting them.
+
+### Work-queue writers are the default
+
+`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`): `pharos web`
+on the writer takes shards from the catalog under leases, polls their sources and indexes and publishes
+changes by itself. Hand-run `pharos index` / `pharos publish` are refused there (exit 2).
+
+- **To keep your current hand-run writer**, add `"writer": {"workQueue": false}` to its `cluster`
+  section before restarting it on 1.9.0. Nothing else changes for it.
+- **To adopt the work queue**, every shard needs a source in the catalog, or it stays pinned to the writer
+  that has its path: index it once on a hand-run writer with `--source-git <url> --ref <branch>` (or
+  `--source-path <dir>` readable by every writer), see README "Work-queue writers". Give every writer the
+  same `workDir` path, or each takeover re-parses the shard in full.
+
+On a work-queue writer:
+
+- **Upgrading is restarting it on the new release.** Its work loop gives every shard it holds a full
+  run when this release needs one (an older local or published index format, a broken graph pointer,
+  files embedded under another chunking version or model) and re-publishes it, without a source
+  change. `pharos upgrade-indexes` and `./setup.sh --upgrade-indexes` refuse there (exit 5), as do
+  `remove-index` and `embed` (exit 2): they would change the indexes under the running loop. The
+  "Steps" of a format upgrade below apply to single nodes and hand-run writers
+  (`"writer": {"workQueue": false}`).
+- **`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds`** (default 30), checked
+  at startup: a writer config from an earlier phase with `heartbeatSeconds` of 30 or more no longer
+  starts until you lower it (or raise the TTL).
+- **Disk guard default:** `cluster.writer.disk.minFreePercent` defaults to 0, so the threshold is
+  `minFreeBytes` (5 GiB). A percentage made writers on large disks permanently "low" (no lease
+  taken, nothing published); set one explicitly if you want it. A low writer logs a WARN once per
+  low episode.
+- **One work loop per node:** a second pharos daemon with the same config on the writer host (one
+  that `./pharos` starts on demand, say) runs no loop; it logs a WARN and serves everything else.
+
 ## Upgrading to 1.8.0
 
 Index format: 1 (unchanged); no re-index. Single-node installs need nothing. Cluster readers:
@@ -146,6 +183,9 @@ are re-indexed.
    ```bash
    ./setup.sh --upgrade-indexes      # or: pharos upgrade-indexes
    ```
+   On a multi-node cluster: readers sync the upgraded generations; a work-queue writer refuses this
+   step and upgrades by itself once restarted on the new release (see "Work-queue writers" above).
+   Run it only on a hand-run writer (`"writer": {"workQueue": false}`).
    You can check progress any time with `pharos index-status`.
 
 ### Time and cost

@@ -9,18 +9,12 @@ import com.pharos.graph.GraphViews;
 import com.pharos.indexer.IndexFormat;
 import com.pharos.indexer.IndexVersions;
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,8 +39,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
-import java.util.zip.CRC32;
-import java.util.zip.CheckedInputStream;
 
 /**
  * Keeps a reader's local cache in step with the published generations.
@@ -109,7 +101,7 @@ public class ReplicaSyncer implements Closeable {
     static final Duration WARM_OPEN_GRACE = Duration.ofSeconds(5);
     private static final Pattern GEN_DIR = Pattern.compile("gen-(\\d{1,18})");
     /** A plain file name: no separators, no {@code .}/{@code ..}, nothing absolute. */
-    private static final Pattern PLAIN_NAME = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,254}");
+    private static final Pattern PLAIN_NAME = GenerationFiles.PLAIN_NAME;
 
     private final ShardCatalog catalog;
     private final ReplicaSource source;
@@ -431,23 +423,8 @@ public class ReplicaSyncer implements Closeable {
         if (manifest.indexFormat() != null) IndexFormat.write(dir, manifest.indexFormat());
     }
 
-    /** Every entry needs a role and a plain file name; at least one Lucene file, at most one graph. */
     private static void checkFiles(ShardManifest manifest) throws IOException {
-        Set<String> luceneNames = new HashSet<>();
-        int graphs = 0;
-        for (ManifestFile f : manifest.files()) {
-            if (f.role() == null) throw new IOException("manifest gen-" + manifest.generation() + " has no role in " + f);
-            if (f.name() == null || !PLAIN_NAME.matcher(f.name()).matches()) {
-                throw new IOException("manifest gen-" + manifest.generation() + " has an unsafe file name: " + f);
-            }
-            if (f.length() < 0) throw new IOException("negative length in " + f);
-            if (ManifestFile.LUCENE.equals(f.role()) && !luceneNames.add(f.name())) {
-                throw new IOException("duplicate Lucene file " + f.name());
-            }
-            if (ManifestFile.GRAPH.equals(f.role())) graphs++;
-        }
-        if (luceneNames.isEmpty()) throw new IOException("manifest gen-" + manifest.generation() + " has no Lucene files");
-        if (graphs > 1) throw new IOException("manifest gen-" + manifest.generation() + " lists " + graphs + " graphs");
+        GenerationFiles.checkFiles(manifest);
     }
 
     private void materialise(ShardId shard, Generation gen, ShardManifest manifest, byte[] manifestJson,
@@ -619,58 +596,17 @@ public class ReplicaSyncer implements Closeable {
     }
 
     private static void checkLength(Path file, ManifestFile f) throws IOException {
-        long actual = Files.size(file);
-        if (actual != f.length()) {
-            throw new IOException("integrity check failed for " + f.key() + ": " + actual
-                    + " bytes, manifest says " + f.length());
-        }
+        GenerationFiles.checkLength(file, f);
     }
 
     private static void checkCrc32(Path file, ManifestFile f) throws IOException {
-        CRC32 crc = new CRC32();
-        try (InputStream in = new CheckedInputStream(Files.newInputStream(file), crc)) {
-            in.transferTo(OutputStream.nullOutputStream());
-        }
-        if (crc.getValue() != parseChecksum(f)) {
-            throw new IOException("integrity check failed for " + f.key() + ": CRC32 "
-                    + Long.toHexString(crc.getValue()) + ", manifest says " + f.checksum());
-        }
+        GenerationFiles.checkCrc32(file, f);
     }
 
-    /**
-     * Downloaded Lucene files are checksummed end to end ({@link CodecUtil#checksumEntireFile}
-     * throws when the body does not match the footer); hard-linked ones have their footer read.
-     * Either checksum must match the manifest, and the commit must be readable. Only the files in
-     * {@code local} are checked (lazy mode leaves the others remote).
-     */
+    /** See {@link GenerationFiles#checkLuceneChecksums}. */
     private static void checkLuceneChecksums(Path lucene, ShardManifest manifest, Set<String> local,
                                              Set<String> downloaded) throws IOException {
-        try (Directory dir = FSDirectory.open(lucene)) {
-            for (ManifestFile f : manifest.files()) {
-                if (!ManifestFile.LUCENE.equals(f.role()) || !local.contains(f.name())) continue;
-                long actual;
-                try (IndexInput in = dir.openInput(f.name(), IOContext.READONCE)) {
-                    actual = downloaded.contains(f.name())
-                            ? CodecUtil.checksumEntireFile(in)
-                            : CodecUtil.retrieveChecksum(in);
-                } catch (org.apache.lucene.index.CorruptIndexException e) {
-                    throw new IOException("integrity check failed for " + f.key() + ": " + e.getMessage(), e);
-                }
-                if (actual != parseChecksum(f)) {
-                    throw new IOException("integrity check failed for " + f.key() + ": footer checksum "
-                            + Long.toHexString(actual) + ", manifest says " + f.checksum());
-                }
-            }
-            SegmentInfos.readLatestCommit(dir);
-        }
-    }
-
-    private static long parseChecksum(ManifestFile f) throws IOException {
-        try {
-            return Long.parseUnsignedLong(Objects.requireNonNull(f.checksum(), "checksum"), 16);
-        } catch (NumberFormatException | NullPointerException e) {
-            throw new IOException("invalid checksum in " + f);
-        }
+        GenerationFiles.checkLuceneChecksums(lucene, manifest, local, downloaded);
     }
 
     private static boolean sameManifest(Path genDir, byte[] manifestJson) {

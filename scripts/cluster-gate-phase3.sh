@@ -171,6 +171,7 @@ cat > "$W_PH/config.json" <<JSON
     "role": "writer",
     "backend": "object-store",
     "nodeId": "gate-writer",
+    "writer": {"workQueue": false},
     "cacheDir": "$W_PH/cluster-cache",
     "objectStore": {
       "endpoint": "http://127.0.0.1:$MINIO_PORT", "region": "us-east-1", "bucket": "pharos-gate",

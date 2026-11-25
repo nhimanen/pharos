@@ -38,6 +38,9 @@ class RouterCommandTest {
         final AtomicInteger healthCalls = new AtomicInteger();
         /** Paths whose answer sends its headers and one body byte, then stalls this long before finishing. */
         final Map<String, Integer> stallBodyMillis = new ConcurrentHashMap<>();
+        /** SSE paths: {intervalMillis, events, stallAfterMillis}: events every interval, then a stall, then the end. */
+        final Map<String, int[]> sse = new ConcurrentHashMap<>();
+        final List<String> acceptHeaders = new CopyOnWriteArrayList<>();
 
         FakeReader(String name) throws IOException {
             this(name, null);
@@ -67,6 +70,26 @@ class RouterCommandTest {
                 headers.add(Map.copyOf(ex.getRequestHeaders()));
                 status = statusFor.getOrDefault(path, 200);
                 out = name;
+            }
+            int[] stream = sse.get(path);
+            if (stream != null) {
+                acceptHeaders.add(String.valueOf(ex.getRequestHeaders().getFirst("Accept")));
+                ex.getResponseHeaders().add("Content-Type", "text/event-stream");
+                ex.sendResponseHeaders(200, 0);
+                try {
+                    for (int i = 1; i <= stream[1]; i++) {
+                        ex.getResponseBody().write(("event: tick\ndata: " + i + "\n\n").getBytes(StandardCharsets.UTF_8));
+                        ex.getResponseBody().flush();
+                        if (i < stream[1]) Thread.sleep(stream[0]);
+                    }
+                    Thread.sleep(stream[2]);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (IOException gone) {
+                    // the router cut the stream
+                }
+                ex.close();
+                return;
             }
             byte[] bytes = out.getBytes(StandardCharsets.UTF_8);
             Integer stall = stallBodyMillis.get(path);
@@ -397,5 +420,60 @@ class RouterCommandTest {
         HttpResponse<String> fast = get(router, "/api/projects");
         assertThat(fast.statusCode()).isEqualTo(200);
         assertThat(fast.body()).isEqualTo("a");
+    }
+
+    /** Task 5: /cluster/events streams through, unbuffered, past the total deadline; idle streams are cut. */
+    @Test
+    void routerStreamsEventsPastTotalDeadline() throws Exception {
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newCachedThreadPool();
+        open.add(pool::shutdownNow);
+        FakeReader a = new FakeReader("a", pool);
+        open.add(a);
+        a.sse.put("/cluster/events", new int[]{300, 6, 0}); // 6 events over 1.5 s, then the end
+        RouterCommand.Router router = new RouterCommand.Router(() -> List.of(a.heartbeat()), Duration.ofHours(1),
+                Duration.ofMillis(500), Duration.ofMillis(800)); // total deadline 800 ms
+        router.setEventsIdleTimeout(Duration.ofMillis(1_000));
+        open.add(router);
+        router.start(0);
+        router.pollNow();
+
+        long t0 = System.nanoTime();
+        HttpResponse<java.util.stream.Stream<String>> resp = http.send(HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + router.port() + "/cluster/events"))
+                .header("Accept", "text/event-stream").build(), HttpResponse.BodyHandlers.ofLines());
+        assertThat(resp.statusCode()).isEqualTo(200);
+        assertThat(resp.headers().firstValue("content-type").orElse("")).startsWith("text/event-stream");
+        List<Long> at = new ArrayList<>();
+        List<String> data = new ArrayList<>();
+        resp.body().forEach(line -> {
+            if (line.startsWith("data:")) {
+                data.add(line.substring(5).trim());
+                at.add((System.nanoTime() - t0) / 1_000_000);
+            }
+        });
+        long tookMs = (System.nanoTime() - t0) / 1_000_000;
+        assertThat(data).as("every event, none cut by the 800 ms total deadline").containsExactly("1", "2", "3", "4", "5", "6");
+        assertThat(tookMs).isGreaterThan(800);
+        assertThat(at.get(at.size() - 1) - at.get(0)).as("streamed as they came, not buffered to the end")
+                .isGreaterThan(1_000);
+        assertThat(a.acceptHeaders).containsExactly("text/event-stream");
+
+        // an idle stream (one event, then silence) is cut after the idle timeout
+        a.sse.put("/cluster/events", new int[]{0, 1, 10_000});
+        long t1 = System.nanoTime();
+        HttpResponse<String> idle = http.send(HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + router.port() + "/cluster/events")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        long idleMs = (System.nanoTime() - t1) / 1_000_000;
+        assertThat(idle.body()).contains("data: 1");
+        assertThat(idleMs).as("cut at the 1 s idle timeout, not after the 10 s stall").isBetween(900L, 5_000L);
+
+        // the status is forwarded like any GET; other methods and cluster paths are not
+        assertThat(get(router, "/cluster/status").body()).isEqualTo("a");
+        assertThat(send(router, "POST", "/cluster/status", "{}").statusCode()).isEqualTo(405);
+        assertThat(get(router, "/cluster/readers").statusCode()).isEqualTo(404);
+        assertThat(RouterCommand.Router.forwardable("/cluster/status")).isTrue();
+        assertThat(RouterCommand.Router.forwardable("/cluster/events")).isTrue();
+        assertThat(RouterCommand.Router.forwardable("/cluster/status/x")).isFalse();
     }
 }

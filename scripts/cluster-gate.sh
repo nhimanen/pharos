@@ -94,6 +94,7 @@ write_config() {  # $1 = role, $2 = node id, $3 = pharos home
     "role": "$1",
     "backend": "object-store",
     "nodeId": "$2",
+    "writer": {"workQueue": false},
     "pollIntervalSeconds": $POLL,
     "cacheDir": "$3/cluster-cache",
     "objectStore": {

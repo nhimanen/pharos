@@ -162,11 +162,28 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
     @Override
     public ParsedProject parseFiles(List<Path> files, Path projectRoot,
                                      String projectName) throws IOException {
+        return parseFiles(files, projectRoot, projectName, com.pharos.indexer.IndexAbort.none());
+    }
+
+    /** {@link #parseFiles(List, Path, String)} that checks {@code abort} before every file. */
+    @Override
+    public ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
+                                     com.pharos.indexer.IndexAbort abort) throws IOException {
+        abort.checkpoint();
         if (files.isEmpty()) {
             return new ParsedProject(projectName, projectRoot.toString(), List.of());
         }
         if (parseThreads <= 1) {
-            return CodeParser.super.parseFiles(files, projectRoot, projectName);
+            List<ParsedFile> results = new ArrayList<>(files.size());
+            for (Path file : files) {
+                abort.checkpoint();
+                try {
+                    results.add(parseFile(file, projectName, projectRoot));
+                } catch (Exception e) {
+                    log.debug("Parse error in {}: {}", file, e.getMessage());
+                }
+            }
+            return new ParsedProject(projectName, projectRoot.toString(), results);
         }
 
         List<ParsedFile> results = Collections.synchronizedList(new ArrayList<>(files.size()));
@@ -182,6 +199,7 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
             List<Future<ParsedFile>> futures = new ArrayList<>(files.size());
             for (Path file : files) {
                 futures.add(pool.submit(() -> {
+                    if (abort.requested()) return null; // aborted: skip the rest of the queue
                     try {
                         ParsedFile pf = parseFile(file, projectName, projectRoot);
                         ok.incrementAndGet();
@@ -194,6 +212,7 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
                 }));
             }
             for (Future<ParsedFile> f : futures) {
+                abort.checkpoint();
                 try {
                     ParsedFile pf = f.get();
                     if (pf != null) results.add(pf);
@@ -208,6 +227,7 @@ public abstract class ScriptBasedCodeParser implements CodeParser {
         } finally {
             pool.shutdown();
         }
+        abort.checkpoint();
         log.info("{}: parsed {} files ({} errors) in project '{}' with {} threads",
                 getClass().getSimpleName(), ok.get(), err.get(), projectName, parseThreads);
         return new ParsedProject(projectName, projectRoot.toString(), results);

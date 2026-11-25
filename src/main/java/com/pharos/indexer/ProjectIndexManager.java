@@ -54,6 +54,21 @@ import java.util.stream.Collectors;
  */
 public class ProjectIndexManager {
 
+    /** Directories the index walk never enters (dot-directories are skipped as well: see {@link #isSkippedDir}). */
+    public static final Set<String> SKIP_DIRS = Set.of(
+                ".git", ".hg", ".svn",
+                "node_modules", ".yarn", "vendor", ".cargo",
+                "target", "build", "dist", "out", ".gradle",
+                "__pycache__", ".tox", ".venv", "venv", ".env",
+                ".idea", ".vscode",
+                "logs", "log", "tmp", "temp", ".cache"
+    );
+
+    /** Whether the index walk skips a directory with this name. */
+    public static boolean isSkippedDir(String name) {
+        return SKIP_DIRS.contains(name) || name.startsWith(".");
+    }
+
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexManager.class);
     /**
      * Fallback batch size when no provider config is present (only the
@@ -392,6 +407,119 @@ public class ProjectIndexManager {
     }
 
     /**
+     * Why an incremental run of {@code projectName} would be turned into a full one by this
+     * indexer, or null when it can run incrementally (also null with no index dir yet: that is a
+     * normal first full index). {@link #index} applies exactly this check; the writer disk guard's
+     * run estimate uses it too.
+     * <ul>
+     *   <li>An index written by another format can't be updated in place: rebuild it fully.</li>
+     *   <li>A broken graph pointer (malformed, or naming a generation that is gone, e.g. left behind
+     *       by an older pharos) can't be patched: patching would need a fresh, empty graph. A full
+     *       run rebuilds the graph and replaces the pointer.</li>
+     * </ul>
+     */
+    public String fullRunReason(String projectName) {
+        Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
+        if (!Files.isDirectory(existingDir)) return null;
+        if (IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
+            return "index format changed (" + IndexFormat.read(existingDir).format()
+                    + " → " + IndexVersions.INDEX_FORMAT + ")";
+        }
+        return CallGraph.pointerProblem(existingDir);
+    }
+
+    /**
+     * The file-state tracker a run of the project in {@code projectIndexDir} uses: stamped with
+     * {@link IndexVersions#CHUNKING_VERSION} and the current models' fingerprint, so
+     * {@link FileStateTracker#isEmbeddingOutdated} sees files embedded under another chunking or
+     * model. Without embeddings no model is involved: it stamps "none" rather than the configured
+     * models' fingerprint (stamping it claimed the files were embedded, so a later normal index
+     * never embedded unchanged files, and computing it loaded the models for {@code --no-embed}).
+     * The legacy aliases are model fingerprints too, skipped likewise.
+     */
+    public FileStateTracker stateTracker(Path projectIndexDir, boolean generateEmbeddings) {
+        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
+        List<String> legacyFps = generateEmbeddings ? legacyCompositeModelFingerprints() : List.of();
+        return new FileStateTracker(projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyFps);
+    }
+
+    /** The full run's embedding-text spool in the project index dir. */
+    static final String FULL_SPOOL = "embed.spool";
+    /** The incremental run's embedding-text spool in the project index dir. */
+    static final String INCREMENTAL_SPOOL = "embed-incr.spool";
+
+    /**
+     * True for a run's temporary files in the project index dir: the spools and the per-run vector
+     * caches ({@code embed.<model>.cache}, {@code embed-incr.<model>.cache}). The persistent
+     * embedding cache ({@code embed-cache.<model>.bin|meta}) is not one of them.
+     */
+    static boolean isRunTempFile(String name) {
+        if (name.equals(FULL_SPOOL) || name.equals(INCREMENTAL_SPOOL)) return true;
+        return (name.startsWith("embed.") || name.startsWith("embed-incr.")) && name.endsWith(".cache");
+    }
+
+    /**
+     * Garbage-collects what an interrupted run (a crash, a kill) left in the project's index dir,
+     * under the same retention rule the index runs apply themselves: every graph generation except
+     * the live one ({@link CallGraph#removeUnusedGraphs}, which a full run also calls before and after
+     * its build) and the run's temporary spool and vector-cache files (a run deletes them in its
+     * {@code finally}). The live Lucene commit, the live graph, {@code file-state.json}, the
+     * persistent embedding cache and the registry are never touched.
+     *
+     * <p>Takes the project's Lucene write lock first, so it never races a run of the project (in
+     * this JVM or another): when a run holds it, nothing is deleted.
+     *
+     * @return bytes freed; 0 when nothing was left over, -1 when a run holds the write lock
+     */
+    public long removeRunLeftovers(String projectName) {
+        Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
+        if (!Files.isDirectory(projectIndexDir)) return 0;
+        Path luceneDir = projectIndexDir.resolve("lucene");
+        long before = sizeOf(projectIndexDir);
+        try (org.apache.lucene.store.Directory dir = Files.isDirectory(luceneDir)
+                ? org.apache.lucene.store.FSDirectory.open(luceneDir) : null;
+             org.apache.lucene.store.Lock lock = dir == null ? null : dir.obtainLock(IndexWriter.WRITE_LOCK_NAME)) {
+            CallGraph.removeUnusedGraphs(projectIndexDir);
+            try (var files = Files.list(projectIndexDir)) {
+                for (Path f : files.toList()) {
+                    if (Files.isRegularFile(f) && isRunTempFile(f.getFileName().toString())) Files.deleteIfExists(f);
+                }
+            }
+        } catch (org.apache.lucene.store.LockObtainFailedException e) {
+            log.debug("Not collecting leftovers of '{}': a run holds its write lock", projectName);
+            return -1;
+        } catch (IOException e) {
+            log.warn("Collecting the leftovers of '{}' failed: {}", projectName, e.toString());
+        }
+        long freed = Math.max(0, before - sizeOf(projectIndexDir));
+        if (freed > 0) log.info("Removed {} bytes of run leftovers of '{}'", freed, projectName);
+        return freed;
+    }
+
+    /** Total size of the regular files under {@code dir} (0 when absent; best effort). */
+    public static long sizeOf(Path dir) {
+        if (!Files.exists(dir)) return 0;
+        long[] total = {0};
+        try {
+            Files.walkFileTree(dir, new java.nio.file.SimpleFileVisitor<>() {
+                @Override
+                public java.nio.file.FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) {
+                    if (a.isRegularFile()) total[0] += a.size();
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFileFailed(Path f, IOException e) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            log.debug("Sizing {} failed: {}", dir, e.toString());
+        }
+        return total[0];
+    }
+
+    /**
      * Index a project.
      *
      * @param projectRoot        path to the project root directory
@@ -435,11 +563,33 @@ public class ProjectIndexManager {
     public ProjectMeta index(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
                               boolean buildSynonyms, ProgressListener progress) throws IOException {
+        return index(projectRoot, projectName, incremental, force, generateEmbeddings, buildSynonyms, progress,
+                IndexAbort.none(), null);
+    }
+
+    /**
+     * An index run that can be aborted at a safe point (see {@link IndexAbort}) and records the
+     * source revision it indexed.
+     *
+     * @param abort          checked between units of work; an abort before the Lucene commit throws
+     *                       {@link IndexAbortedException} and leaves the project at its previous commit
+     * @param sourceRevision stored as the project's {@link ProjectMeta#getSourceRevision()} (and so in
+     *                       the published manifest); null leaves it unset
+     */
+    public ProjectMeta index(Path projectRoot, String projectName,
+                              boolean incremental, boolean force, boolean generateEmbeddings,
+                              boolean buildSynonyms, ProgressListener progress, IndexAbort abort,
+                              String sourceRevision) throws IOException {
         ProjectNames.validate(projectName, config.getIndexDir());
         // Fail fast (before any parsing) when the publisher could never publish this name.
         publisher.checkPublishable(projectName);
+        abort.checkpoint();
         ProjectMeta meta = indexLocally(projectRoot, projectName, incremental, force,
-                generateEmbeddings, buildSynonyms, progress);
+                generateEmbeddings, buildSynonyms, progress, abort);
+        if (sourceRevision != null) {
+            meta.setSourceRevision(sourceRevision);
+            registry.register(meta);
+        }
         // Same rule as the file-state fingerprint: never load models for --no-embed.
         String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
         publisher.publish(new LocalSnapshot(projectName,
@@ -449,25 +599,12 @@ public class ProjectIndexManager {
 
     private ProjectMeta indexLocally(Path projectRoot, String projectName,
                               boolean incremental, boolean force, boolean generateEmbeddings,
-                              boolean buildSynonyms, ProgressListener progress) throws IOException {
+                              boolean buildSynonyms, ProgressListener progress,
+                              IndexAbort abort) throws IOException {
         if (incremental) {
-            // An index written by another format can't be updated in place: rebuild it fully.
-            // A project with no index dir yet is just a normal first full index.
-            Path existingDir = luceneIndexer.getProjectIndexDir(projectName);
-            if (Files.isDirectory(existingDir) && IndexFormat.status(existingDir) != IndexFormat.Status.OK) {
-                String msg = "index format changed (" + IndexFormat.read(existingDir).format()
-                        + " → " + IndexVersions.INDEX_FORMAT + "): running a full re-index";
-                log.warn(msg);
-                progress.onProgress(msg, 0, 0);
-                incremental = false;
-            }
-            // A broken graph pointer (malformed, or naming a generation that is gone — e.g. left
-            // behind by an older pharos) can't be patched: patching would need a fresh, empty
-            // graph. A full run rebuilds the graph and replaces the pointer.
-            String pointerProblem = incremental && Files.isDirectory(existingDir)
-                    ? CallGraph.pointerProblem(existingDir) : null;
-            if (pointerProblem != null) {
-                String msg = pointerProblem + ": running a full re-index";
+            String reason = fullRunReason(projectName);
+            if (reason != null) {
+                String msg = reason + ": running a full re-index";
                 log.warn(msg);
                 progress.onProgress(msg, 0, 0);
                 incremental = false;
@@ -500,16 +637,8 @@ public class ProjectIndexManager {
         Path projectIndexDir = luceneIndexer.getProjectIndexDir(projectName);
         Files.createDirectories(projectIndexDir);
 
-        // Without embeddings no model is involved: stamp "none" rather than the configured
-        // models' fingerprint. Stamping the model fingerprint (as before) claimed these files
-        // were embedded, so a later normal `index` never embedded unchanged files — and
-        // computing it forced the models to load for `index --no-embed`.
-        // The legacy aliases are model fingerprints too: resolving them checks provider
-        // availability, which loads the model, so skip them as well when not embedding.
-        String modelFp = generateEmbeddings ? compositeModelFingerprint() : "none";
-        List<String> legacyFps = generateEmbeddings ? legacyCompositeModelFingerprints() : List.of();
-        FileStateTracker stateTracker = new FileStateTracker(
-                projectIndexDir, IndexVersions.CHUNKING_VERSION, modelFp, legacyFps);
+        // "none" as the model fingerprint without embeddings (see stateTracker)
+        FileStateTracker stateTracker = stateTracker(projectIndexDir, generateEmbeddings);
         // Per-model runtimes — one PersistentEmbeddingCache + cache file per
         // available provider. Full and incremental paths use slightly different
         // cache-file prefixes so a parallel re-index can't clobber an in-progress
@@ -519,10 +648,10 @@ public class ProjectIndexManager {
 
         if (incremental && luceneIndexer.indexExists(projectName)) {
             return indexIncremental(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort);
         } else {
             return indexFull(projectRoot, projectName, projectIndexDir,
-                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes);
+                    stateTracker, generateEmbeddings, buildSynonyms, progress, runtimes, abort);
         }
     }
 
@@ -530,7 +659,7 @@ public class ProjectIndexManager {
                                    Path projectIndexDir, FileStateTracker stateTracker,
                                    boolean generateEmbeddings, boolean buildSynonyms,
                                    ProgressListener progress,
-                                   List<EmbedRuntime> runtimes) throws IOException {
+                                   List<EmbedRuntime> runtimes, IndexAbort abort) throws IOException {
         // Single walkFileTree — collect all supported source files once, dispatch to parsers by extension.
         // This avoids N independent walks when N parsers are registered.
         // Check dirty status against the pre-existing state before clearing it, so synonym mining
@@ -543,14 +672,7 @@ public class ProjectIndexManager {
         // Treat a brand-new project (no prior state) as always changed.
         boolean[] anyChanges = { stateTracker.trackedFiles().isEmpty() };
 
-        Set<String> skipDirs = Set.of(
-                ".git", ".hg", ".svn",
-                "node_modules", ".yarn", "vendor", ".cargo",
-                "target", "build", "dist", "out", ".gradle",
-                "__pycache__", ".tox", ".venv", "venv", ".env",
-                ".idea", ".vscode",
-                "logs", "log", "tmp", "temp", ".cache"
-        );
+        Set<String> skipDirs = SKIP_DIRS;
         OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
             @Override
@@ -575,6 +697,7 @@ public class ProjectIndexManager {
         });
 
         oversized.report(projectName);
+        abort.checkpoint();
 
         // Also treat removed files as a change.
         if (!anyChanges[0]) {
@@ -593,7 +716,8 @@ public class ProjectIndexManager {
         List<ParsedProject> perLang = new ArrayList<>();
         int parserIdx = 0;
         for (Map.Entry<CodeParser, List<Path>> entry : filesByParser.entrySet()) {
-            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName));
+            abort.checkpoint();
+            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName, abort));
             progress.onProgress("Parsing", ++parserIdx, parsers.size());
         }
         ParsedProject project = merge(projectName, projectRoot, perLang);
@@ -614,12 +738,14 @@ public class ProjectIndexManager {
             progress.onProgress("Extracting relationships", ++relIdx, parsers.size());
         }
         com.pharos.parser.model.ParsedRelationships relationships = mergeRelationships(projectName, allRelationships);
+        abort.checkpoint();
 
         // The Lucene write lock is held from here on: a second concurrent run of this project
         // fails to get it before it can touch this run's graph generation. Lucene keeps the
         // previous commit visible to readers until the commit below.
         GraphIndexData graphData;
         try (IndexWriter writer = luceneIndexer.openWriterFresh(projectName)) {
+          try {
             // No other run is in progress, so every graph dir but the live one is a leftover.
             CallGraph.removeUnusedGraphs(projectIndexDir);
 
@@ -640,7 +766,8 @@ public class ProjectIndexManager {
             // The writer does not commit on close: an exception before this commit leaves the
             // previous commit (and the previous graph) live instead of a partial index.
             indexProject(writer, project, stateTracker, generateEmbeddings, graphData, progress,
-                    projectIndexDir, runtimes);
+                    projectIndexDir, runtimes, abort);
+            abort.enterCommit();
             writer.commit();
 
             // Publish the rebuilt graph now that the matching Lucene commit is visible. A failed
@@ -651,6 +778,15 @@ public class ProjectIndexManager {
                 CrossProjectLinker.touchStamp(projectIndexDir.resolve("graph.stamp"));
             }
             CallGraph.removeUnusedGraphs(projectIndexDir);
+          } catch (IndexAbortedException aborted) {
+            // A safe point before the commit: roll the writer back (uncommitted segment files are
+            // deleted; the previous commit stays live) and drop the graph generation being built.
+            writer.rollback();
+            CallGraph.removeUnusedGraphs(projectIndexDir);
+            log.warn("Full index of '{}' aborted before its commit; the previous commit is unchanged: {}",
+                    projectName, aborted.getMessage());
+            throw aborted;
+          }
         }
 
         // Save file state
@@ -694,7 +830,7 @@ public class ProjectIndexManager {
                                           Path projectIndexDir, FileStateTracker stateTracker,
                                           boolean generateEmbeddings, boolean buildSynonyms,
                                           ProgressListener progress,
-                                          List<EmbedRuntime> runtimes) throws IOException {
+                                          List<EmbedRuntime> runtimes, IndexAbort abort) throws IOException {
         log.info("Incremental index: scanning for changes in '{}'", projectName);
         progress.onProgress("Scanning for changes", 0, 0);
 
@@ -704,14 +840,7 @@ public class ProjectIndexManager {
         // Collect all supported source files that currently exist under the project root.
         // Skip noise directories that parsers would also skip — avoids counting .git objects,
         // vendored deps, build artifacts, and log/data directories as source files.
-        Set<String> skipDirs = Set.of(
-                ".git", ".hg", ".svn",
-                "node_modules", ".yarn", "vendor", ".cargo",
-                "target", "build", "dist", "out", ".gradle",
-                "__pycache__", ".tox", ".venv", "venv", ".env",
-                ".idea", ".vscode",
-                "logs", "log", "tmp", "temp", ".cache"
-        );
+        Set<String> skipDirs = SKIP_DIRS;
         Set<Path> currentFiles = new java.util.HashSet<>();
         OversizedFiles oversized = new OversizedFiles();
         Files.walkFileTree(projectRoot, new SimpleFileVisitor<>() {
@@ -799,6 +928,7 @@ public class ProjectIndexManager {
         List<ParsedFile> parsedDirtyFiles = new ArrayList<>();
 
         try (IndexWriter writer = luceneIndexer.openWriter(projectName)) {
+          try {
             // Remove documents for deleted source files
             for (Path deleted : deletedFiles) {
                 writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH, deleted.toString()));
@@ -812,7 +942,7 @@ public class ProjectIndexManager {
             List<Integer> fileSlotStarts = new ArrayList<>();  // slot offset per parsed file
             List<List<String>> parsedSynthBodies = new ArrayList<>();
 
-            Path spoolPath = projectIndexDir.resolve("embed-incr.spool");
+            Path spoolPath = projectIndexDir.resolve(INCREMENTAL_SPOOL);
             try {
                 int totalSlots = 0;
                 try (DataOutputStream spool = doEmbed
@@ -820,6 +950,7 @@ public class ProjectIndexManager {
                                 Files.newOutputStream(spoolPath), 1 << 16))
                         : null) {
                     for (Path file : dirtyFiles) {
+                        abort.checkpoint();
                         writer.deleteDocuments(new Term(DocumentMapper.F_FILE_PATH,
                                 file.toAbsolutePath().toString()));
                         CodeParser fileParser = parserFor(file);
@@ -863,9 +994,10 @@ public class ProjectIndexManager {
                 // if rt.threads > 1.
                 if (doEmbed && totalSlots > 0) {
                     for (EmbedRuntime rt : runtimes) {
-                        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName);
+                        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName, abort);
                     }
                 }
+                abort.checkpoint();
 
                 // Pass 3: write Lucene documents, reading per-model embeddings.
                 Map<String, FileChannel> cacheChannels = new LinkedHashMap<>();
@@ -922,6 +1054,7 @@ public class ProjectIndexManager {
                         try { ch.close(); } catch (IOException ignored) {}
                     }
                 }
+                abort.enterCommit();
                 writer.commit();
             } finally {
                 Files.deleteIfExists(spoolPath);
@@ -929,6 +1062,13 @@ public class ProjectIndexManager {
                     Files.deleteIfExists(rt.cachePath);
                 }
             }
+          } catch (IndexAbortedException aborted) {
+            // Before the commit: the graph is patched only after it, so only the writer is rolled back.
+            writer.rollback();
+            log.warn("Incremental index of '{}' aborted before its commit; the previous commit is unchanged: {}",
+                    projectName, aborted.getMessage());
+            throw aborted;
+          }
         }
 
         stateTracker.save();
@@ -985,7 +1125,8 @@ public class ProjectIndexManager {
     private void indexProject(IndexWriter writer, ParsedProject project,
                                FileStateTracker stateTracker, boolean generateEmbeddings,
                                GraphIndexData graphData, ProgressListener progress,
-                               Path projectIndexDir, List<EmbedRuntime> runtimes) throws IOException {
+                               Path projectIndexDir, List<EmbedRuntime> runtimes,
+                               IndexAbort abort) throws IOException {
         int indexThreads = config.resolvedIndexThreads();
         List<ParsedFile> files = project.files();
         int totalFiles = files.size();
@@ -1012,7 +1153,7 @@ public class ProjectIndexManager {
         List<List<List<Chunk>>> fileMethodChunks = new ArrayList<>(totalFiles);
         List<List<List<Chunk>>> fileClassChunks  = new ArrayList<>(totalFiles);
 
-        Path spoolPath = projectIndexDir.resolve("embed.spool");
+        Path spoolPath = projectIndexDir.resolve(FULL_SPOOL);
         try {
             // Phase 1: build chunk lists and spool all embedding texts to disk.
             // Methods always contribute 1 slot; classes contribute N slots (one per chunk).
@@ -1022,6 +1163,7 @@ public class ProjectIndexManager {
                 try (DataOutputStream spool = new DataOutputStream(new BufferedOutputStream(
                         Files.newOutputStream(spoolPath), 1 << 16))) {
                     for (int fi = 0; fi < totalFiles; fi++) {
+                        if ((fi & 63) == 0) abort.checkpoint();
                         ParsedFile file = files.get(fi);
                         List<String> synthBodies = file.classes().stream()
                                 .map(cls -> synthesizedBodyCache.computeIfAbsent(
@@ -1092,9 +1234,10 @@ public class ProjectIndexManager {
             // runs in parallel internally if rt.threads > 1.
             if (doEmbed && totalSlots > 0) {
                 for (EmbedRuntime rt : runtimes) {
-                    runEmbedPass(spoolPath, totalSlots, rt, progress, project.projectName());
+                    runEmbedPass(spoolPath, totalSlots, rt, progress, project.projectName(), abort);
                 }
             }
+            abort.checkpoint();
 
             // Phase 3: write Lucene documents. Each file reads its per-model
             // embedding ranges in one shot per provider; FileChannel is thread-safe
@@ -1112,6 +1255,7 @@ public class ProjectIndexManager {
 
                 if (indexThreads <= 1) {
                     for (int fi = 0; fi < totalFiles; fi++) {
+                        if ((fi & 63) == 0) abort.checkpoint();
                         ParsedFile file = files.get(fi);
                         int slotCount = fileSlotCount(file, fileMethodChunks.get(fi), fileClassChunks.get(fi));
                         Map<String, float[][]> embsByModel = readPerModelEmbeddings(
@@ -1132,6 +1276,7 @@ public class ProjectIndexManager {
                             final int fiFinal = fi;
                             futures.add(pool.submit(() -> {
                                 try {
+                                    abort.checkpoint();
                                     ParsedFile file = files.get(fiFinal);
                                     int slotCount = fileSlotCount(file, fileMethodChunks.get(fiFinal), fileClassChunks.get(fiFinal));
                                     Map<String, float[][]> embsByModel = readPerModelEmbeddings(
@@ -1312,7 +1457,13 @@ public class ProjectIndexManager {
      * worker, equivalent to the previous serial pass.
      */
     void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
-                               ProgressListener progress, String projectName) throws IOException {
+                      ProgressListener progress, String projectName) throws IOException {
+        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName, IndexAbort.none());
+    }
+
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                      ProgressListener progress, String projectName,
+                      IndexAbort abort) throws IOException {
         if (totalSlots == 0) return;
         int chunkSize = rt.chunkSize;
         int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
@@ -1351,6 +1502,7 @@ public class ProjectIndexManager {
         LongAdder hits   = new LongAdder();
         LongAdder misses = new LongAdder();
         AtomicInteger chunksDone = new AtomicInteger(0);
+        progress.onProgress("Embedding[" + rt.modelId() + "]", 0, totalChunks);
 
         ExecutorService pool = Executors.newFixedThreadPool(threads, r -> {
             Thread t = new Thread(r, "embed-" + rt.modelId());
@@ -1363,6 +1515,7 @@ public class ProjectIndexManager {
             for (int i = 0; i < totalChunks; i++) {
                 final int chunkIdx = i;
                 futures.add(pool.submit(() -> {
+                    abort.checkpoint(); // a safe point per chunk: the run's slowest phase
                     int[] range = chunkRanges.get(chunkIdx);
                     List<String> texts = chunkTexts.get(chunkIdx);
                     float[][] embeddings = embedBatchWithCache(
@@ -1398,7 +1551,7 @@ public class ProjectIndexManager {
                     throw new IOException("Embed task failed: " + cause.getMessage(), cause);
                 }
             }
-        } catch (IOException | RuntimeException abort) {
+        } catch (IOException | RuntimeException failure) {
             // Keep what was already embedded so the next run does not redo it.
             pool.shutdownNow();
             try {
@@ -1406,9 +1559,9 @@ public class ProjectIndexManager {
                 if (rt.cache != null) rt.cache.save();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                abort.addSuppressed(interrupted);
+                failure.addSuppressed(interrupted);
             }
-            throw abort;
+            throw failure;
         } finally {
             pool.shutdown();
         }

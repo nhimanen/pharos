@@ -15,6 +15,7 @@ import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -43,6 +44,13 @@ import java.util.Optional;
  * block fetches use) also bounds each attempt by that and the whole call, retries included, by
  * {@link ClusterConfig.ObjectStoreConfig#readTotalTimeout}. An unreachable bucket then fails a query's
  * miss in seconds instead of stalling it for the SDK's minutes of socket timeouts and retries.
+ *
+ * <p>Every other call is bounded by {@code callAttemptTimeoutSeconds} per attempt and
+ * {@code callTimeoutSeconds} in total (gate run 2 for 1.9.0: a heartbeat put on a saturated MinIO
+ * took about 4 minutes without them). An upload (one PutObject, whatever its size) adds its body at
+ * {@code uploadMinBytesPerSecond} to both ({@link #uploadAttemptTimeout}, {@link #uploadTotalTimeout}).
+ * A whole-object download's bounds end with its response headers: its body, which can be gigabytes,
+ * is bounded by the idle-read timeout only.
  */
 public class S3ObjectStore implements ObjectStore {
 
@@ -50,6 +58,7 @@ public class S3ObjectStore implements ObjectStore {
     /** Per-request bounds of a ranged read: one attempt, and the whole call with retries. */
     private final java.time.Duration readAttemptTimeout;
     private final java.time.Duration readTotalTimeout;
+    private final ClusterConfig.ObjectStoreConfig cfg;
     private final String bucket;
     /** For messages: the configured endpoint, or the AWS default. */
     private final String endpoint;
@@ -61,6 +70,7 @@ public class S3ObjectStore implements ObjectStore {
     /** Visible for tests that supply credentials directly. */
     S3ObjectStore(ClusterConfig.ObjectStoreConfig cfg, AwsCredentialsProvider credentials) {
         this.bucket = cfg.getBucket();
+        this.cfg = cfg;
         this.endpoint = describeEndpoint(cfg);
         this.readAttemptTimeout = cfg.readAttemptTimeout();
         this.readTotalTimeout = cfg.readTotalTimeout();
@@ -77,6 +87,22 @@ public class S3ObjectStore implements ObjectStore {
                 ? "the default AWS endpoint (region " + cfg.getRegion() + ")"
                 : "endpoint '" + cfg.getEndpoint() + "'";
     }
+
+    /**
+     * One attempt of an upload of {@code bytes}: {@code callAttemptTimeoutSeconds} plus the body at
+     * {@code uploadMinBytesPerSecond}.
+     */
+    static java.time.Duration uploadAttemptTimeout(ClusterConfig.ObjectStoreConfig cfg, long bytes) {
+        return cfg.callAttemptTimeout().plus(cfg.uploadAllowance(bytes));
+    }
+
+    /** An upload with its retries: {@code callTimeoutSeconds} plus the body once per attempt. */
+    static java.time.Duration uploadTotalTimeout(ClusterConfig.ObjectStoreConfig cfg, long bytes) {
+        return cfg.callTotalTimeout().plus(cfg.uploadAllowance(bytes).multipliedBy(UPLOAD_ATTEMPTS));
+    }
+
+    /** The SDK's default attempts (1 + 2 retries) an upload's total bound allows for. */
+    static final int UPLOAD_ATTEMPTS = 3;
 
     /** The client-wide floor of {@link #clientSocketTimeout}. */
     static final java.time.Duration MIN_CLIENT_SOCKET_TIMEOUT = java.time.Duration.ofSeconds(30);
@@ -100,6 +126,9 @@ public class S3ObjectStore implements ObjectStore {
                         .build())
                 .region(Region.of(cfg.getRegion()))
                 .credentialsProvider(credentials)
+                // every call is bounded; ranged reads and uploads override this per request
+                .overrideConfiguration(o -> o.apiCallAttemptTimeout(cfg.callAttemptTimeout())
+                        .apiCallTimeout(cfg.callTotalTimeout()))
                 .serviceConfiguration(S3Configuration.builder()
                         .pathStyleAccessEnabled(cfg.isPathStyle()).build());
         if (cfg.getEndpoint() != null && !cfg.getEndpoint().isBlank()) {
@@ -386,7 +415,8 @@ public class S3ObjectStore implements ObjectStore {
     @Override
     public String put(String key, Path source) throws IOException {
         try {
-            return s3.putObject(putReq(key).build(), RequestBody.fromFile(source)).eTag();
+            long bytes = Files.size(source);
+            return s3.putObject(putReq(key, bytes).build(), RequestBody.fromFile(source)).eTag();
         } catch (SdkException e) {
             throw wrap("put", key, e);
         }
@@ -395,7 +425,7 @@ public class S3ObjectStore implements ObjectStore {
     @Override
     public String put(String key, byte[] data) throws IOException {
         try {
-            return s3.putObject(putReq(key).build(), RequestBody.fromBytes(data)).eTag();
+            return s3.putObject(putReq(key, data.length).build(), RequestBody.fromBytes(data)).eTag();
         } catch (SdkException e) {
             throw wrap("put", key, e);
         }
@@ -403,14 +433,14 @@ public class S3ObjectStore implements ObjectStore {
 
     @Override
     public Optional<String> putIfAbsent(String key, byte[] data) throws IOException {
-        return conditionalPut(key, data, putReq(key).ifNoneMatch("*").build(), false);
+        return conditionalPut(key, data, putReq(key, data.length).ifNoneMatch("*").build(), false);
     }
 
     @Override
     public Optional<String> putIfMatch(String key, byte[] data, String etag) throws IOException {
         Objects.requireNonNull(etag, "etag");
         // AWS answers If-Match on a nonexistent key with 404 NoSuchKey: treat as "etag changed".
-        return conditionalPut(key, data, putReq(key).ifMatch(etag).build(), true);
+        return conditionalPut(key, data, putReq(key, data.length).ifMatch(etag).build(), true);
     }
 
     private Optional<String> conditionalPut(String key, byte[] data, PutObjectRequest req,
@@ -446,6 +476,21 @@ public class S3ObjectStore implements ObjectStore {
         return out;
     }
 
+    /** HeadObject; a 404 (no body, so no NoSuchKey code) is an absent object. */
+    @Override
+    public Optional<ObjectInfo> stat(String key) throws IOException {
+        try {
+            HeadObjectResponse head = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+            return Optional.of(new ObjectInfo(key, head.contentLength() == null ? 0 : head.contentLength(),
+                    head.lastModified()));
+        } catch (S3Exception e) {
+            if (isMissingOnHead(e)) return Optional.empty();
+            throw wrap("stat", key, e);
+        } catch (SdkException e) {
+            throw wrap("stat", key, e);
+        }
+    }
+
     @Override
     public void delete(String key) throws IOException {
         try {
@@ -467,8 +512,12 @@ public class S3ObjectStore implements ObjectStore {
         return GetObjectRequest.builder().bucket(bucket).key(key).build();
     }
 
-    private PutObjectRequest.Builder putReq(String key) {
-        return PutObjectRequest.builder().bucket(bucket).key(key);
+    /** A PutObject of {@code bytes}, bounded by {@link #uploadAttemptTimeout} and {@link #uploadTotalTimeout}. */
+    private PutObjectRequest.Builder putReq(String key, long bytes) {
+        java.time.Duration attempt = uploadAttemptTimeout(cfg, bytes);
+        java.time.Duration total = uploadTotalTimeout(cfg, bytes);
+        return PutObjectRequest.builder().bucket(bucket).key(key)
+                .overrideConfiguration(o -> o.apiCallAttemptTimeout(attempt).apiCallTimeout(total));
     }
 
     private static ObjectMissingException missing(String key) {

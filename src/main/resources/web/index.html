@@ -6,6 +6,7 @@
   <title>Pharos — Code Graph Browser</title>
   <link rel="stylesheet" href="/style.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" defer></script>
+  <script src="/cluster.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -14,6 +15,7 @@
       <span class="logo">🏛 Pharos</span>
       <button id="btn-modules" class="btn-view active" title="Show module dependency graph">Module Graph</button>
       <button id="btn-hide-external" class="btn-view active" title="Toggle external dependencies">Hide external</button>
+      <button id="btn-cluster" class="btn-view" title="Cluster layout, backlog, health and proposals (/cluster/status)">Cluster</button>
     </div>
     <div class="header-center">
       <div class="search-wrap">
@@ -135,6 +137,16 @@
       <div id="detail-content"></div>
     </aside>
   </div>
+
+  <!-- Cluster page: drawn by cluster.js from /cluster/status, live from /cluster/events -->
+  <main id="cluster-view" style="display:none" aria-label="Cluster">
+    <div class="cl-toolbar">
+      <span class="cl-title">Cluster</span>
+      <span id="cluster-live" class="cl-live" title="How this page stays current">connecting…</span>
+      <button id="cluster-refresh" class="btn-tool" title="Fetch /cluster/status now">↻ Refresh</button>
+    </div>
+    <div id="cluster-content"><div class="loading">Loading…</div></div>
+  </main>
 
   <!-- Right-click context menu -->
   <div id="ctx-menu" style="display:none; position:fixed; z-index:9999;">

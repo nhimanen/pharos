@@ -867,6 +867,25 @@ def _parse_path_spec(spec: str) -> tuple:
 EXIT_PUBLISH_FAILED = 3
 
 
+def _source_flags(args):
+    """--source-git/--ref/--source-path: passed to the jar, which records them in the cluster catalog."""
+    flags = []
+    if args.source_git:   flags += ["--source-git", args.source_git]
+    if args.ref:          flags += ["--ref", args.ref]
+    if args.source_path:  flags += ["--source-path", str(Path(args.source_path).expanduser().resolve())]
+    return flags
+
+
+def _add_source_args(p):
+    p.add_argument("--source-git", dest="source_git", metavar="URL",
+                   help="Cluster: git clone URL writers fetch this project's source from (needs --ref;"
+                        " no credentials in the URL). Needs an object-store backend.")
+    p.add_argument("--ref", metavar="REF", help="Cluster: branch, tag or commit of --source-git")
+    p.add_argument("--source-path", dest="source_path", metavar="DIR",
+                   help="Cluster: directory every writer can read the source at (shared volume)."
+                        " Needs an object-store backend.")
+
+
 def cmd_index(args):
     """Run indexing by spawning the JAR directly (daemon is search-only, no write lock).
 
@@ -898,6 +917,7 @@ def cmd_index(args):
     if args.depth != 3:   base_flags += ["--depth", str(args.depth)]
     if args.project_threads != 1:
         base_flags += ["--project-threads", str(args.project_threads)]
+    base_flags += _source_flags(args)
 
     failed = []
     multi = len(specs) > 1
@@ -943,7 +963,9 @@ def cmd_publish(args):
     """
     if not JAR.exists():
         die(f"pharos JAR not found at {JAR}\nRun: mvn clean package -DskipTests")
-    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "publish", args.project]
+    cmd = ["java"] + _jvm_flags() + ["-jar", str(JAR), "publish", args.project] + _source_flags(args)
+    if args.no_embed:
+        cmd.append("--no-embed")
     sys.exit(subprocess.run(cmd).returncode)
 
 
@@ -1434,6 +1456,7 @@ EXAMPLES
                          help="Max directory depth to search for sub-projects (default: 3)")
     p_index.add_argument("--project-threads", dest="project_threads", type=int, default=1, metavar="N",
                          help="Projects to index concurrently (default: 1)")
+    _add_source_args(p_index)
     p_index.set_defaults(func=cmd_index)
 
     # search
@@ -1775,10 +1798,14 @@ EXIT CODES
 
 EXAMPLES
   pharos publish myproject
+  pharos publish lucene --source-git https://example.org/lucene.git --ref main --no-embed
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_publish.add_argument("project", help="Project name (as shown in 'pharos projects')")
+    _add_source_args(p_publish)
+    p_publish.add_argument("--no-embed", dest="no_embed", action="store_true",
+                           help="With --source-git/--source-path: work-queue writers index it without embeddings")
     p_publish.set_defaults(func=cmd_publish)
 
     # embed

@@ -23,11 +23,25 @@ public final class ObjectStoreLayout {
 
     public String readersPrefix() { return root + "catalog/readers/"; }
 
+    /** Heartbeat of writer {@code node} (work-queue mode): {@code catalog/writers/<node>.json}. */
+    public String writerKey(String node) { return writersPrefix() + node + ".json"; }
+
+    public String writersPrefix() { return root + "catalog/writers/"; }
+
+    /**
+     * The shared state of {@code /cluster/status} (proposal hysteresis, first-seen backlog stamps):
+     * {@code catalog/status/state.json}, updated by compare-and-set by every node.
+     */
+    public String statusStateKey() { return root + "catalog/status/state.json"; }
+
     public String synonymsKey() { return root + "catalog/synonyms.txt"; }
 
     public String shardPrefix(ShardId shard) { return root + "shards/" + shard.value() + "/"; }
 
     public String latestKey(ShardId shard) { return shardPrefix(shard) + "LATEST"; }
+
+    /** Writer lease of a shard (work-queue mode): {@code shards/<shard>/lease}. */
+    public String leaseKey(ShardId shard) { return shardPrefix(shard) + "lease"; }
 
     public String manifestKey(ShardId shard, Generation gen) {
         return shardPrefix(shard) + "manifests/" + manifestName(gen);
@@ -51,5 +65,23 @@ public final class ObjectStoreLayout {
     /** Content-named per-generation unresolved refs; see {@link #graphKey}. */
     public String refsKey(ShardId shard, Generation gen, String checksumHex) {
         return shardPrefix(shard) + "refs/gen-" + gen.value() + "@" + checksumHex + ".json.gz";
+    }
+
+    /** Writer-only state of a shard (embedding caches, file state): {@code shards/<shard>/writer-state/}. */
+    public String writerStatePrefix(ShardId shard) { return shardPrefix(shard) + "writer-state/"; }
+
+    /** Per-generation writer-state files: {@code writer-state/gen-N/}. */
+    public String writerStateGenPrefix(ShardId shard, Generation gen) {
+        return writerStatePrefix(shard) + "gen-" + gen.value() + "/";
+    }
+
+    /** The index of a writer-state backup, written last: {@code writer-state/gen-N/index.json}. */
+    public String writerStateIndexKey(ShardId shard, Generation gen) {
+        return writerStateGenPrefix(shard, gen) + "index.json";
+    }
+
+    /** Content-addressed writer-state blob (embedding cache files): {@code writer-state/blobs/<sha256>}. */
+    public String writerStateBlobKey(ShardId shard, String sha256Hex) {
+        return writerStatePrefix(shard) + "blobs/" + sha256Hex;
     }
 }
