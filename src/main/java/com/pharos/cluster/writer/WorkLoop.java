@@ -1142,9 +1142,12 @@ public final class WorkLoop implements Closeable {
 
     /**
      * Renews each reshard lease while this writer holds every shard lease of its project's work unit
-     * (a reshard runs only on the unit's holder). Once the unit is lost (a lease taken over or a failed
-     * renewal) the running build of that project is aborted and the reshard lease released at once, so
-     * the writer that holds the project now takes the reshard over without waiting out the TTL.
+     * (a reshard runs only on the unit's holder). Once the unit is definitely lost (a lease taken over
+     * or gone) the running build of that project is aborted and the reshard lease released at once, so
+     * the writer that holds the project now takes the reshard over without waiting out the TTL. A unit
+     * whose leases are only unconfirmed (a renewal's I/O error or deadline: most likely still ours, as
+     * for a run, see {@link #leaseLost}) keeps its build and its reshard lease; the build's publish
+     * re-checks the unit's leases, and the next tick reclaims or drops the unit.
      */
     void renewReshardLeases() {
         com.pharos.cluster.sharding.ReshardJob job = reshard;
@@ -1152,6 +1155,12 @@ public final class WorkLoop implements Closeable {
         for (Lease l : job.leases().held()) {
             ShardId unit = l.shard();
             if (unitHeld(unit)) {
+                job.leases().renew(l);
+                continue;
+            }
+            if (unitUnconfirmed(unit)) {
+                log.info("Reshard of project {}: writer {} could not confirm the project's shard leases; the build"
+                        + " goes on and its reshard lease is kept", unit, settings.node());
                 job.leases().renew(l);
                 continue;
             }
@@ -1676,6 +1685,19 @@ public final class WorkLoop implements Closeable {
     private boolean unitHeld(ShardId unit) {
         ShardState st = shards.get(unit);
         return st != null && leasedShards().containsAll(st.leaseShards);
+    }
+
+    /**
+     * True when this writer still has the unit's state and each of its shard leases is either held or
+     * only unconfirmed ({@link LeaseManager#lostUnconfirmed}), none definitely lost or released.
+     */
+    private boolean unitUnconfirmed(ShardId unit) {
+        ShardState st = shards.get(unit);
+        if (st == null) return false;
+        for (ShardId s : st.leaseShards) {
+            if (!leases.isHeld(s) && !leases.lostUnconfirmed(s)) return false;
+        }
+        return true;
     }
 
     private Set<ShardId> leasedShards() {

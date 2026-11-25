@@ -92,8 +92,9 @@ public final class LeaseManager implements LeaseGuard, Closeable {
     }
 
     /** A lease this manager holds; {@code lastModified} is null when the stat after the write failed. */
-    private record Held(Lease lease, Instant lastModified, boolean lost) {
-        Held lostCopy() { return new Held(lease, lastModified, true); }
+    /** {@code definite}: only meaningful once lost (see {@link Lost#definite}). */
+    private record Held(Lease lease, Instant lastModified, boolean lost, boolean definite) {
+        Held lostCopy(boolean definite) { return new Held(lease, lastModified, true, definite); }
     }
 
     /** A store call on the lease path. */
@@ -385,6 +386,18 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         }
     }
 
+    /**
+     * True while the shard's lease was seen lost without a definite answer (a renewal's I/O error or
+     * deadline, an expiry by the bucket's clock: {@link Lost#definite} false) and nothing has replaced
+     * or released it since: the lease may well still be this writer's. Never waits on the store.
+     */
+    public boolean lostUnconfirmed(ShardId shard) {
+        synchronized (mu) {
+            Held h = held.get(shard);
+            return h != null && h.lost() && !h.definite();
+        }
+    }
+
     /** The leases currently held (not lost). Never waits on the store. */
     public List<Lease> held() {
         synchronized (mu) {
@@ -497,7 +510,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
         synchronized (mu) {
             Held h = held.get(shard);
             if (h == null || h != expected || h.lost()) return;
-            held.put(shard, h.lostCopy());
+            held.put(shard, h.lostCopy(definite));
         }
         log.warn("Lease of shard {} lost ({}): writer {} stops publishing it", shard, why, writer);
         try {
@@ -518,7 +531,7 @@ public final class LeaseManager implements LeaseGuard, Closeable {
             log.debug("Stat of the lease of shard {} failed: {}", shard, e.toString());
         }
         Instant expires = (lastModified != null ? lastModified : clock.instant()).plus(ttl);
-        Held h = new Held(new Lease(shard, writer, expires, etag), lastModified, false);
+        Held h = new Held(new Lease(shard, writer, expires, etag), lastModified, false, false);
         synchronized (mu) {
             if (held.get(shard) == expected) held.put(shard, h);
         }

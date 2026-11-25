@@ -3,7 +3,6 @@ package com.pharos.cluster.writer;
 import com.pharos.cluster.ShardId;
 import com.pharos.cluster.ShardSource;
 import com.pharos.cluster.objectstore.GenerationGc;
-import com.pharos.cluster.objectstore.InMemoryObjectStore;
 import com.pharos.cluster.objectstore.ObjectStoreCatalog;
 import com.pharos.cluster.objectstore.ObjectStoreLayout;
 import com.pharos.cluster.objectstore.ObjectStorePublisher;
@@ -46,14 +45,14 @@ class ReshardLeaseRenewalTest {
     private static final ShardId UNIT = ShardId.ofProject("lib");
 
     @TempDir Path tmp;
-    private InMemoryObjectStore store;
+    private com.pharos.cluster.objectstore.StallingObjectStore store;
     private ObjectStoreLayout layout;
     private WorkLoop loop;
     private LuceneIndexer lucene;
 
     @BeforeEach
     void startWriterHoldingTheProject() throws Exception {
-        store = new InMemoryObjectStore(Clock.systemUTC());
+        store = new com.pharos.cluster.objectstore.StallingObjectStore(Clock.systemUTC());
         layout = new ObjectStoreLayout("pharos");
         ObjectStoreCatalog catalog = new ObjectStoreCatalog(store, layout);
         ObjectStoreReplicaSource replicas = new ObjectStoreReplicaSource(store, layout);
@@ -89,6 +88,7 @@ class ReshardLeaseRenewalTest {
 
     @AfterEach
     void stop() {
+        if (store != null) store.release();
         if (loop != null) loop.close();
         if (lucene != null) lucene.close();
     }
@@ -125,5 +125,32 @@ class ReshardLeaseRenewalTest {
         LeaseManager b = new LeaseManager(store, layout, "w2", TTL, LeaseManager.BucketNow.NONE, Clock.systemUTC(),
                 id -> layout.reshardLeaseKey(id.value()));
         assertThat(b.tryAcquire(UNIT)).as("B proceeds").isPresent();
+    }
+
+    /**
+     * 1.11.0 merge (1.9.0 × Phase 6): a renewal of the project's shard lease that fails without a
+     * definite answer (an I/O error or its deadline on a slow bucket) leaves the lease most likely
+     * still this writer's, and 1.9.0 lets a run go on then. The reshard build must too: aborting it
+     * throws the whole build away on a bucket blip, and releasing the reshard lease hands the reshard to
+     * whoever asks next while this writer still holds the project. Only a definite loss (above) does.
+     */
+    @Test
+    void anAmbiguousLossOfTheProjectsLeaseKeepsTheBuildAndTheReshardLease() throws Exception {
+        ReshardJob job = loop.reshardJob().orElseThrow();
+        assertThat(job.leases().tryAcquire(UNIT)).isPresent();
+        IndexAbort build = loop.runningForTest(UNIT);
+
+        store.failPutIfMatchOn(layout.leaseKey(UNIT)); // the shard lease's renewals fail; its object stays w1's
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (loop.leaseManager().isHeld(UNIT) && System.nanoTime() < deadline) Thread.sleep(20);
+        assertThat(loop.leaseManager().isHeld(UNIT)).as("the shard lease is seen lost (ambiguously)").isFalse();
+        String etag = store.get(layout.reshardLeaseKey("lib")).orElseThrow().etag();
+
+        Thread.sleep(TTL.dividedBy(3).multipliedBy(3).toMillis()); // three reshard renewal rounds
+
+        assertThat(build.requested()).as("the build goes on").isFalse();
+        assertThat(job.leases().isHeld(UNIT)).as("the reshard lease is kept").isTrue();
+        assertThat(store.get(layout.reshardLeaseKey("lib")).orElseThrow().etag())
+                .as("and renewed").isNotEqualTo(etag);
     }
 }
