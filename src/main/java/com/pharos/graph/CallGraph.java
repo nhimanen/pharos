@@ -123,12 +123,146 @@ public class CallGraph implements GraphView {
                 throw e;
             }
         }
+        // Checked before initSchema, which may add names to an older graph's dictionary.
+        String damage = created ? null : dictionaryProblem(db, DICTIONARY_ORDER);
+        if (damage != null) warnDamaged(dbDir, damage);
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);
+        graph.dictionaryDamage = damage;
         if (created) graph.markFreshDatabase();
         else if (repairIndexes) graph.repairIndexesOnce();
         return graph;
+    }
+
+    // -------------------------------------------------------------------------
+    // Damaged property dictionary (graphs written before 1.10.0, see awaitDictionaryOnDisk)
+    // -------------------------------------------------------------------------
+
+    /**
+     * The order in which pharos has always added this graph's property names to ArcadeDB's
+     * dictionary: {@link #initSchema} creates them in this order (Method's two since the ArcadeDB
+     * backend, CodeField's three since the knowledge graph), and no record sets any other name.
+     * A dictionary that maps one of them to another id was written stale, and its records decode
+     * with the wrong names.
+     */
+    static final List<String> DICTIONARY_ORDER = List.of("fqn", "classPrefix", "ownerFqn", "fieldType", "accessMod");
+
+    /** Dirs already warned about in this JVM: a reader opens the graph on every query. */
+    private static final Set<Path> WARNED_DAMAGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Null, or what is wrong with this graph's property dictionary (checked when it was opened). */
+    private String dictionaryDamage;
+
+    /**
+     * Null, or why this graph's records decode with the wrong property names: its dictionary does
+     * not map {@link #DICTIONARY_ORDER}{@code [i]} to {@code i}. Such a graph must not be published
+     * or exported; {@code pharos index --full} rebuilds it.
+     */
+    public String dictionaryDamage() {
+        return dictionaryDamage;
+    }
+
+    /** Null, or the names of {@code canonical} that {@code db}'s dictionary maps to another id. */
+    static String dictionaryProblem(Database db, List<String> canonical) {
+        return dictionaryProblem(((com.arcadedb.database.DatabaseInternal) db).getSchema().getEmbedded()
+                .getDictionary().getDictionaryMap(), canonical);
+    }
+
+    static String dictionaryProblem(Map<String, Integer> ids, List<String> canonical) {
+        List<String> wrong = new ArrayList<>();
+        for (int i = 0; i < canonical.size(); i++) {
+            Integer id = ids.get(canonical.get(i));
+            if (id != null && id != i) wrong.add(canonical.get(i) + " has id " + id + ", not " + i);
+        }
+        return wrong.isEmpty() ? null : "damaged property dictionary (" + String.join(", ", wrong) + ")";
+    }
+
+    /**
+     * {@link #dictionaryDamage()} of the graph database at {@code dbDir}, read from its dictionary
+     * file without opening the database (an open, even read-only, rewrites ArcadeDB's
+     * {@code cached-count.json}, and fails while another instance holds the database). Null when
+     * there is no database or its dictionary cannot be read, so a caller never reports damage it
+     * did not see.
+     */
+    public static String dictionaryProblem(Path dbDir) {
+        try {
+            Map<String, Integer> ids = readDictionary(dbDir);
+            return ids == null ? null : dictionaryProblem(ids, DICTIONARY_ORDER);
+        } catch (java.io.IOException | RuntimeException e) {
+            log.debug("Could not read the dictionary of {}: {}", dbDir, e.getMessage());
+            return null;
+        }
+    }
+
+    private static final java.util.regex.Pattern DICTIONARY_FILE =
+            java.util.regex.Pattern.compile("dictionary\\.\\d+\\.\\d+\\.v\\d+\\.dict");
+
+    /**
+     * Name to id from ArcadeDB 25.1.1's dictionary file, as {@code Dictionary.reload} reads it:
+     * page 0 holds an int version and an int used size (header included, big-endian), a 4-byte
+     * legacy counter, then the names in id order, each an unsigned LEB128 byte length plus UTF-8.
+     * Null when {@code dbDir} has no dictionary file.
+     */
+    static Map<String, Integer> readDictionary(Path dbDir) throws java.io.IOException {
+        if (!Files.isDirectory(dbDir)) return null;
+        Path file;
+        try (Stream<Path> s = Files.list(dbDir)) {
+            file = s.filter(p -> DICTIONARY_FILE.matcher(p.getFileName().toString()).matches()).findFirst().orElse(null);
+        }
+        if (file == null) return null;
+        try (var ch = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
+            java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(8);
+            if (ch.read(head, 0) < 8) return null;
+            int used = head.getInt(4);
+            if (used < 12 || used > ch.size()) throw new java.io.IOException("dictionary page size " + used);
+            java.nio.ByteBuffer page = java.nio.ByteBuffer.allocate(used);
+            while (page.hasRemaining() && ch.read(page, page.position()) > 0) { }
+            Map<String, Integer> ids = new LinkedHashMap<>();
+            int pos = 12;
+            for (int id = 0; pos < used; id++) {
+                int len = 0, shift = 0, b;
+                do {
+                    b = page.get(pos++) & 0xFF;
+                    len |= (b & 0x7F) << shift;
+                    shift += 7;
+                } while ((b & 0x80) != 0 && shift < 32);
+                if (len < 0 || pos + len > used) throw new java.io.IOException("corrupt dictionary entry at " + pos);
+                ids.putIfAbsent(new String(page.array(), pos, len, java.nio.charset.StandardCharsets.UTF_8), id);
+                pos += len;
+            }
+            return ids;
+        }
+    }
+
+    /** What repairs the graph at {@code dbDir}: a project's full re-index, or the cross-project link. */
+    static String repairAdvice(Path dbDir) {
+        Path name = dbDir.getFileName();
+        Path parent = dbDir.toAbsolutePath().normalize().getParent();
+        if (name != null && GRAPH_ENTRY.matcher(name.toString()).matches() && parent != null
+                && parent.getFileName() != null) {
+            return "run: pharos index --full " + parent.getFileName();
+        }
+        return "re-run: pharos link (it recreates the cross-project graph)";
+    }
+
+    private static void warnDamaged(Path dbDir, String damage) {
+        if (!WARNED_DAMAGED.add(dbDir.toAbsolutePath().normalize())) return;
+        Path parent = dbDir.toAbsolutePath().normalize().getParent();
+        String what = GRAPH_ENTRY.matcher(String.valueOf(dbDir.getFileName())).matches() && parent != null
+                ? "Call graph of project '" + parent.getFileName() + "'" : "Call graph " + dbDir;
+        log.warn("{} has a {}, written by pharos before 1.10.0: callers, callees, usages and paths "
+                + "from it are wrong and it will not be published; {}", what, damage, repairAdvice(dbDir));
+    }
+
+    /** The database directory; null for graphs not opened from disk. */
+    Path dbDir() {
+        return dbDir;
+    }
+
+    /** This graph's dictionary, name to id; for tests. */
+    Map<String, Integer> dictionaryMap() {
+        return ((com.arcadedb.database.DatabaseInternal) db).getSchema().getEmbedded().getDictionary().getDictionaryMap();
     }
 
     /**
@@ -321,7 +455,7 @@ public class CallGraph implements GraphView {
         }
     }
 
-    private static void deleteRecursively(Path p) throws java.io.IOException {
+    static void deleteRecursively(Path p) throws java.io.IOException {
         if (!Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return;
         try (var w = Files.walk(p)) {
             for (Path q : w.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(q);

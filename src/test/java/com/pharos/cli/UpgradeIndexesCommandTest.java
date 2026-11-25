@@ -96,6 +96,27 @@ class UpgradeIndexesCommandTest {
         return new CommandLine(c).execute(args);
     }
 
+    /** A current index whose call graph has a damaged dictionary (pre-1.10.0) is planned and rebuilt. */
+    @Test
+    void damagedGraphOfACurrentIndexIsReindexed() throws Exception {
+        indexProject("a", false);
+        indexProject("d", false);
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(dir("d"));
+        deleteRecursively(live);
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(live);
+        var aStamp = IndexFormat.read(dir("a")).writtenAt();
+
+        assertThat(run(cmd(), "--dry-run")).isZero();
+        assertThat(out.toString()).contains("d: call graph has a damaged property dictionary")
+                .contains("[damaged-graph]");
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(live)).isNotNull();
+
+        assertThat(run(cmd(), "--yes")).isZero();
+        Path rebuilt = com.pharos.graph.CallGraph.projectGraphDir(dir("d"));
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(rebuilt)).isNull();
+        assertThat(IndexFormat.read(dir("a")).writtenAt()).as("healthy project untouched").isEqualTo(aStamp);
+    }
+
     @Test
     void dryRunChangesNothing() throws Exception {
         indexProject("a", false);

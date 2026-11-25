@@ -98,6 +98,26 @@ class IndexStatusCommandTest {
         assertThat(snapshot()).isEqualTo(before);
     }
 
+    @Test
+    void damagedCallGraphIsReportedWithoutWritingAnything() throws Exception {
+        Path graph = tmp.resolve("indexes").resolve("a").resolve("callgraph.arcadedb");
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(graph);
+        Map<String, Long> before = snapshot();
+
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute("--json")).isZero();
+        JsonNode j = new ObjectMapper().readTree(out.toString());
+        Map<String, JsonNode> byName = new TreeMap<>();
+        j.get("projects").forEach(p -> byName.put(p.get("name").asText(), p));
+        assertThat(byName.get("a").get("graphDamage").asText()).contains("fqn has id 2, not 0");
+        assertThat(byName.get("b").get("graphDamage").isNull()).isTrue();
+
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute()).isZero();
+        assertThat(out.toString()).contains("warning: a: call graph has a damaged property dictionary")
+                .contains("pharos index --full");
+        assertThat(snapshot()).isEqualTo(before);
+    }
+
     private Map<String, Long> snapshot() throws Exception {
         Map<String, Long> m = new TreeMap<>();
         try (Stream<Path> s = Files.walk(tmp)) {

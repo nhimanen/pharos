@@ -31,8 +31,19 @@ public final class CompactGraphWriter {
 
     private CompactGraphWriter() {}
 
-    /** Writes {@code source} to {@code target} (via a temp file, so readers never see a partial file). */
+    /**
+     * Writes {@code source} to {@code target} (via a temp file, so readers never see a partial file).
+     *
+     * @throws IOException also when {@code source} has a damaged property dictionary
+     *         ({@link CallGraph#dictionaryDamage()}): its records decode wrongly, and an export would
+     *         spread that to every reader and to a writer that restores it
+     */
     public static void export(CallGraph source, Path target) throws IOException {
+        String damage = source.dictionaryDamage();
+        if (damage != null) {
+            throw new IOException("refusing to export a call graph with a " + damage + "; "
+                    + CallGraph.repairAdvice(source.dbDir()));
+        }
         List<CallGraph.VertexRecord> vertices = new ArrayList<>();
         List<Map<String, Integer>> idByKind = List.of(new HashMap<>(), new HashMap<>(), new HashMap<>());
         source.forEachVertex(v -> {
