@@ -34,9 +34,18 @@ public final class TestClusters {
         return load("s3.yaml");
     }
 
+    /**
+     * The pharos version the fixtures run, whatever release the examples name: the examples track the current
+     * release, while the tests' expected images and upgrade paths (1.6.0 → 1.7.0) are written against this one.
+     */
+    public static final String FIXTURE_VERSION = "1.6.0";
+
     public static PharosCluster load(String file) {
         try (InputStream in = Files.newInputStream(examples().resolve(file))) {
-            return YAML.readValue(in, PharosCluster.class);
+            PharosCluster c = YAML.readValue(in, PharosCluster.class);
+            PharosClusterSpec s = c.getSpec();
+            return withSpec(c, new PharosClusterSpec(FIXTURE_VERSION, s.storage(), s.embeddings(), s.projects(),
+                    s.writers(), s.readers(), s.router(), s.autoscaling(), s.pharosConfig()));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
