@@ -3,7 +3,29 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.10.0] - 2026-11-25
+
+**Index format:** 1 (unchanged)
+
+Multi-node Phase 5: peer pull, a cluster **without a bucket** (experimental). With
+`cluster.backend: peer-pull` each writer keeps its published generations in a local peer store and serves
+them from its `pharos web` on the token-guarded `/replication/*` endpoint; readers find the writers by DNS
+(`dns:<name>`, e.g. a Kubernetes headless service) or a seed list with gossip (`seeds:<url>,…`), long-poll
+each shard for new generations, and fetch whole files from other readers that already hold them. Reader
+membership and the cluster status state live on the writers, so coordinators, `pharos router` and
+`/cluster/status` work as with a bucket. Optional TLS protects reader-to-writer pulls. Phase 5 gate: top-10,
+callers and usages identical to a single node on 99/99 queries, a new publish visible to readers within
+0.6 s, 0 failed queries over 2 minutes with the writer killed, and the Phase 2/3 cold, warm, fan-out and
+router-elasticity criteria passed as in bucket mode. **Single-node installs and bucket clusters are unaffected**
+(`object-store` stays the default backend). No re-index.
+
+**When to use it.** Peer mode is for small or on-premises clusters where running S3 or MinIO is not worth
+it. Prefer the bucket when you have one: peer mode has **no writer takeover** (no leases; the Phase 4 work
+queue is forced off, so writers index and publish by hand), a writer that is down publishes nothing until
+it is back (its shards keep serving what readers hold; a lazy reader's cold reads of them fail), the writer's
+disk is the only copy of its published generations, and `cluster.token` is the only credential, visible on
+the network except reader-to-writer with TLS. Read README "Without a bucket: peer-pull" and UPGRADING.md
+("Upgrading to 1.10.0").
 
 ### Added (multi-node Phase 5: peer pull without a bucket)
 - Peer-pull backend without a bucket (experimental, README "Without a bucket: peer-pull"):
@@ -30,6 +52,15 @@ All notable changes to Pharos. Every release section starts with an `**Index for
     `127.0.0.1:<cluster.tls.localPort>` (default web port + 1, no `/replication/*`), which
     `./pharos` uses.
   - `cluster.peers.maxLongPolls` defaults to 4096; size it to readers × shards per writer.
+- A peer reader's shutdown is bounded as a bucket reader's is (1.9.0): on a slow or frozen writer
+  the draining heartbeat and the withdraw each give up after 5 s with a `Stopping: gave up …` WARN,
+  so the drain stays within `cluster.drainSeconds`.
+
+### Maintainers
+- Phase 5 gate (`scripts/cluster-gate-phase5.sh`): ports, paths, heaps and the embedding seed come
+  from `GATE_*` settings (defaults unchanged), `GATE_KEYWORD_ONLY=1` runs the steps that do not test
+  vectors without an embedding model, and the header shows how to run it under
+  `scripts/gate-watchdog.sh`.
 
 ## [1.9.0] - 2026-11-24
 

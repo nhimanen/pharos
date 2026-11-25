@@ -1,5 +1,35 @@
 # Upgrading
 
+## Upgrading to 1.10.0
+
+Index format: 1 (unchanged); no re-index. Nothing changes for single-node installs (`role: all`) or for
+clusters with a bucket (`cluster.backend: object-store`, still the default): restart on the new jar.
+
+### Optional: moving a cluster to peer pull (no bucket)
+
+Peer pull (`cluster.backend: peer-pull`) is new and experimental; see README "Without a bucket: peer-pull"
+for the configs. It trades the bucket for these limits: no writer takeover, the writer's disk is the only
+copy of what it published, and the cluster token is the only credential. Keep the bucket if you rely on
+Phase 4 failover or the work queue.
+
+- **Writers.** Set `backend: peer-pull`, `cluster.token` (required) and `cluster.peers` (`storeDir` on the
+  same file system as `indexDir`, `discovery`, `allowHosts`). Remove `"writer": {"workQueue": true}` if set
+  (a config error in peer mode; the default is forced off) and publish by hand next to a long-running
+  `pharos web`. The peer store starts empty: run `pharos publish <project>` (or `pharos index <dir>`) for
+  each project of the writer so readers have a generation to pull. Each writer owns the shards in its own
+  registry; give every shard exactly one writer.
+- **Readers, coordinators and `pharos router`.** Set `backend: peer-pull`, the same `token`, and
+  `cluster.peers.discovery` (`dns:<fully qualified name>` or `seeds:<url>,…`); drop `objectStore`. Readers
+  need an `advertiseUrl` whose host resolves to the address they connect from, or is in the writers'
+  `allowHosts`. Run `pharos router` with a reader's config.
+- **TLS (optional).** A writer `cluster.tls.keystore` (password from `passwordEnv`) and a reader
+  `truststore`; seeds must then be `https://`, `dns:` discovery needs IP SANs, and peer fetch between readers
+  is off. On a TLS writer `./pharos` uses the plain loopback port `cluster.tls.localPort` (web port + 1).
+- **Size `cluster.peers.maxLongPolls`** (default 4096) to at least readers × shards per writer, and the
+  writer's open-files limit above it.
+- **Network.** The token travels in clear text between readers and to coordinators: run the cluster on a
+  network only its nodes reach (a Kubernetes `NetworkPolicy`, a private network).
+
 ## Upgrading to 1.9.0
 
 Index format: 1 (unchanged); no re-index. Single-node installs (`role: all`) and readers need nothing.
