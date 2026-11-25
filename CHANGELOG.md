@@ -60,6 +60,14 @@ the network except reader-to-writer with TLS. Read README "Without a bucket: pee
 - `./pharos` in a repo checkout runs the newest `target/pharos-*.jar` by version number. It sorted
   the names as strings, so a leftover `pharos-1.9.0.jar` (a `mvn package` without `clean`) would have
   won over `pharos-1.10.0.jar`. The gate scripts pick their default jar the same way (`sort -V`).
+- A newly created call graph could be written with a stale property dictionary (rare; every release
+  since the ArcadeDB graph backend, single-node and clusters alike). ArcadeDB queues a new database's
+  first dictionary page for asynchronous flushing, and pharos then rewrote that page synchronously;
+  when the queued copy reached the disk last, every later open decoded the records' property names
+  wrongly: methods and edges vanished from the graph and other vertices came back with shuffled
+  properties, with no error. Any graph creation could hit it: a full index, a writer takeover's
+  restore, the cross-project link graph. A new graph now waits until that page is on disk before
+  anything else is written. A graph that already has it is repaired by `pharos index --full`.
 
 ### Maintainers
 - Phase 5 gate (`scripts/cluster-gate-phase5.sh`): every port is a setting (`GATE_W1_PORT`,

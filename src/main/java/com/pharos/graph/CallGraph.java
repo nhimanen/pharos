@@ -115,12 +115,57 @@ public class CallGraph implements GraphView {
         boolean created = !factory.exists();
         if (created && !allowCreate) throw new GraphNotFoundException(dbDir);
         Database db = created ? factory.create() : factory.open();
+        if (created) {
+            try {
+                awaitDictionaryOnDisk(db);
+            } catch (RuntimeException e) {
+                db.close();
+                throw e;
+            }
+        }
         db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);
         if (created) graph.markFreshDatabase();
         else if (repairIndexes) graph.repairIndexesOnce();
         return graph;
+    }
+
+    /**
+     * Waits until ArcadeDB has written a new database's dictionary header page.
+     *
+     * <p>{@code DatabaseFactory.create()} commits that page through ArcadeDB's JVM-wide
+     * asynchronous flush queue: the commit runs before {@code setAsyncFlush(false)} can apply.
+     * {@link #initSchema} then rewrites the same page synchronously (it adds the property names).
+     * When the queued, older copy reached the disk after that, the file kept the stale dictionary
+     * and every later open decoded the records' property names wrongly: vertices whose fqn read as
+     * null vanished from every scan, others came back with shuffled properties, and nothing failed.
+     * A page evicted from ArcadeDB's page cache inside that window was even re-read stale by the
+     * same instance.
+     *
+     * <p>Closing the database would not do: its wait misses a batch the flush thread has taken off
+     * the queue but not yet marked in flight, and then the write is dropped for the closed
+     * instance. The dictionary file stays empty until the header is written, and the flush thread
+     * marks the batch in flight before writing it, so the file size plus ArcadeDB's own wait cover
+     * the whole window.
+     */
+    private static void awaitDictionaryOnDisk(Database db) {
+        var internal = (com.arcadedb.database.DatabaseInternal) db;
+        var dictionary = internal.getSchema().getEmbedded().getDictionary();
+        var file = (com.arcadedb.engine.PaginatedComponentFile) internal.getFileManager().getFile(dictionary.getFileId());
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+        try {
+            while (file.getSize() == 0) {
+                if (System.nanoTime() > deadline) {
+                    throw new IllegalStateException("ArcadeDB did not write the dictionary of new graph "
+                            + internal.getDatabasePath() + " within 60 s");
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(100_000);
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Cannot read the dictionary of new graph " + internal.getDatabasePath(), e);
+        }
+        internal.getPageManager().waitAllPagesOfDatabaseAreFlushed(db);
     }
 
     // -------------------------------------------------------------------------
