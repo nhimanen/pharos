@@ -62,7 +62,7 @@ MINIO_CONSOLE_PORT="${GATE_MINIO_CONSOLE_PORT:-9001}"
 LAZY_PORT="${GATE_LAZY_PORT:-7301}"
 FULL_PORT="${GATE_FULL_PORT:-7302}"
 PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
-JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
+JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -V -r | head -1 || true)}"
 
 if (( DRY )); then
   cat <<PLAN

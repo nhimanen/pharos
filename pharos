@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -36,12 +37,23 @@ from pathlib import Path
 
 # ── JAR resolution ────────────────────────────────────────────────────────────
 
+def _newest_jar(paths):
+    """The path whose pharos-<version>.jar is the highest version, compared numerically (1.10.0 > 1.9.0;
+    a release beats its -SNAPSHOT or other suffix); None when there is none."""
+    def key(p):
+        m = re.match(r"pharos-(\d+(?:\.\d+)*)(.*)\.jar$", Path(p).name)
+        if not m:
+            return ((), 0, Path(p).name)
+        return (tuple(int(x) for x in m.group(1).split(".")), 0 if m.group(2) else 1, Path(p).name)
+    return max(paths, key=key, default=None)
+
+
 def _resolve_jar() -> Path:
-    """Find the pharos JAR: prefer local target/ build, fall back to installed."""
+    """Find the pharos JAR: prefer local target/ build (its newest version), fall back to installed."""
     script_dir = Path(__file__).resolve().parent
-    candidates = sorted(glob.glob(str(script_dir / "target" / "pharos-*.jar")), reverse=True)
-    if candidates:
-        return Path(candidates[0])
+    newest = _newest_jar(glob.glob(str(script_dir / "target" / "pharos-*.jar")))
+    if newest:
+        return Path(newest)
     return Path.home() / ".pharos" / "bin" / "pharos.jar"
 
 JAR = _resolve_jar()
