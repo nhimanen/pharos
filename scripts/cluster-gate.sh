@@ -43,7 +43,7 @@ MSG
 fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JAR="$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)"
+JAR="$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -V -r | head -1 || true)"
 [[ -n "$JAR" ]] || { echo "cluster-gate: no target/pharos-*.jar; run mvn clean package -DskipTests" >&2; exit 2; }
 
 REAL_REGISTRY="$HOME/.pharos/registry.json"

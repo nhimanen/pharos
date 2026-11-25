@@ -85,7 +85,7 @@ REF_PORT="${GATE_REF_PORT:-7305}"; ROUTER_PORT="${GATE_ROUTER_PORT:-7080}"
 PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
 PROJECTS="lucene,pharos"; R2_SHARDS="lucene"
 if (( WITH_MYPAL )); then PROJECTS="lucene,pharos,$EXTRA"; R2_SHARDS="lucene, $EXTRA"; fi
-JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
+JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -V -r | head -1 || true)}"
 TOKEN="gate3-cluster-token-0123456789"
 
 if (( DRY )); then

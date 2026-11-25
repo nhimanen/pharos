@@ -345,6 +345,15 @@ public final class CachingRemoteIndexInput extends IndexInput implements RandomA
     // ---------------------------------------------------------------- shared file
 
     /** One manifest file shared by an input and all its clones and slices; also the block fetcher. */
+    /**
+     * The 16-byte footer a Lucene file of {@code f}'s manifest entry must end with
+     * ({@link CodecUtil#writeFooter}'s layout around the manifest checksum); null when the file is too
+     * short or the checksum is no CRC32 value. Peer-reader transfers are checked against it.
+     */
+    public static byte[] manifestFooter(ManifestFile f) {
+        return RemoteFile.footerOf(f);
+    }
+
     static final class RemoteFile implements BlockCache.BlockFetcher {
         private static final int STREAM_CHUNK = 64 * 1024;
 

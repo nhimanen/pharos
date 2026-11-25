@@ -94,7 +94,7 @@ W1_PORT="${GATE_W1_PORT:-7411}"; W2_PORT="${GATE_W2_PORT:-7412}"; W3_PORT="${GAT
 W4_PORT="${GATE_W4_PORT:-7414}"; W5_PORT="${GATE_W5_PORT:-7415}"; W6_PORT="${GATE_W6_PORT:-7416}"
 WLOW_PORT="${GATE_WLOW_PORT:-7417}"
 PROBE_TIMEOUT="${GATE_PORT_PROBE_TIMEOUT:-2}"
-JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -r | head -1 || true)}"
+JAR="${GATE_JAR:-$(ls -1 "$REPO"/target/pharos-*.jar 2>/dev/null | grep -v '/original-' | sort -V -r | head -1 || true)}"
 TOKEN="gate4-cluster-token-0123456789"
 PORTS=("$MINIO_PORT" "$MINIO_CONSOLE_PORT" "$ROUTER_PORT" "$WEBHOOK_PORT" "$R1_PORT" "$R2_PORT" "$W1_PORT" "$W2_PORT"
        "$W3_PORT" "$W4_PORT" "$W5_PORT" "$W6_PORT" "$WLOW_PORT")

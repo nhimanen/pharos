@@ -193,7 +193,8 @@ def queries():
     plus vector and hybrid on the pharos ones (lucene is indexed without embeddings)."""
     base = cluster_gate.load_queries()
     out = [(q, p, "keyword") for q, p in base]
-    out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
+    if os.environ.get("GATE_NO_MODELS", "0") != "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY: keyword only
+        out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
     return base, out
 
 
@@ -220,6 +221,25 @@ def health(base):
 # --------------------------------------------------------------------------- readers
 
 
+def peer_mode():
+    """GATE_BACKEND=peer-pull (the Phase 5 gate, scripts/cluster-gate-phase5.sh): no bucket; readers
+    pull from the writers they find through cluster.peers.discovery (GATE_DISCOVERY)."""
+    return os.environ.get("GATE_BACKEND", "object-store") == "peer-pull"
+
+
+def peer_cluster(name, port, cache_dir, reader_cfg):
+    """The `cluster` section of a peer-pull reader: seeds discovery only (never a static writer map),
+    the cluster token, and an advertised URL (membership; peer readers fetch from it). Without
+    `shards` in reader_cfg, GATE_READER_SHARDS (comma separated) pins it."""
+    rc = dict(reader_cfg)
+    if "shards" not in rc and os.environ.get("GATE_READER_SHARDS"):
+        rc["shards"] = [x for x in os.environ["GATE_READER_SHARDS"].split(",") if x]
+    return {"role": "reader", "backend": "peer-pull", "nodeId": "gate-" + name, "cacheDir": str(cache_dir),
+            "reader": rc, "token": os.environ["GATE_TOKEN"], "advertiseUrl": f"http://127.0.0.1:{port}",
+            "peers": {"discovery": os.environ.get("GATE_DISCOVERY", "seeds:http://127.0.0.1:7300"),
+                      "refreshSeconds": int(os.environ.get("GATE_REFRESH_SECONDS", "10"))}}
+
+
 class Reader:
     """One reader web JVM with its own user.home / pharos.home under $GATE/readers/<name>."""
 
@@ -243,6 +263,17 @@ class Reader:
             link.symlink_to(os.environ["GATE_MODELS"])
         rc = {"mode": self.mode}
         rc.update(self.reader_cfg)
+        if peer_mode():
+            cfg = {
+                "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
+                                        "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
+                "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": False,
+                "cluster": peer_cluster(self.name, self.port, self.cache_dir, rc),
+            }
+            if os.environ.get("GATE_NO_MODELS", "0") == "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY
+                del cfg["embeddingProviders"], cfg["searchEmbeddingModel"]
+            (self.ph / "config.json").write_text(json.dumps(cfg, indent=2))
+            return
         cfg = {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
@@ -250,8 +281,13 @@ class Reader:
             "cluster": {
                 "role": "reader", "backend": "object-store", "nodeId": "gate-" + self.name,
                 "pollIntervalSeconds": 10, "cacheDir": str(self.cache_dir), "reader": rc,
+                # required on readers since Phase 3
+                "advertiseUrl": f"http://127.0.0.1:{self.port}",
+                "token": os.environ.get("GATE_TOKEN", "gate2-cluster-token-0123456789"),
                 "objectStore": {
-                    "endpoint": f"http://127.0.0.1:{MINIO_PORT}", "region": "us-east-1", "bucket": "pharos-gate",
+                    # GATE_S3_ENDPOINT: another MinIO address; otherwise GATE_MINIO_PORT on localhost
+                    "endpoint": os.environ.get("GATE_S3_ENDPOINT", f"http://127.0.0.1:{MINIO_PORT}"),
+                    "region": "us-east-1", "bucket": "pharos-gate",
                     "prefix": "pharos", "pathStyle": True,
                     "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"},
             },
@@ -381,7 +417,9 @@ def phase_cold(trials, variant="cold"):
             dl, res_l = search(r.base, lq, "lucene", "keyword")
             mid = (health(r.base).get("readerCache") or {}).get("bytesFetched")
             vq = pharos_q[t % len(pharos_q)]
-            dv, res_v = search(r.base, vq, "pharos", "vector")
+            # keyword only (GATE_NO_MODELS=1): the pharos query is keyword too (no model to embed it)
+            dv, res_v = search(r.base, vq, "pharos",
+                               "keyword" if os.environ.get("GATE_NO_MODELS", "0") == "1" else "vector")
             rc = health(r.base).get("readerCache") or {}
             models_ms = r.models_ready_ms()
         finally:
@@ -535,6 +573,8 @@ def phase_warm():
             warm_ok = ratio <= WARM_RATIO_LIMIT
             print(f"WARM keyword p95 ratio {ratio:.3f} limit <= {WARM_RATIO_LIMIT} -> {'PASS' if warm_ok else 'FAIL'}")
         for pl in ("vector", "hybrid"):
+            if pl not in out["timings"]["lazy"]:
+                continue  # keyword only (GATE_NO_MODELS=1)
             lv, fv = out["timings"]["lazy"][pl], out["timings"]["full"][pl]
             print(f"   {pl} p95 lazy {lv['p95'] * 1000:.1f} ms vs full {fv['p95'] * 1000:.1f} ms (not gated)")
         mm = check(lazy_res, full_res, "strict")

@@ -206,4 +206,24 @@ class WarmStatsSurfaceTest {
         assertThat(python(body).lines().toList())
                 .containsExactly("True False 503", "True True 200", "False False");
     }
+
+    /**
+     * Phase 5 I3: on a peer-pull writer with cluster.tls.keystore, ./pharos talks to the daemon's
+     * plain-HTTP loopback listener (cluster.tls.localPort, default web port + 1).
+     */
+    @Test
+    void pythonClientUsesTheLoopbackListenerOnATlsWriter() throws Exception {
+        Path plain = tmp.resolve("plain.json");
+        Files.writeString(plain, "{\"cluster\": {\"role\": \"writer\"}}");
+        Path tls = tmp.resolve("tls.json");
+        Files.writeString(tls, "{\"cluster\": {\"tls\": {\"keystore\": \"/k.p12\", \"passwordEnv\": \"P\"}}}");
+        Path tlsPort = tmp.resolve("tls-port.json");
+        Files.writeString(tlsPort, "{\"cluster\": {\"tls\": {\"keystore\": \"/k.p12\", \"localPort\": 9443}}}");
+        String body = "from pathlib import Path\n"
+                + "for f in sys.argv[2:]: print(mod._local_daemon_url(Path(f), 7171))\n";
+        assertThat(python(body, plain.toString(), tls.toString(), tlsPort.toString(),
+                tmp.resolve("absent.json").toString()).lines().toList())
+                .containsExactly("http://localhost:7171", "http://127.0.0.1:7172", "http://127.0.0.1:9443",
+                        "http://localhost:7171");
+    }
 }

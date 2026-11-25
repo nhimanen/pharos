@@ -78,5 +78,14 @@ class EmbeddingsCli(unittest.TestCase):
         self.assertNotEqual(ex.exception.code, 0)
 
 
+
+class JarResolution(unittest.TestCase):
+    def test_newest_version_wins_numerically(self):
+        # 1.10.0 is the first two-digit minor: a string sort would pick 1.9.0
+        p = load()
+        names = ["pharos-1.9.0.jar", "pharos-1.10.0.jar", "pharos-1.4.1.jar", "pharos-1.10.0-SNAPSHOT.jar"]
+        self.assertEqual("pharos-1.10.0.jar", pathlib.Path(p._newest_jar(["/t/" + n for n in names])).name)
+        self.assertIsNone(p._newest_jar([]))
+
 if __name__ == "__main__":
     unittest.main()

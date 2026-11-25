@@ -27,7 +27,8 @@ import java.util.stream.Stream;
 /**
  * Reports each registered project's index format status. Strictly read-only: reads the registry
  * and the per-project format stamps, and sizes the index dirs by walking them. It opens no
- * Lucene writers or graphs, creates nothing and never starts a daemon.
+ * Lucene writers, opens each call graph read-only (to report a damaged property dictionary as
+ * {@code graphDamage}), creates nothing and never starts a daemon.
  */
 @Command(
         name = "index-status",
@@ -106,6 +107,9 @@ public class IndexStatusCommand implements Callable<Integer> {
             r.put("needsReembed", embeddingsConfigured && dir != null && com.pharos.indexer.LegacyVectorFields
                     .hasLiveMisnamedVectors(dir.resolve("lucene")));
             r.put("lastIndexed", p.getLastIndexed() == null ? null : p.getLastIndexed().toString());
+            // null, or why the writer graph's records decode wrongly (pre-1.10.0 dictionary race)
+            r.put("graphDamage", dir == null ? null
+                    : com.pharos.graph.CallGraph.dictionaryProblem(com.pharos.graph.CallGraph.projectGraphDir(dir)));
             rows.add(r);
         }
 
@@ -140,6 +144,11 @@ public class IndexStatusCommand implements Callable<Integer> {
                     r.get("lastIndexed") == null ? "never" : r.get("lastIndexed"));
         }
         for (Map<String, Object> r : rows) {
+            if (r.get("graphDamage") != null) {
+                System.out.printf("warning: %s: call graph has a %s; callers, callees and usages are wrong "
+                                + "(run: %s)%n", r.get("name"), r.get("graphDamage"),
+                        com.pharos.indexer.ReindexHint.fullIndexCommand((String) r.get("name"), (String) r.get("rootPath")));
+            }
             if (Boolean.TRUE.equals(r.get("needsReembed"))) {
                 System.out.printf("note: %s: vectors need re-embed (run: %s)%n", r.get("name"),
                         com.pharos.indexer.ReindexHint.fullIndexCommand((String) r.get("name"), (String) r.get("rootPath")));

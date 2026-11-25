@@ -61,6 +61,76 @@ public final class SynonymsMerge {
     }
 
     /**
+     * The file reduced to its hand-written lines and the sections of {@code projects}, in the same
+     * canonical layout as {@link #merge}: what a peer-mode writer serves for the shards it owns
+     * (ruling P5-R4), so every reader can merge the writers' files with {@link #merge}'s rules.
+     *
+     * @param text     a synonyms file; null is treated as empty
+     * @param projects the projects whose sections are kept
+     */
+    public static String retain(String text, java.util.Collection<String> projects) {
+        Parsed parsed = parse(text);
+        StringBuilder out = new StringBuilder();
+        for (String line : new LinkedHashSet<>(parsed.hand())) out.append(line).append('\n');
+        for (Map.Entry<String, Set<String>> e : parsed.sections().entrySet()) {
+            if (!projects.contains(e.getKey())) continue;
+            if (!out.isEmpty()) out.append('\n');
+            for (String line : e.getValue()) out.append(line).append('\n');
+        }
+        return out.toString();
+    }
+
+    /**
+     * Peer mode (P5-R4): merges the files the writers serve ({@link #retain}: hand lines plus their
+     * own shards' sections) into the one cluster-wide file, in {@link #merge}'s canonical layout, so
+     * every reader that sees the same writers ends up with identical bytes. The hand-written lines
+     * come from every writer in node-id order, duplicates dropped. A shard section served by more
+     * than one writer is a conflict: the section of {@code preferred(shard)} is used when it is among
+     * them, else that of the lowest node id, and {@code conflict} is told
+     * {@code synonyms of shard X served by A and B; using A's}.
+     *
+     * @param byWriter  each writer's served file, by node id
+     * @param preferred the writer whose section wins for a shard (the shard's owner); empty when none
+     * @param conflict  receives one message per conflicting shard
+     * @return the merged file; empty when it has no line at all
+     */
+    public static String mergeWriters(Map<String, String> byWriter,
+                                      java.util.function.Function<String, java.util.Optional<String>> preferred,
+                                      java.util.function.Consumer<String> conflict) {
+        Map<String, Parsed> parsed = new TreeMap<>();
+        byWriter.forEach((node, text) -> parsed.put(node, parse(text)));
+        Set<String> hand = new LinkedHashSet<>();
+        Map<String, Map<String, Set<String>>> sectionsByShard = new TreeMap<>(); // shard → node → lines
+        for (Map.Entry<String, Parsed> e : parsed.entrySet()) {
+            hand.addAll(e.getValue().hand());
+            e.getValue().sections().forEach((shard, lines) ->
+                    sectionsByShard.computeIfAbsent(shard, s -> new TreeMap<>()).put(e.getKey(), lines));
+        }
+        StringBuilder out = new StringBuilder();
+        for (String line : hand) out.append(line).append('\n');
+        for (Map.Entry<String, Map<String, Set<String>>> e : sectionsByShard.entrySet()) {
+            Map<String, Set<String>> candidates = e.getValue();
+            String use = candidates.keySet().iterator().next();
+            if (candidates.size() > 1) {
+                String want = preferred.apply(e.getKey()).orElse(null);
+                if (want != null && candidates.containsKey(want)) use = want;
+                conflict.accept("synonyms of shard " + e.getKey() + " served by " + joinNames(candidates.keySet())
+                        + "; using " + use + "'s");
+            }
+            if (!out.isEmpty()) out.append('\n');
+            for (String line : candidates.get(use)) out.append(line).append('\n');
+        }
+        return out.toString();
+    }
+
+    /** {@code A}, {@code A and B}, {@code A, B and C}. */
+    public static String joinNames(java.util.Collection<String> names) {
+        List<String> l = List.copyOf(names);
+        if (l.size() <= 1) return String.join("", l);
+        return String.join(", ", l.subList(0, l.size() - 1)) + " and " + l.get(l.size() - 1);
+    }
+
+    /**
      * @param published the cluster's current file; null when the bucket has none
      * @param local     the publishing writer's file
      * @param project   the project being published

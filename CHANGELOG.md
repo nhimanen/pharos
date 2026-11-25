@@ -3,6 +3,98 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.10.0] - 2026-11-25
+
+**Index format:** 1 (unchanged)
+
+Multi-node Phase 5: peer pull, a cluster **without a bucket** (experimental). With
+`cluster.backend: peer-pull` each writer keeps its published generations in a local peer store and serves
+them from its `pharos web` on the token-guarded `/replication/*` endpoint; readers find the writers by DNS
+(`dns:<name>`, e.g. a Kubernetes headless service) or a seed list with gossip (`seeds:<url>,…`), long-poll
+each shard for new generations, and fetch whole files from other readers that already hold them. Reader
+membership and the cluster status state live on the writers, so coordinators, `pharos router` and
+`/cluster/status` work as with a bucket. Optional TLS protects reader-to-writer pulls. Phase 5 gate: top-10,
+callers and usages identical to a single node on 99/99 queries, a new publish visible to readers within
+0.6 s, 0 failed queries over 2 minutes with the writer killed, and the Phase 2/3 cold, warm, fan-out and
+router-elasticity criteria passed as in bucket mode. **Single-node installs and bucket clusters are unaffected**
+by peer pull (`object-store` stays the default backend). The index format is unchanged, but run
+`pharos index --full` once for every project and re-run `pharos link`: older releases could write a call
+graph that silently decodes wrong (see Fixed; UPGRADING.md "Upgrading to 1.10.0").
+
+**When to use it.** Peer mode is for small or on-premises clusters where running S3 or MinIO is not worth
+it. Prefer the bucket when you have one: peer mode has **no writer takeover** (no leases; the Phase 4 work
+queue is forced off, so writers index and publish by hand), a writer that is down publishes nothing until
+it is back (its shards keep serving what readers hold; a lazy reader's cold reads of them fail), the writer's
+disk is the only copy of its published generations, and `cluster.token` is the only credential, visible on
+the network except reader-to-writer with TLS. Read README "Without a bucket: peer-pull" and UPGRADING.md
+("Upgrading to 1.10.0").
+
+### Added (multi-node Phase 5: peer pull without a bucket)
+- Peer-pull backend without a bucket (experimental, README "Without a bucket: peer-pull"):
+  `cluster.backend: peer-pull`. A writer keeps its published generations in a local peer store
+  (`cluster.peers.storeDir`; Lucene files hard-linked) and its `pharos web` serves them on the
+  token-guarded `/replication/*` endpoint (catalog, `latest` long-poll, manifests, whole files
+  and `Range`s, synonyms; at most `maxTransfersPerWriter` transfers, more get 503 with
+  `Retry-After`; optional TLS on writers via `cluster.tls`). Readers find writers through
+  `cluster.peers.discovery` (`dns:<name>[:port]` or `seeds:<url>,…` with gossip limited to
+  `allowHosts`), long-poll each shard's `latest` (`longPollSeconds`), merge the writers' catalogs
+  (a writer missing for 3 refreshes is dropped; its shards keep serving their cached generation)
+  and fetch whole files from peer readers that hold the generation (checked against the
+  manifest; `maxTransfersPerReader`). Reader membership and the cluster status state live on the
+  writers (`POST /replication/readers`), so coordinators and `pharos router` work without a
+  bucket. No writer takeover in this mode (`cluster.writer.workQueue` is forced off). `/health`
+  reports `peers` (writers, conflicts, `peerFetch` files and bytes; on a writer `transfers`).
+  - In peer mode `cluster.token` is the membership credential. A writer admits a reader heartbeat
+    only when its `advertiseUrl` host resolves to the request's address or is in
+    `cluster.peers.allowHosts` (403 otherwise). The token travels in clear text on the reader tier
+    even with `cluster.tls` (which protects reader-to-writer pulls only): restrict the network.
+  - `/health` shows the discovery spec, writer URLs and peer URLs only with
+    `X-Pharos-Cluster-Token` (as `/cluster/status`); the public view names nodes only.
+  - With `cluster.tls.keystore` a writer also listens with plain HTTP on
+    `127.0.0.1:<cluster.tls.localPort>` (default web port + 1, no `/replication/*`), which
+    `./pharos` uses.
+  - `cluster.peers.maxLongPolls` defaults to 4096; size it to readers × shards per writer.
+- A peer reader's shutdown is bounded as a bucket reader's is (1.9.0): on a slow or frozen writer
+  the draining heartbeat and the withdraw each give up after 5 s with a `Stopping: gave up …` WARN,
+  so the drain stays within `cluster.drainSeconds`.
+
+### Fixed
+- `./pharos` in a repo checkout runs the newest `target/pharos-*.jar` by version number. It sorted
+  the names as strings, so a leftover `pharos-1.9.0.jar` (a `mvn package` without `clean`) would have
+  won over `pharos-1.10.0.jar`. The gate scripts pick their default jar the same way (`sort -V`).
+- A newly created call graph could be written with a stale property dictionary (rare; every release
+  since the ArcadeDB graph backend, single-node and clusters alike). ArcadeDB queues a new database's
+  first dictionary page for asynchronous flushing, and pharos then rewrote that page synchronously;
+  when the queued copy reached the disk last, every later open decoded the records' property names
+  wrongly: methods and edges vanished from the graph and other vertices came back with shuffled
+  properties, with no error. Any graph creation could hit it: a full index, a writer takeover's
+  restore, the cross-project link graph, the module graph. A new graph now waits until that page is
+  on disk before anything else is written.
+- Graphs damaged that way by an older release are now detected when opened (pharos always added the
+  dictionary names in a fixed order) and logged as a WARN with the repair:
+  - a project's call graph: the project's next index run is a full one, which rebuilds it; work-queue
+    writers (which refuse `index --full`) repair their shards this way on their own. A standalone
+    `pharos index --full <project>` is still recommended, to find the damage before a run does. As a
+    backstop a writer refuses to publish a damaged graph (and to export it as `graph.cgf.gz`), so
+    readers and takeovers never receive it; `index-status` reports it (`graphDamage` in `--json`),
+    and `upgrade-indexes` re-indexes it.
+  - the cross-project graph: the next `pharos link` rebuilds it.
+  - the module graph (`~/.pharos/module-graph.arcadedb`, never re-created by a re-index): rebuilt
+    empty automatically; each project's modules return when it is next indexed.
+  A reader serving a published `graph.cgf.gz` cannot check it (the file has no dictionary): re-index
+  on the writer, which then publishes a clean generation.
+
+### Maintainers
+- Phase 5 gate (`scripts/cluster-gate-phase5.sh`): every port is a setting (`GATE_W1_PORT`,
+  `GATE_W2_PORT`, `GATE_P1_PORT`, `GATE_REF_PORT`, `GATE_ROUTER_PORT`, `GATE_D1_PORT`/`GATE_D2_PORT`,
+  `GATE_LOAD_BASE_PORT`, the Phase 2/3 drivers' `GATE_LAZY_PORT`/`GATE_FULL_PORT` and
+  `GATE_R1_PORT`..`GATE_R4_PORT`; probe bound `GATE_PORT_PROBE_TIMEOUT`), `GATE_PHAROS_SRC` snapshots
+  pharos from a git tree, and `GATE_SEED_FROM` seeds the pharos (and mypal) embedding caches; defaults
+  unchanged. `GATE_KEYWORD_ONLY=1` loads no embedding model anywhere: pharos and mypal are indexed
+  `--no-embed`, ranking compares the keyword pipeline only and the router load is keyword only; a
+  `GATE` set up in the other mode is refused. The header shows how to run it under
+  `scripts/gate-watchdog.sh`.
+
 ## [1.9.0] - 2026-11-24
 
 **Index format:** 1 (unchanged)

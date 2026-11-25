@@ -10,7 +10,6 @@ import com.pharos.config.ClusterConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -36,7 +35,7 @@ import java.util.function.Supplier;
  * <p>A failed write or listing logs a WARN and is retried on the next tick; it never stops the
  * reader.
  */
-public final class ReaderRegistry implements Closeable {
+public final class ReaderRegistry implements MembershipSource {
 
     private static final Logger log = LoggerFactory.getLogger(ReaderRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -83,6 +82,7 @@ public final class ReaderRegistry implements Closeable {
     }
 
     /** Beats now and then every {@code heartbeatSeconds}, all on a daemon thread (never blocks the caller). */
+    @Override
     public void start() {
         synchronized (mu) {
             if (scheduler != null || closed) return;
@@ -117,6 +117,7 @@ public final class ReaderRegistry implements Closeable {
     static final Duration DEFAULT_SHUTDOWN_CALL = Duration.ofSeconds(5);
 
     /** {@link #drain(Duration)} within {@link #DEFAULT_SHUTDOWN_CALL}. */
+    @Override
     public void drain() {
         drain(DEFAULT_SHUTDOWN_CALL);
     }
@@ -155,11 +156,13 @@ public final class ReaderRegistry implements Closeable {
     }
 
     /** The live readers as of the last refresh (this node's own entry included). */
+    @Override
     public List<ReaderHeartbeat> live() {
         return live.stream().map(LiveReader::heartbeat).toList();
     }
 
     /** Like {@link #live()}, with each reader's age in seconds. */
+    @Override
     public List<LiveReader> liveWithAge() {
         return live;
     }

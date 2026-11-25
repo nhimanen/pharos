@@ -13,4 +13,15 @@ public final class ClusterTestAccess {
         com.pharos.cluster.warm.WarmTestAccess.objectMissing(runtime.lazyGenerations(), shard, gen,
                 "test/" + shard + "/gen-" + gen + "/gone");
     }
+
+    /** The reader's lazy directory factory and block cache; null unless a lazy reader. */
+    public static com.pharos.cluster.warm.LazyGenerations lazyGenerations(ClusterRuntime runtime) {
+        return runtime.lazyGenerations();
+    }
+
+    /** {@link SingleNodeGoldenTest#snapshot}: every query surface's answers as one string. */
+    public static String snapshot(com.pharos.search.SearchEngine engine, com.pharos.config.ProjectRegistry registry)
+            throws Exception {
+        return SingleNodeGoldenTest.snapshot(engine, registry);
+    }
 }

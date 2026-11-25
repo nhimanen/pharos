@@ -46,4 +46,17 @@ class SynonymsMergeTest {
         assertThat(merged).contains("zeta => six", "alpha => one", "mu => m");
         assertThat(merged.indexOf("alpha")).isLessThan(merged.indexOf("mu")).isLessThan(merged.indexOf("zeta"));
     }
+
+    @Test
+    void retainKeepsHandLinesAndTheGivenSectionsCanonically() {
+        String file = "calc, calculator\n" + section("z", "d", "zeta => six") + section("a", "d", "alpha => one")
+                + section("m", "d", "mu => m");
+        String kept = SynonymsMerge.retain(file, java.util.Set.of("m", "a"));
+        assertThat(kept).contains("calc, calculator", "alpha => one", "mu => m").doesNotContain("zeta");
+        assertThat(kept.indexOf("alpha")).isLessThan(kept.indexOf("mu"));
+        // Merging retained files of two writers gives the same bytes as the full file.
+        String other = SynonymsMerge.retain(file, java.util.Set.of("z"));
+        assertThat(SynonymsMerge.merge(kept, other, "z")).isEqualTo(SynonymsMerge.merge(null, file, "z"));
+        assertThat(SynonymsMerge.retain(null, java.util.Set.of("a"))).isEmpty();
+    }
 }

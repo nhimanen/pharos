@@ -54,6 +54,11 @@ public class WebServer {
     /** Why a ready node can't answer every query, or null; see {@link #setDegradation}. */
     private volatile java.util.function.Supplier<String> degradation = () -> null;
     private volatile java.util.function.Supplier<Map<String, Object>> writerDisk = () -> null;
+    /**
+     * A peer-pull reader's writers, conflicts and unavailable shards, by view (true: the token view,
+     * with addresses); null result: omitted.
+     */
+    private volatile java.util.function.Function<Boolean, Map<String, Object>> peers = member -> null;
     private volatile java.util.function.Supplier<java.util.List<String>> degradedShards = java.util.List::of;
     private volatile java.util.function.BooleanSupplier draining = () -> false;
     /** Requests in flight for {@link #awaitIdle}; guarded by itself (notified on every decrement). */
@@ -63,6 +68,87 @@ public class WebServer {
     private final com.pharos.cluster.membership.LoadCounter load = new com.pharos.cluster.membership.LoadCounter();
     /** Source of {@code /cluster/status} and {@code /cluster/events}; without one both answer 404. */
     private volatile com.pharos.cluster.status.StatusService clusterStatus = null;
+    /** {@code /replication/*} on a peer-mode writer; null elsewhere (the routes stay absent). */
+    private volatile com.pharos.cluster.peer.ReplicationEndpoint replication = null;
+    /** {@code cluster.tls}: when set, the server listens with TLS only. */
+    private volatile Tls tls = null;
+
+    /** The keystore the TLS connector serves from. */
+    public record Tls(Path keystore, String type, char[] password) {
+        public Tls {
+            java.util.Objects.requireNonNull(keystore, "keystore");
+            type = type == null || type.isBlank() ? "PKCS12" : type;
+            java.util.Objects.requireNonNull(password, "password");
+        }
+    }
+
+    /**
+     * Listen with TLS only (a Jetty SSL connector on the port; plain HTTP connections are refused at
+     * the handshake). Without it the server speaks plain HTTP.
+     */
+    public void setTls(Tls tls) {
+        this.tls = java.util.Objects.requireNonNull(tls, "tls");
+    }
+
+    /** With {@link #setTls}: the loopback plain-HTTP port ({@code cluster.tls.localPort}); 0 = none. */
+    private volatile int localPlainPort = 0;
+
+    /**
+     * With {@link #setTls}, also listen with plain HTTP on {@code 127.0.0.1:port} (Phase 5 I3), so
+     * {@code ./pharos} on the writer reaches its own daemon without a truststore. That listener serves
+     * everything except {@code /replication/*} (404): peers only ever get replication over TLS. It
+     * cannot share the TLS port: the TLS connector binds the wildcard address, and Linux refuses a
+     * loopback bind on a port a wildcard socket holds.
+     */
+    public void setLocalPlainPort(int port) {
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("local port must be 1-65535, got " + port);
+        this.localPlainPort = port;
+    }
+
+    /**
+     * A peer-pull reader's writer view reported by {@code /health} as {@code peers} (writers,
+     * {@code shard X claimed by A and B} conflicts, unavailable shards), or a peer-pull writer's
+     * transfer counters ({@code peers.transfers}). Informational: it changes neither the status nor
+     * readiness.
+     */
+    public void setPeers(java.util.function.Supplier<Map<String, Object>> peers) {
+        java.util.Objects.requireNonNull(peers, "peers");
+        this.peers = member -> peers.get(); // one view: it must carry no address
+    }
+
+    /**
+     * Like {@link #setPeers}, with a public view ({@code false}: no discovery spec, writer or peer URL)
+     * and a token view ({@code true}), chosen by {@code X-Pharos-Cluster-Token} as on
+     * {@code /cluster/status} (see {@link #setClusterToken}).
+     */
+    public void setPeerViews(java.util.function.Function<Boolean, Map<String, Object>> views) {
+        this.peers = java.util.Objects.requireNonNull(views, "views");
+    }
+
+    /** {@code /replication/<shard>/files/*} on a peer-mode reader; null elsewhere. */
+    private volatile com.pharos.cluster.peer.PeerFileSource peerFiles = null;
+
+    /** Mounts a peer-mode reader's {@code /replication/<shard>/files/<key>} (serving other readers). */
+    public void setPeerFileSource(com.pharos.cluster.peer.PeerFileSource files) {
+        this.peerFiles = java.util.Objects.requireNonNull(files, "files");
+    }
+
+    /** Mounts {@code /replication/*} (a peer-mode writer). */
+    public void setReplicationEndpoint(com.pharos.cluster.peer.ReplicationEndpoint endpoint) {
+        this.replication = java.util.Objects.requireNonNull(endpoint, "endpoint");
+    }
+
+    /** The connector's idle timeout when set; null keeps Jetty's default (30 s). */
+    private volatile java.time.Duration idleTimeout = null;
+
+    /**
+     * Overrides the idle timeout of every connection (Jetty's default is 30 s). A {@code latest}
+     * long-poll raises it for its own connection only, for as long as it waits.
+     */
+    public void setIdleTimeout(java.time.Duration timeout) {
+        this.idleTimeout = java.util.Objects.requireNonNull(timeout, "timeout");
+    }
+
     /** Checks a presented cluster token (constant time); without one, no request gets the token view. */
     private volatile java.util.function.Predicate<String> clusterToken = t -> false;
 
@@ -249,6 +335,11 @@ public class WebServer {
      * liveness treats any answer as "running". Every signal is read once.
      */
     HealthAnswer healthAnswer() {
+        return healthAnswer(false);
+    }
+
+    /** @param member the request carried the cluster token: the {@code peers} token view */
+    HealthAnswer healthAnswer(boolean member) {
         boolean drain = draining.getAsBoolean();
         boolean ready = readiness.getAsBoolean();
         if (drain) { // wins over every other state: the node is going away
@@ -269,6 +360,8 @@ public class WebServer {
         if (cache != null) out.put("readerCache", cache);
         Map<String, Object> disk = writerDisk.get();
         if (disk != null) out.put("writerDisk", disk);
+        Map<String, Object> peerView = peers.apply(member);
+        if (peerView != null) out.put("peers", peerView);
         return new HealthAnswer(ready ? 200 : 503, out);
     }
 
@@ -298,13 +391,35 @@ public class WebServer {
 
     /** @param pharosDir directory that receives the usage log ({@code logs/usage.jsonl}) */
     public Javalin start(int port, Path pharosDir) {
+        Tls t = tls;
+        int local = localPlainPort;
         Javalin app = Javalin.create(config -> {
             config.jsonMapper(new JavalinJackson(mapper, false));
             config.staticFiles.add("/web", Location.CLASSPATH);
             // Global on a reader: Javalin has one request-size cap, so every route (not only /internal/*)
             // accepts bodies up to 4 MiB there (other roles keep Javalin's default).
             if (readerNode) config.http.maxRequestSize = com.pharos.cluster.internal.InternalApi.MAX_BODY_BYTES;
+            java.time.Duration idle = idleTimeout;
+            if (t != null || idle != null) {
+                // Our own connector replaces Javalin's default one (which it adds only when none is set).
+                config.jetty.addConnector((server, http) -> connector(server, http, port, t, idle));
+            }
+            if (t != null && local > 0) { // after the TLS one: app.port() stays the TLS port
+                config.jetty.addConnector((server, http) -> {
+                    org.eclipse.jetty.server.ServerConnector c = connector(server, http, local, null, idle);
+                    c.setHost("127.0.0.1");
+                    return c;
+                });
+            }
         });
+        if (t != null && local > 0) {
+            // First before-handler: no /replication/* route (nor its token filter) is reached on the plain listener.
+            app.before(ctx -> {
+                if (ctx.req().getLocalPort() == local && replicationPath(ctx)) {
+                    throw new io.javalin.http.NotFoundResponse("not served on the local plain-HTTP listener");
+                }
+            });
+        }
 
         // ── Usage logging — one JSONL line per /api/* request to logs/usage.jsonl ──
         UsageLogger usage = new UsageLogger(pharosDir);
@@ -866,7 +981,9 @@ public class WebServer {
 
         // Health check (used by daemon client to detect readiness)
         app.get("/health", ctx -> {
-            HealthAnswer h = healthAnswer(); // status and body from the same reads
+            // addresses (peers) only with the cluster token, as on /cluster/status (Phase 5 I2)
+            boolean member = clusterToken.test(ctx.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER));
+            HealthAnswer h = healthAnswer(member); // status and body from the same reads
             ctx.status(h.status()).json(h.body());
         });
 
@@ -930,11 +1047,68 @@ public class WebServer {
         });
 
         if (readerNode && internalApi != null) internalApi.mount(app);
+        com.pharos.cluster.peer.ReplicationEndpoint repl = replication;
+        if (repl != null) repl.mount(app);
+        com.pharos.cluster.peer.PeerFileSource files = peerFiles;
+        if (files != null && repl == null) files.mount(app);
 
         app.start(port);
-        System.out.printf("Web UI available at http://localhost:%d%n", port);
+        System.out.printf("Web UI available at %s://localhost:%d%n", t != null ? "https" : "http", port);
+        if (t != null && local > 0) {
+            System.out.printf("Local plain HTTP (127.0.0.1 only, no /replication/*) at http://127.0.0.1:%d%n", local);
+        }
         log.info("Web server started on port {}", port);
         return app;
+    }
+
+    /** {@code /replication} or below it, raw or percent-decoded. */
+    private static boolean replicationPath(io.javalin.http.Context ctx) {
+        String raw = ctx.req().getRequestURI();
+        String decoded;
+        try {
+            decoded = java.net.URLDecoder.decode(raw == null ? "" : raw.replace("+", "%2B"),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return true; // not decodable: refuse
+        }
+        for (String p : new String[]{ctx.path(), raw, decoded}) {
+            if (p == null) continue;
+            String n = p.replaceAll("/{2,}", "/").toLowerCase(java.util.Locale.ROOT);
+            if (n.equals(com.pharos.cluster.peer.ReplicationEndpoint.PREFIX)
+                    || n.startsWith(com.pharos.cluster.peer.ReplicationEndpoint.PREFIX + "/")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The listening connector: TLS (from {@link Tls}) or plain HTTP; {@code idle} null keeps the default. */
+    static org.eclipse.jetty.server.ServerConnector connector(org.eclipse.jetty.server.Server server,
+                                                              org.eclipse.jetty.server.HttpConfiguration http,
+                                                              int port, Tls tls, java.time.Duration idle) {
+        org.eclipse.jetty.server.ServerConnector c;
+        if (tls != null) {
+            if (!java.nio.file.Files.isRegularFile(tls.keystore())) {
+                throw new IllegalStateException("cluster.tls.keystore " + tls.keystore() + " does not exist");
+            }
+            org.eclipse.jetty.util.ssl.SslContextFactory.Server ssl = new org.eclipse.jetty.util.ssl.SslContextFactory.Server();
+            ssl.setKeyStorePath(tls.keystore().toAbsolutePath().toString());
+            ssl.setKeyStoreType(tls.type());
+            ssl.setKeyStorePassword(new String(tls.password()));
+            org.eclipse.jetty.server.HttpConfiguration https = new org.eclipse.jetty.server.HttpConfiguration(http);
+            org.eclipse.jetty.server.SecureRequestCustomizer secure = new org.eclipse.jetty.server.SecureRequestCustomizer();
+            // Clients verify the host name against the certificate; the server does not police SNI.
+            secure.setSniHostCheck(false);
+            https.addCustomizer(secure);
+            c = new org.eclipse.jetty.server.ServerConnector(server,
+                    new org.eclipse.jetty.server.SslConnectionFactory(ssl, org.eclipse.jetty.http.HttpVersion.HTTP_1_1.asString()),
+                    new org.eclipse.jetty.server.HttpConnectionFactory(https));
+        } else {
+            c = new org.eclipse.jetty.server.ServerConnector(server, new org.eclipse.jetty.server.HttpConnectionFactory(http));
+        }
+        c.setPort(port);
+        if (idle != null) c.setIdleTimeout(idle.toMillis());
+        return c;
     }
 
     private static final com.fasterxml.jackson.databind.ObjectWriter ASCII_JSON = new ObjectMapper()

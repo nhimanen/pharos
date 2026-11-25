@@ -876,6 +876,35 @@ class WorkLoopTest {
     }
 
     /**
+     * A work-queue writer refuses {@code pharos index --full}, so it must repair a call graph with a
+     * damaged property dictionary (written before 1.10.0) by itself: the shard gets a FULL run, which
+     * builds a new graph generation and publishes it.
+     */
+    @Test
+    void damagedGraphDictionaryGetsAFullRunAndPublishes() throws IOException {
+        ShardId s = pathShard("solo");
+        Writer a = new Writer("node-a");
+        a.loop.tick();
+        rounds(1, 10, a);
+        assertThat(latest(s)).as("idle").contains(Generation.FIRST);
+        Path dir = a.lucene.getProjectIndexDir(s.value());
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(dir);
+        try (java.util.stream.Stream<Path> w = Files.walk(live)) {
+            for (Path p : w.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(p);
+        }
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(live);
+
+        List<String> logs = logsOf(WorkLoop.class, () -> rounds(1, 10, a));
+        assertThat(logs).anyMatch(l -> l.contains("running a FULL index") && l.contains("damaged property dictionary"));
+        assertThat(latest(s)).contains(new Generation(2));
+        Path rebuilt = com.pharos.graph.CallGraph.projectGraphDir(dir);
+        assertThat(rebuilt).isNotEqualTo(live);
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(rebuilt)).isNull();
+        rounds(3, 10, a);
+        assertThat(latest(s)).as("idle again").contains(new Generation(2));
+    }
+
+    /**
      * Final review I4: one shard's remote black-holes (its ls-remote hangs in a child process). Its
      * checks time out after the short ls-remote timeout, run in parallel with the other shards', so
      * the other shard's change is still seen and published at once; the failed checks count toward

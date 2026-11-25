@@ -11,6 +11,7 @@ public final class Backends {
         return switch (kind) {
             case LOCAL -> new LocalBackend(config);
             case OBJECT_STORE -> new ObjectStoreBackend(config);
+            case PEER_PULL -> new com.pharos.cluster.peer.PeerBackend(config);
         };
     }
 }

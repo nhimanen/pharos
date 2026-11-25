@@ -75,6 +75,46 @@ class ClusterTokenSecrecyTest {
         assertThat(out.toString()).doesNotContain(SECRET);
     }
 
+    /**
+     * Phase 5 I2: {@code /health} shows peer addresses (discovery spec, writer and peer URLs) only with
+     * the cluster token, compared in constant time; status and readiness are the same in both views.
+     */
+    @Test
+    void healthShowsPeerAddressesOnlyWithTheToken(@TempDir Path tmp) throws Exception {
+        WebServer server = new WebServer(null, null, null, null, null);
+        server.setPeerViews(member -> member
+                ? java.util.Map.of("discovery", "seeds:http://writer.internal:7171",
+                        "writers", List.of(java.util.Map.of("node", "w1", "url", "http://writer.internal:7171")))
+                : java.util.Map.of("writers", List.of(java.util.Map.of("node", "w1"))));
+        server.setClusterToken(com.pharos.cluster.internal.InternalApi.tokenMatcher(SECRET));
+        server.setReadiness(() -> false); // warming: 503 in both views
+        io.javalin.Javalin app = server.start(0, tmp.resolve("web"));
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            java.net.URI uri = java.net.URI.create("http://127.0.0.1:" + app.port() + "/health");
+            java.util.function.Function<String, java.net.http.HttpResponse<String>> get = tok -> {
+                var b = java.net.http.HttpRequest.newBuilder(uri);
+                if (tok != null) b.header(com.pharos.cluster.internal.InternalApi.TOKEN_HEADER, tok);
+                try {
+                    return http.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            };
+            for (String tok : new String[]{null, "", "wrong", SECRET.substring(1), SECRET + "x"}) {
+                var r = get.apply(tok);
+                assertThat(r.statusCode()).as("token %s", tok).isEqualTo(503);
+                assertThat(r.body()).as("token %s", tok).contains("\"w1\"", "\"warming\"")
+                        .doesNotContain("writer.internal").doesNotContain("discovery");
+            }
+            var member = get.apply(SECRET);
+            assertThat(member.statusCode()).isEqualTo(503);
+            assertThat(member.body()).contains("writer.internal", "discovery", "\"warming\"").doesNotContain(SECRET);
+        } finally {
+            app.stop();
+        }
+    }
+
     /** Task 5: {@code /cluster/status} (and its events) never carry the token or store credentials. */
     @Test
     void statusNeverCarriesTokenOrCredentials(@TempDir Path tmp) throws Exception {

@@ -23,7 +23,8 @@ import java.util.function.Function;
 
 /**
  * Re-indexes (full) every project whose index is {@code upgrade-available}, {@code outdated}
- * or {@code newer}, so the whole set reaches the current index format. Refused on reader nodes:
+ * or {@code newer}, so the whole set reaches the current index format, and every current one whose
+ * call graph has a damaged property dictionary (written before 1.10.0). Refused on reader nodes:
  * they receive upgraded generations by syncing from the writer.
  *
  * <p>Exit codes: {@value #EXIT_OK} nothing to do, all upgraded, or aborted at the prompt;
@@ -121,6 +122,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         int invalidCount = 0;
         Set<String> known = new HashSet<>();
         List<ProjectMeta> reembed = new ArrayList<>();
+        Set<String> damaged = new HashSet<>();
         boolean embeddingsConfigured = !config.getEmbeddingProviders().isEmpty();
         for (ProjectMeta p : registry.listAll()) {
             known.add(p.getName());
@@ -141,7 +143,18 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             switch (IndexFormat.status(idx)) {
                 case UPGRADE_AVAILABLE, OUTDATED, NEWER -> todo.add(p);
                 case MISSING -> missing.add(p);
-                case OK, INVALID -> { }
+                case OK -> {
+                    // a current format with a call graph that decodes wrongly (pre-1.10.0 dictionary
+                    // race): the full re-index rebuilds the graph
+                    String damage = idx == null ? null
+                            : com.pharos.graph.CallGraph.dictionaryProblem(com.pharos.graph.CallGraph.projectGraphDir(idx));
+                    if (damage != null) {
+                        System.out.printf("%s: call graph has a %s; it is re-indexed%n", p.getName(), damage);
+                        damaged.add(p.getName());
+                        todo.add(p);
+                    }
+                }
+                case INVALID -> { }
             }
         }
         for (String n : names) {
@@ -174,7 +187,8 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             for (ProjectMeta p : todo) {
                 System.out.printf("  %-25s  %10s  %s  [%s]  embeddings: %s%n", p.getName(),
                         IndexStatusCommand.humanBytes(IndexStatusCommand.sizeOf(IndexFormat.dir(p.getIndexPath()))),
-                        p.getRootPath(), IndexFormat.status(IndexFormat.dir(p.getIndexPath())).wireName(),
+                        p.getRootPath(), damaged.contains(p.getName()) ? "damaged-graph"
+                                : IndexFormat.status(IndexFormat.dir(p.getIndexPath())).wireName(),
                         embed ? "yes" : "no");
             }
         }

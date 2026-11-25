@@ -77,6 +77,7 @@ public class WebCommand implements Callable<Integer> {
                 webServer.setDegradation(clusterRuntime::degradation);
                 webServer.setDegradedShards(clusterRuntime::degradedShards);
                 webServer.setLiveReaders(clusterRuntime::liveReaders);
+                if (clusterRuntime.peerStatus() != null) webServer.setPeerViews(clusterRuntime::peerStatus);
                 // With the engine, this reader also coordinates queries over shards it does not hold.
                 com.pharos.cluster.internal.InternalApi internal = searchEngine != null
                         ? clusterRuntime.internalApi(searchEngine) : clusterRuntime.internalApi();
@@ -89,6 +90,20 @@ public class WebCommand implements Callable<Integer> {
                 // /cluster/status and /cluster/events on every role (single node: from local state)
                 webServer.setClusterStatus(clusterRuntime.statusService());
                 webServer.setClusterToken(clusterRuntime.clusterTokenMatcher()); // token view: reader addresses
+                // a peer-mode writer serves its published generations to readers (token-guarded)
+                clusterRuntime.replicationEndpoint().ifPresent(e -> {
+                    webServer.setReplicationEndpoint(e);
+                    webServer.setWriterDisk(clusterRuntime::writerDisk); // index dir, store dir, checkouts
+                    webServer.setPeers(() -> java.util.Map.of("transfers", e.stats())); // /health peers.transfers
+                    clusterRuntime.registerReplicationDrain(); // on a signal: in-flight ranges finish first
+                    System.out.println("Serving /replication/* (cluster.backend: peer-pull)");
+                });
+                // a peer-mode reader serves the generations it holds in full to other readers (token-guarded)
+                clusterRuntime.peerFileSource().ifPresent(webServer::setPeerFileSource);
+                clusterRuntime.serverTls().ifPresent(t -> {
+                    webServer.setTls(new WebServer.Tls(t.getKeystore(), t.getKeystoreType(), t.password()));
+                    webServer.setLocalPlainPort(t.localPortFor(port)); // ./pharos on this host (I3)
+                });
             }
             webServer.start(port);
             if (!noOpen) {

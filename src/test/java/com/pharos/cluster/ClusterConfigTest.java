@@ -413,4 +413,133 @@ class ClusterConfigTest {
         assertThatThrownBy(() -> parse("{\"cluster\":{\"status\":{\"eventsKeepAliveSeconds\":0}}}"))
                 .hasMessageContaining("eventsKeepAliveSeconds");
     }
+
+    @Test
+    void peerPullBackendForcesWorkQueueOffAndNeedsAToken() throws Exception {
+        String writer = "{\"cluster\":{\"role\":\"writer\",\"backend\":\"peer-pull\",\"token\":\"t\"";
+        ClusterConfig c = parse(writer + "}}");
+        assertThat(c.getBackend()).isEqualTo(BackendKind.PEER_PULL);
+        assertThat(c.getWriter().isWorkQueue()).as("forced off in peer mode (P5-R6)").isFalse();
+        assertThat(c.getWriter().getWorkQueue()).as("nothing configured").isNull();
+        assertThat(parse(writer + ",\"writer\":{\"workQueue\":false}}}").getWriter().isWorkQueue()).isFalse();
+        // the backend key after the writer section: same result
+        assertThat(parse("{\"cluster\":{\"writer\":{},\"role\":\"writer\",\"token\":\"t\",\"backend\":\"peer-pull\"}}")
+                .getWriter().isWorkQueue()).isFalse();
+        assertThatThrownBy(() -> parse(writer + ",\"writer\":{\"workQueue\":true}}}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.writer.workQueue")
+                .hasMessageContaining("peer-pull");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"writer\",\"backend\":\"peer-pull\"}}"))
+                .hasMessageContaining("cluster.token");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"all\",\"backend\":\"peer-pull\"}}"))
+                .hasMessageContaining("'local'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"writer\"}}"))
+                .hasMessageContaining("'object-store' or 'peer-pull'");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"backend\":\"bucketless\"}}"))
+                .hasStackTraceContaining("peer-pull");
+        // object-store keeps the work-queue default
+        assertThat(parse("{\"cluster\":{\"role\":\"writer\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"}}}").getWriter().isWorkQueue()).isTrue();
+    }
+
+    @Test
+    void workQueueIsSavedOnlyWhenConfigured() throws Exception {
+        IndexConfig cfg = mapper.readValue("{\"cluster\":{\"role\":\"writer\",\"backend\":\"peer-pull\","
+                + "\"token\":\"t\"}}", IndexConfig.class);
+        cfg.getCluster().validate();
+        String saved = mapper.writeValueAsString(cfg);
+        assertThat(saved).doesNotContain("workQueue");
+        // a forced-off writer saved and loaded again is still valid
+        ClusterConfig back = mapper.readValue(saved, IndexConfig.class).getCluster();
+        back.validate();
+        assertThat(back.getWriter().isWorkQueue()).isFalse();
+        cfg.getCluster().getWriter().setWorkQueue(false);
+        assertThat(mapper.writeValueAsString(cfg)).contains("\"workQueue\":false");
+    }
+
+    @Test
+    void peersAndTlsDefaultsAndValidation() throws Exception {
+        ClusterConfig c = parse("{}");
+        assertThat(c.getPeers().getRefreshSeconds()).isEqualTo(15);
+        assertThat(c.getPeers().getMaxTransfersPerWriter()).isEqualTo(8);
+        assertThat(c.getPeers().getMaxTransfersPerReader()).isEqualTo(4);
+        assertThat(c.getPeers().getLongPollSeconds()).isEqualTo(30);
+        assertThat(c.getPeers().getMaxLongPolls()).isEqualTo(4096);
+        assertThat(c.getPeers().getStoreDir()).isEqualTo(IndexConfig.DEFAULT_BASE.resolve("peer-store"));
+        assertThat(c.getTls()).isNull();
+        assertThat(c.tlsServer()).isFalse();
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxTransfersPerWriter\":0}}}"))
+                .hasMessageContaining("cluster.peers.maxTransfersPerWriter");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxTransfersPerReader\":0}}}"))
+                .hasMessageContaining("cluster.peers.maxTransfersPerReader");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"longPollSeconds\":301}}}"))
+                .hasMessageContaining("cluster.peers.longPollSeconds");
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"peers\":{\"maxLongPolls\":0}}}"))
+                .hasMessageContaining("cluster.peers.maxLongPolls");
+        String peerWriter = "\"role\":\"writer\",\"backend\":\"peer-pull\",\"token\":\"t\",";
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\"}}}"))
+                .hasMessageContaining("cluster.tls.passwordEnv");
+        ClusterConfig tls = parse("{\"cluster\":{" + peerWriter
+                + "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\"}}}");
+        assertThat(tls.tlsServer()).isTrue();
+        assertThat(tls.getTls().getKeystoreType()).isEqualTo("PKCS12");
+        assertThat(new String(tls.getTls().password())).isEqualTo(System.getenv("PATH"));
+        assertThat(tls.getTls().localPortFor(7171)).as("I3: the loopback plain port, default web port + 1").isEqualTo(7172);
+        assertThat(parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\","
+                + "\"localPort\":9000}}}").getTls().localPortFor(7171)).isEqualTo(9000);
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"keystore\":\"/k.p12\","
+                + "\"passwordEnv\":\"PATH\",\"localPort\":70000}}}")).hasMessageContaining("cluster.tls.localPort");
+        ClusterConfig unset = parse("{\"cluster\":{" + peerWriter + "\"tls\":{\"truststore\":\"/t.p12\","
+                + "\"passwordEnv\":\"PHAROS_TEST_SURELY_UNSET_VAR\"}}}");
+        assertThat(unset.tlsServer()).as("a truststore alone is client-side only").isFalse();
+        assertThatThrownBy(() -> unset.getTls().password()).hasMessageContaining("PHAROS_TEST_SURELY_UNSET_VAR");
+        // P5-R7: TLS only on peer-pull writers for now
+        String keystore = "\"tls\":{\"keystore\":\"/k.p12\",\"passwordEnv\":\"PATH\"}";
+        for (String other : new String[]{"",
+                "\"role\":\"writer\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},",
+                "\"role\":\"reader\",\"backend\":\"object-store\",\"objectStore\":{\"bucket\":\"b\"},"
+                        + "\"advertiseUrl\":\"http://r:1\",\"token\":\"t\",",
+                "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\","
+                        + "\"peers\":{\"discovery\":\"dns:w\"},"}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{" + other + keystore + "}}")).as(other)
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.tls is not supported")
+                    .hasMessageContaining("only peer-pull writers");
+        }
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"tls\":{\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
+                .hasMessageContaining("cluster.tls is not supported");
+        assertThat(parse("{\"cluster\":{\"tls\":{}}}").tlsServer()).as("an empty section configures nothing").isFalse();
+    }
+
+    /** Phase 5 Task 2: a peer-pull reader needs discovery and may hold a truststore (P5-R7 carry). */
+    @Test
+    void peerReaderNeedsDiscoveryAndMayHoldATruststore() throws Exception {
+        String peerReader = "\"role\":\"reader\",\"backend\":\"peer-pull\",\"advertiseUrl\":\"http://r:1\",\"token\":\"t\",";
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader.substring(0, peerReader.length() - 1) + "}}"))
+                .hasMessageContaining("cluster.peers.discovery is required");
+        ClusterConfig dns = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:writers.ns.svc:7070\"}}}");
+        assertThat(dns.getPeers().getDiscovery()).isEqualTo("dns:writers.ns.svc:7070");
+        parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"seeds:http://w1:7070,https://w2\"}}}");
+        for (String bad : new String[]{"dns:", "dns:bad_name", "dns:w:0", "dns:w:x", "seeds:", "seeds:ftp://w",
+                "seeds:http://u:p@w", "w1:7070"}) {
+            assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"" + bad + "\"}}}"))
+                    .as(bad).isInstanceOf(IllegalStateException.class).hasMessageContaining("cluster.peers.discovery");
+        }
+        String trust = "\"tls\":{\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}";
+        ClusterConfig reader = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:w\"}," + trust + "}}");
+        assertThat(reader.getTls().getTruststore()).hasToString("/t.p12");
+        assertThat(reader.tlsServer()).as("a reader never listens with TLS").isFalse();
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":\"dns:w\"},"
+                + "\"tls\":{\"keystore\":\"/k.p12\",\"truststore\":\"/t.p12\",\"passwordEnv\":\"PATH\"}}}"))
+                .hasMessageContaining("cluster.tls is not supported").hasMessageContaining("cluster.tls.keystore");
+        // P5-R8: with a truststore every seed must be https
+        assertThatThrownBy(() -> parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":"
+                + "\"seeds:https://w1,http://w2\"}," + trust + "}}"))
+                .hasMessageContaining("every seed must be https://");
+        ClusterConfig httpsSeeds = parse("{\"cluster\":{" + peerReader + "\"peers\":{\"discovery\":"
+                + "\"seeds:https://w1\",\"allowHosts\":[\"w2\"]}," + trust + "}}");
+        assertThat(httpsSeeds.getPeers().getAllowHosts()).containsExactly("w2");
+        // object-store readers and coordinators are unchanged: no truststore there yet
+        assertThatThrownBy(() -> parse("{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","
+                + "\"objectStore\":{\"bucket\":\"b\"},\"advertiseUrl\":\"http://r:1\",\"token\":\"t\"," + trust + "}}"))
+                .hasMessageContaining("cluster.tls is not supported");
+    }
 }

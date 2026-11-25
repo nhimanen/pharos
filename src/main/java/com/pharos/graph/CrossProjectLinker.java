@@ -161,7 +161,9 @@ public class CrossProjectLinker {
                 resolvedEdges.size(), projectNames.size());
 
         // Save guard: only rewrite if something changed
-        if (!resolvedEdges.isEmpty() || !Files.isDirectory(crossDbDir)) {
+        // (a damaged dictionary, written before 1.10.0, is rebuilt too: its records decode wrongly)
+        if (!resolvedEdges.isEmpty() || !Files.isDirectory(crossDbDir)
+                || CallGraph.dictionaryProblem(crossDbDir) != null) {
             // Delete and recreate instead of clear() — avoids the O(M) DELETE VERTEX
             // scan and the LSM compaction-file-removal race that causes
             // "File with id N has been removed" errors on concurrent writes.

@@ -226,7 +226,7 @@ def freshness(args):
         with open(log_path, errors="replace") as f:
             f.seek(log_size_before)
             for ln in f:
-                m = re.search(r"Shard (\S+): materialised generation (\d+) .* in (\d+) ms", ln)
+                m = re.search(r"Shard (\S+): materialised (?:lazy )?generation (\d+) .* in (\d+) ms", ln)
                 if m and m.group(1) == shard and m.group(2) == gen:
                     ms.append(int(m.group(3)))
                     lines = [ln.strip()]

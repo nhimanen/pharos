@@ -1,5 +1,60 @@
 # Upgrading
 
+## Upgrading to 1.10.0
+
+Index format: 1 (unchanged). Peer pull changes nothing for single-node installs (`role: all`) or for
+clusters with a bucket (`cluster.backend: object-store`, still the default): restart on the new jar.
+One recommended step applies to every install:
+
+### Recommended: rebuild the call graphs once
+
+Every release since the ArcadeDB graph backend could, rarely, write a new graph whose property
+dictionary was stale. Such a graph opens without an error but decodes wrongly: methods and edges are
+missing, other vertices have shuffled properties, so callers, callees, usages and call paths are wrong.
+1.10.0 creates graphs safely and recognises the damaged ones, but cannot repair a graph in place.
+
+- **Every project:** run `pharos index --full <project>` once (or `pharos upgrade-indexes`, which
+  re-indexes the damaged ones it finds). A full run builds a new call graph. Any index run of a
+  damaged project now turns full by itself, so the graph is repaired at the latest on the project's
+  next change; the explicit run repairs it now. Work-queue writers refuse `index --full` and need
+  nothing: a shard whose local graph is damaged gets a full run and publishes a clean generation,
+  which replaces the one readers serve. Writers without the work queue: run it on the writer.
+- **Cross-project graph:** re-run `pharos link` afterwards; it rebuilds the graph when it is damaged.
+- **Module graph** (`~/.pharos/module-graph.arcadedb`): a re-index never re-creates it. 1.10.0 rebuilds
+  a damaged one automatically (empty; each project's modules return when it is next indexed, so the
+  full re-indexes above refill it).
+
+What 1.10.0 does when it finds a damaged graph: it logs a WARN naming the graph and the repair, and the
+project's next index run is a full one. As a backstop a writer refuses to publish a damaged project graph
+(the publish fails with that message) until a full run has rebuilt it.
+`pharos index-status` shows a `warning:` line (`graphDamage` in `--json`). A reader can only check an
+ArcadeDB graph, not a published `graph.cgf.gz`: repair on the writer.
+
+### Optional: moving a cluster to peer pull (no bucket)
+
+Peer pull (`cluster.backend: peer-pull`) is new and experimental; see README "Without a bucket: peer-pull"
+for the configs. It trades the bucket for these limits: no writer takeover, the writer's disk is the only
+copy of what it published, and the cluster token is the only credential. Keep the bucket if you rely on
+Phase 4 failover or the work queue.
+
+- **Writers.** Set `backend: peer-pull`, `cluster.token` (required) and `cluster.peers` (`storeDir` on the
+  same file system as `indexDir`, `discovery`, `allowHosts`). Remove `"writer": {"workQueue": true}` if set
+  (a config error in peer mode; the default is forced off) and publish by hand next to a long-running
+  `pharos web`. The peer store starts empty: run `pharos publish <project>` (or `pharos index <dir>`) for
+  each project of the writer so readers have a generation to pull. Each writer owns the shards in its own
+  registry; give every shard exactly one writer.
+- **Readers, coordinators and `pharos router`.** Set `backend: peer-pull`, the same `token`, and
+  `cluster.peers.discovery` (`dns:<fully qualified name>` or `seeds:<url>,…`); drop `objectStore`. Readers
+  need an `advertiseUrl` whose host resolves to the address they connect from, or is in the writers'
+  `allowHosts`. Run `pharos router` with a reader's config.
+- **TLS (optional).** A writer `cluster.tls.keystore` (password from `passwordEnv`) and a reader
+  `truststore`; seeds must then be `https://`, `dns:` discovery needs IP SANs, and peer fetch between readers
+  is off. On a TLS writer `./pharos` uses the plain loopback port `cluster.tls.localPort` (web port + 1).
+- **Size `cluster.peers.maxLongPolls`** (default 4096) to at least readers × shards per writer, and the
+  writer's open-files limit above it.
+- **Network.** The token travels in clear text between readers and to coordinators: run the cluster on a
+  network only its nodes reach (a Kubernetes `NetworkPolicy`, a private network).
+
 ## Upgrading to 1.9.0
 
 Index format: 1 (unchanged); no re-index. Single-node installs (`role: all`) and readers need nothing.

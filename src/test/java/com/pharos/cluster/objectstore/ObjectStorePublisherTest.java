@@ -678,6 +678,43 @@ class ObjectStorePublisherTest {
         assertThat(shardDir.resolve(com.pharos.graph.GraphViews.ARCADE_DIR)).doesNotExist();
     }
 
+    /**
+     * A writer graph with a damaged property dictionary (written before 1.10.0) is refused before
+     * anything is uploaded, so the damage never reaches readers or a restoring writer (the backstop);
+     * an index run, incremental included, turns full, builds a fresh graph generation and publishes.
+     */
+    @Test
+    void damagedGraphDictionaryIsRefusedUntilAFullRunRebuildsIt() throws Exception {
+        indexFull(manager(snapshot -> Optional.empty()));
+        Path shardDir = tmp.resolve("indexes").resolve(PROJECT);
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(shardDir);
+        try (Stream<Path> w = Files.walk(live)) {
+            for (Path p : w.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(p);
+        }
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(live);
+        ProjectMeta meta = ProjectRegistry.at(tmp.resolve("registry.json")).find(PROJECT).orElseThrow();
+
+        assertThatThrownBy(() -> publisher.publish(new LocalSnapshot(SHARD.value(), shardDir, meta, "none")))
+                .isInstanceOf(PublishException.class)
+                .hasMessageContaining("damaged property dictionary")
+                .hasMessageContaining("pharos index --full " + PROJECT);
+        assertThat(store.list("")).as("nothing uploaded").isEmpty();
+        ProjectIndexManager m = manager(publisher);
+        assertThat(m.fullRunReason(PROJECT)).contains("damaged property dictionary");
+
+        // a standalone incremental run turns into a full one, which rebuilds the graph and publishes
+        touchOneFileAndReindex(m);
+        assertThat(m.fullRunReason(PROJECT)).isNull();
+        Path rebuilt = com.pharos.graph.CallGraph.projectGraphDir(shardDir);
+        assertThat(rebuilt).isNotEqualTo(live);
+        assertThat(live).doesNotExist();
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(rebuilt)).isNull();
+        assertThat(store.get(layout.latestKey(SHARD))).isPresent();
+        try (com.pharos.graph.CallGraph g = com.pharos.graph.CallGraph.openExisting(rebuilt)) {
+            assertThat(g.methodCount()).isPositive();
+        }
+    }
+
     private static Set<String> listing(Path dir) throws IOException {
         try (Stream<Path> s = Files.list(dir)) {
             return s.map(p -> p.getFileName().toString())

@@ -269,19 +269,25 @@ class Node(p2.Reader):
         link = self.home / ".djl.ai"
         if not link.is_symlink():
             link.symlink_to(os.environ["GATE_MODELS"])
-        no_models = self.kind != "reference" and KEYWORD_ONLY
+        # GATE_NO_MODELS=1 (the Phase 5 gate's GATE_KEYWORD_ONLY): no node loads a model, the reference included
+        no_models = (self.kind != "reference" and KEYWORD_ONLY) or os.environ.get("GATE_NO_MODELS", "0") == "1"
         cfg = {} if no_models else {
             "embeddingProviders": [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
                                     "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}],
             "searchEmbeddingModel": os.environ["GATE_MODEL_ID"],
             # GATE_READER_CROSS_ENCODER=0: readers and the router skip the cross-encoder (it loads at
             # warm-up), for an elasticity-only run on a tight memory cap; the reference always has it.
-            "crossEncoderEnabled": self.kind == "reference"
-                                   or os.environ.get("GATE_READER_CROSS_ENCODER", "1") != "0",
+            # GATE_CROSS_ENCODER=0 (the Phase 5 router step): no node has it, the reference included.
+            "crossEncoderEnabled": os.environ.get("GATE_CROSS_ENCODER", "1") == "1"
+                                   and (self.kind == "reference"
+                                        or os.environ.get("GATE_READER_CROSS_ENCODER", "1") != "0"),
         }
         if no_models:  # GATE_ELASTICITY_KEYWORD_ONLY: no embedding model, no cross-encoder
             cfg["crossEncoderEnabled"] = False
-        if self.kind != "reference":
+        if self.kind != "reference" and p2.peer_mode():
+            cfg["cluster"] = p2.peer_cluster(self.name, self.port, self.cache_dir,
+                                             {"mode": "lazy", "shards": self.shards})
+        elif self.kind != "reference":
             cfg["cluster"] = {
                 "role": "reader", "backend": "object-store", "nodeId": "gate-" + self.name,
                 "pollIntervalSeconds": 10, "cacheDir": str(self.cache_dir),
