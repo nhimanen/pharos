@@ -38,6 +38,26 @@ public final class DamagedGraphFixture {
     }
 
     /**
+     * Cuts the dictionary of the (closed) database at {@code dbDir} back to its header-only page:
+     * what the race leaves on disk before an ArcadeDB open refills the names in another order.
+     */
+    public static void cutDictionaryToHeader(Path dbDir) throws IOException {
+        Path dict;
+        try (var s = Files.list(dbDir)) {
+            dict = s.filter(p -> p.getFileName().toString().matches("dictionary\\..*\\.dict")).findFirst().orElseThrow();
+        }
+        try (var ch = java.nio.channels.FileChannel.open(dict, java.nio.file.StandardOpenOption.READ,
+                java.nio.file.StandardOpenOption.WRITE)) {
+            java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(8);
+            ch.read(head, 0);
+            int used = head.getInt(4);
+            // used size = page header (8) + the 4-byte legacy counter; the names are zeroed
+            ch.write(java.nio.ByteBuffer.allocate(4).putInt(0, 12), 4);
+            ch.write(java.nio.ByteBuffer.allocate(used - 12), 12);
+        }
+    }
+
+    /**
      * Creates an empty ArcadeDB database at {@code dbDir} whose dictionary holds {@code names} in
      * this order, as a stale dictionary re-filled in another order would.
      */

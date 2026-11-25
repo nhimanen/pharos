@@ -192,11 +192,32 @@ public class CallGraph implements GraphView {
     public static String dictionaryProblem(Path dbDir) {
         try {
             Map<String, Integer> ids = readDictionary(dbDir);
-            return ids == null ? null : dictionaryProblem(ids, DICTIONARY_ORDER);
+            if (ids == null) return null;
+            // The race's raw state on disk is the header-only page: the names come back, out of
+            // order, only on the next ArcadeDB open. Every open adds each property the schema
+            // declares, so a declared name missing from the file is that state, never a healthy one.
+            List<String> missing = new ArrayList<>();
+            for (String name : declaredProperties(dbDir)) if (!ids.containsKey(name)) missing.add(name);
+            if (!missing.isEmpty()) {
+                return "damaged property dictionary (no " + String.join(", ", missing)
+                        + ", which the schema declares)";
+            }
+            return dictionaryProblem(ids, DICTIONARY_ORDER);
         } catch (java.io.IOException | RuntimeException e) {
             log.debug("Could not read the dictionary of {}: {}", dbDir, e.getMessage());
             return null;
         }
+    }
+
+    /** The property names {@code schema.json} declares on any type, in file order. */
+    static Set<String> declaredProperties(Path dbDir) throws java.io.IOException {
+        Path schema = dbDir.resolve("schema.json");
+        Set<String> names = new LinkedHashSet<>();
+        if (!Files.isRegularFile(schema)) return names;
+        com.fasterxml.jackson.databind.JsonNode types =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(schema.toFile()).path("types");
+        types.forEach(t -> t.path("properties").fieldNames().forEachRemaining(names::add));
+        return names;
     }
 
     private static final java.util.regex.Pattern DICTIONARY_FILE =

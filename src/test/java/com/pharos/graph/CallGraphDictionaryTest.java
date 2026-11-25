@@ -104,6 +104,31 @@ class CallGraphDictionaryTest {
         }
     }
 
+    /**
+     * The race's raw on-disk state, the header-only dictionary page (names refilled out of order
+     * only by the next open), is damage too: the schema declares names the file lacks.
+     */
+    @Test
+    void headerOnlyDictionaryIsDamage() throws Exception {
+        Path sample = tmp.resolve("sample-app").resolve("callgraph.arcadedb");
+        DamagedGraphFixture.unpackCallGraph(sample);
+        DamagedGraphFixture.cutDictionaryToHeader(sample);
+        Path fresh = tmp.resolve("p").resolve("callgraph-1.arcadedb");
+        try (CallGraph g = CallGraph.open(fresh)) {
+            g.addMethod("p.A#run()", "p.A");
+        }
+        assertThat(CallGraph.dictionaryProblem(fresh)).as("healthy before the cut").isNull();
+        DamagedGraphFixture.cutDictionaryToHeader(fresh);
+        for (Path dir : List.of(sample, fresh)) {
+            assertThat(CallGraph.readDictionary(dir)).as(dir.toString()).isEmpty();
+            assertThat(CallGraph.dictionaryProblem(dir)).as(dir.toString())
+                    .contains("damaged property dictionary (no ").contains("fqn").contains("which the schema declares");
+        }
+        // unreadable schema: fail-safe, no claim of damage
+        Files.writeString(fresh.resolve("schema.json"), "{not json");
+        assertThat(CallGraph.dictionaryProblem(fresh)).isNull();
+    }
+
     /** The file reader used without opening a database agrees with ArcadeDB's own dictionary. */
     @Test
     void dictionaryFileReaderMatchesArcadeDb() throws Exception {
