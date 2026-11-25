@@ -67,9 +67,17 @@ QPS_TARGET = 8
 ADD_READERS_WINDOW = 60
 MIN_FREE_FLOOR = 8 << 30   # the gate never lets / go below this
 SHARDS = ["alpha", "pharos", "beta", "lucene"]
-PORTS = {"router": 7080, "r1": 7401, "r2": 7402, "w1": 7411, "w2": 7412, "w3": 7413, "w4": 7414, "w5": 7415,
-         "w6": 7416, "wlow": 7417}
-WEBHOOK_PORT = 7390
+_DEFAULT_PORTS = {"router": 7080, "r1": 7401, "r2": 7402, "w1": 7411, "w2": 7412, "w3": 7413, "w4": 7414,
+                  "w5": 7415, "w6": 7416, "wlow": 7417}
+# GATE_<NAME>_PORT overrides (cluster-gate-phase4.sh exports them); the defaults are unchanged
+PORTS = {n: int(os.environ.get(f"GATE_{n.upper()}_PORT", p)) for n, p in _DEFAULT_PORTS.items()}
+WEBHOOK_PORT = int(os.environ.get("GATE_WEBHOOK_PORT", 7390))
+MINIO_PORT = int(os.environ.get("GATE_MINIO_PORT", 9000))
+# GATE_KEYWORD_ONLY=1: no node has an embedding provider (pharos was bootstrapped --no-embed too), and K2
+# kills the GATE_K2_SHARD holder in GATE_K2_PHASE ("any": the first indexing phase its heartbeat shows)
+KEYWORD_ONLY = os.environ.get("GATE_KEYWORD_ONLY", "0") == "1"
+K2_SHARD = os.environ.get("GATE_K2_SHARD", "lucene" if KEYWORD_ONLY else "pharos")
+K2_PHASE = os.environ.get("GATE_K2_PHASE", "any" if KEYWORD_ONLY else "embed")
 GIB = 1 << 30
 MIB = 1 << 20
 
@@ -117,8 +125,8 @@ def pct(values, p):
 
 
 class S3:
-    def __init__(self, endpoint="127.0.0.1:9000", bucket="pharos-gate", prefix="pharos/"):
-        self.host, self.bucket, self.prefix = endpoint, bucket, prefix
+    def __init__(self, endpoint=None, bucket="pharos-gate", prefix="pharos/"):
+        self.host, self.bucket, self.prefix = endpoint or f"127.0.0.1:{MINIO_PORT}", bucket, prefix
         self.ak = os.environ["PHAROS_GATE_ACCESS_KEY"]
         self.sk = os.environ["PHAROS_GATE_SECRET_KEY"]
 
@@ -198,7 +206,7 @@ class S3:
 
 
 def object_store_cfg():
-    return {"endpoint": "http://127.0.0.1:9000", "region": "us-east-1", "bucket": "pharos-gate", "prefix": "pharos",
+    return {"endpoint": f"http://127.0.0.1:{MINIO_PORT}", "region": "us-east-1", "bucket": "pharos-gate", "prefix": "pharos",
             "pathStyle": True, "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"}
 
 
@@ -236,11 +244,13 @@ class Node:
             disk.update(self.disk or {})
             cluster["writer"] = {"workQueue": True, "workDir": str(self.home / "work"), "pollSeconds": POLL,
                                  "leaseTtlSeconds": TTL, "minHoldSeconds": MIN_HOLD, "disk": disk}
-            cfg["embeddingProviders"] = [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
-                                          "url": os.environ["GATE_MODEL_URL"], "dimensions": 768, "maxTokens": 512}]
-            # a normal writer config: the web start of a writer skips the search-model warm-up (the
-            # driver records each writer's RSS before its first embed to show jina is not loaded)
-            cfg["searchEmbeddingModel"] = os.environ["GATE_MODEL_ID"]
+            if not KEYWORD_ONLY:
+                cfg["embeddingProviders"] = [{"type": "djl", "modelId": os.environ["GATE_MODEL_ID"],
+                                              "url": os.environ["GATE_MODEL_URL"], "dimensions": 768,
+                                              "maxTokens": 512}]
+                # a normal writer config: the web start of a writer skips the search-model warm-up (the
+                # driver records each writer's RSS before its first embed to show jina is not loaded)
+                cfg["searchEmbeddingModel"] = os.environ["GATE_MODEL_ID"]
         else:
             cluster["role"] = "reader"
             cluster["advertiseUrl"] = self.base
@@ -688,9 +698,9 @@ def change_files(shard):
     return _FILES[shard]
 
 
-def k2_files():
-    edit = gate_dir() / "edit" / "pharos"
-    fs = sorted(edit.glob("src/main/java/**/*.java"))
+def k2_files(shard="pharos"):
+    edit = gate_dir() / "edit" / shard
+    fs = sorted(edit.glob("src/main/java/**/*.java" if shard == "pharos" else "**/*.java"))
     return [str(p.relative_to(edit)) for p in fs[-40:]]
 
 
@@ -947,35 +957,41 @@ def phase_failover():
     wait_until(all_published, 1500, "all shards published after K1", step=2)
     out["k1"]["all_current_after_s"] = round(now() - t_k1, 1)
     out["valid_after_k1"] = {s: check_generation(MON.s3, s) for s in SHARDS}
-    # K2: the pharos holder while it embeds a 40-file change. First a small change, so the holder has a
-    # local index (a takeover owner that had nothing to publish has none) and the K2 run is incremental.
-    w = MON.push_change("pharos", 8999)
-    wait_until(lambda: shard_revision("pharos") == w["sha"], 900, "the pharos warm-up change published", step=1)
+    # K2: the K2_SHARD holder (default pharos, while it embeds) on a 40-file change. First a small change,
+    # so the holder has a local index (a takeover owner that had nothing to publish has none) and the K2
+    # run is incremental.
+    k2s = K2_SHARD
+    w = MON.push_change(k2s, 8999)
+    wait_until(lambda: shard_revision(k2s) == w["sha"], 900, f"the {k2s} warm-up change published", step=1)
     wait_until(all_published, 600, "all shards current before K2", step=2)
-    holder_id = lease_holder("pharos")
+    holder_id = lease_holder(k2s)
     victim = next(n for n in writers_alive() if n.node_id == holder_id)
     other = [n for n in writers_alive() if n is not victim]
-    c = MON.push_change("pharos", 9000, kind="method", files=k2_files())
-    log(f"K2: pushed a pharos change of {len(c['files'])} files ({c['sha'][:10]}); holder {victim.name}")
+    c = MON.push_change(k2s, 9000, kind="method", files=k2_files(k2s))
+    log(f"K2: pushed a {k2s} change of {len(c['files'])} files ({c['sha'][:10]}); holder {victim.name};"
+        f" killing it in phase {K2_PHASE}")
     seen2 = []
 
-    def pharos_embed():
+    def k2_phase():
         hb = hb_of(victim.node_id) or {}
         ix = hb.get("indexing") or {}
         key = (ix.get("shard"), ix.get("phase"))
         if not seen2 or tuple(seen2[-1][1:]) != key:
             seen2.append((rel(now()), *key))
-        if shard_revision("pharos") == c["sha"]:
-            raise RuntimeError("the pharos change was published before its embed phase was seen")
-        return ix if ix.get("shard") == "pharos" and ix.get("phase") == "embed" else None
-    ix2 = wait_until(pharos_embed, 600, f"{victim.name} embedding pharos", step=0.2)
+        if shard_revision(k2s) == c["sha"]:
+            raise RuntimeError(f"the {k2s} change was published before its {K2_PHASE} phase was seen")
+        if ix.get("shard") != k2s or not ix.get("phase"):
+            return None
+        return ix if K2_PHASE == "any" or ix.get("phase") == K2_PHASE else None
+    ix2 = wait_until(k2_phase, 600, f"{victim.name} indexing {k2s} ({K2_PHASE})", step=0.2)
     log(f"{victim.name} indexing {ix2}; killing it")
     t_k2 = victim.kill9()
-    out["k2_change"] = {"sha": c["sha"], "files": len(c["files"])}
+    out["k2_change"] = {"shard": k2s, "phase": K2_PHASE, "keyword_only": KEYWORD_ONLY, "sha": c["sha"],
+                        "files": len(c["files"])}
     out["k2_phases_seen"] = seen2
     out["k2_indexing_at_kill"] = ix2
-    out["k2"] = takeover(victim, "pharos", t_k2, len(c["files"]), other)
-    out["k2"]["published_revision_is_change"] = shard_revision("pharos") == c["sha"]
+    out["k2"] = takeover(victim, k2s, t_k2, len(c["files"]), other)
+    out["k2"]["published_revision_is_change"] = shard_revision(k2s) == c["sha"]
     wait_until(all_published, 1500, "all shards published after K2", step=2)
     out["k2"]["all_current_after_s"] = round(now() - t_k2, 1)
     out["pass"] = out["k1"]["pass"] and out["k2"]["pass"]
@@ -1394,6 +1410,8 @@ def main():
     if args.dry_run:
         print(f"driver (dry run): phases {phases}; heartbeat {HB}s, writer poll {POLL}s, lease TTL {TTL}s, min hold"
               f" {MIN_HOLD}s; load {BASE_QPS} QPS keyword (proposals {HIGH_QPS}); a change every {CHANGE_EVERY}s")
+        print(f"driver (dry run): ports {PORTS}, webhook {WEBHOOK_PORT}, MinIO {MINIO_PORT}; keyword only"
+              f" {KEYWORD_ONLY}; K2 kills the {K2_SHARD} holder in phase {K2_PHASE}")
         return 0
     if not phases:
         print("driver: no phases")

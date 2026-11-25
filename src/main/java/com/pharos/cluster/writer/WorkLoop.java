@@ -20,6 +20,7 @@ import com.pharos.indexer.IndexAbortedException;
 import com.pharos.indexer.LuceneIndexer;
 import com.pharos.indexer.ProgressListener;
 import com.pharos.indexer.ProjectIndexManager;
+import com.pharos.cluster.BoundedCall;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -117,10 +118,18 @@ import java.util.concurrent.locks.ReentrantLock;
  * checks run per shard, in parallel, under a per-shard lock: an unreachable remote (its
  * {@code ls-remote} killed after {@code lsRemoteTimeoutSeconds}) stalls only its own shard.
  *
+ * <p><b>Lost lease</b>: when the renewer (or the publish check) sees the lease of the shard being
+ * run definitely lost (taken over, or gone), the run is aborted at its next safe point
+ * ({@link #leaseLost}): its publish could only fail the lease check. A renewal that merely failed
+ * (an I/O error or its deadline) does not abort it.
+ *
  * <p><b>Graceful stop</b> ({@link #stop}): no new run starts; a run in progress gets until the
  * budget minus a reserve to finish, then is aborted at a safe point ({@link IndexAbort}; a run past
  * its commit finishes, publish included); then every lease is released (before the lease manager is
- * closed, after which a release can no longer write) and the heartbeat is deleted.
+ * closed, after which a release can no longer write) and the heartbeat is deleted. The stop returns
+ * within the budget plus {@link #DEFAULT_SHUTDOWN_CLEANUP} whatever the bucket does: every store
+ * call on the way (the stopping heartbeat, the releases, the heartbeat delete) has a deadline, and
+ * one that passes it is given up with a WARN (its lease or heartbeat then expires after the TTL).
  */
 public final class WorkLoop implements Closeable {
 
@@ -308,6 +317,15 @@ public final class WorkLoop implements Closeable {
     private ScheduledExecutorService scheduler;
 
     /**
+     * How long a stop may spend on the bucket after its budget: releasing the leases, closing the
+     * lease manager and deleting the heartbeat. A stop ends within {@code cluster.drainSeconds} plus
+     * this (20 + 10 s by default), well inside the operator's pod grace of drainSeconds + 30 s, which
+     * also covers the model-call drain and the JVM exit after it.
+     */
+    public static final Duration DEFAULT_SHUTDOWN_CLEANUP = Duration.ofSeconds(10);
+    private volatile Duration shutdownCleanup = DEFAULT_SHUTDOWN_CLEANUP;
+
+    /**
      * @param clock this writer's clock: {@code minHold}, backlog ages and run start times. Lease and
      *              liveness expiry use the bucket's clock only.
      */
@@ -341,6 +359,33 @@ public final class WorkLoop implements Closeable {
                 this::heartbeat);
         // The heartbeat is the bucket's "now" for lease expiry: without it no expired lease is taken over.
         this.leases = new LeaseManager(store, layout, settings.node(), settings.leaseTtl(), members::bucketNow, clock);
+        this.leases.onLost(this::leaseLost);
+    }
+
+    /**
+     * A held lease was seen lost (renewer thread, or the publish check). A definite loss (another
+     * writer took it, or it is gone) aborts the run of that shard at its next safe point instead of
+     * parsing, embedding and committing for nothing. An ambiguous one (a renewal's I/O error or
+     * deadline on a slow bucket) does not: the lease is often still ours and reclaimed on the next
+     * tick, and aborting would make the next run full again; the run commits locally, its publish
+     * re-checks the lease, and the next (incremental) run publishes. A run past its commit finishes;
+     * its publish fails the lease check.
+     */
+    private void leaseLost(LeaseManager.Lost lost) {
+        Run r = current;
+        if (r == null || !r.shard.equals(lost.shard())) return;
+        if (!lost.definite()) {
+            log.info("Shard {}: writer {} could not confirm its lease ({}); the run goes on, its publish re-checks"
+                    + " the lease", lost.shard(), settings.node(), lost.why());
+            return;
+        }
+        if (r.abort.request("writer " + settings.node() + " lost the lease of shard " + lost.shard())) {
+            log.warn("Shard {}: writer {} lost its lease ({}); aborting the run at its next safe point (nothing is"
+                    + " committed, the new owner indexes it)", lost.shard(), settings.node(), lost.why());
+        } else {
+            log.info("Shard {}: writer {} lost its lease after the run's commit; its publish fails the lease check",
+                    lost.shard(), settings.node());
+        }
     }
 
     /** Starts the heartbeat, the lease renewer and the polling loop (daemon threads). */
@@ -1719,10 +1764,13 @@ public final class WorkLoop implements Closeable {
     // ------------------------------------------------------------------------------- stop
 
     /**
-     * Graceful stop within {@code budget} ({@code cluster.drainSeconds}): no new run starts; a run in
-     * progress may finish until the budget minus a reserve (a quarter, at least 1 s), then is aborted
-     * at a safe point (a run past its commit finishes its publish); then all leases are released
-     * (before the lease manager closes) and the heartbeat is deleted. Idempotent.
+     * Graceful stop within {@code budget} ({@code cluster.drainSeconds}) plus the cleanup bound
+     * ({@link #DEFAULT_SHUTDOWN_CLEANUP}): no new run starts; the stopping heartbeat is written
+     * (given up after the lease manager's per-call deadline, at most the budget); a run in progress
+     * may finish until the budget minus a reserve (a quarter, at least 1 s), then is aborted at a safe
+     * point (a run past its commit finishes its publish); then all leases are released (before the
+     * lease manager closes) and the heartbeat is deleted, each given up at the cleanup bound. A tick
+     * that is only waiting on the bucket (no run, no restore) is not waited for. Idempotent.
      */
     public void stop(Duration budget) {
         ScheduledExecutorService s;
@@ -1742,9 +1790,15 @@ public final class WorkLoop implements Closeable {
         long start = System.nanoTime();
         long total = Math.max(0, budget.toNanos());
         long reserve = Math.min(total, Math.max(TimeUnit.SECONDS.toNanos(1), total / 4));
-        members.beat(); // announce stopping: peers stop counting this writer
+        long end = start + total;
+        long cleanupEnd = end + Math.max(0, shutdownCleanup.toNanos());
+        log.info("Writer {} stopping: drain {} s, then at most {} s for releasing leases and the heartbeat",
+                settings.node(), budget.toSeconds(), shutdownCleanup.toSeconds());
+        // announce stopping (peers stop counting this writer); a slow bucket must not eat the drain
+        Duration announce = BoundedCall.min(settings.leaseTtl().dividedBy(6), budget);
+        if (!announce.isZero() && !announce.isNegative()) members.announce(announce);
         if (s != null) s.shutdown(); // no interrupt: a run is stopped by its abort, never mid-I/O
-        boolean idle = awaitIdle(total - reserve);
+        boolean idle = awaitIdle(end - reserve - System.nanoTime());
         if (!idle) {
             Run r = current;
             if (r != null) {
@@ -1754,31 +1808,52 @@ public final class WorkLoop implements Closeable {
                     log.info("Stopping: the run of shard {} is past its commit; letting it publish", r.shard);
                 }
             }
-            idle = awaitIdle(total - (System.nanoTime() - start));
+            idle = awaitIdle(end - System.nanoTime());
         }
         if (!idle) {
-            log.warn("Stopping with a run still in progress after {} s; releasing its lease (its publish will fail"
-                    + " the lease check)", budget.toSeconds());
+            Run r = current;
+            log.warn("Stopping with {} still in progress after {} s; releasing its lease (a publish fails the lease"
+                    + " check)", r != null ? "the run of shard " + r.shard : "a tick", budget.toSeconds());
         }
-        for (Lease l : leases.held()) leases.release(l); // before close: after it a release cannot write
+        // before close: after it a release cannot write. Half the cleanup, the rest for the heartbeat.
+        long releaseEnd = System.nanoTime() + (cleanupEnd - System.nanoTime()) / 2;
         com.pharos.cluster.sharding.ReshardJob job = reshard;
+        // with a reshard job, its leases get the second half of the release window (the work leases
+        // finish early when the bucket answers, leaving the rest to the reshard leases)
+        long workReleaseEnd = job == null ? releaseEnd : System.nanoTime() + (releaseEnd - System.nanoTime()) / 2;
+        leases.releaseAll(BoundedCall.until(workReleaseEnd));
         if (job != null) {
-            for (Lease l : job.leases().held()) job.leases().release(l);
-            job.leases().close();
+            job.leases().releaseAll(BoundedCall.until(releaseEnd));
+            job.leases().close(BoundedCall.min(Duration.ofSeconds(1), BoundedCall.until(cleanupEnd)));
         }
         shards.clear();
-        leases.close();
-        members.close();
-        log.info("Writer {} stopped: leases released, heartbeat removed", settings.node());
+        leases.close(BoundedCall.min(Duration.ofSeconds(1), BoundedCall.until(cleanupEnd)));
+        members.close(BoundedCall.until(cleanupEnd));
+        log.info("Writer {} stopped in {} ms", settings.node(), (System.nanoTime() - start) / 1_000_000);
     }
 
+    /** Visible for tests: the cleanup bound of {@link #stop}. */
+    void shutdownCleanup(Duration d) {
+        shutdownCleanup = Objects.requireNonNull(d, "d");
+    }
+
+    /**
+     * Waits until no tick runs, or until the tick in progress has nothing to drain: no run and no
+     * shard being restored, only bucket or source I/O (which may hang on a slow store). False when
+     * {@code nanos} passed first.
+     */
     private boolean awaitIdle(long nanos) {
+        long deadline = System.nanoTime() + Math.max(0, nanos);
         try {
-            if (tickLock.tryLock(Math.max(0, nanos), TimeUnit.NANOSECONDS)) {
-                tickLock.unlock();
-                return true;
+            while (true) {
+                long slice = Math.min(TimeUnit.MILLISECONDS.toNanos(25), Math.max(0, deadline - System.nanoTime()));
+                if (tickLock.tryLock(slice, TimeUnit.NANOSECONDS)) {
+                    tickLock.unlock();
+                    return true;
+                }
+                if (current == null && busy == null) return true; // nothing to drain
+                if (System.nanoTime() >= deadline) return false;
             }
-            return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;

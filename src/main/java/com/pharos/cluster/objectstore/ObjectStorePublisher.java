@@ -342,6 +342,15 @@ public final class ObjectStorePublisher implements IndexPublisher {
                     + IndexFormat.read(shardDir).format() + " (" + status.wireName() + "), this pharos publishes "
                     + com.pharos.indexer.IndexVersions.INDEX_FORMAT + "; re-index the project (pharos index --full)");
         }
+        // Before anything is uploaded: a graph whose records decode with the wrong property names
+        // must not reach the readers, nor a writer that restores this generation.
+        Path arcade = CallGraph.projectGraphDir(shardDir);
+        String damage = Files.isDirectory(arcade) ? CallGraph.dictionaryProblem(arcade) : null;
+        if (damage != null) {
+            throw new PublishException("cannot publish shard " + shard + ": its call graph has a " + damage
+                    + ", written by pharos before 1.10.0; re-index the project (pharos index --full "
+                    + shard + ")");
+        }
     }
 
     /** The shard's index-format.json as written by the index run; null when it has none (format 0). */

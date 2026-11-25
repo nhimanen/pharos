@@ -113,6 +113,47 @@ class ReaderRegistryTest {
                 .hasSize(1);
     }
 
+    /**
+     * The reader twin of the 1.9.0 gate's writer stop hang (also in 1.8.1): a tick stuck on a hung
+     * bucket holds the registry lock across its S3 calls, and the SIGTERM drain's draining heartbeat
+     * and close's heartbeat delete waited on that lock with no deadline. Both now give up in time.
+     */
+    @Test
+    void drainAndCloseGiveUpOnAHungBucket() throws Exception {
+        com.pharos.cluster.objectstore.StallingObjectStore stalling =
+                new com.pharos.cluster.objectstore.StallingObjectStore(bucketClock);
+        ClusterConfig c = cfg("a", List.of());
+        ReaderRegistry a = new ReaderRegistry(stalling, layout, c, () -> new ReaderHeartbeat("a", c.getAdvertiseUrl(),
+                List.of("p1"), false, Map.of("mode", "lazy"), 0, 0, 0L));
+        a.tick();
+        stalling.stallOn("catalog/readers/");
+        Thread tick = new Thread(a::tick, "test-tick"); // the heartbeat thread, stuck mid-tick
+        tick.setDaemon(true);
+        tick.start();
+        assertThat(stalling.awaitStalled(1, 10)).isTrue();
+        try {
+            long[] took = {-1};
+            Thread stopper = new Thread(() -> {
+                long t0 = System.nanoTime();
+                a.drain(java.time.Duration.ofMillis(300));
+                a.close(java.time.Duration.ofMillis(500));
+                took[0] = (System.nanoTime() - t0) / 1_000_000;
+            }, "test-stop");
+            stopper.setDaemon(true);
+            stopper.start();
+            stopper.join(10_000);
+            assertThat(stopper.isAlive()).as("drain and close returned").isFalse();
+            assertThat(took[0]).isLessThan(2_000);
+
+            stalling.release(); // the stuck put lands after the close: the tick deletes it again
+            tick.join(10_000);
+            assertThat(tick.isAlive()).isFalse();
+            assertThat(stalling.get("pharos/catalog/readers/a.json")).isEmpty();
+        } finally {
+            stalling.release();
+        }
+    }
+
     @Test
     void closeRemovesHeartbeat() throws Exception {
         ReaderRegistry a = registry("a", List.of("p1"));

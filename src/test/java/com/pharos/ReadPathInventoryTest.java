@@ -76,7 +76,11 @@ class ReadPathInventoryTest {
         assertThat(files("DirectoryReader.open(")).containsExactlyInAnyOrder(
                 "indexer/LuceneIndexer.java",
                 "indexer/ProjectIndexManager.java", // writer: reshard build lists each local shard's files
-                "indexer/ShardedWriter.java");      // writer: a reshard applies its deletes (NRT) to expunge them
+                "indexer/ShardedWriter.java",       // writer: a reshard applies its deletes (NRT) to expunge them
+                // 1.5.0: one-shot "does this dir hold live vectors" probe on a directory the caller
+                // resolved (index-status / embeddings status / upgrade-indexes hints, and the writer's
+                // legacy-vector re-index check); never on the search serving path
+                "indexer/LegacyVectorFields.java");
         // LuceneIndexer opens directories through LuceneDirectoryFactory (DEFAULT = FSDirectory.open,
         // or NIOFSDirectory under the -Dpharos.diag.luceneDirectory=niofs diagnostics hook).
         assertThat(files("FSDirectory::open")).isEmpty();

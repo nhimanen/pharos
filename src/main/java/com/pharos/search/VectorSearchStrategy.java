@@ -62,19 +62,42 @@ public class VectorSearchStrategy {
     }
 
     public List<SearchResult> search(IndexReader reader, SearchRequest req) throws IOException {
-        return CandidateShaper.shape(retrieveRaw(searcherFactory.newSearcher(reader, null), req), TYPE, null);
+        return search(reader, req, null);
+    }
+
+    /** Embeds the query and runs {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])}; a failed
+     *  embedding yields no results and, with a trace, a warning. */
+    public List<SearchResult> search(IndexReader reader, SearchRequest req,
+                                     SearchTrace trace) throws IOException {
+        return CandidateShaper.shape(retrieveRaw(searcherFactory.newSearcher(reader, null), req, trace), TYPE, null);
     }
 
     /** {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])} with the query embedded here. */
     public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req) throws IOException {
+        return retrieveRaw(searcher, req, (SearchTrace) null);
+    }
+
+    /** {@link #retrieveRaw(IndexSearcher, SearchRequest, float[])} with the query embedded here; a failed
+     *  embedding yields no candidates and, with a trace, a warning. */
+    public List<RawCandidate> retrieveRaw(IndexSearcher searcher, SearchRequest req, SearchTrace trace)
+            throws IOException {
         if (!embedder.isAvailable()) {
             log.warn("Vector search requested but no embedding provider configured.");
             return List.of();
         }
 
-        float[] queryVector = embedder.embed(req.query());
+        float[] queryVector;
+        try {
+            queryVector = embedder.embedQuery(req.query());
+        } catch (com.pharos.embedding.EmbeddingException e) {
+            queryVector = null;   // already logged at WARN by the provider
+            if (trace != null) {
+                trace.addWarning("vector embedding failed for model " + embedder.modelId() + "; "
+                        + (req.type() == SearchRequest.SearchType.VECTOR
+                                ? "no vector results" : "results are keyword-only"));
+            }
+        }
         if (queryVector == null) {
-            log.warn("Embedding returned null for query: {}", req.query());
             return List.of();
         }
 

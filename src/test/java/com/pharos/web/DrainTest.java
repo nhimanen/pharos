@@ -179,6 +179,46 @@ class DrainTest {
         }
     }
 
+    /**
+     * Review I2: the drain notice (at least 4 s in which coordinators and the router can see
+     * {@code draining}) is measured from when the draining heartbeat is out, not from the signal: a
+     * slow but working announce (3 s here) must not eat it.
+     */
+    @Test
+    void slowAnnounceStillLeavesTheFullNotice() throws Exception {
+        AtomicBoolean slow = new AtomicBoolean();
+        InMemoryObjectStore store = new InMemoryObjectStore() {
+            @Override
+            public String put(String key, byte[] data) {
+                if (slow.get() && key.endsWith("/r4.json")
+                        && new String(data, java.nio.charset.StandardCharsets.UTF_8).contains("\"draining\":true")) {
+                    try {
+                        Thread.sleep(3_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return super.put(key, data);
+            }
+        };
+        var reader = ClusterFixture.reader(tmp.resolve("r4"), store, "b", "r4", List.of(), c -> c.setDrainSeconds(20));
+        reader.runtime().setInFlight(() -> 0);
+        try {
+            reader.runtime().startServing(true);
+            await("first heartbeat", () -> heartbeat(store, "r4").isPresent());
+            slow.set(true);
+            CompletableFuture<Void> stop = CompletableFuture.runAsync(reader.runtime()::drainAndClose);
+            await("draining heartbeat", () -> heartbeat(store, "r4").map(ReaderHeartbeat::draining).orElse(false));
+            long visible = System.nanoTime();
+            stop.get(20, TimeUnit.SECONDS);
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - visible);
+            assertThat(millis).as("draining visible for the full notice before close").isGreaterThanOrEqualTo(3_800L);
+        } finally {
+            reader.runtime().close();
+            reader.lucene().close();
+        }
+    }
+
     /** Waiting in-flight work holds the stop, and the stop follows once it finishes (and the quiet period). */
     @Test
     void inFlightWorkHoldsTheStop() throws Exception {

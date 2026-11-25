@@ -27,7 +27,8 @@ import java.util.stream.Stream;
 /**
  * Reports each registered project's index format status. Strictly read-only: reads the registry
  * and the per-project format stamps, and sizes the index dirs by walking them. It opens no
- * Lucene writers or graphs, creates nothing and never starts a daemon.
+ * Lucene writers, opens each call graph read-only (to report a damaged property dictionary as
+ * {@code graphDamage}), creates nothing and never starts a daemon.
  */
 @Command(
         name = "index-status",
@@ -41,10 +42,12 @@ public class IndexStatusCommand implements Callable<Integer> {
 
     private final ProjectRegistry registry;
     private final NodeRole role;
+    private final boolean embeddingsConfigured;
     private final Supplier<Map<String, Object>> readerCache;
 
+    /** For callers that do not know the config: reports {@code needsReembed} as if embeddings were on. */
     public IndexStatusCommand(ProjectRegistry registry) {
-        this(registry, NodeRole.ALL);
+        this(registry, NodeRole.ALL, true);
     }
 
     /**
@@ -52,7 +55,7 @@ public class IndexStatusCommand implements Callable<Integer> {
      *             (setup.sh) do not advise {@code upgrade-indexes} on a reader, which refuses it
      */
     public IndexStatusCommand(ProjectRegistry registry, NodeRole role) {
-        this(registry, role, null);
+        this(registry, role, true, null);
     }
 
     /**
@@ -60,8 +63,26 @@ public class IndexStatusCommand implements Callable<Integer> {
      *                    reported as {@code readerCache}; null, or returning null, on anything but a lazy reader
      */
     public IndexStatusCommand(ProjectRegistry registry, NodeRole role, Supplier<Map<String, Object>> readerCache) {
+        this(registry, role, true, readerCache);
+    }
+
+    /**
+     * @param embeddingsConfigured whether an embedding provider is configured; without one, nothing
+     *                             re-embeds, so {@code needsReembed} is always false
+     */
+    public IndexStatusCommand(ProjectRegistry registry, boolean embeddingsConfigured) {
+        this(registry, NodeRole.ALL, embeddingsConfigured, null);
+    }
+
+    public IndexStatusCommand(ProjectRegistry registry, NodeRole role, boolean embeddingsConfigured) {
+        this(registry, role, embeddingsConfigured, null);
+    }
+
+    public IndexStatusCommand(ProjectRegistry registry, NodeRole role, boolean embeddingsConfigured,
+                              Supplier<Map<String, Object>> readerCache) {
         this.registry = registry;
         this.role = role;
+        this.embeddingsConfigured = embeddingsConfigured;
         this.readerCache = readerCache;
     }
 
@@ -81,7 +102,14 @@ public class IndexStatusCommand implements Callable<Integer> {
             r.put("rootPath", p.getRootPath());
             r.put("rootExists", p.getRootPath() != null && Files.isDirectory(Path.of(p.getRootPath())));
             r.put("indexBytes", sizeOf(dir));
+            // Status values stay as-is; this flag marks projects whose vectors pharos 1.4.0-1.4.1 stored
+            // under vec.legacy (never searched) and that the next 'pharos index' re-embeds.
+            r.put("needsReembed", embeddingsConfigured && dir != null && com.pharos.indexer.LegacyVectorFields
+                    .hasLiveMisnamedVectors(dir.resolve("lucene")));
             r.put("lastIndexed", p.getLastIndexed() == null ? null : p.getLastIndexed().toString());
+            // null, or why the writer graph's records decode wrongly (pre-1.10.0 dictionary race)
+            r.put("graphDamage", dir == null ? null
+                    : com.pharos.graph.CallGraph.dictionaryProblem(com.pharos.graph.CallGraph.projectGraphDir(dir)));
             rows.add(r);
         }
 
@@ -114,6 +142,17 @@ public class IndexStatusCommand implements Callable<Integer> {
                     humanBytes((Long) r.get("indexBytes")),
                     Boolean.TRUE.equals(r.get("rootExists")) ? "ok" : "gone",
                     r.get("lastIndexed") == null ? "never" : r.get("lastIndexed"));
+        }
+        for (Map<String, Object> r : rows) {
+            if (r.get("graphDamage") != null) {
+                System.out.printf("warning: %s: call graph has a %s; callers, callees and usages are wrong "
+                                + "(run: %s)%n", r.get("name"), r.get("graphDamage"),
+                        com.pharos.indexer.ReindexHint.fullIndexCommand((String) r.get("name"), (String) r.get("rootPath")));
+            }
+            if (Boolean.TRUE.equals(r.get("needsReembed"))) {
+                System.out.printf("note: %s: vectors need re-embed (run: %s)%n", r.get("name"),
+                        com.pharos.indexer.ReindexHint.fullIndexCommand((String) r.get("name"), (String) r.get("rootPath")));
+            }
         }
         return 0;
     }

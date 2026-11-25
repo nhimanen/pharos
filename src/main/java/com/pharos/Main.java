@@ -45,12 +45,19 @@ public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
 
     static void main(String[] args) {
+        optOutOfDjlTracking();
         if (ConfigCommand.handles(args)) {
             // `config validate <file>` checks a file: it must work when the node's own config is
             // broken, and it needs no backend, index or model
             System.exit(ConfigCommand.execute(args));
         }
-        IndexConfig config = IndexConfig.load();
+        IndexConfig config;
+        try {
+            config = IndexConfig.load();
+        } catch (RuntimeException e) {
+            System.exit(runWithInvalidConfig(args, e, IndexConfig.DEFAULT_BASE));
+            return;
+        }
 
         // Core components. Readers serve the registry their syncer fills from the object
         // store, and never read source files (bodies come from the index).
@@ -107,6 +114,29 @@ public class Main {
         // shutdown hook, which frees the native environment under any call still running.
         com.pharos.embedding.NativeInferenceGuard.beginShutdown();
         System.exit(com.pharos.embedding.NativeInferenceGuard.exitCode(exitCode));
+    }
+
+    /**
+     * config.json failed validation. {@code embeddings} only edits that file (and {@code status}
+     * reports the error itself), so it runs without the full wiring — otherwise a bad provider
+     * entry would lock the user out of {@code pharos embeddings disable}, the way to remove it.
+     * Every other command prints the error and how to fix the file.
+     */
+    static int runWithInvalidConfig(String[] args, RuntimeException error, java.nio.file.Path home) {
+        if (args.length > 0 && "embeddings".equals(args[0])) {
+            return new CommandLine(new EmbeddingsCommand(home, ProjectRegistry.at(home.resolve("registry.json"))))
+                    .execute(java.util.Arrays.copyOfRange(args, 1, args.length));
+        }
+        System.err.println("Invalid configuration in " + home.resolve("config.json") + ": " + error.getMessage());
+        System.err.println(EmbeddingsCommand.fixConfigHint(home));
+        return 1;
+    }
+
+    /** DJL telemetry otherwise calls the EC2 instance-metadata endpoint when a model loads. */
+    static void optOutOfDjlTracking() {
+        if (System.getProperty("OPT_OUT_TRACKING") == null && System.getenv("OPT_OUT_TRACKING") == null) {
+            System.setProperty("OPT_OUT_TRACKING", "true");
+        }
     }
 
     private static CrossEncoder buildCrossEncoder(IndexConfig config) {
@@ -208,9 +238,11 @@ public class Main {
                         new com.pharos.indexer.EmbeddingCacheBackfiller(config, luceneIndexer, registry), config);
             if (cls == IndexStatusCommand.class)
                 return (K) new IndexStatusCommand(registry, config.getCluster().getRole(),
-                        clusterRuntime::readerCacheStats);
+                        !config.getEmbeddingProviders().isEmpty(), clusterRuntime::readerCacheStats);
             if (cls == UpgradeIndexesCommand.class)
                 return (K) new UpgradeIndexesCommand(indexManager, registry, config, clusterRuntime);
+            if (cls == EmbeddingsCommand.class)
+                return (K) new EmbeddingsCommand(IndexConfig.DEFAULT_BASE, registry);
             if (cls == MineCommand.class)
                 return (K) new MineCommand(registry, luceneIndexer, config);
             if (cls == EmbedCommand.class)

@@ -103,6 +103,27 @@ class UpgradeIndexesCommandTest {
         return new CommandLine(c).execute(args);
     }
 
+    /** A current index whose call graph has a damaged dictionary (pre-1.10.0) is planned and rebuilt. */
+    @Test
+    void damagedGraphOfACurrentIndexIsReindexed() throws Exception {
+        indexProject("a", false);
+        indexProject("d", false);
+        Path live = com.pharos.graph.CallGraph.projectGraphDir(dir("d"));
+        deleteRecursively(live);
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(live);
+        var aStamp = IndexFormat.read(dir("a")).writtenAt();
+
+        assertThat(run(cmd(), "--dry-run")).isZero();
+        assertThat(out.toString()).contains("d: call graph has a damaged property dictionary")
+                .contains("[damaged-graph]");
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(live)).isNotNull();
+
+        assertThat(run(cmd(), "--yes")).isZero();
+        Path rebuilt = com.pharos.graph.CallGraph.projectGraphDir(dir("d"));
+        assertThat(com.pharos.graph.CallGraph.dictionaryProblem(rebuilt)).isNull();
+        assertThat(IndexFormat.read(dir("a")).writtenAt()).as("healthy project untouched").isEqualTo(aStamp);
+    }
+
     @Test
     void dryRunChangesNothing() throws Exception {
         indexProject("a", false);
@@ -132,7 +153,7 @@ class UpgradeIndexesCommandTest {
         deleteRecursively(rootB);
         int rc = run(cmd(), "--yes");
         assertThat(rc).isEqualTo(1);
-        assertThat(out.toString()).contains("re-index manually: pharos index --full b");
+        assertThat(out.toString()).contains("re-index manually: pharos index --full --single --project b <root path>");
         assertThat(IndexFormat.status(dir("c"))).isEqualTo(IndexFormat.Status.OK);
         assertThat(IndexFormat.status(dir("b"))).isEqualTo(IndexFormat.Status.UPGRADE_AVAILABLE);
     }
@@ -394,5 +415,25 @@ class UpgradeIndexesCommandTest {
         Files.delete(dir("n").resolve("index-format.json")); // format 0: N-1 or older
         int expected = IndexFormat.servable(IndexFormat.statusOf(0)) ? 0 : 3;
         assertThat(run(cmd(), "--check")).isEqualTo(expected);
+    }
+
+    @Test
+    void listsLegacyVectorProjectsWithTheirIndexCommandButDoesNotRunThem() throws Exception {
+        config.setEmbeddingProviders(List.of(IndexConfig.presetProvider("jina-v2-code")));
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        int rc = run(cmd(), "--yes");
+        assertThat(rc).as("exit codes unchanged: nothing to upgrade").isZero();
+        assertThat(out.toString())
+                .contains("pharos index --full --single --project mis " + tmp.resolve("src-mis"))
+                .contains("does not migrate");
+        assertThat(com.pharos.indexer.LegacyVectorFields.hasLiveMisnamedVectors(
+                tmp.resolve("indexes").resolve("mis").resolve("lucene"))).as("not run").isTrue();
+    }
+
+    @Test
+    void legacyVectorProjectsNotListedWithoutEmbeddings() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(run(cmd(), "--yes")).isZero();
+        assertThat(out.toString()).doesNotContain("--project mis");
     }
 }

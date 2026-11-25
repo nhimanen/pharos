@@ -715,7 +715,7 @@ public class DocumentMapper {
      *
      * <p>Examples:
      * <pre>
-     *   "jina-code-v2"                      → "vec.jina-code-v2"
+     *   "jina-v2-code"                      → "vec.jina-v2-code"
      *   "Qwen/Qwen3-Embedding-4B@1024"      → "vec.qwen_qwen3-embedding-4b_1024"
      * </pre>
      */
@@ -762,7 +762,7 @@ public class DocumentMapper {
     // Each new overload delegates to the corresponding legacy overload with a
     // null embedding (which suppresses the legacy F_VECTOR_LEGACY field), then
     // attaches one KnnFloatVectorField per (modelId, vector) entry under the
-    // per-model field name from vectorFieldName(modelId). Same pattern for
+    // per-model field name from vectorFieldFor(modelId). Same pattern for
     // chunk-vector LateInteractionFields. Chunk line ranges remain a single
     // model-independent field — the chunk decomposition is shared.
 
@@ -828,7 +828,7 @@ public class DocumentMapper {
             float[] v = e.getValue();
             if (v == null || v.length == 0) continue;
             doc.add(new KnnFloatVectorField(
-                    vectorFieldName(e.getKey()), v, VectorSimilarityFunction.COSINE));
+                    vectorFieldFor(e.getKey()), v, VectorSimilarityFunction.COSINE));
         }
     }
 
@@ -838,7 +838,7 @@ public class DocumentMapper {
         for (Map.Entry<String, float[][]> e : chunkVectorsByModel.entrySet()) {
             float[][] cv = e.getValue();
             if (cv == null || cv.length == 0) continue;
-            doc.add(new LateInteractionField(chunkVectorFieldName(e.getKey()), cv));
+            doc.add(new LateInteractionField(chunkVectorFieldFor(e.getKey()), cv));
         }
     }
 

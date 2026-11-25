@@ -22,6 +22,12 @@ public class SearchTrace {
     private long overallStart;
     private QueryClassification classification;
 
+    private final List<String> warnings = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** User-visible warning surfaced in the search response (e.g. degraded retrieval). */
+    public void addWarning(String w) { warnings.add(w); }
+    public List<String> warnings() { return List.copyOf(warnings); }
+
     void start() {
         overallStart = System.currentTimeMillis();
     }

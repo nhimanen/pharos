@@ -45,6 +45,12 @@ import java.util.function.Supplier;
  * WARN at most once a minute. {@link #drain} POSTs the draining heartbeat at once;
  * {@link #close} withdraws this process from every live writer ({@code DELETE}, which tombstones it
  * there), so coordinators drop it on their next tick.
+ *
+ * <p>Both are bounded, like {@link ReaderRegistry}'s: a frozen writer (accepting connections, never
+ * answering) holds a tick for up to two call timeouts, so {@link #drain(Duration)} waits for the tick
+ * and the POST only until its timeout and then gives up with a {@code Stopping: gave up ...} WARN (the
+ * flag is set first, so a later tick carries it), and {@link #close(Duration)} gives up on the
+ * withdraw at its deadline (writers drop the reader after {@code readerTtlSeconds}).
  */
 public final class PeerMembership implements MembershipSource {
 
@@ -80,13 +86,16 @@ public final class PeerMembership implements MembershipSource {
     private final Duration timeout;
     private final LongSupplier nanoClock;
     private final long startedAt = System.currentTimeMillis();
-    private final Object mu = new Object();
+    /** Guards a tick, a drain announce and {@link #previous}; shutdown only tries it (bounded). */
+    private final java.util.concurrent.locks.ReentrantLock mu = new java.util.concurrent.locks.ReentrantLock();
+    /** The bound of {@link #drain()} and of {@link #close()}'s withdraw. */
+    static final Duration DEFAULT_SHUTDOWN_CALL = Duration.ofSeconds(5);
     private volatile List<ReaderRegistry.LiveReader> live = List.of();
     private volatile List<WriterReaders> lastAnswers = List.of();
-    private boolean draining;   // under mu
-    private boolean closed;     // under mu
-    private long lastWarn;
-    private ScheduledExecutorService scheduler;
+    private volatile boolean draining;
+    private volatile boolean closed;
+    private long lastWarn;                  // under mu
+    private ScheduledExecutorService scheduler; // under this
 
     /**
      * @param self this reader's heartbeat; null: an observer that never POSTs
@@ -135,7 +144,7 @@ public final class PeerMembership implements MembershipSource {
 
     @Override
     public void start() {
-        synchronized (mu) {
+        synchronized (this) {
             if (scheduler != null || closed) return;
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "pharos-reader-heartbeat");
@@ -157,27 +166,58 @@ public final class PeerMembership implements MembershipSource {
     /** One heartbeat: refresh the catalog when due, POST to every live writer, then merge their lists. */
     public void tick() {
         catalog.refreshIfDue(); // outside mu: a hung discovery must not block drain() or close()
-        synchronized (mu) {
+        mu.lock();
+        try {
             if (closed) return;
             List<PeerCatalog.WriterRef> writers = catalog.liveWriters();
-            if (self != null && post(writers) == 0) {
+            if (self != null && post(writers, Long.MAX_VALUE) == 0) {
                 warnStale(writers.isEmpty() ? "no live writer to heartbeat to"
                         : "no writer accepted our heartbeat");
                 return;
             }
-            refresh(writers);
+            refresh(writers, Long.MAX_VALUE);
+        } finally {
+            mu.unlock();
         }
     }
 
-    /** Marks this reader draining and POSTs that to every live writer at once. */
+    /** {@link #drain(Duration)} within {@link #DEFAULT_SHUTDOWN_CALL}. */
     @Override
     public void drain() {
-        synchronized (mu) {
-            if (closed || self == null) return;
-            draining = true;
+        drain(DEFAULT_SHUTDOWN_CALL);
+    }
+
+    /**
+     * Marks this reader draining and POSTs that to every live writer at once, then refreshes the list
+     * with what is left of {@code timeout}. Waits for a tick in progress and for the calls only until
+     * {@code timeout}, then gives up with a WARN: the next tick carries {@code draining} (the flag is
+     * set first). Never throws.
+     */
+    @Override
+    public void drain(Duration timeout) {
+        if (closed || self == null) return;
+        draining = true;
+        long deadline = System.nanoTime() + Math.max(0, timeout.toNanos());
+        try {
+            if (!mu.tryLock(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS)) {
+                log.warn("Stopping: gave up announcing draining to the peer writers: a heartbeat has been in progress"
+                        + " for over {} ms (a writer is slow or frozen)", Math.max(0, timeout.toMillis()));
+                return;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        try {
+            if (closed) return;
             List<PeerCatalog.WriterRef> writers = catalog.liveWriters();
-            post(writers);
-            refresh(writers);
+            if (!writers.isEmpty() && post(writers, deadline) == 0) {
+                log.warn("Stopping: gave up announcing draining to the peer writers within {} ms: no writer accepted"
+                        + " it (the next heartbeat carries it)", Math.max(0, timeout.toMillis()));
+            }
+            if (deadline - System.nanoTime() > 0) refresh(writers, deadline);
+        } finally {
+            mu.unlock();
         }
     }
 
@@ -195,7 +235,8 @@ public final class PeerMembership implements MembershipSource {
     /** Writers whose 403 to a heartbeat was logged (once each, P5-R12). */
     private final java.util.Set<String> refusedBy = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    private int post(List<PeerCatalog.WriterRef> writers) {
+    // deadlineNanos: System.nanoTime() after which no call is waited for (Long.MAX_VALUE: none).
+    private int post(List<PeerCatalog.WriterRef> writers, long deadlineNanos) {
         if (writers.isEmpty()) return 0;
         byte[] body;
         try {
@@ -211,9 +252,10 @@ public final class PeerMembership implements MembershipSource {
             log.warn("Building the reader heartbeat failed (retrying next tick): {}", e.toString());
             return 0;
         }
+        Duration bound = within(timeout, deadlineNanos);
         Map<PeerCatalog.WriterRef, CompletableFuture<HttpResponse<byte[]>>> calls = new LinkedHashMap<>();
         for (PeerCatalog.WriterRef w : writers) {
-            HttpRequest req = http.request(w.url(), MembershipRoutes.READERS, timeout)
+            HttpRequest req = http.request(w.url(), MembershipRoutes.READERS, bound)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .header("Content-Type", "application/json").build();
             calls.put(w, http.sendAsync(req));
@@ -221,7 +263,7 @@ public final class PeerMembership implements MembershipSource {
         int ok = 0;
         for (Map.Entry<PeerCatalog.WriterRef, CompletableFuture<HttpResponse<byte[]>>> e : calls.entrySet()) {
             try {
-                HttpResponse<byte[]> r = e.getValue().get(timeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
+                HttpResponse<byte[]> r = e.getValue().get(waitMillis(timeout, deadlineNanos), TimeUnit.MILLISECONDS);
                 if (r.statusCode() == 204) {
                     ok++;
                 } else if (r.statusCode() == 403 && refusedBy.add(e.getKey().url().toString())) {
@@ -243,8 +285,8 @@ public final class PeerMembership implements MembershipSource {
     }
 
     // Holding mu.
-    private void refresh(List<PeerCatalog.WriterRef> writers) {
-        List<WriterReaders> answers = fetch(http, writers, timeout, nanoClock);
+    private void refresh(List<PeerCatalog.WriterRef> writers, long deadlineNanos) {
+        List<WriterReaders> answers = fetch(http, writers, timeout, nanoClock, deadlineNanos);
         if (answers.isEmpty()) {
             warnStale(writers.isEmpty() ? "no live writer" : "no writer answered GET /replication/readers");
             return;
@@ -274,15 +316,22 @@ public final class PeerMembership implements MembershipSource {
      */
     public static List<WriterReaders> fetch(PeerHttp http, List<PeerCatalog.WriterRef> writers, Duration timeout,
                                             LongSupplier nanoClock) {
+        return fetch(http, writers, timeout, nanoClock, Long.MAX_VALUE);
+    }
+
+    /** {@link #fetch(PeerHttp, List, Duration, LongSupplier)}, waiting for no answer past {@code deadlineNanos}. */
+    static List<WriterReaders> fetch(PeerHttp http, List<PeerCatalog.WriterRef> writers, Duration timeout,
+                                     LongSupplier nanoClock, long deadlineNanos) {
+        Duration bound = within(timeout, deadlineNanos);
         Map<PeerCatalog.WriterRef, CompletableFuture<HttpResponse<byte[]>>> calls = new LinkedHashMap<>();
         for (PeerCatalog.WriterRef w : writers) {
-            calls.put(w, http.sendAsync(http.request(w.url(), MembershipRoutes.READERS, timeout).build()));
+            calls.put(w, http.sendAsync(http.request(w.url(), MembershipRoutes.READERS, bound).build()));
         }
         List<WriterReaders> out = new ArrayList<>();
         for (Map.Entry<PeerCatalog.WriterRef, CompletableFuture<HttpResponse<byte[]>>> e : calls.entrySet()) {
             PeerCatalog.WriterRef w = e.getKey();
             try {
-                HttpResponse<byte[]> r = e.getValue().get(timeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
+                HttpResponse<byte[]> r = e.getValue().get(waitMillis(timeout, deadlineNanos), TimeUnit.MILLISECONDS);
                 long answered = nanoClock.getAsLong();
                 if (r.statusCode() != 200) {
                     log.debug("Readers of writer {} answered {}", w, PeerHttp.describe(r.statusCode(), r.body()));
@@ -322,6 +371,20 @@ public final class PeerMembership implements MembershipSource {
             }
         }
         return out;
+    }
+
+    /** {@code timeout}, cut to what is left before {@code deadlineNanos} (at least 1 ms: a request needs one). */
+    private static Duration within(Duration timeout, long deadlineNanos) {
+        if (deadlineNanos == Long.MAX_VALUE) return timeout;
+        Duration left = Duration.ofNanos(Math.max(1_000_000L, deadlineNanos - System.nanoTime()));
+        return left.compareTo(timeout) < 0 ? left : timeout;
+    }
+
+    /** How long to wait for one answer: the request bound plus 1 s, cut at {@code deadlineNanos}. */
+    private static long waitMillis(Duration timeout, long deadlineNanos) {
+        long ms = timeout.toMillis() + 1000;
+        if (deadlineNanos == Long.MAX_VALUE) return ms;
+        return Math.max(0, Math.min(ms, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())));
     }
 
     /**
@@ -368,51 +431,68 @@ public final class PeerMembership implements MembershipSource {
         return out;
     }
 
-    /** Stops heartbeating and withdraws this process from every live writer. */
+    /** {@link #close(Duration)} within {@link #DEFAULT_SHUTDOWN_CALL}. */
     @Override
     public void close() {
+        close(DEFAULT_SHUTDOWN_CALL);
+    }
+
+    /**
+     * Stops heartbeating and withdraws this process from every live writer, giving up on the withdraw
+     * when {@code within} has passed (writers then drop it after {@code readerTtlSeconds}; a heartbeat
+     * still in flight after the withdraw is refused, the writer tombstones this process). Never throws.
+     */
+    public void close(Duration within) {
+        long deadline = System.nanoTime() + Math.max(0, within.toNanos());
         ScheduledExecutorService s;
-        synchronized (mu) {
+        synchronized (this) {
             if (closed) return;
             closed = true;
             s = scheduler;
             scheduler = null;
         }
         if (s != null) {
-            s.shutdownNow();
+            s.shutdownNow(); // interrupts a tick waiting on a writer
             try {
-                s.awaitTermination(5, TimeUnit.SECONDS);
+                s.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        synchronized (mu) {
-            live = List.of();
-            if (self == null) return;
-            String node;
+        live = List.of();
+        if (self == null) return;
+        String node;
+        try {
+            node = self.get().node();
+        } catch (RuntimeException e) {
+            log.warn("Withdrawing from reader membership failed (writers drop us after the TTL): {}", e.toString());
+            return;
+        }
+        String path = MembershipRoutes.READERS + "/" + URLEncoder.encode(node, StandardCharsets.UTF_8)
+                .replace("+", "%20") + "?startedAt=" + startedAt;
+        Duration bound = within(timeout, deadline);
+        List<CompletableFuture<HttpResponse<byte[]>>> calls = new ArrayList<>();
+        for (PeerCatalog.WriterRef w : catalog.liveWriters()) {
+            calls.add(http.sendAsync(http.request(w.url(), path, bound).DELETE().build()));
+        }
+        int gaveUp = 0;
+        for (CompletableFuture<HttpResponse<byte[]>> c : calls) {
             try {
-                node = self.get().node();
-            } catch (RuntimeException e) {
-                log.warn("Withdrawing from reader membership failed (writers drop us after the TTL): {}", e.toString());
+                c.get(waitMillis(timeout, deadline), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 return;
+            } catch (java.util.concurrent.TimeoutException e) {
+                c.cancel(true);
+                gaveUp++;
+            } catch (Exception e) {
+                c.cancel(true);
+                log.debug("Withdrawing from a writer failed (it drops us after the TTL): {}", e.toString());
             }
-            String path = MembershipRoutes.READERS + "/" + URLEncoder.encode(node, StandardCharsets.UTF_8)
-                    .replace("+", "%20") + "?startedAt=" + startedAt;
-            List<CompletableFuture<HttpResponse<byte[]>>> calls = new ArrayList<>();
-            for (PeerCatalog.WriterRef w : catalog.liveWriters()) {
-                calls.add(http.sendAsync(http.request(w.url(), path, timeout).DELETE().build()));
-            }
-            for (CompletableFuture<HttpResponse<byte[]>> c : calls) {
-                try {
-                    c.get(timeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } catch (Exception e) {
-                    c.cancel(true);
-                    log.debug("Withdrawing from a writer failed (it drops us after the TTL): {}", e.toString());
-                }
-            }
+        }
+        if (gaveUp > 0) {
+            log.warn("Stopping: gave up withdrawing from {} peer writer(s) after {} ms (they drop this reader after"
+                    + " cluster.readerTtlSeconds)", gaveUp, Math.max(0, within.toMillis()));
         }
     }
 }

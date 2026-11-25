@@ -60,6 +60,10 @@ public final class LazyEmbeddingProvider implements EmbeddingProvider {
 
     @Override public float[] embed(String text) { return delegate().embed(text); }
 
+    @Override public float[] embedQuery(String text) { return delegate().embedQuery(text); }
+
+    @Override public float[] embedDocument(String text) { return delegate().embedDocument(text); }
+
     @Override public float[][] embedBatch(List<String> texts) { return delegate().embedBatch(texts); }
 
     @Override

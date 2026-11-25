@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phase 2 gate driver (standard library only). Driven by scripts/cluster-gate-phase2.sh, which has
-already started MinIO on 127.0.0.1:9000 and published lucene (--no-embed) and pharos (embedded).
+already started MinIO on 127.0.0.1:$GATE_MINIO_PORT (default 9000) and published lucene (--no-embed) and pharos (embedded).
 
 This script starts the reader JVMs itself, one configuration at a time, and stops them by PID:
 
@@ -26,6 +26,8 @@ This script starts the reader JVMs itself, one configuration at a time, and stop
         second. Pass: max sample <= cacheMaxBytes + maxConcurrentFetches x blockSizeBytes, and
         top-10 identical to full mode under the warm rules. The hit rate is recorded.
 
+Ports come from GATE_MINIO_PORT (9000), GATE_LAZY_PORT (7301) and GATE_FULL_PORT (7302).
+
 Results go to $GATE/results-<phase>.json and stdout. --self-test checks the statistics and the
 comparison rules against canned inputs; --dry-run prints the plan.
 """
@@ -49,6 +51,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 import cluster_gate  # noqa: E402  (Phase 1 helpers: load_queries)
+
+MINIO_PORT = int(os.environ.get("GATE_MINIO_PORT", "9000"))
+LAZY_PORT = int(os.environ.get("GATE_LAZY_PORT", "7301"))
+FULL_PORT = int(os.environ.get("GATE_FULL_PORT", "7302"))
 
 COLD_P95_LIMIT_S = 3.0
 WARM_RATIO_LIMIT = 1.10
@@ -187,7 +193,8 @@ def queries():
     plus vector and hybrid on the pharos ones (lucene is indexed without embeddings)."""
     base = cluster_gate.load_queries()
     out = [(q, p, "keyword") for q, p in base]
-    out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
+    if os.environ.get("GATE_NO_MODELS", "0") != "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY: keyword only
+        out += [(q, p, pl) for pl in ("vector", "hybrid") for q, p in base if p == "pharos"]
     return base, out
 
 
@@ -263,6 +270,8 @@ class Reader:
                 "searchEmbeddingModel": os.environ["GATE_MODEL_ID"], "crossEncoderEnabled": False,
                 "cluster": peer_cluster(self.name, self.port, self.cache_dir, rc),
             }
+            if os.environ.get("GATE_NO_MODELS", "0") == "1":  # the Phase 5 gate's GATE_KEYWORD_ONLY
+                del cfg["embeddingProviders"], cfg["searchEmbeddingModel"]
             (self.ph / "config.json").write_text(json.dumps(cfg, indent=2))
             return
         cfg = {
@@ -276,8 +285,8 @@ class Reader:
                 "advertiseUrl": f"http://127.0.0.1:{self.port}",
                 "token": os.environ.get("GATE_TOKEN", "gate2-cluster-token-0123456789"),
                 "objectStore": {
-                    # GATE_S3_ENDPOINT: another MinIO address (a host where :9000 is taken)
-                    "endpoint": os.environ.get("GATE_S3_ENDPOINT", "http://127.0.0.1:9000"),
+                    # GATE_S3_ENDPOINT: another MinIO address; otherwise GATE_MINIO_PORT on localhost
+                    "endpoint": os.environ.get("GATE_S3_ENDPOINT", f"http://127.0.0.1:{MINIO_PORT}"),
                     "region": "us-east-1", "bucket": "pharos-gate",
                     "prefix": "pharos", "pathStyle": True,
                     "accessKeyEnv": "PHAROS_GATE_ACCESS_KEY", "secretKeyEnv": "PHAROS_GATE_SECRET_KEY"},
@@ -397,7 +406,7 @@ def phase_cold(trials, variant="cold"):
         raise RuntimeError("need 20 distinct lucene queries")
     rows = []
     for t in range(trials):
-        r = Reader(variant, 7301, mode=mode, fresh=True)  # empties block cache + generation dirs + registry
+        r = Reader(variant, LAZY_PORT, mode=mode, fresh=True)  # empties block cache + generation dirs + registry
         print(f"-- {variant} trial {t + 1}/{trials}: MemAvailable {mem_available_gib():.1f} GiB")
         r.start(f"-{t + 1:02d}")
         try:
@@ -408,7 +417,9 @@ def phase_cold(trials, variant="cold"):
             dl, res_l = search(r.base, lq, "lucene", "keyword")
             mid = (health(r.base).get("readerCache") or {}).get("bytesFetched")
             vq = pharos_q[t % len(pharos_q)]
-            dv, res_v = search(r.base, vq, "pharos", "vector")
+            # keyword only (GATE_NO_MODELS=1): the pharos query is keyword too (no model to embed it)
+            dv, res_v = search(r.base, vq, "pharos",
+                               "keyword" if os.environ.get("GATE_NO_MODELS", "0") == "1" else "vector")
             rc = health(r.base).get("readerCache") or {}
             models_ms = r.models_ready_ms()
         finally:
@@ -496,9 +507,9 @@ def phase_warm():
     if len(base) != 99:
         print(f"WARNING: {len(base)} pharos+lucene queries, expected 99")
     gate = Path(os.environ["GATE"])
-    lazy = Reader("lazy", 7301, fresh=True)
-    full = Reader("full", 7302, mode="full", fresh=True)
-    print(f"-- warm: MemAvailable {mem_available_gib():.1f} GiB; starting lazy :7301 and full :7302")
+    lazy = Reader("lazy", LAZY_PORT, fresh=True)
+    full = Reader("full", FULL_PORT, mode="full", fresh=True)
+    print(f"-- warm: MemAvailable {mem_available_gib():.1f} GiB; starting lazy :{LAZY_PORT} and full :{FULL_PORT}")
     lazy.start()
     full.start()
     out = {}
@@ -562,6 +573,8 @@ def phase_warm():
             warm_ok = ratio <= WARM_RATIO_LIMIT
             print(f"WARM keyword p95 ratio {ratio:.3f} limit <= {WARM_RATIO_LIMIT} -> {'PASS' if warm_ok else 'FAIL'}")
         for pl in ("vector", "hybrid"):
+            if pl not in out["timings"]["lazy"]:
+                continue  # keyword only (GATE_NO_MODELS=1)
             lv, fv = out["timings"]["lazy"][pl], out["timings"]["full"][pl]
             print(f"   {pl} p95 lazy {lv['p95'] * 1000:.1f} ms vs full {fv['p95'] * 1000:.1f} ms (not gated)")
         mm = check(lazy_res, full_res, "strict")
@@ -569,7 +582,7 @@ def phase_warm():
         out["strict"] = mm
 
         full.stop()
-        niofs = Reader("full", 7302, mode="full", niofs=True)  # same home: the same full copy
+        niofs = Reader("full", FULL_PORT, mode="full", niofs=True)  # same home: the same full copy
         print("-- re-opening the same full copy with NIOFSDirectory")
         niofs.start("-niofs")
         try:
@@ -606,14 +619,14 @@ def phase_cap():
         if not p.is_file():
             raise RuntimeError(f"{p} missing: run the warm phase first")
         refs[name] = json.loads(p.read_text())
-    lb = Reader("lazy", 7301).lucene_bytes()
+    lb = Reader("lazy", LAZY_PORT).lucene_bytes()
     cap, block = cache_cap(lb)
     fetches = DEFAULT_FETCHES
     bound = cap + fetches * block
     print(f"-- cap: lucene shard Lucene bytes {lb}; cacheMaxBytes {cap} ({cap / 2**20:.1f} MiB),"
           f" blockSizeBytes {block} ({block >> 10} KiB), maxConcurrentFetches {fetches}; bound {bound}")
-    r = Reader("cap", 7301, reader_cfg={"cacheMaxBytes": cap, "blockSizeBytes": block,
-                                        "maxConcurrentFetches": fetches}, fresh=True)
+    r = Reader("cap", LAZY_PORT, reader_cfg={"cacheMaxBytes": cap, "blockSizeBytes": block,
+                                             "maxConcurrentFetches": fetches}, fresh=True)
     samples, stop = [], threading.Event()
 
     def sampler():

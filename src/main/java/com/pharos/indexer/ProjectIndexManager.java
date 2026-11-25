@@ -418,6 +418,9 @@ public class ProjectIndexManager {
      *   <li>A broken graph pointer (malformed, or naming a generation that is gone, e.g. left behind
      *       by an older pharos) can't be patched: patching would need a fresh, empty graph. A full
      *       run rebuilds the graph and replaces the pointer.</li>
+     *   <li>A call graph with a damaged property dictionary (written before 1.10.0) decodes wrongly
+     *       and can't be patched or published: a full run builds a new graph generation. This is how
+     *       work-queue writers, which refuse {@code index --full}, repair it.</li>
      * </ul>
      */
     public String fullRunReason(String projectName) {
@@ -439,6 +442,8 @@ public class ProjectIndexManager {
         }
         String pointer = CallGraph.pointerProblem(existingDir);
         if (pointer != null) return pointer;
+        String damage = CallGraph.dictionaryProblem(CallGraph.projectGraphDir(existingDir));
+        if (damage != null) return "the call graph has a " + damage;
         if (Files.exists(existingDir.resolve(LocalShardLayout.COMMITTING))) {
             return "a previous run stopped between the commits of its shards";
         }
@@ -678,6 +683,22 @@ public class ProjectIndexManager {
             if (reason != null) {
                 String msg = reason + ": running a full re-index";
                 log.warn(msg);
+                progress.onProgress(msg, 0, 0);
+                incremental = false;
+            }
+        }
+        // 1.4.0-1.4.1 stored the legacy model's vectors under vec.legacy, which search never reads.
+        // Only a full index embeds exactly like a fresh one (chunked text, chunk vectors), so it also
+        // reuses the existing embedding cache; an incremental run would miss it and downgrade chunks.
+        if (incremental && !force && generateEmbeddings && !embedders.isEmpty()
+                && LegacyVectorFields.hasLiveMisnamedVectors(luceneIndexer.getLucenePath(projectName))) {
+            if (availableEmbedders().isEmpty()) {
+                // A full run without a usable model writes no vectors and the project would stay flagged.
+                log.warn("project {}: vectors need re-embedding but no embedding model is available", projectName);
+            } else {
+                String msg = "vectors stored under vec.legacy by pharos 1.4.0-1.4.1; "
+                        + "running a full re-index to re-embed (cached vectors are reused)";
+                log.warn("project {}: {}", projectName, msg);
                 progress.onProgress(msg, 0, 0);
                 incremental = false;
             }
@@ -1116,7 +1137,7 @@ public class ProjectIndexManager {
         int parserIdx = 0;
         for (Map.Entry<CodeParser, List<Path>> entry : filesByParser.entrySet()) {
             abort.checkpoint();
-            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName));
+            perLang.add(entry.getKey().parseFiles(entry.getValue(), projectRoot, projectName, abort));
             progress.onProgress("Parsing", ++parserIdx, parsers.size());
         }
         ParsedProject project = merge(projectName, projectRoot, perLang);
@@ -1861,9 +1882,14 @@ public class ProjectIndexManager {
      * <p>Threads count is from {@code rt.threads}; 1 collapses to a single
      * worker, equivalent to the previous serial pass.
      */
-    private void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
-                               ProgressListener progress, String projectName,
-                               IndexAbort abort) throws IOException {
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                      ProgressListener progress, String projectName) throws IOException {
+        runEmbedPass(spoolPath, totalSlots, rt, progress, projectName, IndexAbort.none());
+    }
+
+    void runEmbedPass(Path spoolPath, int totalSlots, EmbedRuntime rt,
+                      ProgressListener progress, String projectName,
+                      IndexAbort abort) throws IOException {
         if (totalSlots == 0) return;
         int chunkSize = rt.chunkSize;
         int totalChunks = (totalSlots + chunkSize - 1) / chunkSize;
@@ -1951,6 +1977,17 @@ public class ProjectIndexManager {
                     throw new IOException("Embed task failed: " + cause.getMessage(), cause);
                 }
             }
+        } catch (IOException | RuntimeException failure) {
+            // Keep what was already embedded so the next run does not redo it.
+            pool.shutdownNow();
+            try {
+                pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (rt.cache != null) rt.cache.save();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                failure.addSuppressed(interrupted);
+            }
+            throw failure;
         } finally {
             pool.shutdown();
         }

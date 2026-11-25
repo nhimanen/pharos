@@ -682,4 +682,50 @@ class PeerMembershipTest {
             assertThat(nodes(router.live())).containsExactly("r1");
         }
     }
+
+    /**
+     * A frozen writer (it accepts connections and never answers) must not hold a reader's shutdown:
+     * the drain announce gives up at its timeout although a tick holds the membership lock in a POST
+     * to that writer, and close's withdraw gives up within its default bound (1.9.0's bounded
+     * shutdown, for the bucket's {@code ReaderRegistry}, applied to peer membership).
+     */
+    @Test
+    void drainAndCloseGiveUpOnAFrozenWriter() throws Exception {
+        PeerWriterFixture w = writer("w", CLOCK_A);
+        PeerHttp http = http();
+        // refreshed once while the writer answers, then never again during the test
+        PeerCatalog catalog = new PeerCatalog(new PeerDiscovery(PeerDiscovery.parse("seeds:" + w.url()), "http",
+                PeerDiscovery.SYSTEM_RESOLVER, http), http, Duration.ofHours(1), System::nanoTime);
+        catalog.refresh();
+        assertThat(catalog.liveWriters()).hasSize(1);
+        int port = URI.create(w.url()).getPort();
+        w.stop();
+        java.net.ServerSocket hole = new java.net.ServerSocket();
+        hole.setReuseAddress(true);
+        hole.bind(new java.net.InetSocketAddress(port));
+        List<java.net.Socket> held = new java.util.concurrent.CopyOnWriteArrayList<>();
+        Thread.ofVirtual().start(() -> {
+            try {
+                while (true) held.add(hole.accept());
+            } catch (java.io.IOException closed) {
+                // the test is over
+            }
+        });
+        open.add(() -> {
+            hole.close();
+            for (java.net.Socket sock : held) sock.close();
+        });
+
+        PeerMembership m = member(catalog, http, heartbeat("r1", List.of("p1"), false, null, null, 0));
+        m.start(); // the first tick POSTs to the frozen writer, holding the lock for up to ~2 x 11 s
+        await("the heartbeat reaching the frozen writer", () -> !held.isEmpty());
+
+        long t0 = System.nanoTime();
+        m.drain(Duration.ofSeconds(1));
+        assertThat(Duration.ofNanos(System.nanoTime() - t0)).isLessThan(Duration.ofSeconds(3));
+
+        long t1 = System.nanoTime();
+        m.close();
+        assertThat(Duration.ofNanos(System.nanoTime() - t1)).isLessThan(Duration.ofSeconds(8));
+    }
 }

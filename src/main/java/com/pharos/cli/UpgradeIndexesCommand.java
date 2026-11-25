@@ -23,7 +23,8 @@ import java.util.function.Function;
 
 /**
  * Re-indexes (full) every project whose index is {@code upgrade-available}, {@code outdated}
- * or {@code newer}, so the whole set reaches the current index format. Refused on reader nodes:
+ * or {@code newer}, so the whole set reaches the current index format, and every current one whose
+ * call graph has a damaged property dictionary (written before 1.10.0). Refused on reader nodes:
  * they receive upgraded generations by syncing from the writer.
  *
  * <p>Exit codes: {@value #EXIT_OK} nothing to do, all upgraded, or aborted at the prompt;
@@ -152,6 +153,9 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         int skipped = 0;
         int invalidCount = 0;
         Set<String> known = new HashSet<>();
+        List<ProjectMeta> reembed = new ArrayList<>();
+        Set<String> damaged = new HashSet<>();
+        boolean embeddingsConfigured = !config.getEmbeddingProviders().isEmpty();
         for (ProjectMeta p : registry.listAll()) {
             known.add(p.getName());
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
@@ -163,10 +167,26 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
                 invalidCount++;
                 continue;
             }
-            switch (IndexFormat.status(IndexFormat.dir(p.getIndexPath()))) {
+            Path idx = IndexFormat.dir(p.getIndexPath());
+            if (embeddingsConfigured && idx != null
+                    && com.pharos.indexer.LegacyVectorFields.hasLiveMisnamedVectors(idx.resolve("lucene"))) {
+                reembed.add(p);
+            }
+            switch (IndexFormat.status(idx)) {
                 case UPGRADE_AVAILABLE, OUTDATED, NEWER -> todo.add(p);
                 case MISSING -> missing.add(p);
-                case OK, INVALID -> { }
+                case OK -> {
+                    // a current format with a call graph that decodes wrongly (pre-1.10.0 dictionary
+                    // race): the full re-index rebuilds the graph
+                    String damage = idx == null ? null
+                            : com.pharos.graph.CallGraph.dictionaryProblem(com.pharos.graph.CallGraph.projectGraphDir(idx));
+                    if (damage != null) {
+                        System.out.printf("%s: call graph has a %s; it is re-indexed%n", p.getName(), damage);
+                        damaged.add(p.getName());
+                        todo.add(p);
+                    }
+                }
+                case INVALID -> { }
             }
         }
         for (String n : names) {
@@ -181,6 +201,14 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             System.out.printf("%d invalid registration%s ignored (warning only).%n",
                     invalidCount, invalidCount == 1 ? "" : "s");
         }
+        if (!reembed.isEmpty()) {
+            // Listed, never run: a legacy-vector migration re-embeds the whole project (hours on CPU
+            // for a large one), which is not what "upgrade the index format" promises.
+            System.out.println("Legacy-model vectors need re-embedding (upgrade-indexes does not migrate them); run:");
+            for (ProjectMeta p : reembed) {
+                System.out.println("  " + com.pharos.indexer.ReindexHint.fullIndexCommand(p.getName(), p.getRootPath()));
+            }
+        }
         if (todo.isEmpty() && missing.isEmpty() && skipped == 0) {
             System.out.println("All indexes are current; nothing to upgrade.");
             return 0;
@@ -191,13 +219,14 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             for (ProjectMeta p : todo) {
                 System.out.printf("  %-25s  %10s  %s  [%s]  embeddings: %s%n", p.getName(),
                         IndexStatusCommand.humanBytes(IndexStatusCommand.sizeOf(IndexFormat.dir(p.getIndexPath()))),
-                        p.getRootPath(), IndexFormat.status(IndexFormat.dir(p.getIndexPath())).wireName(),
+                        p.getRootPath(), damaged.contains(p.getName()) ? "damaged-graph"
+                                : IndexFormat.status(IndexFormat.dir(p.getIndexPath())).wireName(),
                         embed ? "yes" : "no");
             }
         }
         for (ProjectMeta p : missing) {
-            System.out.printf("  %-25s  missing index dir; run pharos index --full %s %s%n",
-                    p.getName(), p.getName(), p.getRootPath());
+            System.out.printf("  %-25s  missing index dir; run %s%n",
+                    p.getName(), com.pharos.indexer.ReindexHint.fullIndexCommand(p.getName(), p.getRootPath()));
             skipped++;
         }
 
@@ -225,8 +254,8 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
         for (ProjectMeta p : todo) {
             Path root = p.getRootPath() == null ? null : Path.of(p.getRootPath());
             if (root == null || !Files.isDirectory(root)) {
-                System.out.printf("Skipping '%s': root path no longer exists. re-index manually: "
-                        + "pharos index --full %s <path>%n", p.getName(), p.getName());
+                System.out.printf("Skipping '%s': root path no longer exists. re-index manually: %s%n",
+                        p.getName(), com.pharos.indexer.ReindexHint.fullIndexCommand(p.getName(), null));
                 skipped++;
                 continue;
             }

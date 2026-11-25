@@ -31,6 +31,176 @@ a reader of an older release heartbeats, `pharos reshard` is refused (exit 1, na
 an already open reshard holds before staging and before its flip (past
 `reshardSyncTimeoutSeconds` too); `pharos reshard <p> --status` shows why it waits. It goes on
 once every live reader runs this release.
+## Upgrading to 1.10.0
+
+Index format: 1 (unchanged). Peer pull changes nothing for single-node installs (`role: all`) or for
+clusters with a bucket (`cluster.backend: object-store`, still the default): restart on the new jar.
+One recommended step applies to every install:
+
+### Recommended: rebuild the call graphs once
+
+Every release since the ArcadeDB graph backend could, rarely, write a new graph whose property
+dictionary was stale. Such a graph opens without an error but decodes wrongly: methods and edges are
+missing, other vertices have shuffled properties, so callers, callees, usages and call paths are wrong.
+1.10.0 creates graphs safely and recognises the damaged ones, but cannot repair a graph in place.
+
+- **Every project:** run `pharos index --full <project>` once (or `pharos upgrade-indexes`, which
+  re-indexes the damaged ones it finds). A full run builds a new call graph. Any index run of a
+  damaged project now turns full by itself, so the graph is repaired at the latest on the project's
+  next change; the explicit run repairs it now. Work-queue writers refuse `index --full` and need
+  nothing: a shard whose local graph is damaged gets a full run and publishes a clean generation,
+  which replaces the one readers serve. Writers without the work queue: run it on the writer.
+- **Cross-project graph:** re-run `pharos link` afterwards; it rebuilds the graph when it is damaged.
+- **Module graph** (`~/.pharos/module-graph.arcadedb`): a re-index never re-creates it. 1.10.0 rebuilds
+  a damaged one automatically (empty; each project's modules return when it is next indexed, so the
+  full re-indexes above refill it).
+
+What 1.10.0 does when it finds a damaged graph: it logs a WARN naming the graph and the repair, and the
+project's next index run is a full one. As a backstop a writer refuses to publish a damaged project graph
+(the publish fails with that message) until a full run has rebuilt it.
+`pharos index-status` shows a `warning:` line (`graphDamage` in `--json`). A reader can only check an
+ArcadeDB graph, not a published `graph.cgf.gz`: repair on the writer.
+
+### Optional: moving a cluster to peer pull (no bucket)
+
+Peer pull (`cluster.backend: peer-pull`) is new and experimental; see README "Without a bucket: peer-pull"
+for the configs. It trades the bucket for these limits: no writer takeover, the writer's disk is the only
+copy of what it published, and the cluster token is the only credential. Keep the bucket if you rely on
+Phase 4 failover or the work queue.
+
+- **Writers.** Set `backend: peer-pull`, `cluster.token` (required) and `cluster.peers` (`storeDir` on the
+  same file system as `indexDir`, `discovery`, `allowHosts`). Remove `"writer": {"workQueue": true}` if set
+  (a config error in peer mode; the default is forced off) and publish by hand next to a long-running
+  `pharos web`. The peer store starts empty: run `pharos publish <project>` (or `pharos index <dir>`) for
+  each project of the writer so readers have a generation to pull. Each writer owns the shards in its own
+  registry; give every shard exactly one writer.
+- **Readers, coordinators and `pharos router`.** Set `backend: peer-pull`, the same `token`, and
+  `cluster.peers.discovery` (`dns:<fully qualified name>` or `seeds:<url>,…`); drop `objectStore`. Readers
+  need an `advertiseUrl` whose host resolves to the address they connect from, or is in the writers'
+  `allowHosts`. Run `pharos router` with a reader's config.
+- **TLS (optional).** A writer `cluster.tls.keystore` (password from `passwordEnv`) and a reader
+  `truststore`; seeds must then be `https://`, `dns:` discovery needs IP SANs, and peer fetch between readers
+  is off. On a TLS writer `./pharos` uses the plain loopback port `cluster.tls.localPort` (web port + 1).
+- **Size `cluster.peers.maxLongPolls`** (default 4096) to at least readers × shards per writer, and the
+  writer's open-files limit above it.
+- **Network.** The token travels in clear text between readers and to coordinators: run the cluster on a
+  network only its nodes reach (a Kubernetes `NetworkPolicy`, a private network).
+
+## Upgrading to 1.9.0
+
+Index format: 1 (unchanged); no re-index. Single-node installs (`role: all`) and readers need nothing.
+**Cluster writers change behaviour** — read this before restarting them.
+
+### Work-queue writers are the default
+
+`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`): `pharos web`
+on the writer takes shards from the catalog under leases, polls their sources and indexes and publishes
+changes by itself. Hand-run `pharos index` / `pharos publish` are refused there (exit 2).
+
+- **To keep your current hand-run writer**, add `"writer": {"workQueue": false}` to its `cluster`
+  section before restarting it on 1.9.0. Nothing else changes for it.
+- **To adopt the work queue**, every shard needs a source in the catalog, or it stays pinned to the writer
+  that has its path: index it once on a hand-run writer with `--source-git <url> --ref <branch>` (or
+  `--source-path <dir>` readable by every writer), see README "Work-queue writers". Give every writer the
+  same `workDir` path, or each takeover re-parses the shard in full.
+
+On a work-queue writer:
+
+- **Upgrading is restarting it on the new release.** Its work loop gives every shard it holds a full
+  run when this release needs one (an older local or published index format, a broken graph pointer,
+  files embedded under another chunking version or model) and re-publishes it, without a source
+  change. `pharos upgrade-indexes` and `./setup.sh --upgrade-indexes` refuse there (exit 5), as do
+  `remove-index` and `embed` (exit 2): they would change the indexes under the running loop. The
+  "Steps" of a format upgrade below apply to single nodes and hand-run writers
+  (`"writer": {"workQueue": false}`).
+- **`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds`** (default 30), checked
+  at startup: a writer config from an earlier phase with `heartbeatSeconds` of 30 or more no longer
+  starts until you lower it (or raise the TTL).
+- **Disk guard default:** `cluster.writer.disk.minFreePercent` defaults to 0, so the threshold is
+  `minFreeBytes` (5 GiB). A percentage made writers on large disks permanently "low" (no lease
+  taken, nothing published); set one explicitly if you want it. A low writer logs a WARN once per
+  low episode.
+- **One work loop per node:** a second pharos daemon with the same config on the writer host (one
+  that `./pharos` starts on demand, say) runs no loop; it logs a WARN and serves everything else.
+
+## Upgrading to 1.8.0
+
+Index format: 1 (unchanged); no re-index. Single-node installs need nothing. Cluster readers:
+
+### `retireGraceSeconds` rules
+
+`cluster.retireGraceSeconds` (default 120) must be at least `2 x cluster.pollIntervalSeconds` and at
+least `cluster.fanoutTimeoutMillis / 1000` (default 5 s). A reader whose config breaks either rule
+refuses to start and names both fields; raise `retireGraceSeconds` (or lower the other value).
+Readers also need `cluster.token` (already required) for the new `/internal/*` shard API.
+
+### Health probes and stop timeouts
+
+- `/health` now answers **200** `{"status":"degraded",…}` for a reader with a degraded shard (1.7.0: 503),
+  so the reader stays routable for its other shards, and **503** `{"status":"draining"}` while it drains.
+  A readiness probe that only checks the HTTP status keeps working.
+- On SIGTERM a reader drains for up to `cluster.drainSeconds` (default 20) before exiting. Set the
+  process manager's stop timeout above `drainSeconds` + 15 s (Kubernetes
+  `terminationGracePeriodSeconds`, e.g. 45), or it will be killed mid-drain.
+
+## Upgrading to 1.5.0
+
+Index format: 1 (unchanged). No default changes: semantic search stays off unless you configured it, and
+existing jina installs keep jina.
+
+### Legacy-model vectors
+
+With the old single-model config (`embeddingModelUrl`) or a provider with model id `legacy`, 1.4.0-1.4.1
+stored vectors in a field vector search never read, so vector search returned nothing. `pharos index-status`
+flags such projects (`needsReembed`) and prints the command for each; it looks like this (`index` takes the
+project's root directory, and `--project` keeps the registered name):
+
+```bash
+pharos index --full --single --project <name> <root path>
+```
+
+It re-indexes the project and re-embeds it from the embedding cache, so it is fast. `pharos upgrade-indexes`
+lists these projects with the same command but does not migrate legacy vectors: use `pharos index`.
+
+### Switching to granite-r2
+
+Nothing changes on upgrade: no default model changed, no re-embed happens, and the index format is unchanged.
+Semantic search is off unless you configured it; existing jina installs keep jina. granite-embedding-english-r2
+is the *recommended* model when you do enable embeddings (see the A/B in the CHANGELOG).
+
+To enable it (or to switch a jina install):
+
+```bash
+pharos embeddings enable                 # fresh: writes the granite-r2 provider
+pharos embeddings enable --force         # replaces an existing jina provider
+pharos daemon restart
+pharos embeddings status                 # prints the index command for every project without vectors
+pharos index --full <root path>          # per project; embeds it (`index` takes the directory, not the name)
+```
+
+The block written to `~/.pharos/config.json` (you can also paste it by hand):
+
+```json
+{
+  "embeddingProviders": [
+    {
+      "modelId": "granite-r2",
+      "type": "djl",
+      "url": "hf://onnx-community/granite-embedding-english-r2-ONNX@2a49b9c076aa627b14bc528b36b67462808ccc23",
+      "dimensions": 768,
+      "maxTokens": 512,
+      "pooling": "cls"
+    }
+  ],
+  "searchEmbeddingModel": "granite-r2"
+}
+```
+
+`enable` only edits the config and never embeds. `pharos embed` is not the way to embed a keyword-only
+project: it adds a model next to existing vectors only, and fails on an index that has none. Embedding caches are per model and do not carry over, so the
+first embed covers everything: expect hours for a large project on CPU (10.9 h for the lucene source tree in the
+A/B, against about 30 min for jina from cache). Peak memory is about 2.8 GB (jina about 2.3 GB). To stay on jina
+change nothing; `pharos embeddings status` shows what is configured and which projects have vectors.
 
 ## Invalid project names (e.g. ".")
 
@@ -68,35 +238,6 @@ directory. If you also have a project named `lucene`, the `.` project may have p
 `segments_N` and `write.lock` directly in `indexes/lucene/`; those two may go too. The real
 `lucene` index lives one level down, in `indexes/lucene/lucene/`: never touch that folder.
 **Never delete project subdirectories** of the indexes directory.
-
-## Work-queue writers (multi-node)
-
-`role: writer` nodes now run the work queue by default (`cluster.writer.workQueue: true`). On such a
-writer:
-
-- **Upgrading is restarting it on the new release.** Its work loop gives every shard it holds a full
-  run when this release needs one (an older local or published index format, a broken graph pointer,
-  files embedded under another chunking version or model) and re-publishes it, without a source
-  change. `pharos upgrade-indexes` and `./setup.sh --upgrade-indexes` refuse there (exit 5), as do
-  `remove-index` and `embed` (exit 2): they would change the indexes under the running loop. The
-  "Steps" of a format upgrade below apply to single nodes and hand-run writers
-  (`"writer": {"workQueue": false}`).
-- **`cluster.heartbeatSeconds` must be below `cluster.writer.leaseTtlSeconds`** (default 30), checked
-  at startup: a writer config from an earlier phase with `heartbeatSeconds` of 30 or more no longer
-  starts until you lower it (or raise the TTL).
-- **Disk guard default:** `cluster.writer.disk.minFreePercent` defaults to 0, so the threshold is
-  `minFreeBytes` (5 GiB). A percentage made writers on large disks permanently "low" (no lease
-  taken, nothing published); set one explicitly if you want it. A low writer logs a WARN once per
-  low episode.
-- **One work loop per node:** a second pharos daemon with the same config on the writer host (one
-  that `./pharos` starts on demand, say) runs no loop; it logs a WARN and serves everything else.
-
-## Cluster readers: `retireGraceSeconds` rules
-
-`cluster.retireGraceSeconds` (default 120) must be at least `2 x cluster.pollIntervalSeconds` and at
-least `cluster.fanoutTimeoutMillis / 1000` (default 5 s). A reader whose config breaks either rule
-refuses to start and names both fields; raise `retireGraceSeconds` (or lower the other value).
-Readers also need `cluster.token` (already required) for the new `/internal/*` shard API.
 
 ## Upgrading to 1.4.0 (index format 1)
 

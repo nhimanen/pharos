@@ -100,6 +100,26 @@ class IndexStatusCommandTest {
         assertThat(snapshot()).isEqualTo(before);
     }
 
+    @Test
+    void damagedCallGraphIsReportedWithoutWritingAnything() throws Exception {
+        Path graph = tmp.resolve("indexes").resolve("a").resolve("callgraph.arcadedb");
+        com.pharos.graph.DamagedGraphFixture.unpackCallGraph(graph);
+        Map<String, Long> before = snapshot();
+
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute("--json")).isZero();
+        JsonNode j = new ObjectMapper().readTree(out.toString());
+        Map<String, JsonNode> byName = new TreeMap<>();
+        j.get("projects").forEach(p -> byName.put(p.get("name").asText(), p));
+        assertThat(byName.get("a").get("graphDamage").asText()).contains("fqn has id 2, not 0");
+        assertThat(byName.get("b").get("graphDamage").isNull()).isTrue();
+
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry)).execute()).isZero();
+        assertThat(out.toString()).contains("warning: a: call graph has a damaged property dictionary")
+                .contains("pharos index --full");
+        assertThat(snapshot()).isEqualTo(before);
+    }
+
     private Map<String, Long> snapshot() throws Exception {
         Map<String, Long> m = new TreeMap<>();
         try (Stream<Path> s = Files.walk(tmp)) {
@@ -143,5 +163,29 @@ class IndexStatusCommandTest {
         assertThat(new CommandLine(new IndexStatusCommand(registry, com.pharos.cluster.NodeRole.READER))
                 .execute("--json")).isZero();
         assertThat(new ObjectMapper().readTree(out.toString()).get("role").asText()).isEqualTo("reader");
+    }
+
+    @Test
+    void needsReembedHintPrintsTheRootPathAndKeepsTheName() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(new CommandLine(new IndexStatusCommand(registry, true)).execute()).isZero();
+        assertThat(out.toString())
+                .contains("pharos index --full --single --project mis " + tmp.resolve("src-mis"))
+                .doesNotContain("pharos index mis");
+    }
+
+    @Test
+    void needsReembedOnlyWhenAnEmbeddingProviderIsConfigured() throws Exception {
+        VectorIndexFixture.register(registry, tmp, "mis", "vec.legacy");
+        assertThat(new CommandLine(new IndexStatusCommand(registry, false)).execute("--json")).isZero();
+        JsonNode j = new ObjectMapper().readTree(out.toString());
+        j.get("projects").forEach(p -> assertThat(p.get("needsReembed").asBoolean()).as(p.toString()).isFalse());
+        out.reset();
+        assertThat(new CommandLine(new IndexStatusCommand(registry, true)).execute("--json")).isZero();
+        boolean any = false;
+        for (JsonNode p : new ObjectMapper().readTree(out.toString()).get("projects")) {
+            if (p.get("name").asText().equals("mis")) any = p.get("needsReembed").asBoolean();
+        }
+        assertThat(any).isTrue();
     }
 }

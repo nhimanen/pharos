@@ -6,16 +6,26 @@ Metrics: Precision@1, Precision@3, MRR@10 per pipeline per category.
 Flags:
   --goldenset       also run goldenset evaluation after the main benchmark
   --goldenset-only  run only goldenset evaluation (skip 200-query benchmark)
+
+A/B mode (used by scripts/embedding-ab.sh; the default behaviour is unchanged):
+  --base-url URL    daemon to query (default http://localhost:7171)
+  --cache-file F    result cache (default eval/benchmark_cache.json; use a per-model file
+                    so results from different models never mix)
+  --projects a,b    restrict to queries of these projects
+  --pipelines a,b   restrict to these pipelines
+  --timeout S       per-request timeout in seconds (default 30)
+  --json-out F      write per-query ranks as JSON to F and skip the markdown report
 """
 import argparse, hashlib, json, os, sys, urllib.parse, urllib.request
 from collections import defaultdict
 
 BASE_URL = "http://localhost:7171"
 LIMIT = 10
+TIMEOUT = 30
 # Cache lives next to this script so results persist across sessions
 CACHE_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_cache.json")
 GOLDENSET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldenset.jsonl")
-PIPELINES = ["keyword", "auto", "vector", "unified", "hybrid", "hybrid-rrf", "hybrid-diverse", "hybrid-reranked", "hybrid-reranked-diverse"]
+ALL_PIPELINES = PIPELINES = ["keyword", "auto", "vector", "unified", "hybrid", "hybrid-rrf", "hybrid-diverse", "hybrid-reranked", "hybrid-reranked-diverse"]
 
 CAT_LABELS = {
     "A": "Exact name (single term)",
@@ -249,7 +259,7 @@ def api_search(query: str, project: str, pipeline: str) -> list:
             params["project"] = proj
         url = f"{BASE_URL}/api/search?" + urllib.parse.urlencode(params)
         try:
-            with urllib.request.urlopen(url, timeout=30) as r:
+            with urllib.request.urlopen(url, timeout=TIMEOUT) as r:
                 data = json.loads(r.read())
                 # unwrap envelope format {"results": [...], "searchMeta": {...}}
                 if isinstance(data, dict):
@@ -414,7 +424,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--goldenset",      action="store_true", help="Run goldenset eval after main benchmark")
     parser.add_argument("--goldenset-only", action="store_true", help="Run only goldenset eval")
+    parser.add_argument("--base-url",   default=None, help="Daemon base URL (default http://localhost:7171)")
+    parser.add_argument("--cache-file", default=None, help="Result cache file (default eval/benchmark_cache.json)")
+    parser.add_argument("--projects",   default=None, help="Comma-separated project filter")
+    parser.add_argument("--pipelines",  default=None, help="Comma-separated pipeline filter")
+    parser.add_argument("--timeout",    type=int, default=None, help="Per-request timeout, seconds")
+    parser.add_argument("--json-out",   default=None, help="Write per-query ranks as JSON and skip the markdown report")
     args = parser.parse_args()
+
+    global BASE_URL, CACHE_FILE, TIMEOUT, QUERIES, PIPELINES
+    if args.base_url:   BASE_URL = args.base_url.rstrip("/")
+    if args.cache_file: CACHE_FILE = args.cache_file
+    if args.timeout:    TIMEOUT = args.timeout
+    if args.projects:
+        wanted = set(args.projects.split(","))
+        QUERIES = [q for q in QUERIES if q[2] in wanted]
+    if args.pipelines:
+        PIPELINES = [pl for pl in args.pipelines.split(",") if pl]
+        unknown = [pl for pl in PIPELINES if pl not in ALL_PIPELINES]
+        if unknown:
+            sys.exit(f"unknown pipeline(s): {unknown}")
+    if not QUERIES:
+        sys.exit("no queries selected")
 
     cache = _load_cache()
 
@@ -455,6 +486,21 @@ def main():
         for pl in PIPELINES:
             entry = cache.get(f"{idx}:{pl}", {})
             raw[(idx, pl)] = entry.get("results", [])
+
+    if args.json_out:
+        ranks_out = {pl: {str(idx): hit_rank(raw[(idx, pl)], gt_id)
+                          for (idx, query, project, cat, gt_id, conf) in QUERIES}
+                     for pl in PIPELINES}
+        empty = {pl: sum(1 for (idx, *_rest) in QUERIES if not raw[(idx, pl)]) for pl in PIPELINES}
+        out = {"base_url": BASE_URL, "limit": LIMIT, "pipelines": PIPELINES,
+               "empty_result_queries": empty,
+               "queries": [{"idx": i, "query": q, "project": p, "category": c, "gt_id": g, "confidence": cf}
+                           for (i, q, p, c, g, cf) in QUERIES],
+               "ranks": ranks_out}
+        with open(args.json_out, "w") as f:
+            json.dump(out, f, indent=1)
+        print(f"Wrote {args.json_out} ({len(QUERIES)} queries x {len(PIPELINES)} pipelines)", file=sys.stderr)
+        return
 
     print("Computing metrics...", file=sys.stderr)
 
