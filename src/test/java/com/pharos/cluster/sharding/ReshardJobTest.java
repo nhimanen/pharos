@@ -121,10 +121,12 @@ public class ReshardJobTest {
             return super.parseFile(file, projectName);
         }
 
+        // the abortable variant (1.9.0): every batch goes through it, the 3-argument one included
         @Override
-        public ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName) throws IOException {
+        public ParsedProject parseFiles(List<Path> files, Path projectRoot, String projectName,
+                                        com.pharos.indexer.IndexAbort abort) throws IOException {
             parsed.addAll(files);
-            return super.parseFiles(files, projectRoot, projectName);
+            return super.parseFiles(files, projectRoot, projectName, abort);
         }
     }
 
