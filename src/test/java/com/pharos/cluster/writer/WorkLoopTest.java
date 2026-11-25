@@ -1306,6 +1306,40 @@ class WorkLoopTest {
     }
 
     /**
+     * 1.11.0 merge (1.9.0's abort on a definite loss × Phase 6's split projects): a split project's
+     * run holds one lease per ring shard, under the project's work unit. Another writer taking any of
+     * them aborts the run, as for an unsplit shard; matching the lost lease against the unit's id only
+     * (the project name, never a ring shard's) let the run parse on for nothing.
+     */
+    @Test
+    void lostLeaseOfOneRingShardAbortsTheSplitProjectsRun() throws Exception {
+        List<ShardId> ring = splitProject("big", 12);
+        SlowParser parser = new SlowParser();
+        Writer a = new Writer("node-a", null, SourceCheckout::new, parser);
+        a.loop.tick();
+        Optional<Generation> before = latest(ring.get(1));
+        assertThat(before).contains(Generation.FIRST);
+        change(new ShardId("big"), "slow");
+        Files.writeString(a.lucene.getProjectIndexDir("big").resolve(WorkLoop.FULL_RUN_REQUIRED), "");
+        clock.advance(10);
+        parser.armed.set(true);
+        Thread runner = new Thread(a.loop::tick, "test-tick");
+        runner.setDaemon(true);
+        runner.start();
+        assertThat(parser.inParse.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        // another writer took the second ring shard's lease meanwhile
+        store.put(layout.leaseKey(ring.get(1)), "{\"writer\":\"node-x\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        a.loop.leaseManager().renewAll();
+
+        runner.join(10_000);
+        assertThat(runner.isAlive()).as("the run stopped").isFalse();
+        assertThat(parser.aborted).as("aborted inside its parse").isTrue();
+        for (ShardId s : ring) assertThat(latest(s)).isEqualTo(before);
+        assertThat(warnings()).anyMatch(m -> m.contains("lost") && m.contains("aborting the run"));
+    }
+
+    /**
      * Review I1: a renewal that fails without a definite answer (an I/O error or its deadline on a
      * slow bucket) may leave the lease ours. Aborting would throw a full run away and the next run
      * would be full again; on a bucket slow often enough the shard would never publish. Such a run

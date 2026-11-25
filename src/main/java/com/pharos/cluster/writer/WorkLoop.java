@@ -373,7 +373,8 @@ public final class WorkLoop implements Closeable {
      */
     private void leaseLost(LeaseManager.Lost lost) {
         Run r = current;
-        if (r == null || !r.shard.equals(lost.shard())) return;
+        // a split project's run holds one lease per shard under its unit (the project's id): any of them counts
+        if (r == null || !(r.shard.equals(lost.shard()) || r.leaseShards.contains(lost.shard()))) return;
         if (!lost.definite()) {
             log.info("Shard {}: writer {} could not confirm its lease ({}); the run goes on, its publish re-checks"
                     + " the lease", lost.shard(), settings.node(), lost.why());
