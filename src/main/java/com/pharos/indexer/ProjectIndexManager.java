@@ -1238,7 +1238,7 @@ public class ProjectIndexManager {
         IndexFormat.write(projectIndexDir);
 
         log.info("Full index complete for '{}': {} methods, {} classes, {} files",
-                meta.getMethodCount(), meta.getClassCount(), meta.getFileCount(), projectName);
+                projectName, meta.getMethodCount(), meta.getClassCount(), meta.getFileCount());
 
         if (buildSynonyms && anyChanges[0]) {
             progress.onProgress("Mining synonyms", 0, 0);
