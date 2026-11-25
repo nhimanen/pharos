@@ -62,9 +62,18 @@ Single nodes: the format change makes each project's next `pharos index` a full 
   writer published, e.g. a writer scale-down and up that kept its disk) catches up with a full
   run before it splits the project, so the new version never lacks that writer's files.
 - Writer leases on a reshard: another writer taking any shard lease of the project (or the reshard
-  lease) aborts the running build at its next safe point and releases the reshard lease at once; a
-  renewal that only fails to get an answer from a slow bucket does not (as for index runs since
-  1.9.0), so the build is not thrown away and the reshard stays with its writer.
+  lease) aborts the running build at its next safe point and releases the reshard lease within one
+  renewal interval of the writer seeing it; a renewal that only fails to get an answer from a slow
+  bucket does not (as for index runs since 1.9.0), so the build is not thrown away and the reshard
+  stays with its writer.
+- A lease loss without a definite answer (a renewal's I/O error or timeout) is now resolved while
+  the run or reshard build goes on: every renewal round re-reads such a lease until the bucket
+  answers, reclaims it when it is untouched (still this writer's last write) and treats it as taken
+  otherwise. Before, nothing re-read it during a run, so only runs shorter than about one lease TTL
+  survived a bucket blip: a longer one lost its lease to expiry, kept working for nothing (holding
+  the reshard lease, which blocked the project's new owner), and failed at its publish. Now a long
+  run or build survives the blip and publishes, and one whose lease was taken meanwhile is aborted,
+  and its reshard lease released, within a renewal interval of the bucket answering.
 - Resharding is visible: `/cluster/status` gains `projects[]` (a split project is one entry over
   its shards, with its staged and retired spec versions and the reshard's phase — requested,
   building, pinned, flipped, abandoned — progress in shards and in files, and the reshard lease
