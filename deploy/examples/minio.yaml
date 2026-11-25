@@ -9,7 +9,7 @@ metadata:
   name: demo
   namespace: pharos
 spec:
-  version: "1.6.0"                    # pharos image tag
+  version: "1.11.0"                   # pharos image tag (ghcr.io/<owner>/pharos:<version>; 1.11.0 is the first published)
   storage:
     minio:
       storage: 20Gi                   # MinIO PVC size
@@ -56,8 +56,8 @@ spec:
       - { cron: "0 8 * * 1-5", timezone: Europe/Helsinki, readers: { min: 4 } }
       - { cron: "0 18 * * 1-5", timezone: Europe/Helsinki, readers: { min: 2 } }
   pharosConfig: {}                    # extra keys merged into cluster.* (validated by ClusterConfig)
-  # e.g. split a large project into ring shards (or reshard it live: pharos reshard in a writer pod):
+  # Split a large project into ring shards live with `pharos reshard lucene --spec "[project, ring(path,
+  # shards=4)]"` in a writer pod or a one-off Job (cluster.sharding in pharosConfig is validated, not applied).
   #   pharosConfig:
-  #     sharding: {projects: {lucene: "[project, ring(path, shards=4)]"}}
   #     writer.reshardSyncTimeoutSeconds: 600
   #     reader.previousGenerationGraceSeconds: 45   # unset: max(30, 15 + 2 x heartbeatSeconds)

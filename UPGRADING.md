@@ -1,36 +1,68 @@
 # Upgrading
 
-## Index format 2 (search key filters)
+## Upgrading to 1.11.0
 
-### What changed
+Index format: 1 → 2. This release brings multi-node sharding and live resharding (Phase 6) and the
+Kubernetes operator. Documents now carry key fields (module directory, directory prefixes, file
+extension, file kind) for the `module`, `pathPrefix`, `language` and `kind` search filters and the
+shard keys; that is index format 2.
 
-Documents now carry key fields (module directory, directory prefixes, file extension, file kind)
-for the `module`, `pathPrefix`, `language` and `kind` search filters. That is index format 2.
+### What keeps working without a re-index
 
-### What you need to do
-
-Nothing, unless you want the filters:
+Under the N-1 rule a release serves its own format and the one before it:
 
 - A format-1 index keeps working unchanged for every unfiltered search, call-graph and lookup
   query (status `upgrade-available` in `pharos index-status`).
 - A *filtered* search over a format-1 project is refused with a message naming the project and the
   fix (`pharos index --full <project>`; the web API answers 409, `pharos search` exits 4). It is
   never answered silently empty.
-- The next index run of a project (incremental or not) is a full one, which writes format 2;
-  `pharos upgrade-indexes` re-indexes every project.
-- Format-0 indexes (before 1.x stamps) are now outside the read window (N-1 = 1) and must be
-  re-indexed.
+- **Format-0 indexes** (written before 1.4.0's stamps) are now outside the read window (N-1 = 1):
+  re-index them before upgrading, or right after (`pharos upgrade-indexes` lists and re-indexes them).
+  `pharos upgrade-indexes --check` on the new jar reports, without changing anything, what it would
+  refuse (exit 3).
 
-**Clusters:** readers serve format-1 generations unfiltered until the writers republish at
-format 2. Upgrade readers before relying on filters: a coordinator skips readers that do not
-advertise filter support (with a warning) for filtered queries.
+### Single node
 
-**Resharding:** finish the rolling upgrade before running `pharos reshard`. A node of an older
-release can't read split shard ids (`p~ring=…`) and never prepares a reshard's new version, so while
-a reader of an older release heartbeats, `pharos reshard` is refused (exit 1, naming the nodes) and
-an already open reshard holds before staging and before its flip (past
-`reshardSyncTimeoutSeconds` too); `pharos reshard <p> --status` shows why it waits. It goes on
-once every live reader runs this release.
+Restart on the new jar. The next index run of each project (incremental or not) is a full one, which
+writes format 2; `pharos upgrade-indexes` re-indexes every project now. Embeddings come from the
+embedding cache, so only the parse and the Lucene write are repeated. The call-graph advice of 1.10.0
+below still applies if you skipped that release.
+
+### Clusters (object-store backend)
+
+1. **Check first:** `pharos upgrade-indexes --check` with the new jar against the bucket (any role;
+   the operator runs it as its pre-flight Job). Exit 3 names the shards 1.11.0 would refuse (format 0
+   generations); republish those on 1.10.0 first.
+2. **Readers first, then writers, then the router.** A 1.11.0 reader serves the writers' format-1
+   generations (unfiltered) until they are republished. Upgrade readers before relying on filters: a
+   coordinator skips readers that do not advertise filter support (with a warning) for filtered
+   queries.
+3. **Writers:** restarted on 1.11.0, a work-queue writer re-indexes and republishes every shard it holds
+   at format 2 (a full run each; the published format is older than the one it writes), so the cluster
+   upgrades itself shard by shard. Size the writers' disk and time for one full run of every project.
+   Writers without the work queue: run `pharos upgrade-indexes` (or `pharos index --full`) on the writer.
+4. **Then reshard, if you want to.** Finish the rolling upgrade before running `pharos reshard`. A node of
+   an older release can't read split shard ids (`p~ring=…`) and never prepares a reshard's new version,
+   so while a reader of an older release heartbeats, `pharos reshard` is refused (exit 1, naming the
+   nodes) and an already open reshard holds before staging and before its flip (past
+   `reshardSyncTimeoutSeconds` too); `pharos reshard <p> --status` shows why it waits. It goes on once
+   every live reader runs this release. After a reshard, do not roll a reader back to 1.10.0: it cannot
+   read the split project's shards.
+5. Projects are split only by `pharos reshard`. `cluster.sharding` in `config.json` is validated at
+   startup but not applied in 1.11.0, so setting it changes nothing.
+
+Peer-pull clusters (`cluster.backend: peer-pull`): the format change applies the same way; sharding
+and resharding need the object-store backend.
+
+### Kubernetes operator (new)
+
+The operator is new in 1.11.0; there is nothing to migrate. To move an existing bucket cluster under
+it, point a `PharosCluster` with `storage.s3` at the same bucket, with `spec.version: "1.11.0"` (images
+`ghcr.io/<owner>/pharos:1.11.0` and `ghcr.io/<owner>/pharos-operator:1.11.0`). The operator owns
+`cluster.objectStore` and always uses the default prefix `pharos`, so this works only for a cluster
+that kept that prefix. Stop the hand-run writers first, so only the operator's writers take leases.
+The CHANGELOG has the install steps.
+
 ## Upgrading to 1.10.0
 
 Index format: 1 (unchanged). Peer pull changes nothing for single-node installs (`role: all`) or for

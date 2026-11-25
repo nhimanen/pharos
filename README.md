@@ -592,7 +592,7 @@ A `role: writer` node runs the **work queue** by default (`cluster.writer.workQu
 
 ### Resharding a project
 
-A project is split into shards by its **shard spec** (`cluster.sharding`; object-store clusters only): `[project]` (the default, one shard), `[project, module]`, `[project, ring(path, shards=8)]`, `[language]` and so on. Changing it live is one command:
+A project is split into shards by its **shard spec** (object-store clusters only): `[project]` (the default, one shard), `[project, module]`, `[project, ring(path, shards=8)]`, `[language]` and so on. Every project starts as `[project]`; `pharos reshard` sets and changes its spec, live. (`cluster.sharding.default` and `cluster.sharding.projects.<name>` in `config.json` are validated at startup but not applied yet in 1.11.0.) It is one command:
 
 ```bash
 pharos reshard lucene --spec "[project, ring(path, shards=4)]"   # request (a new spec version)
