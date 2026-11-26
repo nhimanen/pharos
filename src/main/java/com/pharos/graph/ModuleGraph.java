@@ -35,6 +35,10 @@ import java.util.stream.Stream;
  */
 public class ModuleGraph implements AutoCloseable {
 
+    static {
+        ArcadeDbSettings.apply(); // before any database opens: stay readable by ArcadeDB 25.1.1
+    }
+
     private static final Logger log = LoggerFactory.getLogger(ModuleGraph.class);
 
     private final Database db;
@@ -58,7 +62,7 @@ public class ModuleGraph implements AutoCloseable {
     public static ModuleGraph open(Path dbDir) {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
         boolean created = !factory.exists();
-        Database db = created ? factory.create() : factory.open();
+        Database db = created ? CallGraph.createSettled(dbDir) : factory.open(); // ArcadeDB #13441
         if (!created) {
             String damage = CallGraph.dictionaryProblem(db, DICTIONARY_ORDER);
             if (damage != null) {
@@ -73,19 +77,10 @@ public class ModuleGraph implements AutoCloseable {
                 log.warn("The module graph {} had a {} (written by pharos before 1.10.0) and was rebuilt empty; "
                         + "each project's modules and dependencies return when it is next indexed "
                         + "(pharos index <project>)", dbDir, damage);
-                created = true;
-                db = factory.create();
+                db = CallGraph.createSettled(dbDir);
             }
         }
-        if (created) {
-            try {
-                CallGraph.awaitDictionaryOnDisk(db); // same ArcadeDB race as a new call graph
-            } catch (RuntimeException e) {
-                db.close();
-                throw e;
-            }
-        }
-        db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
+        db.setAsyncFlush(false); // database-wide since ArcadeDB 26: close() returns with the pages on disk
         initSchema(db);
         return new ModuleGraph(db);
     }

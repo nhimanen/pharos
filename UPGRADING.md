@@ -1,5 +1,28 @@
 # Upgrading
 
+## Upgrading to 1.12.0
+
+Index format: unchanged. Readers switch to deterministic vector arithmetic (README, "Multi-node CPU
+determinism"); nothing to re-index.
+
+- **Graph store: ArcadeDB 25.1.1 → 26.11.1, no step.** 1.12.0 opens 1.11.x graphs as they are, and it turns
+  off ArcadeDB 26's super-node promotion and bloom filters, so 1.11.x can still read the graphs 1.12.0 writes.
+  A downgrade or a mixed 1.11.x/1.12.0 cluster during the rollout needs no re-index.
+- **Cluster fan-out, mixed versions.** A 1.11.x reader ignores the new optional `statsCheck` field of
+  `/internal/shard-search`; the coordinator runs the separate statistics round with it, as before.
+- **Kubernetes operator: one rolling restart of every pharos pod.** The operator renders a new env var,
+  `PHAROS_ARITHMETIC`, on every writer, reader and router pod (and the project Jobs). That changes every pod
+  template, so the first reconcile after the operator upgrade rolls all pharos pods, even when `spec.version`
+  pins an older pharos image. On an older image the variable is ignored, so the restart is harmless, but it
+  is a full rollout: schedule the operator upgrade as you would a release rollout (readers drain one at a
+  time under their PodDisruptionBudget).
+- **Mixed readers during the rollout.** Until every reader runs this release, old readers keep Lucene's
+  per-CPU arithmetic: exact ties can still order differently between old and new replicas, as before. The
+  new readers' WARN about differing profiles ignores old readers' heartbeats (they carry no profile).
+- **Custom launchers.** A reader started without the deterministic flags now logs a WARN naming them; to accept native
+  arithmetic, set `PHAROS_ARITHMETIC=native` with a pharos launcher, or pass `-Dpharos.arithmetic=native`
+  (what that sets) in your own.
+
 ## Upgrading to 1.11.0
 
 Index format: 1 → 2. This release brings multi-node sharding and live resharding (Phase 6) and the

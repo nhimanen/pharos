@@ -94,6 +94,7 @@ public final class ProjectJobRenderer {
         env.add(plain("PHAROS_ROLE", Role.WRITER.id()));
         env.add(plain("PHAROS_HOME", ConfigRenderer.PHAROS_HOME));
         env.add(plain("PHAROS_CONFIG", WorkloadRenderer.CONFIG_MOUNT + "/" + ConfigRenderer.CONFIG_KEY));
+        env.add(plain(WorkloadRenderer.ARITHMETIC_ENV, WorkloadRenderer.arithmetic(Role.WRITER)));
         env.add(StorageRenderer.secretEnv(ConfigRenderer.TOKEN_ENV, Names.token(name), WorkloadRenderer.TOKEN_KEY));
         env.addAll(StorageRenderer.credentialsEnv(cluster));
         return new JobBuilder()

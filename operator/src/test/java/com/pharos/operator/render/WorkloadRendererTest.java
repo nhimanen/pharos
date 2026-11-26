@@ -166,6 +166,25 @@ class WorkloadRendererTest {
         }
     }
 
+    /** Ruling CPU-R1: readers ask the entrypoint for the deterministic vector arithmetic, the rest for native. */
+    @Test
+    void readersRunDeterministicArithmetic() {
+        PharosCluster c = TestClusters.minio();
+        DesiredState s = state(c);
+        assertThat(env(main(s.get(DesiredState.READERS, StatefulSet.class).getSpec().getTemplate()), "PHAROS_ARITHMETIC")
+                .getValue()).isEqualTo("deterministic");
+        assertThat(env(main(s.get(DesiredState.WRITERS, StatefulSet.class).getSpec().getTemplate()), "PHAROS_ARITHMETIC")
+                .getValue()).isEqualTo("native");
+        assertThat(env(main(s.get(DesiredState.ROUTER, Deployment.class).getSpec().getTemplate()), "PHAROS_ARITHMETIC")
+                .getValue()).isEqualTo("native");
+        for (PodTemplateSpec t : pharosPods(s)) {
+            assertThat(main(t).getEnv()).noneMatch(e -> e.getName().equals("JAVA_OPTS")); // nothing overrides it
+        }
+        var job = ProjectJobRenderer.job(c, SETTINGS, "1.6.0", "demo-index-x", "index", Map.of(), List.of("index"));
+        Container jc = job.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(env(jc, "PHAROS_ARITHMETIC").getValue()).isEqualTo("native");
+    }
+
     @Test
     void pdbsAreMaxUnavailableOne() {
         DesiredState s = state(TestClusters.minio());

@@ -501,7 +501,7 @@ public final class ClusterRuntime implements Closeable {
         return new com.pharos.cluster.membership.ReaderHeartbeat(c.effectiveNodeId(), c.getAdvertiseUrl(), shards,
                 draining, readerCacheStats(), load.inFlight(), load.qps(), 0L, state, degraded, load.warmP95Millis(),
                 catalogAge, Boolean.TRUE, // applies key filters on /internal search (P6-R12)
-                generations, prepared, retained);
+                generations, prepared, retained, ArithmeticProfile.effective());
     }
 
     // Holding the monitor of this.
@@ -1119,6 +1119,7 @@ public final class ClusterRuntime implements Closeable {
             }
             if (advertise) startMembership();
         }
+        if (advertise) logArithmetic(ArithmeticProfile.effective());
         if (advertise) {
             // On a signal the drain runs before any shutdown hook (ONNX Runtime's environment closer
             // among them), while queries that call the models are still served.
@@ -1128,6 +1129,20 @@ public final class ClusterRuntime implements Closeable {
             }
         }
         modelsLoaded.whenComplete((r, e) -> maybeBecomeReady());
+    }
+
+    /**
+     * Ruling CPU-R1: a serving reader states its vector arithmetic, and warns when it is not the deterministic
+     * setting (the JVM flags are fixed at launch: nothing here can change them).
+     */
+    static void logArithmetic(ArithmeticProfile p) {
+        String warning = p.startupWarning();
+        if (warning == null) {
+            log.info("Vector arithmetic: {} ({})", p.summary(),
+                    p.isDeterministic() ? "deterministic" : "native, as PHAROS_ARITHMETIC asks");
+        } else {
+            log.warn(warning);
+        }
     }
 
     /** The first sync is served; ready now if the models have settled too. */

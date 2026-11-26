@@ -12,7 +12,7 @@
     <parent>
         <groupId>com.pharos</groupId>
         <artifactId>pharos-parent</artifactId>
-        <version>1.11.1</version>
+        <version>1.12.0</version>
     </parent>
 
     <artifactId>pharos</artifactId>
@@ -67,7 +67,7 @@
         <dependency>
             <groupId>com.arcadedb</groupId>
             <artifactId>arcadedb-engine</artifactId>
-            <version>25.1.1</version>
+            <version>26.11.1</version>
         </dependency>
 
         <!-- ===== DJL + ONNX Runtime (optional vector embeddings) ===== -->

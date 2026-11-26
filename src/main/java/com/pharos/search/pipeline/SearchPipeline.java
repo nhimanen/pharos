@@ -64,6 +64,15 @@ public final class SearchPipeline {
     @FunctionalInterface
     public interface StageRunner {
         List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace) throws IOException;
+
+        /**
+         * Called once per pipeline run, before its first stage, with the stages it will run in order
+         * (a {@link RouterDispatcher}'s child pipeline calls it again with its own) and the request they
+         * get: a runner may start work the stages will need (the coordinator embeds the query meanwhile).
+         * It must not change what the stages return.
+         */
+        default void beforeRetrieval(List<RetrievalStage> stages, SearchRequest req) {
+        }
     }
 
     public List<SearchResult> execute(IndexReader reader, SearchRequest req,
@@ -95,6 +104,11 @@ public final class SearchPipeline {
 
         // ── Retrieval ─────────────────────────────────────────────────────────
         List<List<SearchResult>> candidates = new ArrayList<>(retrievers.size());
+        if (runner != null) {
+            List<RetrievalStage> leaves = new ArrayList<>(retrievers.size());
+            for (RetrievalStage r : retrievers) if (!(r instanceof RouterDispatcher)) leaves.add(r);
+            if (!leaves.isEmpty()) runner.beforeRetrieval(List.copyOf(leaves), fetchReq);
+        }
         for (RetrievalStage r : retrievers) {
             List<SearchResult> list;
             if (runner == null) {

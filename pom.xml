@@ -13,7 +13,7 @@
     -->
     <groupId>com.pharos</groupId>
     <artifactId>pharos-parent</artifactId>
-    <version>1.11.1</version>
+    <version>1.12.0</version>
     <packaging>pom</packaging>
     <name>pharos-parent</name>
     <description>Pharos build: the pharos application, its shared api module and the Kubernetes operator</description>
@@ -77,6 +77,19 @@
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-databind</artifactId>
                 <version>${jackson.version}</version>
+            </dependency>
+            <!-- ArcadeDB 26.x pulls these Lucene modules at its own Lucene version (10.5.x, for
+                 its geospatial index, which pharos does not use). Pinned to pharos' Lucene so the
+                 fat jar carries a single Lucene release. -->
+            <dependency>
+                <groupId>org.apache.lucene</groupId>
+                <artifactId>lucene-spatial-extras</artifactId>
+                <version>${lucene.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.lucene</groupId>
+                <artifactId>lucene-spatial3d</artifactId>
+                <version>${lucene.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.junit.jupiter</groupId>

@@ -3,6 +3,100 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [1.12.0] - 2026-11-26
+
+**Index format:** 2 (unchanged)
+
+Three changes: the graph store moves to ArcadeDB 26.11.1, multi-node readers score vectors with the same bits on
+every CPU, and a cluster fan-out query needs fewer and shorter round trips. No re-index is needed.
+
+### Upgrade notes
+- **No re-index.** The index format stays 2, and 1.12.0 opens every 1.11.x index and graph as it is.
+- **Graphs stay readable by 1.11.x.** pharos runs ArcadeDB 26 with super-node promotion and bloom filters
+  turned off (`ArcadeDbSettings`), so the graph files it writes can still be opened by 1.11.x's ArcadeDB 25.1.1.
+  A downgrade, or a cluster that mixes 1.11.x and 1.12.0 nodes during a rollout, needs no extra step.
+- **Readers switch to deterministic arithmetic.** A node with the reader role now starts with Lucene's scalar
+  vector code and FMA off. This costs 0.1–0.2 ms per KNN query on a 50k-vector shard. To keep the per-CPU
+  code, set `PHAROS_ARITHMETIC=native`; that also silences the reader's startup WARN. Writers, routers and
+  single nodes are unchanged. Until every reader runs 1.12.0, old and new replicas can still order exact ties
+  differently, as before.
+- **Kubernetes operator: the first upgrade rolls every pharos pod.** The operator now sets
+  `PHAROS_ARITHMETIC` on every pharos pod and Job, so every pod template changes, and the first reconcile
+  after the operator upgrade restarts all pharos pods once. This happens even with `spec.version` pinned to an
+  older image, where the variable is ignored. Schedule it as you would a release rollout; see UPGRADING.md.
+- **Mixed-version fan-out.** `/internal/shard-search` gains the optional `statsCheck` request field and
+  `shardStats` response field. A 1.11.x reader ignores them. The coordinator then runs the separate statistics
+  round with that reader, as before, and does not ask it again for 10 minutes.
+
+### Changed
+- ArcadeDB, which stores the call graph, the module graph and the cross-project graph, is upgraded from
+  25.1.1 to 26.11.1. No re-index is needed: 26.11.1 opens graphs written by 25.1.1 as they are and keeps
+  writing them in their layout (a full re-index starts a new graph with 26.11.1's smaller dictionary
+  page), and 1.11.1 still reads graphs this release wrote, so a downgrade or a mixed-version cluster needs
+  no step either (readers import the published `graph.cgf.gz`, pharos' own format, which did not change).
+  To keep that true pharos turns off two ArcadeDB 26 features that write files 25.1.1 cannot read
+  correctly: super-node promotion (`arcadedb.graph.supernodeThreshold=0`; a vertex past about 4,096 edges
+  in one direction, such as lucene's `Override` with 54,963 `annotated_by` edges or `Document#add` with
+  5,692 callers, would otherwise move one way to a striped layout with a record type 25.1.1 refuses) and index bloom filters (`arcadedb.indexBloomFilterRate=0`; 25.1.1 ignores them, so a
+  later 26 open would trust filters that miss the keys 25.1.1 added). 26.11.1 also fixes a 25.1.1 bug where
+  a database occasionally reopened with no records after it was closed.
+- A new graph database is now closed and reopened right after ArcadeDB creates it, so no write from its
+  creation is still queued when the schema is added. This is the workaround for ArcadeDB
+  [#13441](https://github.com/ArcadeData/arcadedb/issues/13441), which 26.11.1 still has. It replaces the
+  1.10 workaround, which polled the dictionary file and called an ArcadeDB-internal wait.
+- Damaged-graph detection (`index-status`, `upgrade-indexes`, publishing) reads ArcadeDB 26's multi-page
+  dictionary file as well as 25.1.1's single-page one.
+- A full index no longer truncates and rebuilds the indexes of the graph database it has just created
+  (empty by construction). On ArcadeDB 26 that in-place rebuild of empty indexes made later lookups log
+  "Compacted index … main page 0 has totalPages=N" (1,513 warnings for one lucene index, while the lookups
+  were still right) and cost about 2 s; the graph phase of a lucene full index now takes 7.1 s, against
+  6.8 s on 1.11.1 on the same machine.
+- Indexed projects that use libraries pharos itself bundles can resolve slightly more or fewer calls,
+  because JavaParser's reflection solver sees pharos' own classpath, which ArcadeDB 26 changes (lucene:
+  +6,645 resolved calls, +2.8 %; pharos' own sources: −2, through the changed ArcadeDB API).
+- The fat jar keeps a single Lucene release: the Lucene modules that ArcadeDB 26 adds are pinned to pharos'
+  Lucene version.
+- ArcadeDB 26 no longer prints its startup warnings (Truffle fallback runtime, channel interrupt) on every
+  command.
+- Multi-node: readers score vectors with the same bits on every CPU (ruling CPU-R1). Lucene picks fused
+  multiply-add and the SIMD width of its Vector API code per CPU, and that code also rounds differently before
+  and after the JIT compiles it, so replicas on Intel and AMD, with and without AVX-512, or a freshly started
+  one, scored the same document an ulp apart and could order exact ties differently in a fan-out. A reader
+  now runs Lucene's scalar vector code with FMA off (no `--add-modules jdk.incubator.vector`,
+  `-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false`): identical bits on every CPU, measured on an AMD
+  Ryzen 9700X and an Intel i5-1135G7, each also posing as AVX2-only, FMA-less and SSE-only hardware (aarch64
+  follows from Java's strict float semantics; not measured). It costs 0.1–0.2 ms per KNN query of a 50k-vector
+  shard; writers, routers and single nodes keep the faster per-CPU code. See the README,
+  "Multi-node CPU determinism".
+- `PHAROS_ARITHMETIC=deterministic|native` chooses it on every launcher: the image entrypoint (default
+  deterministic for `PHAROS_ROLE=reader`), the operator (renders it per role on pods and Jobs), `./pharos` and
+  `setup.sh`'s daemon start (deterministic when `config.json` has `cluster.role: reader`). The flags are read
+  when Lucene loads, so they cannot be set from `config.json`. Only an explicit `PHAROS_ARITHMETIC=native`
+  silences a reader's WARN; native as a launcher's role default passes `-Dpharos.arithmetic=native-default`.
+- Cluster fan-out: a hybrid query's coordinator embeds the query while the keyword stage's statistics and
+  search rounds run (unified: while its statistics round runs), on a bounded pool shared by the JVM
+  (`pharos-query-embed-*`, one thread per core, no queue: with every thread busy a query embeds when it needs
+  the vector, as before). Results, warnings, the query deadline and the re-plan are unchanged.
+- Cluster fan-out: a keyword round (keyword queries, hybrid's keyword stage) whose term statistics the
+  coordinator has from earlier queries (a bounded cache per shard generation) takes one round trip instead of
+  two: the search round goes out with the cached global statistics, and each remote shard returns its own
+  statistics of the same terms from the generation it searched. The answers are used only when every shard
+  confirms the cached ones, so scores are bitwise those of the statistics round; otherwise the query runs the
+  statistics round as before. Not used for split projects, key-filtered shards, pinned versions or capped term
+  sets. `/internal/shard-search` gains an optional `statsCheck` request field and `shardStats` response field;
+  an older reader ignores them and is not asked again for 10 minutes.
+- Cluster fan-out: vector snippet hints no longer call a remote shard that answered "no vectors of the model"
+  in the same query (it has no hints; a single node finds none either), and the hint calls of two or more
+  remote shards run in parallel instead of one after another.
+
+### Added
+- A reader logs its vector arithmetic at startup (`Vector arithmetic: fma=off simd=scalar canary=…`) and WARNs
+  when it is not the deterministic one, unless `PHAROS_ARITHMETIC=native` asked for that. It advertises the
+  profile in its heartbeat (`arithmetic`, absent from older readers' heartbeats), and the reader membership of
+  every reader and router WARNs once when the live readers' profiles differ.
+- `scripts/cpu-determinism.sh` measures Lucene's vector arithmetic under each flag set (score bits, KNN latency,
+  HNSW indexing throughput) and fails unless every deterministic configuration gives the same bits.
+
 ## [1.11.1] - 2026-11-26
 
 **Index format:** 2 (unchanged from 1.11.0)

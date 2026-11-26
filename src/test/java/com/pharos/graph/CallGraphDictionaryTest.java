@@ -138,7 +138,17 @@ class CallGraphDictionaryTest {
         DamagedGraphFixture.unpackCallGraph(damaged);
         Path odd = tmp.resolve("o.arcadedb");
         DamagedGraphFixture.createWithDictionary(odd, List.of("zeta", "fqn", "äö-name"));
-        for (Path dir : List.of(fresh, damaged, odd)) {
+        // ArcadeDB 26 rolls a full dictionary page over to the next (65,536-byte pages): 700 names
+        // of 101 bytes take two pages. The damaged sample is a one-page 25.1.1 file.
+        Path rolled = tmp.resolve("r.arcadedb");
+        List<String> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 700; i++) many.add(String.format("name-%04d-", i) + "x".repeat(91));
+        DamagedGraphFixture.createWithDictionary(rolled, many);
+        try (var files = Files.list(rolled)) {
+            Path dict = files.filter(f -> f.getFileName().toString().endsWith(".dict")).findFirst().orElseThrow();
+            assertThat(Files.size(dict)).as("rolled over").isEqualTo(2 * 65_536L);
+        }
+        for (Path dir : List.of(fresh, damaged, odd, rolled)) {
             var db = new com.arcadedb.database.DatabaseFactory(dir.toString()).open();
             Map<String, Integer> arcade;
             try {

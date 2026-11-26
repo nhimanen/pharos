@@ -270,6 +270,38 @@ class DistributedSearchTest {
     }
 
     /**
+     * A repeated query's keyword round is scored with cached statistics in one round trip, each remote shard
+     * confirming them: keyword results stay bitwise those of the single node, hybrid ones bitwise those of
+     * the coordinator that runs the statistics round (the control).
+     */
+    @Test
+    void cachedStatisticsScoreAsASingleNode() throws Exception {
+        DistributedSearch ds = a.ds();
+        int cached = 0;
+        for (String q : queries()) {
+            search(a, q, SearchType.KEYWORD, null, 10); // a statistics round: fills the cache
+            SearchResponse fan = search(a, q, SearchType.KEYWORD, null, 10);
+            String st = fan.trace().statistics();
+            if (st != null && st.endsWith("(cached, confirmed by the search round)")) cached++;
+            assertThat(fan.warnings()).as(q).isEmpty();
+            assertThat(bits(fan.results())).as("keyword " + q)
+                    .isEqualTo(bits(search(all, q, SearchType.KEYWORD, null, 10).results()));
+            SearchResponse hybrid = search(a, q, SearchType.HYBRID, null, 10);
+            ds.cachedStatistics = false;
+            try {
+                SearchResponse control = search(a, q, SearchType.HYBRID, null, 10);
+                assertThat(bits(hybrid.results())).as("hybrid " + q).isEqualTo(bits(control.results()));
+                assertThat(hybrid.warnings()).as("hybrid " + q).isEqualTo(control.warnings());
+            } finally {
+                ds.cachedStatistics = true;
+            }
+        }
+        System.out.printf("cachedStatisticsScoreAsASingleNode: %d of %d repeated queries used cached statistics%n",
+                cached, queries().size());
+        assertThat(cached).as("repeated queries served with cached statistics").isGreaterThan(queries().size() / 2);
+    }
+
+    /**
      * The control: the same keyword comparison with shard-local statistics must differ from the
      * single node on many queries, or the parity test above could not tell global statistics apart.
      */
@@ -827,6 +859,7 @@ class DistributedSearchTest {
     @Test
     void readerDyingAfterTermStatsIsRetriedOnItsReplica() throws Exception {
         try (Small s = small(2, null)) {
+            s.coordinator().ds().cachedStatistics = false; // the scenario needs the statistics round
             String q = "GreetingService farewell";
             List<String> expected = bits(search(s.coordinator(), q, SearchType.KEYWORD, null, 10).results());
             s.replicas().forEach(r -> { r.drainCalls(); r.dieAfterStats = true; });

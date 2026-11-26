@@ -10,11 +10,27 @@ import java.util.List;
  * {@code shapingIntent} is the intent the stage's own shaping would use (unified: it depends on
  * whether the vector pass ran); null for keyword and vector, whose intent the coordinator knows.
  * {@code recall}/{@code knn}/{@code chunkVectors} answer the first round of a two-round retriever.
+ * {@code shardStats} answers a request's {@link ShardSearchRequest.StatsCheck} (null otherwise).
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record ShardSearchResponse(long generation, int maxInDegree, List<RawCandidate> candidates,
                                   String shapingIntent, List<com.pharos.search.distributed.ScoredId> recall,
-                                  List<com.pharos.search.distributed.ScoredId> knn, boolean chunkVectors) {
+                                  List<com.pharos.search.distributed.ScoredId> knn, boolean chunkVectors,
+                                  @com.fasterxml.jackson.annotation.JsonInclude(
+                                          com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+                                  com.pharos.search.distributed.GlobalStats shardStats) {
+
+    public ShardSearchResponse(long generation, int maxInDegree, List<RawCandidate> candidates,
+                               String shapingIntent, List<com.pharos.search.distributed.ScoredId> recall,
+                               List<com.pharos.search.distributed.ScoredId> knn, boolean chunkVectors) {
+        this(generation, maxInDegree, candidates, shapingIntent, recall, knn, chunkVectors, null);
+    }
+
+    /** This answer with the shard's statistics of a {@link ShardSearchRequest.StatsCheck}. */
+    public ShardSearchResponse withShardStats(com.pharos.search.distributed.GlobalStats stats) {
+        return new ShardSearchResponse(generation, maxInDegree, candidates, shapingIntent, recall, knn, chunkVectors,
+                stats);
+    }
 
     public ShardSearchResponse(long generation, int maxInDegree, List<RawCandidate> candidates) {
         this(generation, maxInDegree, candidates, null);

@@ -2,6 +2,7 @@ package com.pharos.cluster.membership;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.pharos.cluster.ArithmeticProfile;
 
 import java.util.List;
 import java.util.Map;
@@ -28,6 +29,10 @@ import java.util.Map;
  * shard catalog. Both are nullable and omitted when null: a heartbeat from an older reader has
  * neither (and its "add readers" rule falls back to QPS only), a reader without requests in the last
  * minute has no p95, and one that never read the catalog has no age.
+ *
+ * <p>{@code arithmetic} (ruling CPU-R1) is the reader's Lucene vector arithmetic, whose canary tells whether two
+ * readers score the same document with the same bits ({@link ArithmeticDivergence} warns when they don't);
+ * null in an older reader's heartbeat.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record ReaderHeartbeat(String node, String advertiseUrl, List<String> shards, boolean draining,
@@ -38,7 +43,8 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
                               @JsonInclude(JsonInclude.Include.NON_NULL) Boolean filters,
                               @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> generations,
                               @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> prepared,
-                              @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> retained) {
+                              @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Long> retained,
+                              @JsonInclude(JsonInclude.Include.NON_NULL) ArithmeticProfile arithmetic) {
 
     public static final String WARMING = "warming";
     public static final String READY = "ready";
@@ -55,6 +61,16 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
                            Boolean filters) {
         this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, state, degradedShards,
                 warmP95Millis, catalogAgeSeconds, filters, null, null, null);
+    }
+
+    /** A heartbeat without its arithmetic profile (a reader before ruling CPU-R1). */
+    public ReaderHeartbeat(String node, String advertiseUrl, List<String> shards, boolean draining,
+                           Map<String, Object> readerCache, int inFlight, double qps, long startedAt,
+                           String state, List<String> degradedShards, Long warmP95Millis, Long catalogAgeSeconds,
+                           Boolean filters, Map<String, Long> generations, Map<String, Long> prepared,
+                           Map<String, Long> retained) {
+        this(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt, state, degradedShards,
+                warmP95Millis, catalogAgeSeconds, filters, generations, prepared, retained, null);
     }
 
     /** A heartbeat without retained previous generations (a reader before ruling P6-R19). */
@@ -162,6 +178,7 @@ public record ReaderHeartbeat(String node, String advertiseUrl, List<String> sha
     /** This heartbeat as a membership writes it: {@code draining} and the process start set. */
     public ReaderHeartbeat with(boolean draining, long startedAt) {
         return new ReaderHeartbeat(node, advertiseUrl, shards, draining, readerCache, inFlight, qps, startedAt,
-                state, degradedShards, warmP95Millis, catalogAgeSeconds, filters, generations, prepared, retained);
+                state, degradedShards, warmP95Millis, catalogAgeSeconds, filters, generations, prepared, retained,
+                arithmetic);
     }
 }

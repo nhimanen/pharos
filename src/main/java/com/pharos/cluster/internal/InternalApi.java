@@ -212,6 +212,8 @@ public final class InternalApi {
             if (r.queryVector() != null && r.queryVector().length > MAX_VECTOR_LENGTH) return "query vector too long";
             if (r.globalStats() != null && (r.globalStats().terms() != null && r.globalStats().terms().size() > MAX_ITEMS))
                 return "too many terms";
+            if (r.statsCheck() != null && (size(r.statsCheck().fields()) > MAX_ITEMS || size(r.statsCheck().terms()) > MAX_ITEMS))
+                return "too many fields or terms";
         } else if (req instanceof SnippetsRequest r) {
             if (size(r.ids()) > MAX_ITEMS) return "too many ids";
             if (r.queryVector() != null && r.queryVector().length > MAX_VECTOR_LENGTH) return "query vector too long";

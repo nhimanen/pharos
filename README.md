@@ -636,6 +636,39 @@ The web UI (`pharos web`, `./pharos web`) has a **Cluster** button next to *Modu
 
 The page follows `/cluster/events` and refetches the status on every event; when the stream is unavailable (a refused stream, more than 64 clients on the node, a proxy that drops it) it polls every 10 s and says so. On a single node (`role: all`) it shows one node holding every project.
 
+### Multi-node CPU determinism
+
+Readers on different CPU types score the same vector query with the same bits, so a fan-out orders exact score ties (identical methods, copied files) the same way whichever replica answers.
+
+**Why it needs a setting.** Lucene chooses its float-vector arithmetic per CPU, once, when it loads: fused multiply-add or not (`Constants.HAS_FAST_SCALAR_FMA` / `HAS_FAST_VECTOR_FMA`: on for Intel and AVX-512 AMD, partly off for AMD without AVX-512), and, with `--add-modules jdk.incubator.vector`, the SIMD width of its Vector API ("Panama") code (512 bits with AVX-512, 256 with AVX2, 128 on NEON). Both change the rounding or the summation order of a cosine, so the same document scores about one ulp apart on two readers. The SIMD width alone is enough: with FMA off on both, 512-bit and 256-bit runs differ for 384- and 768-dim vectors. The Panama code is not stable within one JVM either: its lane reductions round differently before and after C2 compiles them, so a just-started reader disagrees with itself, and the exact-scan bits vary from run to run.
+
+**Ruling CPU-R1.** A reader runs Lucene's *scalar* vector code with FMA off: no `--add-modules jdk.incubator.vector`, and `-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false`. Plain Java `float` arithmetic is strictly specified, so every JVM on every CPU computes the same bits, from the first query on. Writers, routers and single nodes keep Lucene's per-CPU choice: a writer's arithmetic only shapes the HNSW graph it publishes (readers search copies of it), and a router does no vector math. FMA *forced on* was rejected: a CPU without FMA cannot follow (Lucene then falls back to unfused arithmetic, because `Math.fma` in software costs 234 ns against 0.36 ns for a multiply-add), so it is not reachable everywhere. Panama at a pinned 256 bits (`-XX:MaxVectorSize=32`) with FMA off was rejected too: it matches across AVX2 and AVX-512 x86 once warm, but not before C2 compiles it, and not on 128-bit NEON.
+
+| `PHAROS_ARITHMETIC` | JVM flags | Default for |
+|---|---|---|
+| `deterministic` | `-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic`, no vector module | `cluster.role: reader` |
+| `native` | `--add-modules jdk.incubator.vector -Dpharos.arithmetic=native` (set explicitly) or `=native-default` (the role's default) | writers, routers, `role: all` |
+
+The flags must be on the `java` command line (Lucene reads them at class load; a `config.json` field could not change them), so every launcher sets them: the image entrypoint from `PHAROS_ROLE` (and `PHAROS_ARITHMETIC`, before `JAVA_OPTS`), the Kubernetes operator by rendering `PHAROS_ARITHMETIC` on every pod and Job (`deterministic` for readers), and `./pharos` and `setup.sh`'s daemon start from `cluster.role` in `~/.pharos/config.json`. Set `PHAROS_ARITHMETIC` to override the default in any of them. A deterministic JVM logs Lucene's own `Java vector incubator module is not readable` warning at startup; that is expected.
+
+**Checking it.** A serving reader logs `Vector arithmetic: fma=off simd=scalar canary=b10a7e42 (deterministic)`, or a WARN naming the flags when it runs anything else without an explicit `PHAROS_ARITHMETIC=native`. Native as a launcher's *default* does not silence it: a container started with a reader config but `PHAROS_ROLE` unset (so `all`, native) passes `-Dpharos.arithmetic=native-default` and its reader still warns. The canary hashes the bits of fixed 384- and 768-dim cosines, so equal canaries mean equal scores. Readers advertise the profile in their heartbeat (`arithmetic`), and each reader and router WARNs once when the live readers' profiles differ. The deterministic canary changes only if a Lucene upgrade changes its scalar code; old and new readers then disagree until the rolling upgrade finishes, and the release notes say so.
+
+**Cost** (AMD Ryzen 9700X, AVX-512, otherwise idle; seeded vectors, k=10, medians of three interleaved runs of `scripts/cpu-determinism.sh … timing`):
+
+| | default (FMA, 512-bit) | Panama 256-bit, FMA off | **deterministic** |
+|---|---|---|---|
+| KNN query over 50k vectors, 768 dims (mean / p99) | 102 / 285 µs | 124 / 317 µs | 291 / 525 µs |
+| KNN query over 50k vectors, 384 dims (mean / p99) | 80 / 305 µs | 97 / 299 µs | 182 / 368 µs |
+| HNSW index of 20k vectors, 768 dims (add + merge) | 15.9 s | 18.1 s | 66.0 s |
+| HNSW index of 20k vectors, 384 dims (add + merge) | 5.1 s | 5.7 s | 16.5 s |
+| one cosine, 768 dims | 43 ns | 49 ns | 315 ns |
+
+That is 0.1–0.2 ms more per KNN query on each shard, against a hybrid query's tens of milliseconds (most of them embedding the query). Indexing would be three to four times slower, which is why writers stay native.
+
+**Proof.** `scripts/cpu-determinism.sh <lucene-core.jar> <work-dir>` runs seeded cosines and KNN plus exact-scan queries over one shared index under each configuration and compares the exact bits, cold and warm. The deterministic flags gave identical bits on the Ryzen 9700X, also posing as an AVX2-only CPU (`-XX:UseAVX=2`), an AVX1 CPU without FMA, an SSE-only CPU, C1 only and without SuperWord, and on an Intel i5-1135G7 (AVX-512) searching a copy of the same index. The Panama configurations differ by SIMD width and FMA choice, and from themselves between cold and warm. `ArithmeticProfileTest` repeats the check on each build in forked JVMs. aarch64 is not measured; it follows from Java's strict `float` semantics.
+
+**Not covered.** The query embedding and the cross-encoder reranker (on by default) both run in ONNX Runtime on the coordinator, whose kernels also differ per CPU: one fan-out sends every shard the same vector and reranks the merged list once, but two coordinators on different CPUs can embed the same query, or rerank the same candidates, differently. The tests still pin FMA *on* with the Panama code (surefire's argLine) for `PipelineSplitParityTest`'s recorded fixture.
+
 ## Container image
 
 `docker/pharos/Dockerfile` builds the image the Kubernetes operator deploys (Temurin 25 JRE, the fat jar, python3 with `python-hcl2`, node, git; runs as uid 10001). Build from the repository root: `docker build -f docker/pharos/Dockerfile -t pharos:dev .`. Release tags publish `ghcr.io/<owner>/pharos:<version>`.
@@ -647,7 +680,8 @@ Entrypoint contract:
 | `PHAROS_ROLE` | `writer`, `reader` or `all` run `pharos web` (port 7070); `router` runs `pharos router` (port 7080). The node's cluster role comes from `cluster.role` in the config. |
 | `/etc/pharos/config.json` | The config, mounted from a ConfigMap and linked to `$PHAROS_HOME/config.json`. Override the path with `PHAROS_CONFIG`. |
 | `PHAROS_HOME` | State and model cache, `/data/pharos` (put a PVC on `/data`). |
-| `PHAROS_PORT`, `JAVA_OPTS` | Optional port and JVM options. |
+| `PHAROS_ARITHMETIC` | `deterministic` (default for `PHAROS_ROLE=reader`) or `native` (default otherwise): Lucene's vector arithmetic, see [Multi-node CPU determinism](#multi-node-cpu-determinism). |
+| `PHAROS_PORT`, `JAVA_OPTS` | Optional port and JVM options (`JAVA_OPTS` comes after the arithmetic flags). |
 | arguments | One pharos command to run instead of the server, e.g. `index --project lucene --source-git <url> --ref main` (the operator's registration Job); the container exits with its code. |
 
 Pods must set `securityContext` `runAsUser: 10001` and `fsGroup: 10001` when a PVC is mounted on `/data` (the operator sets these). With `PHAROS_ROLE` writer, reader or router a missing config makes the container exit 78, and an invalid one fails `pharos config validate` before serving.

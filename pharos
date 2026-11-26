@@ -103,13 +103,51 @@ def _default_heap() -> str:
         return "4g"  # safe fallback when sysconf is unavailable
 
 
+# Ruling CPU-R1: a reader runs Lucene's scalar vector code with FMA off (no jdk.incubator.vector module), so
+# readers on different CPU types score the same document with the same bits. Lucene reads this once at class
+# load, so it must be JVM flags. Keep in sync with ArithmeticProfile.DETERMINISTIC_FLAGS.
+DETERMINISTIC_ARITHMETIC_FLAGS = [
+    "-Dlucene.useScalarFMA=false", "-Dlucene.useVectorFMA=false", "-Dpharos.arithmetic=deterministic",
+]
+NATIVE_ARITHMETIC_FLAGS = ["--add-modules", "jdk.incubator.vector", "-Dpharos.arithmetic=native"]
+# native only as the role's default (not an explicit PHAROS_ARITHMETIC=native): a node serving as a reader warns
+NATIVE_DEFAULT_ARITHMETIC_FLAGS = ["--add-modules", "jdk.incubator.vector", "-Dpharos.arithmetic=native-default"]
+
+
+def _arithmetic_mode(config_file: Path = None) -> str:
+    """deterministic or native: PHAROS_ARITHMETIC when set, else deterministic for cluster.role reader in
+    config.json and native otherwise (a writer, a single node, no readable config)."""
+    mode = os.environ.get("PHAROS_ARITHMETIC", "").strip().lower()
+    if mode in ("deterministic", "native"):
+        return mode
+    if mode:
+        print(f"pharos: ignoring PHAROS_ARITHMETIC={mode!r} (expected deterministic or native)", file=sys.stderr)
+    try:
+        cfg = json.loads((config_file or PHAROS_DIR / "config.json").read_text())
+        role = (cfg.get("cluster") or {}).get("role") or "all"
+    except Exception:
+        role = "all"
+    return "deterministic" if role == "reader" else "native"
+
+
+def _arithmetic_flags(config_file: Path = None) -> list:
+    """The JVM flags of _arithmetic_mode(): native adds the vector incubator module (Lucene's SIMD code)."""
+    if _arithmetic_mode(config_file) == "deterministic":
+        return list(DETERMINISTIC_ARITHMETIC_FLAGS)
+    if os.environ.get("PHAROS_ARITHMETIC", "").strip().lower() == "native":
+        return list(NATIVE_ARITHMETIC_FLAGS)
+    return list(NATIVE_DEFAULT_ARITHMETIC_FLAGS)
+
+
 def _jvm_flags() -> list:
     """Common JVM args for every pharos subprocess: native-access opens for
-    Lucene/ArcadeDB, vector incubator module for SIMD-accelerated KNN, and
-    HeapDumpOnOutOfMemoryError so a post-mortem .hprof lands in ~/.pharos/dumps/.
+    Lucene/ArcadeDB, the arithmetic flags (the vector incubator module for SIMD-accelerated KNN
+    unless deterministic), and HeapDumpOnOutOfMemoryError so a post-mortem .hprof lands in ~/.pharos/dumps/.
 
     Heap: defaults to 75 % of RAM (clamped 2–24 g) so large projects (lucene,
     solr, vespa) can be indexed without OOM. Override with PHAROS_HEAP=Ng.
+
+    Arithmetic: _arithmetic_flags() (deterministic on a reader; PHAROS_ARITHMETIC overrides).
     """
     PHAROS_DUMPS.mkdir(parents=True, exist_ok=True)
     heap = os.environ.get("PHAROS_HEAP", "").strip() or _default_heap()
@@ -117,7 +155,6 @@ def _jvm_flags() -> list:
         f"-Xmx{heap}",
         "--enable-native-access=ALL-UNNAMED",
         "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
-        "--add-modules", "jdk.incubator.vector",
         "-XX:+HeapDumpOnOutOfMemoryError",
         f"-XX:HeapDumpPath={PHAROS_DUMPS}",
         # The JVM resolves user.home from the passwd entry, not $HOME: pin the pharos dir to
@@ -128,7 +165,7 @@ def _jvm_flags() -> list:
         "-Dpolyglot.engine.WarnInterpreterOnly=false",
         # DJL telemetry otherwise probes the EC2 instance-metadata endpoint on model load.
         "-DOPT_OUT_TRACKING=true",
-    ]
+    ] + _arithmetic_flags()
     return flags
 
 # ── Daemon management ─────────────────────────────────────────────────────────
