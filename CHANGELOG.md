@@ -56,6 +56,21 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   changes every pod template, so the first operator upgrade to this release rolls every pharos pod once, even
   with `spec.version` pinned to an older image (where the env is ignored, harmlessly). Schedule it like a
   release rollout; see UPGRADING.md.
+- Cluster fan-out: a hybrid query's coordinator embeds the query while the keyword stage's statistics and
+  search rounds run (unified: while its statistics round runs), on a bounded pool shared by the JVM
+  (`pharos-query-embed-*`, one thread per core, no queue: with every thread busy a query embeds when it needs
+  the vector, as before). Results, warnings, the query deadline and the re-plan are unchanged.
+- Cluster fan-out: a keyword round (keyword queries, hybrid's keyword stage) whose term statistics the
+  coordinator has from earlier queries (a bounded cache per shard generation) takes one round trip instead of
+  two: the search round goes out with the cached global statistics, and each remote shard returns its own
+  statistics of the same terms from the generation it searched. The answers are used only when every shard
+  confirms the cached ones, so scores are bitwise those of the statistics round; otherwise the query runs the
+  statistics round as before. Not used for split projects, key-filtered shards, pinned versions or capped term
+  sets. `/internal/shard-search` gains an optional `statsCheck` request field and `shardStats` response field;
+  an older reader ignores them and is not asked again for 10 minutes.
+- Cluster fan-out: vector snippet hints no longer call a remote shard that answered "no vectors of the model"
+  in the same query (it has no hints; a single node finds none either), and the hint calls of two or more
+  remote shards run in parallel instead of one after another.
 
 ### Added
 - A reader logs its vector arithmetic at startup (`Vector arithmetic: fma=off simd=scalar canary=…`) and WARNs

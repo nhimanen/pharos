@@ -155,6 +155,20 @@ public final class DistributedSearch implements Closeable {
     volatile boolean globalStatistics = true;
     /** Tests only: false turns off the one re-plan of a query (ruling P6-R16; the control of its tests). */
     volatile boolean retries = true;
+    /** Tests only: false embeds the query when a stage first needs it (the control of the overlap tests). */
+    volatile boolean overlapEmbedding = true;
+    /** Tests only: false always runs the keyword statistics round (the control of the statistics cache tests). */
+    volatile boolean cachedStatistics = true;
+    /** Tests only: false asks every remote shard for snippet hints, models' vectors or not (the control). */
+    volatile boolean snippetShortcuts = true;
+    /** Tests only: false makes the snippet calls one after another, on first use (the control). */
+    volatile boolean parallelSnippets = true;
+    /** What the statistics rounds of this coordinator's queries read, per shard generation ({@link Query#keywordRoundWithCachedStats}). */
+    final TermStatsCache statsCache = new TermStatsCache(TermStatsCache.DEFAULT_MAX_TERMS);
+    /** Readers that answered a statistics check without their statistics (an older pharos): until when they are not asked again. */
+    private final Map<String, Long> noStatsCheck = new java.util.concurrent.ConcurrentHashMap<>();
+    /** How long a reader that ignored a statistics check is not asked for one again. */
+    static final Duration NO_STATS_CHECK_BACKOFF = Duration.ofMinutes(10);
     /** Tests only: runs after a query's statistics round (a reader may swap a generation here). */
     static volatile java.util.function.Consumer<String> afterStatsRound;
     /** Tests only: runs when a query is about to be planned again (P6-R16), before the wait for fresh state. */
@@ -164,6 +178,18 @@ public final class DistributedSearch implements Closeable {
     /** Re-planned queries running at once; beyond it a query keeps its first, partial answer. */
     static final int MAX_CONCURRENT_REPLANS = 16;
     private final java.util.concurrent.Semaphore replans = new java.util.concurrent.Semaphore(MAX_CONCURRENT_REPLANS);
+
+    /** Threads embedding queries ahead of the rounds that need the vector ({@link Query#prefetchVector}). */
+    static final int EMBED_THREADS = Math.max(2, Runtime.getRuntime().availableProcessors());
+    /**
+     * Shared by every coordinator of the JVM, never shut down: an embedding provider keeps one inference
+     * session per thread, so its threads live as long as the JVM (a pool per coordinator would leak the
+     * sessions of a replaced one). No queue: a query finding every thread busy embeds on its own thread
+     * when the vector is needed, as it did before, so a full pool never makes a query wait longer.
+     */
+    private static final java.util.concurrent.ThreadPoolExecutor EMBEDDINGS = new java.util.concurrent.ThreadPoolExecutor(
+            EMBED_THREADS, EMBED_THREADS, 0L, TimeUnit.MILLISECONDS, new java.util.concurrent.SynchronousQueue<>(),
+            Thread.ofPlatform().name("pharos-query-embed-", 0).daemon(true).factory());
 
     /**
      * @param queryTimeout      the budget of one query, every round included
@@ -432,6 +458,8 @@ public final class DistributedSearch implements Closeable {
         private final long deadlineNanos;
         private final List<String> warnings = new ArrayList<>();
         private final Map<String, float[]> vectors = new HashMap<>();
+        /** Embeddings started ahead ({@link #prefetchVector}), until {@link #queryVector(String)} takes them. */
+        private final Map<String, Future<float[]>> pendingVectors = new HashMap<>();
         /** Queries whose embedding threw (the provider logged it); their vector is null. */
         private final Set<String> embedFailed = new HashSet<>();
         private final Set<Future<?>> outstanding = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1292,21 +1320,117 @@ public final class DistributedSearch implements Closeable {
 
         /** The pipeline's stage runner for this query: every retrieval stage fans out. */
         public SearchPipeline.StageRunner runner() {
-            return this::retrieve;
+            return new SearchPipeline.StageRunner() {
+                @Override
+                public List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace)
+                        throws IOException {
+                    return Query.this.retrieve(stage, req, trace);
+                }
+
+                @Override
+                public void beforeRetrieval(List<RetrievalStage> stages, SearchRequest req) {
+                    if (overlapsEmbedding(stages)) prefetchVector(req.query());
+                }
+            };
         }
 
-        private synchronized float[] queryVector(String query) {
-            if (vectors.containsKey(query)) return vectors.get(query);
+        /**
+         * True when the query vector is needed by {@code stages} after shard rounds that do not need it:
+         * a keyword stage ahead of a vector one (hybrid), or a unified stage (its statistics round). The
+         * query is then embedded meanwhile. A vector-only pipeline has nothing to overlap.
+         */
+        private boolean overlapsEmbedding(List<RetrievalStage> stages) {
+            if (!overlapEmbedding) return false;
+            boolean keyword = false;
+            for (RetrievalStage s : stages) {
+                if (s instanceof UnifiedRetrievalStage) return globalStatistics;
+                if (s instanceof KeywordRetrievalStage) keyword = true;
+                if (s instanceof VectorRetrievalStage && keyword) return true;
+            }
+            return false;
+        }
+
+        /**
+         * Starts embedding {@code query} on {@link #EMBEDDINGS}, so the keyword rounds run meanwhile; the
+         * vector is the one {@link #queryVector(String)} would compute (the same provider call). Does
+         * nothing when every embedding thread is busy: the vector is then computed when first needed.
+         */
+        void prefetchVector(String query) {
+            synchronized (this) {
+                if (closed || vectors.containsKey(query) || pendingVectors.containsKey(query)) return;
+            }
+            Future<float[]> f;
+            try {
+                f = EMBEDDINGS.submit(() -> embedder.isAvailable() ? embedder.embedQuery(query) : null);
+            } catch (java.util.concurrent.RejectedExecutionException busy) {
+                return;
+            }
+            synchronized (this) {
+                pendingVectors.putIfAbsent(query, f);
+            }
+        }
+
+        /**
+         * The query vector of {@code query}, embedded once per query (the provider applies its query
+         * prefix): a prefetched embedding is waited for, else it is computed here. Null when no model is
+         * available or the embedding failed. The query's monitor is not held while embedding.
+         */
+        private float[] queryVector(String query) {
+            Future<float[]> pending;
+            synchronized (this) {
+                if (vectors.containsKey(query)) return vectors.get(query);
+                pending = pendingVectors.get(query);
+            }
             float[] v = null;
-            if (embedder.isAvailable()) {
+            boolean failed = false;
+            if (pending != null) {
                 try {
-                    v = embedder.embedQuery(query); // embedded once, here; the provider applies its query prefix
+                    v = awaitUninterruptibly(pending);
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof com.pharos.embedding.EmbeddingException) {
+                        failed = true;              // already logged at WARN by the provider
+                    } else {
+                        synchronized (this) {
+                            pendingVectors.remove(query, pending); // as inline: not remembered, a later call retries
+                        }
+                        if (e.getCause() instanceof RuntimeException re) throw re;
+                        if (e.getCause() instanceof Error err) throw err;
+                        throw new IllegalStateException(e.getCause());
+                    }
+                }
+            } else if (embedder.isAvailable()) {
+                try {
+                    v = embedder.embedQuery(query);
                 } catch (com.pharos.embedding.EmbeddingException e) {
-                    embedFailed.add(query);         // already logged at WARN by the provider
+                    failed = true;                  // already logged at WARN by the provider
                 }
             }
-            vectors.put(query, v);
+            synchronized (this) {
+                pendingVectors.remove(query);
+                if (vectors.containsKey(query)) return vectors.get(query); // another thread was first: one vector
+                if (failed) embedFailed.add(query);
+                vectors.put(query, v);
+            }
             return v;
+        }
+
+        /**
+         * The embedding's result, waited for as an inline embedding runs: to the end. An interrupt meanwhile
+         * is kept (the thread's status is set again) for the rounds after it, which honour it.
+         */
+        private static float[] awaitUninterruptibly(Future<float[]> f) throws ExecutionException {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        return f.get();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
 
         /** The query vector for a retrieval stage; a failed embedding warns as the local stages do. */
@@ -1346,14 +1470,22 @@ public final class DistributedSearch implements Closeable {
                         return false;
                     });
             GlobalStats merged = GlobalStats.merge(new ArrayList<>(answers.values()));
+            answers.forEach((s, r) -> {
+                if (!s.local) statsCache.put(s.name(), r.generation(), fields, terms, r.stats());
+            });
+            statsSummary = summary(answers, merged, "");
+            return merged;
+        }
+
+        /** The trace diagnostic of a statistics round's answers (P6-R22). */
+        private String summary(Map<ShardState, TermStatsResponse> answers, GlobalStats merged, String suffix) {
             StringBuilder sb = new StringBuilder("statistics of ").append(answers.size()).append(" shard(s):");
             answers.forEach((s, r) -> sb.append(' ').append(s.name()).append('@').append(r.generation())
                     .append(s.local ? "" : "(" + (s.reader == null ? "?" : s.reader.node()) + ")"));
             merged.fields().entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> sb.append("; ")
                     .append(e.getKey()).append(" docCount=").append(e.getValue().docCount()).append(" sumTtf=")
                     .append(e.getValue().sumTotalTermFreq()));
-            statsSummary = sb.toString();
-            return merged;
+            return sb.append(suffix).toString();
         }
 
         /** What the last statistics round read (shards, generations, field totals): a trace diagnostic. */
@@ -1428,6 +1560,132 @@ public final class DistributedSearch implements Closeable {
             return merged;
         }
 
+        /**
+         * The keyword round in one round trip instead of two: when the coordinator holds every remote shard's
+         * statistics of the query's terms (from earlier statistics rounds, {@link #statsCache}, keyed by the
+         * generation its reader advertises), the search round is sent at once, scored with their sum, and
+         * each remote shard returns its own statistics of the same terms, read from the generation it
+         * searched exactly as {@code /internal/term-stats} reads them. Only when every one equals what was
+         * cached are the answers used: the sum is then the one a statistics round would have gathered at those
+         * generations, so the scores are bitwise the same. The round pins the shards as a statistics round does
+         * (first contact). Otherwise (a shard disagrees, an older reader without the check, any failure)
+         * the answers are discarded and null is returned: the query gathers statistics and searches as before.
+         * Not for split projects (their run alignment rides on the statistics round), key-filtered shards,
+         * pinned versions, capped term sets or a query analysed with previous synonyms.
+         */
+        private Map<ShardState, ShardSearchResponse> keywordRoundWithCachedStats(SearchRequest req) throws IOException {
+            if (!cachedStatistics || hasSplitProject || keyword != null) return null;
+            synchronized (this) {
+                if (globalStats != null) return null; // this query has its statistics already
+            }
+            KeywordSearchStrategy kw = keyword();
+            org.apache.lucene.search.Query lq = kw.buildQuery(req);
+            if (lq == null) return null;
+            Set<Term> terms = GlobalStats.queryTerms(lq);
+            if (terms.isEmpty() || terms.size() > maxShippedTerms) return null;
+            reconcileRuns(); // no split shard: only notes it ran, as the statistics round's fan-out would
+            List<ShardState> all = available();
+            if (all.isEmpty()) return null;
+            long now = System.nanoTime();
+            for (ShardState s : all) {
+                if (s.split || s.statsOnly || s.expectedGeneration != null || s.specVersion != null) return null;
+                if (!s.local) {
+                    ReaderHeartbeat hb = firstReader(s);
+                    Long until = hb == null ? null : noStatsCheck.get(hb.node());
+                    if (hb == null || (until != null && until - now > 0)) return null;
+                }
+            }
+            TreeSet<String> fields = new TreeSet<>();
+            for (Term t : terms) fields.add(t.field());
+            Map<ShardState, GlobalStats> expected = new LinkedHashMap<>();
+            Map<ShardState, Long> keyGeneration = new HashMap<>();
+            for (ShardState s : all) {
+                if (s.local) {
+                    LocalShardService.Pin p = pin(s);
+                    expected.put(s, local.termStats(p, fields, terms)); // in process: read, not cached
+                    keyGeneration.put(s, p.generation());
+                    continue;
+                }
+                Long gen;
+                synchronized (s) {
+                    gen = s.generation;
+                }
+                if (gen == null) {
+                    ReaderHeartbeat hb = firstReader(s);
+                    gen = hb.generations() == null ? null : hb.generations().get(s.name());
+                }
+                GlobalStats cached = gen == null ? null : statsCache.get(s.name(), gen, fields, terms);
+                if (cached == null) return null;
+                expected.put(s, cached);
+                keyGeneration.put(s, gen);
+            }
+            List<TermStatsResponse> perShard = new ArrayList<>(all.size());
+            for (ShardState s : all) perShard.add(new TermStatsResponse(keyGeneration.get(s), expected.get(s)));
+            GlobalStats merged = GlobalStats.merge(perShard);
+            List<TermStatsRequest.Term> wire = new ArrayList<>(terms.size());
+            for (Term t : terms) wire.add(new TermStatsRequest.Term(t.field(), t.text()));
+            ShardSearchRequest.StatsCheck check = new ShardSearchRequest.StatsCheck(List.copyOf(fields), wire);
+
+            List<ShardState> targets = searchable();
+            Map<ShardState, Throwable> failed = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<ShardState, ShardSearchResponse> answers = round(targets, "keyword", req, null, merged,
+                    s -> null, s -> null, false, false, check, (s, t) -> {
+                        failed.put(s, t);
+                        return true;
+                    });
+            // A shard missing at the deadline (marked unavailable, as a stalled search round marks it) keeps the
+            // answer: the sequential query would have had its statistics (they come first) and then lost its
+            // search round the same way. Any other failure runs the statistics round, as before.
+            boolean verified = failed.isEmpty() && (answers.keySet().containsAll(targets) || remainingNanos() <= 0);
+            for (Map.Entry<ShardState, ShardSearchResponse> e : answers.entrySet()) {
+                ShardState s = e.getKey();
+                if (s.local) continue;
+                GlobalStats theirs = e.getValue().shardStats();
+                if (theirs == null) { // a reader that does not know the check
+                    ReaderHeartbeat r;
+                    synchronized (s) {
+                        r = s.reader;
+                    }
+                    if (r != null) noStatsCheck.put(r.node(), System.nanoTime() + NO_STATS_CHECK_BACKOFF.toNanos());
+                    verified = false;
+                    continue;
+                }
+                // fresh statistics of the generation searched: worth keeping either way
+                statsCache.put(s.name(), e.getValue().generation(), fields, terms, theirs);
+                if (!theirs.equals(expected.get(s))) verified = false;
+            }
+            if (!verified) {
+                log.debug("Query: cached statistics not confirmed by {} shard(s) ({} failed); running the statistics round",
+                        answers.size(), failed.size());
+                return null;
+            }
+            Map<ShardState, TermStatsResponse> summaryAnswers = new LinkedHashMap<>();
+            for (ShardState s : all) {
+                ShardSearchResponse a = answers.get(s);
+                if (!s.local) {
+                    synchronized (s) {
+                        s.consumed = true; // the answers are used: the shard stays on this generation
+                    }
+                }
+                summaryAnswers.put(s, new TermStatsResponse(a == null ? keyGeneration.get(s) : a.generation(), expected.get(s)));
+            }
+            statsSummary = summary(summaryAnswers, merged, " (cached, confirmed by the search round)");
+            synchronized (this) {
+                globalStats = merged;
+                statsKey = kw.synonymsHash() + "|" + terms;
+            }
+            return answers;
+        }
+
+        /** The reader a call for {@code s} tries first: its pinned one, else the route's first candidate. */
+        private ReaderHeartbeat firstReader(ShardState s) {
+            synchronized (s) {
+                if (s.reader != null) return s.reader;
+            }
+            List<ReaderHeartbeat> c = s.route.candidates();
+            return c.isEmpty() ? null : c.get(0);
+        }
+
         private List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace)
                 throws IOException {
             long t0 = System.currentTimeMillis();
@@ -1445,9 +1703,14 @@ public final class DistributedSearch implements Closeable {
             } else {
                 throw new UnsupportedOperationException(stage.getClass().getSimpleName() + " cannot fan out");
             }
+            // a keyword round scored with cached statistics, checked by the round itself (null: not this time)
+            Map<ShardState, ShardSearchResponse> cachedRound = "keyword".equals(retriever) && globalStatistics
+                    ? keywordRoundWithCachedStats(req) : null;
+            // the statistics round first: unified's query embedding (prefetched) runs meanwhile
+            GlobalStats stats = cachedRound != null ? null
+                    : "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             float[] vec = "keyword".equals(retriever) ? null : queryVector(req);
             if ("vector".equals(retriever) && vec == null) return List.of(); // as the local stage: no vectors
-            GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             List<ShardState> targets = new ArrayList<>();
             boolean unified = "unified".equals(retriever);
             for (ShardState s : searchable()) {
@@ -1465,7 +1728,8 @@ public final class DistributedSearch implements Closeable {
             String mode = "keyword".equals(retriever) || targets.size() == 1 ? retriever : retriever + "-2";
             switch (mode) {
                 case "keyword" -> {
-                    Map<ShardState, ShardSearchResponse> r = round(targets, "keyword", req, null, stats, s -> null, s -> null, false);
+                    Map<ShardState, ShardSearchResponse> r = cachedRound != null ? cachedRound
+                            : round(targets, "keyword", req, null, stats, s -> null, s -> null, false);
                     r.values().forEach(x -> lists.add(candidates(x)));
                     answered = r.size();
                 }
@@ -1576,6 +1840,21 @@ public final class DistributedSearch implements Closeable {
                                                            java.util.function.Function<ShardState, List<ScoredId>> selected,
                                                            java.util.function.Function<ShardState, List<ScoredId>> selectedKnn,
                                                            boolean chunks) {
+            return round(targets, retriever, req, vec, stats, selected, selectedKnn, chunks, true, null, (s, t) -> false);
+        }
+
+        /**
+         * As above; {@code consumes} false leaves the shards free to move to another generation (the answers
+         * may be discarded), {@code check} asks the remote shards for their statistics too, and
+         * {@code claim} may claim a failure before anything else does (true: handled, the shard stays available).
+         */
+        private Map<ShardState, ShardSearchResponse> round(List<ShardState> targets, String retriever,
+                                                           SearchRequest req, float[] vec, GlobalStats stats,
+                                                           java.util.function.Function<ShardState, List<ScoredId>> selected,
+                                                           java.util.function.Function<ShardState, List<ScoredId>> selectedKnn,
+                                                           boolean chunks, boolean consumes,
+                                                           ShardSearchRequest.StatsCheck check,
+                                                           java.util.function.BiPredicate<ShardState, Throwable> claim) {
             // pure vector retrieval analyses no text: no synonyms to agree on
             String hash = retriever.startsWith("vector") ? null : synonymsHash();
             LocalShardService.Model model = local.model();
@@ -1597,10 +1876,11 @@ public final class DistributedSearch implements Closeable {
                     return local.search(pin(s), retriever, req, v, stats, selected.apply(s), selectedKnn.apply(s), chunks,
                             hash);
                 }
-                return remote(s, ShardClient.SHARD_SEARCH, true, // first-round doc ids bind the generation too
+                return remote(s, ShardClient.SHARD_SEARCH, consumes, // first-round doc ids bind the generation too
                         (hb, gen) -> new ShardSearchRequest(s.name(), gen, retriever, req, v, stats, hash, modelId,
-                                dims, fingerprint, selected.apply(s), selectedKnn.apply(s), chunks));
+                                dims, fingerprint, selected.apply(s), selectedKnn.apply(s), chunks, check));
             }, (s, t) -> {
+                if (claim.test(s, t)) return true;
                 ModelMismatchException m = modelMismatch(t);
                 if (m == null) return false;
                 boolean noVectors = m.reason() == ModelMismatchException.Reason.NO_VECTORS;
@@ -1656,23 +1936,93 @@ public final class DistributedSearch implements Closeable {
 
         /**
          * Vector snippet hints for the final {@code results}: from the pinned reader of each result's
-         * shard (in process for local shards, one {@code /internal/snippets} call per remote shard,
-         * made on first use). The query is embedded only when a hint is first asked for. Usable after
-         * the query is closed: a local reader is then used only while it is still open.
+         * shard (in process for local shards, one {@code /internal/snippets} call per remote shard). The
+         * query is embedded only when a hint is first asked for. On the first hint, the calls of every
+         * remote shard holding a result the decorator asks hints for (one with a body) are made at once,
+         * in parallel; a single one is made on this thread. A remote shard that refused the model's vectors
+         * in this query (no vectors of the model) is not asked: it has no hints, as on a single node. Usable
+         * after the query is closed: a local reader is then used only while it is still open.
          */
         public SnippetResolver vectorResolver(List<SearchResult> results, String query) {
             Map<String, List<String>> idsByShard = new LinkedHashMap<>();
-            for (SearchResult r : results) idsByShard.computeIfAbsent(ownerName(r), k -> new ArrayList<>()).add(r.id());
-            Map<String, SnippetResolver> perShard = new HashMap<>();
-            return r -> {
-                SnippetResolver inner;
+            Set<String> hinted = new LinkedHashSet<>(); // shards of results SnippetDecorator resolves (with a body)
+            for (SearchResult r : results) {
                 String owner = ownerName(r);
+                idsByShard.computeIfAbsent(owner, k -> new ArrayList<>()).add(r.id());
+                if (r.body() != null && !r.body().isBlank()) hinted.add(owner);
+            }
+            Map<String, SnippetResolver> perShard = new HashMap<>();
+            Map<String, Future<SnippetResolver>> fetching = new HashMap<>();
+            boolean[] started = {false};
+            return r -> {
+                String owner = ownerName(r);
+                Future<SnippetResolver> pending;
+                SnippetResolver inner;
                 synchronized (perShard) {
-                    inner = perShard.computeIfAbsent(owner, shard -> shardResolver(shard,
-                            idsByShard.getOrDefault(shard, List.of()), query));
+                    if (!started[0]) {
+                        started[0] = true;
+                        if (parallelSnippets) fetching.putAll(fetchRemoteHints(hinted, idsByShard, query));
+                    }
+                    pending = fetching.remove(owner);
+                    inner = pending == null ? perShard.computeIfAbsent(owner, shard -> shardResolver(shard,
+                            idsByShard.getOrDefault(shard, List.of()), query)) : null;
+                }
+                if (pending != null) {
+                    try {
+                        inner = awaitHints(pending);
+                    } catch (ExecutionException e) {
+                        log.warn("Vector snippet hints of shard {} unavailable for this search: {}", owner, e.getCause().toString());
+                        inner = SnippetResolver.none();
+                    }
+                    synchronized (perShard) {
+                        perShard.put(owner, inner);
+                    }
                 }
                 return inner.resolve(r);
             };
+        }
+
+        /**
+         * Starts the {@code /internal/snippets} calls of the remote {@code shards} that need one, in parallel,
+         * when there are two or more of them (one is left to the first hint of its shard, on its thread).
+         */
+        private Map<String, Future<SnippetResolver>> fetchRemoteHints(Set<String> shards, Map<String, List<String>> idsByShard,
+                                                                      String query) {
+            List<String> calls = new ArrayList<>();
+            for (String shard : shards) {
+                ShardState s = byName(shard);
+                if (s != null && !s.local && s.unavailable == null && !noModelVectors(shard)) calls.add(shard);
+            }
+            if (calls.size() < 2) return Map.of();
+            if (queryVector(query) == null) return Map.of(); // embedded once, here, before the calls share it
+            Map<String, Future<SnippetResolver>> out = new HashMap<>();
+            for (String shard : calls) {
+                try {
+                    out.put(shard, remote.submit(() -> shardResolver(shard, idsByShard.getOrDefault(shard, List.of()), query)));
+                } catch (java.util.concurrent.RejectedExecutionException closed) {
+                    break; // the coordinator was replaced: the rest are called on first use
+                }
+            }
+            return out;
+        }
+
+        private static SnippetResolver awaitHints(Future<SnippetResolver> f) throws ExecutionException {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        return f.get();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }
+
+        private synchronized boolean noModelVectors(String shard) {
+            return noModelVectors.contains(shard);
         }
 
         private SnippetResolver shardResolver(String shard, List<String> ids, String query) {
@@ -1681,6 +2031,9 @@ public final class DistributedSearch implements Closeable {
             try {
                 float[] vec = queryVector(query);
                 if (vec == null) return SnippetResolver.none();
+                if (!s.local && snippetShortcuts && noModelVectors(shard)) {
+                    return SnippetResolver.none(); // no vectors of the model: no hints there (a single node finds none)
+                }
                 if (s.local) {
                     org.apache.lucene.index.IndexReader reader;
                     synchronized (s) {
