@@ -3,6 +3,36 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## [Unreleased]
+
+**Index format:** 2 (unchanged)
+
+### Changed
+- ArcadeDB, which stores the call graph, the module graph and the cross-project graph, is upgraded from
+  25.1.1 to 26.11.1. No re-index is needed: 26.11.1 opens graphs written by 25.1.1 as they are and keeps
+  writing them in their layout (a full re-index starts a new graph in 26.11.1's layout), and 1.11.1 still
+  reads graphs this release wrote, so a downgrade or a mixed-version cluster needs no step either (readers
+  import the published `graph.cgf.gz`, pharos' own format, which did not change). 26.11.1 also fixes a
+  25.1.1 bug where a database occasionally reopened with no records after it was closed.
+- A new graph database is now closed and reopened right after ArcadeDB creates it, so no write from its
+  creation is still queued when the schema is added. This is the workaround for ArcadeDB
+  [#13441](https://github.com/ArcadeData/arcadedb/issues/13441), which 26.11.1 still has. It replaces the
+  1.10 workaround, which polled the dictionary file and called an ArcadeDB-internal wait.
+- Damaged-graph detection (`index-status`, `upgrade-indexes`, publishing) reads ArcadeDB 26's multi-page
+  dictionary file as well as 25.1.1's single-page one.
+- A full index no longer truncates and rebuilds the indexes of the graph database it has just created
+  (empty by construction). On ArcadeDB 26 that in-place rebuild of empty indexes made later lookups log
+  "Compacted index … main page 0 has totalPages=N" (1,513 warnings for one lucene index, while the lookups
+  were still right) and cost about 2 s; the graph phase of a lucene full index now takes 6.8 s, against
+  6.5 s on 1.11.1.
+- Indexed projects that use libraries pharos itself bundles can resolve slightly more or fewer calls,
+  because JavaParser's reflection solver sees pharos' own classpath, which ArcadeDB 26 changes (lucene:
+  +6,645 resolved calls, +2.8 %; pharos' own sources: −2, through the changed ArcadeDB API).
+- The fat jar keeps a single Lucene release: the Lucene modules that ArcadeDB 26 adds are pinned to pharos'
+  Lucene version.
+- ArcadeDB 26 no longer prints its startup warnings (Truffle fallback runtime, channel interrupt) on every
+  command.
+
 ## [1.11.1] - 2026-11-26
 
 **Index format:** 2 (unchanged from 1.11.0)
