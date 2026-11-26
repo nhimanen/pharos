@@ -21,8 +21,8 @@ import java.util.TreeSet;
  */
 final class TermStatsCache {
 
-    /** Default bound on cached term entries (field entries: a tenth of it). */
-    static final int DEFAULT_MAX_TERMS = 200_000;
+    /** Default bound on cached term entries (field entries: a tenth of it): a few MB of heap at most. */
+    static final int DEFAULT_MAX_TERMS = 50_000;
 
     private record FieldKey(String shard, long generation, String field) {}
 
