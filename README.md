@@ -647,11 +647,11 @@ Readers on different CPU types score the same vector query with the same bits, s
 | `PHAROS_ARITHMETIC` | JVM flags | Default for |
 |---|---|---|
 | `deterministic` | `-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic`, no vector module | `cluster.role: reader` |
-| `native` | `--add-modules jdk.incubator.vector -Dpharos.arithmetic=native` | writers, routers, `role: all` |
+| `native` | `--add-modules jdk.incubator.vector -Dpharos.arithmetic=native` (set explicitly) or `=native-default` (the role's default) | writers, routers, `role: all` |
 
 The flags must be on the `java` command line (Lucene reads them at class load; a `config.json` field could not change them), so every launcher sets them: the image entrypoint from `PHAROS_ROLE` (and `PHAROS_ARITHMETIC`, before `JAVA_OPTS`), the Kubernetes operator by rendering `PHAROS_ARITHMETIC` on every pod and Job (`deterministic` for readers), and `./pharos` and `setup.sh`'s daemon start from `cluster.role` in `~/.pharos/config.json`. Set `PHAROS_ARITHMETIC` to override the default in any of them. A deterministic JVM logs Lucene's own `Java vector incubator module is not readable` warning at startup; that is expected.
 
-**Checking it.** A serving reader logs `Vector arithmetic: fma=off simd=scalar canary=b10a7e42 (deterministic)`, or a WARN naming the flags when it runs anything else without `PHAROS_ARITHMETIC=native`. The canary hashes the bits of fixed 384- and 768-dim cosines, so equal canaries mean equal scores. Readers advertise the profile in their heartbeat (`arithmetic`), and each reader and router WARNs once when the live readers' profiles differ. The deterministic canary changes only if a Lucene upgrade changes its scalar code; old and new readers then disagree until the rolling upgrade finishes, and the release notes say so.
+**Checking it.** A serving reader logs `Vector arithmetic: fma=off simd=scalar canary=b10a7e42 (deterministic)`, or a WARN naming the flags when it runs anything else without an explicit `PHAROS_ARITHMETIC=native`. Native as a launcher's *default* does not silence it: a container started with a reader config but `PHAROS_ROLE` unset (so `all`, native) passes `-Dpharos.arithmetic=native-default` and its reader still warns. The canary hashes the bits of fixed 384- and 768-dim cosines, so equal canaries mean equal scores. Readers advertise the profile in their heartbeat (`arithmetic`), and each reader and router WARNs once when the live readers' profiles differ. The deterministic canary changes only if a Lucene upgrade changes its scalar code; old and new readers then disagree until the rolling upgrade finishes, and the release notes say so.
 
 **Cost** (AMD Ryzen 9700X, AVX-512, otherwise idle; seeded vectors, k=10, medians of three interleaved runs of `scripts/cpu-determinism.sh … timing`):
 
@@ -667,7 +667,7 @@ That is 0.1–0.2 ms more per KNN query on each shard, against a hybrid query's 
 
 **Proof.** `scripts/cpu-determinism.sh <lucene-core.jar> <work-dir>` runs seeded cosines and KNN plus exact-scan queries over one shared index under each configuration and compares the exact bits, cold and warm. The deterministic flags gave identical bits on the Ryzen 9700X, also posing as an AVX2-only CPU (`-XX:UseAVX=2`), an AVX1 CPU without FMA, an SSE-only CPU, C1 only and without SuperWord, and on an Intel i5-1135G7 (AVX-512) searching a copy of the same index. The Panama configurations differ by SIMD width and FMA choice, and from themselves between cold and warm. `ArithmeticProfileTest` repeats the check on each build in forked JVMs. aarch64 is not measured; it follows from Java's strict `float` semantics.
 
-**Not covered.** The query embedding comes from ONNX Runtime on the coordinator, whose kernels also differ per CPU: one fan-out sends every shard the same vector, but two coordinators on different CPUs can embed the same query differently. The tests still pin FMA *on* with the Panama code (surefire's argLine) for `PipelineSplitParityTest`'s recorded fixture.
+**Not covered.** The query embedding and the cross-encoder reranker (on by default) both run in ONNX Runtime on the coordinator, whose kernels also differ per CPU: one fan-out sends every shard the same vector and reranks the merged list once, but two coordinators on different CPUs can embed the same query, or rerank the same candidates, differently. The tests still pin FMA *on* with the Panama code (surefire's argLine) for `PipelineSplitParityTest`'s recorded fixture.
 
 ## Container image
 

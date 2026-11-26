@@ -19,7 +19,12 @@ All notable changes to Pharos. Every release section starts with an `**Index for
 - `PHAROS_ARITHMETIC=deterministic|native` chooses it on every launcher: the image entrypoint (default
   deterministic for `PHAROS_ROLE=reader`), the operator (renders it per role on pods and Jobs), `./pharos` and
   `setup.sh`'s daemon start (deterministic when `config.json` has `cluster.role: reader`). The flags are read
-  when Lucene loads, so they cannot be set from `config.json`.
+  when Lucene loads, so they cannot be set from `config.json`. Only an explicit `PHAROS_ARITHMETIC=native`
+  silences a reader's WARN; native as a launcher's role default passes `-Dpharos.arithmetic=native-default`.
+- Upgrade note (operator): the operator now renders `PHAROS_ARITHMETIC` on every pharos pod and Job, which
+  changes every pod template, so the first operator upgrade to this release rolls every pharos pod once, even
+  with `spec.version` pinned to an older image (where the env is ignored, harmlessly). Schedule it like a
+  release rollout; see UPGRADING.md.
 
 ### Added
 - A reader logs its vector arithmetic at startup (`Vector arithmetic: fma=off simd=scalar canary=…`) and WARNs
