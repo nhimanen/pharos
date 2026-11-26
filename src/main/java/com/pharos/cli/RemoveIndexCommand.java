@@ -29,6 +29,24 @@ import java.util.concurrent.Callable;
 )
 public class RemoveIndexCommand implements Callable<Integer> {
 
+    /** Set by picocli; the web API runs this command with its own writers (see {@code WebServer} admin commands). */
+    @picocli.CommandLine.Spec
+    picocli.CommandLine.Model.CommandSpec spec;
+    private java.io.PrintWriter stdout;
+    private java.io.PrintWriter stderr;
+
+    private java.io.PrintWriter out() {
+        if (spec != null) return spec.commandLine().getOut();
+        if (stdout == null) stdout = new java.io.PrintWriter(System.out, true);
+        return stdout;
+    }
+
+    private java.io.PrintWriter err() {
+        if (spec != null) return spec.commandLine().getErr();
+        if (stderr == null) stderr = new java.io.PrintWriter(System.err, true);
+        return stderr;
+    }
+
     @Parameters(index = "0", arity = "0..1",
             description = "Name of the project to remove (omit when --all is set)")
     private String projectName;
@@ -63,20 +81,29 @@ public class RemoveIndexCommand implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
+        try {
+            return run();
+        } finally {
+            out().flush();
+            err().flush();
+        }
+    }
+
+    private Integer run() throws Exception {
         if (fromCatalog) return removeFromCatalog();
         try {
             RoleGuard.requireIndexing(config);
             RoleGuard.requireNoWorkQueue(config, "pharos remove-index");
         } catch (IllegalStateException e) {
-            System.err.println(e.getMessage());
+            err().println(e.getMessage());
             return 2;
         }
         if (all && projectName != null) {
-            System.err.println("Specify either a project name or --all, not both.");
+            err().println("Specify either a project name or --all, not both.");
             return 2;
         }
         if (!all && projectName == null) {
-            System.err.println("Missing project name. Pass a project or use --all.");
+            err().println("Missing project name. Pass a project or use --all.");
             return 2;
         }
 
@@ -84,7 +111,7 @@ public class RemoveIndexCommand implements Callable<Integer> {
             if (all) return removeAll();
             return removeOne(projectName);
         } catch (IllegalArgumentException e) {
-            System.err.println("Error: " + e.getMessage());
+            err().println("Error: " + e.getMessage());
             return 1;
         }
     }
@@ -94,55 +121,55 @@ public class RemoveIndexCommand implements Callable<Integer> {
         try {
             RoleGuard.requireIndexing(config); // readers never change the catalog
         } catch (IllegalStateException e) {
-            System.err.println(e.getMessage());
+            err().println(e.getMessage());
             return 2;
         }
         if (all || projectName == null) {
-            System.err.println("--from-catalog removes one project: pass its name (not --all).");
+            err().println("--from-catalog removes one project: pass its name (not --all).");
             return 2;
         }
         var catalog = runtime == null ? java.util.Optional.<com.pharos.cluster.objectstore.ObjectStoreCatalog>empty()
                 : runtime.sourceCatalog();
         if (catalog.isEmpty()) {
-            System.err.println("--from-catalog needs a cluster object-store backend (cluster.backend 'object-store');"
+            err().println("--from-catalog needs a cluster object-store backend (cluster.backend 'object-store');"
                     + " this node has none.");
             return 2;
         }
         if (!com.pharos.cluster.ShardId.isProjectName(projectName)) {
-            System.err.println("Error: '" + projectName + "' is not a valid cluster project name");
+            err().println("Error: '" + projectName + "' is not a valid cluster project name");
             return 2;
         }
         try {
             // the whole project in one catalog write: a split project's shards and its versions too (I4)
             List<com.pharos.cluster.ShardId> removed = catalog.get().removeProject(projectName);
             if (!removed.isEmpty()) {
-                System.out.println("Removed project '" + projectName + "' from the cluster catalog"
+                out().println("Removed project '" + projectName + "' from the cluster catalog"
                         + (removed.size() == 1 ? "." : " (" + removed.size() + " shards)."));
             } else {
-                System.out.println("Project '" + projectName + "' is not in the cluster catalog.");
+                out().println("Project '" + projectName + "' is not in the cluster catalog.");
             }
             return 0;
         } catch (java.io.IOException e) {
-            System.err.println("Removing " + projectName + " from the cluster catalog failed: " + e.getMessage());
+            err().println("Removing " + projectName + " from the cluster catalog failed: " + e.getMessage());
             return 1;
         }
     }
 
     private int removeOne(String name) throws Exception {
         if (registry.find(name).isEmpty()) {
-            System.err.println("Project not found: " + name);
+            err().println("Project not found: " + name);
             return 1;
         }
         if (!ProjectNames.isValid(name)) {
             // Its index dir may be the indexes root: unregister only, delete nothing on disk.
             indexManager.unregisterOnly(name);
-            System.out.println("Unregistered invalid project name '" + name + "' (registry entry, link "
+            out().println("Unregistered invalid project name '" + name + "' (registry entry, link "
                     + "references and synonyms only). Nothing was deleted from disk; any leftover files "
                     + "in the index directory must be removed by hand (see UPGRADING.md).");
             return 0;
         }
         indexManager.removeProject(name);
-        System.out.println("Removed project '" + name + "'.");
+        out().println("Removed project '" + name + "'.");
         return 0;
     }
 
@@ -150,7 +177,7 @@ public class RemoveIndexCommand implements Callable<Integer> {
         // Snapshot the project list — removeProject mutates the registry mid-iteration.
         List<ProjectMeta> all = registry.listAll();
         if (all.isEmpty()) {
-            System.out.println("No projects to remove.");
+            out().println("No projects to remove.");
             return 0;
         }
         int removed = 0;
@@ -159,20 +186,20 @@ public class RemoveIndexCommand implements Callable<Integer> {
             try {
                 if (!ProjectNames.isValid(meta.getName())) {
                     indexManager.unregisterOnly(meta.getName());
-                    System.out.println("Unregistered invalid project name '" + meta.getName()
+                    out().println("Unregistered invalid project name '" + meta.getName()
                             + "' (nothing deleted from disk).");
                     removed++;
                     continue;
                 }
                 indexManager.removeProject(meta.getName());
-                System.out.println("Removed project '" + meta.getName() + "'.");
+                out().println("Removed project '" + meta.getName() + "'.");
                 removed++;
             } catch (Exception e) {
-                System.err.println("Failed to remove '" + meta.getName() + "': " + e.getMessage());
+                err().println("Failed to remove '" + meta.getName() + "': " + e.getMessage());
                 failed++;
             }
         }
-        System.out.printf("Done: %d removed%s.%n",
+        out().printf("Done: %d removed%s.%n",
                 removed, failed > 0 ? ", " + failed + " failed" : "");
         return failed > 0 ? 1 : 0;
     }

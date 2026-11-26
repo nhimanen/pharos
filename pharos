@@ -341,6 +341,44 @@ def _api_get(path: str, params: dict = None) -> object:
             f"Try restarting with: pharos daemon restart")
 
 
+ADMIN_HEADER = "X-Pharos-Admin"   # WebServer.ADMIN_HEADER: the daemon runs admin commands only with it
+
+
+def _api_admin(command: str, cli_args: list) -> int:
+    """Run a Java CLI command inside the daemon (POST /api/admin/<command>) and print its output.
+
+    remove-index, link and stats change or read the indexes the daemon holds open: running them in
+    the daemon lets it close and reopen its own readers, instead of a second JVM changing files under
+    them. The daemon runs the same picocli command as `java -jar pharos.jar <command>`, so the
+    output and exit code are the Java CLI's. Returns that exit code.
+    """
+    req = urllib.request.Request(
+        f"{BASE_URL}/api/admin/{command}",
+        data=json.dumps({"args": cli_args}).encode(),
+        headers={"Content-Type": "application/json", ADMIN_HEADER: "1"},
+        method="POST",
+    )
+    try:
+        # removing or linking large projects can take a while: no short client timeout
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            msg = json.loads(body).get("error", body)
+        except (ValueError, AttributeError):
+            msg = body
+        die(f"API error {e.code}: {msg}")
+    except urllib.error.URLError as e:
+        die(f"Cannot reach pharos daemon: {e.reason}\n"
+            f"Try restarting with: pharos daemon restart")
+    if data.get("out"):
+        sys.stdout.write(data["out"])
+    if data.get("err"):
+        sys.stderr.write(data["err"])
+    return int(data.get("exitCode", 1))
+
+
 def die(msg: str):
     print(f"pharos: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -858,6 +896,97 @@ def cmd_impact(args):
     params = {"fqn": args.fqn, "depth": args.depth, "maxCallers": args.max_callers}
     data = _api_get("/api/impact", params)
     print(fmt_impact(data))
+
+
+def fmt_trace(r: dict) -> str:
+    """The Java CLI's `trace` output, from /api/trace (CallChainResult)."""
+    nodes = (r or {}).get("nodes") or []
+    if not nodes:
+        return f"No nodes found for: {(r or {}).get('root', '?')}"
+    lines = [f"Call chain from: {r.get('root')}",
+             f"Direction: {r.get('direction')} | Depth: {r.get('maxDepth')} | Nodes: {r.get('totalNodes')}"
+             + (" (truncated at 50)" if r.get("truncated") else ""), ""]
+    for n in nodes:
+        depth = n.get("depth", 0)
+        indent = "  " * depth
+        prefix = "" if depth == 0 else "\u21b3 "
+        lines.append(f"{indent}{prefix}[{depth}] {n.get('fqn')}")
+        if n.get("filePath"):
+            lines.append(f"{indent}    {n['filePath']}:{n.get('startLine')}-{n.get('endLine')}")
+        body = n.get("body")
+        if body and body.strip():
+            lines.extend(f"{indent}    {line}" for line in body.split("\n"))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+USAGE_SECTIONS = [
+    ("Callers", "callers"), ("Subclasses", "subclasses"), ("Super types", "superTypes"),
+    ("Field readers", "fieldReaders"), ("Field writers", "fieldWriters"),
+    ("Annotated with", "annotatedWith"), ("Methods returning", "methodsReturning"),
+    ("Methods taking", "methodsTaking"),
+]
+
+
+def fmt_usages(r: dict) -> str:
+    """The Java CLI's `usages` output, from /api/usages (UsageResult)."""
+    r = r or {}
+    lines = [f"Usages of: {r.get('fqn', '?')}", ""]
+    for label, key in USAGE_SECTIONS:
+        items = r.get(key) or []
+        if not items:
+            continue
+        lines.append(f"{label} ({len(items)}):")
+        lines.extend(f"  {i}" for i in items)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def cmd_trace(args):
+    ensure_daemon()
+    data = _api_get("/api/trace", {"fqn": args.fqn, "depth": max(1, min(4, args.depth)),
+                                   "direction": args.direction, "maxBodyChars": args.max_body})
+    print(fmt_trace(data))
+
+
+def cmd_usages(args):
+    ensure_daemon()
+    data = _api_get("/api/usages", {"fqn": args.fqn, "kind": args.kind})
+    print(fmt_usages(data))
+
+
+def _link_args(args) -> list:
+    return [args.project1, args.project2]
+
+
+def _stats_args(args) -> list:
+    return ["--project", args.project] if args.project else []
+
+
+def _remove_index_args(args) -> list:
+    out = []
+    if args.project:
+        out.append(args.project)
+    if args.all:
+        out.append("--all")
+    if args.from_catalog:
+        out.append("--from-catalog")
+    return out
+
+
+def cmd_link(args):
+    ensure_daemon()
+    sys.exit(_api_admin("link", _link_args(args)))
+
+
+def cmd_stats(args):
+    ensure_daemon()
+    sys.exit(_api_admin("stats", _stats_args(args)))
+
+
+def cmd_remove_index(args):
+    ensure_daemon()
+    sys.exit(_api_admin("remove-index", _remove_index_args(args)))
 
 
 def cmd_callers(args):
@@ -1475,7 +1604,12 @@ COMMANDS
   callers     Find all methods that call a given method
   callees     Find all methods called by a given method
   path        Find the shortest call chain between two methods
+  trace       Multi-hop call chain with method bodies
+  usages      Knowledge-graph usages (callers, subclasses, fields, annotations, type refs)
   projects    List all indexed projects
+  stats       Index statistics for one or all projects
+  link        Link two projects for cross-project call paths
+  remove-index  Remove a project's index and registration
   modules     List all modules in the dependency graph
   deps        Show dependencies of a module
   mod-path    Find dependency path between two modules
@@ -1761,6 +1895,104 @@ EXAMPLES
     p_path.add_argument("from_fqn", help="Source method FQN")
     p_path.add_argument("to_fqn", help="Target method FQN")
     p_path.set_defaults(func=cmd_path)
+
+    # trace (multi-hop call chain with bodies)
+    p_trace = sub.add_parser(
+        "trace",
+        help="Traverse the call graph from a method and show the bodies of visited methods",
+        description="""\
+Breadth-first traversal of the call graph from a method, with each visited method's body.
+
+EXAMPLES
+  pharos trace "com.example.PaymentService#process(Order)"
+  pharos trace "com.example.PaymentService#process(Order)" --direction callers --depth 3
+  pharos trace "com.example.PaymentService#process(Order)" --direction both --max-body 0
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_trace.add_argument("fqn", help="Starting method FQN")
+    p_trace.add_argument("--depth", "-d", type=int, default=2, metavar="N",
+                         help="Hops to traverse (default: 2, max: 4)")
+    p_trace.add_argument("--direction", choices=["callees", "callers", "both"], default="callees",
+                         help="callees (default), callers or both")
+    p_trace.add_argument("--max-body", type=int, default=500, metavar="CHARS",
+                         help="Truncate each body to this many chars (default: 500, 0 = no truncation)")
+    p_trace.set_defaults(func=cmd_trace)
+
+    # usages (knowledge graph)
+    p_usages = sub.add_parser(
+        "usages",
+        help="Find all usages of a method, class, field or annotation in the knowledge graph",
+        description="""\
+Knowledge-graph usages: callers, subclasses, super types, field readers and writers,
+annotated elements, and methods returning or taking a type.
+
+EXAMPLES
+  pharos usages "com.example.Repository" --kind subclasses
+  pharos usages "Transactional" --kind annotated
+  pharos usages "com.example.PaymentService#connectionPool" --kind field_readers
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_usages.add_argument("fqn", help="com.example.MyClass, com.example.MyClass#myMethod() or com.example.MyClass#field")
+    p_usages.add_argument("--kind", "-k", default="all",
+                          choices=["all", "callers", "subclasses", "field_readers", "field_writers",
+                                   "annotated", "type_refs"],
+                          help="Usage kind (default: all)")
+    p_usages.set_defaults(func=cmd_usages)
+
+    # link
+    p_link = sub.add_parser(
+        "link",
+        help="Link two projects for cross-project call graph traversal (runs in the daemon)",
+        description="""\
+Link two indexed projects and build the cross-project call graph, so call paths can cross
+from one into the other. Runs inside the daemon, which owns the graphs.
+
+EXAMPLES
+  pharos link my-service my-library
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_link.add_argument("project1", help="First project name")
+    p_link.add_argument("project2", help="Second project name")
+    p_link.set_defaults(func=cmd_link)
+
+    # stats
+    p_stats = sub.add_parser(
+        "stats",
+        help="Show index statistics for one or all projects",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_stats.add_argument("--project", "-p", metavar="NAME", help="Show stats for a specific project")
+    p_stats.set_defaults(func=cmd_stats)
+
+    # remove-index
+    p_remove = sub.add_parser(
+        "remove-index",
+        help="Remove a project's index and all associated data (runs in the daemon)",
+        description="""\
+Remove a project's index, call graph, file state, module-graph entry, links and registry
+entry. Runs inside the daemon, which closes its own readers of the project first. A project
+registered under an invalid name (e.g. ".") is only unregistered; nothing is deleted from disk.
+
+EXIT CODES
+  0 removed, 1 not found or a removal failed, 2 bad usage, or refused on this node
+    (a cluster reader, or a work-queue writer)
+
+EXAMPLES
+  pharos remove-index myproject
+  pharos remove-index --all
+  pharos remove-index lucene --from-catalog      # cluster: drop it from the shard catalog only
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_remove.add_argument("project", nargs="?", help="Project name (omit with --all)")
+    p_remove.add_argument("--all", action="store_true", help="Remove every indexed project")
+    p_remove.add_argument("--from-catalog", action="store_true",
+                          help="Cluster: only remove the project (every shard of a split project) from the "
+                               "shard catalog; deletes no index data")
+    p_remove.set_defaults(func=cmd_remove_index)
 
     # projects
     p_projects = sub.add_parser(

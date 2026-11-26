@@ -149,6 +149,36 @@ public class WebServer {
         this.idleTimeout = java.util.Objects.requireNonNull(timeout, "timeout");
     }
 
+    /**
+     * Commands {@code ./pharos} runs inside this daemon ({@code POST /api/admin/<name>}): each call
+     * builds a fresh command object and runs it with the request's arguments, exactly as the Java CLI
+     * would, but on this process's indexer, so the commands that delete or rewrite indexes
+     * ({@code remove-index}, {@code link}) close and reopen this daemon's readers instead of a second
+     * JVM changing files under them. Empty: no admin commands (tests, and nodes wired without them).
+     */
+    private volatile Map<String, java.util.function.Supplier<Object>> adminCommands = Map.of();
+    /** One admin command at a time: they change the registry and the index dirs. */
+    private final Object adminLock = new Object();
+    /** Header every admin request must carry; a browser cannot send it cross-site without a CORS preflight. */
+    public static final String ADMIN_HEADER = "X-Pharos-Admin";
+
+    /** The commands {@code POST /api/admin/<name>} runs, by name (see {@link #adminCommands}). */
+    public void setAdminCommands(Map<String, java.util.function.Supplier<Object>> commands) {
+        this.adminCommands = Map.copyOf(commands);
+    }
+
+    /** Whether {@code remoteAddr} (the TCP peer) is this host: admin commands are local only. */
+    static boolean isLoopback(String remoteAddr) {
+        if (remoteAddr == null || remoteAddr.isBlank()) return false;
+        try {
+            // a literal address from the connection, never a name: no DNS lookup happens here
+            return java.net.InetAddress.ofLiteral(remoteAddr.startsWith("[") && remoteAddr.endsWith("]")
+                    ? remoteAddr.substring(1, remoteAddr.length() - 1) : remoteAddr).isLoopbackAddress();
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
     /** Checks a presented cluster token (constant time); without one, no request gets the token view. */
     private volatile java.util.function.Predicate<String> clusterToken = t -> false;
 
@@ -647,6 +677,56 @@ public class WebServer {
                 log.error("Search failed for query '{}': {}", q, e.getMessage(), e);
                 ctx.status(500).json(Map.of("error", e.getMessage()));
             }
+        });
+
+        // API: run a CLI command inside the daemon (./pharos remove-index | link | stats). Local only:
+        // the TCP peer must be this host and the request must carry X-Pharos-Admin (a cross-site
+        // browser request cannot set it without a CORS preflight, which this server never grants).
+        // Body {"args": [...]}, the command's own arguments; answer {"exitCode", "out", "err"}.
+        app.post("/api/admin/{command}", ctx -> {
+            java.util.function.Supplier<Object> factory = adminCommands.get(ctx.pathParam("command"));
+            if (factory == null) {
+                ctx.status(404).json(Map.of("error", "no such admin command: " + ctx.pathParam("command")));
+                return;
+            }
+            if (!"1".equals(ctx.header(ADMIN_HEADER))) {
+                ctx.status(403).json(Map.of("error", "admin commands need the " + ADMIN_HEADER + ": 1 header"));
+                return;
+            }
+            if (!isLoopback(ctx.req().getRemoteAddr())) {
+                ctx.status(403).json(Map.of("error", "admin commands are accepted from this host only"));
+                return;
+            }
+            List<String> args = new ArrayList<>();
+            try {
+                Object raw = ctx.body().isBlank() ? null : mapper.readValue(ctx.body(), Map.class).get("args");
+                if (raw != null) {
+                    if (!(raw instanceof List<?> list)) throw new IllegalArgumentException("args must be a list");
+                    for (Object o : list) {
+                        if (!(o instanceof String str)) throw new IllegalArgumentException("args must be strings");
+                        args.add(str);
+                    }
+                }
+            } catch (Exception e) {
+                ctx.status(400).json(Map.of("error", "body must be {\"args\": [\"...\"]}"));
+                return;
+            }
+            java.io.StringWriter out = new java.io.StringWriter();
+            java.io.StringWriter err = new java.io.StringWriter();
+            int exit;
+            synchronized (adminLock) {
+                picocli.CommandLine cmd = new picocli.CommandLine(factory.get());
+                cmd.setOut(new java.io.PrintWriter(out, true));
+                cmd.setErr(new java.io.PrintWriter(err, true));
+                exit = cmd.execute(args.toArray(String[]::new));
+                cmd.getOut().flush();
+                cmd.getErr().flush();
+            }
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("exitCode", exit);
+            res.put("out", out.toString());
+            res.put("err", err.toString());
+            ctx.json(res);
         });
 
         // API: rate a search result — appends a judgment to eval/goldenset.jsonl

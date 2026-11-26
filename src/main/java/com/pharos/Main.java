@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * CLI entrypoint with manual dependency wiring (no Spring/DI framework).
@@ -189,6 +190,18 @@ public class Main {
             this.crossProjectLinker = crossProjectLinker;
         }
 
+        /**
+         * The commands {@code ./pharos} runs inside the daemon ({@code POST /api/admin/<name>}), each a
+         * fresh instance on this process's registry, indexer and cluster runtime: the same objects the
+         * Java CLI runs, so both report the same output and exit codes.
+         */
+        Map<String, java.util.function.Supplier<Object>> adminCommands() {
+            return Map.of(
+                    "remove-index", () -> new RemoveIndexCommand(registry, indexManager, config, clusterRuntime),
+                    "link", () -> new LinkCommand(registry, config),
+                    "stats", () -> new StatsCommand(registry, luceneIndexer));
+        }
+
         @Override
         @SuppressWarnings("unchecked")
         public <K> K create(Class<K> cls) throws Exception {
@@ -227,10 +240,13 @@ public class Main {
                 return (K) new ModuleDepsCommand(moduleGraphBuilder);
             if (cls == ModulePathCommand.class)
                 return (K) new ModulePathCommand(moduleGraphBuilder);
-            if (cls == WebCommand.class)
-                return (K) new WebCommand(new WebServer(searchEngine, registry,
-                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, config.getCluster().getRole()),
-                        searchEngine, clusterRuntime);
+            if (cls == WebCommand.class) {
+                WebServer web = new WebServer(searchEngine, registry,
+                        moduleGraphBuilder, luceneIndexer, boundaryAnalyzer, config.getCluster().getRole());
+                // ./pharos runs these inside the daemon, on its own indexer (see WebServer#setAdminCommands)
+                web.setAdminCommands(adminCommands());
+                return (K) new WebCommand(web, searchEngine, clusterRuntime);
+            }
             if (cls == RemoveIndexCommand.class)
                 return (K) new RemoveIndexCommand(registry, indexManager, config, clusterRuntime);
             if (cls == BackfillEmbeddingCacheCommand.class)
