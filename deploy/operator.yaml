@@ -1,6 +1,6 @@
 # The pharos operator. One replica (no leader election in v1); it watches PharosClusters in its
 # own namespace only (WATCH_NAMESPACE). Replace OWNER with the lowercased GitHub owner and VERSION
-# with the release (e.g. 1.11.1); for minikube, `minikube image load pharos-operator:<tag>` and set that image.
+# with the release (e.g. 1.12.0); for minikube, `minikube image load pharos-operator:<tag>` and set that image.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
