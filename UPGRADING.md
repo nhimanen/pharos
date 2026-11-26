@@ -1,10 +1,15 @@
 # Upgrading
 
-## Upgrading to the next release (Unreleased)
+## Upgrading to 1.12.0
 
 Index format: unchanged. Readers switch to deterministic vector arithmetic (README, "Multi-node CPU
 determinism"); nothing to re-index.
 
+- **Graph store: ArcadeDB 25.1.1 → 26.11.1, no step.** 1.12.0 opens 1.11.x graphs as they are, and it turns
+  off ArcadeDB 26's super-node promotion and bloom filters, so 1.11.x can still read the graphs 1.12.0 writes.
+  A downgrade or a mixed 1.11.x/1.12.0 cluster during the rollout needs no re-index.
+- **Cluster fan-out, mixed versions.** A 1.11.x reader ignores the new optional `statsCheck` field of
+  `/internal/shard-search`; the coordinator runs the separate statistics round with it, as before.
 - **Kubernetes operator: one rolling restart of every pharos pod.** The operator renders a new env var,
   `PHAROS_ARITHMETIC`, on every writer, reader and router pod (and the project Jobs). That changes every pod
   template, so the first reconcile after the operator upgrade rolls all pharos pods, even when `spec.version`

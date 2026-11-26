@@ -3,9 +3,30 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
-## [Unreleased]
+## [1.12.0] - 2026-11-26
 
 **Index format:** 2 (unchanged)
+
+Three changes: the graph store moves to ArcadeDB 26.11.1, multi-node readers score vectors with the same bits on
+every CPU, and a cluster fan-out query needs fewer and shorter round trips. No re-index is needed.
+
+### Upgrade notes
+- **No re-index.** The index format stays 2, and 1.12.0 opens every 1.11.x index and graph as it is.
+- **Graphs stay readable by 1.11.x.** pharos runs ArcadeDB 26 with super-node promotion and bloom filters
+  turned off (`ArcadeDbSettings`), so the graph files it writes can still be opened by 1.11.x's ArcadeDB 25.1.1.
+  A downgrade, or a cluster that mixes 1.11.x and 1.12.0 nodes during a rollout, needs no extra step.
+- **Readers switch to deterministic arithmetic.** A node with the reader role now starts with Lucene's scalar
+  vector code and FMA off. This costs 0.1–0.2 ms per KNN query on a 50k-vector shard. To keep the per-CPU
+  code, set `PHAROS_ARITHMETIC=native`; that also silences the reader's startup WARN. Writers, routers and
+  single nodes are unchanged. Until every reader runs 1.12.0, old and new replicas can still order exact ties
+  differently, as before.
+- **Kubernetes operator: the first upgrade rolls every pharos pod.** The operator now sets
+  `PHAROS_ARITHMETIC` on every pharos pod and Job, so every pod template changes, and the first reconcile
+  after the operator upgrade restarts all pharos pods once. This happens even with `spec.version` pinned to an
+  older image, where the variable is ignored. Schedule it as you would a release rollout; see UPGRADING.md.
+- **Mixed-version fan-out.** `/internal/shard-search` gains the optional `statsCheck` request field and
+  `shardStats` response field. A 1.11.x reader ignores them. The coordinator then runs the separate statistics
+  round with that reader, as before, and does not ask it again for 10 minutes.
 
 ### Changed
 - ArcadeDB, which stores the call graph, the module graph and the cross-project graph, is upgraded from
@@ -52,10 +73,6 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   `setup.sh`'s daemon start (deterministic when `config.json` has `cluster.role: reader`). The flags are read
   when Lucene loads, so they cannot be set from `config.json`. Only an explicit `PHAROS_ARITHMETIC=native`
   silences a reader's WARN; native as a launcher's role default passes `-Dpharos.arithmetic=native-default`.
-- Upgrade note (operator): the operator now renders `PHAROS_ARITHMETIC` on every pharos pod and Job, which
-  changes every pod template, so the first operator upgrade to this release rolls every pharos pod once, even
-  with `spec.version` pinned to an older image (where the env is ignored, harmlessly). Schedule it like a
-  release rollout; see UPGRADING.md.
 - Cluster fan-out: a hybrid query's coordinator embeds the query while the keyword stage's statistics and
   search rounds run (unified: while its statistics round runs), on a bounded pool shared by the JVM
   (`pharos-query-embed-*`, one thread per core, no queue: with every thread busy a query embeds when it needs
