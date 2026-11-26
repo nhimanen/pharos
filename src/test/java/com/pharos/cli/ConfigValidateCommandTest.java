@@ -43,6 +43,19 @@ class ConfigValidateCommandTest {
     }
 
     @Test
+    void nullEmbeddingProviderIsAValidationErrorNotACrash() throws Exception {
+        Run r = run("config", "validate", file("nullprov.json", "{\"embeddingProviders\":[null]}").toString());
+        assertThat(r.exit()).isEqualTo(2);
+        assertThat(r.err()).contains("embeddingProviders[0] is empty").doesNotContain("NullPointerException");
+
+        r = run("config", "validate", file("nullfb.json", "{\"embeddingProviders\":[{\"modelId\":\"m\","
+                + "\"type\":\"djl\",\"url\":\"hf://a/b\",\"dimensions\":384,\"fallbacks\":[null]}]}").toString());
+        assertThat(r.exit()).isEqualTo(2);
+        assertThat(r.err()).contains("embeddingProviders[0].fallbacks[0] is empty")
+                .doesNotContain("NullPointerException");
+    }
+
+    @Test
     void configValidateReportsErrorsWithExit2() throws Exception {
         // a valid reader config (the token from env): exit 0, "ok"
         Path ok = file("ok.json", "{\"cluster\":{\"role\":\"reader\",\"backend\":\"object-store\","

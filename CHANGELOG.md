@@ -832,7 +832,7 @@ single-node tool (`role: all`, `backend: local`), and its search and graph outpu
   the indexes root, so removing it could delete every project's index. Default names now come from
   the directory name, invalid names (empty, `.`, `..`, separators, anything outside the indexes
   directory) are refused, and deletes and writes never leave the indexes directory. Existing bad
-  registrations are reported as `invalid` and ignored; `pharos remove .` unregisters them without
+  registrations are reported as `invalid` and ignored; `pharos remove-index .` unregisters them without
   deleting anything (see UPGRADING.md, "Invalid project names").
 - `setup.sh` printed "pharos pharos X" on its final line.
 

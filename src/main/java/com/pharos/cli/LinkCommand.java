@@ -15,6 +15,24 @@ import java.util.concurrent.Callable;
 )
 public class LinkCommand implements Callable<Integer> {
 
+    /** Set by picocli; the web API runs this command with its own writers (see {@code WebServer} admin commands). */
+    @picocli.CommandLine.Spec
+    picocli.CommandLine.Model.CommandSpec spec;
+    private java.io.PrintWriter stdout;
+    private java.io.PrintWriter stderr;
+
+    private java.io.PrintWriter out() {
+        if (spec != null) return spec.commandLine().getOut();
+        if (stdout == null) stdout = new java.io.PrintWriter(System.out, true);
+        return stdout;
+    }
+
+    private java.io.PrintWriter err() {
+        if (spec != null) return spec.commandLine().getErr();
+        if (stderr == null) stderr = new java.io.PrintWriter(System.err, true);
+        return stderr;
+    }
+
     @Parameters(index = "0", description = "First project name")
     private String project1;
 
@@ -32,23 +50,32 @@ public class LinkCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         try {
+            return run();
+        } finally {
+            out().flush();
+            err().flush();
+        }
+    }
+
+    private Integer run() {
+        try {
             RoleGuard.requireIndexing(config);
         } catch (IllegalStateException e) {
-            System.err.println(e.getMessage());
+            err().println(e.getMessage());
             return 2;
         }
         try {
             registry.link(project1, project2);
-            System.out.printf("Linked '%s' and '%s'%n", project1, project2);
+            out().printf("Linked '%s' and '%s'%n", project1, project2);
 
             // Build cross-project call graph
-            System.out.println("Building cross-project call graph...");
+            out().println("Building cross-project call graph...");
             CrossProjectLinker linker = new CrossProjectLinker(config, registry);
             linker.buildCrossProjectGraph(project1, project2);
-            System.out.println("Cross-project graph built.");
+            out().println("Cross-project graph built.");
             return 0;
         } catch (Exception e) {
-            System.err.println("Error: " + e.getMessage());
+            err().println("Error: " + e.getMessage());
             return 1;
         }
     }

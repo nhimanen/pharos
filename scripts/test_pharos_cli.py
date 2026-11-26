@@ -1,11 +1,14 @@
-"""Tests for the ./pharos Python client's `embeddings` command. Run: python3 scripts/test_pharos_cli.py"""
+"""Tests for the ./pharos Python client (embeddings, graph and admin commands). Run: python3 scripts/test_pharos_cli.py"""
 import importlib.machinery
 import importlib.util
 import pathlib
 import subprocess
 import sys
 import tempfile
+import io
+import json
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -86,6 +89,129 @@ class JarResolution(unittest.TestCase):
         names = ["pharos-1.9.0.jar", "pharos-1.10.0.jar", "pharos-1.4.1.jar", "pharos-1.10.0-SNAPSHOT.jar"]
         self.assertEqual("pharos-1.10.0.jar", pathlib.Path(p._newest_jar(["/t/" + n for n in names])).name)
         self.assertIsNone(p._newest_jar([]))
+
+
+class FakeResponse(io.BytesIO):
+    """What urllib.request.urlopen returns, as a context manager."""
+    def __init__(self, payload):
+        super().__init__(json.dumps(payload).encode())
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class GraphAndAdminCommands(unittest.TestCase):
+    """trace and usages read the daemon's API; link, stats and remove-index run inside the daemon."""
+
+    def setUp(self):
+        self.p = load()
+        self.p.PHAROS_DUMPS = pathlib.Path(tempfile.mkdtemp())
+
+    def main(self, *argv):
+        """Runs `pharos <argv>` with the daemon mocked; returns (exit code, the urlopen calls)."""
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(req)
+            url = req if isinstance(req, str) else req.full_url
+            if "/api/admin/" in url:
+                return FakeResponse({"exitCode": 3, "out": "done\n", "err": "warned\n"})
+            if "/api/trace" in url:
+                return FakeResponse({"root": "a.B#c()", "direction": "callees", "maxDepth": 2, "totalNodes": 0,
+                                     "truncated": False, "nodes": []})
+            return FakeResponse({"fqn": "a.B", "callers": ["x.Y#z()"]})
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["pharos", *argv]), \
+             mock.patch.object(self.p, "ensure_daemon"), \
+             mock.patch.object(self.p.urllib.request, "urlopen", side_effect=urlopen), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            code = 0
+            try:
+                self.p.main()
+            except SystemExit as e:
+                code = e.code
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return code, calls
+
+    def test_remove_index_runs_in_the_daemon_with_the_cli_arguments(self):
+        code, calls = self.main("remove-index", "myproject")
+        self.assertEqual(1, len(calls))
+        req = calls[0]
+        self.assertTrue(req.full_url.endswith("/api/admin/remove-index"))
+        self.assertEqual("POST", req.get_method())
+        self.assertEqual("1", req.get_header("X-pharos-admin"))   # urllib capitalizes header names
+        self.assertEqual({"args": ["myproject"]}, json.loads(req.data))
+        self.assertEqual(3, code)                    # the daemon's exit code, passed through
+        self.assertEqual("done\n", self.out)
+        self.assertEqual("warned\n", self.err)
+
+    def test_remove_index_flags(self):
+        _, calls = self.main("remove-index", "--all")
+        self.assertEqual({"args": ["--all"]}, json.loads(calls[0].data))
+        _, calls = self.main("remove-index", "lucene", "--from-catalog")
+        self.assertEqual({"args": ["lucene", "--from-catalog"]}, json.loads(calls[0].data))
+        _, calls = self.main("remove-index", ".")    # an invalid registration: the daemon only unregisters it
+        self.assertEqual({"args": ["."]}, json.loads(calls[0].data))
+
+    def test_link_and_stats(self):
+        _, calls = self.main("link", "a", "b")
+        self.assertTrue(calls[0].full_url.endswith("/api/admin/link"))
+        self.assertEqual({"args": ["a", "b"]}, json.loads(calls[0].data))
+        _, calls = self.main("stats")
+        self.assertEqual({"args": []}, json.loads(calls[0].data))
+        _, calls = self.main("stats", "--project", "a")
+        self.assertTrue(calls[0].full_url.endswith("/api/admin/stats"))
+        self.assertEqual({"args": ["--project", "a"]}, json.loads(calls[0].data))
+
+    def test_admin_http_error_exits_1_with_the_message(self):
+        def refuse(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {},
+                                         io.BytesIO(b'{"error": "admin commands are accepted from this host only"}'))
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["pharos", "stats"]), \
+             mock.patch.object(self.p, "ensure_daemon"), \
+             mock.patch.object(self.p.urllib.request, "urlopen", side_effect=refuse), \
+             mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as ex:
+            self.p.main()
+        self.assertEqual(1, ex.exception.code)
+        self.assertIn("from this host only", err.getvalue())
+
+    def test_trace_and_usages_query_the_api(self):
+        _, calls = self.main("trace", "a.B#c()", "--direction", "both", "--depth", "9", "--max-body", "0")
+        url = calls[0]
+        self.assertIn("/api/trace?", url)
+        self.assertIn("direction=both", url)
+        self.assertIn("depth=4", url)                # clamped like the Java CLI
+        self.assertIn("maxBodyChars=0", url)
+        self.assertIn("No nodes found for: a.B#c()", self.out)
+        _, calls = self.main("usages", "a.B", "--kind", "subclasses")
+        self.assertIn("/api/usages?", calls[0])
+        self.assertIn("kind=subclasses", calls[0])
+        self.assertIn("Callers (1):\n  x.Y#z()", self.out)
+
+    def test_formatters_match_the_java_cli(self):
+        r = {"root": "a.B#c()", "direction": "callees", "maxDepth": 1, "totalNodes": 2, "truncated": True,
+             "nodes": [{"fqn": "a.B#c()", "depth": 0, "filePath": "B.java", "startLine": 3, "endLine": 5,
+                        "body": "void c() {\n  d();\n}"},
+                       {"fqn": "a.B#d()", "depth": 1}]}
+        text = self.p.fmt_trace(r)
+        self.assertIn("Direction: callees | Depth: 1 | Nodes: 2 (truncated at 50)", text)
+        self.assertIn("[0] a.B#c()\n    B.java:3-5\n    void c() {", text)
+        self.assertIn("  \u21b3 [1] a.B#d()", text)
+        u = self.p.fmt_usages({"fqn": "a.B", "subclasses": ["a.C"], "fieldReaders": [], "methodsTaking": ["a.D#e(B)"]})
+        self.assertEqual("Usages of: a.B\n\nSubclasses (1):\n  a.C\n\nMethods taking (1):\n  a.D#e(B)", u)
+
+    def test_usages_rejects_an_unknown_kind(self):
+        with mock.patch.object(sys, "argv", ["pharos", "usages", "a.B", "--kind", "nope"]), \
+             mock.patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as ex:
+            self.p.main()
+        self.assertNotEqual(0, ex.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()

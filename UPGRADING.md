@@ -2,8 +2,8 @@
 
 ## Upgrading to 1.12.0
 
-Index format: unchanged. Readers switch to deterministic vector arithmetic (README, "Multi-node CPU
-determinism"); nothing to re-index.
+Index format: unchanged. Readers switch to deterministic vector arithmetic ([docs/cluster.md, "CPU-deterministic
+readers"](docs/cluster.md#cpu-deterministic-readers)); nothing to re-index.
 
 - **Graph store: ArcadeDB 25.1.1 → 26.11.1, no step.** 1.12.0 opens 1.11.x graphs as they are, and it turns
   off ArcadeDB 26's super-node promotion and bloom filters, so 1.11.x can still read the graphs 1.12.0 writes.
@@ -118,7 +118,7 @@ ArcadeDB graph, not a published `graph.cgf.gz`: repair on the writer.
 
 ### Optional: moving a cluster to peer pull (no bucket)
 
-Peer pull (`cluster.backend: peer-pull`) is new and experimental; see README "Without a bucket: peer-pull"
+Peer pull (`cluster.backend: peer-pull`) is new and experimental; see [docs/cluster.md, "Peer pull"](docs/cluster.md#peer-pull-without-a-bucket-experimental)
 for the configs. It trades the bucket for these limits: no writer takeover, the writer's disk is the only
 copy of what it published, and the cluster token is the only credential. Keep the bucket if you rely on
 Phase 4 failover or the work queue.
@@ -156,7 +156,7 @@ changes by itself. Hand-run `pharos index` / `pharos publish` are refused there 
   section before restarting it on 1.9.0. Nothing else changes for it.
 - **To adopt the work queue**, every shard needs a source in the catalog, or it stays pinned to the writer
   that has its path: index it once on a hand-run writer with `--source-git <url> --ref <branch>` (or
-  `--source-path <dir>` readable by every writer), see README "Work-queue writers". Give every writer the
+  `--source-path <dir>` readable by every writer), see [docs/cluster.md, "Sources"](docs/cluster.md#sources). Give every writer the
   same `workDir` path, or each takeover re-parses the shard in full.
 
 On a work-queue writer:
@@ -278,7 +278,7 @@ containing `/` had the same problem.
 ### Removing the entry
 
 ```bash
-pharos remove .
+pharos remove-index .
 ```
 
 This only unregisters the entry (registry, link references, synonyms) and deletes nothing on disk.
@@ -325,7 +325,7 @@ are re-indexed.
    ./setup.sh --upgrade-indexes      # or: pharos upgrade-indexes
    ```
    On a multi-node cluster: readers sync the upgraded generations; a work-queue writer refuses this
-   step and upgrades by itself once restarted on the new release (see "Work-queue writers" above).
+   step and upgrades by itself once restarted on the new release (see [docs/cluster.md, "Upgrading work-queue writers"](docs/cluster.md#upgrading-work-queue-writers)).
    Run it only on a hand-run writer (`"writer": {"workQueue": false}`).
    You can check progress any time with `pharos index-status`.
 

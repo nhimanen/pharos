@@ -25,6 +25,9 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 | Control result count | `pharos search "<query>" --limit 20` |
 | Show pipeline trace (resolved type + timings) | `pharos search "<query>" --trace` |
 | Control snippet size per result | `pharos search "<query>" --snippet-lines 20` |
+| Restrict to a build module / directory | `pharos search "<query>" --module <dir>` / `--path-prefix <dir>` |
+| Restrict to a file extension or to code vs docs | `pharos search "<query>" --language java` / `--kind code\|doc` |
+| Use a named pipeline | `pharos search "<query>" --pipeline <id>` (list them with `pharos pipelines`) |
 
 ### Method & Class Lookup
 
@@ -51,12 +54,13 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 | All usages (callers, subclasses, field access, annotations, type refs) | `pharos usages "<fqn>"` |
 | Specific usage kind | `pharos usages "<fqn>" --kind callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs` |
 
+
 ### Module Graph
 
 | Goal | Command |
 |---|---|
 | List indexed projects | `pharos projects [--limit N]` |
-| List Maven modules | `pharos modules [--filter indexed\|external] [--limit N]` |
+| List modules (Maven, Gradle, npm, Python, CMake, Go) | `pharos modules [--filter indexed\|external] [--limit N]` |
 | Module dependency tree | `pharos deps <module> [--transitive] [--limit N]` |
 | Dependency path between modules | `pharos mod-path <from> <to>` |
 | Module public API surface | `pharos boundary <project> [--limit N]` |
@@ -67,13 +71,15 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 |---|---|
 | Project structure as file tree | `pharos skeleton <project> [--path <dir>] [--depth N] [--limit N]` |
 | Index a project | `pharos index <path> [--force] [--full] [--no-embed] [--single] [--depth N] [--project-threads N]` |
+| Index format status of every project | `pharos index-status [--json]` |
+| Index statistics | `pharos stats [--project <name>]` |
 | Daemon lifecycle | `pharos daemon status\|start\|stop\|restart\|logs` |
 
 ## FQN Format
 
 `com.example.MyClass#methodName(ParamType1,ParamType2)`
 
-Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `trace`, `impact`, `usages`.
+Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `impact`, `path`, `trace`, `usages`.
 
 ## Search Types
 
@@ -84,9 +90,12 @@ Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, 
 - **hybrid** — keyword + vector fused; good general-purpose for natural language
 - **unified** — single BM25 pass with vector similarity as a score boost; no separate merge step
 
+`vector`, `hybrid` and `unified` need embeddings, which are off by default (`pharos embeddings status`
+shows whether a project has vectors). Without them, use `--type keyword`; the call graph works either way.
+
 ## Limits
 
-All listing commands accept `--limit N` (default 0 = no limit). `search` defaults to `--limit 10`.
+Most listing commands (`projects`, `modules`, `callers`, `callees`, `deps`, `boundary`, `skeleton`) accept `--limit N` (default 0 = no limit). `search` defaults to `--limit 10`.
 Use `--limit 0` to remove the cap, or a positive number to cap output.
 
 ## Indexing Options
@@ -99,6 +108,7 @@ pharos index <path> --no-embed           # skip vector embedding (faster, no sem
 pharos index <path> --single             # treat as one project even if sub-projects exist
 pharos index <path> --depth 2            # workspace discovery depth (default: 3)
 pharos index <path> --project-threads 4  # index N projects in parallel
+pharos index <path> --project <name>     # set the project name (default: directory name)
 ```
 
 ## Skeleton Options

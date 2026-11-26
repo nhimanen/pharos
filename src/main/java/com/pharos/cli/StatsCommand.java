@@ -19,6 +19,24 @@ import java.util.concurrent.Callable;
 )
 public class StatsCommand implements Callable<Integer> {
 
+    /** Set by picocli; the web API runs this command with its own writers (see {@code WebServer} admin commands). */
+    @picocli.CommandLine.Spec
+    picocli.CommandLine.Model.CommandSpec spec;
+    private java.io.PrintWriter stdout;
+    private java.io.PrintWriter stderr;
+
+    private java.io.PrintWriter out() {
+        if (spec != null) return spec.commandLine().getOut();
+        if (stdout == null) stdout = new java.io.PrintWriter(System.out, true);
+        return stdout;
+    }
+
+    private java.io.PrintWriter err() {
+        if (spec != null) return spec.commandLine().getErr();
+        if (stderr == null) stderr = new java.io.PrintWriter(System.err, true);
+        return stderr;
+    }
+
     @Option(names = {"--project", "-p"}, description = "Show stats for a specific project")
     private String project;
 
@@ -32,49 +50,58 @@ public class StatsCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        try {
+            return run();
+        } finally {
+            out().flush();
+            err().flush();
+        }
+    }
+
+    private Integer run() {
         List<ProjectMeta> projects = project != null
                 ? registry.find(project).map(List::of).orElse(List.of())
                 : registry.listAll();
 
         if (projects.isEmpty()) {
-            System.out.println("No indexed projects found.");
+            out().println("No indexed projects found.");
             return 0;
         }
 
         for (ProjectMeta meta : projects) {
-            System.out.printf("Project: %s%n", meta.getName());
-            System.out.printf("  Root:         %s%n", meta.getRootPath());
-            System.out.printf("  Index:        %s%n", meta.getIndexPath());
-            System.out.printf("  Methods:      %d%n", meta.getMethodCount());
-            System.out.printf("  Classes:      %d%n", meta.getClassCount());
-            System.out.printf("  Files:        %d%n", meta.getFileCount());
-            System.out.printf("  Packages:     %s%n", meta.getKnownPackages().size());
-            System.out.printf("  Last indexed: %s%n", meta.getLastIndexed());
+            out().printf("Project: %s%n", meta.getName());
+            out().printf("  Root:         %s%n", meta.getRootPath());
+            out().printf("  Index:        %s%n", meta.getIndexPath());
+            out().printf("  Methods:      %d%n", meta.getMethodCount());
+            out().printf("  Classes:      %d%n", meta.getClassCount());
+            out().printf("  Files:        %d%n", meta.getFileCount());
+            out().printf("  Packages:     %s%n", meta.getKnownPackages().size());
+            out().printf("  Last indexed: %s%n", meta.getLastIndexed());
             if (!meta.getLinkedProjects().isEmpty()) {
-                System.out.printf("  Linked:       %s%n", String.join(", ", meta.getLinkedProjects()));
+                out().printf("  Linked:       %s%n", String.join(", ", meta.getLinkedProjects()));
             }
 
             // Lucene doc count
             try {
                 DirectoryReader reader = luceneIndexer.openReader(meta.getName());
-                System.out.printf("  Lucene docs:  %d%n", reader.numDocs());
+                out().printf("  Lucene docs:  %d%n", reader.numDocs());
             } catch (Exception e) {
-                System.out.printf("  Lucene docs:  (unavailable)%n");
+                out().printf("  Lucene docs:  (unavailable)%n");
             }
 
             // Graph stats
             try (GraphView graph = GraphViews.open(meta)) { // checks the index format first
-                System.out.printf("  Graph methods: %d%n", graph.methodCount());
-                System.out.printf("  Graph calls:   %d%n", graph.callCount());
+                out().printf("  Graph methods: %d%n", graph.methodCount());
+                out().printf("  Graph calls:   %d%n", graph.callCount());
             } catch (IncompatibleIndexException e) {
-                System.out.printf("  Graph:         (index format incompatible: %s)%n", e.status().wireName());
+                out().printf("  Graph:         (index format incompatible: %s)%n", e.status().wireName());
             } catch (Exception e) {
-                System.out.printf("  Graph:         (unavailable)%n");
+                out().printf("  Graph:         (unavailable)%n");
             }
 
-            System.out.printf("  Unresolved:   %d call refs (for cross-project linking)%n",
+            out().printf("  Unresolved:   %d call refs (for cross-project linking)%n",
                     registry.refsOf(meta).size());
-            System.out.println();
+            out().println();
         }
         return 0;
     }

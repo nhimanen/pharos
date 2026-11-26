@@ -231,6 +231,7 @@ public class IndexConfig {
         IndexConfig config = mapper.readValue(configFile.toFile(), IndexConfig.class);
         if (config.indexDir == null) config.indexDir = DEFAULT_BASE.resolve("indexes");
         if (config.embeddingProviders == null) config.embeddingProviders = new ArrayList<>();
+        rejectEmptyProviders(config.embeddingProviders);
         config.migrateLegacyEmbeddingConfig();
         if (config.cluster == null) config.cluster = new ClusterConfig();
         config.cluster.validate();
@@ -298,6 +299,27 @@ public class IndexConfig {
      * corrupt the shared Lucene vector field or silently defeat many-to-one
      * routing.
      */
+    /**
+     * A {@code null} entry ({@code "embeddingProviders": [null]}, or one in a provider's
+     * {@code fallbacks}) is a validation error naming its position, not a NullPointerException.
+     */
+    static void rejectEmptyProviders(List<EmbeddingProviderConfig> providers) {
+        for (int i = 0; i < providers.size(); i++) {
+            EmbeddingProviderConfig p = providers.get(i);
+            if (p == null) {
+                throw new IllegalArgumentException("embeddingProviders[" + i + "] is empty (null):"
+                        + " remove it or give it a provider object");
+            }
+            List<EmbeddingProviderConfig> fallbacks = p.getFallbacks();
+            for (int j = 0; fallbacks != null && j < fallbacks.size(); j++) {
+                if (fallbacks.get(j) == null) {
+                    throw new IllegalArgumentException("embeddingProviders[" + i + "].fallbacks[" + j
+                            + "] is empty (null): remove it or give it a provider object");
+                }
+            }
+        }
+    }
+
     private static void validateFallbacks(EmbeddingProviderConfig parent) {
         List<EmbeddingProviderConfig> fallbacks = parent.getFallbacks();
         for (int i = 0; i < fallbacks.size(); i++) {
