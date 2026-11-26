@@ -21,7 +21,11 @@ import java.util.TreeSet;
  */
 final class TermStatsCache {
 
-    /** Default bound on cached term entries (field entries: a tenth of it): a few MB of heap at most. */
+    /**
+     * Default bound on cached term entries (field entries: a tenth of it). Worst case about 30-50 MB of
+     * heap: 50 000 terms of up to 255 characters each (key strings, records and map entries), plus the
+     * 5 000 field entries. Typical query terms are far shorter, so a few MB is the common case.
+     */
     static final int DEFAULT_MAX_TERMS = 50_000;
 
     private record FieldKey(String shard, long generation, String field) {}
