@@ -39,6 +39,10 @@ import java.util.stream.Stream;
  */
 public class CallGraph implements GraphView {
 
+    static {
+        ArcadeDbSettings.apply(); // before any database opens: stay readable by ArcadeDB 25.1.1
+    }
+
     private static final Logger log = LoggerFactory.getLogger(CallGraph.class);
 
     /** Commit vertex/edge batches every N pending operations to bound transaction size. */

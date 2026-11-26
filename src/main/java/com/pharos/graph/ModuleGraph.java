@@ -35,6 +35,10 @@ import java.util.stream.Stream;
  */
 public class ModuleGraph implements AutoCloseable {
 
+    static {
+        ArcadeDbSettings.apply(); // before any database opens: stay readable by ArcadeDB 25.1.1
+    }
+
     private static final Logger log = LoggerFactory.getLogger(ModuleGraph.class);
 
     private final Database db;
