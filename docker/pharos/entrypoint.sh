@@ -6,7 +6,10 @@
 #                 the embedding model cache (~/.djl.ai) lands on the PVC: uid 10001 has no home dir
 #   PHAROS_PORT   HTTP port (default 7070 for web, 7080 for router)
 #   PHAROS_CONFIG config file to use (default /etc/pharos/config.json, a ConfigMap mount)
-#   JAVA_OPTS     extra JVM options
+#   PHAROS_ARITHMETIC  deterministic | native: Lucene's vector arithmetic (ruling CPU-R1). Default
+#                 deterministic for reader (Lucene's scalar code, FMA off: the same score bits on every
+#                 CPU), native for writer, router and all (Lucene's per-CPU fastest choice)
+#   JAVA_OPTS     extra JVM options (after the arithmetic flags, so they win)
 # Arguments, when given, are one pharos command to run instead of the server (an operator Job:
 # `index --source-git <url> --ref <ref> --project <name>`, `remove-index --from-catalog <name>`);
 # the container exits with its code. The config is linked in the same way.
@@ -37,16 +40,34 @@ else
     echo "pharos-entrypoint: no config at $config; starting with defaults" >&2
 fi
 
+# Lucene reads its FMA choice and whether it uses the Vector API once, at class load: only JVM flags pin them.
+arithmetic="${PHAROS_ARITHMETIC:-}"
+if [ -z "$arithmetic" ]; then
+    case "$role" in
+        reader) arithmetic=deterministic ;;
+        *) arithmetic=native ;;
+    esac
+fi
+case "$arithmetic" in
+    deterministic)
+        # no --add-modules jdk.incubator.vector: Lucene runs its scalar code, strictly specified Java floats
+        arithmetic_opts="-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic" ;;
+    native)
+        arithmetic_opts="--add-modules jdk.incubator.vector -Dpharos.arithmetic=native" ;;
+    *)
+        echo "pharos-entrypoint: PHAROS_ARITHMETIC must be deterministic or native (got '$arithmetic')" >&2
+        exit 64 ;;
+esac
+
 jar=/opt/pharos/pharos.jar
 command_args=$#
-# The flags ./pharos always passes, plus container-aware heap sizing; a command's own arguments
-# stay after them.
+# The flags ./pharos always passes, plus container-aware heap sizing and the arithmetic flags; a
+# command's own arguments stay after them.
 set -- -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError \
     --enable-native-access=ALL-UNNAMED \
     --add-opens java.base/java.nio.channels.spi=ALL-UNNAMED \
-    --add-modules jdk.incubator.vector \
     -Dpolyglot.engine.WarnInterpreterOnly=false \
-    -Dpharos.home="$home" -Duser.home="$home" ${JAVA_OPTS:-} -jar "$jar" "$@"
+    -Dpharos.home="$home" -Duser.home="$home" $arithmetic_opts ${JAVA_OPTS:-} -jar "$jar" "$@"
 
 if [ "$command_args" -gt 0 ]; then
     # pharos loads (and validates) the config itself before running the command

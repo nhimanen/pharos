@@ -70,6 +70,22 @@ import java.util.random.RandomGenerator;
  */
 public final class WorkloadRenderer {
 
+    /**
+     * Ruling CPU-R1: readers run Lucene's deterministic vector arithmetic (its scalar code, FMA off), so readers
+     * scheduled on different CPU types score the same document with the same bits; writers, the router and the
+     * Jobs keep Lucene's per-CPU SIMD code (no score they compute reaches a fan-out). The image entrypoint turns
+     * this env into JVM flags (Lucene reads them at class load). Those are also its defaults per role, rendered
+     * explicitly so the pod spec says what runs.
+     */
+    static final String ARITHMETIC_ENV = "PHAROS_ARITHMETIC";
+    static final String DETERMINISTIC_ARITHMETIC = "deterministic";
+    static final String NATIVE_ARITHMETIC = "native";
+
+    /** The {@link #ARITHMETIC_ENV} value of {@code role}'s pods. */
+    static String arithmetic(Role role) {
+        return role == Role.READER ? DETERMINISTIC_ARITHMETIC : NATIVE_ARITHMETIC;
+    }
+
     /** The image's uid, gid and volume group (docker/pharos/Dockerfile). */
     public static final long UID = 10001;
     /** Added to {@code cluster.drainSeconds} for the pod's termination grace period. */
@@ -231,6 +247,7 @@ public final class WorkloadRenderer {
         env.add(plainEnv("PHAROS_HOME", ConfigRenderer.PHAROS_HOME));
         env.add(plainEnv("PHAROS_PORT", String.valueOf(port)));
         env.add(plainEnv("PHAROS_CONFIG", CONFIG_MOUNT + "/" + ConfigRenderer.CONFIG_KEY));
+        env.add(plainEnv(ARITHMETIC_ENV, arithmetic(role)));
         env.add(StorageRenderer.secretEnv(ConfigRenderer.TOKEN_ENV, Names.token(name), TOKEN_KEY));
         env.addAll(StorageRenderer.credentialsEnv(cluster));
 

@@ -56,6 +56,7 @@ public final class ReaderRegistry implements MembershipSource {
     private final ReentrantLock lock = new ReentrantLock();
     private final Object mu = new Object(); // guards scheduler; never held across a store call
     private volatile List<LiveReader> live = List.of();
+    private final ArithmeticDivergence arithmetic = new ArithmeticDivergence();
     private volatile boolean lastWriteOk;
     private volatile boolean draining;
     private volatile boolean closed;
@@ -236,6 +237,7 @@ public final class ReaderRegistry implements MembershipSource {
             }
             out.sort(Comparator.comparing(l -> l.heartbeat().node()));
             live = List.copyOf(out);
+            arithmetic.observe(live());
         } catch (IOException | RuntimeException e) {
             log.warn("Listing the live readers failed (keeping the previous list): {}", e.toString());
         }
