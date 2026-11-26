@@ -314,6 +314,92 @@ class ReplanTest {
         }
     }
 
+    /**
+     * A hybrid query (its vector stage overlapped with the keyword rounds) re-plans as a keyword query does:
+     * the swap between the statistics and search rounds loses both shards of the split project in the
+     * control, and one re-plan answers complete.
+     */
+    @Test
+    void aHybridQuerySwappingAShardIsFollowedByOneReplan() throws Exception {
+        Path tmp = Files.createTempDirectory("replan-hybrid");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        String project = "swap";
+        ShardSpec ring2 = ShardSpec.parse("[project, ring(path, shards=2)]");
+        List<ShardId> shards = List.of(new ShardId(project + "~ring=s01"), new ShardId(project + "~ring=s02"));
+        Path src = tmp.resolve("src");
+        for (int i = 0; i < 12; i++) {
+            SplitProjectSearchTest.writeClass(src, "src/main/java/com/example/p" + i + "/Kestrel" + i + ".java",
+                    "com.example.p" + i, "Kestrel" + i, "kestrel hover " + i);
+        }
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            fx.indexSplit(src, project, ring2, shards, false);
+            fx.index(JAVA, false);
+            try (TestReaderNode x = new TestReaderNode(tmp.resolve("x"), store, BUCKET, "x",
+                    List.of(ShardId.wildcardOf(project)), EMBEDDER, null, NO_RETENTION);
+                 TestReaderNode k = new TestReaderNode(tmp.resolve("k"), store, BUCKET, "k", List.of(JAVA), EMBEDDER, null)) {
+                for (ShardId s : shards) k.awaitShard(s.value(), 1);
+                assertThat(search(k, project, "kestrel", SearchType.HYBRID).warnings()).as("before").isEmpty();
+
+                k.ds().retries = false;
+                nextRun(fx, src, project, ring2, shards, 1);
+                swapOnceAfterStats(x);
+                assertThatThrownBy(() -> search(k, project, "kestrel", SearchType.HYBRID)).as("without the re-plan")
+                        .hasMessageContaining("generation changed during the query");
+
+                k.ds().retries = true;
+                nextRun(fx, src, project, ring2, shards, 2);
+                swapOnceAfterStats(x);
+                SearchResponse on = search(k, project, "kestrel", SearchType.HYBRID);
+                assertThat(on.warnings()).as("with the re-plan").isEmpty();
+                assertThat(on.results().stream().map(res -> res.className()).distinct().count())
+                        .as("every Kestrel class, from both shards").isEqualTo(12);
+                assertThat(on.trace().notes()).anyMatch(n -> n.startsWith("re-planned once"));
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
+    /**
+     * The re-plan's budget is unchanged for a hybrid query whose embedding runs alongside its keyword
+     * rounds: within the original timeout, with the same answer as the sequential coordinator.
+     */
+    @Test
+    void aHybridReplanNeverExceedsTheOriginalQueryTimeout() throws Exception {
+        Path tmp = Files.createTempDirectory("replan-hybrid-budget");
+        InMemoryObjectStore store = new InMemoryObjectStore();
+        int timeoutMillis = 1500;
+        try (ClusterFixture fx = new ClusterFixture(tmp.resolve("fixture"), store, store, BUCKET, EMBEDDER)) {
+            fx.indexBoth();
+            try (TestReaderNode c = new TestReaderNode(tmp.resolve("c"), store, BUCKET, "c", List.of(PY), EMBEDDER,
+                    "old, rule\n", cfg -> {
+                        cfg.setFanoutTimeoutMillis(1000);
+                        cfg.setQueryTimeoutMillis(timeoutMillis);
+                    });
+                 TestReaderNode r = new TestReaderNode(tmp.resolve("r"), store, BUCKET, "r", List.of(JAVA), EMBEDDER,
+                         "calculator, adder\n")) {
+                c.awaitShard(JAVA, 1);
+                search(c, null, "multiply Calculator", SearchType.HYBRID); // warm-up
+                c.ds().overlapEmbedding = false;
+                SearchResponse control = search(c, null, "multiply Calculator", SearchType.HYBRID);
+                c.ds().overlapEmbedding = true;
+                for (int i = 0; i < 3; i++) {
+                    long t0 = System.nanoTime();
+                    SearchResponse resp = search(c, null, "multiply Calculator", SearchType.HYBRID);
+                    long tookMillis = (System.nanoTime() - t0) / 1_000_000;
+                    assertThat(resp.trace().notes()).anyMatch(n -> n.startsWith("re-planned once"));
+                    assertThat(resp.warnings()).as("still refused: the partial answer").anyMatch(w -> w.contains("synonyms"))
+                            .isEqualTo(control.warnings());
+                    assertThat(DistributedSearchTest.bits(resp.results())).isEqualTo(DistributedSearchTest.bits(control.results()));
+                    assertThat(tookMillis).as("within the query timeout of " + timeoutMillis + " ms (plus scheduling)")
+                            .isLessThan(timeoutMillis + 400);
+                }
+            }
+        } finally {
+            SplitProjectSearchTest.deleteTree(tmp);
+        }
+    }
+
     /** Publishes the project's next index run (a changed file), which reader x has not activated yet. */
     private static void nextRun(ClusterFixture fx, Path src, String project, ShardSpec spec, List<ShardId> shards,
                                 int n) throws Exception {
@@ -343,5 +429,9 @@ class ReplanTest {
     private static SearchResponse search(TestReaderNode node, String project, String q) throws Exception {
         return node.engine.searchWithTrace(new SearchRequest(q, SearchType.KEYWORD, project, null, 50, "text", null,
                 null, 0), false);
+    }
+
+    private static SearchResponse search(TestReaderNode node, String project, String q, SearchType type) throws Exception {
+        return node.engine.searchWithTrace(new SearchRequest(q, type, project, null, 50, "text", null, null, 0), false);
     }
 }

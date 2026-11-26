@@ -155,6 +155,8 @@ public final class DistributedSearch implements Closeable {
     volatile boolean globalStatistics = true;
     /** Tests only: false turns off the one re-plan of a query (ruling P6-R16; the control of its tests). */
     volatile boolean retries = true;
+    /** Tests only: false embeds the query when a stage first needs it (the control of the overlap tests). */
+    volatile boolean overlapEmbedding = true;
     /** Tests only: runs after a query's statistics round (a reader may swap a generation here). */
     static volatile java.util.function.Consumer<String> afterStatsRound;
     /** Tests only: runs when a query is about to be planned again (P6-R16), before the wait for fresh state. */
@@ -164,6 +166,18 @@ public final class DistributedSearch implements Closeable {
     /** Re-planned queries running at once; beyond it a query keeps its first, partial answer. */
     static final int MAX_CONCURRENT_REPLANS = 16;
     private final java.util.concurrent.Semaphore replans = new java.util.concurrent.Semaphore(MAX_CONCURRENT_REPLANS);
+
+    /** Threads embedding queries ahead of the rounds that need the vector ({@link Query#prefetchVector}). */
+    static final int EMBED_THREADS = Math.max(2, Runtime.getRuntime().availableProcessors());
+    /**
+     * Shared by every coordinator of the JVM, never shut down: an embedding provider keeps one inference
+     * session per thread, so its threads live as long as the JVM (a pool per coordinator would leak the
+     * sessions of a replaced one). No queue: a query finding every thread busy embeds on its own thread
+     * when the vector is needed, as it did before, so a full pool never makes a query wait longer.
+     */
+    private static final java.util.concurrent.ThreadPoolExecutor EMBEDDINGS = new java.util.concurrent.ThreadPoolExecutor(
+            EMBED_THREADS, EMBED_THREADS, 0L, TimeUnit.MILLISECONDS, new java.util.concurrent.SynchronousQueue<>(),
+            Thread.ofPlatform().name("pharos-query-embed-", 0).daemon(true).factory());
 
     /**
      * @param queryTimeout      the budget of one query, every round included
@@ -432,6 +446,8 @@ public final class DistributedSearch implements Closeable {
         private final long deadlineNanos;
         private final List<String> warnings = new ArrayList<>();
         private final Map<String, float[]> vectors = new HashMap<>();
+        /** Embeddings started ahead ({@link #prefetchVector}), until {@link #queryVector(String)} takes them. */
+        private final Map<String, Future<float[]>> pendingVectors = new HashMap<>();
         /** Queries whose embedding threw (the provider logged it); their vector is null. */
         private final Set<String> embedFailed = new HashSet<>();
         private final Set<Future<?>> outstanding = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1292,21 +1308,117 @@ public final class DistributedSearch implements Closeable {
 
         /** The pipeline's stage runner for this query: every retrieval stage fans out. */
         public SearchPipeline.StageRunner runner() {
-            return this::retrieve;
+            return new SearchPipeline.StageRunner() {
+                @Override
+                public List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace)
+                        throws IOException {
+                    return Query.this.retrieve(stage, req, trace);
+                }
+
+                @Override
+                public void beforeRetrieval(List<RetrievalStage> stages, SearchRequest req) {
+                    if (overlapsEmbedding(stages)) prefetchVector(req.query());
+                }
+            };
         }
 
-        private synchronized float[] queryVector(String query) {
-            if (vectors.containsKey(query)) return vectors.get(query);
+        /**
+         * True when the query vector is needed by {@code stages} after shard rounds that do not need it:
+         * a keyword stage ahead of a vector one (hybrid), or a unified stage (its statistics round). The
+         * query is then embedded meanwhile. A vector-only pipeline has nothing to overlap.
+         */
+        private boolean overlapsEmbedding(List<RetrievalStage> stages) {
+            if (!overlapEmbedding) return false;
+            boolean keyword = false;
+            for (RetrievalStage s : stages) {
+                if (s instanceof UnifiedRetrievalStage) return globalStatistics;
+                if (s instanceof KeywordRetrievalStage) keyword = true;
+                if (s instanceof VectorRetrievalStage && keyword) return true;
+            }
+            return false;
+        }
+
+        /**
+         * Starts embedding {@code query} on {@link #EMBEDDINGS}, so the keyword rounds run meanwhile; the
+         * vector is the one {@link #queryVector(String)} would compute (the same provider call). Does
+         * nothing when every embedding thread is busy: the vector is then computed when first needed.
+         */
+        void prefetchVector(String query) {
+            synchronized (this) {
+                if (closed || vectors.containsKey(query) || pendingVectors.containsKey(query)) return;
+            }
+            Future<float[]> f;
+            try {
+                f = EMBEDDINGS.submit(() -> embedder.isAvailable() ? embedder.embedQuery(query) : null);
+            } catch (java.util.concurrent.RejectedExecutionException busy) {
+                return;
+            }
+            synchronized (this) {
+                pendingVectors.putIfAbsent(query, f);
+            }
+        }
+
+        /**
+         * The query vector of {@code query}, embedded once per query (the provider applies its query
+         * prefix): a prefetched embedding is waited for, else it is computed here. Null when no model is
+         * available or the embedding failed. The query's monitor is not held while embedding.
+         */
+        private float[] queryVector(String query) {
+            Future<float[]> pending;
+            synchronized (this) {
+                if (vectors.containsKey(query)) return vectors.get(query);
+                pending = pendingVectors.get(query);
+            }
             float[] v = null;
-            if (embedder.isAvailable()) {
+            boolean failed = false;
+            if (pending != null) {
                 try {
-                    v = embedder.embedQuery(query); // embedded once, here; the provider applies its query prefix
+                    v = awaitUninterruptibly(pending);
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof com.pharos.embedding.EmbeddingException) {
+                        failed = true;              // already logged at WARN by the provider
+                    } else {
+                        synchronized (this) {
+                            pendingVectors.remove(query, pending); // as inline: not remembered, a later call retries
+                        }
+                        if (e.getCause() instanceof RuntimeException re) throw re;
+                        if (e.getCause() instanceof Error err) throw err;
+                        throw new IllegalStateException(e.getCause());
+                    }
+                }
+            } else if (embedder.isAvailable()) {
+                try {
+                    v = embedder.embedQuery(query);
                 } catch (com.pharos.embedding.EmbeddingException e) {
-                    embedFailed.add(query);         // already logged at WARN by the provider
+                    failed = true;                  // already logged at WARN by the provider
                 }
             }
-            vectors.put(query, v);
+            synchronized (this) {
+                pendingVectors.remove(query);
+                if (vectors.containsKey(query)) return vectors.get(query); // another thread was first: one vector
+                if (failed) embedFailed.add(query);
+                vectors.put(query, v);
+            }
             return v;
+        }
+
+        /**
+         * The embedding's result, waited for as an inline embedding runs: to the end. An interrupt meanwhile
+         * is kept (the thread's status is set again) for the rounds after it, which honour it.
+         */
+        private static float[] awaitUninterruptibly(Future<float[]> f) throws ExecutionException {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        return f.get();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
 
         /** The query vector for a retrieval stage; a failed embedding warns as the local stages do. */
@@ -1445,9 +1557,10 @@ public final class DistributedSearch implements Closeable {
             } else {
                 throw new UnsupportedOperationException(stage.getClass().getSimpleName() + " cannot fan out");
             }
+            // the statistics round first: unified's query embedding (prefetched) runs meanwhile
+            GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             float[] vec = "keyword".equals(retriever) ? null : queryVector(req);
             if ("vector".equals(retriever) && vec == null) return List.of(); // as the local stage: no vectors
-            GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             List<ShardState> targets = new ArrayList<>();
             boolean unified = "unified".equals(retriever);
             for (ShardState s : searchable()) {

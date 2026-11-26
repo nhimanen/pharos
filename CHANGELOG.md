@@ -3,6 +3,16 @@
 All notable changes to Pharos. Every release section starts with an `**Index format:**` line;
 `scripts/release-notes.sh` (and the release workflow) fail without it.
 
+## Unreleased
+
+**Index format:** 2 (unchanged)
+
+### Changed
+- Cluster fan-out: a hybrid query's coordinator embeds the query while the keyword stage's statistics and
+  search rounds run (unified: while its statistics round runs), on a bounded pool shared by the JVM
+  (`pharos-query-embed-*`, one thread per core, no queue: with every thread busy a query embeds when it needs
+  the vector, as before). Results, warnings, the query deadline and the re-plan are unchanged.
+
 ## [1.11.1] - 2026-11-26
 
 **Index format:** 2 (unchanged from 1.11.0)
