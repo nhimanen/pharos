@@ -114,23 +114,13 @@ public class CallGraph implements GraphView {
         DatabaseFactory factory = new DatabaseFactory(dbDir.toString());
         boolean created = !factory.exists();
         if (created && !allowCreate) throw new GraphNotFoundException(dbDir);
-        Database db = created ? factory.create() : factory.open();
-        if (created) {
-            try {
-                awaitDictionaryOnDisk(db);
-            } catch (RuntimeException e) {
-                db.close();
-                throw e;
-            }
-        }
+        Database db = created ? createSettled(dbDir) : factory.open();
         // Checked before initSchema, which may add names to an older graph's dictionary.
         String damage = created ? null : dictionaryProblem(db, DICTIONARY_ORDER);
         if (damage != null) warnDamaged(dbDir, damage);
-        // setAsyncFlush applies to this thread's transaction context only: every write to this
-        // graph must stay on the opening thread. Commits from another thread go through ArcadeDB's
-        // asynchronous flush queue, which can land after a later synchronous write of the same
-        // page (see awaitDictionaryOnDisk).
-        db.setAsyncFlush(false); // ensure close() blocks until pages are flushed to disk
+        // Database-wide since ArcadeDB 26 (#8352): every commit on this instance, from any thread,
+        // writes its pages synchronously, so close() returns with them on disk.
+        db.setAsyncFlush(false);
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);
         graph.dictionaryDamage = damage;
@@ -140,7 +130,7 @@ public class CallGraph implements GraphView {
     }
 
     // -------------------------------------------------------------------------
-    // Damaged property dictionary (graphs written before 1.10.0, see awaitDictionaryOnDisk)
+    // Damaged property dictionary (graphs written before 1.10.0, see createSettled)
     // -------------------------------------------------------------------------
 
     /**
@@ -220,8 +210,17 @@ public class CallGraph implements GraphView {
         return names;
     }
 
+    /** ArcadeDB's dictionary file name: {@code dictionary.<fileId>.<pageSize>.v<version>.dict}. */
     private static final java.util.regex.Pattern DICTIONARY_FILE =
-            java.util.regex.Pattern.compile("dictionary\\.\\d+\\.\\d+\\.v\\d+\\.dict");
+            java.util.regex.Pattern.compile("dictionary\\.\\d+\\.(\\d+)\\.v\\d+\\.dict");
+
+    /** {@code dbDir}'s dictionary file, or null when it has none. */
+    private static Path dictionaryFile(Path dbDir) throws java.io.IOException {
+        if (!Files.isDirectory(dbDir)) return null;
+        try (Stream<Path> s = Files.list(dbDir)) {
+            return s.filter(p -> DICTIONARY_FILE.matcher(p.getFileName().toString()).matches()).findFirst().orElse(null);
+        }
+    }
 
     /**
      * Name to id from ArcadeDB 25.1.1's dictionary file, as {@code Dictionary.reload} reads it:
@@ -230,11 +229,7 @@ public class CallGraph implements GraphView {
      * Null when {@code dbDir} has no dictionary file.
      */
     static Map<String, Integer> readDictionary(Path dbDir) throws java.io.IOException {
-        if (!Files.isDirectory(dbDir)) return null;
-        Path file;
-        try (Stream<Path> s = Files.list(dbDir)) {
-            file = s.filter(p -> DICTIONARY_FILE.matcher(p.getFileName().toString()).matches()).findFirst().orElse(null);
-        }
+        Path file = dictionaryFile(dbDir);
         if (file == null) return null;
         try (var ch = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
             java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(8);
@@ -291,40 +286,41 @@ public class CallGraph implements GraphView {
     }
 
     /**
-     * Waits until ArcadeDB has written a new database's dictionary header page.
+     * Creates the ArcadeDB database at {@code dbDir} and returns it opened again, with nothing of
+     * its creation still in ArcadeDB's asynchronous flush queue. A workaround for ArcadeDB
+     * <a href="https://github.com/ArcadeData/arcadedb/issues/13441">#13441</a> (open in 26.11.1).
      *
-     * <p>{@code DatabaseFactory.create()} commits that page through ArcadeDB's JVM-wide
-     * asynchronous flush queue: the commit runs before {@code setAsyncFlush(false)} can apply.
-     * {@link #initSchema} then rewrites the same page synchronously (it adds the property names).
-     * When the queued, older copy reached the disk after that, the file kept the stale dictionary
-     * and every later open decoded the records' property names wrongly: vertices whose fqn read as
-     * null vanished from every scan, others came back with shuffled properties, and nothing failed.
-     * A page evicted from ArcadeDB's page cache inside that window was even re-read stale by the
-     * same instance.
+     * <p>{@code DatabaseFactory.create()} commits the property dictionary's header page through
+     * the asynchronous flush queue: the commit runs before {@code setAsyncFlush(false)} can apply.
+     * {@link #initSchema} then rewrites the same page synchronously (it adds the property names),
+     * and nothing in ArcadeDB orders the two writes. When the queued, older copy reached the disk
+     * last, the file kept the empty dictionary and every later open decoded the records' property
+     * names wrongly: vertices whose fqn read as null vanished from every scan, others came back with
+     * shuffled properties, and nothing failed.
      *
-     * <p>Closing the database would not do: its wait misses a batch the flush thread has taken off
-     * the queue but not yet marked in flight, and then the write is dropped for the closed
-     * instance. The dictionary file stays empty until the header is written, and the flush thread
-     * marks the batch in flight before writing it, so the file size plus ArcadeDB's own wait cover
-     * the whole window.
+     * <p>Closing waits for the database's queued and in-flight pages on ArcadeDB 26 (on 25.1.1 it
+     * could miss a batch the flush thread had polled, which is why pharos up to 1.11 polled the
+     * dictionary file and used the internal {@code waitAllPagesOfDatabaseAreFlushed}). The file
+     * check below is a cheap guard on that promise: a dictionary file without its header page
+     * after close means the write was lost, and the reopen would queue the header again.
      */
-    static void awaitDictionaryOnDisk(Database db) {
-        var internal = (com.arcadedb.database.DatabaseInternal) db;
-        var dictionary = internal.getSchema().getEmbedded().getDictionary();
-        var file = (com.arcadedb.engine.PaginatedComponentFile) internal.getFileManager().getFile(dictionary.getFileId());
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
-        try {
-            while (file.getSize() == 0) {
-                if (System.nanoTime() > deadline) {
-                    throw new IllegalStateException("ArcadeDB did not write the dictionary of new graph "
-                            + internal.getDatabasePath() + " within 60 s");
-                }
-                java.util.concurrent.locks.LockSupport.parkNanos(100_000);
-            }
-        } catch (java.io.IOException e) {
-            throw new IllegalStateException("Cannot read the dictionary of new graph " + internal.getDatabasePath(), e);
+    static Database createSettled(Path dbDir) {
+        new DatabaseFactory(dbDir.toString()).create().close();
+        if (!hasDictionaryPage(dbDir)) {
+            throw new IllegalStateException("ArcadeDB closed the new graph " + dbDir
+                    + " without writing its dictionary header page (ArcadeDB #13441)");
         }
-        internal.getPageManager().waitAllPagesOfDatabaseAreFlushed(db);
+        return new DatabaseFactory(dbDir.toString()).open();
+    }
+
+    /** True when {@code dbDir}'s dictionary file holds at least its page header. */
+    private static boolean hasDictionaryPage(Path dbDir) {
+        try {
+            Path file = dictionaryFile(dbDir);
+            return file != null && Files.size(file) >= 12;
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     // -------------------------------------------------------------------------
