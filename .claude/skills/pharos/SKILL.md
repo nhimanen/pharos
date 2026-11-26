@@ -25,6 +25,9 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 | Control result count | `pharos search "<query>" --limit 20` |
 | Show pipeline trace (resolved type + timings) | `pharos search "<query>" --trace` |
 | Control snippet size per result | `pharos search "<query>" --snippet-lines 20` |
+| Restrict to a build module / directory | `pharos search "<query>" --module <dir>` / `--path-prefix <dir>` |
+| Restrict to a file extension or to code vs docs | `pharos search "<query>" --language java` / `--kind code\|doc` |
+| Use a named pipeline | `pharos search "<query>" --pipeline <id>` (list them with `pharos pipelines`) |
 
 ### Method & Class Lookup
 
@@ -40,7 +43,7 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 |---|---|
 | Who calls a method | `pharos callers "<fqn>" [--limit N]` |
 | What a method calls | `pharos callees "<fqn>" [--limit N]` |
-| Multi-hop call chain with bodies | `pharos trace "<fqn>" [--depth 2] [--direction callees\|callers\|both] [--max-body 500]` |
+| Multi-hop call chain with bodies | `pharos.jar trace "<fqn>" [--depth 2] [--direction callees\|callers\|both] [--max-body 500]` (Java CLI, see below) |
 | All transitive callers — impact analysis | `pharos impact "<fqn>" [--depth 5] [--max 2000]` |
 | Shortest path between two methods | `pharos path "<from_fqn>" "<to_fqn>"` |
 
@@ -48,15 +51,25 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 
 | Goal | Command |
 |---|---|
-| All usages (callers, subclasses, field access, annotations, type refs) | `pharos usages "<fqn>"` |
-| Specific usage kind | `pharos usages "<fqn>" --kind callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs` |
+| All usages (callers, subclasses, field access, annotations, type refs) | `pharos.jar usages "<fqn>"` |
+| Specific usage kind | `pharos.jar usages "<fqn>" --kind callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs` |
+
+`trace` and `usages` are Java CLI commands: the `pharos` client has no wrapper for them. Run them with the
+installed jar (it starts its own JVM, so expect a few seconds). Below, `pharos.jar` stands for
+`java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar`:
+
+```
+java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar usages "com.example.Repository" --kind subclasses
+```
+
+If the pharos MCP server is configured, its `trace_call_chain` and `find_usages` tools do the same.
 
 ### Module Graph
 
 | Goal | Command |
 |---|---|
 | List indexed projects | `pharos projects [--limit N]` |
-| List Maven modules | `pharos modules [--filter indexed\|external] [--limit N]` |
+| List modules (Maven, Gradle, npm, Python, CMake, Go) | `pharos modules [--filter indexed\|external] [--limit N]` |
 | Module dependency tree | `pharos deps <module> [--transitive] [--limit N]` |
 | Dependency path between modules | `pharos mod-path <from> <to>` |
 | Module public API surface | `pharos boundary <project> [--limit N]` |
@@ -67,13 +80,14 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 |---|---|
 | Project structure as file tree | `pharos skeleton <project> [--path <dir>] [--depth N] [--limit N]` |
 | Index a project | `pharos index <path> [--force] [--full] [--no-embed] [--single] [--depth N] [--project-threads N]` |
+| Index format status of every project | `pharos index-status [--json]` |
 | Daemon lifecycle | `pharos daemon status\|start\|stop\|restart\|logs` |
 
 ## FQN Format
 
 `com.example.MyClass#methodName(ParamType1,ParamType2)`
 
-Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `trace`, `impact`, `usages`.
+Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `impact`, `path`, and the Java CLI's `trace` and `usages`.
 
 ## Search Types
 
@@ -84,9 +98,12 @@ Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, 
 - **hybrid** — keyword + vector fused; good general-purpose for natural language
 - **unified** — single BM25 pass with vector similarity as a score boost; no separate merge step
 
+`vector`, `hybrid` and `unified` need embeddings, which are off by default (`pharos embeddings status`
+shows whether a project has vectors). Without them, use `--type keyword`; the call graph works either way.
+
 ## Limits
 
-All listing commands accept `--limit N` (default 0 = no limit). `search` defaults to `--limit 10`.
+Most listing commands (`projects`, `modules`, `callers`, `callees`, `deps`, `boundary`, `skeleton`) accept `--limit N` (default 0 = no limit). `search` defaults to `--limit 10`.
 Use `--limit 0` to remove the cap, or a positive number to cap output.
 
 ## Indexing Options
@@ -99,6 +116,7 @@ pharos index <path> --no-embed           # skip vector embedding (faster, no sem
 pharos index <path> --single             # treat as one project even if sub-projects exist
 pharos index <path> --depth 2            # workspace discovery depth (default: 3)
 pharos index <path> --project-threads 4  # index N projects in parallel
+pharos index <path> --project <name>     # set the project name (default: directory name)
 ```
 
 ## Skeleton Options
@@ -130,29 +148,29 @@ Returns: body, declared fields, constructors (shows injected deps), public metho
 ```
 pharos callers "com.example.MyClass#x()"          # direct callers
 pharos impact "com.example.MyClass#x()"           # all transitive callers, no bodies
-pharos trace "com.example.MyClass#x()" --direction callers --depth 3  # callers with bodies
+pharos.jar trace "com.example.MyClass#x()" --direction callers --depth 3  # callers with bodies
 ```
 
 **"Trace an execution path / understand dependencies"**
 ```
-pharos trace "com.example.PaymentService#process(Order)" --direction callees --depth 2
+pharos.jar trace "com.example.PaymentService#process(Order)" --direction callees --depth 2
 pharos path "com.example.Entry#main(String[])" "com.example.MyClass#x()"
 ```
 
 **"Find all implementations of an interface / subclasses"**
 ```
-pharos usages "com.example.Repository" --kind subclasses
+pharos.jar usages "com.example.Repository" --kind subclasses
 ```
 
 **"Find everything annotated with @Transactional"**
 ```
-pharos usages "Transactional" --kind annotated
+pharos.jar usages "Transactional" --kind annotated
 ```
 
 **"Where is this field read or written?"**
 ```
-pharos usages "com.example.PaymentService#connectionPool" --kind field_readers
-pharos usages "com.example.PaymentService#connectionPool" --kind field_writers
+pharos.jar usages "com.example.PaymentService#connectionPool" --kind field_readers
+pharos.jar usages "com.example.PaymentService#connectionPool" --kind field_writers
 ```
 
 **"Find an exact class or method by name"**
