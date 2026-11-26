@@ -161,7 +161,7 @@ public class UpgradeIndexesCommand implements Callable<Integer> {
             if (!wanted.isEmpty() && !wanted.contains(p.getName())) continue;
             if (!ProjectNames.isValid(p.getName())) {
                 System.out.printf("Ignoring invalid project name '%s': its index directory would be the "
-                        + "index root, so pharos will not touch it. Run 'pharos remove %s' to unregister "
+                        + "index root, so pharos will not touch it. Run 'pharos remove-index %s' to unregister "
                         + "it safely (registry: %s); see UPGRADING.md, section \"Invalid project names\".%n",
                         p.getName(), p.getName(), registryPath());
                 invalidCount++;

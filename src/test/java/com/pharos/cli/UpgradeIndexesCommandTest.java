@@ -273,7 +273,8 @@ class UpgradeIndexesCommandTest {
                 config.getIndexDir().resolve(".").toString()));
         int rc = run(cmd(), "--yes");
         assertThat(rc).isZero();
-        assertThat(out.toString()).contains("invalid project name '.'").contains("registry.json");
+        assertThat(out.toString()).contains("invalid project name '.'").contains("registry.json")
+                .contains("Run 'pharos remove-index .'"); // the command that exists (not 'pharos remove')
         assertThat(config.getIndexDir()).isDirectory();
     }
 
