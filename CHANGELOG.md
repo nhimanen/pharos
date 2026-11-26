@@ -20,6 +20,9 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   statistics round as before. Not used for split projects, key-filtered shards, pinned versions or capped term
   sets. `/internal/shard-search` gains an optional `statsCheck` request field and `shardStats` response field;
   an older reader ignores them and is not asked again for 10 minutes.
+- Cluster fan-out: vector snippet hints no longer call a remote shard that answered "no vectors of the model"
+  in the same query (it has no hints; a single node finds none either), and the hint calls of two or more
+  remote shards run in parallel instead of one after another.
 
 ## [1.11.1] - 2026-11-26
 

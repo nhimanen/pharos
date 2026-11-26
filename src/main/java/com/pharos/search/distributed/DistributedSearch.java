@@ -159,6 +159,10 @@ public final class DistributedSearch implements Closeable {
     volatile boolean overlapEmbedding = true;
     /** Tests only: false always runs the keyword statistics round (the control of the statistics cache tests). */
     volatile boolean cachedStatistics = true;
+    /** Tests only: false asks every remote shard for snippet hints, models' vectors or not (the control). */
+    volatile boolean snippetShortcuts = true;
+    /** Tests only: false makes the snippet calls one after another, on first use (the control). */
+    volatile boolean parallelSnippets = true;
     /** What the statistics rounds of this coordinator's queries read, per shard generation ({@link Query#keywordRoundWithCachedStats}). */
     final TermStatsCache statsCache = new TermStatsCache(TermStatsCache.DEFAULT_MAX_TERMS);
     /** Readers that answered a statistics check without their statistics (an older pharos): until when they are not asked again. */
@@ -1932,23 +1936,93 @@ public final class DistributedSearch implements Closeable {
 
         /**
          * Vector snippet hints for the final {@code results}: from the pinned reader of each result's
-         * shard (in process for local shards, one {@code /internal/snippets} call per remote shard,
-         * made on first use). The query is embedded only when a hint is first asked for. Usable after
-         * the query is closed: a local reader is then used only while it is still open.
+         * shard (in process for local shards, one {@code /internal/snippets} call per remote shard). The
+         * query is embedded only when a hint is first asked for. On the first hint, the calls of every
+         * remote shard holding a result the decorator asks hints for (one with a body) are made at once,
+         * in parallel; a single one is made on this thread. A remote shard that refused the model's vectors
+         * in this query (no vectors of the model) is not asked: it has no hints, as on a single node. Usable
+         * after the query is closed: a local reader is then used only while it is still open.
          */
         public SnippetResolver vectorResolver(List<SearchResult> results, String query) {
             Map<String, List<String>> idsByShard = new LinkedHashMap<>();
-            for (SearchResult r : results) idsByShard.computeIfAbsent(ownerName(r), k -> new ArrayList<>()).add(r.id());
-            Map<String, SnippetResolver> perShard = new HashMap<>();
-            return r -> {
-                SnippetResolver inner;
+            Set<String> hinted = new LinkedHashSet<>(); // shards of results SnippetDecorator resolves (with a body)
+            for (SearchResult r : results) {
                 String owner = ownerName(r);
+                idsByShard.computeIfAbsent(owner, k -> new ArrayList<>()).add(r.id());
+                if (r.body() != null && !r.body().isBlank()) hinted.add(owner);
+            }
+            Map<String, SnippetResolver> perShard = new HashMap<>();
+            Map<String, Future<SnippetResolver>> fetching = new HashMap<>();
+            boolean[] started = {false};
+            return r -> {
+                String owner = ownerName(r);
+                Future<SnippetResolver> pending;
+                SnippetResolver inner;
                 synchronized (perShard) {
-                    inner = perShard.computeIfAbsent(owner, shard -> shardResolver(shard,
-                            idsByShard.getOrDefault(shard, List.of()), query));
+                    if (!started[0]) {
+                        started[0] = true;
+                        if (parallelSnippets) fetching.putAll(fetchRemoteHints(hinted, idsByShard, query));
+                    }
+                    pending = fetching.remove(owner);
+                    inner = pending == null ? perShard.computeIfAbsent(owner, shard -> shardResolver(shard,
+                            idsByShard.getOrDefault(shard, List.of()), query)) : null;
+                }
+                if (pending != null) {
+                    try {
+                        inner = awaitHints(pending);
+                    } catch (ExecutionException e) {
+                        log.warn("Vector snippet hints of shard {} unavailable for this search: {}", owner, e.getCause().toString());
+                        inner = SnippetResolver.none();
+                    }
+                    synchronized (perShard) {
+                        perShard.put(owner, inner);
+                    }
                 }
                 return inner.resolve(r);
             };
+        }
+
+        /**
+         * Starts the {@code /internal/snippets} calls of the remote {@code shards} that need one, in parallel,
+         * when there are two or more of them (one is left to the first hint of its shard, on its thread).
+         */
+        private Map<String, Future<SnippetResolver>> fetchRemoteHints(Set<String> shards, Map<String, List<String>> idsByShard,
+                                                                      String query) {
+            List<String> calls = new ArrayList<>();
+            for (String shard : shards) {
+                ShardState s = byName(shard);
+                if (s != null && !s.local && s.unavailable == null && !noModelVectors(shard)) calls.add(shard);
+            }
+            if (calls.size() < 2) return Map.of();
+            if (queryVector(query) == null) return Map.of(); // embedded once, here, before the calls share it
+            Map<String, Future<SnippetResolver>> out = new HashMap<>();
+            for (String shard : calls) {
+                try {
+                    out.put(shard, remote.submit(() -> shardResolver(shard, idsByShard.getOrDefault(shard, List.of()), query)));
+                } catch (java.util.concurrent.RejectedExecutionException closed) {
+                    break; // the coordinator was replaced: the rest are called on first use
+                }
+            }
+            return out;
+        }
+
+        private static SnippetResolver awaitHints(Future<SnippetResolver> f) throws ExecutionException {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        return f.get();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }
+
+        private synchronized boolean noModelVectors(String shard) {
+            return noModelVectors.contains(shard);
         }
 
         private SnippetResolver shardResolver(String shard, List<String> ids, String query) {
@@ -1957,6 +2031,9 @@ public final class DistributedSearch implements Closeable {
             try {
                 float[] vec = queryVector(query);
                 if (vec == null) return SnippetResolver.none();
+                if (!s.local && snippetShortcuts && noModelVectors(shard)) {
+                    return SnippetResolver.none(); // no vectors of the model: no hints there (a single node finds none)
+                }
                 if (s.local) {
                     org.apache.lucene.index.IndexReader reader;
                     synchronized (s) {
