@@ -10,15 +10,26 @@ mvn clean package -DskipTests  # Build without running tests
 mvn test                    # Run all tests
 mvn test -Dtest=ClassName   # Run a single test class
 mvn clean compile           # Compile only
+mvn -pl app -am package -DskipTests      # Only the pharos jar (pharos-api + app)
+mvn -pl operator -am test                # Only the operator and what it needs
 ```
+
+**Memory: heavy builds go to the build server.** A full `mvn test` (and the gate scripts) needs more
+memory than a development machine shared with a running daemon and other apps has; local Maven runs
+have ended in OOM kills. Run full test suites, gates and e2e runs on the separate build server (host and
+login are in the maintainer's local notes; it needs JDK 25 and Maven installed in `~`): rsync the
+worktree over without `target/` and `.superpowers/`, and never copy `~/.pharos` or model files. It is
+shared with the maintainer's own benchmarks: run heavy jobs only when it is quiet, under a hard memory
+cap. To check CLI help without building, download the released jar (`gh release download vX.Y.Z
+--pattern 'pharos-X.Y.Z.jar'`) and run `java -Dpharos.home=<scratch dir> -jar … <cmd> --help`.
 
 **Test isolation:** surefire sets `-Dpharos.home=target/test-pharos-home`, so tests never touch the real `~/.pharos`
 (`IndexConfig.DEFAULT_BASE` honors `pharos.home`; unset means `~/.pharos`). Pass `-Dpharos.home=<dir>` to relocate state when running the CLI.
 
 **Java 25+ required.** The shade plugin produces a single executable JAR.
 
-**Maven layout.** The root `pom.xml` is the aggregator and parent (`pharos-parent`); run every command above
-from the root. Modules:
+**Maven layout (reactor).** The root `pom.xml` is the aggregator and parent (`pharos-parent`); run every command above
+from the root. Modules, in build order:
 - `app/pom.xml` — the pharos application (artifactId `pharos`). Its sources stay in the root `src/` and it
   builds into the root `target/`, so the jar is still `target/pharos-<version>.jar`; its tests run with the
   repository root as working directory.
@@ -77,7 +88,13 @@ java -jar target/pharos-*.jar search <query>    # Keyword search
 java -jar target/pharos-*.jar mcp-server        # Start MCP server (stdio JSON-RPC)
 ```
 
-**Python CLI client:** `./pharos` at the project root is the primary user-facing CLI. It starts a background JVM daemon on first use and proxies all commands via the web API (avoids JVM cold-start). Always check/update `./pharos` when adding new commands or API parameters — the Java CLI and the Python client must stay in sync.
+**Python CLI client:** `./pharos` at the project root is the primary user-facing CLI. It starts a background JVM daemon on first use and proxies all commands via the web API (avoids JVM cold-start). Always check/update `./pharos` when adding new commands or API parameters — the Java CLI and the Python client must stay in sync. Known gaps today: `trace`, `usages`, `link`, `stats`, `mine`, `remove-index` and `mcp-server` exist only in the Java CLI (the README lists them under "Commands only in the Java CLI"); `invalidate-embeddings`, `skeleton`, `pipelines`, `boundary` and `daemon` exist only in `./pharos`.
+
+**User docs:** `README.md` is the entry point; long reference material lives in `docs/cluster.md`
+(multi-node), `docs/operator.md` (Kubernetes), `docs/docker.md` (the image) and `docs/embeddings.md`.
+Update them with any user-visible change (option names and defaults come from the code: `ClusterConfig`,
+`IndexConfig`, the picocli commands, `./pharos`, the CRD). `docs/superpowers/` holds internal design
+specs, plans and gate reports: never link them from user docs.
 
 ```bash
 ./pharos search "query"           # Uses auto type-classification by default
@@ -112,15 +129,15 @@ Source files flow through four sequential stages:
    that emits solely unresolved references contributes no call graph at all. That is why the
    regex tier has none.
 
-2. **Graph** (`graph/`) — `CallGraphBuilder` turns parsed call references into a JGraphT `DefaultDirectedGraph` stored as `<index-dir>/<project>/graph.graphml`. `ModuleGraphBuilder` maintains `~/.pharos/module-graph.graphml`; `ProjectIndexManager.updateModuleGraph` detects the build system (first match wins: Maven → Gradle → Python → Node.js → CMake → Go) and every reader returns the shared `MavenPomReader.PomInfo` shape, so a new language's reader (e.g. `GoModReader` for `go.mod`) just joins that chain.
+2. **Graph** (`graph/`) — the call graph and knowledge graph live in an embedded **ArcadeDB 26.11.1** database per project: `<index-dir>/<project>/callgraph-<gen>.arcadedb`, with `callgraph.current` naming the live generation (a full re-index builds a new generation and switches the pointer atomically, so searches are never disturbed). `CallGraphBuilder` / `KnowledgeGraphBuilder` turn parsed references into typed edges; `CallGraph` is the ArcadeDB store. `ArcadeDbSettings` turns off ArcadeDB 26's super-node promotion and index bloom filters so 1.11.x (ArcadeDB 25.1.1) can still open what this release writes — keep it that way unless a release deliberately breaks downgrades. A new database is closed and reopened right after creation (workaround for ArcadeDB #13441); damaged graphs from older releases are detected on open (`graphDamage`) and force a full run. Read paths go through the read-only `GraphView`; cluster readers serve `CompactGraph`, an immutable import of the published `graph.cgf.gz` (`CompactGraphWriter`). `ModuleGraphBuilder` maintains `~/.pharos/module-graph.arcadedb`; `CrossProjectLinker` the cross-project graph. `ProjectIndexManager.updateModuleGraph` detects the build system (first match wins: Maven → Gradle → Python → Node.js → CMake → Go) and every reader returns the shared `MavenPomReader.PomInfo` shape, so a new language's reader (e.g. `GoModReader` for `go.mod`) just joins that chain.
 
-3. **Embed** (`embedding/`) — Optional DJL + ONNX Runtime step that produces float vectors (768-dim for the default). Falls back to `NoOpEmbeddingProvider` when unavailable. **No default model:** embeddings are off until `pharos embeddings enable [--model granite-r2|jina-code-v2] [--force]` (`EmbeddingsCommand`, mirrored in `./pharos` as `embeddings`; `IndexConfig.presetProvider` holds the blocks) writes a provider to config.json; `disable` removes it, `status` reports it. granite-r2 is the *recommended* model (A/B: `docs/superpowers/gates/2026-11-16-embedding-ab.md`); nothing ever enables it implicitly, and enabling never downloads or embeds. `hf://owner/name@<sha>` pins a model revision (download URL and cache dir name include it).
+3. **Embed** (`embedding/`) — Optional DJL + ONNX Runtime step that produces float vectors (768-dim for the default). Falls back to `NoOpEmbeddingProvider` when unavailable. **No default model:** embeddings are off until `pharos embeddings enable [--model granite-r2|jina-v2-code] [--force]` (`EmbeddingsCommand`, mirrored in `./pharos` as `embeddings`; `IndexConfig.presetProvider` holds the blocks) writes a provider to config.json; `disable` removes it, `status` reports it. granite-r2 is the *recommended* model (A/B: `docs/superpowers/gates/2026-11-16-embedding-ab.md`); nothing ever enables it implicitly, and enabling never downloads or embeds. `hf://owner/name@<sha>` pins a model revision (download URL and cache dir name include it).
 
 4. **Index** (`indexer/`) — `DocumentMapper` converts parsed objects to Lucene documents with `TextField` (BM25) and `KnnFloatVectorField` (vector search). `LuceneIndexer` manages per-project `FSDirectory` instances with cached `DirectoryReader`s.
 
 ### Search Layer
 
-`SearchEngine` is the facade. It selects a strategy (`KeywordSearchStrategy` / `VectorSearchStrategy` / `HybridSearchStrategy`) and applies two post-processing steps:
+`SearchEngine` is the facade. Pipelines (`search/pipeline/`, defined in `src/main/resources/pipelines.yaml`) compose retrievers (`KeywordSearchStrategy` / `VectorSearchStrategy` / unified), a merger (Borda, RRF, cross-encoder merge) and rerankers (cross-encoder, doc-type diversity, MMR class diversity); `auto` dispatches by query intent (`FstQueryClassifier`). Keyword ties are broken by a stable, build-independent order (document id, type, line range). Two post-processing steps:
 - **Graph boost**: score × (1 + 0.3 × log(inDegree) / log(maxInDegree))
 - **Neighborhood expansion**: appends callees of top-3 results at 0.5× score
 
@@ -159,20 +176,48 @@ When projects are indexed, `ProjectRegistry` stores unresolved call references. 
 3. Add the fixture for the new format: `mvn test -Dtest=IndexCompatTest -Dpharos.regenerateCompat=true` writes `src/test/resources/compat/format-<new N>.zip`. **Keep `compat/format-<N-1>.zip`**; older fixtures may stay (`refusesFixturesBelowMinimum` checks they are refused).
 4. `IndexCompatTest` must pass: it searches every fixture whose format is ≥ N-1.
 
+### Multi-node (`cluster/`, `search/distributed/`)
+
+Without a `cluster` section nothing here runs (`role: all`, `backend: local`). User docs: `docs/cluster.md`.
+
+- `cluster/` — `ClusterRuntime` wires a node from `ClusterConfig` (in `pharos-api`); `RoleGuard` refuses
+  index-changing commands on readers and work-queue writers; `ReplicaSyncer` and `ReaderLocalCache` sync
+  generations on readers; `ArithmeticProfile` is the reader's deterministic vector arithmetic.
+- `cluster/objectstore/` — the S3 backend: `ObjectStorePublisher` (generations, `LATEST` by conditional
+  put), `ObjectStoreCatalog` (shard catalog, CAS), `GenerationGc`, `ObjectStoreWriterStateStore`
+  (embedding cache and file state for takeovers), `S3ObjectStore` (bounded calls), `SynonymsMerge`.
+- `cluster/peer/` — the peer-pull backend: `ReplicationEndpoint` (`/replication/*` on writers),
+  `PeerDiscovery`, `PeerReplicaSource`, `PeerFileSource` (peer readers), `PeerMembership`.
+- `cluster/warm/` — lazy readers: `RemoteDirectory`, `CachingRemoteIndexInput`, `BlockCache`,
+  `LazyGenerations`.
+- `cluster/writer/` — the work queue: `WorkLoop`, `LeaseManager`, `Balancer`, `SourceCheckout` (git,
+  per-project credentials), `DiskGuard`, `WriterRegistry`.
+- `cluster/membership/` — reader heartbeats, health, load; `cluster/internal/` — the token-guarded
+  `/internal/*` shard API (`InternalApi`, `ShardClient`); `cluster/routing/` — `ShardRouter`,
+  `CachedCatalog`, `ShardFilter`; `cluster/sharding/` — `ProjectShards`, `ReshardJob`;
+  `cluster/status/` — `/cluster/status`, `/cluster/events`, proposals, webhook.
+- `search/distributed/` — fan-out: `DistributedSearch` (coordinator), `GlobalStats` (corpus-wide BM25
+  statistics), `LocalShardService` (the shard side), `TermStatsCache`.
+- `cli/RouterCommand` — `pharos router`; `cli/ReshardCommand` — `pharos reshard`.
+
+Container image: `docker/pharos/` (Dockerfile + `entrypoint.sh`: `PHAROS_ROLE`, `PHAROS_ARITHMETIC`,
+`user.home` = `PHAROS_HOME`); operator image: `docker/operator/`. Kubernetes manifests: `deploy/`.
+
 ### MCP Server
 
 `McpServerCommand` starts a JSON-RPC 2.0 server over stdio. Tools are registered in `McpToolRegistry` and map directly to `SearchEngine` / `ProjectIndexManager` operations. Configure in Claude Desktop via:
 ```json
-{ "mcpServers": { "pharos": { "command": "java", "args": ["-jar", "codesearch.jar", "mcp-server"] } } }
+{ "mcpServers": { "pharos": { "command": "java", "args": ["--enable-native-access=ALL-UNNAMED", "-jar", "/home/<you>/.pharos/bin/pharos.jar", "mcp-server"] } } }
 ```
 
 ## Releasing (maintainers only)
 
 1. Bump the version in every pom (`X.Y.Z`): `mvn versions:set -DnewVersion=X.Y.Z -DgenerateBackupPoms=false`
-   (root `pom.xml` plus the `<parent>` version in `app/`, `pharos-api/`, `operator/`).
+   (root `pom.xml` plus the `<parent>` version in `app/`, `pharos-api/`, `operator/`), and the image tags in
+   `deploy/` (`deploy/examples/*.yaml` `spec.version`, the comment in `deploy/operator.yaml`).
 2. In `CHANGELOG.md`, move `Unreleased` into a new `## [X.Y.Z] - date` section. It must start with an `**Index format:**` line (`N (unchanged)` or `N → M (...)`; `scripts/release-notes.sh X.Y.Z` fails without it). If the format changed, add a section to `UPGRADING.md`.
 3. Run `bash scripts/test-setup.sh` and `mvn -B clean package`.
-4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` workflow checks the tag against the pom version, builds, and publishes the GitHub release (jar, `.sha256`, skill bundle, `pharos`, `setup.sh`).
+4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` workflow checks the tag against the pom version, builds, publishes the GitHub release (jar, `.sha256`, skill bundle, `pharos`, `setup.sh`) and pushes the images `ghcr.io/<owner>/pharos:X.Y.Z` and `ghcr.io/<owner>/pharos-operator:X.Y.Z`.
 
 ## Critical: FAT JAR Gotchas
 
