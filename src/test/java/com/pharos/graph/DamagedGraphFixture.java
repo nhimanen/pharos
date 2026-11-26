@@ -1,7 +1,6 @@
 package com.pharos.graph;
 
 import com.arcadedb.database.Database;
-import com.arcadedb.database.DatabaseFactory;
 import com.arcadedb.database.DatabaseInternal;
 
 import java.io.IOException;
@@ -62,9 +61,8 @@ public final class DamagedGraphFixture {
      * this order, as a stale dictionary re-filled in another order would.
      */
     public static void createWithDictionary(Path dbDir, List<String> names) {
-        Database db = new DatabaseFactory(dbDir.toString()).create();
+        Database db = CallGraph.createSettled(dbDir);
         try {
-            CallGraph.awaitDictionaryOnDisk(db);
             db.setAsyncFlush(false);
             var dictionary = ((DatabaseInternal) db).getSchema().getEmbedded().getDictionary();
             for (String n : names) dictionary.getIdByName(n, true);
