@@ -124,6 +124,7 @@ public class CallGraph implements GraphView {
         initSchema(db);
         CallGraph graph = new CallGraph(db, dbDir);
         graph.dictionaryDamage = damage;
+        graph.createdByOpen = created;
         if (created) graph.markFreshDatabase();
         else if (repairIndexes) graph.repairIndexesOnce();
         return graph;
@@ -724,6 +725,19 @@ public class CallGraph implements GraphView {
         flushKgEdges();
     }
 
+    /** True when this graph was created by the {@link #open} that returned it. */
+    private boolean createdByOpen;
+
+    /** True when no vertex or edge type of this graph holds a record. */
+    private boolean isEmpty() {
+        List<String> types = new ArrayList<>(List.of("Method", "CodeType", "CodeField"));
+        types.addAll(EDGE_TYPES);
+        for (String type : types) {
+            if (db.getSchema().existsType(type) && db.countType(type, false) > 0) return false;
+        }
+        return true;
+    }
+
     /**
      * Delete all vertices and edges (call graph + knowledge graph).
      * Uses TRUNCATE TYPE (O(1)) rather than DELETE VERTEX (O(M) full scan).
@@ -738,6 +752,14 @@ public class CallGraph implements GraphView {
         insertedMethodFqns.clear();
         insertedCodeTypeFqns.clear();
         insertedCodeFieldFqns.clear();
+        if (createdByOpen && isEmpty()) {
+            // A database this open created holds no record and no index entry yet: nothing to
+            // truncate. Rebuilding its empty indexes in place left ArcadeDB 26 warning "Compacted
+            // index ... main page 0 has totalPages=N" on every later lookup of a compacted series
+            // (lookups were still right) and cost ~2 s of a lucene-sized graph build.
+            writeChurn(0);
+            return;
+        }
         db.begin();
         for (String edge : new String[]{"calls", "inherits", "implements_iface", "declares_field",
                 "reads_field", "writes_field", "returns_type", "takes_type", "annotated_by"}) {
