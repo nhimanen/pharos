@@ -369,8 +369,15 @@ public final class LocalShardService implements ShardSearchService {
         }
         try (Pin pin = pin(new ShardId(request.shard()), request.generation())) {
             if (other(request.generation(), pin)) return new ShardSearchResponse(pin.generation(), 1, List.of());
-            return search(pin, request.retriever(), request.request(), request.queryVector(), request.globalStats(),
-                    request.selected(), request.selectedKnn(), request.chunkVectors(), request.synonymsHash());
+            ShardSearchResponse r = search(pin, request.retriever(), request.request(), request.queryVector(),
+                    request.globalStats(), request.selected(), request.selectedKnn(), request.chunkVectors(),
+                    request.synonymsHash());
+            ShardSearchRequest.StatsCheck check = request.statsCheck();
+            if (check == null) return r;
+            List<Term> terms = new ArrayList<>();
+            if (check.terms() != null) for (TermStatsRequest.Term t : check.terms()) terms.add(new Term(t.field(), t.text()));
+            // as /internal/term-stats reads them, from the generation just searched
+            return r.withShardStats(termStats(pin, check.fields() == null ? List.of() : check.fields(), terms));
         }
     }
 

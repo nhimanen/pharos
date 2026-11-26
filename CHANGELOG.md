@@ -12,6 +12,14 @@ All notable changes to Pharos. Every release section starts with an `**Index for
   search rounds run (unified: while its statistics round runs), on a bounded pool shared by the JVM
   (`pharos-query-embed-*`, one thread per core, no queue: with every thread busy a query embeds when it needs
   the vector, as before). Results, warnings, the query deadline and the re-plan are unchanged.
+- Cluster fan-out: a keyword round (keyword queries, hybrid's keyword stage) whose term statistics the
+  coordinator has from earlier queries (a bounded cache per shard generation) takes one round trip instead of
+  two: the search round goes out with the cached global statistics, and each remote shard returns its own
+  statistics of the same terms from the generation it searched. The answers are used only when every shard
+  confirms the cached ones, so scores are bitwise those of the statistics round; otherwise the query runs the
+  statistics round as before. Not used for split projects, key-filtered shards, pinned versions or capped term
+  sets. `/internal/shard-search` gains an optional `statsCheck` request field and `shardStats` response field;
+  an older reader ignores them and is not asked again for 10 minutes.
 
 ## [1.11.1] - 2026-11-26
 

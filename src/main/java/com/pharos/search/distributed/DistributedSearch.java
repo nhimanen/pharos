@@ -157,6 +157,14 @@ public final class DistributedSearch implements Closeable {
     volatile boolean retries = true;
     /** Tests only: false embeds the query when a stage first needs it (the control of the overlap tests). */
     volatile boolean overlapEmbedding = true;
+    /** Tests only: false always runs the keyword statistics round (the control of the statistics cache tests). */
+    volatile boolean cachedStatistics = true;
+    /** What the statistics rounds of this coordinator's queries read, per shard generation ({@link Query#keywordRoundWithCachedStats}). */
+    final TermStatsCache statsCache = new TermStatsCache(TermStatsCache.DEFAULT_MAX_TERMS);
+    /** Readers that answered a statistics check without their statistics (an older pharos): until when they are not asked again. */
+    private final Map<String, Long> noStatsCheck = new java.util.concurrent.ConcurrentHashMap<>();
+    /** How long a reader that ignored a statistics check is not asked for one again. */
+    static final Duration NO_STATS_CHECK_BACKOFF = Duration.ofMinutes(10);
     /** Tests only: runs after a query's statistics round (a reader may swap a generation here). */
     static volatile java.util.function.Consumer<String> afterStatsRound;
     /** Tests only: runs when a query is about to be planned again (P6-R16), before the wait for fresh state. */
@@ -1458,14 +1466,22 @@ public final class DistributedSearch implements Closeable {
                         return false;
                     });
             GlobalStats merged = GlobalStats.merge(new ArrayList<>(answers.values()));
+            answers.forEach((s, r) -> {
+                if (!s.local) statsCache.put(s.name(), r.generation(), fields, terms, r.stats());
+            });
+            statsSummary = summary(answers, merged, "");
+            return merged;
+        }
+
+        /** The trace diagnostic of a statistics round's answers (P6-R22). */
+        private String summary(Map<ShardState, TermStatsResponse> answers, GlobalStats merged, String suffix) {
             StringBuilder sb = new StringBuilder("statistics of ").append(answers.size()).append(" shard(s):");
             answers.forEach((s, r) -> sb.append(' ').append(s.name()).append('@').append(r.generation())
                     .append(s.local ? "" : "(" + (s.reader == null ? "?" : s.reader.node()) + ")"));
             merged.fields().entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> sb.append("; ")
                     .append(e.getKey()).append(" docCount=").append(e.getValue().docCount()).append(" sumTtf=")
                     .append(e.getValue().sumTotalTermFreq()));
-            statsSummary = sb.toString();
-            return merged;
+            return sb.append(suffix).toString();
         }
 
         /** What the last statistics round read (shards, generations, field totals): a trace diagnostic. */
@@ -1540,6 +1556,132 @@ public final class DistributedSearch implements Closeable {
             return merged;
         }
 
+        /**
+         * The keyword round in one round trip instead of two: when the coordinator holds every remote shard's
+         * statistics of the query's terms (from earlier statistics rounds, {@link #statsCache}, keyed by the
+         * generation its reader advertises), the search round is sent at once, scored with their sum, and
+         * each remote shard returns its own statistics of the same terms, read from the generation it
+         * searched exactly as {@code /internal/term-stats} reads them. Only when every one equals what was
+         * cached are the answers used: the sum is then the one a statistics round would have gathered at those
+         * generations, so the scores are bitwise the same. The round pins the shards as a statistics round does
+         * (first contact). Otherwise (a shard disagrees, an older reader without the check, any failure)
+         * the answers are discarded and null is returned: the query gathers statistics and searches as before.
+         * Not for split projects (their run alignment rides on the statistics round), key-filtered shards,
+         * pinned versions, capped term sets or a query analysed with previous synonyms.
+         */
+        private Map<ShardState, ShardSearchResponse> keywordRoundWithCachedStats(SearchRequest req) throws IOException {
+            if (!cachedStatistics || hasSplitProject || keyword != null) return null;
+            synchronized (this) {
+                if (globalStats != null) return null; // this query has its statistics already
+            }
+            KeywordSearchStrategy kw = keyword();
+            org.apache.lucene.search.Query lq = kw.buildQuery(req);
+            if (lq == null) return null;
+            Set<Term> terms = GlobalStats.queryTerms(lq);
+            if (terms.isEmpty() || terms.size() > maxShippedTerms) return null;
+            reconcileRuns(); // no split shard: only notes it ran, as the statistics round's fan-out would
+            List<ShardState> all = available();
+            if (all.isEmpty()) return null;
+            long now = System.nanoTime();
+            for (ShardState s : all) {
+                if (s.split || s.statsOnly || s.expectedGeneration != null || s.specVersion != null) return null;
+                if (!s.local) {
+                    ReaderHeartbeat hb = firstReader(s);
+                    Long until = hb == null ? null : noStatsCheck.get(hb.node());
+                    if (hb == null || (until != null && until - now > 0)) return null;
+                }
+            }
+            TreeSet<String> fields = new TreeSet<>();
+            for (Term t : terms) fields.add(t.field());
+            Map<ShardState, GlobalStats> expected = new LinkedHashMap<>();
+            Map<ShardState, Long> keyGeneration = new HashMap<>();
+            for (ShardState s : all) {
+                if (s.local) {
+                    LocalShardService.Pin p = pin(s);
+                    expected.put(s, local.termStats(p, fields, terms)); // in process: read, not cached
+                    keyGeneration.put(s, p.generation());
+                    continue;
+                }
+                Long gen;
+                synchronized (s) {
+                    gen = s.generation;
+                }
+                if (gen == null) {
+                    ReaderHeartbeat hb = firstReader(s);
+                    gen = hb.generations() == null ? null : hb.generations().get(s.name());
+                }
+                GlobalStats cached = gen == null ? null : statsCache.get(s.name(), gen, fields, terms);
+                if (cached == null) return null;
+                expected.put(s, cached);
+                keyGeneration.put(s, gen);
+            }
+            List<TermStatsResponse> perShard = new ArrayList<>(all.size());
+            for (ShardState s : all) perShard.add(new TermStatsResponse(keyGeneration.get(s), expected.get(s)));
+            GlobalStats merged = GlobalStats.merge(perShard);
+            List<TermStatsRequest.Term> wire = new ArrayList<>(terms.size());
+            for (Term t : terms) wire.add(new TermStatsRequest.Term(t.field(), t.text()));
+            ShardSearchRequest.StatsCheck check = new ShardSearchRequest.StatsCheck(List.copyOf(fields), wire);
+
+            List<ShardState> targets = searchable();
+            Map<ShardState, Throwable> failed = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<ShardState, ShardSearchResponse> answers = round(targets, "keyword", req, null, merged,
+                    s -> null, s -> null, false, false, check, (s, t) -> {
+                        failed.put(s, t);
+                        return true;
+                    });
+            // A shard missing at the deadline (marked unavailable, as a stalled search round marks it) keeps the
+            // answer: the sequential query would have had its statistics (they come first) and then lost its
+            // search round the same way. Any other failure runs the statistics round, as before.
+            boolean verified = failed.isEmpty() && (answers.keySet().containsAll(targets) || remainingNanos() <= 0);
+            for (Map.Entry<ShardState, ShardSearchResponse> e : answers.entrySet()) {
+                ShardState s = e.getKey();
+                if (s.local) continue;
+                GlobalStats theirs = e.getValue().shardStats();
+                if (theirs == null) { // a reader that does not know the check
+                    ReaderHeartbeat r;
+                    synchronized (s) {
+                        r = s.reader;
+                    }
+                    if (r != null) noStatsCheck.put(r.node(), System.nanoTime() + NO_STATS_CHECK_BACKOFF.toNanos());
+                    verified = false;
+                    continue;
+                }
+                // fresh statistics of the generation searched: worth keeping either way
+                statsCache.put(s.name(), e.getValue().generation(), fields, terms, theirs);
+                if (!theirs.equals(expected.get(s))) verified = false;
+            }
+            if (!verified) {
+                log.debug("Query: cached statistics not confirmed by {} shard(s) ({} failed); running the statistics round",
+                        answers.size(), failed.size());
+                return null;
+            }
+            Map<ShardState, TermStatsResponse> summaryAnswers = new LinkedHashMap<>();
+            for (ShardState s : all) {
+                ShardSearchResponse a = answers.get(s);
+                if (!s.local) {
+                    synchronized (s) {
+                        s.consumed = true; // the answers are used: the shard stays on this generation
+                    }
+                }
+                summaryAnswers.put(s, new TermStatsResponse(a == null ? keyGeneration.get(s) : a.generation(), expected.get(s)));
+            }
+            statsSummary = summary(summaryAnswers, merged, " (cached, confirmed by the search round)");
+            synchronized (this) {
+                globalStats = merged;
+                statsKey = kw.synonymsHash() + "|" + terms;
+            }
+            return answers;
+        }
+
+        /** The reader a call for {@code s} tries first: its pinned one, else the route's first candidate. */
+        private ReaderHeartbeat firstReader(ShardState s) {
+            synchronized (s) {
+                if (s.reader != null) return s.reader;
+            }
+            List<ReaderHeartbeat> c = s.route.candidates();
+            return c.isEmpty() ? null : c.get(0);
+        }
+
         private List<SearchResult> retrieve(RetrievalStage stage, SearchRequest req, SearchTrace trace)
                 throws IOException {
             long t0 = System.currentTimeMillis();
@@ -1557,8 +1699,12 @@ public final class DistributedSearch implements Closeable {
             } else {
                 throw new UnsupportedOperationException(stage.getClass().getSimpleName() + " cannot fan out");
             }
+            // a keyword round scored with cached statistics, checked by the round itself (null: not this time)
+            Map<ShardState, ShardSearchResponse> cachedRound = "keyword".equals(retriever) && globalStatistics
+                    ? keywordRoundWithCachedStats(req) : null;
             // the statistics round first: unified's query embedding (prefetched) runs meanwhile
-            GlobalStats stats = "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
+            GlobalStats stats = cachedRound != null ? null
+                    : "vector".equals(retriever) || !globalStatistics ? null : globalStats(req);
             float[] vec = "keyword".equals(retriever) ? null : queryVector(req);
             if ("vector".equals(retriever) && vec == null) return List.of(); // as the local stage: no vectors
             List<ShardState> targets = new ArrayList<>();
@@ -1578,7 +1724,8 @@ public final class DistributedSearch implements Closeable {
             String mode = "keyword".equals(retriever) || targets.size() == 1 ? retriever : retriever + "-2";
             switch (mode) {
                 case "keyword" -> {
-                    Map<ShardState, ShardSearchResponse> r = round(targets, "keyword", req, null, stats, s -> null, s -> null, false);
+                    Map<ShardState, ShardSearchResponse> r = cachedRound != null ? cachedRound
+                            : round(targets, "keyword", req, null, stats, s -> null, s -> null, false);
                     r.values().forEach(x -> lists.add(candidates(x)));
                     answered = r.size();
                 }
@@ -1689,6 +1836,21 @@ public final class DistributedSearch implements Closeable {
                                                            java.util.function.Function<ShardState, List<ScoredId>> selected,
                                                            java.util.function.Function<ShardState, List<ScoredId>> selectedKnn,
                                                            boolean chunks) {
+            return round(targets, retriever, req, vec, stats, selected, selectedKnn, chunks, true, null, (s, t) -> false);
+        }
+
+        /**
+         * As above; {@code consumes} false leaves the shards free to move to another generation (the answers
+         * may be discarded), {@code check} asks the remote shards for their statistics too, and
+         * {@code claim} may claim a failure before anything else does (true: handled, the shard stays available).
+         */
+        private Map<ShardState, ShardSearchResponse> round(List<ShardState> targets, String retriever,
+                                                           SearchRequest req, float[] vec, GlobalStats stats,
+                                                           java.util.function.Function<ShardState, List<ScoredId>> selected,
+                                                           java.util.function.Function<ShardState, List<ScoredId>> selectedKnn,
+                                                           boolean chunks, boolean consumes,
+                                                           ShardSearchRequest.StatsCheck check,
+                                                           java.util.function.BiPredicate<ShardState, Throwable> claim) {
             // pure vector retrieval analyses no text: no synonyms to agree on
             String hash = retriever.startsWith("vector") ? null : synonymsHash();
             LocalShardService.Model model = local.model();
@@ -1710,10 +1872,11 @@ public final class DistributedSearch implements Closeable {
                     return local.search(pin(s), retriever, req, v, stats, selected.apply(s), selectedKnn.apply(s), chunks,
                             hash);
                 }
-                return remote(s, ShardClient.SHARD_SEARCH, true, // first-round doc ids bind the generation too
+                return remote(s, ShardClient.SHARD_SEARCH, consumes, // first-round doc ids bind the generation too
                         (hb, gen) -> new ShardSearchRequest(s.name(), gen, retriever, req, v, stats, hash, modelId,
-                                dims, fingerprint, selected.apply(s), selectedKnn.apply(s), chunks));
+                                dims, fingerprint, selected.apply(s), selectedKnn.apply(s), chunks, check));
             }, (s, t) -> {
+                if (claim.test(s, t)) return true;
                 ModelMismatchException m = modelMismatch(t);
                 if (m == null) return false;
                 boolean noVectors = m.reason() == ModelMismatchException.Reason.NO_VECTORS;

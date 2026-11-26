@@ -114,7 +114,7 @@ class FanoutOverlapTest {
             assertThat(probe.threads).noneMatch(t -> t.startsWith(POOL));
 
             ds.overlapEmbedding = true;
-            r.stallPath = "/internal/term-stats";
+            r.stallPath = "/internal/"; // the statistics round, or the keyword round with cached statistics
             r.stallMillis = 300;
             r.drainCalls();
             probe.reset(() -> answered(r, "/term-stats", null) || answered(r, "/shard-search", "keyword"));

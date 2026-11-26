@@ -26,7 +26,29 @@ public record ShardSearchRequest(String shard, Long generation, String retriever
                                  String modelId, int dims, String modelFingerprint,
                                  java.util.List<com.pharos.search.distributed.ScoredId> selected,
                                  java.util.List<com.pharos.search.distributed.ScoredId> selectedKnn,
-                                 boolean chunkVectors) {
+                                 boolean chunkVectors,
+                                 @com.fasterxml.jackson.annotation.JsonInclude(
+                                         com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+                                 StatsCheck statsCheck) {
+
+    /**
+     * Asks the shard to also return its own statistics of {@code fields} and {@code terms}
+     * ({@link ShardSearchResponse#shardStats}), read from the generation it searched exactly as
+     * {@code /internal/term-stats} reads them: how a coordinator that scored with cached statistics
+     * proves they are the ones a statistics round would have gathered. A reader without it ignores it.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record StatsCheck(java.util.List<String> fields, java.util.List<TermStatsRequest.Term> terms) {}
+
+    public ShardSearchRequest(String shard, Long generation, String retriever, SearchRequest request,
+                              float[] queryVector, GlobalStats globalStats, String synonymsHash,
+                              String modelId, int dims, String modelFingerprint,
+                              java.util.List<com.pharos.search.distributed.ScoredId> selected,
+                              java.util.List<com.pharos.search.distributed.ScoredId> selectedKnn,
+                              boolean chunkVectors) {
+        this(shard, generation, retriever, request, queryVector, globalStats, synonymsHash, modelId, dims,
+                modelFingerprint, selected, selectedKnn, chunkVectors, null);
+    }
 
     public ShardSearchRequest(String shard, Long generation, String retriever, SearchRequest request,
                               float[] queryVector, GlobalStats globalStats, String synonymsHash,
