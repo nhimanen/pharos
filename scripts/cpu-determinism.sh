@@ -4,9 +4,11 @@
 # bitwise-identical vector scoring. Prints one line per configuration; the *_sha columns must match
 # between configurations that are meant to be equivalent.
 #
-#   scripts/cpu-determinism.sh <lucene-core.jar> <work-dir> [quick]
+#   scripts/cpu-determinism.sh <lucene-core.jar> <work-dir> [quick|timing]
 #
 # quick: only the pairs and a 768-dim KNN check (no 384-dim index, smaller corpus), for a second machine.
+# timing: default, panama256-fma-off and deterministic only, interleaved, CPUDET_REPS times (default 3),
+# KNN latency on the full run's indexes plus a 20k-vector build; prints medians.
 # The index is built once, under the default flags, and every configuration searches that same index:
 # in a cluster the writer builds the segments and every reader searches copies of them.
 set -euo pipefail
@@ -54,6 +56,36 @@ run() { # name flags args...
     # shellcheck disable=SC2086
     java "${base[@]}" $f -cp "$jar" "$src" "$@" 2> "$work/$name.$1.err"
 }
+
+# timing: only the three candidate settings, interleaved and repeated (medians), for latency and throughput
+# numbers less exposed to other load on the machine. Searches the indexes a full run built.
+if [ "$mode" = timing ]; then
+    reps="${CPUDET_REPS:-3}"
+    : > "$work/timing.txt"
+    for rep in $(seq 1 "$reps"); do
+        for i in 0 4 3; do # default, panama256-fma-off, deterministic
+            name="${names[$i]}"; f="${flags[$i]}"
+            for dim in 768 384; do
+                run "$name" "$f" search "$work/idx$dim" "$dim" 1000 10 "$work/t.bin" | sed "s/^/$name /" >> "$work/timing.txt"
+                run "$name" "$f" build "$work/tidx$dim" "$dim" 20000 | sed "s/^/$name /" >> "$work/timing.txt"
+            done
+            echo "rep $rep $name done"
+        done
+    done
+    python3 - "$work/timing.txt" <<'PY'
+import re, statistics, sys
+vals = {}
+for line in open(sys.argv[1]):
+    name, kind, rest = line.split(" ", 2)
+    kv = dict(re.findall(r"(\w+)=(\S+)", rest))
+    for f in ("knn_mean_us", "knn_p50_us", "knn_p99_us", "add_docs_per_s", "add_plus_merge_s"):
+        if f in kv:
+            vals.setdefault((name, kv["dim"], f), []).append(float(kv[f]))
+for (name, dim, f), v in sorted(vals.items()):
+    print(f"{name:20s} dim={dim} {f:18s} median={statistics.median(v):9.1f} runs={v}")
+PY
+    exit 0
+fi
 
 dims=(768 384); n=50000; nq=1000
 [ "$mode" = quick ] && { dims=(768); n=20000; nq=500; }
