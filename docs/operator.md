@@ -246,12 +246,18 @@ The pharos image's entrypoint runs one pharos command when given arguments, with
 environment. For example, to reshard a large project:
 
 ```bash
-kubectl -n pharos exec demo-writers-0 -- pharos-entrypoint reshard lucene --spec "[project, ring(path, shards=4)]"
-kubectl -n pharos exec demo-writers-0 -- pharos-entrypoint reshard lucene --status
+kubectl -n pharos exec demo-writers-0 -c pharos -- pharos-entrypoint reshard lucene --spec "[project, ring(path, shards=4)]"
+kubectl -n pharos exec demo-writers-0 -c pharos -- pharos-entrypoint reshard lucene --status
 ```
 
-A one-off Job with the same image and a writer's config works too. The cluster's router Service is
-`<name>-router` (port 7080); the writer and reader pods listen on port 7070.
+`--status` shows the requested spec version, then the job's progress, and `flipped` once readers route
+the new version. (The writer logs Lucene's `Using incubator modules: jdk.incubator.vector` warning on
+every command; that is expected.) A one-off Job with the same image and a writer's config works too.
+
+The cluster's router Service is `<name>-router` (port 7080), the headless Services are
+`<name>-writers-hl` and `<name>-readers-hl`, and the writer and reader pods listen on port 7070. To try
+a search from your machine: `kubectl -n pharos port-forward svc/demo-router 7080:7080`, then
+`curl "localhost:7080/api/search?q=parse%20options&type=keyword"`. The image has no `curl` or `wget`.
 
 ## Upgrades and downgrades
 
@@ -290,7 +296,8 @@ you would a release rollout; readers drain one at a time under their PodDisrupti
 - Writer and reader volume claims outlive their StatefulSets.
 - With `storage.s3` the operator never touches the bucket's contents.
 
-Full teardown, data included:
+The claims left behind are `<name>-minio`, `work-<name>-writers-<n>` and `cache-<name>-readers-<n>`;
+the kept Secret is `<name>-minio`. Full teardown, data included:
 
 ```bash
 kubectl -n pharos delete pharoscluster demo
