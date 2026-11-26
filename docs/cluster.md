@@ -357,8 +357,7 @@ pharos remove-index --from-catalog lucene
 ```
 
 Writers release it and readers stop serving it. Its generations and writer state stay in the bucket,
-and registering it again resumes from them. (`pharos remove-index` is a command of the Java CLI; see
-the README's "Commands only in the Java CLI".)
+and registering it again resumes from them.
 
 ### Git credentials
 

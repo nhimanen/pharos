@@ -43,7 +43,7 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 |---|---|
 | Who calls a method | `pharos callers "<fqn>" [--limit N]` |
 | What a method calls | `pharos callees "<fqn>" [--limit N]` |
-| Multi-hop call chain with bodies | `pharos.jar trace "<fqn>" [--depth 2] [--direction callees\|callers\|both] [--max-body 500]` (Java CLI, see below) |
+| Multi-hop call chain with bodies | `pharos trace "<fqn>" [--depth 2] [--direction callees\|callers\|both] [--max-body 500]` |
 | All transitive callers — impact analysis | `pharos impact "<fqn>" [--depth 5] [--max 2000]` |
 | Shortest path between two methods | `pharos path "<from_fqn>" "<to_fqn>"` |
 
@@ -51,18 +51,9 @@ Start with `pharos projects` to confirm the project is indexed before using othe
 
 | Goal | Command |
 |---|---|
-| All usages (callers, subclasses, field access, annotations, type refs) | `pharos.jar usages "<fqn>"` |
-| Specific usage kind | `pharos.jar usages "<fqn>" --kind callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs` |
+| All usages (callers, subclasses, field access, annotations, type refs) | `pharos usages "<fqn>"` |
+| Specific usage kind | `pharos usages "<fqn>" --kind callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs` |
 
-`trace` and `usages` are Java CLI commands: the `pharos` client has no wrapper for them. Run them with the
-installed jar (it starts its own JVM, so expect a few seconds). Below, `pharos.jar` stands for
-`java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar`:
-
-```
-java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar usages "com.example.Repository" --kind subclasses
-```
-
-If the pharos MCP server is configured, its `trace_call_chain` and `find_usages` tools do the same.
 
 ### Module Graph
 
@@ -81,13 +72,14 @@ If the pharos MCP server is configured, its `trace_call_chain` and `find_usages`
 | Project structure as file tree | `pharos skeleton <project> [--path <dir>] [--depth N] [--limit N]` |
 | Index a project | `pharos index <path> [--force] [--full] [--no-embed] [--single] [--depth N] [--project-threads N]` |
 | Index format status of every project | `pharos index-status [--json]` |
+| Index statistics | `pharos stats [--project <name>]` |
 | Daemon lifecycle | `pharos daemon status\|start\|stop\|restart\|logs` |
 
 ## FQN Format
 
 `com.example.MyClass#methodName(ParamType1,ParamType2)`
 
-Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `impact`, `path`, and the Java CLI's `trace` and `usages`.
+Use FQNs from `pharos search` results directly in `method`, `class`, `callers`, `callees`, `impact`, `path`, `trace`, `usages`.
 
 ## Search Types
 
@@ -148,29 +140,29 @@ Returns: body, declared fields, constructors (shows injected deps), public metho
 ```
 pharos callers "com.example.MyClass#x()"          # direct callers
 pharos impact "com.example.MyClass#x()"           # all transitive callers, no bodies
-pharos.jar trace "com.example.MyClass#x()" --direction callers --depth 3  # callers with bodies
+pharos trace "com.example.MyClass#x()" --direction callers --depth 3  # callers with bodies
 ```
 
 **"Trace an execution path / understand dependencies"**
 ```
-pharos.jar trace "com.example.PaymentService#process(Order)" --direction callees --depth 2
+pharos trace "com.example.PaymentService#process(Order)" --direction callees --depth 2
 pharos path "com.example.Entry#main(String[])" "com.example.MyClass#x()"
 ```
 
 **"Find all implementations of an interface / subclasses"**
 ```
-pharos.jar usages "com.example.Repository" --kind subclasses
+pharos usages "com.example.Repository" --kind subclasses
 ```
 
 **"Find everything annotated with @Transactional"**
 ```
-pharos.jar usages "Transactional" --kind annotated
+pharos usages "Transactional" --kind annotated
 ```
 
 **"Where is this field read or written?"**
 ```
-pharos.jar usages "com.example.PaymentService#connectionPool" --kind field_readers
-pharos.jar usages "com.example.PaymentService#connectionPool" --kind field_writers
+pharos usages "com.example.PaymentService#connectionPool" --kind field_readers
+pharos usages "com.example.PaymentService#connectionPool" --kind field_writers
 ```
 
 **"Find an exact class or method by name"**

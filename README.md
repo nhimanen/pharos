@@ -184,8 +184,15 @@ pharos class  "com.pharos.search.SearchEngine" --context   # + fields, construct
 # Call graph
 pharos callers "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
 pharos callees "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"
+pharos trace   "com.pharos.search.SearchEngine#search(SearchRequest,boolean)" --direction callees --depth 2
 pharos impact  "com.pharos.search.SearchEngine#search(SearchRequest,boolean)"   # all transitive callers
 pharos path    "com.pharos.Main#main(String[])" "com.pharos.parser.JavaCodeParser#parseProject(Path,String)"
+
+# Knowledge graph
+pharos usages "com.pharos.search.SearchEngine"                 # all usage kinds
+pharos usages "com.pharos.search.SearchEngine" --kind subclasses
+pharos usages "com.pharos.indexer.LuceneIndexer#indexer" --kind field_readers
+pharos usages "Cacheable" --kind annotated
 
 # Project structure as a filesystem tree
 pharos skeleton myproject
@@ -200,9 +207,12 @@ pharos boundary myproject
 # Web UI (graph browser and Cluster page, on the daemon's port 7171)
 pharos web
 
-# List indexed projects, index status
+# Projects
 pharos projects
+pharos stats --project myproject      # index statistics
 pharos index-status
+pharos link my-service my-library     # cross-project call paths
+pharos remove-index myproject         # delete a project's index and registration
 ```
 
 `pharos search` exit codes: 0 results (or none), 1 error, 4 a project's index format is not served by
@@ -219,25 +229,20 @@ unfiltered query. They need index format 2; a filtered search over an older proj
 fix. The web API (`/api/search`: `module`, `pathPrefix`, `language`, `kind`) and MCP `search_code`
 (`module`, `path_prefix`, `language`, `kind`) take the same filters.
 
+`link`, `stats` and `remove-index` run inside the daemon (the same commands as the Java CLI, with the
+same output and exit codes), so the daemon closes and reopens its own readers instead of a second JVM
+changing the index under it. The daemon accepts them only from the same host
+(`POST /api/admin/<command>` with the `X-Pharos-Admin: 1` header). `remove-index` also takes `--all`, and
+`--from-catalog` on a cluster.
+
 ### Commands only in the Java CLI
 
-Some commands have no `pharos` client wrapper yet. Run them with the installed jar:
+`mine <project> [--write]` (mine vocabulary and synonym candidates) and `mcp-server` (see below) have no
+`pharos` client wrapper. Run them with the installed jar:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar <command> ...
+java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar mine myproject
 ```
-
-| Command | What it does |
-|---|---|
-| `trace <fqn> [--depth 2] [--direction callees\|callers\|both] [--max-body 500]` | multi-hop call chain with bodies |
-| `usages <fqn> [--kind all\|callers\|subclasses\|field_readers\|field_writers\|annotated\|type_refs]` | knowledge-graph usages |
-| `link <project1> <project2>` | link two projects for cross-project call paths |
-| `stats [--project <name>]` | index statistics |
-| `mine <project> [--write]` | mine vocabulary and synonym candidates |
-| `remove-index <name>` / `--all` | remove a project's index and registration |
-| `mcp-server` | the MCP server (see below) |
-
-The same operations are available as MCP tools (`trace_call_chain`, `find_usages`) and on the web API.
 
 ### Pipelines and reranking
 
@@ -330,7 +335,7 @@ mkdir -p ~/.claude/skills/pharos
 cp .claude/skills/pharos/SKILL.md ~/.claude/skills/pharos/SKILL.md
 ```
 
-Once installed, Claude Code calls `pharos search`, `pharos callers`, `pharos impact`, `pharos class --context`, etc. when navigating indexed projects instead of falling back to grep.
+Once installed, Claude Code calls `pharos search`, `pharos trace`, `pharos usages`, `pharos impact`, etc. when navigating indexed projects instead of falling back to grep.
 
 ### MCP server (alternative)
 

@@ -278,10 +278,10 @@ containing `/` had the same problem.
 ### Removing the entry
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -jar ~/.pharos/bin/pharos.jar remove-index .
+pharos remove-index .
 ```
 
-(`remove-index` is a Java CLI command; the `pharos` client has no wrapper for it.) This only unregisters the entry (registry, link references, synonyms) and deletes nothing on disk.
+This only unregisters the entry (registry, link references, synonyms) and deletes nothing on disk.
 Then re-index the directory with a proper name: `pharos index --project <name> <path>`.
 
 ### Stray files

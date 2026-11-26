@@ -14,15 +14,6 @@ mvn -pl app -am package -DskipTests      # Only the pharos jar (pharos-api + app
 mvn -pl operator -am test                # Only the operator and what it needs
 ```
 
-**Memory: heavy builds go to the build server.** A full `mvn test` (and the gate scripts) needs more
-memory than a development machine shared with a running daemon and other apps has; local Maven runs
-have ended in OOM kills. Run full test suites, gates and e2e runs on the separate build server (host and
-login are in the maintainer's local notes; it needs JDK 25 and Maven installed in `~`): rsync the
-worktree over without `target/` and `.superpowers/`, and never copy `~/.pharos` or model files. It is
-shared with the maintainer's own benchmarks: run heavy jobs only when it is quiet, under a hard memory
-cap. To check CLI help without building, download the released jar (`gh release download vX.Y.Z
---pattern 'pharos-X.Y.Z.jar'`) and run `java -Dpharos.home=<scratch dir> -jar … <cmd> --help`.
-
 **Test isolation:** surefire sets `-Dpharos.home=target/test-pharos-home`, so tests never touch the real `~/.pharos`
 (`IndexConfig.DEFAULT_BASE` honors `pharos.home`; unset means `~/.pharos`). Pass `-Dpharos.home=<dir>` to relocate state when running the CLI.
 
@@ -88,7 +79,7 @@ java -jar target/pharos-*.jar search <query>    # Keyword search
 java -jar target/pharos-*.jar mcp-server        # Start MCP server (stdio JSON-RPC)
 ```
 
-**Python CLI client:** `./pharos` at the project root is the primary user-facing CLI. It starts a background JVM daemon on first use and proxies all commands via the web API (avoids JVM cold-start). Always check/update `./pharos` when adding new commands or API parameters — the Java CLI and the Python client must stay in sync. Known gaps today: `trace`, `usages`, `link`, `stats`, `mine`, `remove-index` and `mcp-server` exist only in the Java CLI (the README lists them under "Commands only in the Java CLI"); `invalidate-embeddings`, `skeleton`, `pipelines`, `boundary` and `daemon` exist only in `./pharos`.
+**Python CLI client:** `./pharos` at the project root is the primary user-facing CLI. It starts a background JVM daemon on first use and proxies all commands via the web API (avoids JVM cold-start). Always check/update `./pharos` when adding new commands or API parameters — the Java CLI and the Python client must stay in sync. Commands that change indexes the daemon holds open (`remove-index`, `link`) run *inside* the daemon: `./pharos` posts their arguments to `POST /api/admin/<command>` (loopback peers with `X-Pharos-Admin: 1` only), and `WebServer` runs the same picocli command object (`Main.DependencyFactory#adminCommands`) with its own writers, so output and exit codes match the Java CLI. Such commands print through `spec.commandLine().getOut()/getErr()`, never `System.out`. Known gaps today: `mine` and `mcp-server` exist only in the Java CLI; `invalidate-embeddings`, `skeleton`, `pipelines`, `boundary` and `daemon` exist only in `./pharos`.
 
 **User docs:** `README.md` is the entry point; long reference material lives in `docs/cluster.md`
 (multi-node), `docs/operator.md` (Kubernetes), `docs/docker.md` (the image) and `docs/embeddings.md`.
