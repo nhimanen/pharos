@@ -1130,7 +1130,7 @@ public class CallGraph implements GraphView {
             for (int end = f.length; end > 0; end -= BATCH_SIZE) {
                 db.begin();
                 for (int i = end - 1; i >= Math.max(0, end - BATCH_SIZE); i--) {
-                    rids[f[i]].asVertex().modify().newEdge(type, rids[tt[i]], true);
+                    rids[f[i]].asVertex().modify().newEdge(type, rids[tt[i]]);
                 }
                 db.commit();
             }
@@ -1189,7 +1189,7 @@ public class CallGraph implements GraphView {
             MutableVertex to   = vMap.get(c[1]);
             if (from != null && to != null) {
                 try {
-                    from.newEdge("calls", to, true);
+                    from.newEdge("calls", to);
                 } catch (Exception e) {
                     log.debug("Could not create call edge {} → {}: {}", c[0], c[1], e.getMessage());
                 }
@@ -1275,7 +1275,7 @@ public class CallGraph implements GraphView {
             try {
                 MutableVertex from = ensureKgVertex(fromFqn, fromVType);
                 MutableVertex to   = ensureKgVertex(toFqn,   toVType);
-                if (from != null && to != null) from.newEdge(edgeType, to, true);
+                if (from != null && to != null) from.newEdge(edgeType, to);
             } catch (Exception ex) {
                 log.debug("KG edge {} → {} ({}): {}", fromFqn, toFqn, edgeType, ex.getMessage());
             }

@@ -84,7 +84,10 @@ class CallGraphIndexHygieneTest {
             for (int c = 0; c < 50; c++) addClass(g, "C" + c, 10);
             g.flush();
         }
-        // Reproduce what earlier versions did: TRUNCATE without rebuild, then re-insert.
+        // What earlier versions did: TRUNCATE without rebuild, then re-insert. ArcadeDB 25.1.1 kept
+        // the truncated records' index entries; 26.x rebuilds the index on TRUNCATE, so the graph
+        // is only corrupted when an earlier ArcadeDB wrote it. The once-only repair of a graph
+        // without the marker is what is checked either way.
         try (Database db = new DatabaseFactory(dbDir.toString()).open()) {
             db.begin();
             db.command("sql", "TRUNCATE TYPE Method UNSAFE");
@@ -95,12 +98,14 @@ class CallGraphIndexHygieneTest {
             db.commit();
         }
         Files.deleteIfExists(dbDir.resolveSibling(dbDir.getFileName() + ".index-v2"));
-        assertThat(indexEntries(dbDir, "Method[fqn]")).isGreaterThan(500);    // corrupted
+        long before = indexEntries(dbDir, "Method[fqn]");
+        assertThat(before).isGreaterThanOrEqualTo(500);    // > 500 when written by ArcadeDB 25.1.1
 
         try (CallGraph reader = CallGraph.open(dbDir)) {
             assertThat(reader.methodCount()).isEqualTo(500);
         }
-        assertThat(indexEntries(dbDir, "Method[fqn]")).as("readers never rebuild").isGreaterThan(500);
+        assertThat(indexEntries(dbDir, "Method[fqn]")).as("readers never rebuild").isEqualTo(before);
+        assertThat(dbDir.resolveSibling(dbDir.getFileName() + ".index-v2")).as("nor mark").doesNotExist();
 
         try (CallGraph writer = CallGraph.open(dbDir, true)) {
             assertThat(writer.methodCount()).isEqualTo(500);
