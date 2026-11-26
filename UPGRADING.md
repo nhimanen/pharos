@@ -1,5 +1,23 @@
 # Upgrading
 
+## Upgrading to the next release (Unreleased)
+
+Index format: unchanged. Readers switch to deterministic vector arithmetic (README, "Multi-node CPU
+determinism"); nothing to re-index.
+
+- **Kubernetes operator: one rolling restart of every pharos pod.** The operator renders a new env var,
+  `PHAROS_ARITHMETIC`, on every writer, reader and router pod (and the project Jobs). That changes every pod
+  template, so the first reconcile after the operator upgrade rolls all pharos pods, even when `spec.version`
+  pins an older pharos image. On an older image the variable is ignored, so the restart is harmless, but it
+  is a full rollout: schedule the operator upgrade as you would a release rollout (readers drain one at a
+  time under their PodDisruptionBudget).
+- **Mixed readers during the rollout.** Until every reader runs this release, old readers keep Lucene's
+  per-CPU arithmetic: exact ties can still order differently between old and new replicas, as before. The
+  new readers' WARN about differing profiles ignores old readers' heartbeats (they carry no profile).
+- **Custom launchers.** A reader started without the deterministic flags now logs a WARN naming them; to accept native
+  arithmetic, set `PHAROS_ARITHMETIC=native` with a pharos launcher, or pass `-Dpharos.arithmetic=native`
+  (what that sets) in your own.
+
 ## Upgrading to 1.11.0
 
 Index format: 1 → 2. This release brings multi-node sharding and live resharding (Phase 6) and the

@@ -91,6 +91,8 @@ public final class PeerMembership implements MembershipSource {
     /** The bound of {@link #drain()} and of {@link #close()}'s withdraw. */
     static final Duration DEFAULT_SHUTDOWN_CALL = Duration.ofSeconds(5);
     private volatile List<ReaderRegistry.LiveReader> live = List.of();
+    private final com.pharos.cluster.membership.ArithmeticDivergence arithmetic =
+            new com.pharos.cluster.membership.ArithmeticDivergence();
     private volatile List<WriterReaders> lastAnswers = List.of();
     private volatile boolean draining;
     private volatile boolean closed;
@@ -300,6 +302,7 @@ public final class PeerMembership implements MembershipSource {
             out.add(new ReaderRegistry.LiveReader(m.heartbeat(), Math.max(0, (now - m.receivedNanos()) / 1_000_000_000L)));
         }
         live = List.copyOf(out);
+        arithmetic.observe(live());
     }
 
     private void warnStale(String why) {

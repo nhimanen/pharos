@@ -25,6 +25,8 @@
 #                 https://github.com/nhimanen/pharos/releases/download); "latest" is then
 #                 read from $PHAROS_RELEASE_BASE_URL/latest (a file holding a tag)
 #   PHAROS_NO_DAEMON=1       do not start/restart the daemon (used by tests)
+#   PHAROS_ARITHMETIC=deterministic|native  Lucene's vector arithmetic for the daemon (default
+#                 deterministic on cluster.role reader, native otherwise; see README)
 #
 # Exit codes: 2 = upgrade warning declined / needs --yes, 3 = checksum mismatch;
 # with --upgrade-indexes, the exit status of upgrade-indexes (0 done, 1 skipped/failed,
@@ -107,8 +109,22 @@ PHAROS_JVM_HOME_ARGS=("-Duser.home=$HOME" "-Dpharos.home=$HOME/.pharos" "-DOPT_O
 
 # ── Daemon helpers ────────────────────────────────────────────────────────────
 
-_daemon_running() {
-  curl -s "http://localhost:$DAEMON_PORT/health" >/dev/null 2>&1
+# Ruling CPU-R1: Lucene's vector arithmetic flags (Lucene reads them once, at class load). A reader
+# (cluster.role reader) runs Lucene's scalar code with FMA off, without the vector incubator module, so every
+# CPU type scores with the same bits; anything else keeps Lucene's per-CPU SIMD choice.
+# PHAROS_ARITHMETIC=deterministic|native overrides. Same rule as the Python client's _arithmetic_flags()
+# and ArithmeticProfile.DETERMINISTIC_FLAGS.
+_arithmetic_args() { # -> one JVM argument per line
+  local mode="${PHAROS_ARITHMETIC:-}" native_property=native
+  if [ "$mode" != deterministic ] && [ "$mode" != native ]; then
+    # only the role's default: native-default, so a node that serves as a reader anyway still warns
+    if [ "$(_cluster_role)" = reader ]; then mode=deterministic; else mode=native; native_property=native-default; fi
+  fi
+  if [ "$mode" = deterministic ]; then
+    printf '%s\n' -Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic
+  else
+    printf '%s\n' --add-modules jdk.incubator.vector "-Dpharos.arithmetic=$native_property"
+  fi
 }
 
 _restart_daemon() {
@@ -130,11 +146,12 @@ _restart_daemon() {
   JVM_ARGS=(
     "--enable-native-access=ALL-UNNAMED"
     "--add-opens" "java.base/java.nio.channels.spi=ALL-UNNAMED"
-    "--add-modules" "jdk.incubator.vector"
     "-XX:+HeapDumpOnOutOfMemoryError"
     "-XX:HeapDumpPath=$PHAROS_DUMPS"
     "-DOPT_OUT_TRACKING=true"
   )
+  local arithmetic
+  while IFS= read -r arithmetic; do JVM_ARGS+=("$arithmetic"); done < <(_arithmetic_args)
   if [ -n "${PHAROS_HEAP:-}" ]; then
     JVM_ARGS=("-Xmx${PHAROS_HEAP}" "${JVM_ARGS[@]}")
     echo "Daemon heap: -Xmx${PHAROS_HEAP}"

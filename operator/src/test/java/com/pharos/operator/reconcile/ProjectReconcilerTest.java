@@ -183,7 +183,7 @@ class ProjectReconcilerTest {
                 .containsExactlyInAnyOrder(ConfigRenderer.TOKEN_ENV, ConfigRenderer.ACCESS_KEY_ENV,
                         ConfigRenderer.SECRET_KEY_ENV);
         assertThat(main.getEnv()).filteredOn(e -> e.getValueFrom() == null).allSatisfy(e ->
-                assertThat(e.getName()).isIn("PHAROS_ROLE", "PHAROS_HOME", "PHAROS_CONFIG"));
+                assertThat(e.getName()).isIn("PHAROS_ROLE", "PHAROS_HOME", "PHAROS_CONFIG", "PHAROS_ARITHMETIC"));
         assertThat(main.getEnv()).anySatisfy(e -> {
             assertThat(e.getName()).isEqualTo("PHAROS_ROLE");
             assertThat(e.getValue()).isEqualTo("writer");
