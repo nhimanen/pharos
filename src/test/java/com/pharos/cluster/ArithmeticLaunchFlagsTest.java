@@ -49,14 +49,14 @@ class ArithmeticLaunchFlagsTest {
     @Test
     void entrypointPinsReadersAndLeavesTheOtherRolesNative() throws Exception {
         assertDeterministic(entrypoint("reader", null));
-        assertNative(entrypoint("writer", null));
-        assertNative(entrypoint("router", null));
-        assertNative(entrypoint("all", null));
+        assertNativeDefault(entrypoint("writer", null));
+        assertNativeDefault(entrypoint("router", null));
+        assertNativeDefault(entrypoint("all", null));
     }
 
     @Test
     void entrypointHonoursPharosArithmetic() throws Exception {
-        assertNative(entrypoint("reader", "native"));
+        assertNativeExplicit(entrypoint("reader", "native"));
         assertDeterministic(entrypoint("writer", "deterministic"));
         assertDeterministic(entrypoint("all", "deterministic"));
     }
@@ -108,10 +108,10 @@ class ArithmeticLaunchFlagsTest {
     void pythonClientPinsReadersAndLeavesTheOtherRolesNative() throws Exception {
         assumeTrue(onPath("python3"), "needs python3");
         assertDeterministic(pythonFlags("{\"cluster\": {\"role\": \"reader\"}}", null));
-        assertNative(pythonFlags("{\"cluster\": {\"role\": \"writer\"}}", null));
-        assertNative(pythonFlags("{}", null));
-        assertNative(pythonFlags(null, null)); // no config at all
-        assertNative(pythonFlags("{\"cluster\": {\"role\": \"reader\"}}", "native"));
+        assertNativeDefault(pythonFlags("{\"cluster\": {\"role\": \"writer\"}}", null));
+        assertNativeDefault(pythonFlags("{}", null));
+        assertNativeDefault(pythonFlags(null, null)); // no config at all
+        assertNativeExplicit(pythonFlags("{\"cluster\": {\"role\": \"reader\"}}", "native"));
         assertDeterministic(pythonFlags("{}", "deterministic"));
     }
 
@@ -141,9 +141,9 @@ class ArithmeticLaunchFlagsTest {
     void setupShDaemonStartPinsReadersAndLeavesTheOtherRolesNative() throws Exception {
         assumeTrue(onPath("python3") && Files.isExecutable(Path.of("/bin/bash")), "needs bash and python3");
         assertDeterministic(setupArgs("{\"cluster\": {\"role\": \"reader\"}}", null));
-        assertNative(setupArgs("{\"cluster\": {\"role\": \"writer\"}}", null));
-        assertNative(setupArgs(null, null));
-        assertNative(setupArgs("{\"cluster\": {\"role\": \"reader\"}}", "native"));
+        assertNativeDefault(setupArgs("{\"cluster\": {\"role\": \"writer\"}}", null));
+        assertNativeDefault(setupArgs(null, null));
+        assertNativeExplicit(setupArgs("{\"cluster\": {\"role\": \"reader\"}}", "native"));
         assertDeterministic(setupArgs("{}", "deterministic"));
         // and _restart_daemon really appends them to the daemon's java command line
         String setup = Files.readString(Path.of("setup.sh"));
@@ -175,11 +175,22 @@ class ArithmeticLaunchFlagsTest {
         assertThat(args).noneMatch(a -> a.startsWith("-Dlucene.use") && a.endsWith("=true"));
     }
 
-    private static void assertNative(List<String> args) {
+    /** Native because PHAROS_ARITHMETIC=native said so: the node accepts it without a WARN. */
+    private static void assertNativeExplicit(List<String> args) {
+        assertNative(args, ArithmeticProfile.NATIVE);
+    }
+
+    /** Native only as the role's default: a node that serves as a reader anyway still WARNs. */
+    private static void assertNativeDefault(List<String> args) {
+        assertNative(args, ArithmeticProfile.NATIVE_DEFAULT);
+    }
+
+    private static void assertNative(List<String> args, String property) {
         int i = args.indexOf("--add-modules");
         assertThat(i).as("--add-modules in %s", args).isNotNegative();
         assertThat(args.get(i + 1)).isEqualTo(MODULE);
-        assertThat(args).contains("-Dpharos.arithmetic=native");
+        assertThat(args).contains("-Dpharos.arithmetic=" + property);
+        assertThat(args).filteredOn(a -> a.startsWith("-Dpharos.arithmetic=")).hasSize(1);
         assertThat(args).noneMatch(a -> a.startsWith("-Dlucene.use"));
     }
 

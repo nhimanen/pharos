@@ -35,7 +35,9 @@ import java.util.Random;
  * @param simdBits   the vector width of Lucene's Panama code; 0 when Lucene runs its scalar code
  * @param canary     8 hex digits over the bits of the fixed cosines
  * @param requested  the {@value #PROPERTY} system property the launcher set ({@value #DETERMINISTIC},
- *                   {@value #NATIVE}), or null when it set none (a custom launcher)
+ *                   {@value #NATIVE} when PHAROS_ARITHMETIC=native was set explicitly, {@value #NATIVE_DEFAULT}
+ *                   when native is only the launcher's default for a non-reader role), or null when it set
+ *                   none (a custom launcher)
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record ArithmeticProfile(boolean scalarFma, boolean vectorFma, int simdBits, String canary, String requested) {
@@ -44,6 +46,11 @@ public record ArithmeticProfile(boolean scalarFma, boolean vectorFma, int simdBi
     public static final String PROPERTY = "pharos.arithmetic";
     public static final String DETERMINISTIC = "deterministic";
     public static final String NATIVE = "native";
+    /**
+     * What a launcher passes when native is only its default for the role it was given (not {@code reader}), not
+     * an explicit {@code PHAROS_ARITHMETIC=native}: a node that then serves as a reader still warns.
+     */
+    public static final String NATIVE_DEFAULT = "native-default";
     /** The JVM flags of {@link #DETERMINISTIC}; the launchers' copies are checked against this list by tests. */
     public static final List<String> DETERMINISTIC_FLAGS = List.of(
             "-Dlucene.useScalarFMA=false", "-Dlucene.useVectorFMA=false", "-D" + PROPERTY + "=" + DETERMINISTIC);
@@ -79,12 +86,17 @@ public record ArithmeticProfile(boolean scalarFma, boolean vectorFma, int simdBi
 
     /**
      * The startup check of a reader: null when the arithmetic is deterministic or the launcher asked for
-     * {@value #NATIVE} on purpose; otherwise the WARN to log, naming the flags.
+     * {@value #NATIVE} explicitly; otherwise the WARN to log, naming the flags. {@value #NATIVE_DEFAULT} warns: the
+     * launcher defaulted to native for another role (e.g. {@code PHAROS_ROLE} unset, so {@code all}) while the
+     * config made this node a reader.
      */
     public String startupWarning() {
         if (isDeterministic() || NATIVE.equals(requested)) return null;
         String why = DETERMINISTIC.equals(requested)
                 ? "the launcher asked for deterministic arithmetic but the JVM options override it"
+                : NATIVE_DEFAULT.equals(requested)
+                ? "the launcher chose native as the default for another role (is PHAROS_ROLE, or cluster.role in"
+                        + " the config it read, not reader?)"
                 : "this JVM was not started with the deterministic arithmetic flags";
         return "Vector arithmetic is " + summary() + ": " + why + ". Readers on other CPU types (and this one,"
                 + " before its JIT warms up) may score the same document an ulp apart and order exact ties"

@@ -42,10 +42,12 @@ fi
 
 # Lucene reads its FMA choice and whether it uses the Vector API once, at class load: only JVM flags pin them.
 arithmetic="${PHAROS_ARITHMETIC:-}"
+native_property=native # an explicit PHAROS_ARITHMETIC=native: the node accepts it
 if [ -z "$arithmetic" ]; then
     case "$role" in
         reader) arithmetic=deterministic ;;
-        *) arithmetic=native ;;
+        # only this role's default: a node whose config makes it a reader anyway still warns
+        *) arithmetic=native; native_property=native-default ;;
     esac
 fi
 case "$arithmetic" in
@@ -53,7 +55,7 @@ case "$arithmetic" in
         # no --add-modules jdk.incubator.vector: Lucene runs its scalar code, strictly specified Java floats
         arithmetic_opts="-Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic" ;;
     native)
-        arithmetic_opts="--add-modules jdk.incubator.vector -Dpharos.arithmetic=native" ;;
+        arithmetic_opts="--add-modules jdk.incubator.vector -Dpharos.arithmetic=$native_property" ;;
     *)
         echo "pharos-entrypoint: PHAROS_ARITHMETIC must be deterministic or native (got '$arithmetic')" >&2
         exit 64 ;;

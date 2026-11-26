@@ -110,6 +110,8 @@ DETERMINISTIC_ARITHMETIC_FLAGS = [
     "-Dlucene.useScalarFMA=false", "-Dlucene.useVectorFMA=false", "-Dpharos.arithmetic=deterministic",
 ]
 NATIVE_ARITHMETIC_FLAGS = ["--add-modules", "jdk.incubator.vector", "-Dpharos.arithmetic=native"]
+# native only as the role's default (not an explicit PHAROS_ARITHMETIC=native): a node serving as a reader warns
+NATIVE_DEFAULT_ARITHMETIC_FLAGS = ["--add-modules", "jdk.incubator.vector", "-Dpharos.arithmetic=native-default"]
 
 
 def _arithmetic_mode(config_file: Path = None) -> str:
@@ -132,7 +134,9 @@ def _arithmetic_flags(config_file: Path = None) -> list:
     """The JVM flags of _arithmetic_mode(): native adds the vector incubator module (Lucene's SIMD code)."""
     if _arithmetic_mode(config_file) == "deterministic":
         return list(DETERMINISTIC_ARITHMETIC_FLAGS)
-    return list(NATIVE_ARITHMETIC_FLAGS)
+    if os.environ.get("PHAROS_ARITHMETIC", "").strip().lower() == "native":
+        return list(NATIVE_ARITHMETIC_FLAGS)
+    return list(NATIVE_DEFAULT_ARITHMETIC_FLAGS)
 
 
 def _jvm_flags() -> list:

@@ -52,6 +52,9 @@ class ArithmeticProfileTest {
                 .contains("without --add-modules jdk.incubator.vector").contains("PHAROS_ARITHMETIC=native");
         assertThat(new ArithmeticProfile(false, false, 256, "c", ArithmeticProfile.DETERMINISTIC).startupWarning())
                 .contains("the JVM options override it");
+        // native only as the launcher's default for another role (PHAROS_ROLE unset, config says reader): warns
+        assertThat(new ArithmeticProfile(true, true, 512, "c", ArithmeticProfile.NATIVE_DEFAULT).startupWarning())
+                .contains("default for another role").contains("PHAROS_ARITHMETIC=deterministic");
     }
 
     @Test

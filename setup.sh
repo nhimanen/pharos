@@ -115,14 +115,15 @@ PHAROS_JVM_HOME_ARGS=("-Duser.home=$HOME" "-Dpharos.home=$HOME/.pharos" "-DOPT_O
 # PHAROS_ARITHMETIC=deterministic|native overrides. Same rule as the Python client's _arithmetic_flags()
 # and ArithmeticProfile.DETERMINISTIC_FLAGS.
 _arithmetic_args() { # -> one JVM argument per line
-  local mode="${PHAROS_ARITHMETIC:-}"
+  local mode="${PHAROS_ARITHMETIC:-}" native_property=native
   if [ "$mode" != deterministic ] && [ "$mode" != native ]; then
-    if [ "$(_cluster_role)" = reader ]; then mode=deterministic; else mode=native; fi
+    # only the role's default: native-default, so a node that serves as a reader anyway still warns
+    if [ "$(_cluster_role)" = reader ]; then mode=deterministic; else mode=native; native_property=native-default; fi
   fi
   if [ "$mode" = deterministic ]; then
     printf '%s\n' -Dlucene.useScalarFMA=false -Dlucene.useVectorFMA=false -Dpharos.arithmetic=deterministic
   else
-    printf '%s\n' --add-modules jdk.incubator.vector -Dpharos.arithmetic=native
+    printf '%s\n' --add-modules jdk.incubator.vector "-Dpharos.arithmetic=$native_property"
   fi
 }
 
