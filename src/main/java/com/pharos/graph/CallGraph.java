@@ -214,6 +214,9 @@ public class CallGraph implements GraphView {
     private static final java.util.regex.Pattern DICTIONARY_FILE =
             java.util.regex.Pattern.compile("dictionary\\.\\d+\\.(\\d+)\\.v\\d+\\.dict");
 
+    /** Page header (int version, int used size) plus the dictionary's 4-byte legacy counter. */
+    private static final int DICTIONARY_PAGE_START = 12;
+
     /** {@code dbDir}'s dictionary file, or null when it has none. */
     private static Path dictionaryFile(Path dbDir) throws java.io.IOException {
         if (!Files.isDirectory(dbDir)) return null;
@@ -223,33 +226,57 @@ public class CallGraph implements GraphView {
     }
 
     /**
-     * Name to id from ArcadeDB 25.1.1's dictionary file, as {@code Dictionary.reload} reads it:
-     * page 0 holds an int version and an int used size (header included, big-endian), a 4-byte
-     * legacy counter, then the names in id order, each an unsigned LEB128 byte length plus UTF-8.
-     * Null when {@code dbDir} has no dictionary file.
+     * Name to id from ArcadeDB's dictionary file, as {@code Dictionary.reload} reads it. The file is
+     * a run of pages of the size its name carries; each page holds an int version and an int used
+     * size (header included, big-endian), a 4-byte legacy counter, then names, each an unsigned
+     * LEB128 byte length plus UTF-8. Ids are the names' ordinals across the pages in file order.
+     * ArcadeDB 25.1.1 wrote exactly one such page (327,680 bytes); 26.x starts new databases at
+     * 65,536-byte pages and rolls over to further pages (ArcadeDB #5560), and reads a 25.1.1 file
+     * as its one-page case, so this one reader covers both. Null when {@code dbDir} has no
+     * dictionary file or the file is empty.
+     *
+     * @throws java.io.IOException on a page whose header does not fit the file: callers treat
+     *                             an unreadable dictionary as not damaged
      */
     static Map<String, Integer> readDictionary(Path dbDir) throws java.io.IOException {
         Path file = dictionaryFile(dbDir);
         if (file == null) return null;
+        var name = DICTIONARY_FILE.matcher(file.getFileName().toString());
+        if (!name.matches()) return null;
+        int pageSize = Integer.parseInt(name.group(1));
+        if (pageSize < DICTIONARY_PAGE_START) throw new java.io.IOException("dictionary page size " + pageSize);
         try (var ch = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
-            java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(8);
-            if (ch.read(head, 0) < 8) return null;
-            int used = head.getInt(4);
-            if (used < 12 || used > ch.size()) throw new java.io.IOException("dictionary page size " + used);
-            java.nio.ByteBuffer page = java.nio.ByteBuffer.allocate(used);
-            while (page.hasRemaining() && ch.read(page, page.position()) > 0) { }
+            long size = ch.size();
+            if (size < 8) return null;
+            // As ArcadeDB counts them: whole pages, and page 0 even when the file is shorter.
+            long pages = Math.max(1, size / pageSize);
             Map<String, Integer> ids = new LinkedHashMap<>();
-            int pos = 12;
-            for (int id = 0; pos < used; id++) {
-                int len = 0, shift = 0, b;
-                do {
-                    b = page.get(pos++) & 0xFF;
-                    len |= (b & 0x7F) << shift;
-                    shift += 7;
-                } while ((b & 0x80) != 0 && shift < 32);
-                if (len < 0 || pos + len > used) throw new java.io.IOException("corrupt dictionary entry at " + pos);
-                ids.putIfAbsent(new String(page.array(), pos, len, java.nio.charset.StandardCharsets.UTF_8), id);
-                pos += len;
+            int id = 0;
+            for (long p = 0; p < pages; p++) {
+                long offset = p * pageSize;
+                java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(8);
+                while (head.hasRemaining() && ch.read(head, offset + head.position()) > 0) { }
+                if (head.hasRemaining()) throw new java.io.IOException("dictionary page " + p + " is cut short");
+                int used = head.getInt(4);
+                if (used < DICTIONARY_PAGE_START || used > pageSize || offset + used > size) {
+                    throw new java.io.IOException("dictionary page " + p + " used size " + used);
+                }
+                java.nio.ByteBuffer page = java.nio.ByteBuffer.allocate(used);
+                while (page.hasRemaining() && ch.read(page, offset + page.position()) > 0) { }
+                int pos = DICTIONARY_PAGE_START;
+                for (; pos < used; id++) {
+                    int len = 0, shift = 0, b;
+                    do {
+                        b = page.get(pos++) & 0xFF;
+                        len |= (b & 0x7F) << shift;
+                        shift += 7;
+                    } while ((b & 0x80) != 0 && shift < 32 && pos < used);
+                    if ((b & 0x80) != 0 || len < 0 || pos + len > used) {
+                        throw new java.io.IOException("corrupt dictionary entry in page " + p + " at " + pos);
+                    }
+                    ids.putIfAbsent(new String(page.array(), pos, len, java.nio.charset.StandardCharsets.UTF_8), id);
+                    pos += len;
+                }
             }
             return ids;
         }
